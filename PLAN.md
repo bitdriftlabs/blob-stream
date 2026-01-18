@@ -439,11 +439,11 @@ Proof of no loss:
   pairs, similar to Kafka's idempotent producer, but this adds significant complexity.
 
 ## Milestones
-- [ ] Milestone 0: Repo scaffolding + proto baseline
-  - [ ] Define proto files in this repo following shared-core/bd-proto patterns.
-  - [ ] Commit generated code for Rust (and any other planned languages).
-  - [ ] Add minimal gRPC service wiring using shared-core/bd-grpc.
-  - [ ] Define configuration protos (topic config, runtime config) and implement
+- [x] Milestone 0: Repo scaffolding + proto baseline
+  - [x] Define proto files in this repo following shared-core/bd-proto patterns.
+  - [x] Commit generated code for Rust (and any other planned languages).
+  - [x] Add minimal gRPC service wiring using shared-core/bd-grpc.
+  - [x] Define configuration protos (topic config, runtime config) and implement
         YAML/JSON decoding into proto types via a well-defined decoder.
 
 - [ ] Milestone 1: Core data model + shared types

@@ -1,0 +1,54 @@
+// blob-stream - broker + client APIs
+// Copyright Bitdrift, Inc. All rights reserved.
+//
+// Use of this source code and APIs are governed by a source available license that can be found in
+// the LICENSE file or at:
+// https://polyformproject.org/wp-content/uploads/2020/06/PolyForm-Shield-1.0.0.txt
+
+syntax = "proto3";
+
+package blobstream.v1;
+
+// Broker gRPC API used by producers to append batches of records.
+service BrokerService {
+  // Append a batch of records to a virtual partition and return its seq range.
+  rpc ProduceBatch(ProduceBatchRequest) returns (ProduceBatchResponse);
+}
+
+// A single record in a producer batch.
+message Record {
+  // Opaque payload bytes (no schema validation in v1).
+  bytes payload = 1;
+  // Producer-provided event timestamp in milliseconds since Unix epoch.
+  int64 event_ts_ms = 2;
+}
+
+// Request to append a batch of records for one virtual partition.
+message ProduceBatchRequest {
+  // Target topic name.
+  string topic = 1;
+  // Virtual partition identifier derived from (logical_partition_id + writer offset).
+  uint32 virtual_partition_id = 2;
+  // Records to append for the virtual partition.
+  repeated Record records = 3;
+}
+
+// Response containing the assigned seq range for the batch.
+message ProduceBatchResponse {
+  // Result status for the batch.
+  ProduceStatus status = 1;
+  // Optional error details when status is not OK.
+  string error_message = 2;
+}
+
+// Status codes for broker responses.
+enum ProduceStatus {
+  // Batch accepted and metadata persisted.
+  PRODUCE_STATUS_OK = 0;
+  // Broker does not hold the lease for the virtual partition.
+  PRODUCE_STATUS_NOT_LEASE_HOLDER = 1;
+  // Topic not found in runtime configuration.
+  PRODUCE_STATUS_UNKNOWN_TOPIC = 2;
+  // Broker is overloaded; producer should retry with backoff.
+  PRODUCE_STATUS_OVERLOADED = 3;
+}

@@ -1,0 +1,26 @@
+[package]
+edition = "2024"
+name    = "blob-stream"
+publish = false
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace                = true
+async-trait.workspace           = true
+axum.workspace                  = true
+bd-grpc.workspace               = true
+bd-log.workspace                = true
+blob-stream-proto.path          = "../blob-stream-proto"
+clap.workspace                  = true
+http.workspace                  = true
+log.workspace                   = true
+protobuf.workspace              = true
+protobuf-json-mapping.workspace = true
+serde.workspace                 = true
+serde_json.workspace            = true
+serde_yaml.workspace            = true
+time.workspace                  = true
+tokio.workspace                 = true

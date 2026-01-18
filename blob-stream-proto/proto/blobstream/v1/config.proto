@@ -1,0 +1,40 @@
+// blob-stream - broker configuration
+// Copyright Bitdrift, Inc. All rights reserved.
+//
+// Use of this source code is governed by a source available license that can be found in the
+// LICENSE file or at:
+// https://polyformproject.org/wp-content/uploads/2020/06/PolyForm-Shield-1.0.0.txt
+
+syntax = "proto3";
+
+package blobstream.v1;
+
+// Broker process configuration shared across all topics.
+message BrokerConfig {
+  // Maximum buffered bytes per virtual partition before forcing a flush.
+  uint32 flush_max_bytes = 1;
+  // Maximum time to wait before flushing buffered records, even if size is low.
+  uint32 flush_max_delay_ms = 2;
+  // Address to bind the broker listener (e.g. "0.0.0.0:8080").
+  string bind_addr = 3;
+}
+
+// Per-topic configuration describing partitioning and retention.
+message TopicConfig {
+  // Unique topic name used by producers and consumers.
+  string name = 1;
+  // Number of logical partitions for this topic.
+  uint32 partition_count = 2;
+  // Number of producer clusters that may write to this topic.
+  uint32 num_writers = 3;
+  // Retention window in days (used to drive storage TTL and lifecycle policies).
+  uint32 retention_days = 4;
+}
+
+// Runtime configuration for a broker process.
+message RuntimeConfig {
+  // Broker-wide settings applied across all topics.
+  BrokerConfig broker = 1;
+  // Topic definitions available to this broker.
+  repeated TopicConfig topics = 2;
+}

@@ -1,0 +1,15 @@
+[package]
+edition = "2024"
+name    = "blob-stream-proto"
+publish = false
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+bytes.workspace    = true
+protobuf.workspace = true
+
+[build-dependencies]
+protobuf-codegen.workspace = true
