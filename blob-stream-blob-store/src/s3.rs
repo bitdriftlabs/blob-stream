@@ -5,12 +5,11 @@
 // LICENSE file or at:
 // https://polyformproject.org/wp-content/uploads/2020/06/PolyForm-Shield-1.0.0.txt
 
+use crate::{BlobKey, BlobStore, ByteRange};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
-
-use crate::{BlobKey, BlobStore, ByteRange};
 
 //
 // S3BlobStore
@@ -67,12 +66,8 @@ impl BlobStore for S3BlobStore {
       .await
       .with_context(|| format!("get S3 object {}", key.as_str()))?;
 
-    let body = response
-      .body
-      .collect()
-      .await
-      .context("collect S3 body")?;
+    let body = response.body.collect().await.context("collect S3 body")?;
 
-    Ok(Bytes::from(body.into_bytes()))
+    Ok(body.into_bytes())
   }
 }

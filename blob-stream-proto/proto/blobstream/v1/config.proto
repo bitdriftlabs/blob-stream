@@ -31,10 +31,58 @@ message TopicConfig {
   uint32 retention_days = 4;
 }
 
+// In-memory blob store configuration (used for tests/local runs).
+message InMemoryBlobStoreConfig {}
+
+// S3-backed blob store configuration.
+message S3BlobStoreConfig {
+  // S3 bucket name for blob segments.
+  string bucket = 1;
+  // Optional prefix for blob objects (e.g., "blob-stream/").
+  string prefix = 2;
+  // AWS region (e.g., "us-east-1").
+  string region = 3;
+  // Optional endpoint override for local testing (e.g., LocalStack).
+  string endpoint = 4;
+}
+
+// Blob store configuration selection.
+message BlobStoreConfig {
+  oneof backend {
+    InMemoryBlobStoreConfig in_memory = 1;
+    S3BlobStoreConfig s3 = 2;
+  }
+}
+
+// In-memory metadata store configuration (used for tests/local runs).
+message InMemoryMetadataStoreConfig {}
+
+// DynamoDB-backed metadata store configuration.
+message DynamoMetadataStoreConfig {
+  // DynamoDB table name for segment metadata.
+  string table_name = 1;
+  // AWS region (e.g., "us-east-1").
+  string region = 2;
+  // Optional endpoint override for local testing (e.g., LocalStack).
+  string endpoint = 3;
+}
+
+// Metadata store configuration selection.
+message MetadataStoreConfig {
+  oneof backend {
+    InMemoryMetadataStoreConfig in_memory = 1;
+    DynamoMetadataStoreConfig dynamo = 2;
+  }
+}
+
 // Runtime configuration for a broker process.
 message RuntimeConfig {
   // Broker-wide settings applied across all topics.
   BrokerConfig broker = 1;
   // Topic definitions available to this broker.
   repeated TopicConfig topics = 2;
+  // Blob storage configuration for segments.
+  BlobStoreConfig blob_store = 3;
+  // Metadata storage configuration for segment indexes.
+  MetadataStoreConfig metadata_store = 4;
 }

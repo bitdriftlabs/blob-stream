@@ -9,14 +9,12 @@
 #[path = "./memory_test.rs"]
 mod tests;
 
-use std::collections::HashMap;
-
-use anyhow::{bail, Result};
+use crate::{BlobKey, BlobStore, ByteRange};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::collections::HashMap;
 use tokio::sync::RwLock;
-
-use crate::{BlobKey, BlobStore, ByteRange};
 
 //
 // InMemoryBlobStore
@@ -62,8 +60,10 @@ impl BlobStore for InMemoryBlobStore {
       );
     }
 
-    let start = range.start as usize;
-    let end = range.end as usize;
-    Ok(blob.slice(start..end))
+    let start = usize::try_from(range.start)
+      .map_err(|_| anyhow!("byte range start {} exceeds usize", range.start))?;
+    let end = usize::try_from(range.end)
+      .map_err(|_| anyhow!("byte range end {} exceeds usize", range.end))?;
+    Ok(blob.slice(start .. end))
   }
 }

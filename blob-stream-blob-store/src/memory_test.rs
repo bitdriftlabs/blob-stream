@@ -5,9 +5,8 @@
 // LICENSE file or at:
 // https://polyformproject.org/wp-content/uploads/2020/06/PolyForm-Shield-1.0.0.txt
 
-use bytes::Bytes;
-
 use crate::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
+use bytes::Bytes;
 
 #[tokio::test]
 async fn stores_and_reads_ranges() {
@@ -18,10 +17,7 @@ async fn stores_and_reads_ranges() {
   store.put(&key, payload).await.expect("put blob");
 
   let range = ByteRange { start: 1, end: 4 };
-  let slice = store
-    .get_range(&key, range)
-    .await
-    .expect("read range");
+  let slice = store.get_range(&key, range).await.expect("read range");
 
   assert_eq!(slice, Bytes::from_static(b"bcd"));
 }

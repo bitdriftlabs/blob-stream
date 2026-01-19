@@ -1,0 +1,107 @@
+// blob-stream - in-memory metadata store tests
+// Copyright Bitdrift, Inc. All rights reserved.
+//
+// Use of this source code is governed by a source available license that can be found in the
+// LICENSE file or at:
+// https://polyformproject.org/wp-content/uploads/2020/06/PolyForm-Shield-1.0.0.txt
+
+use crate::{InMemoryMetadataStore, MetadataStore, SegmentMetadata};
+use blob_stream_blob_store::BlobKey;
+use blob_stream_types::{
+  BatchMetadata,
+  BatchSummary,
+  Compression,
+  SeqRange,
+  SnowflakeId,
+  TopicWindowKey,
+  VirtualPartitionId,
+};
+use std::collections::HashMap;
+
+fn build_segment(
+  topic: &str,
+  window_start_unix_seconds: i64,
+  snowflake_id: u64,
+) -> SegmentMetadata {
+  let mut segment_index = HashMap::new();
+  let batch = BatchMetadata {
+    seq_range: SeqRange { start: 10, end: 19 },
+    byte_range: blob_stream_types::ByteRange { start: 0, end: 512 },
+    summary: BatchSummary {
+      record_count: 10,
+      payload_bytes: 512,
+      min_event_ts_ms: 1000,
+      max_event_ts_ms: 2000,
+    },
+    compression: Compression::none(),
+  };
+  segment_index.insert(0 as VirtualPartitionId, vec![batch]);
+
+  SegmentMetadata::new(
+    TopicWindowKey {
+      topic: topic.to_string(),
+      window_start_unix_seconds,
+    },
+    SnowflakeId(snowflake_id),
+    BlobKey::from("topic/1/segment"),
+    segment_index,
+    Compression::none(),
+    10,
+    1000,
+    2000,
+    None,
+    3000,
+  )
+}
+
+#[tokio::test]
+async fn stores_and_scans_window() {
+  let store = InMemoryMetadataStore::new();
+  let first = build_segment("topic-a", 100, 1);
+  let second = build_segment("topic-a", 100, 2);
+  let other = build_segment("topic-b", 200, 3);
+
+  store
+    .write_segment(first.clone())
+    .await
+    .expect("write first");
+  store
+    .write_segment(second.clone())
+    .await
+    .expect("write second");
+  store.write_segment(other).await.expect("write other");
+
+  let window = TopicWindowKey {
+    topic: "topic-a".to_string(),
+    window_start_unix_seconds: 100,
+  };
+  let segments = store.scan_window(&window, None).await.expect("scan window");
+
+  assert_eq!(segments.len(), 2);
+  assert!(segments.contains(&first));
+  assert!(segments.contains(&second));
+}
+
+#[tokio::test]
+async fn respects_min_snowflake_id() {
+  let store = InMemoryMetadataStore::new();
+  let first = build_segment("topic-a", 100, 1);
+  let second = build_segment("topic-a", 100, 9);
+
+  store.write_segment(first).await.expect("write first");
+  store
+    .write_segment(second.clone())
+    .await
+    .expect("write second");
+
+  let window = TopicWindowKey {
+    topic: "topic-a".to_string(),
+    window_start_unix_seconds: 100,
+  };
+  let segments = store
+    .scan_window(&window, Some(SnowflakeId(5)))
+    .await
+    .expect("scan window");
+
+  assert_eq!(segments, vec![second]);
+}

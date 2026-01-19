@@ -9,9 +9,8 @@
 #[path = "./types_test.rs"]
 mod tests;
 
-use serde::{Deserialize, Serialize};
-
 pub use blob_stream_blob_store::ByteRange;
+use serde::{Deserialize, Serialize};
 
 pub type VirtualPartitionId = u32;
 

@@ -15,11 +15,9 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 mod memory;
-#[cfg(feature = "s3")]
 mod s3;
 
 pub use memory::InMemoryBlobStore;
-#[cfg(feature = "s3")]
 pub use s3::S3BlobStore;
 
 //

@@ -67,7 +67,8 @@
   optional at producer; the broker may recompress at segment assembly time.
 - Retention: S3 lifecycle (days) with Dynamo TTL matching lifecycle minus a buffer.
 - Configuration: broker config file/env layer for rollover size, flush delay,
-  compression, retention, and Dynamo/S3 settings.
+  compression, retention, and datastore settings (blob store: in-memory/S3;
+  metadata store: in-memory/Dynamo).
 - Cursor model: per-virtual-partition seq cursor to reduce coordination cost.
 - Consumer leases: 10s heartbeat, 30s lease duration (configurable).
 - S3 layout: single bucket with per-topic prefixes.
@@ -350,6 +351,8 @@ Proof of no loss:
 - Each consumer keeps a per-virtual-partition cursor and a per-topic scan watermark.
 
 ### Scan algorithm (time windows)
+Notes:
+- Window scans are unordered for lowest cost; callers sort client-side only if needed.
 1. Determine current scan window based on wall clock and cursor.
 2. Scan window items from blob_segments (topic#window).
 3. Filter the segment_index for assigned virtual partitions only.
@@ -458,11 +461,13 @@ Proof of no loss:
   - [x] Implement blob storage using S3 (encapsulate S3 details inside the impl).
   - [x] Add unit tests for blob storage trait behavior.
 
-- [ ] Milestone 3: Segment metadata store (trait + implementation)
-  - [ ] Define async trait for metadata store (write segment metadata, scan windows).
-  - [ ] Implement in-memory metadata store for tests.
-  - [ ] Implement metadata store using DynamoDB (window scans, segment_index writes).
-  - [ ] Add unit tests for metadata store scans and writes.
+- [x] Milestone 3: Segment metadata store (trait + implementation)
+  - [x] Define async trait for metadata store (write segment metadata, scan windows).
+  - [x] Document unordered scan behavior (callers sort client-side if needed).
+  - [x] Implement in-memory metadata store for tests.
+  - [x] Implement metadata store using DynamoDB (window scans, segment_index writes).
+  - [x] Add unit tests for metadata store scans and writes.
+  - [x] Add datastore config selection (in-memory/S3/Dynamo) to config protos.
 
 - [ ] Milestone 4: Producer partition leases (trait + implementation)
   - [ ] Define async trait for producer partition leases (acquire/heartbeat/reserve seq).

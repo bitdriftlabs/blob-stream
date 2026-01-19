@@ -365,6 +365,1102 @@ impl ::protobuf::reflect::ProtobufValue for TopicConfig {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
+// @@protoc_insertion_point(message:blobstream.v1.InMemoryBlobStoreConfig)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct InMemoryBlobStoreConfig {
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.InMemoryBlobStoreConfig.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a InMemoryBlobStoreConfig {
+    fn default() -> &'a InMemoryBlobStoreConfig {
+        <InMemoryBlobStoreConfig as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl InMemoryBlobStoreConfig {
+    pub fn new() -> InMemoryBlobStoreConfig {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(0);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<InMemoryBlobStoreConfig>(
+            "InMemoryBlobStoreConfig",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for InMemoryBlobStoreConfig {
+    const NAME: &'static str = "InMemoryBlobStoreConfig";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> InMemoryBlobStoreConfig {
+        InMemoryBlobStoreConfig::new()
+    }
+
+    fn clear(&mut self) {
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static InMemoryBlobStoreConfig {
+        static instance: InMemoryBlobStoreConfig = InMemoryBlobStoreConfig {
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for InMemoryBlobStoreConfig {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("InMemoryBlobStoreConfig").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for InMemoryBlobStoreConfig {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for InMemoryBlobStoreConfig {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.S3BlobStoreConfig)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct S3BlobStoreConfig {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.S3BlobStoreConfig.bucket)
+    pub bucket: ::protobuf::Chars,
+    // @@protoc_insertion_point(field:blobstream.v1.S3BlobStoreConfig.prefix)
+    pub prefix: ::protobuf::Chars,
+    // @@protoc_insertion_point(field:blobstream.v1.S3BlobStoreConfig.region)
+    pub region: ::protobuf::Chars,
+    // @@protoc_insertion_point(field:blobstream.v1.S3BlobStoreConfig.endpoint)
+    pub endpoint: ::protobuf::Chars,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.S3BlobStoreConfig.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a S3BlobStoreConfig {
+    fn default() -> &'a S3BlobStoreConfig {
+        <S3BlobStoreConfig as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl S3BlobStoreConfig {
+    pub fn new() -> S3BlobStoreConfig {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(4);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "bucket",
+            |m: &S3BlobStoreConfig| { &m.bucket },
+            |m: &mut S3BlobStoreConfig| { &mut m.bucket },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "prefix",
+            |m: &S3BlobStoreConfig| { &m.prefix },
+            |m: &mut S3BlobStoreConfig| { &mut m.prefix },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "region",
+            |m: &S3BlobStoreConfig| { &m.region },
+            |m: &mut S3BlobStoreConfig| { &mut m.region },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "endpoint",
+            |m: &S3BlobStoreConfig| { &m.endpoint },
+            |m: &mut S3BlobStoreConfig| { &mut m.endpoint },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<S3BlobStoreConfig>(
+            "S3BlobStoreConfig",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for S3BlobStoreConfig {
+    const NAME: &'static str = "S3BlobStoreConfig";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.bucket = is.read_tokio_chars()?;
+                },
+                18 => {
+                    self.prefix = is.read_tokio_chars()?;
+                },
+                26 => {
+                    self.region = is.read_tokio_chars()?;
+                },
+                34 => {
+                    self.endpoint = is.read_tokio_chars()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if !self.bucket.is_empty() {
+            my_size += ::protobuf::rt::string_size(1, &self.bucket);
+        }
+        if !self.prefix.is_empty() {
+            my_size += ::protobuf::rt::string_size(2, &self.prefix);
+        }
+        if !self.region.is_empty() {
+            my_size += ::protobuf::rt::string_size(3, &self.region);
+        }
+        if !self.endpoint.is_empty() {
+            my_size += ::protobuf::rt::string_size(4, &self.endpoint);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if !self.bucket.is_empty() {
+            os.write_string(1, &self.bucket)?;
+        }
+        if !self.prefix.is_empty() {
+            os.write_string(2, &self.prefix)?;
+        }
+        if !self.region.is_empty() {
+            os.write_string(3, &self.region)?;
+        }
+        if !self.endpoint.is_empty() {
+            os.write_string(4, &self.endpoint)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> S3BlobStoreConfig {
+        S3BlobStoreConfig::new()
+    }
+
+    fn clear(&mut self) {
+        self.bucket.clear();
+        self.prefix.clear();
+        self.region.clear();
+        self.endpoint.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static S3BlobStoreConfig {
+        static instance: S3BlobStoreConfig = S3BlobStoreConfig {
+            bucket: ::protobuf::Chars::new(),
+            prefix: ::protobuf::Chars::new(),
+            region: ::protobuf::Chars::new(),
+            endpoint: ::protobuf::Chars::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for S3BlobStoreConfig {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("S3BlobStoreConfig").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for S3BlobStoreConfig {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for S3BlobStoreConfig {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.BlobStoreConfig)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct BlobStoreConfig {
+    // message oneof groups
+    pub backend: ::std::option::Option<blob_store_config::Backend>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.BlobStoreConfig.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a BlobStoreConfig {
+    fn default() -> &'a BlobStoreConfig {
+        <BlobStoreConfig as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl BlobStoreConfig {
+    pub fn new() -> BlobStoreConfig {
+        ::std::default::Default::default()
+    }
+
+    // .blobstream.v1.InMemoryBlobStoreConfig in_memory = 1;
+
+    pub fn in_memory(&self) -> &InMemoryBlobStoreConfig {
+        match self.backend {
+            ::std::option::Option::Some(blob_store_config::Backend::InMemory(ref v)) => v,
+            _ => <InMemoryBlobStoreConfig as ::protobuf::Message>::default_instance(),
+        }
+    }
+
+    pub fn clear_in_memory(&mut self) {
+        self.backend = ::std::option::Option::None;
+    }
+
+    pub fn has_in_memory(&self) -> bool {
+        match self.backend {
+            ::std::option::Option::Some(blob_store_config::Backend::InMemory(..)) => true,
+            _ => false,
+        }
+    }
+
+    // Param is passed by value, moved
+    pub fn set_in_memory(&mut self, v: InMemoryBlobStoreConfig) {
+        self.backend = ::std::option::Option::Some(blob_store_config::Backend::InMemory(v))
+    }
+
+    // Mutable pointer to the field.
+    pub fn mut_in_memory(&mut self) -> &mut InMemoryBlobStoreConfig {
+        if let ::std::option::Option::Some(blob_store_config::Backend::InMemory(_)) = self.backend {
+        } else {
+            self.backend = ::std::option::Option::Some(blob_store_config::Backend::InMemory(InMemoryBlobStoreConfig::new()));
+        }
+        match self.backend {
+            ::std::option::Option::Some(blob_store_config::Backend::InMemory(ref mut v)) => v,
+            _ => panic!(),
+        }
+    }
+
+    // Take field
+    pub fn take_in_memory(&mut self) -> InMemoryBlobStoreConfig {
+        if self.has_in_memory() {
+            match self.backend.take() {
+                ::std::option::Option::Some(blob_store_config::Backend::InMemory(v)) => v,
+                _ => panic!(),
+            }
+        } else {
+            InMemoryBlobStoreConfig::new()
+        }
+    }
+
+    // .blobstream.v1.S3BlobStoreConfig s3 = 2;
+
+    pub fn s3(&self) -> &S3BlobStoreConfig {
+        match self.backend {
+            ::std::option::Option::Some(blob_store_config::Backend::S3(ref v)) => v,
+            _ => <S3BlobStoreConfig as ::protobuf::Message>::default_instance(),
+        }
+    }
+
+    pub fn clear_s3(&mut self) {
+        self.backend = ::std::option::Option::None;
+    }
+
+    pub fn has_s3(&self) -> bool {
+        match self.backend {
+            ::std::option::Option::Some(blob_store_config::Backend::S3(..)) => true,
+            _ => false,
+        }
+    }
+
+    // Param is passed by value, moved
+    pub fn set_s3(&mut self, v: S3BlobStoreConfig) {
+        self.backend = ::std::option::Option::Some(blob_store_config::Backend::S3(v))
+    }
+
+    // Mutable pointer to the field.
+    pub fn mut_s3(&mut self) -> &mut S3BlobStoreConfig {
+        if let ::std::option::Option::Some(blob_store_config::Backend::S3(_)) = self.backend {
+        } else {
+            self.backend = ::std::option::Option::Some(blob_store_config::Backend::S3(S3BlobStoreConfig::new()));
+        }
+        match self.backend {
+            ::std::option::Option::Some(blob_store_config::Backend::S3(ref mut v)) => v,
+            _ => panic!(),
+        }
+    }
+
+    // Take field
+    pub fn take_s3(&mut self) -> S3BlobStoreConfig {
+        if self.has_s3() {
+            match self.backend.take() {
+                ::std::option::Option::Some(blob_store_config::Backend::S3(v)) => v,
+                _ => panic!(),
+            }
+        } else {
+            S3BlobStoreConfig::new()
+        }
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(1);
+        fields.push(::protobuf::reflect::rt::v2::make_oneof_message_has_get_mut_set_accessor::<_, InMemoryBlobStoreConfig>(
+            "in_memory",
+            BlobStoreConfig::has_in_memory,
+            BlobStoreConfig::in_memory,
+            BlobStoreConfig::mut_in_memory,
+            BlobStoreConfig::set_in_memory,
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_oneof_message_has_get_mut_set_accessor::<_, S3BlobStoreConfig>(
+            "s3",
+            BlobStoreConfig::has_s3,
+            BlobStoreConfig::s3,
+            BlobStoreConfig::mut_s3,
+            BlobStoreConfig::set_s3,
+        ));
+        oneofs.push(blob_store_config::Backend::generated_oneof_descriptor_data());
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<BlobStoreConfig>(
+            "BlobStoreConfig",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for BlobStoreConfig {
+    const NAME: &'static str = "BlobStoreConfig";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.backend = ::std::option::Option::Some(blob_store_config::Backend::InMemory(is.read_message()?));
+                },
+                18 => {
+                    self.backend = ::std::option::Option::Some(blob_store_config::Backend::S3(is.read_message()?));
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if let ::std::option::Option::Some(ref v) = self.backend {
+            match v {
+                &blob_store_config::Backend::InMemory(ref v) => {
+                    let len = v.compute_size();
+                    my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+                },
+                &blob_store_config::Backend::S3(ref v) => {
+                    let len = v.compute_size();
+                    my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+                },
+            };
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if let ::std::option::Option::Some(ref v) = self.backend {
+            match v {
+                &blob_store_config::Backend::InMemory(ref v) => {
+                    ::protobuf::rt::write_message_field_with_cached_size(1, v, os)?;
+                },
+                &blob_store_config::Backend::S3(ref v) => {
+                    ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
+                },
+            };
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> BlobStoreConfig {
+        BlobStoreConfig::new()
+    }
+
+    fn clear(&mut self) {
+        self.backend = ::std::option::Option::None;
+        self.backend = ::std::option::Option::None;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static BlobStoreConfig {
+        static instance: BlobStoreConfig = BlobStoreConfig {
+            backend: ::std::option::Option::None,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for BlobStoreConfig {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("BlobStoreConfig").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for BlobStoreConfig {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for BlobStoreConfig {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+/// Nested message and enums of message `BlobStoreConfig`
+pub mod blob_store_config {
+
+    #[derive(Clone,PartialEq,Debug)]
+    // @@protoc_insertion_point(oneof:blobstream.v1.BlobStoreConfig.backend)
+    pub enum Backend {
+        // @@protoc_insertion_point(oneof_field:blobstream.v1.BlobStoreConfig.in_memory)
+        InMemory(super::InMemoryBlobStoreConfig),
+        // @@protoc_insertion_point(oneof_field:blobstream.v1.BlobStoreConfig.s3)
+        S3(super::S3BlobStoreConfig),
+    }
+
+    impl ::protobuf::Oneof for Backend {
+    }
+
+    impl ::protobuf::OneofFull for Backend {
+        fn descriptor() -> ::protobuf::reflect::OneofDescriptor {
+            static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::OneofDescriptor> = ::protobuf::rt::Lazy::new();
+            descriptor.get(|| <super::BlobStoreConfig as ::protobuf::MessageFull>::descriptor().oneof_by_name("backend").unwrap()).clone()
+        }
+    }
+
+    impl Backend {
+        pub(in super) fn generated_oneof_descriptor_data() -> ::protobuf::reflect::GeneratedOneofDescriptorData {
+            ::protobuf::reflect::GeneratedOneofDescriptorData::new::<Backend>("backend")
+        }
+    }
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.InMemoryMetadataStoreConfig)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct InMemoryMetadataStoreConfig {
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.InMemoryMetadataStoreConfig.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a InMemoryMetadataStoreConfig {
+    fn default() -> &'a InMemoryMetadataStoreConfig {
+        <InMemoryMetadataStoreConfig as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl InMemoryMetadataStoreConfig {
+    pub fn new() -> InMemoryMetadataStoreConfig {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(0);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<InMemoryMetadataStoreConfig>(
+            "InMemoryMetadataStoreConfig",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for InMemoryMetadataStoreConfig {
+    const NAME: &'static str = "InMemoryMetadataStoreConfig";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> InMemoryMetadataStoreConfig {
+        InMemoryMetadataStoreConfig::new()
+    }
+
+    fn clear(&mut self) {
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static InMemoryMetadataStoreConfig {
+        static instance: InMemoryMetadataStoreConfig = InMemoryMetadataStoreConfig {
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for InMemoryMetadataStoreConfig {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("InMemoryMetadataStoreConfig").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for InMemoryMetadataStoreConfig {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for InMemoryMetadataStoreConfig {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.DynamoMetadataStoreConfig)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct DynamoMetadataStoreConfig {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.DynamoMetadataStoreConfig.table_name)
+    pub table_name: ::protobuf::Chars,
+    // @@protoc_insertion_point(field:blobstream.v1.DynamoMetadataStoreConfig.region)
+    pub region: ::protobuf::Chars,
+    // @@protoc_insertion_point(field:blobstream.v1.DynamoMetadataStoreConfig.endpoint)
+    pub endpoint: ::protobuf::Chars,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.DynamoMetadataStoreConfig.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a DynamoMetadataStoreConfig {
+    fn default() -> &'a DynamoMetadataStoreConfig {
+        <DynamoMetadataStoreConfig as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl DynamoMetadataStoreConfig {
+    pub fn new() -> DynamoMetadataStoreConfig {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(3);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "table_name",
+            |m: &DynamoMetadataStoreConfig| { &m.table_name },
+            |m: &mut DynamoMetadataStoreConfig| { &mut m.table_name },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "region",
+            |m: &DynamoMetadataStoreConfig| { &m.region },
+            |m: &mut DynamoMetadataStoreConfig| { &mut m.region },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "endpoint",
+            |m: &DynamoMetadataStoreConfig| { &m.endpoint },
+            |m: &mut DynamoMetadataStoreConfig| { &mut m.endpoint },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<DynamoMetadataStoreConfig>(
+            "DynamoMetadataStoreConfig",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for DynamoMetadataStoreConfig {
+    const NAME: &'static str = "DynamoMetadataStoreConfig";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.table_name = is.read_tokio_chars()?;
+                },
+                18 => {
+                    self.region = is.read_tokio_chars()?;
+                },
+                26 => {
+                    self.endpoint = is.read_tokio_chars()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if !self.table_name.is_empty() {
+            my_size += ::protobuf::rt::string_size(1, &self.table_name);
+        }
+        if !self.region.is_empty() {
+            my_size += ::protobuf::rt::string_size(2, &self.region);
+        }
+        if !self.endpoint.is_empty() {
+            my_size += ::protobuf::rt::string_size(3, &self.endpoint);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if !self.table_name.is_empty() {
+            os.write_string(1, &self.table_name)?;
+        }
+        if !self.region.is_empty() {
+            os.write_string(2, &self.region)?;
+        }
+        if !self.endpoint.is_empty() {
+            os.write_string(3, &self.endpoint)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> DynamoMetadataStoreConfig {
+        DynamoMetadataStoreConfig::new()
+    }
+
+    fn clear(&mut self) {
+        self.table_name.clear();
+        self.region.clear();
+        self.endpoint.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static DynamoMetadataStoreConfig {
+        static instance: DynamoMetadataStoreConfig = DynamoMetadataStoreConfig {
+            table_name: ::protobuf::Chars::new(),
+            region: ::protobuf::Chars::new(),
+            endpoint: ::protobuf::Chars::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for DynamoMetadataStoreConfig {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("DynamoMetadataStoreConfig").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for DynamoMetadataStoreConfig {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for DynamoMetadataStoreConfig {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.MetadataStoreConfig)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct MetadataStoreConfig {
+    // message oneof groups
+    pub backend: ::std::option::Option<metadata_store_config::Backend>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.MetadataStoreConfig.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a MetadataStoreConfig {
+    fn default() -> &'a MetadataStoreConfig {
+        <MetadataStoreConfig as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl MetadataStoreConfig {
+    pub fn new() -> MetadataStoreConfig {
+        ::std::default::Default::default()
+    }
+
+    // .blobstream.v1.InMemoryMetadataStoreConfig in_memory = 1;
+
+    pub fn in_memory(&self) -> &InMemoryMetadataStoreConfig {
+        match self.backend {
+            ::std::option::Option::Some(metadata_store_config::Backend::InMemory(ref v)) => v,
+            _ => <InMemoryMetadataStoreConfig as ::protobuf::Message>::default_instance(),
+        }
+    }
+
+    pub fn clear_in_memory(&mut self) {
+        self.backend = ::std::option::Option::None;
+    }
+
+    pub fn has_in_memory(&self) -> bool {
+        match self.backend {
+            ::std::option::Option::Some(metadata_store_config::Backend::InMemory(..)) => true,
+            _ => false,
+        }
+    }
+
+    // Param is passed by value, moved
+    pub fn set_in_memory(&mut self, v: InMemoryMetadataStoreConfig) {
+        self.backend = ::std::option::Option::Some(metadata_store_config::Backend::InMemory(v))
+    }
+
+    // Mutable pointer to the field.
+    pub fn mut_in_memory(&mut self) -> &mut InMemoryMetadataStoreConfig {
+        if let ::std::option::Option::Some(metadata_store_config::Backend::InMemory(_)) = self.backend {
+        } else {
+            self.backend = ::std::option::Option::Some(metadata_store_config::Backend::InMemory(InMemoryMetadataStoreConfig::new()));
+        }
+        match self.backend {
+            ::std::option::Option::Some(metadata_store_config::Backend::InMemory(ref mut v)) => v,
+            _ => panic!(),
+        }
+    }
+
+    // Take field
+    pub fn take_in_memory(&mut self) -> InMemoryMetadataStoreConfig {
+        if self.has_in_memory() {
+            match self.backend.take() {
+                ::std::option::Option::Some(metadata_store_config::Backend::InMemory(v)) => v,
+                _ => panic!(),
+            }
+        } else {
+            InMemoryMetadataStoreConfig::new()
+        }
+    }
+
+    // .blobstream.v1.DynamoMetadataStoreConfig dynamo = 2;
+
+    pub fn dynamo(&self) -> &DynamoMetadataStoreConfig {
+        match self.backend {
+            ::std::option::Option::Some(metadata_store_config::Backend::Dynamo(ref v)) => v,
+            _ => <DynamoMetadataStoreConfig as ::protobuf::Message>::default_instance(),
+        }
+    }
+
+    pub fn clear_dynamo(&mut self) {
+        self.backend = ::std::option::Option::None;
+    }
+
+    pub fn has_dynamo(&self) -> bool {
+        match self.backend {
+            ::std::option::Option::Some(metadata_store_config::Backend::Dynamo(..)) => true,
+            _ => false,
+        }
+    }
+
+    // Param is passed by value, moved
+    pub fn set_dynamo(&mut self, v: DynamoMetadataStoreConfig) {
+        self.backend = ::std::option::Option::Some(metadata_store_config::Backend::Dynamo(v))
+    }
+
+    // Mutable pointer to the field.
+    pub fn mut_dynamo(&mut self) -> &mut DynamoMetadataStoreConfig {
+        if let ::std::option::Option::Some(metadata_store_config::Backend::Dynamo(_)) = self.backend {
+        } else {
+            self.backend = ::std::option::Option::Some(metadata_store_config::Backend::Dynamo(DynamoMetadataStoreConfig::new()));
+        }
+        match self.backend {
+            ::std::option::Option::Some(metadata_store_config::Backend::Dynamo(ref mut v)) => v,
+            _ => panic!(),
+        }
+    }
+
+    // Take field
+    pub fn take_dynamo(&mut self) -> DynamoMetadataStoreConfig {
+        if self.has_dynamo() {
+            match self.backend.take() {
+                ::std::option::Option::Some(metadata_store_config::Backend::Dynamo(v)) => v,
+                _ => panic!(),
+            }
+        } else {
+            DynamoMetadataStoreConfig::new()
+        }
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(1);
+        fields.push(::protobuf::reflect::rt::v2::make_oneof_message_has_get_mut_set_accessor::<_, InMemoryMetadataStoreConfig>(
+            "in_memory",
+            MetadataStoreConfig::has_in_memory,
+            MetadataStoreConfig::in_memory,
+            MetadataStoreConfig::mut_in_memory,
+            MetadataStoreConfig::set_in_memory,
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_oneof_message_has_get_mut_set_accessor::<_, DynamoMetadataStoreConfig>(
+            "dynamo",
+            MetadataStoreConfig::has_dynamo,
+            MetadataStoreConfig::dynamo,
+            MetadataStoreConfig::mut_dynamo,
+            MetadataStoreConfig::set_dynamo,
+        ));
+        oneofs.push(metadata_store_config::Backend::generated_oneof_descriptor_data());
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MetadataStoreConfig>(
+            "MetadataStoreConfig",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for MetadataStoreConfig {
+    const NAME: &'static str = "MetadataStoreConfig";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.backend = ::std::option::Option::Some(metadata_store_config::Backend::InMemory(is.read_message()?));
+                },
+                18 => {
+                    self.backend = ::std::option::Option::Some(metadata_store_config::Backend::Dynamo(is.read_message()?));
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if let ::std::option::Option::Some(ref v) = self.backend {
+            match v {
+                &metadata_store_config::Backend::InMemory(ref v) => {
+                    let len = v.compute_size();
+                    my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+                },
+                &metadata_store_config::Backend::Dynamo(ref v) => {
+                    let len = v.compute_size();
+                    my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+                },
+            };
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if let ::std::option::Option::Some(ref v) = self.backend {
+            match v {
+                &metadata_store_config::Backend::InMemory(ref v) => {
+                    ::protobuf::rt::write_message_field_with_cached_size(1, v, os)?;
+                },
+                &metadata_store_config::Backend::Dynamo(ref v) => {
+                    ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
+                },
+            };
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> MetadataStoreConfig {
+        MetadataStoreConfig::new()
+    }
+
+    fn clear(&mut self) {
+        self.backend = ::std::option::Option::None;
+        self.backend = ::std::option::Option::None;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static MetadataStoreConfig {
+        static instance: MetadataStoreConfig = MetadataStoreConfig {
+            backend: ::std::option::Option::None,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for MetadataStoreConfig {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("MetadataStoreConfig").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for MetadataStoreConfig {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for MetadataStoreConfig {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+/// Nested message and enums of message `MetadataStoreConfig`
+pub mod metadata_store_config {
+
+    #[derive(Clone,PartialEq,Debug)]
+    // @@protoc_insertion_point(oneof:blobstream.v1.MetadataStoreConfig.backend)
+    pub enum Backend {
+        // @@protoc_insertion_point(oneof_field:blobstream.v1.MetadataStoreConfig.in_memory)
+        InMemory(super::InMemoryMetadataStoreConfig),
+        // @@protoc_insertion_point(oneof_field:blobstream.v1.MetadataStoreConfig.dynamo)
+        Dynamo(super::DynamoMetadataStoreConfig),
+    }
+
+    impl ::protobuf::Oneof for Backend {
+    }
+
+    impl ::protobuf::OneofFull for Backend {
+        fn descriptor() -> ::protobuf::reflect::OneofDescriptor {
+            static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::OneofDescriptor> = ::protobuf::rt::Lazy::new();
+            descriptor.get(|| <super::MetadataStoreConfig as ::protobuf::MessageFull>::descriptor().oneof_by_name("backend").unwrap()).clone()
+        }
+    }
+
+    impl Backend {
+        pub(in super) fn generated_oneof_descriptor_data() -> ::protobuf::reflect::GeneratedOneofDescriptorData {
+            ::protobuf::reflect::GeneratedOneofDescriptorData::new::<Backend>("backend")
+        }
+    }
+}
+
 // @@protoc_insertion_point(message:blobstream.v1.RuntimeConfig)
 #[derive(PartialEq,Clone,Default,Debug)]
 pub struct RuntimeConfig {
@@ -373,6 +1469,10 @@ pub struct RuntimeConfig {
     pub broker: ::protobuf::MessageField<BrokerConfig>,
     // @@protoc_insertion_point(field:blobstream.v1.RuntimeConfig.topics)
     pub topics: ::std::vec::Vec<TopicConfig>,
+    // @@protoc_insertion_point(field:blobstream.v1.RuntimeConfig.blob_store)
+    pub blob_store: ::protobuf::MessageField<BlobStoreConfig>,
+    // @@protoc_insertion_point(field:blobstream.v1.RuntimeConfig.metadata_store)
+    pub metadata_store: ::protobuf::MessageField<MetadataStoreConfig>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.RuntimeConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -390,7 +1490,7 @@ impl RuntimeConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut fields = ::std::vec::Vec::with_capacity(4);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, BrokerConfig>(
             "broker",
@@ -401,6 +1501,16 @@ impl RuntimeConfig {
             "topics",
             |m: &RuntimeConfig| { &m.topics },
             |m: &mut RuntimeConfig| { &mut m.topics },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, BlobStoreConfig>(
+            "blob_store",
+            |m: &RuntimeConfig| { &m.blob_store },
+            |m: &mut RuntimeConfig| { &mut m.blob_store },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, MetadataStoreConfig>(
+            "metadata_store",
+            |m: &RuntimeConfig| { &m.metadata_store },
+            |m: &mut RuntimeConfig| { &mut m.metadata_store },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<RuntimeConfig>(
             "RuntimeConfig",
@@ -426,6 +1536,12 @@ impl ::protobuf::Message for RuntimeConfig {
                 18 => {
                     self.topics.push(is.read_message()?);
                 },
+                26 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.blob_store)?;
+                },
+                34 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.metadata_store)?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -446,6 +1562,14 @@ impl ::protobuf::Message for RuntimeConfig {
             let len = value.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         };
+        if let Some(v) = self.blob_store.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
+        if let Some(v) = self.metadata_store.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -458,6 +1582,12 @@ impl ::protobuf::Message for RuntimeConfig {
         for v in &self.topics {
             ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
         };
+        if let Some(v) = self.blob_store.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(3, v, os)?;
+        }
+        if let Some(v) = self.metadata_store.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(4, v, os)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -477,6 +1607,8 @@ impl ::protobuf::Message for RuntimeConfig {
     fn clear(&mut self) {
         self.broker.clear();
         self.topics.clear();
+        self.blob_store.clear();
+        self.metadata_store.clear();
         self.special_fields.clear();
     }
 
@@ -484,6 +1616,8 @@ impl ::protobuf::Message for RuntimeConfig {
         static instance: RuntimeConfig = RuntimeConfig {
             broker: ::protobuf::MessageField::none(),
             topics: ::std::vec::Vec::new(),
+            blob_store: ::protobuf::MessageField::none(),
+            metadata_store: ::protobuf::MessageField::none(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -515,9 +1649,26 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x12\x12\n\x04name\x18\x01\x20\x01(\tR\x04name\x12'\n\x0fpartition_count\
     \x18\x02\x20\x01(\rR\x0epartitionCount\x12\x1f\n\x0bnum_writers\x18\x03\
     \x20\x01(\rR\nnumWriters\x12%\n\x0eretention_days\x18\x04\x20\x01(\rR\rr\
-    etentionDays\"x\n\rRuntimeConfig\x123\n\x06broker\x18\x01\x20\x01(\x0b2\
-    \x1b.blobstream.v1.BrokerConfigR\x06broker\x122\n\x06topics\x18\x02\x20\
-    \x03(\x0b2\x1a.blobstream.v1.TopicConfigR\x06topicsb\x06proto3\
+    etentionDays\"\x19\n\x17InMemoryBlobStoreConfig\"w\n\x11S3BlobStoreConfi\
+    g\x12\x16\n\x06bucket\x18\x01\x20\x01(\tR\x06bucket\x12\x16\n\x06prefix\
+    \x18\x02\x20\x01(\tR\x06prefix\x12\x16\n\x06region\x18\x03\x20\x01(\tR\
+    \x06region\x12\x1a\n\x08endpoint\x18\x04\x20\x01(\tR\x08endpoint\"\x97\
+    \x01\n\x0fBlobStoreConfig\x12E\n\tin_memory\x18\x01\x20\x01(\x0b2&.blobs\
+    tream.v1.InMemoryBlobStoreConfigH\0R\x08inMemory\x122\n\x02s3\x18\x02\
+    \x20\x01(\x0b2\x20.blobstream.v1.S3BlobStoreConfigH\0R\x02s3B\t\n\x07bac\
+    kend\"\x1d\n\x1bInMemoryMetadataStoreConfig\"n\n\x19DynamoMetadataStoreC\
+    onfig\x12\x1d\n\ntable_name\x18\x01\x20\x01(\tR\ttableName\x12\x16\n\x06\
+    region\x18\x02\x20\x01(\tR\x06region\x12\x1a\n\x08endpoint\x18\x03\x20\
+    \x01(\tR\x08endpoint\"\xaf\x01\n\x13MetadataStoreConfig\x12I\n\tin_memor\
+    y\x18\x01\x20\x01(\x0b2*.blobstream.v1.InMemoryMetadataStoreConfigH\0R\
+    \x08inMemory\x12B\n\x06dynamo\x18\x02\x20\x01(\x0b2(.blobstream.v1.Dynam\
+    oMetadataStoreConfigH\0R\x06dynamoB\t\n\x07backend\"\x82\x02\n\rRuntimeC\
+    onfig\x123\n\x06broker\x18\x01\x20\x01(\x0b2\x1b.blobstream.v1.BrokerCon\
+    figR\x06broker\x122\n\x06topics\x18\x02\x20\x03(\x0b2\x1a.blobstream.v1.\
+    TopicConfigR\x06topics\x12=\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blob\
+    stream.v1.BlobStoreConfigR\tblobStore\x12I\n\x0emetadata_store\x18\x04\
+    \x20\x01(\x0b2\".blobstream.v1.MetadataStoreConfigR\rmetadataStoreb\x06p\
+    roto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -535,9 +1686,15 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
     file_descriptor.get(|| {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
             let mut deps = ::std::vec::Vec::with_capacity(0);
-            let mut messages = ::std::vec::Vec::with_capacity(3);
+            let mut messages = ::std::vec::Vec::with_capacity(9);
             messages.push(BrokerConfig::generated_message_descriptor_data());
             messages.push(TopicConfig::generated_message_descriptor_data());
+            messages.push(InMemoryBlobStoreConfig::generated_message_descriptor_data());
+            messages.push(S3BlobStoreConfig::generated_message_descriptor_data());
+            messages.push(BlobStoreConfig::generated_message_descriptor_data());
+            messages.push(InMemoryMetadataStoreConfig::generated_message_descriptor_data());
+            messages.push(DynamoMetadataStoreConfig::generated_message_descriptor_data());
+            messages.push(MetadataStoreConfig::generated_message_descriptor_data());
             messages.push(RuntimeConfig::generated_message_descriptor_data());
             let mut enums = ::std::vec::Vec::with_capacity(0);
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
