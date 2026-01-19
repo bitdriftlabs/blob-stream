@@ -14,12 +14,13 @@
 - Error handling: Use `anyhow` for general errors, `thiserror` for custom error types
 - Use `#[cfg(test)]` and separate test files with `_test.rs` suffix
 - Imports: Group imports with `One` style, module granularity, and `HorizontalVertical` layout
-- Use workspace dependencies from Cargo.toml where available
+- Use workspace dependencies from Cargo.toml in child crates
 - Edition: Rust 2024
 - Make sure to run `cargo +nightly fmt` after making changes to apply default formatting rules.
 - Use pattern matching with if-let and match expressions for error handling
 - When you write comments, flow them out to 100 columns for wrapping
 - Add separator comments above each struct to distinguish struct blocks and their impls
+- Add succinct comments for trait methods to document intent without restating signatures
 
 ## Documentation Guidelines
 - Avoid redundant documentation for the sake of convention. For example

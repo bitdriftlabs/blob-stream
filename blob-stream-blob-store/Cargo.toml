@@ -1,0 +1,24 @@
+[package]
+edition = "2024"
+name    = "blob-stream-blob-store"
+publish = false
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace      = true
+async-trait.workspace = true
+bytes.workspace       = true
+serde.workspace       = true
+tokio.workspace       = true
+
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+
+[features]
+s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
+
+[dev-dependencies]
+mockall.workspace = true

@@ -11,6 +11,8 @@ mod tests;
 
 use serde::{Deserialize, Serialize};
 
+pub use blob_stream_blob_store::ByteRange;
+
 pub type VirtualPartitionId = u32;
 
 //
@@ -87,28 +89,6 @@ pub struct BatchSummary {
   pub payload_bytes: u64,
   pub min_event_ts_ms: i64,
   pub max_event_ts_ms: i64,
-}
-
-//
-// ByteRange
-//
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ByteRange {
-  pub start: u64,
-  pub end: u64,
-}
-
-impl ByteRange {
-  #[must_use]
-  pub fn len(&self) -> u64 {
-    self.end.saturating_sub(self.start)
-  }
-
-  #[must_use]
-  pub fn is_empty(&self) -> bool {
-    self.end <= self.start
-  }
 }
 
 //

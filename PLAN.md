@@ -452,50 +452,60 @@ Proof of no loss:
   - [x] Define DynamoDB schema constants and key builders (topic/window, snowflake id).
   - [x] Add unit tests for serialization/deserialization and key building.
 
-- [ ] Milestone 2: Storage abstraction traits
-  - [ ] Define async trait for blob storage (put/get range/delete).
+- [x] Milestone 2: Blob storage (trait + implementation)
+  - [x] Define async trait for blob storage (put/get range/delete).
+  - [x] Implement in-memory blob storage for tests.
+  - [x] Implement blob storage using S3 (encapsulate S3 details inside the impl).
+  - [x] Add unit tests for blob storage trait behavior.
+
+- [ ] Milestone 3: Segment metadata store (trait + implementation)
   - [ ] Define async trait for metadata store (write segment metadata, scan windows).
-  - [ ] Define async trait for producer partition leases (acquire/heartbeat/reserve seq).
-  - [ ] Define async trait for consumer group leases (heartbeat/commit/assignment).
-  - [ ] Provide in-memory mock implementations for all traits with tests.
-
-- [ ] Milestone 3: S3 + DynamoDB implementations
-  - [ ] Implement blob storage using S3 (encapsulate S3 details inside the impl).
+  - [ ] Implement in-memory metadata store for tests.
   - [ ] Implement metadata store using DynamoDB (window scans, segment_index writes).
-  - [ ] Implement producer partition leases with Hi-Lo reservation (DynamoDB).
-  - [ ] Implement consumer group leases (DynamoDB).
-  - [ ] Add integration tests using local S3/Dynamo (docker compose acceptable).
+  - [ ] Add unit tests for metadata store scans and writes.
 
-- [ ] Milestone 4: Broker write path (trait-first)
+- [ ] Milestone 4: Producer partition leases (trait + implementation)
+  - [ ] Define async trait for producer partition leases (acquire/heartbeat/reserve seq).
+  - [ ] Implement in-memory lease store with Hi-Lo reservation semantics.
+  - [ ] Implement producer partition leases with Hi-Lo reservation (DynamoDB).
+  - [ ] Add unit tests for lease fencing and sequence reservation.
+
+- [ ] Milestone 5: Consumer group leases (trait + implementation)
+  - [ ] Define async trait for consumer group leases (heartbeat/commit/assignment).
+  - [ ] Implement in-memory consumer group leases.
+  - [ ] Implement consumer group leases (DynamoDB).
+  - [ ] Add unit tests for heartbeat, commit, and assignment updates.
+
+- [ ] Milestone 6: Broker write path (trait-first)
   - [ ] Define async trait for broker write engine (ingest -> buffer -> flush).
   - [ ] Implement in-memory buffering + rollover logic (size/time).
   - [ ] Integrate compression (zstd) and segment assembly.
   - [ ] Write unit tests for buffering, rollover, and seq assignment.
   - [ ] Implement broker gRPC handler using bd-grpc and the write trait.
 
-- [ ] Milestone 5: Consumer read path (trait-first)
+- [ ] Milestone 7: Consumer read path (trait-first)
   - [ ] Define async trait for consumer reader (scan -> fetch -> decode).
   - [ ] Implement window scan + byte-range fetch + decode pipeline.
   - [ ] Implement cursor tracking and re-scan window logic.
   - [ ] Write unit tests for cursor advancement and late metadata handling.
 
-- [ ] Milestone 6: Consumer group coordination
+- [ ] Milestone 8: Consumer group coordination
   - [ ] Implement cooperative sticky assignment logic.
   - [ ] Implement lease heartbeat + commit on heartbeat.
   - [ ] Implement rebalance flow with generation fencing.
   - [ ] Add tests for assignment stability and lease fencing behavior.
 
-- [ ] Milestone 7: Observability + logging
+- [ ] Milestone 9: Observability + logging
   - [ ] Add bd-stats metrics for broker/producer/consumer throughput and lag.
   - [ ] Add structured logging with debug/trace for hot paths.
   - [ ] Apply warn_every for noisy warnings.
 
-- [ ] Milestone 8: End-to-end integration
+- [ ] Milestone 10: End-to-end integration
   - [ ] Compose broker + producer + consumer in docker compose (local S3/Dynamo).
   - [ ] Verify autoscaling behaviors (simulated broker/consumer membership changes).
   - [ ] Validate duplicate handling and cursor monotonicity under retries.
 
-- [ ] Milestone 9: Load + cost validation
+- [ ] Milestone 11: Load + cost validation
   - [ ] Run throughput and latency tests under representative load.
   - [ ] Measure DynamoDB/S3 costs vs targets.
   - [ ] Adjust rollover/window/scan defaults based on cost/latency tradeoffs.
