@@ -469,11 +469,11 @@ Notes:
   - [x] Add unit tests for metadata store scans and writes.
   - [x] Add datastore config selection (in-memory/S3/Dynamo) to config protos.
 
-- [ ] Milestone 4: Producer partition leases (trait + implementation)
-  - [ ] Define async trait for producer partition leases (acquire/heartbeat/reserve seq).
-  - [ ] Implement in-memory lease store with Hi-Lo reservation semantics.
-  - [ ] Implement producer partition leases with Hi-Lo reservation (DynamoDB).
-  - [ ] Add unit tests for lease fencing and sequence reservation.
+- [x] Milestone 4: Producer partition leases (trait + implementation)
+  - [x] Define async trait for producer partition leases (acquire/heartbeat/reserve seq).
+  - [x] Implement in-memory lease store with Hi-Lo reservation semantics.
+  - [x] Implement producer partition leases with Hi-Lo reservation (DynamoDB).
+  - [x] Add unit tests for lease fencing and sequence reservation.
 
 - [ ] Milestone 5: Consumer group leases (trait + implementation)
   - [ ] Define async trait for consumer group leases (heartbeat/commit/assignment).
