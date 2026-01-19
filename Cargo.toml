@@ -1,5 +1,5 @@
 [workspace]
-members  = ["blob-stream-broker", "blob-stream-proto"]
+members  = ["blob-stream-broker", "blob-stream-proto", "blob-stream-types"]
 resolver = "2"
 
 [workspace.dependencies]

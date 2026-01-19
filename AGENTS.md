@@ -19,6 +19,7 @@
 - Make sure to run `cargo +nightly fmt` after making changes to apply default formatting rules.
 - Use pattern matching with if-let and match expressions for error handling
 - When you write comments, flow them out to 100 columns for wrapping
+- Add separator comments above each struct to distinguish struct blocks and their impls
 
 ## Documentation Guidelines
 - Avoid redundant documentation for the sake of convention. For example

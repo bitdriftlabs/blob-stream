@@ -446,11 +446,11 @@ Proof of no loss:
   - [x] Define configuration protos (topic config, runtime config) and implement
         YAML/JSON decoding into proto types via a well-defined decoder.
 
-- [ ] Milestone 1: Core data model + shared types
-  - [ ] Define record/batch types (record format, batch metadata, compression metadata).
-  - [ ] Define cursor types (seq_start/seq_end, committed_cursor).
-  - [ ] Define DynamoDB schema constants and key builders (topic/window, snowflake id).
-  - [ ] Add unit tests for serialization/deserialization and key building.
+- [x] Milestone 1: Core data model + shared types
+  - [x] Define record/batch types (record format, batch metadata, compression metadata).
+  - [x] Define cursor types (seq_start/seq_end, committed_cursor).
+  - [x] Define DynamoDB schema constants and key builders (topic/window, snowflake id).
+  - [x] Add unit tests for serialization/deserialization and key building.
 
 - [ ] Milestone 2: Storage abstraction traits
   - [ ] Define async trait for blob storage (put/get range/delete).
