@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use blob_stream_blob_store::BlobKey;
 use blob_stream_types::{
   BatchMetadata,
+  CommittedCursor,
   Compression,
   SeqRange,
   SnowflakeId,
@@ -22,11 +23,15 @@ use blob_stream_types::{
 };
 use std::collections::HashMap;
 
+mod consumer_group_leases_dynamo;
+mod consumer_group_leases_memory;
 mod dynamo;
 mod memory;
 mod producer_partition_leases_dynamo;
 mod producer_partition_leases_memory;
 
+pub use consumer_group_leases_dynamo::DynamoConsumerGroupLeaseStore;
+pub use consumer_group_leases_memory::InMemoryConsumerGroupLeaseStore;
 pub use dynamo::DynamoMetadataStore;
 pub use memory::InMemoryMetadataStore;
 pub use producer_partition_leases_dynamo::DynamoProducerPartitionLeaseStore;
@@ -218,4 +223,113 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     lease_duration_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome>;
+}
+
+//
+// ConsumerGroupLeaseKey
+//
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ConsumerGroupLeaseKey {
+  pub topic: String,
+  pub group_id: String,
+  pub virtual_partition_id: VirtualPartitionId,
+}
+
+impl ConsumerGroupLeaseKey {
+  #[must_use]
+  pub fn partition_key(&self) -> String {
+    format!("{}#{}", self.topic, self.group_id)
+  }
+
+  #[must_use]
+  pub fn sort_key(&self) -> String {
+    self.virtual_partition_id.to_string()
+  }
+}
+
+//
+// ConsumerGroupLease
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerGroupLease {
+  pub key: ConsumerGroupLeaseKey,
+  pub owner_id: String,
+  pub generation: u64,
+  pub lease_expiration_ts_ms: i64,
+  pub last_heartbeat_ts_ms: i64,
+  pub committed_cursor: Option<CommittedCursor>,
+  pub committed_ts_ms: Option<i64>,
+}
+
+//
+// ConsumerGroupAssignmentOutcome
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConsumerGroupAssignmentOutcome {
+  Assigned(ConsumerGroupLease),
+  HeldByOther(ConsumerGroupLease),
+}
+
+//
+// ConsumerGroupHeartbeatOutcome
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConsumerGroupHeartbeatOutcome {
+  Renewed(ConsumerGroupLease),
+  HeldByOther(ConsumerGroupLease),
+  Expired,
+}
+
+//
+// ConsumerGroupCommitOutcome
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConsumerGroupCommitOutcome {
+  Committed(ConsumerGroupLease),
+  HeldByOther(ConsumerGroupLease),
+  Expired,
+}
+
+//
+// ConsumerGroupLeaseStore
+//
+
+#[cfg_attr(test, mockall::automock)]
+#[async_trait]
+pub trait ConsumerGroupLeaseStore: Send + Sync {
+  /// Assign ownership of a virtual partition lease.
+  async fn assign_partition(
+    &self,
+    key: ConsumerGroupLeaseKey,
+    owner_id: String,
+    generation: u64,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+  ) -> Result<ConsumerGroupAssignmentOutcome>;
+
+  /// Heartbeat a partition lease and optionally commit a cursor.
+  async fn heartbeat_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+    committed_cursor: Option<CommittedCursor>,
+  ) -> Result<ConsumerGroupHeartbeatOutcome>;
+
+  /// Commit a cursor for a partition lease.
+  async fn commit_cursor(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+    committed_cursor: CommittedCursor,
+  ) -> Result<ConsumerGroupCommitOutcome>;
 }

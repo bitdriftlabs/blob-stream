@@ -475,11 +475,11 @@ Notes:
   - [x] Implement producer partition leases with Hi-Lo reservation (DynamoDB).
   - [x] Add unit tests for lease fencing and sequence reservation.
 
-- [ ] Milestone 5: Consumer group leases (trait + implementation)
-  - [ ] Define async trait for consumer group leases (heartbeat/commit/assignment).
-  - [ ] Implement in-memory consumer group leases.
-  - [ ] Implement consumer group leases (DynamoDB).
-  - [ ] Add unit tests for heartbeat, commit, and assignment updates.
+- [x] Milestone 5: Consumer group leases (trait + implementation)
+  - [x] Define async trait for consumer group leases (heartbeat/commit/assignment).
+  - [x] Implement in-memory consumer group leases.
+  - [x] Implement consumer group leases (DynamoDB).
+  - [x] Add unit tests for heartbeat, commit, and assignment updates.
 
 - [ ] Milestone 6: Broker write path (trait-first)
   - [ ] Define async trait for broker write engine (ingest -> buffer -> flush).
@@ -488,29 +488,42 @@ Notes:
   - [ ] Write unit tests for buffering, rollover, and seq assignment.
   - [ ] Implement broker gRPC handler using bd-grpc and the write trait.
 
-- [ ] Milestone 7: Consumer read path (trait-first)
+- [ ] Milestone 7: Producer library (trait-first)
+  - [ ] Define async trait for producer client (hash -> batch -> send -> retry).
+  - [ ] Implement broker discovery + routing (consistent hashing).
+  - [ ] Implement batching per virtual partition with flush-by-size/time.
+  - [ ] Implement retry/backoff policy with broker error mapping.
+  - [ ] Implement optional compression config for producer batches.
+  - [ ] Write unit tests for routing, retries, and ack handling.
+
+- [ ] Milestone 8: Producer config + observability
+  - [ ] Define producer config schema + YAML/JSON decode.
+  - [ ] Add bd-stats metrics for throughput, retries, and latency.
+  - [ ] Add structured logging around retries and broker refresh.
+
+- [ ] Milestone 9: Consumer read path (trait-first)
   - [ ] Define async trait for consumer reader (scan -> fetch -> decode).
   - [ ] Implement window scan + byte-range fetch + decode pipeline.
   - [ ] Implement cursor tracking and re-scan window logic.
   - [ ] Write unit tests for cursor advancement and late metadata handling.
 
-- [ ] Milestone 8: Consumer group coordination
+- [ ] Milestone 10: Consumer group coordination
   - [ ] Implement cooperative sticky assignment logic.
   - [ ] Implement lease heartbeat + commit on heartbeat.
   - [ ] Implement rebalance flow with generation fencing.
   - [ ] Add tests for assignment stability and lease fencing behavior.
 
-- [ ] Milestone 9: Observability + logging
+- [ ] Milestone 11: Observability + logging
   - [ ] Add bd-stats metrics for broker/producer/consumer throughput and lag.
   - [ ] Add structured logging with debug/trace for hot paths.
   - [ ] Apply warn_every for noisy warnings.
 
-- [ ] Milestone 10: End-to-end integration
+- [ ] Milestone 12: End-to-end integration
   - [ ] Compose broker + producer + consumer in docker compose (local S3/Dynamo).
   - [ ] Verify autoscaling behaviors (simulated broker/consumer membership changes).
   - [ ] Validate duplicate handling and cursor monotonicity under retries.
 
-- [ ] Milestone 11: Load + cost validation
+- [ ] Milestone 13: Load + cost validation
   - [ ] Run throughput and latency tests under representative load.
   - [ ] Measure DynamoDB/S3 costs vs targets.
   - [ ] Adjust rollover/window/scan defaults based on cost/latency tradeoffs.

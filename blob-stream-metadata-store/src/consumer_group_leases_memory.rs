@@ -1,0 +1,226 @@
+// blob-stream - in-memory consumer group leases
+// Copyright Bitdrift, Inc. All rights reserved.
+//
+// Use of this source code is governed by a source available license that can be found in the
+// LICENSE file or at:
+// https://polyformproject.org/wp-content/uploads/2020/06/PolyForm-Shield-1.0.0.txt
+
+#[cfg(test)]
+#[path = "./consumer_group_leases_memory_test.rs"]
+mod tests;
+
+use crate::{
+  ConsumerGroupAssignmentOutcome,
+  ConsumerGroupCommitOutcome,
+  ConsumerGroupHeartbeatOutcome,
+  ConsumerGroupLease,
+  ConsumerGroupLeaseKey,
+  ConsumerGroupLeaseStore,
+};
+use anyhow::{Result, anyhow};
+use async_trait::async_trait;
+use blob_stream_types::CommittedCursor;
+use std::collections::HashMap;
+use tokio::sync::RwLock;
+
+//
+// InMemoryConsumerGroupLeaseStore
+//
+
+#[derive(Debug, Default)]
+pub struct InMemoryConsumerGroupLeaseStore {
+  leases: RwLock<HashMap<ConsumerGroupLeaseKey, LeaseState>>,
+}
+
+impl InMemoryConsumerGroupLeaseStore {
+  #[must_use]
+  pub fn new() -> Self {
+    Self::default()
+  }
+}
+
+#[async_trait]
+impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
+  async fn assign_partition(
+    &self,
+    key: ConsumerGroupLeaseKey,
+    owner_id: String,
+    generation: u64,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+  ) -> Result<ConsumerGroupAssignmentOutcome> {
+    let mut guard = self.leases.write().await;
+    let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
+
+    match guard.get_mut(&key) {
+      None => {
+        let lease = LeaseState {
+          owner_id,
+          generation,
+          lease_expiration_ts_ms: expires_at,
+          last_heartbeat_ts_ms: now_ts_ms,
+          committed_cursor: None,
+          committed_ts_ms: None,
+        };
+        guard.insert(key.clone(), lease.clone());
+        Ok(ConsumerGroupAssignmentOutcome::Assigned(
+          lease.to_lease(key),
+        ))
+      },
+      Some(state) => {
+        if state.is_expired(now_ts_ms) {
+          state.owner_id = owner_id;
+          state.generation = generation;
+          state.lease_expiration_ts_ms = expires_at;
+          state.last_heartbeat_ts_ms = now_ts_ms;
+          return Ok(ConsumerGroupAssignmentOutcome::Assigned(
+            state.to_lease(key),
+          ));
+        }
+
+        if state.owner_id == owner_id {
+          if generation < state.generation {
+            return Ok(ConsumerGroupAssignmentOutcome::HeldByOther(
+              state.to_lease(key),
+            ));
+          }
+
+          state.generation = generation;
+          state.lease_expiration_ts_ms = expires_at;
+          state.last_heartbeat_ts_ms = now_ts_ms;
+          return Ok(ConsumerGroupAssignmentOutcome::Assigned(
+            state.to_lease(key),
+          ));
+        }
+
+        Ok(ConsumerGroupAssignmentOutcome::HeldByOther(
+          state.to_lease(key),
+        ))
+      },
+    }
+  }
+
+  async fn heartbeat_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+    committed_cursor: Option<CommittedCursor>,
+  ) -> Result<ConsumerGroupHeartbeatOutcome> {
+    if let Some(cursor) = committed_cursor.as_ref() {
+      validate_cursor(key, cursor)?;
+    }
+
+    let mut guard = self.leases.write().await;
+    let Some(state) = guard.get_mut(key) else {
+      return Ok(ConsumerGroupHeartbeatOutcome::Expired);
+    };
+
+    if state.is_expired(now_ts_ms) {
+      return Ok(ConsumerGroupHeartbeatOutcome::Expired);
+    }
+
+    if state.owner_id != owner_id || state.generation != generation {
+      return Ok(ConsumerGroupHeartbeatOutcome::HeldByOther(
+        state.to_lease(key.clone()),
+      ));
+    }
+
+    state.lease_expiration_ts_ms = expires_at(now_ts_ms, lease_duration_ms)?;
+    state.last_heartbeat_ts_ms = now_ts_ms;
+
+    if let Some(cursor) = committed_cursor {
+      state.committed_cursor = Some(cursor);
+      state.committed_ts_ms = Some(now_ts_ms);
+    }
+
+    Ok(ConsumerGroupHeartbeatOutcome::Renewed(
+      state.to_lease(key.clone()),
+    ))
+  }
+
+  async fn commit_cursor(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+    committed_cursor: CommittedCursor,
+  ) -> Result<ConsumerGroupCommitOutcome> {
+    validate_cursor(key, &committed_cursor)?;
+
+    let mut guard = self.leases.write().await;
+    let Some(state) = guard.get_mut(key) else {
+      return Ok(ConsumerGroupCommitOutcome::Expired);
+    };
+
+    if state.is_expired(now_ts_ms) {
+      return Ok(ConsumerGroupCommitOutcome::Expired);
+    }
+
+    if state.owner_id != owner_id || state.generation != generation {
+      return Ok(ConsumerGroupCommitOutcome::HeldByOther(
+        state.to_lease(key.clone()),
+      ));
+    }
+
+    state.committed_cursor = Some(committed_cursor);
+    state.committed_ts_ms = Some(now_ts_ms);
+
+    Ok(ConsumerGroupCommitOutcome::Committed(
+      state.to_lease(key.clone()),
+    ))
+  }
+}
+
+//
+// LeaseState
+//
+
+#[derive(Clone, Debug)]
+struct LeaseState {
+  owner_id: String,
+  generation: u64,
+  lease_expiration_ts_ms: i64,
+  last_heartbeat_ts_ms: i64,
+  committed_cursor: Option<CommittedCursor>,
+  committed_ts_ms: Option<i64>,
+}
+
+impl LeaseState {
+  fn is_expired(&self, now_ts_ms: i64) -> bool {
+    now_ts_ms >= self.lease_expiration_ts_ms
+  }
+
+  fn to_lease(&self, key: ConsumerGroupLeaseKey) -> ConsumerGroupLease {
+    ConsumerGroupLease {
+      key,
+      owner_id: self.owner_id.clone(),
+      generation: self.generation,
+      lease_expiration_ts_ms: self.lease_expiration_ts_ms,
+      last_heartbeat_ts_ms: self.last_heartbeat_ts_ms,
+      committed_cursor: self.committed_cursor.clone(),
+      committed_ts_ms: self.committed_ts_ms,
+    }
+  }
+}
+
+fn validate_cursor(key: &ConsumerGroupLeaseKey, cursor: &CommittedCursor) -> Result<()> {
+  if key.virtual_partition_id != cursor.virtual_partition_id {
+    return Err(anyhow!(
+      "committed cursor partition mismatch: {} != {}",
+      key.virtual_partition_id,
+      cursor.virtual_partition_id
+    ));
+  }
+
+  Ok(())
+}
+
+fn expires_at(now_ts_ms: i64, lease_duration_ms: i64) -> Result<i64> {
+  now_ts_ms
+    .checked_add(lease_duration_ms)
+    .ok_or_else(|| anyhow!("lease expiration overflow"))
+}

@@ -143,9 +143,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
         Ok(LeaseAcquireOutcome::Acquired(lease))
       },
       Err(SdkError::ServiceError(service_error))
-        if service_error
-          .err()
-          .is_conditional_check_failed_exception() =>
+        if service_error.err().is_conditional_check_failed_exception() =>
       {
         let lease = self
           .get_lease(&key)
@@ -201,9 +199,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
         Ok(LeaseHeartbeatOutcome::Renewed(lease))
       },
       Err(SdkError::ServiceError(service_error))
-        if service_error
-          .err()
-          .is_conditional_check_failed_exception() =>
+        if service_error.err().is_conditional_check_failed_exception() =>
       {
         let Some(lease) = self.get_lease(key).await? else {
           return Ok(LeaseHeartbeatOutcome::Expired);
@@ -279,9 +275,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
         }))
       },
       Err(SdkError::ServiceError(service_error))
-        if service_error
-          .err()
-          .is_conditional_check_failed_exception() =>
+        if service_error.err().is_conditional_check_failed_exception() =>
       {
         let Some(lease) = self.get_lease(key).await? else {
           return Ok(SequenceReservationOutcome::Expired);
