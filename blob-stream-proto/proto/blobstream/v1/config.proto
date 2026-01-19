@@ -17,6 +17,54 @@ message BrokerConfig {
   uint32 flush_max_delay_ms = 2;
   // Address to bind the broker listener (e.g. "0.0.0.0:8080").
   string bind_addr = 3;
+  // Node identity config used for lease holder ids.
+  BrokerNodeIdentityConfig node_identity = 4;
+  // Broker discovery config used to watch membership changes.
+  BrokerDiscoveryConfig discovery = 5;
+}
+
+// Node identity selection for brokers.
+message BrokerNodeIdentityConfig {
+  oneof source {
+    // Explicit node identifier override.
+    string static_id = 1;
+    // Use the runtime hostname as the node identifier.
+    BrokerHostnameIdentity hostname = 2;
+  }
+}
+
+// Hostname-based broker identity.
+message BrokerHostnameIdentity {}
+
+// Broker discovery configuration.
+message BrokerDiscoveryConfig {
+  oneof backend {
+    // Static broker topology.
+    StaticBrokerDiscoveryConfig static = 1;
+    // Discover brokers via Kubernetes service endpoints.
+    K8sServiceBrokerDiscoveryConfig k8s_service = 2;
+  }
+}
+
+// Static broker discovery configuration.
+message StaticBrokerDiscoveryConfig {
+  repeated BrokerNode nodes = 1;
+}
+
+// Broker node descriptor.
+message BrokerNode {
+  // Unique node identifier.
+  string node_id = 1;
+  // Broker address (e.g. "10.0.0.1:8080").
+  string address = 2;
+}
+
+// Kubernetes service discovery configuration.
+message K8sServiceBrokerDiscoveryConfig {
+  // Namespace containing the broker service.
+  string namespace = 1;
+  // Service name for the broker endpoints.
+  string service_name = 2;
 }
 
 // Per-topic configuration describing partitioning and retention.

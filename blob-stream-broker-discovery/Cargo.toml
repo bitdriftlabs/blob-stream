@@ -1,0 +1,23 @@
+[package]
+edition = "2024"
+name    = "blob-stream-broker-discovery"
+publish = false
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace       = true
+async-trait.workspace  = true
+bd-log.workspace       = true
+futures.workspace      = true
+k8s-openapi.workspace  = true
+kube.workspace         = true
+log.workspace          = true
+time.workspace         = true
+tokio.workspace        = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+mockall.workspace = true

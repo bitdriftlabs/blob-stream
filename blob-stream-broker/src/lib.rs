@@ -7,5 +7,4 @@
 
 pub mod config;
 pub mod grpc;
-
-pub use blob_stream_proto::protos;
+pub mod write;

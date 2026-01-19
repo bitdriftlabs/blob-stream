@@ -127,6 +127,38 @@
 - Brokers do not own partitions durably; they only acquire short-lived leases for
   virtual partitions to prevent split-writes during routing changes.
 
+### Broker lease acquisition (virtual partitions)
+#### Goal
+- Ensure every virtual partition has a single broker actively holding the lease in steady state.
+- Use the same consistent hashing model as producers so brokers self-assign without a central
+  coordinator, while still allowing reassignment during scale events.
+
+#### Mechanism (self-assignment)
+- Brokers derive a stable `broker_id` (e.g., UUID or pod UID) and a broker discovery list from the
+  same source as producers (K8s service/DNS or a discovery registry).
+- Brokers compute ownership for every virtual partition using the same consistent hash ring as
+  producers: `owner = hash(topic, virtual_partition_id) -> broker_id`.
+- Each broker attempts to acquire leases only for the virtual partitions it owns per the hash
+  ring. Lease rows live in `producer_partition_leases` and are fenced by holder_id + expiration.
+- Lease acquisition is performed in the background with periodic heartbeats and retries. Brokers
+  relinquish (stop heartbeating) partitions they no longer own after membership changes.
+
+#### Bootstrap and convergence
+- On startup, brokers load the topic list and compute the set of virtual partitions.
+- For each partition owned by the hash ring, broker acquires lease and reserves seq blocks (Hi-Lo)
+  as needed. Ownership stabilizes once all brokers converge on the same membership view.
+
+#### Membership changes
+- When the broker list changes, brokers recompute ownership and shift leases accordingly.
+- Any stale broker that still receives batches will reject writes if it no longer holds the lease.
+- Producers and brokers share the ring to minimize lease thrash and avoid prolonged split-writes.
+
+#### Consistency considerations
+- Brokers should apply jittered backoff when failing to acquire a lease held by another broker.
+- Use `warn_every` for repeated lease conflicts.
+- If discovery is temporarily stale, leases prevent concurrent writers; producers retry on
+  `NOT_LEASE_HOLDER`.
+
 ### Virtual partitions (multi-cluster safe)
 - Goal: keep single-writer semantics per virtual partition while allowing many
   producer clusters/brokers to write to the same topic.
@@ -442,24 +474,50 @@ Notes:
   pairs, similar to Kafka's idempotent producer, but this adds significant complexity.
 
 ## Milestones
+### Tracking snapshot (verified 2026-02-28)
+- Verification commands:
+  - `cargo build --workspace`
+  - `cargo test -p blob-stream write::tests`
+- Status summary:
+  - Completed and source-verified: Milestones 0-6
+  - In progress: Milestone 7+
+
 - [x] Milestone 0: Repo scaffolding + proto baseline
   - [x] Define proto files in this repo following shared-core/bd-proto patterns.
   - [x] Commit generated code for Rust (and any other planned languages).
   - [x] Add minimal gRPC service wiring using shared-core/bd-grpc.
   - [x] Define configuration protos (topic config, runtime config) and implement
         YAML/JSON decoding into proto types via a well-defined decoder.
+  - Source map:
+    - `blob-stream-proto/proto/blobstream/v1/broker.proto`
+    - `blob-stream-proto/proto/blobstream/v1/config.proto`
+    - `blob-stream-proto/build.rs`
+    - `blob-stream-proto/src/protos/blobstream/v1/broker.rs` (generated)
+    - `blob-stream-proto/src/protos/blobstream/v1/config.rs` (generated)
+    - `blob-stream-broker/src/grpc.rs`
+    - `blob-stream-broker/src/config.rs`
 
 - [x] Milestone 1: Core data model + shared types
   - [x] Define record/batch types (record format, batch metadata, compression metadata).
   - [x] Define cursor types (seq_start/seq_end, committed_cursor).
   - [x] Define DynamoDB schema constants and key builders (topic/window, snowflake id).
   - [x] Add unit tests for serialization/deserialization and key building.
+  - Source map:
+    - `blob-stream-types/src/lib.rs`
+    - `blob-stream-types/src/types_test.rs`
+    - `blob-stream-metadata-store/src/lib.rs` (`SegmentMetadata::partition_key`, `snowflake_key`)
 
 - [x] Milestone 2: Blob storage (trait + implementation)
   - [x] Define async trait for blob storage (put/get range/delete).
   - [x] Implement in-memory blob storage for tests.
   - [x] Implement blob storage using S3 (encapsulate S3 details inside the impl).
   - [x] Add unit tests for blob storage trait behavior.
+  - Source map:
+    - `blob-stream-blob-store/src/lib.rs`
+    - `blob-stream-blob-store/src/memory.rs`
+    - `blob-stream-blob-store/src/s3.rs`
+    - `blob-stream-blob-store/src/memory_test.rs`
+    - `blob-stream-blob-store/src/blob_store_test.rs`
 
 - [x] Milestone 3: Segment metadata store (trait + implementation)
   - [x] Define async trait for metadata store (write segment metadata, scan windows).
@@ -468,29 +526,60 @@ Notes:
   - [x] Implement metadata store using DynamoDB (window scans, segment_index writes).
   - [x] Add unit tests for metadata store scans and writes.
   - [x] Add datastore config selection (in-memory/S3/Dynamo) to config protos.
+  - Source map:
+    - `blob-stream-metadata-store/src/lib.rs` (`MetadataStore`)
+    - `blob-stream-metadata-store/src/memory.rs`
+    - `blob-stream-metadata-store/src/dynamo.rs`
+    - `blob-stream-metadata-store/src/memory_test.rs`
+    - `blob-stream-metadata-store/src/metadata_store_test.rs`
+    - `blob-stream-proto/proto/blobstream/v1/config.proto`
+    - `blob-stream-broker/src/write/config.rs` (`build_blob_store`, `build_metadata_store`)
 
 - [x] Milestone 4: Producer partition leases (trait + implementation)
   - [x] Define async trait for producer partition leases (acquire/heartbeat/reserve seq).
   - [x] Implement in-memory lease store with Hi-Lo reservation semantics.
   - [x] Implement producer partition leases with Hi-Lo reservation (DynamoDB).
   - [x] Add unit tests for lease fencing and sequence reservation.
+  - Source map:
+    - `blob-stream-metadata-store/src/lib.rs` (`ProducerPartitionLeaseStore`)
+    - `blob-stream-metadata-store/src/producer_partition_leases_memory.rs`
+    - `blob-stream-metadata-store/src/producer_partition_leases_dynamo.rs`
+    - `blob-stream-metadata-store/src/producer_partition_leases_memory_test.rs`
+    - `blob-stream-metadata-store/src/producer_partition_leases_dynamo_test.rs`
 
 - [x] Milestone 5: Consumer group leases (trait + implementation)
   - [x] Define async trait for consumer group leases (heartbeat/commit/assignment).
   - [x] Implement in-memory consumer group leases.
   - [x] Implement consumer group leases (DynamoDB).
   - [x] Add unit tests for heartbeat, commit, and assignment updates.
+  - Source map:
+    - `blob-stream-metadata-store/src/lib.rs` (`ConsumerGroupLeaseStore`)
+    - `blob-stream-metadata-store/src/consumer_group_leases_memory.rs`
+    - `blob-stream-metadata-store/src/consumer_group_leases_dynamo.rs`
+    - `blob-stream-metadata-store/src/consumer_group_leases_memory_test.rs`
+    - `blob-stream-metadata-store/src/consumer_group_leases_dynamo_test.rs`
 
-- [ ] Milestone 6: Broker write path (trait-first)
-  - [ ] Define async trait for broker write engine (ingest -> buffer -> flush).
-  - [ ] Implement in-memory buffering + rollover logic (size/time).
-  - [ ] Integrate compression (zstd) and segment assembly.
-  - [ ] Write unit tests for buffering, rollover, and seq assignment.
-  - [ ] Implement broker gRPC handler using bd-grpc and the write trait.
+- [x] Milestone 6: Broker write path + lease self-assignment (trait-first)
+  - [x] Define async trait for broker write engine (ingest -> buffer -> flush).
+  - [x] Implement in-memory buffering + rollover logic (size/time).
+  - [x] Integrate compression (zstd) and segment assembly.
+  - [x] Implement broker lease self-assignment loop using consistent hashing + discovery list.
+  - [x] Add background lease heartbeat + reservation logic for owned virtual partitions.
+  - [x] Write unit tests for buffering, rollover, seq assignment, and lease ownership changes.
+  - [x] Implement broker gRPC handler using bd-grpc and the write trait.
+  - Source map:
+    - `blob-stream-broker/src/write/mod.rs` (`WriteEngine`, buffering, seq allocation, self-assignment loop)
+    - `blob-stream-broker/src/write/flush.rs` (segment assembly + zstd compression)
+    - `blob-stream-broker/src/write/config.rs` (engine wiring, discovery wiring, lease store wiring)
+    - `blob-stream-broker/src/write/write_test.rs`
+    - `blob-stream-broker/src/grpc.rs`
+    - `blob-stream-broker-discovery/src/lib.rs`
+    - `blob-stream-broker-discovery/src/static.rs`
+    - `blob-stream-broker-discovery/src/k8s.rs`
 
 - [ ] Milestone 7: Producer library (trait-first)
   - [ ] Define async trait for producer client (hash -> batch -> send -> retry).
-  - [ ] Implement broker discovery + routing (consistent hashing).
+  - [ ] Implement broker discovery + routing (consistent hashing shared with broker leasing).
   - [ ] Implement batching per virtual partition with flush-by-size/time.
   - [ ] Implement retry/backoff policy with broker error mapping.
   - [ ] Implement optional compression config for producer batches.

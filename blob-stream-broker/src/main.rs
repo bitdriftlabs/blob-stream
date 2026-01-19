@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use blob_stream::config::load_runtime_config;
 use blob_stream::grpc::make_broker_router;
+use blob_stream::write::build_write_engine;
 use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -29,7 +30,8 @@ async fn main() -> Result<()> {
   let addr: SocketAddr = bind_addr
     .parse()
     .with_context(|| format!("invalid broker.bind_addr: {bind_addr}"))?;
+  let write_engine = build_write_engine(&config).await?;
   let listener = tokio::net::TcpListener::bind(addr).await?;
-  axum::serve(listener, make_broker_router()).await?;
+  axum::serve(listener, make_broker_router(write_engine)).await?;
   Ok(())
 }

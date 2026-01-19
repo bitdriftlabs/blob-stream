@@ -48,8 +48,3 @@ pub fn load_runtime_config(path: &Path) -> Result<RuntimeConfig> {
     .with_context(|| format!("failed to read runtime config from {}", path.display()))?;
   decode_runtime_config_str(&contents, format)
 }
-
-pub fn decode_runtime_config_bytes(input: &[u8], format: ConfigFormat) -> Result<RuntimeConfig> {
-  let as_str = std::str::from_utf8(input).context("config is not valid UTF-8")?;
-  decode_runtime_config_str(as_str, format)
-}
