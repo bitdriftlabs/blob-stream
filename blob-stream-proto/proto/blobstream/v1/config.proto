@@ -134,3 +134,47 @@ message RuntimeConfig {
   // Metadata storage configuration for segment indexes.
   MetadataStoreConfig metadata_store = 4;
 }
+
+// Producer-side compression for gRPC requests.
+enum ProducerCompression {
+  PRODUCER_COMPRESSION_NONE = 0;
+  PRODUCER_COMPRESSION_SNAPPY = 1;
+}
+
+// Producer client settings.
+message ProducerConfig {
+  // Writer id in range [0, num_writers) for each configured topic.
+  optional uint32 writer_id = 1;
+  // Maximum records in a producer-side batch.
+  optional uint32 max_batch_records = 2;
+  // Maximum uncompressed payload bytes in a producer-side batch.
+  optional uint32 max_batch_bytes = 3;
+  // Maximum delay before time-based flush.
+  optional uint64 flush_max_delay_ms = 4;
+  // Maximum retry attempts for transient produce failures.
+  optional uint32 max_retries = 5;
+  // Exponential backoff base delay.
+  optional uint64 retry_base_delay_ms = 6;
+  // Exponential backoff max delay.
+  optional uint64 retry_max_delay_ms = 7;
+  // gRPC connect timeout.
+  optional int64 connect_timeout_ms = 8;
+  // gRPC request timeout.
+  optional int64 request_timeout_ms = 9;
+  // Maximum in-flight request concurrency.
+  optional uint64 max_request_concurrency = 10;
+  // Request compression strategy.
+  optional ProducerCompression compression = 11;
+}
+
+// Runtime configuration for producer clients.
+message ProducerRuntimeConfig {
+  // Producer behavior/tuning parameters.
+  ProducerConfig producer = 1;
+  // Broker discovery backend (static or k8s service).
+  BrokerDiscoveryConfig discovery = 2;
+  // Topic definitions used by producer routing and validation.
+  repeated TopicConfig topics = 3;
+  // Optional stats scope prefix.
+  string stats_scope = 4;
+}

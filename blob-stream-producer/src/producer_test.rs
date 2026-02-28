@@ -10,14 +10,13 @@
 use super::{
   ProducerClient,
   ProducerClientImpl,
-  ProducerCompression,
-  ProducerConfig,
   ProducerError,
   ProducerRecord,
-  ProducerTopicConfig,
   compute_virtual_partition_id,
   retry_delay_ms,
 };
+use crate::config::{producer_config_with_defaults, producer_writer_id};
+use crate::{ProducerCompression, ProducerConfig, ProducerTopicConfig};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode, owner_for_partition};
@@ -89,26 +88,28 @@ impl super::BrokerTransport for FakeBrokerTransport {
 
 fn topic_config() -> ProducerTopicConfig {
   ProducerTopicConfig {
-    name: "telemetry".to_string(),
+    name: "telemetry".into(),
     partition_count: 16,
     num_writers: 2,
+    retention_days: 0,
+    ..Default::default()
   }
 }
 
 fn default_config() -> ProducerConfig {
-  ProducerConfig {
-    writer_id: 1,
-    max_batch_records: 1,
-    max_batch_bytes: 1_024,
-    flush_max_delay_ms: 1_000,
-    max_retries: 4,
-    retry_base_delay_ms: 1,
-    retry_max_delay_ms: 8,
-    connect_timeout_ms: 1_000,
-    request_timeout_ms: 1_000,
-    max_request_concurrency: 16,
-    compression: ProducerCompression::Snappy,
-  }
+  let mut config = producer_config_with_defaults();
+  config.writer_id = Some(1);
+  config.max_batch_records = Some(1);
+  config.max_batch_bytes = Some(1_024);
+  config.flush_max_delay_ms = Some(1_000);
+  config.max_retries = Some(4);
+  config.retry_base_delay_ms = Some(1);
+  config.retry_max_delay_ms = Some(8);
+  config.connect_timeout_ms = Some(1_000);
+  config.request_timeout_ms = Some(1_000);
+  config.max_request_concurrency = Some(16);
+  config.compression = Some(ProducerCompression::PRODUCER_COMPRESSION_SNAPPY.into());
+  config
 }
 
 fn membership() -> BrokerMembership {
@@ -149,7 +150,7 @@ async fn routes_to_expected_broker() {
     .await
     .unwrap();
 
-  let expected_partition = compute_virtual_partition_id(&key, 16, config.writer_id);
+  let expected_partition = compute_virtual_partition_id(&key, 16, producer_writer_id(&config));
   assert_eq!(ack.virtual_partition_id, expected_partition);
   let discovered_membership = membership();
   let expected_owner =
@@ -214,8 +215,8 @@ async fn retries_transient_status_until_success() {
 #[tokio::test]
 async fn batches_by_partition_and_acks_waiters() {
   let mut config = default_config();
-  config.max_batch_records = 2;
-  config.flush_max_delay_ms = 10_000;
+  config.max_batch_records = Some(2);
+  config.flush_max_delay_ms = Some(10_000);
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
   let transport = Arc::new(FakeBrokerTransport::default());
@@ -270,7 +271,7 @@ async fn batches_by_partition_and_acks_waiters() {
 #[tokio::test]
 async fn surfaces_retry_exhaustion_for_transport_errors() {
   let mut config = default_config();
-  config.max_retries = 2;
+  config.max_retries = Some(2);
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
   let transport = Arc::new(FakeBrokerTransport::default());

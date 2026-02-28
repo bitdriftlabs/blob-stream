@@ -2739,6 +2739,549 @@ impl ::protobuf::reflect::ProtobufValue for RuntimeConfig {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
+// @@protoc_insertion_point(message:blobstream.v1.ProducerConfig)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct ProducerConfig {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.writer_id)
+    pub writer_id: ::std::option::Option<u32>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.max_batch_records)
+    pub max_batch_records: ::std::option::Option<u32>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.max_batch_bytes)
+    pub max_batch_bytes: ::std::option::Option<u32>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.flush_max_delay_ms)
+    pub flush_max_delay_ms: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.max_retries)
+    pub max_retries: ::std::option::Option<u32>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.retry_base_delay_ms)
+    pub retry_base_delay_ms: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.retry_max_delay_ms)
+    pub retry_max_delay_ms: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.connect_timeout_ms)
+    pub connect_timeout_ms: ::std::option::Option<i64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.request_timeout_ms)
+    pub request_timeout_ms: ::std::option::Option<i64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.max_request_concurrency)
+    pub max_request_concurrency: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.compression)
+    pub compression: ::std::option::Option<::protobuf::EnumOrUnknown<ProducerCompression>>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.ProducerConfig.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a ProducerConfig {
+    fn default() -> &'a ProducerConfig {
+        <ProducerConfig as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl ProducerConfig {
+    pub fn new() -> ProducerConfig {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(11);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "writer_id",
+            |m: &ProducerConfig| { &m.writer_id },
+            |m: &mut ProducerConfig| { &mut m.writer_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "max_batch_records",
+            |m: &ProducerConfig| { &m.max_batch_records },
+            |m: &mut ProducerConfig| { &mut m.max_batch_records },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "max_batch_bytes",
+            |m: &ProducerConfig| { &m.max_batch_bytes },
+            |m: &mut ProducerConfig| { &mut m.max_batch_bytes },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "flush_max_delay_ms",
+            |m: &ProducerConfig| { &m.flush_max_delay_ms },
+            |m: &mut ProducerConfig| { &mut m.flush_max_delay_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "max_retries",
+            |m: &ProducerConfig| { &m.max_retries },
+            |m: &mut ProducerConfig| { &mut m.max_retries },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "retry_base_delay_ms",
+            |m: &ProducerConfig| { &m.retry_base_delay_ms },
+            |m: &mut ProducerConfig| { &mut m.retry_base_delay_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "retry_max_delay_ms",
+            |m: &ProducerConfig| { &m.retry_max_delay_ms },
+            |m: &mut ProducerConfig| { &mut m.retry_max_delay_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "connect_timeout_ms",
+            |m: &ProducerConfig| { &m.connect_timeout_ms },
+            |m: &mut ProducerConfig| { &mut m.connect_timeout_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "request_timeout_ms",
+            |m: &ProducerConfig| { &m.request_timeout_ms },
+            |m: &mut ProducerConfig| { &mut m.request_timeout_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "max_request_concurrency",
+            |m: &ProducerConfig| { &m.max_request_concurrency },
+            |m: &mut ProducerConfig| { &mut m.max_request_concurrency },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "compression",
+            |m: &ProducerConfig| { &m.compression },
+            |m: &mut ProducerConfig| { &mut m.compression },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ProducerConfig>(
+            "ProducerConfig",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for ProducerConfig {
+    const NAME: &'static str = "ProducerConfig";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                8 => {
+                    self.writer_id = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                16 => {
+                    self.max_batch_records = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                24 => {
+                    self.max_batch_bytes = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                32 => {
+                    self.flush_max_delay_ms = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                40 => {
+                    self.max_retries = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                48 => {
+                    self.retry_base_delay_ms = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                56 => {
+                    self.retry_max_delay_ms = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                64 => {
+                    self.connect_timeout_ms = ::std::option::Option::Some(is.read_int64()?);
+                },
+                72 => {
+                    self.request_timeout_ms = ::std::option::Option::Some(is.read_int64()?);
+                },
+                80 => {
+                    self.max_request_concurrency = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                88 => {
+                    self.compression = ::std::option::Option::Some(is.read_enum_or_unknown()?);
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if let Some(v) = self.writer_id {
+            my_size += ::protobuf::rt::uint32_size(1, v);
+        }
+        if let Some(v) = self.max_batch_records {
+            my_size += ::protobuf::rt::uint32_size(2, v);
+        }
+        if let Some(v) = self.max_batch_bytes {
+            my_size += ::protobuf::rt::uint32_size(3, v);
+        }
+        if let Some(v) = self.flush_max_delay_ms {
+            my_size += ::protobuf::rt::uint64_size(4, v);
+        }
+        if let Some(v) = self.max_retries {
+            my_size += ::protobuf::rt::uint32_size(5, v);
+        }
+        if let Some(v) = self.retry_base_delay_ms {
+            my_size += ::protobuf::rt::uint64_size(6, v);
+        }
+        if let Some(v) = self.retry_max_delay_ms {
+            my_size += ::protobuf::rt::uint64_size(7, v);
+        }
+        if let Some(v) = self.connect_timeout_ms {
+            my_size += ::protobuf::rt::int64_size(8, v);
+        }
+        if let Some(v) = self.request_timeout_ms {
+            my_size += ::protobuf::rt::int64_size(9, v);
+        }
+        if let Some(v) = self.max_request_concurrency {
+            my_size += ::protobuf::rt::uint64_size(10, v);
+        }
+        if let Some(v) = self.compression {
+            my_size += ::protobuf::rt::int32_size(11, v.value());
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if let Some(v) = self.writer_id {
+            os.write_uint32(1, v)?;
+        }
+        if let Some(v) = self.max_batch_records {
+            os.write_uint32(2, v)?;
+        }
+        if let Some(v) = self.max_batch_bytes {
+            os.write_uint32(3, v)?;
+        }
+        if let Some(v) = self.flush_max_delay_ms {
+            os.write_uint64(4, v)?;
+        }
+        if let Some(v) = self.max_retries {
+            os.write_uint32(5, v)?;
+        }
+        if let Some(v) = self.retry_base_delay_ms {
+            os.write_uint64(6, v)?;
+        }
+        if let Some(v) = self.retry_max_delay_ms {
+            os.write_uint64(7, v)?;
+        }
+        if let Some(v) = self.connect_timeout_ms {
+            os.write_int64(8, v)?;
+        }
+        if let Some(v) = self.request_timeout_ms {
+            os.write_int64(9, v)?;
+        }
+        if let Some(v) = self.max_request_concurrency {
+            os.write_uint64(10, v)?;
+        }
+        if let Some(v) = self.compression {
+            os.write_enum(11, ::protobuf::EnumOrUnknown::value(&v))?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> ProducerConfig {
+        ProducerConfig::new()
+    }
+
+    fn clear(&mut self) {
+        self.writer_id = ::std::option::Option::None;
+        self.max_batch_records = ::std::option::Option::None;
+        self.max_batch_bytes = ::std::option::Option::None;
+        self.flush_max_delay_ms = ::std::option::Option::None;
+        self.max_retries = ::std::option::Option::None;
+        self.retry_base_delay_ms = ::std::option::Option::None;
+        self.retry_max_delay_ms = ::std::option::Option::None;
+        self.connect_timeout_ms = ::std::option::Option::None;
+        self.request_timeout_ms = ::std::option::Option::None;
+        self.max_request_concurrency = ::std::option::Option::None;
+        self.compression = ::std::option::Option::None;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static ProducerConfig {
+        static instance: ProducerConfig = ProducerConfig {
+            writer_id: ::std::option::Option::None,
+            max_batch_records: ::std::option::Option::None,
+            max_batch_bytes: ::std::option::Option::None,
+            flush_max_delay_ms: ::std::option::Option::None,
+            max_retries: ::std::option::Option::None,
+            retry_base_delay_ms: ::std::option::Option::None,
+            retry_max_delay_ms: ::std::option::Option::None,
+            connect_timeout_ms: ::std::option::Option::None,
+            request_timeout_ms: ::std::option::Option::None,
+            max_request_concurrency: ::std::option::Option::None,
+            compression: ::std::option::Option::None,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for ProducerConfig {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("ProducerConfig").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for ProducerConfig {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for ProducerConfig {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.ProducerRuntimeConfig)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct ProducerRuntimeConfig {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerRuntimeConfig.producer)
+    pub producer: ::protobuf::MessageField<ProducerConfig>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerRuntimeConfig.discovery)
+    pub discovery: ::protobuf::MessageField<BrokerDiscoveryConfig>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerRuntimeConfig.topics)
+    pub topics: ::std::vec::Vec<TopicConfig>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerRuntimeConfig.stats_scope)
+    pub stats_scope: ::protobuf::Chars,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.ProducerRuntimeConfig.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a ProducerRuntimeConfig {
+    fn default() -> &'a ProducerRuntimeConfig {
+        <ProducerRuntimeConfig as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl ProducerRuntimeConfig {
+    pub fn new() -> ProducerRuntimeConfig {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(4);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ProducerConfig>(
+            "producer",
+            |m: &ProducerRuntimeConfig| { &m.producer },
+            |m: &mut ProducerRuntimeConfig| { &mut m.producer },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, BrokerDiscoveryConfig>(
+            "discovery",
+            |m: &ProducerRuntimeConfig| { &m.discovery },
+            |m: &mut ProducerRuntimeConfig| { &mut m.discovery },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
+            "topics",
+            |m: &ProducerRuntimeConfig| { &m.topics },
+            |m: &mut ProducerRuntimeConfig| { &mut m.topics },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "stats_scope",
+            |m: &ProducerRuntimeConfig| { &m.stats_scope },
+            |m: &mut ProducerRuntimeConfig| { &mut m.stats_scope },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ProducerRuntimeConfig>(
+            "ProducerRuntimeConfig",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for ProducerRuntimeConfig {
+    const NAME: &'static str = "ProducerRuntimeConfig";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.producer)?;
+                },
+                18 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.discovery)?;
+                },
+                26 => {
+                    self.topics.push(is.read_message()?);
+                },
+                34 => {
+                    self.stats_scope = is.read_tokio_chars()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if let Some(v) = self.producer.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
+        if let Some(v) = self.discovery.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
+        for value in &self.topics {
+            let len = value.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        };
+        if !self.stats_scope.is_empty() {
+            my_size += ::protobuf::rt::string_size(4, &self.stats_scope);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if let Some(v) = self.producer.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(1, v, os)?;
+        }
+        if let Some(v) = self.discovery.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
+        }
+        for v in &self.topics {
+            ::protobuf::rt::write_message_field_with_cached_size(3, v, os)?;
+        };
+        if !self.stats_scope.is_empty() {
+            os.write_string(4, &self.stats_scope)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> ProducerRuntimeConfig {
+        ProducerRuntimeConfig::new()
+    }
+
+    fn clear(&mut self) {
+        self.producer.clear();
+        self.discovery.clear();
+        self.topics.clear();
+        self.stats_scope.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static ProducerRuntimeConfig {
+        static instance: ProducerRuntimeConfig = ProducerRuntimeConfig {
+            producer: ::protobuf::MessageField::none(),
+            discovery: ::protobuf::MessageField::none(),
+            topics: ::std::vec::Vec::new(),
+            stats_scope: ::protobuf::Chars::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for ProducerRuntimeConfig {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("ProducerRuntimeConfig").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for ProducerRuntimeConfig {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for ProducerRuntimeConfig {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+#[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
+// @@protoc_insertion_point(enum:blobstream.v1.ProducerCompression)
+pub enum ProducerCompression {
+    // @@protoc_insertion_point(enum_value:blobstream.v1.ProducerCompression.PRODUCER_COMPRESSION_NONE)
+    PRODUCER_COMPRESSION_NONE = 0,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.ProducerCompression.PRODUCER_COMPRESSION_SNAPPY)
+    PRODUCER_COMPRESSION_SNAPPY = 1,
+}
+
+impl ::protobuf::Enum for ProducerCompression {
+    const NAME: &'static str = "ProducerCompression";
+
+    fn value(&self) -> i32 {
+        *self as i32
+    }
+
+    fn from_i32(value: i32) -> ::std::option::Option<ProducerCompression> {
+        match value {
+            0 => ::std::option::Option::Some(ProducerCompression::PRODUCER_COMPRESSION_NONE),
+            1 => ::std::option::Option::Some(ProducerCompression::PRODUCER_COMPRESSION_SNAPPY),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    fn from_str(str: &str) -> ::std::option::Option<ProducerCompression> {
+        match str {
+            "PRODUCER_COMPRESSION_NONE" => ::std::option::Option::Some(ProducerCompression::PRODUCER_COMPRESSION_NONE),
+            "PRODUCER_COMPRESSION_SNAPPY" => ::std::option::Option::Some(ProducerCompression::PRODUCER_COMPRESSION_SNAPPY),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    const VALUES: &'static [ProducerCompression] = &[
+        ProducerCompression::PRODUCER_COMPRESSION_NONE,
+        ProducerCompression::PRODUCER_COMPRESSION_SNAPPY,
+    ];
+}
+
+impl ::protobuf::EnumFull for ProducerCompression {
+    fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().enum_by_package_relative_name("ProducerCompression").unwrap()).clone()
+    }
+
+    fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
+        let index = *self as usize;
+        Self::enum_descriptor().value_by_index(index)
+    }
+}
+
+impl ::std::default::Default for ProducerCompression {
+    fn default() -> Self {
+        ProducerCompression::PRODUCER_COMPRESSION_NONE
+    }
+}
+
+impl ProducerCompression {
+    fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
+        ::protobuf::reflect::GeneratedEnumDescriptorData::new::<ProducerCompression>("ProducerCompression")
+    }
+}
+
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x1ablobstream/v1/config.proto\x12\rblobstream.v1\"\x92\x02\n\x0cBroke\
     rConfig\x12&\n\x0fflush_max_bytes\x18\x01\x20\x01(\rR\rflushMaxBytes\x12\
@@ -2780,8 +3323,32 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     figR\x06broker\x122\n\x06topics\x18\x02\x20\x03(\x0b2\x1a.blobstream.v1.\
     TopicConfigR\x06topics\x12=\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blob\
     stream.v1.BlobStoreConfigR\tblobStore\x12I\n\x0emetadata_store\x18\x04\
-    \x20\x01(\x0b2\".blobstream.v1.MetadataStoreConfigR\rmetadataStoreb\x06p\
-    roto3\
+    \x20\x01(\x0b2\".blobstream.v1.MetadataStoreConfigR\rmetadataStore\"\xa4\
+    \x06\n\x0eProducerConfig\x12\x20\n\twriter_id\x18\x01\x20\x01(\rH\0R\x08\
+    writerId\x88\x01\x01\x12/\n\x11max_batch_records\x18\x02\x20\x01(\rH\x01\
+    R\x0fmaxBatchRecords\x88\x01\x01\x12+\n\x0fmax_batch_bytes\x18\x03\x20\
+    \x01(\rH\x02R\rmaxBatchBytes\x88\x01\x01\x120\n\x12flush_max_delay_ms\
+    \x18\x04\x20\x01(\x04H\x03R\x0fflushMaxDelayMs\x88\x01\x01\x12$\n\x0bmax\
+    _retries\x18\x05\x20\x01(\rH\x04R\nmaxRetries\x88\x01\x01\x122\n\x13retr\
+    y_base_delay_ms\x18\x06\x20\x01(\x04H\x05R\x10retryBaseDelayMs\x88\x01\
+    \x01\x120\n\x12retry_max_delay_ms\x18\x07\x20\x01(\x04H\x06R\x0fretryMax\
+    DelayMs\x88\x01\x01\x121\n\x12connect_timeout_ms\x18\x08\x20\x01(\x03H\
+    \x07R\x10connectTimeoutMs\x88\x01\x01\x121\n\x12request_timeout_ms\x18\t\
+    \x20\x01(\x03H\x08R\x10requestTimeoutMs\x88\x01\x01\x12;\n\x17max_reques\
+    t_concurrency\x18\n\x20\x01(\x04H\tR\x15maxRequestConcurrency\x88\x01\
+    \x01\x12I\n\x0bcompression\x18\x0b\x20\x01(\x0e2\".blobstream.v1.Produce\
+    rCompressionH\nR\x0bcompression\x88\x01\x01B\x0c\n\n_writer_idB\x14\n\
+    \x12_max_batch_recordsB\x12\n\x10_max_batch_bytesB\x15\n\x13_flush_max_d\
+    elay_msB\x0e\n\x0c_max_retriesB\x16\n\x14_retry_base_delay_msB\x15\n\x13\
+    _retry_max_delay_msB\x15\n\x13_connect_timeout_msB\x15\n\x13_request_tim\
+    eout_msB\x1a\n\x18_max_request_concurrencyB\x0e\n\x0c_compression\"\xeb\
+    \x01\n\x15ProducerRuntimeConfig\x129\n\x08producer\x18\x01\x20\x01(\x0b2\
+    \x1d.blobstream.v1.ProducerConfigR\x08producer\x12B\n\tdiscovery\x18\x02\
+    \x20\x01(\x0b2$.blobstream.v1.BrokerDiscoveryConfigR\tdiscovery\x122\n\
+    \x06topics\x18\x03\x20\x03(\x0b2\x1a.blobstream.v1.TopicConfigR\x06topic\
+    s\x12\x1f\n\x0bstats_scope\x18\x04\x20\x01(\tR\nstatsScope*U\n\x13Produc\
+    erCompression\x12\x1d\n\x19PRODUCER_COMPRESSION_NONE\x10\0\x12\x1f\n\x1b\
+    PRODUCER_COMPRESSION_SNAPPY\x10\x01b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -2799,7 +3366,7 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
     file_descriptor.get(|| {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
             let mut deps = ::std::vec::Vec::with_capacity(0);
-            let mut messages = ::std::vec::Vec::with_capacity(15);
+            let mut messages = ::std::vec::Vec::with_capacity(17);
             messages.push(BrokerConfig::generated_message_descriptor_data());
             messages.push(BrokerNodeIdentityConfig::generated_message_descriptor_data());
             messages.push(BrokerHostnameIdentity::generated_message_descriptor_data());
@@ -2815,7 +3382,10 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             messages.push(DynamoMetadataStoreConfig::generated_message_descriptor_data());
             messages.push(MetadataStoreConfig::generated_message_descriptor_data());
             messages.push(RuntimeConfig::generated_message_descriptor_data());
-            let mut enums = ::std::vec::Vec::with_capacity(0);
+            messages.push(ProducerConfig::generated_message_descriptor_data());
+            messages.push(ProducerRuntimeConfig::generated_message_descriptor_data());
+            let mut enums = ::std::vec::Vec::with_capacity(1);
+            enums.push(ProducerCompression::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),
                 deps,

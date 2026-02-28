@@ -479,8 +479,8 @@ Notes:
   - `cargo build --workspace`
   - `cargo test -p blob-stream write::tests`
 - Status summary:
-  - Completed and source-verified: Milestones 0-7
-  - In progress: Milestone 8+
+  - Completed and source-verified: Milestones 0-8
+  - In progress: Milestone 9+
 
 - [x] Milestone 0: Repo scaffolding + proto baseline
   - [x] Define proto files in this repo following shared-core/bd-proto patterns.
@@ -591,10 +591,16 @@ Notes:
     - `blob-stream-producer/src/producer_test.rs`
     - `Cargo.toml` (workspace member registration)
 
-- [ ] Milestone 8: Producer config + observability
-  - [ ] Define producer config schema + YAML/JSON decode.
-  - [ ] Add bd-stats metrics for throughput, retries, and latency.
-  - [ ] Add structured logging around retries and broker refresh.
+- [x] Milestone 8: Producer config + observability
+  - [x] Define producer config schema + YAML/JSON decode.
+  - [x] Add bd-stats metrics for throughput, retries, and latency.
+  - [x] Add structured logging around retries and broker refresh.
+  - Source map:
+    - `blob-stream-producer/src/producer.rs` (`ProducerRuntimeConfig`, `ProducerDiscoveryConfig`, `ProducerMetrics`, retry/routing debug+trace logs)
+    - `blob-stream-producer/src/producer_test.rs` (runtime config JSON/YAML decode tests)
+    - `blob-stream-producer/src/lib.rs` (runtime config type exports)
+    - `blob-stream-producer/Cargo.toml` (serde/log/bd-server-stats dependencies)
+    - `Cargo.toml` (workspace `bd-server-stats` dependency)
 
 - [ ] Milestone 9: Consumer read path (trait-first)
   - [ ] Define async trait for consumer reader (scan -> fetch -> decode).
@@ -609,7 +615,7 @@ Notes:
   - [ ] Add tests for assignment stability and lease fencing behavior.
 
 - [ ] Milestone 11: Observability + logging
-  - [ ] Add bd-stats metrics for broker/producer/consumer throughput and lag.
+  - [ ] Add bd-server-stats metrics for broker/producer/consumer throughput and lag.
   - [ ] Add structured logging with debug/trace for hot paths.
   - [ ] Apply warn_every for noisy warnings.
 
@@ -617,11 +623,14 @@ Notes:
   - [ ] Compose broker + producer + consumer in docker compose (local S3/Dynamo).
   - [ ] Verify autoscaling behaviors (simulated broker/consumer membership changes).
   - [ ] Validate duplicate handling and cursor monotonicity under retries.
-
-- [ ] Milestone 13: Load + cost validation
-  - [ ] Run throughput and latency tests under representative load.
-  - [ ] Measure DynamoDB/S3 costs vs targets.
-  - [ ] Adjust rollover/window/scan defaults based on cost/latency tradeoffs.
+  - [ ] Develop a deterministic fault injection framework that can be used during integration
+        tests. This can use a simulated network and broker discovery implementation that can
+        be driven during tests. Then use this to test failure cases across producers, brokers,
+        and consumers.
+  - [ ] Write detailed README.md on how to use the system including details on the producer library
+        and configuration, consumer library and configuration, and broker service setup. Also
+        include details on all of the Dynamo tables required as well as any details about the
+        required S3 bucket.
 
 ## Open Questions
 - None currently; iterate as implementation progresses.

@@ -5,15 +5,21 @@
 // LICENSE file or at:
 // https://polyformproject.org/wp-content/uploads/2020/06/PolyForm-Shield-1.0.0.txt
 
+mod config;
 mod producer;
 
+pub use config::{
+  ProducerCompression,
+  ProducerConfig,
+  ProducerDiscoveryConfig,
+  ProducerNodeConfig,
+  ProducerRuntimeConfig,
+  ProducerTopicConfig,
+};
 pub use producer::{
   ProducerAck,
   ProducerClient,
   ProducerClientImpl,
-  ProducerCompression,
-  ProducerConfig,
   ProducerError,
   ProducerRecord,
-  ProducerTopicConfig,
 };

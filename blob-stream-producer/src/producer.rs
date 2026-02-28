@@ -9,11 +9,33 @@
 #[path = "./producer_test.rs"]
 mod tests;
 
+use crate::config::{
+  ProducerConfig,
+  ProducerRuntimeConfig,
+  ProducerTopicConfig,
+  compression_as_grpc,
+  into_discovery,
+  producer_compression,
+  producer_connect_timeout_ms,
+  producer_flush_max_delay_ms,
+  producer_max_batch_bytes,
+  producer_max_batch_records,
+  producer_max_request_concurrency,
+  producer_max_retries,
+  producer_request_timeout_ms,
+  producer_retry_base_delay_ms,
+  producer_retry_max_delay_ms,
+  producer_writer_id,
+  stats_scope,
+  validate_producer_config,
+  validate_runtime_config,
+  validate_topic_config,
+};
 use anyhow::{Result, anyhow, bail, ensure};
 use async_trait::async_trait;
 use bd_grpc::client::Client as GrpcClient;
-use bd_grpc::compression::Compression;
 use bd_grpc::service::ServiceMethod;
+use bd_server_stats::stats::{Collector, Scope};
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, owner_for_partition};
 use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchRequest,
@@ -22,6 +44,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   Record,
 };
 use blob_stream_types::{VirtualPartitionId, virtual_partition_for_key};
+use log::{debug, trace};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,133 +54,51 @@ use tokio::sync::{Mutex, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval};
 
-const DEFAULT_MAX_BATCH_RECORDS: usize = 1_000;
-const DEFAULT_MAX_BATCH_BYTES: usize = 1_048_576;
-const DEFAULT_FLUSH_MAX_DELAY_MS: u64 = 200;
-const DEFAULT_MAX_RETRIES: u32 = 5;
-const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 25;
-const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 1_000;
-const DEFAULT_CONNECT_TIMEOUT_MS: i64 = 2_000;
-const DEFAULT_REQUEST_TIMEOUT_MS: i64 = 5_000;
-const DEFAULT_MAX_REQUEST_CONCURRENCY: u64 = 64;
-
 //
-// ProducerCompression
+// ProducerMetrics
 //
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ProducerCompression {
-  #[default]
-  None,
-  Snappy,
+#[derive(Clone)]
+struct ProducerMetrics {
+  scope: Scope,
 }
 
-impl ProducerCompression {
-  fn as_grpc(self) -> Compression {
-    match self {
-      Self::None => Compression::None,
-      Self::Snappy => Compression::Snappy,
-    }
-  }
-}
-
-//
-// ProducerConfig
-//
-
-#[derive(Clone, Debug)]
-pub struct ProducerConfig {
-  pub writer_id: u32,
-  pub max_batch_records: usize,
-  pub max_batch_bytes: usize,
-  pub flush_max_delay_ms: u64,
-  pub max_retries: u32,
-  pub retry_base_delay_ms: u64,
-  pub retry_max_delay_ms: u64,
-  pub connect_timeout_ms: i64,
-  pub request_timeout_ms: i64,
-  pub max_request_concurrency: u64,
-  pub compression: ProducerCompression,
-}
-
-impl ProducerConfig {
-  #[must_use]
-  pub fn with_defaults() -> Self {
+impl ProducerMetrics {
+  fn new(scope: &Scope) -> Self {
     Self {
-      writer_id: 0,
-      max_batch_records: DEFAULT_MAX_BATCH_RECORDS,
-      max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
-      flush_max_delay_ms: DEFAULT_FLUSH_MAX_DELAY_MS,
-      max_retries: DEFAULT_MAX_RETRIES,
-      retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
-      retry_max_delay_ms: DEFAULT_RETRY_MAX_DELAY_MS,
-      connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
-      request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
-      max_request_concurrency: DEFAULT_MAX_REQUEST_CONCURRENCY,
-      compression: ProducerCompression::None,
+      scope: scope.scope("producer"),
     }
   }
 
-  fn validate(&self) -> Result<()> {
-    ensure!(
-      self.max_batch_records > 0,
-      "producer.max_batch_records must be greater than zero"
-    );
-    ensure!(
-      self.max_batch_bytes > 0,
-      "producer.max_batch_bytes must be greater than zero"
-    );
-    ensure!(
-      self.flush_max_delay_ms > 0,
-      "producer.flush_max_delay_ms must be greater than zero"
-    );
-    ensure!(
-      self.retry_base_delay_ms > 0,
-      "producer.retry_base_delay_ms must be greater than zero"
-    );
-    ensure!(
-      self.retry_max_delay_ms > 0,
-      "producer.retry_max_delay_ms must be greater than zero"
-    );
-    ensure!(
-      self.connect_timeout_ms > 0,
-      "producer.connect_timeout_ms must be greater than zero"
-    );
-    ensure!(
-      self.request_timeout_ms > 0,
-      "producer.request_timeout_ms must be greater than zero"
-    );
-    ensure!(
-      self.max_request_concurrency > 0,
-      "producer.max_request_concurrency must be greater than zero"
-    );
-    Ok(())
+  fn inc_records_enqueued(&self) {
+    self.scope.counter("records_enqueued").inc();
   }
-}
 
-//
-// ProducerTopicConfig
-//
+  fn inc_batches_sent(&self) {
+    self.scope.counter("batches_sent").inc();
+  }
 
-#[derive(Clone, Debug)]
-pub struct ProducerTopicConfig {
-  pub name: String,
-  pub partition_count: u32,
-  pub num_writers: u32,
-}
+  fn inc_records_sent_by(&self, count: u64) {
+    self.scope.counter("records_sent").inc_by(count);
+  }
 
-impl ProducerTopicConfig {
-  fn validate(&self) -> Result<()> {
-    ensure!(!self.name.trim().is_empty(), "topic name is required");
-    ensure!(
-      self.partition_count > 0,
-      "partition_count must be greater than zero"
-    );
-    ensure!(
-      self.num_writers > 0,
-      "num_writers must be greater than zero"
-    );
-    Ok(())
+  fn inc_retries(&self) {
+    self.scope.counter("retries").inc();
+  }
+
+  fn inc_failures(&self) {
+    self.scope.counter("failures").inc();
+  }
+
+  fn inc_no_brokers(&self) {
+    self.scope.counter("no_brokers").inc();
+  }
+
+  fn observe_send_latency_seconds(&self, latency_seconds: f64) {
+    self
+      .scope
+      .histogram("send_latency_seconds")
+      .observe(latency_seconds);
   }
 }
 
@@ -264,24 +205,24 @@ impl BrokerTransport for GrpcBrokerTransport {
     broker_address: &str,
     request: ProduceBatchRequest,
   ) -> Result<ProduceBatchResponse> {
-    let connect_timeout = TimeDuration::milliseconds(self.config.connect_timeout_ms);
+    let connect_timeout = TimeDuration::milliseconds(producer_connect_timeout_ms(&self.config));
     let client = GrpcClient::new_http(
       broker_address,
       connect_timeout,
-      self.config.max_request_concurrency,
+      producer_max_request_concurrency(&self.config),
     )?;
     let service_method = ServiceMethod::<ProduceBatchRequest, ProduceBatchResponse>::new(
       "BrokerService",
       "ProduceBatch",
     );
-    let request_timeout = TimeDuration::milliseconds(self.config.request_timeout_ms);
+    let request_timeout = TimeDuration::milliseconds(producer_request_timeout_ms(&self.config));
     let response = client
       .unary(
         &service_method,
         None,
         request,
         request_timeout,
-        self.config.compression.as_grpc(),
+        compression_as_grpc(producer_compression(&self.config)),
       )
       .await
       .map_err(|error| anyhow!(error.to_string()))?;
@@ -298,6 +239,7 @@ pub struct ProducerClientImpl {
   topics: HashMap<String, ProducerTopicConfig>,
   membership_rx: watch::Receiver<BrokerMembership>,
   transport: Arc<dyn BrokerTransport>,
+  metrics: Arc<ProducerMetrics>,
   state: Arc<Mutex<ProducerState>>,
   flush_task: JoinHandle<()>,
 }
@@ -312,28 +254,60 @@ impl ProducerClientImpl {
     Self::new_with_transport(config, topics, discovery, transport).await
   }
 
+  pub async fn from_runtime_config(runtime: ProducerRuntimeConfig) -> Result<Self> {
+    validate_runtime_config(&runtime)?;
+    let metrics_scope = Collector::default().scope(stats_scope(&runtime));
+    let producer = runtime
+      .producer
+      .as_ref()
+      .ok_or_else(|| anyhow!("producer config is required"))?
+      .clone();
+    let discovery = runtime
+      .discovery
+      .as_ref()
+      .ok_or_else(|| anyhow!("producer discovery config is required"))?
+      .clone();
+    let topics = runtime.topics.clone();
+    let discovery = into_discovery(&discovery)?;
+    let transport: Arc<dyn BrokerTransport> = Arc::new(GrpcBrokerTransport::new(producer.clone()));
+    Self::new_with_transport_and_scope(producer, topics, discovery, transport, metrics_scope).await
+  }
+
   pub async fn new_with_transport(
     config: ProducerConfig,
     topics: Vec<ProducerTopicConfig>,
     discovery: Arc<dyn BrokerDiscovery>,
     transport: Arc<dyn BrokerTransport>,
   ) -> Result<Self> {
-    config.validate()?;
+    let metrics_scope = Collector::default().scope("blob_stream_producer");
+    Self::new_with_transport_and_scope(config, topics, discovery, transport, metrics_scope).await
+  }
+
+  pub async fn new_with_transport_and_scope(
+    config: ProducerConfig,
+    topics: Vec<ProducerTopicConfig>,
+    discovery: Arc<dyn BrokerDiscovery>,
+    transport: Arc<dyn BrokerTransport>,
+    metrics_scope: Scope,
+  ) -> Result<Self> {
+    validate_producer_config(&config)?;
+    let writer_id = producer_writer_id(&config);
 
     let mut topic_map = HashMap::new();
     for topic in topics {
-      topic.validate()?;
+      validate_topic_config(&topic)?;
       ensure!(
-        config.writer_id < topic.num_writers,
+        writer_id < topic.num_writers,
         "writer_id {} must be less than num_writers {} for topic {}",
-        config.writer_id,
+        writer_id,
         topic.num_writers,
         topic.name
       );
-      if topic_map.contains_key(&topic.name) {
-        bail!("duplicate topic config: {}", topic.name);
+      let topic_name = topic.name.to_string();
+      if topic_map.contains_key(&topic_name) {
+        bail!("duplicate topic config: {topic_name}");
       }
-      topic_map.insert(topic.name.clone(), topic);
+      topic_map.insert(topic_name, topic);
     }
 
     ensure!(
@@ -343,6 +317,17 @@ impl ProducerClientImpl {
 
     let membership_rx = discovery.watch_membership().await?;
     let state = Arc::new(Mutex::new(ProducerState::default()));
+    let metrics = Arc::new(ProducerMetrics::new(&metrics_scope));
+
+    log::info!(
+      "producer initialized: writer_id={}, topics={}, flush_max_delay_ms={}, \
+       max_batch_records={}, max_batch_bytes={}",
+      writer_id,
+      topic_map.len(),
+      producer_flush_max_delay_ms(&config),
+      producer_max_batch_records(&config),
+      producer_max_batch_bytes(&config)
+    );
 
     let flush_task = Self::spawn_flush_loop(
       Arc::clone(&state),
@@ -350,6 +335,7 @@ impl ProducerClientImpl {
       config.clone(),
       topic_map.clone(),
       membership_rx.clone(),
+      Arc::clone(&metrics),
     );
 
     Ok(Self {
@@ -357,6 +343,7 @@ impl ProducerClientImpl {
       topics: topic_map,
       membership_rx,
       transport,
+      metrics,
       state,
       flush_task,
     })
@@ -368,23 +355,37 @@ impl ProducerClientImpl {
     config: ProducerConfig,
     topics: HashMap<String, ProducerTopicConfig>,
     membership_rx: watch::Receiver<BrokerMembership>,
+    metrics: Arc<ProducerMetrics>,
   ) -> JoinHandle<()> {
     // The flush loop handles time-based flushes so producers can efficiently batch sparse traffic.
     tokio::spawn(async move {
-      let tick_ms = (config.flush_max_delay_ms / 2).max(10);
+      let tick_ms = (producer_flush_max_delay_ms(&config) / 2).max(10);
       let mut ticker = interval(Duration::from_millis(tick_ms));
 
       loop {
         ticker.tick().await;
         let batches = {
           let mut guard = state.lock().await;
-          guard.collect_ready_batches(config.flush_max_delay_ms)
+          guard.collect_ready_batches(producer_flush_max_delay_ms(&config))
         };
 
+        if !batches.is_empty() {
+          trace!(
+            "producer flush loop found {} ready batch(es)",
+            batches.len()
+          );
+        }
+
         for batch in batches {
-          let result =
-            send_batch_with_retry(&config, &topics, &membership_rx, transport.as_ref(), &batch)
-              .await;
+          let result = send_batch_with_retry(
+            &config,
+            &topics,
+            &membership_rx,
+            transport.as_ref(),
+            &batch,
+            &metrics,
+          )
+          .await;
           notify_waiters(batch.waiters, &result);
         }
       }
@@ -394,6 +395,7 @@ impl ProducerClientImpl {
 
 impl Drop for ProducerClientImpl {
   fn drop(&mut self) {
+    debug!("producer dropping; aborting flush loop task");
     self.flush_task.abort();
   }
 }
@@ -409,16 +411,18 @@ impl ProducerClient for ProducerClientImpl {
     let virtual_partition_id = compute_virtual_partition_id(
       &record.record_key,
       topic.partition_count,
-      self.config.writer_id,
+      producer_writer_id(&self.config),
     );
 
     let (tx, rx) = oneshot::channel();
+    let topic = record.topic.clone();
+    let payload_len = record.payload.len();
 
     let maybe_batch = {
       let mut guard = self.state.lock().await;
       guard.push_record(
         BufferedRecord {
-          topic: record.topic,
+          topic,
           virtual_partition_id,
           proto_record: Record {
             payload: record.payload.into(),
@@ -427,18 +431,31 @@ impl ProducerClient for ProducerClientImpl {
           },
           waiter: tx,
         },
-        self.config.max_batch_records,
-        self.config.max_batch_bytes,
+        producer_max_batch_records(&self.config) as usize,
+        producer_max_batch_bytes(&self.config) as usize,
       )
     };
 
+    self.metrics.inc_records_enqueued();
+    trace!(
+      "record buffered: topic={}, virtual_partition_id={}, payload_bytes={}",
+      record.topic, virtual_partition_id, payload_len
+    );
+
     if let Some(batch) = maybe_batch {
+      trace!(
+        "size flush triggered: topic={}, virtual_partition_id={}, records={}",
+        batch.topic,
+        batch.virtual_partition_id,
+        batch.records.len()
+      );
       let result = send_batch_with_retry(
         &self.config,
         &self.topics,
         &self.membership_rx,
         self.transport.as_ref(),
         &batch,
+        &self.metrics,
       )
       .await;
       notify_waiters(batch.waiters, &result);
@@ -462,6 +479,7 @@ impl ProducerClient for ProducerClientImpl {
         &self.membership_rx,
         self.transport.as_ref(),
         &batch,
+        &self.metrics,
       )
       .await;
       if let Err(error) = &result
@@ -494,16 +512,52 @@ async fn send_batch_with_retry(
   membership_rx: &watch::Receiver<BrokerMembership>,
   transport: &dyn BrokerTransport,
   batch: &BufferedBatch,
+  metrics: &ProducerMetrics,
 ) -> Result<ProducerAck, ProducerError> {
   let _topic = topics
     .get(&batch.topic)
     .ok_or_else(|| ProducerError::UnknownTopic(batch.topic.clone()))?;
 
   let mut attempt: u32 = 0;
+  let mut previous_owner: Option<String> = None;
+  let started_at = Instant::now();
   loop {
     let membership = membership_rx.borrow().clone();
-    let broker = owner_for_partition(&batch.topic, batch.virtual_partition_id, &membership)
-      .ok_or(ProducerError::NoBrokersAvailable)?;
+    let Some(broker) = owner_for_partition(&batch.topic, batch.virtual_partition_id, &membership)
+    else {
+      metrics.inc_no_brokers();
+      metrics.inc_failures();
+      metrics.observe_send_latency_seconds(started_at.elapsed().as_secs_f64());
+      debug!(
+        "no broker owner available: topic={}, virtual_partition_id={}, membership_nodes={}",
+        batch.topic,
+        batch.virtual_partition_id,
+        membership.nodes.len()
+      );
+      return Err(ProducerError::NoBrokersAvailable);
+    };
+
+    if previous_owner
+      .as_deref()
+      .is_some_and(|old| old != broker.node_id)
+    {
+      debug!(
+        "producer routing changed after retry: topic={}, virtual_partition_id={}, from={}, to={}",
+        batch.topic,
+        batch.virtual_partition_id,
+        previous_owner.as_deref().unwrap_or_default(),
+        broker.node_id
+      );
+    }
+    previous_owner = Some(broker.node_id.clone());
+
+    trace!(
+      "send attempt: topic={}, virtual_partition_id={}, attempt={}, broker={}",
+      batch.topic,
+      batch.virtual_partition_id,
+      attempt.saturating_add(1),
+      broker.address
+    );
 
     let request = ProduceBatchRequest {
       topic: batch.topic.clone().into(),
@@ -518,6 +572,9 @@ async fn send_batch_with_retry(
         let status = response.status.enum_value_or_default();
         match status {
           ProduceStatus::PRODUCE_STATUS_OK => {
+            metrics.inc_batches_sent();
+            metrics.inc_records_sent_by(batch.records.len() as u64);
+            metrics.observe_send_latency_seconds(started_at.elapsed().as_secs_f64());
             return Ok(ProducerAck {
               topic: batch.topic.clone(),
               virtual_partition_id: batch.virtual_partition_id,
@@ -540,21 +597,39 @@ async fn send_batch_with_retry(
       Err(error) => error.to_string(),
     };
 
-    if attempt >= config.max_retries {
+    if attempt >= producer_max_retries(config) {
+      metrics.inc_failures();
+      metrics.observe_send_latency_seconds(started_at.elapsed().as_secs_f64());
+      debug!(
+        "producer retries exhausted: topic={}, virtual_partition_id={}, attempts={}, error={}",
+        batch.topic,
+        batch.virtual_partition_id,
+        attempt.saturating_add(1),
+        current_error
+      );
       return Err(ProducerError::RetriesExhausted(current_error));
     }
 
     let delay_ms = retry_delay_ms(config, attempt);
+    metrics.inc_retries();
+    debug!(
+      "producer retrying batch: topic={}, virtual_partition_id={}, attempt={}, delay_ms={}, \
+       error={}",
+      batch.topic,
+      batch.virtual_partition_id,
+      attempt.saturating_add(1),
+      delay_ms,
+      current_error
+    );
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     attempt = attempt.saturating_add(1);
   }
 }
 
 fn retry_delay_ms(config: &ProducerConfig, attempt: u32) -> u64 {
-  let exponential = config
-    .retry_base_delay_ms
-    .saturating_mul(2u64.saturating_pow(attempt));
-  exponential.min(config.retry_max_delay_ms)
+  let exponential =
+    producer_retry_base_delay_ms(config).saturating_mul(2u64.saturating_pow(attempt));
+  exponential.min(producer_retry_max_delay_ms(config))
 }
 
 fn compute_virtual_partition_id(
