@@ -1002,6 +1002,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "blob-stream-consumer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blob-stream-blob-store",
+ "blob-stream-metadata-store",
+ "blob-stream-types",
+ "bytes",
+ "serde_json",
+ "tokio",
+ "zstd",
+]
+
+[[package]]
 name = "blob-stream-metadata-store"
 version = "0.1.0"
 dependencies = [

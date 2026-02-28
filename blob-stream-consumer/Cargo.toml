@@ -1,0 +1,21 @@
+[package]
+edition = "2024"
+name    = "blob-stream-consumer"
+publish = false
+version = "0.1.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace                = true
+async-trait.workspace           = true
+blob-stream-blob-store.path     = "../blob-stream-blob-store"
+blob-stream-metadata-store.path = "../blob-stream-metadata-store"
+blob-stream-types.path          = "../blob-stream-types"
+serde_json.workspace            = true
+zstd.workspace                  = true
+
+[dev-dependencies]
+bytes.workspace = true
+tokio.workspace = true

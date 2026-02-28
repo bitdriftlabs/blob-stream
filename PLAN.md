@@ -602,11 +602,17 @@ Notes:
     - `blob-stream-producer/Cargo.toml` (serde/log/bd-server-stats dependencies)
     - `Cargo.toml` (workspace `bd-server-stats` dependency)
 
-- [ ] Milestone 9: Consumer read path (trait-first)
-  - [ ] Define async trait for consumer reader (scan -> fetch -> decode).
-  - [ ] Implement window scan + byte-range fetch + decode pipeline.
-  - [ ] Implement cursor tracking and re-scan window logic.
-  - [ ] Write unit tests for cursor advancement and late metadata handling.
+- [x] Milestone 9: Consumer read path (trait-first)
+  - [x] Define async trait for consumer reader (scan -> fetch -> decode).
+  - [x] Implement window scan + byte-range fetch + decode pipeline.
+  - [x] Implement cursor tracking and re-scan window logic.
+  - [x] Write unit tests for cursor advancement and late metadata handling.
+  - Source map:
+    - `blob-stream-consumer/Cargo.toml`
+    - `blob-stream-consumer/src/lib.rs`
+    - `blob-stream-consumer/src/consumer.rs`
+    - `blob-stream-consumer/src/consumer_test.rs`
+    - `Cargo.toml` (workspace member registration)
 
 - [ ] Milestone 10: Consumer group coordination
   - [ ] Implement cooperative sticky assignment logic.
