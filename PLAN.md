@@ -479,8 +479,8 @@ Notes:
   - `cargo build --workspace`
   - `cargo test -p blob-stream write::tests`
 - Status summary:
-  - Completed and source-verified: Milestones 0-6
-  - In progress: Milestone 7+
+  - Completed and source-verified: Milestones 0-7
+  - In progress: Milestone 8+
 
 - [x] Milestone 0: Repo scaffolding + proto baseline
   - [x] Define proto files in this repo following shared-core/bd-proto patterns.
@@ -577,13 +577,19 @@ Notes:
     - `blob-stream-broker-discovery/src/static.rs`
     - `blob-stream-broker-discovery/src/k8s.rs`
 
-- [ ] Milestone 7: Producer library (trait-first)
-  - [ ] Define async trait for producer client (hash -> batch -> send -> retry).
-  - [ ] Implement broker discovery + routing (consistent hashing shared with broker leasing).
-  - [ ] Implement batching per virtual partition with flush-by-size/time.
-  - [ ] Implement retry/backoff policy with broker error mapping.
-  - [ ] Implement optional compression config for producer batches.
-  - [ ] Write unit tests for routing, retries, and ack handling.
+- [x] Milestone 7: Producer library (trait-first)
+  - [x] Define async trait for producer client (hash -> batch -> send -> retry).
+  - [x] Implement broker discovery + routing (consistent hashing shared with broker leasing).
+  - [x] Implement batching per virtual partition with flush-by-size/time.
+  - [x] Implement retry/backoff policy with broker error mapping.
+  - [x] Implement optional compression config for producer batches.
+  - [x] Write unit tests for routing, retries, and ack handling.
+  - Source map:
+    - `blob-stream-producer/Cargo.toml`
+    - `blob-stream-producer/src/lib.rs`
+    - `blob-stream-producer/src/producer.rs`
+    - `blob-stream-producer/src/producer_test.rs`
+    - `Cargo.toml` (workspace member registration)
 
 - [ ] Milestone 8: Producer config + observability
   - [ ] Define producer config schema + YAML/JSON decode.

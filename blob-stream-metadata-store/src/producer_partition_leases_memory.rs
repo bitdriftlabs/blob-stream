@@ -12,6 +12,7 @@ mod tests;
 use crate::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
+  LeaseReleaseOutcome,
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
@@ -108,7 +109,6 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     now_ts_ms: i64,
-    _lease_duration_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
     if reservation_size == 0 {
@@ -137,6 +137,32 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       range,
       lease: state.to_lease(key.clone()),
     }))
+  }
+
+  async fn release_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    now_ts_ms: i64,
+  ) -> Result<LeaseReleaseOutcome> {
+    let mut guard = self.leases.write().await;
+    let Some(state) = guard.get(key).cloned() else {
+      return Ok(LeaseReleaseOutcome::Expired);
+    };
+
+    if state.is_expired(now_ts_ms) {
+      guard.remove(key);
+      return Ok(LeaseReleaseOutcome::Expired);
+    }
+
+    if state.holder_id != holder_id {
+      return Ok(LeaseReleaseOutcome::HeldByOther(
+        state.to_lease(key.clone()),
+      ));
+    }
+
+    guard.remove(key);
+    Ok(LeaseReleaseOutcome::Released)
   }
 }
 

@@ -12,6 +12,7 @@ mod tests;
 use crate::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
+  LeaseReleaseOutcome,
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
@@ -219,7 +220,6 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     now_ts_ms: i64,
-    _lease_duration_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
     if reservation_size == 0 {
@@ -284,6 +284,48 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
           Ok(SequenceReservationOutcome::Expired)
         } else {
           Ok(SequenceReservationOutcome::HeldByOther(lease))
+        }
+      },
+      Err(error) => Err(error.into()),
+    }
+  }
+
+  async fn release_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    now_ts_ms: i64,
+  ) -> Result<LeaseReleaseOutcome> {
+    let mut values = HashMap::new();
+    values.insert(
+      ":holder".to_string(),
+      AttributeValue::S(holder_id.to_string()),
+    );
+
+    let condition = format!("{ATTR_HOLDER} = :holder");
+    let response = self
+      .client
+      .delete_item()
+      .table_name(&self.table_name)
+      .key(ATTR_PK, AttributeValue::S(key.format()))
+      .condition_expression(condition)
+      .set_expression_attribute_values(Some(values))
+      .return_values(ReturnValue::AllOld)
+      .send()
+      .await;
+
+    match response {
+      Ok(_) => Ok(LeaseReleaseOutcome::Released),
+      Err(SdkError::ServiceError(service_error))
+        if service_error.err().is_conditional_check_failed_exception() =>
+      {
+        let Some(lease) = self.get_lease(key).await? else {
+          return Ok(LeaseReleaseOutcome::Expired);
+        };
+        if lease.lease_expiration_ts_ms <= now_ts_ms {
+          Ok(LeaseReleaseOutcome::Expired)
+        } else {
+          Ok(LeaseReleaseOutcome::HeldByOther(lease))
         }
       },
       Err(error) => Err(error.into()),

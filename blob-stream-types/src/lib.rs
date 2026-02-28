@@ -11,8 +11,37 @@ mod tests;
 
 pub use blob_stream_blob_store::ByteRange;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 pub type VirtualPartitionId = u32;
+
+#[must_use]
+pub fn logical_partition_for_key(record_key: &[u8], partition_count: u32) -> u32 {
+  let mut hasher = DefaultHasher::new();
+  record_key.hash(&mut hasher);
+  let logical_partition = hasher.finish() % u64::from(partition_count);
+  u32::try_from(logical_partition).map_or(0, |partition_id| partition_id)
+}
+
+#[must_use]
+pub fn virtual_partition_for_logical(
+  logical_partition_id: u32,
+  partition_count: u32,
+  writer_id: u32,
+) -> VirtualPartitionId {
+  logical_partition_id.saturating_add(writer_id.saturating_mul(partition_count))
+}
+
+#[must_use]
+pub fn virtual_partition_for_key(
+  record_key: &[u8],
+  partition_count: u32,
+  writer_id: u32,
+) -> VirtualPartitionId {
+  let logical_partition_id = logical_partition_for_key(record_key, partition_count);
+  virtual_partition_for_logical(logical_partition_id, partition_count, writer_id)
+}
 
 //
 // Record

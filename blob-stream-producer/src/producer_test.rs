@@ -1,0 +1,312 @@
+// blob-stream - producer tests
+// Copyright Bitdrift, Inc. All rights reserved.
+//
+// Use of this source code is governed by a source available license that can be found in the
+// LICENSE file or at:
+// https://polyformproject.org/wp-content/uploads/2020/06/PolyForm-Shield-1.0.0.txt
+
+#![allow(clippy::unwrap_used)]
+
+use super::{
+  ProducerClient,
+  ProducerClientImpl,
+  ProducerCompression,
+  ProducerConfig,
+  ProducerError,
+  ProducerRecord,
+  ProducerTopicConfig,
+  compute_virtual_partition_id,
+  retry_delay_ms,
+};
+use anyhow::anyhow;
+use async_trait::async_trait;
+use blob_stream_broker_discovery::{BrokerMembership, BrokerNode, owner_for_partition};
+use blob_stream_proto::protos::blobstream::v1::broker::{ProduceBatchResponse, ProduceStatus};
+use std::collections::VecDeque;
+use std::sync::Arc;
+use tokio::sync::{Mutex, watch};
+
+struct TestBrokerDiscovery {
+  membership: BrokerMembership,
+}
+
+impl TestBrokerDiscovery {
+  fn new(membership: BrokerMembership) -> Self {
+    Self { membership }
+  }
+}
+
+#[async_trait]
+impl blob_stream_broker_discovery::BrokerDiscovery for TestBrokerDiscovery {
+  async fn watch_membership(&self) -> anyhow::Result<watch::Receiver<BrokerMembership>> {
+    let (tx, rx) = watch::channel(self.membership.clone());
+    drop(tx);
+    Ok(rx)
+  }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SentBatch {
+  broker_address: String,
+  request: blob_stream_proto::protos::blobstream::v1::broker::ProduceBatchRequest,
+}
+
+#[derive(Default)]
+struct FakeBrokerTransport {
+  sent: Mutex<Vec<SentBatch>>,
+  responses: Mutex<VecDeque<std::result::Result<ProduceBatchResponse, anyhow::Error>>>,
+}
+
+impl FakeBrokerTransport {
+  async fn enqueue_response(
+    &self,
+    response: std::result::Result<ProduceBatchResponse, anyhow::Error>,
+  ) {
+    self.responses.lock().await.push_back(response);
+  }
+}
+
+#[async_trait]
+impl super::BrokerTransport for FakeBrokerTransport {
+  async fn produce_batch(
+    &self,
+    broker_address: &str,
+    request: blob_stream_proto::protos::blobstream::v1::broker::ProduceBatchRequest,
+  ) -> anyhow::Result<ProduceBatchResponse> {
+    self.sent.lock().await.push(SentBatch {
+      broker_address: broker_address.to_string(),
+      request,
+    });
+
+    self.responses.lock().await.pop_front().unwrap_or_else(|| {
+      Ok(ProduceBatchResponse {
+        status: ProduceStatus::PRODUCE_STATUS_OK.into(),
+        ..Default::default()
+      })
+    })
+  }
+}
+
+fn topic_config() -> ProducerTopicConfig {
+  ProducerTopicConfig {
+    name: "telemetry".to_string(),
+    partition_count: 16,
+    num_writers: 2,
+  }
+}
+
+fn default_config() -> ProducerConfig {
+  ProducerConfig {
+    writer_id: 1,
+    max_batch_records: 1,
+    max_batch_bytes: 1_024,
+    flush_max_delay_ms: 1_000,
+    max_retries: 4,
+    retry_base_delay_ms: 1,
+    retry_max_delay_ms: 8,
+    connect_timeout_ms: 1_000,
+    request_timeout_ms: 1_000,
+    max_request_concurrency: 16,
+    compression: ProducerCompression::Snappy,
+  }
+}
+
+fn membership() -> BrokerMembership {
+  BrokerMembership::new(vec![
+    BrokerNode {
+      node_id: "node-a".to_string(),
+      address: "a:8080".to_string(),
+    },
+    BrokerNode {
+      node_id: "node-b".to_string(),
+      address: "b:8080".to_string(),
+    },
+  ])
+}
+
+#[tokio::test]
+async fn routes_to_expected_broker() {
+  let config = default_config();
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let transport = Arc::new(FakeBrokerTransport::default());
+  let producer = ProducerClientImpl::new_with_transport(
+    config.clone(),
+    vec![topic_config()],
+    discovery,
+    transport.clone(),
+  )
+  .await
+  .unwrap();
+
+  let key = b"device-123".to_vec();
+  let ack = producer
+    .produce(ProducerRecord::new(
+      "telemetry",
+      key.clone(),
+      vec![1, 2, 3],
+      100,
+    ))
+    .await
+    .unwrap();
+
+  let expected_partition = compute_virtual_partition_id(&key, 16, config.writer_id);
+  assert_eq!(ack.virtual_partition_id, expected_partition);
+  let discovered_membership = membership();
+  let expected_owner =
+    owner_for_partition("telemetry", expected_partition, &discovered_membership).unwrap();
+
+  let sent = transport.sent.lock().await;
+  assert_eq!(sent.len(), 1);
+  assert_eq!(sent[0].broker_address, expected_owner.address);
+  assert_eq!(sent[0].request.virtual_partition_id, expected_partition);
+}
+
+#[tokio::test]
+async fn retries_transient_status_until_success() {
+  let config = default_config();
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let transport = Arc::new(FakeBrokerTransport::default());
+
+  transport
+    .enqueue_response(Ok(ProduceBatchResponse {
+      status: ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER.into(),
+      error_message: "lease moved".into(),
+      ..Default::default()
+    }))
+    .await;
+  transport
+    .enqueue_response(Ok(ProduceBatchResponse {
+      status: ProduceStatus::PRODUCE_STATUS_OVERLOADED.into(),
+      error_message: "busy".into(),
+      ..Default::default()
+    }))
+    .await;
+  transport
+    .enqueue_response(Ok(ProduceBatchResponse {
+      status: ProduceStatus::PRODUCE_STATUS_OK.into(),
+      ..Default::default()
+    }))
+    .await;
+
+  let producer = ProducerClientImpl::new_with_transport(
+    config,
+    vec![topic_config()],
+    discovery,
+    transport.clone(),
+  )
+  .await
+  .unwrap();
+
+  let ack = producer
+    .produce(ProducerRecord::new(
+      "telemetry",
+      b"retry-key".to_vec(),
+      vec![7],
+      100,
+    ))
+    .await
+    .unwrap();
+
+  assert_eq!(ack.attempts, 3);
+  assert_eq!(transport.sent.lock().await.len(), 3);
+}
+
+#[tokio::test]
+async fn batches_by_partition_and_acks_waiters() {
+  let mut config = default_config();
+  config.max_batch_records = 2;
+  config.flush_max_delay_ms = 10_000;
+
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let transport = Arc::new(FakeBrokerTransport::default());
+  let producer = Arc::new(
+    ProducerClientImpl::new_with_transport(
+      config,
+      vec![topic_config()],
+      discovery,
+      transport.clone(),
+    )
+    .await
+    .unwrap(),
+  );
+
+  let first = {
+    let producer = Arc::clone(&producer);
+    tokio::spawn(async move {
+      producer
+        .produce(ProducerRecord::new(
+          "telemetry",
+          b"same-key".to_vec(),
+          vec![1],
+          100,
+        ))
+        .await
+    })
+  };
+
+  let second = {
+    let producer = Arc::clone(&producer);
+    tokio::spawn(async move {
+      producer
+        .produce(ProducerRecord::new(
+          "telemetry",
+          b"same-key".to_vec(),
+          vec![2],
+          101,
+        ))
+        .await
+    })
+  };
+
+  let ack_one = first.await.unwrap().unwrap();
+  let ack_two = second.await.unwrap().unwrap();
+  assert_eq!(ack_one.virtual_partition_id, ack_two.virtual_partition_id);
+
+  let sent = transport.sent.lock().await;
+  assert_eq!(sent.len(), 1);
+  assert_eq!(sent[0].request.records.len(), 2);
+}
+
+#[tokio::test]
+async fn surfaces_retry_exhaustion_for_transport_errors() {
+  let mut config = default_config();
+  config.max_retries = 2;
+
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let transport = Arc::new(FakeBrokerTransport::default());
+  transport
+    .enqueue_response(Err(anyhow!("network down")))
+    .await;
+  transport
+    .enqueue_response(Err(anyhow!("network down")))
+    .await;
+  transport
+    .enqueue_response(Err(anyhow!("network down")))
+    .await;
+
+  let producer =
+    ProducerClientImpl::new_with_transport(config, vec![topic_config()], discovery, transport)
+      .await
+      .unwrap();
+
+  let error = producer
+    .produce(ProducerRecord::new(
+      "telemetry",
+      b"retry-fail".to_vec(),
+      vec![1],
+      0,
+    ))
+    .await
+    .unwrap_err();
+  assert!(matches!(error, ProducerError::RetriesExhausted(_)));
+}
+
+#[test]
+fn retry_backoff_is_exponential_and_capped() {
+  let config = default_config();
+  assert_eq!(retry_delay_ms(&config, 0), 1);
+  assert_eq!(retry_delay_ms(&config, 1), 2);
+  assert_eq!(retry_delay_ms(&config, 2), 4);
+  assert_eq!(retry_delay_ms(&config, 3), 8);
+  assert_eq!(retry_delay_ms(&config, 4), 8);
+}

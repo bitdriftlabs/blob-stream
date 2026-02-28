@@ -11,6 +11,7 @@ mod tests;
 
 mod config;
 mod flush;
+mod lease_assignment;
 
 use crate::write::flush::FlushContext;
 use anyhow::{Context, Result, anyhow};
@@ -39,15 +40,12 @@ use blob_stream_types::{
   VirtualPartitionId,
 };
 pub use config::{TopicInfo, WriteConfig, build_write_engine};
-use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use thiserror::Error;
 use time::ext::NumericalDuration;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, oneshot, watch};
 
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
@@ -131,6 +129,7 @@ pub struct WriteEngineImpl {
   holder_id: String,
   time_provider: Arc<dyn TimeProvider>,
   state: Arc<Mutex<WriteState>>,
+  lease_assignment_shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
 impl WriteEngineImpl {
@@ -169,7 +168,7 @@ impl WriteEngineImpl {
     let state = Arc::new(Mutex::new(WriteState::default()));
     let flush_context = FlushContext::new(config.clone(), blob_store, metadata_store, snowflake);
 
-    let engine = Self {
+    let mut engine = Self {
       config,
       topics,
       flush_context,
@@ -177,164 +176,15 @@ impl WriteEngineImpl {
       holder_id,
       time_provider,
       state,
+      lease_assignment_shutdown_tx: None,
     };
 
     engine.spawn_flush_loop();
     if let Some(membership_rx) = membership_rx {
-      engine.spawn_lease_self_assignment_loop(membership_rx);
+      engine.lease_assignment_shutdown_tx =
+        Some(engine.spawn_lease_self_assignment_loop(membership_rx));
     }
     Ok(engine)
-  }
-
-  fn owned_virtual_partitions(
-    topics: &HashMap<String, TopicInfo>,
-    writer_id: u32,
-    holder_id: &str,
-    membership: &BrokerMembership,
-  ) -> Vec<(String, VirtualPartitionId)> {
-    let static_self = membership.nodes.is_empty();
-
-    let mut owned = Vec::new();
-    for (topic, topic_info) in topics {
-      let base = writer_id.saturating_mul(topic_info.partition_count);
-      for logical_partition_id in 0 .. topic_info.partition_count {
-        let virtual_partition_id = base.saturating_add(logical_partition_id);
-        if static_self
-          || Self::owner_for_partition(topic, virtual_partition_id, membership).as_deref()
-            == Some(holder_id)
-        {
-          owned.push((topic.clone(), virtual_partition_id));
-        }
-      }
-    }
-
-    owned.sort_unstable();
-    owned
-  }
-
-  fn owner_for_partition(
-    topic: &str,
-    virtual_partition_id: VirtualPartitionId,
-    membership: &BrokerMembership,
-  ) -> Option<String> {
-    membership
-      .nodes
-      .iter()
-      .map(|node| {
-        let mut hasher = DefaultHasher::new();
-        topic.hash(&mut hasher);
-        virtual_partition_id.hash(&mut hasher);
-        node.node_id.hash(&mut hasher);
-        (Reverse(hasher.finish()), node.node_id.clone())
-      })
-      .min_by_key(|(score, _)| *score)
-      .map(|(_, node_id)| node_id)
-  }
-
-  fn spawn_lease_self_assignment_loop(&self, membership_rx: watch::Receiver<BrokerMembership>) {
-    let interval_ms = (self.config.lease_duration_ms / 3)
-      .max(1_000)
-      .cast_unsigned();
-    let interval = StdDuration::from_millis(interval_ms);
-    let topics = self.topics.clone();
-    let holder_id = self.holder_id.clone();
-    let writer_id = self.config.writer_id;
-    let lease_duration_ms = self.config.lease_duration_ms;
-    let reservation_size = self.config.reservation_size;
-    let lease_store = Arc::clone(&self.lease_store);
-    let state = Arc::clone(&self.state);
-    let time_provider = Arc::clone(&self.time_provider);
-
-    tokio::spawn(async move {
-      let mut ticker = tokio::time::interval(interval);
-      loop {
-        ticker.tick().await;
-
-        let membership = membership_rx.borrow().clone();
-        let owned = Self::owned_virtual_partitions(&topics, writer_id, &holder_id, &membership);
-
-        for (topic, virtual_partition_id) in owned {
-          let key = ProducerPartitionLeaseKey {
-            topic: topic.clone(),
-            writer_id,
-            virtual_partition_id,
-          };
-
-          let now = time_provider.now();
-          let now_ts_ms = now.unix_timestamp_ms();
-
-          let acquired = match lease_store
-            .acquire_lease(key.clone(), holder_id.clone(), now_ts_ms, lease_duration_ms)
-            .await
-          {
-            Ok(LeaseAcquireOutcome::Acquired(lease)) => {
-              let mut guard = state.lock().await;
-              let partition_state = guard.partition_state_mut(&topic, virtual_partition_id);
-              partition_state.lease_expiration_ts_ms = Some(lease.lease_expiration_ts_ms);
-              true
-            },
-            Ok(LeaseAcquireOutcome::HeldByOther(_)) => {
-              let mut guard = state.lock().await;
-              let partition_state = guard.partition_state_mut(&topic, virtual_partition_id);
-              partition_state.lease_expiration_ts_ms = None;
-              false
-            },
-            Err(error) => {
-              warn_every!(
-                15.seconds(),
-                "lease self-assignment acquire failed: {}",
-                error
-              );
-              false
-            },
-          };
-
-          if !acquired {
-            continue;
-          }
-
-          let needs_reservation = {
-            let mut guard = state.lock().await;
-            let partition_state = guard.partition_state_mut(&topic, virtual_partition_id);
-            !partition_state.seq_allocator.can_allocate(1)
-          };
-
-          if !needs_reservation {
-            continue;
-          }
-
-          match lease_store
-            .reserve_sequences(
-              &key,
-              &holder_id,
-              now_ts_ms,
-              lease_duration_ms,
-              reservation_size,
-            )
-            .await
-          {
-            Ok(SequenceReservationOutcome::Reserved(reservation)) => {
-              let mut guard = state.lock().await;
-              let partition_state = guard.partition_state_mut(&topic, virtual_partition_id);
-              partition_state
-                .seq_allocator
-                .set_reservation(reservation.range);
-            },
-            Ok(
-              SequenceReservationOutcome::HeldByOther(_)
-              | SequenceReservationOutcome::Expired,
-            ) => {},
-            Err(error) => {
-              warn_every!(
-                15.seconds(),
-                "lease self-assignment reserve failed: {}",
-                error
-              );
-            },
-          }
-        }
-      }
-    });
   }
 
   async fn ensure_lease(
@@ -386,7 +236,6 @@ impl WriteEngineImpl {
         &key,
         &self.holder_id,
         now_ts_ms,
-        self.config.lease_duration_ms,
         self.config.reservation_size,
       )
       .await
@@ -429,6 +278,14 @@ impl WriteEngineImpl {
         }
       }
     });
+  }
+}
+
+impl Drop for WriteEngineImpl {
+  fn drop(&mut self) {
+    if let Some(shutdown_tx) = self.lease_assignment_shutdown_tx.take() {
+      let _ignored = shutdown_tx.send(());
+    }
   }
 }
 
@@ -492,9 +349,15 @@ impl WriteEngine for WriteEngineImpl {
     let (seq_range, plans) = {
       let mut state = self.state.lock().await;
       let partition_state = state.partition_state_mut(&request.topic, request.virtual_partition_id);
+      // We should normally have capacity because we reserve when `can_allocate(record_count)` is
+      // false above, and the lease-assignment loop also proactively tops up. This can still fail
+      // if ownership changed or local reservation state was invalidated concurrently.
       let seq_range = partition_state
         .seq_allocator
         .allocate(record_count)
+        // TODO(mattklein123): Consider a single inline re-reserve + allocate retry here before
+        // returning OVERLOADED. That would reduce transient write failures during rapid
+        // reservation turnover while preserving lease fencing.
         .ok_or_else(|| WriteError::Overloaded("sequence reservation exhausted".to_string()))?;
 
       partition_state.buffer.push(

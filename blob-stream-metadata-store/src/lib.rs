@@ -190,6 +190,17 @@ pub enum SequenceReservationOutcome {
 }
 
 //
+// LeaseReleaseOutcome
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeaseReleaseOutcome {
+  Released,
+  HeldByOther(ProducerPartitionLease),
+  Expired,
+}
+
+//
 // ProducerPartitionLeaseStore
 //
 
@@ -220,9 +231,16 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     now_ts_ms: i64,
-    lease_duration_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome>;
+
+  /// Release a lease held by the caller to speed up ownership convergence.
+  async fn release_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    now_ts_ms: i64,
+  ) -> Result<LeaseReleaseOutcome>;
 }
 
 //

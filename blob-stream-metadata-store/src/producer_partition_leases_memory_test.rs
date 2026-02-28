@@ -9,6 +9,7 @@ use crate::{
   InMemoryProducerPartitionLeaseStore,
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
+  LeaseReleaseOutcome,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
   SequenceReservationOutcome,
@@ -67,7 +68,7 @@ async fn reserves_sequences_in_order() {
     .expect("acquire lease");
 
   let first = store
-    .reserve_sequences(&key, "broker-a", 1000, 100, 5)
+    .reserve_sequences(&key, "broker-a", 1000, 5)
     .await
     .expect("reserve seq");
 
@@ -79,7 +80,7 @@ async fn reserves_sequences_in_order() {
   assert_eq!(first.range.end, 4);
 
   let second = store
-    .reserve_sequences(&key, "broker-a", 1000, 100, 3)
+    .reserve_sequences(&key, "broker-a", 1000, 3)
     .await
     .expect("reserve seq");
 
@@ -89,4 +90,27 @@ async fn reserves_sequences_in_order() {
 
   assert_eq!(second.range.start, 5);
   assert_eq!(second.range.end, 7);
+}
+
+#[tokio::test]
+async fn releases_lease_for_current_holder() {
+  let store = InMemoryProducerPartitionLeaseStore::new();
+  let key = lease_key();
+
+  store
+    .acquire_lease(key.clone(), "broker-a".to_string(), 1000, 100)
+    .await
+    .expect("acquire lease");
+
+  let outcome = store
+    .release_lease(&key, "broker-a", 1000)
+    .await
+    .expect("release lease");
+  assert!(matches!(outcome, LeaseReleaseOutcome::Released));
+
+  let reacquired = store
+    .acquire_lease(key, "broker-b".to_string(), 1000, 100)
+    .await
+    .expect("acquire after release");
+  assert!(matches!(reacquired, LeaseAcquireOutcome::Acquired(_)));
 }

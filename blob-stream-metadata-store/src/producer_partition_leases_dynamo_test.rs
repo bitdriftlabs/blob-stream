@@ -9,6 +9,7 @@ use crate::{
   DynamoProducerPartitionLeaseStore,
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
+  LeaseReleaseOutcome,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
   SequenceReservationOutcome,
@@ -141,9 +142,7 @@ async fn reserves_sequences_in_order() -> Result<()> {
     .acquire_lease(key.clone(), "broker-a".to_string(), 1000, 100)
     .await?;
 
-  let first = store
-    .reserve_sequences(&key, "broker-a", 1000, 100, 5)
-    .await?;
+  let first = store.reserve_sequences(&key, "broker-a", 1000, 5).await?;
 
   let SequenceReservationOutcome::Reserved(first) = first else {
     panic!("expected reservation");
@@ -152,9 +151,7 @@ async fn reserves_sequences_in_order() -> Result<()> {
   assert_eq!(first.range.start, 0);
   assert_eq!(first.range.end, 4);
 
-  let second = store
-    .reserve_sequences(&key, "broker-a", 1000, 100, 3)
-    .await?;
+  let second = store.reserve_sequences(&key, "broker-a", 1000, 3).await?;
 
   let SequenceReservationOutcome::Reserved(second) = second else {
     panic!("expected reservation");
@@ -165,5 +162,30 @@ async fn reserves_sequences_in_order() -> Result<()> {
 
   client.delete_table().table_name(table_name).send().await?;
 
+  Ok(())
+}
+
+#[tokio::test]
+async fn releases_lease_for_current_holder() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
+  create_leases_table(&client, &table_name).await?;
+
+  let store = DynamoProducerPartitionLeaseStore::new(client.clone(), table_name.clone());
+  let key = lease_key();
+
+  store
+    .acquire_lease(key.clone(), "broker-a".to_string(), 1000, 100)
+    .await?;
+
+  let release = store.release_lease(&key, "broker-a", 1000).await?;
+  assert!(matches!(release, LeaseReleaseOutcome::Released));
+
+  let reacquire = store
+    .acquire_lease(key, "broker-b".to_string(), 1000, 100)
+    .await?;
+  assert!(matches!(reacquire, LeaseAcquireOutcome::Acquired(_)));
+
+  client.delete_table().table_name(table_name).send().await?;
   Ok(())
 }

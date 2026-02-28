@@ -4,6 +4,7 @@ members = [
 	"blob-stream-broker",
 	"blob-stream-blob-store",
 	"blob-stream-metadata-store",
+	"blob-stream-producer",
 	"blob-stream-proto",
 	"blob-stream-types",
 ]

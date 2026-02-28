@@ -11,14 +11,13 @@ use super::{TopicInfo, WriteConfig, WriteEngine, WriteEngineImpl, WriteRequest};
 use anyhow::Result;
 use bd_time::{OffsetDateTimeExt, TestTimeProvider, TimeProvider};
 use blob_stream_blob_store::InMemoryBlobStore;
-use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{
   InMemoryMetadataStore,
   InMemoryProducerPartitionLeaseStore,
   MetadataStore,
 };
 use blob_stream_types::{Compression, CompressionCodec, Record, SeqRange, Window};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -201,54 +200,4 @@ async fn writes_compressed_metadata() -> Result<()> {
   let batch_metadata = segments[0].segment_index.get(&0).unwrap().first().unwrap();
   assert_eq!(batch_metadata.compression.codec, CompressionCodec::Zstd);
   Ok(())
-}
-
-#[test]
-fn ownership_changes_with_membership() {
-  let mut topics = HashMap::new();
-  topics.insert(
-    "telemetry".to_string(),
-    TopicInfo {
-      name: "telemetry".to_string(),
-      partition_count: 8,
-      num_writers: 1,
-    },
-  );
-
-  let solo_a = BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-a".to_string(),
-    address: "10.0.0.1:8080".to_string(),
-  }]);
-  let owned_solo = WriteEngineImpl::owned_virtual_partitions(&topics, 0, "node-a", &solo_a);
-  assert_eq!(owned_solo.len(), 8);
-
-  let split = BrokerMembership::new(vec![
-    BrokerNode {
-      node_id: "node-a".to_string(),
-      address: "10.0.0.1:8080".to_string(),
-    },
-    BrokerNode {
-      node_id: "node-b".to_string(),
-      address: "10.0.0.2:8080".to_string(),
-    },
-  ]);
-
-  let owned_a = WriteEngineImpl::owned_virtual_partitions(&topics, 0, "node-a", &split)
-    .into_iter()
-    .collect::<HashSet<_>>();
-  let owned_b = WriteEngineImpl::owned_virtual_partitions(&topics, 0, "node-b", &split)
-    .into_iter()
-    .collect::<HashSet<_>>();
-
-  assert!(!owned_a.is_empty());
-  assert!(!owned_b.is_empty());
-  assert!(owned_a.is_disjoint(&owned_b));
-  assert_eq!(owned_a.union(&owned_b).count(), 8);
-
-  let solo_b = BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-b".to_string(),
-    address: "10.0.0.2:8080".to_string(),
-  }]);
-  let owned_after_move = WriteEngineImpl::owned_virtual_partitions(&topics, 0, "node-a", &solo_b);
-  assert!(owned_after_move.is_empty());
 }

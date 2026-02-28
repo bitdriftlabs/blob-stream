@@ -14,6 +14,9 @@ pub mod r#static;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::cmp::Reverse;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use tokio::sync::watch;
 
 //
@@ -40,6 +43,36 @@ impl BrokerMembership {
   pub fn new(nodes: Vec<BrokerNode>) -> Self {
     Self { nodes }
   }
+}
+
+//
+// owner_for_partition
+//
+
+#[must_use]
+pub fn owner_for_partition<'a>(
+  topic: &str,
+  virtual_partition_id: u32,
+  membership: &'a BrokerMembership,
+) -> Option<&'a BrokerNode> {
+  // Rendezvous (highest-random-weight) hashing: for each candidate node, hash the tuple
+  // (topic, virtual_partition_id, node_id) and choose the node with the highest score.
+  // We model "highest" with Reverse(score) + min_by_key so ordering is deterministic and
+  // stable for equal membership views across producers and brokers.
+  membership
+    .nodes
+    .iter()
+    .map(|node| {
+      // We intentionally hash node_id (not address) so ownership only changes when logical
+      // membership changes, not when endpoint strings are reformatted.
+      let mut hasher = DefaultHasher::new();
+      topic.hash(&mut hasher);
+      virtual_partition_id.hash(&mut hasher);
+      node.node_id.hash(&mut hasher);
+      (Reverse(hasher.finish()), node)
+    })
+    .min_by_key(|(score, _)| *score)
+    .map(|(_, node)| node)
 }
 
 //

@@ -1019,6 +1019,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "blob-stream-producer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bd-grpc",
+ "blob-stream-broker-discovery",
+ "blob-stream-proto",
+ "blob-stream-types",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "blob-stream-proto"
 version = "0.1.0"
 dependencies = [
