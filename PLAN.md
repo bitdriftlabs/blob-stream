@@ -658,14 +658,14 @@ Notes:
     - `blob-stream-broker/Cargo.toml` (bd-server-stats + prometheus dependencies)
 
 - [ ] Milestone 13: End-to-end integration
-  - [ ] Write integration tests for broker + producer + consumer using docker compose for
+  - [x] Write integration tests for broker + producer + consumer using docker compose for
         dependencies (local S3/Dynamo). The integration tests should use real networking but all
         be run in the same process. Develop an integration test framework that is able to start
         N brokers binding to port 0 to allow test concurrency. Then allow N producers and M
         consumers to operate against the brokers. A fake dynamic discovery mechanism can be used
         to simulate k8s service discovery.
-  - [ ] Verify autoscaling behaviors (simulated broker/consumer membership changes).
-  - [ ] Validate duplicate handling and cursor monotonicity under retries.
+  - [x] Verify autoscaling behaviors (simulated broker/consumer membership changes).
+  - [x] Validate duplicate handling and cursor monotonicity under retries.
   - [ ] Additionally develop a deterministic fault injection framework that can be used during
         integration tests. This should use a simulated network and broker discovery implementation
         that can be driven during tests. Then use this to test failure cases across producers,

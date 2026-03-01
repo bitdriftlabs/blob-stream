@@ -39,6 +39,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use time::ext::NumericalDuration;
 use tokio::sync::oneshot;
 
+// TODO(mattklein123): Add prefetching.
+
+// TODO(mattklein123): Add backoff to stop wasting resources in low throughput scenarios.
 const IDLE_POLL_DELAY_MS: u64 = 50;
 
 //

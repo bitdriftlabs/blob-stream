@@ -340,16 +340,22 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       ":holder".to_string(),
       AttributeValue::S(holder_id.to_string()),
     );
+    values.insert(
+      ":expired".to_string(),
+      AttributeValue::N(now_ts_ms.to_string()),
+    );
 
+    let update = format!("SET {ATTR_EXPIRES} = :expired");
     let condition = format!("{ATTR_HOLDER} = :holder");
     let response = self
       .client
-      .delete_item()
+      .update_item()
       .table_name(&self.table_name)
       .key(ATTR_PK, AttributeValue::S(key.format()))
+      .update_expression(update)
       .condition_expression(condition)
       .set_expression_attribute_values(Some(values))
-      .return_values(ReturnValue::AllOld)
+      .return_values(ReturnValue::AllNew)
       .send()
       .await;
 

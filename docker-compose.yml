@@ -7,3 +7,12 @@ services:
     command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
     ports:
       - "8000:8000"
+
+  localstack:
+    image: localstack/localstack:latest
+    container_name: blob-stream-localstack
+    environment:
+      - SERVICES=s3
+      - AWS_DEFAULT_REGION=us-east-1
+    ports:
+      - "4566:4566"

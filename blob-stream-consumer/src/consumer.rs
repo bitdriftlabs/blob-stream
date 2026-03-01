@@ -327,11 +327,14 @@ impl ConsumerReader for ConsumerReaderImpl {
 
           for batch_metadata in sorted_batches {
             // Cursor semantics: seq_end <= cursor was already consumed and can be skipped.
-            let current_cursor = self.cursors.get(partition_id).copied().unwrap_or(0);
-            if batch_metadata.seq_range.end <= current_cursor {
+            let current_cursor = self.cursors.get(partition_id).copied();
+            if current_cursor.is_some_and(|cursor| batch_metadata.seq_range.end <= cursor) {
               trace!(
                 "consumer skipped batch by cursor: topic={}, partition={}, seq_end={}, cursor={}",
-                self.config.topic, partition_id, batch_metadata.seq_range.end, current_cursor
+                self.config.topic,
+                partition_id,
+                batch_metadata.seq_range.end,
+                current_cursor.unwrap_or(0)
               );
               continue;
             }
@@ -342,7 +345,7 @@ impl ConsumerReader for ConsumerReaderImpl {
               .await?;
 
             // Cursor always moves forward. max() keeps monotonicity if metadata ordering is odd.
-            let next_cursor = batch.seq_range.end.max(current_cursor);
+            let next_cursor = batch.seq_range.end.max(current_cursor.unwrap_or(0));
             self.cursors.insert(*partition_id, next_cursor);
             trace!(
               "consumer accepted batch: topic={}, partition={}, seq_start={}, seq_end={}, \

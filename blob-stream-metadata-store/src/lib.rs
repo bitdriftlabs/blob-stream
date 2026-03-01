@@ -317,6 +317,8 @@ pub enum ConsumerGroupCommitOutcome {
 // ConsumerGroupLeaseStore
 //
 
+// TODO(mattklein123): Consumers should release the lease on shutdown to speed up convergence.
+
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait ConsumerGroupLeaseStore: Send + Sync {

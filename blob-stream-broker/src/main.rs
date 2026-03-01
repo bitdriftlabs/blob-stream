@@ -15,6 +15,7 @@ struct Cli {
   config: PathBuf,
 }
 
+// fixfix use bd-rt/bd-panic/bd-log
 #[tokio::main]
 async fn main() -> Result<()> {
   let cli = Cli::parse();
