@@ -178,3 +178,39 @@ message ProducerRuntimeConfig {
   // Optional stats scope prefix.
   string stats_scope = 4;
 }
+
+// Consumer read path settings.
+message ConsumerReadConfig {
+  // Topic to scan for segment metadata.
+  string topic = 1;
+  // Fixed window size used for metadata scanning.
+  optional int64 window_size_seconds = 2;
+  // Number of trailing windows to scan on each read.
+  optional uint32 lookback_windows = 3;
+}
+
+// Consumer group lease and heartbeat settings.
+message ConsumerGroupConfig {
+  // Topic for the consumer group lease domain.
+  string topic = 1;
+  // Consumer group id.
+  string group_id = 2;
+  // Stable member id for this consumer instance.
+  string member_id = 3;
+  // Lease duration in milliseconds.
+  optional int64 lease_duration_ms = 4;
+  // Heartbeat interval in milliseconds.
+  optional int64 heartbeat_interval_ms = 5;
+  // Rebalance interval in milliseconds.
+  optional int64 rebalance_interval_ms = 6;
+}
+
+// Runtime configuration for consumer library applications.
+message ConsumerRuntimeConfig {
+  // Read path configuration.
+  ConsumerReadConfig read = 1;
+  // Group coordination configuration.
+  ConsumerGroupConfig group = 2;
+  // Optional stats scope prefix.
+  string stats_scope = 3;
+}

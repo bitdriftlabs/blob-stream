@@ -9,7 +9,7 @@
 #[path = "./coordination_test.rs"]
 mod tests;
 
-use crate::config::ConsumerGroupConfig;
+use crate::config::{ConsumerGroupConfig, consumer_lease_duration_ms, validate_group_config};
 use anyhow::Result;
 use async_trait::async_trait;
 use blob_stream_metadata_store::{
@@ -19,6 +19,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupLeaseStore,
 };
 use blob_stream_types::{CommittedCursor, VirtualPartitionId};
+use log::info;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -74,6 +75,16 @@ pub struct HeartbeatReport {
 }
 
 //
+// RebalanceReport
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebalanceReport {
+  pub owned_partitions: Vec<VirtualPartitionId>,
+  pub committed_cursors: HashMap<VirtualPartitionId, u64>,
+}
+
+//
 // ConsumerGroupCoordinator
 //
 
@@ -84,7 +95,7 @@ pub trait ConsumerGroupCoordinator: Send {
     members: Vec<String>,
     partitions: Vec<VirtualPartitionId>,
     now_ts_ms: i64,
-  ) -> Result<Vec<VirtualPartitionId>>;
+  ) -> Result<RebalanceReport>;
 
   async fn heartbeat_and_commit(
     &mut self,
@@ -115,7 +126,7 @@ impl ConsumerGroupCoordinatorImpl {
   ) -> Result<Self> {
     // Validate static configuration once at construction so runtime paths stay focused on
     // coordination logic.
-    config.validate()?;
+    validate_group_config(&config)?;
     Ok(Self {
       config,
       lease_store,
@@ -133,7 +144,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     members: Vec<String>,
     partitions: Vec<VirtualPartitionId>,
     now_ts_ms: i64,
-  ) -> Result<Vec<VirtualPartitionId>> {
+  ) -> Result<RebalanceReport> {
     // Compute target assignment from current membership + partition set while preserving prior
     // placements when possible.
     let desired_assignment = cooperative_sticky_assignment(
@@ -147,24 +158,29 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     // lease operations to fence stale coordinators/owners.
     if self.desired_assignment != desired_assignment {
       self.generation = self.generation.saturating_add(1);
+      info!(
+        "consumer rebalance plan changed: topic={}, group_id={}, member_id={}, generation={}",
+        self.config.topic, self.config.group_id, self.config.member_id, self.generation
+      );
       self.desired_assignment = desired_assignment;
     }
 
     // Rebuild owned set from lease-store assignment outcomes for this pass.
     // We do not assume local desired ownership implies real ownership.
     self.owned.clear();
+    let mut committed_cursors = HashMap::new();
     for partition_id in partitions {
       let Some(owner_id) = self.desired_assignment.get(&partition_id) else {
         continue;
       };
       // Skip partitions assigned to other members.
-      if owner_id != &self.config.member_id {
+      if owner_id != self.config.member_id.to_string().as_str() {
         continue;
       }
 
       let key = ConsumerGroupLeaseKey {
-        topic: self.config.topic.clone(),
-        group_id: self.config.group_id.clone(),
+        topic: self.config.topic.to_string(),
+        group_id: self.config.group_id.to_string(),
         virtual_partition_id: partition_id,
       };
 
@@ -172,23 +188,37 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
         .lease_store
         .assign_partition(
           key,
-          self.config.member_id.clone(),
+          self.config.member_id.to_string(),
           self.generation,
           now_ts_ms,
-          self.config.lease_duration_ms,
+          consumer_lease_duration_ms(&self.config),
         )
         .await?;
 
       // Track only partitions that the lease store actually granted to this member.
-      if matches!(outcome, ConsumerGroupAssignmentOutcome::Assigned(_)) {
+      if let ConsumerGroupAssignmentOutcome::Assigned(lease) = outcome {
         self.owned.insert(partition_id);
+        if let Some(committed_cursor) = lease.committed_cursor {
+          committed_cursors.insert(partition_id, committed_cursor.seq_end);
+        }
       }
     }
 
     // Stable ordering helps deterministic tests and predictable downstream behavior.
     let mut owned = self.owned.iter().copied().collect::<Vec<_>>();
     owned.sort_unstable();
-    Ok(owned)
+    info!(
+      "consumer rebalance applied: topic={}, group_id={}, member_id={}, generation={}, owned={}",
+      self.config.topic,
+      self.config.group_id,
+      self.config.member_id,
+      self.generation,
+      owned.len()
+    );
+    Ok(RebalanceReport {
+      owned_partitions: owned,
+      committed_cursors,
+    })
   }
 
   async fn heartbeat_and_commit(
@@ -212,8 +242,8 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
         });
 
       let key = ConsumerGroupLeaseKey {
-        topic: self.config.topic.clone(),
-        group_id: self.config.group_id.clone(),
+        topic: self.config.topic.to_string(),
+        group_id: self.config.group_id.to_string(),
         virtual_partition_id: partition_id,
       };
 
@@ -224,7 +254,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
           &self.config.member_id,
           self.generation,
           now_ts_ms,
-          self.config.lease_duration_ms,
+          consumer_lease_duration_ms(&self.config),
           committed_cursor,
         )
         .await?;
@@ -238,6 +268,14 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
           fenced.push(partition_id);
         },
       }
+    }
+
+    if !fenced.is_empty() {
+      info!(
+        "consumer fenced partitions detected: topic={}, group_id={}, member_id={}, generation={}, \
+         fenced={:?}",
+        self.config.topic, self.config.group_id, self.config.member_id, self.generation, fenced
+      );
     }
 
     renewed.sort_unstable();

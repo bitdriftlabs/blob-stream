@@ -624,28 +624,44 @@ Notes:
     - `blob-stream-consumer/src/coordination_test.rs`
     - `blob-stream-consumer/src/lib.rs`
 
-- [ ] Milestone 11: Consumer config + observability + ready library
-  - [ ] Define config in blob-stream-proto
-  - [ ] Add bd-server-stats metrics throughput, retries, and latency.
-  - [ ] Add logging throughout the code. High throughput logging should be trace/debug level. All
-        coordination changes should be info level.
-  - [ ] The end result is a library ready to use in applications.
+- [x] Milestone 11: Consumer config + observability + ready library
+  - [x] Define config in blob-stream-proto
+  - [x] Add bd-server-stats metrics throughput, retries, and latency.
+  - [x] Add logging throughout the code. High throughput logging should be trace/debug level. All
+    coordination changes should be info level.
+  - [x] The end result is a library ready to use in applications.
+  - Source map:
+    - `blob-stream-proto/proto/blobstream/v1/config.proto` (consumer read/group/runtime config messages)
+    - `blob-stream-consumer/src/config.rs` (proto-backed config exports, defaults, and validation)
+    - `blob-stream-consumer/src/consumer.rs` (proto-config read path integration + assignment/cursor mutators)
+    - `blob-stream-consumer/src/coordination.rs` (info-level coordination logging + proto-config accessors)
+    - `blob-stream-consumer/src/iterator.rs` (Kafka-like iterator trait, revocation callback, heartbeat/rebalance loop, metrics)
+    - `blob-stream-consumer/src/iterator_test.rs` (revocation callback and commit/renewal tests)
+    - `blob-stream-consumer/src/lib.rs` (iterator/runtime API exports)
+    - `blob-stream-consumer/Cargo.toml` (consumer observability + proto/runtime dependencies)
 
 - [ ] Milestone 12: Observability + logging
-  - [ ] Add bd-server-stats metrics for broker/producer/consumer throughput and lag.
-  - [ ] Add structured logging with debug/trace for hot paths.
-  - [ ] Apply warn_every for noisy warnings.
+  - [ ] Do another pass and add bd-server-stats metrics for broker/producer/consumer that will
+        provide operational value. Verify all crates.
+  - [ ] Add structured logging with debug/trace for hot paths. Use info logging for anything low
+        rate or related to startup/shutdown. Verify all crates. Use warn_every for any handled
+        errors that can fail at high rate.
   - [ ] Create an axum admin handler in the broker to expose prometheus metrics collected via
         bd-server-stats.
 
 - [ ] Milestone 13: End-to-end integration
-  - [ ] Compose broker + producer + consumer in docker compose (local S3/Dynamo).
+  - [ ] Write integration tests for broker + producer + consumer using docker compose for
+        dependencies (local S3/Dynamo). The integration tests should use real networking but all
+        be run in the same process. Develop an integration test framework that is able to start
+        N brokers binding to port 0 to allow test concurrency. Then allow N producers and M
+        consumers to operate against the brokers. A fake dynamic discovery mechanism can be used
+        to simulate k8s service discovery.
   - [ ] Verify autoscaling behaviors (simulated broker/consumer membership changes).
   - [ ] Validate duplicate handling and cursor monotonicity under retries.
-  - [ ] Develop a deterministic fault injection framework that can be used during integration
-        tests. This can use a simulated network and broker discovery implementation that can
-        be driven during tests. Then use this to test failure cases across producers, brokers,
-        and consumers.
+  - [ ] Additionally develop a deterministic fault injection framework that can be used during
+        integration tests. This should use a simulated network and broker discovery implementation
+        that can be driven during tests. Then use this to test failure cases across producers,
+        brokers, and consumers.
   - [ ] Write detailed README.md on how to use the system including details on the producer library
         and configuration, consumer library and configuration, and broker service setup. Also
         include details on all of the Dynamo tables required as well as any details about the

@@ -111,12 +111,13 @@ async fn advances_cursor_and_dedupes_on_rescan() {
 
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
-      topic: "telemetry".to_string(),
-      window_size_seconds: 300,
-      lookback_windows: 2,
-      assigned_virtual_partitions: vec![7],
-      initial_cursors: HashMap::new(),
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      lookback_windows: Some(2),
+      ..Default::default()
     },
+    vec![7],
+    HashMap::new(),
     blob_store,
     metadata_store,
   )
@@ -152,12 +153,13 @@ async fn catches_late_metadata_with_lookback_window() {
 
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
-      topic: "telemetry".to_string(),
-      window_size_seconds: 300,
-      lookback_windows: 3,
-      assigned_virtual_partitions: vec![11],
-      initial_cursors: HashMap::new(),
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      lookback_windows: Some(3),
+      ..Default::default()
     },
+    vec![11],
+    HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
   )
@@ -206,12 +208,13 @@ async fn decodes_zstd_compressed_batches() {
 
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
-      topic: "telemetry".to_string(),
-      window_size_seconds: 300,
-      lookback_windows: 2,
-      assigned_virtual_partitions: vec![3],
-      initial_cursors: HashMap::new(),
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      lookback_windows: Some(2),
+      ..Default::default()
     },
+    vec![3],
+    HashMap::new(),
     blob_store,
     metadata_store,
   )

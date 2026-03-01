@@ -9,7 +9,12 @@
 #[path = "./consumer_test.rs"]
 mod tests;
 
-use crate::config::ConsumerReadConfig;
+use crate::config::{
+  ConsumerReadConfig,
+  consumer_lookback_windows,
+  consumer_window_size_seconds,
+  validate_read_config,
+};
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use blob_stream_blob_store::{BlobStore, ByteRange};
@@ -147,21 +152,25 @@ pub struct ConsumerReaderImpl {
   config: ConsumerReadConfig,
   blob_store: Arc<dyn BlobStore>,
   metadata_store: Arc<dyn MetadataStore>,
+  assigned_virtual_partitions: Vec<VirtualPartitionId>,
   cursors: HashMap<VirtualPartitionId, u64>,
 }
 
 impl ConsumerReaderImpl {
   pub fn new(
     config: ConsumerReadConfig,
+    assigned_virtual_partitions: Vec<VirtualPartitionId>,
+    initial_cursors: HashMap<VirtualPartitionId, u64>,
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
   ) -> Result<Self> {
-    config.validate()?;
+    validate_read_config(&config)?;
 
     // Seed runtime cursors from the caller-provided committed state.
     // Missing partitions default to cursor 0 during read processing.
     Ok(Self {
-      cursors: config.initial_cursors.clone(),
+      assigned_virtual_partitions,
+      cursors: initial_cursors,
       config,
       blob_store,
       metadata_store,
@@ -172,14 +181,17 @@ impl ConsumerReaderImpl {
     // Anchor scans to the current fixed-size time window and include a trailing lookback span.
     // Oldest -> newest ordering keeps processing chronology intuitive.
     let current_window =
-      Window::for_timestamp(now_unix_seconds, self.config.window_size_seconds).start_unix_seconds;
+      Window::for_timestamp(now_unix_seconds, consumer_window_size_seconds(&self.config))
+        .start_unix_seconds;
 
-    let mut windows = Vec::with_capacity(self.config.lookback_windows as usize);
-    for offset in (0 .. self.config.lookback_windows).rev() {
-      let window_start = current_window
-        .saturating_sub(i64::from(offset).saturating_mul(self.config.window_size_seconds));
+    let lookback_windows = consumer_lookback_windows(&self.config);
+    let window_size_seconds = consumer_window_size_seconds(&self.config);
+    let mut windows = Vec::with_capacity(lookback_windows as usize);
+    for offset in (0 .. lookback_windows).rev() {
+      let window_start =
+        current_window.saturating_sub(i64::from(offset).saturating_mul(window_size_seconds));
       windows.push(TopicWindowKey {
-        topic: self.config.topic.clone(),
+        topic: self.config.topic.to_string(),
         window_start_unix_seconds: window_start,
       });
     }
@@ -230,6 +242,29 @@ impl ConsumerReaderImpl {
       records: record_batch.records,
     })
   }
+
+  pub fn set_assigned_virtual_partitions(
+    &mut self,
+    assigned_virtual_partitions: Vec<VirtualPartitionId>,
+  ) -> Result<()> {
+    self.assigned_virtual_partitions = assigned_virtual_partitions;
+    Ok(())
+  }
+
+  pub fn set_cursor(&mut self, virtual_partition_id: VirtualPartitionId, seq_end: u64) {
+    self.cursors.insert(virtual_partition_id, seq_end);
+  }
+
+  pub fn hydrate_cursor(&mut self, virtual_partition_id: VirtualPartitionId, seq_end: u64) {
+    let current = self
+      .cursors
+      .get(&virtual_partition_id)
+      .copied()
+      .unwrap_or(0);
+    self
+      .cursors
+      .insert(virtual_partition_id, current.max(seq_end));
+  }
 }
 
 #[async_trait]
@@ -247,7 +282,7 @@ impl ConsumerReader for ConsumerReaderImpl {
 
       for segment in segments {
         // Restrict work to currently assigned virtual partitions only.
-        for partition_id in &self.config.assigned_virtual_partitions {
+        for partition_id in &self.assigned_virtual_partitions {
           let Some(partition_batches) = segment.segment_index.get(partition_id) else {
             continue;
           };

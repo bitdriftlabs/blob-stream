@@ -59,10 +59,13 @@ async fn heartbeat_commit_renews_and_commits_cursor() {
   let store: Arc<dyn ConsumerGroupLeaseStore> = Arc::new(InMemoryConsumerGroupLeaseStore::new());
   let mut coordinator = ConsumerGroupCoordinatorImpl::new(
     ConsumerGroupConfig {
-      topic: "topic-a".to_string(),
-      group_id: "group-a".to_string(),
-      member_id: "member-a".to_string(),
-      lease_duration_ms: 100,
+      topic: "topic-a".to_string().into(),
+      group_id: "group-a".to_string().into(),
+      member_id: "member-a".to_string().into(),
+      lease_duration_ms: Some(100),
+      heartbeat_interval_ms: Some(50),
+      rebalance_interval_ms: Some(50),
+      ..Default::default()
     },
     Arc::clone(&store),
   )
@@ -72,7 +75,8 @@ async fn heartbeat_commit_renews_and_commits_cursor() {
     .rebalance(vec!["member-a".to_string()], vec![7], 1_000)
     .await
     .unwrap();
-  assert_eq!(owned, vec![7]);
+  assert_eq!(owned.owned_partitions, vec![7]);
+  assert!(owned.committed_cursors.is_empty());
 
   let report = coordinator
     .heartbeat_and_commit(1_010, &HashMap::from([(7_u32, 10_u64)]))
@@ -88,10 +92,13 @@ async fn heartbeat_detects_fencing_by_new_generation() {
   let store: Arc<dyn ConsumerGroupLeaseStore> = concrete_store.clone();
   let mut coordinator = ConsumerGroupCoordinatorImpl::new(
     ConsumerGroupConfig {
-      topic: "topic-a".to_string(),
-      group_id: "group-a".to_string(),
-      member_id: "member-a".to_string(),
-      lease_duration_ms: 100,
+      topic: "topic-a".to_string().into(),
+      group_id: "group-a".to_string().into(),
+      member_id: "member-a".to_string().into(),
+      lease_duration_ms: Some(100),
+      heartbeat_interval_ms: Some(50),
+      rebalance_interval_ms: Some(50),
+      ..Default::default()
     },
     Arc::clone(&store),
   )

@@ -3220,6 +3220,536 @@ impl ::protobuf::reflect::ProtobufValue for ProducerRuntimeConfig {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
+// @@protoc_insertion_point(message:blobstream.v1.ConsumerReadConfig)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct ConsumerReadConfig {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.topic)
+    pub topic: ::protobuf::Chars,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.window_size_seconds)
+    pub window_size_seconds: ::std::option::Option<i64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.lookback_windows)
+    pub lookback_windows: ::std::option::Option<u32>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.ConsumerReadConfig.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a ConsumerReadConfig {
+    fn default() -> &'a ConsumerReadConfig {
+        <ConsumerReadConfig as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl ConsumerReadConfig {
+    pub fn new() -> ConsumerReadConfig {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(3);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "topic",
+            |m: &ConsumerReadConfig| { &m.topic },
+            |m: &mut ConsumerReadConfig| { &mut m.topic },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "window_size_seconds",
+            |m: &ConsumerReadConfig| { &m.window_size_seconds },
+            |m: &mut ConsumerReadConfig| { &mut m.window_size_seconds },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "lookback_windows",
+            |m: &ConsumerReadConfig| { &m.lookback_windows },
+            |m: &mut ConsumerReadConfig| { &mut m.lookback_windows },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ConsumerReadConfig>(
+            "ConsumerReadConfig",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for ConsumerReadConfig {
+    const NAME: &'static str = "ConsumerReadConfig";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.topic = is.read_tokio_chars()?;
+                },
+                16 => {
+                    self.window_size_seconds = ::std::option::Option::Some(is.read_int64()?);
+                },
+                24 => {
+                    self.lookback_windows = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if !self.topic.is_empty() {
+            my_size += ::protobuf::rt::string_size(1, &self.topic);
+        }
+        if let Some(v) = self.window_size_seconds {
+            my_size += ::protobuf::rt::int64_size(2, v);
+        }
+        if let Some(v) = self.lookback_windows {
+            my_size += ::protobuf::rt::uint32_size(3, v);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if !self.topic.is_empty() {
+            os.write_string(1, &self.topic)?;
+        }
+        if let Some(v) = self.window_size_seconds {
+            os.write_int64(2, v)?;
+        }
+        if let Some(v) = self.lookback_windows {
+            os.write_uint32(3, v)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> ConsumerReadConfig {
+        ConsumerReadConfig::new()
+    }
+
+    fn clear(&mut self) {
+        self.topic.clear();
+        self.window_size_seconds = ::std::option::Option::None;
+        self.lookback_windows = ::std::option::Option::None;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static ConsumerReadConfig {
+        static instance: ConsumerReadConfig = ConsumerReadConfig {
+            topic: ::protobuf::Chars::new(),
+            window_size_seconds: ::std::option::Option::None,
+            lookback_windows: ::std::option::Option::None,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for ConsumerReadConfig {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("ConsumerReadConfig").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for ConsumerReadConfig {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for ConsumerReadConfig {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.ConsumerGroupConfig)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct ConsumerGroupConfig {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.topic)
+    pub topic: ::protobuf::Chars,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.group_id)
+    pub group_id: ::protobuf::Chars,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.member_id)
+    pub member_id: ::protobuf::Chars,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.lease_duration_ms)
+    pub lease_duration_ms: ::std::option::Option<i64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.heartbeat_interval_ms)
+    pub heartbeat_interval_ms: ::std::option::Option<i64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.rebalance_interval_ms)
+    pub rebalance_interval_ms: ::std::option::Option<i64>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.ConsumerGroupConfig.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a ConsumerGroupConfig {
+    fn default() -> &'a ConsumerGroupConfig {
+        <ConsumerGroupConfig as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl ConsumerGroupConfig {
+    pub fn new() -> ConsumerGroupConfig {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(6);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "topic",
+            |m: &ConsumerGroupConfig| { &m.topic },
+            |m: &mut ConsumerGroupConfig| { &mut m.topic },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "group_id",
+            |m: &ConsumerGroupConfig| { &m.group_id },
+            |m: &mut ConsumerGroupConfig| { &mut m.group_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "member_id",
+            |m: &ConsumerGroupConfig| { &m.member_id },
+            |m: &mut ConsumerGroupConfig| { &mut m.member_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "lease_duration_ms",
+            |m: &ConsumerGroupConfig| { &m.lease_duration_ms },
+            |m: &mut ConsumerGroupConfig| { &mut m.lease_duration_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "heartbeat_interval_ms",
+            |m: &ConsumerGroupConfig| { &m.heartbeat_interval_ms },
+            |m: &mut ConsumerGroupConfig| { &mut m.heartbeat_interval_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "rebalance_interval_ms",
+            |m: &ConsumerGroupConfig| { &m.rebalance_interval_ms },
+            |m: &mut ConsumerGroupConfig| { &mut m.rebalance_interval_ms },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ConsumerGroupConfig>(
+            "ConsumerGroupConfig",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for ConsumerGroupConfig {
+    const NAME: &'static str = "ConsumerGroupConfig";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.topic = is.read_tokio_chars()?;
+                },
+                18 => {
+                    self.group_id = is.read_tokio_chars()?;
+                },
+                26 => {
+                    self.member_id = is.read_tokio_chars()?;
+                },
+                32 => {
+                    self.lease_duration_ms = ::std::option::Option::Some(is.read_int64()?);
+                },
+                40 => {
+                    self.heartbeat_interval_ms = ::std::option::Option::Some(is.read_int64()?);
+                },
+                48 => {
+                    self.rebalance_interval_ms = ::std::option::Option::Some(is.read_int64()?);
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if !self.topic.is_empty() {
+            my_size += ::protobuf::rt::string_size(1, &self.topic);
+        }
+        if !self.group_id.is_empty() {
+            my_size += ::protobuf::rt::string_size(2, &self.group_id);
+        }
+        if !self.member_id.is_empty() {
+            my_size += ::protobuf::rt::string_size(3, &self.member_id);
+        }
+        if let Some(v) = self.lease_duration_ms {
+            my_size += ::protobuf::rt::int64_size(4, v);
+        }
+        if let Some(v) = self.heartbeat_interval_ms {
+            my_size += ::protobuf::rt::int64_size(5, v);
+        }
+        if let Some(v) = self.rebalance_interval_ms {
+            my_size += ::protobuf::rt::int64_size(6, v);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if !self.topic.is_empty() {
+            os.write_string(1, &self.topic)?;
+        }
+        if !self.group_id.is_empty() {
+            os.write_string(2, &self.group_id)?;
+        }
+        if !self.member_id.is_empty() {
+            os.write_string(3, &self.member_id)?;
+        }
+        if let Some(v) = self.lease_duration_ms {
+            os.write_int64(4, v)?;
+        }
+        if let Some(v) = self.heartbeat_interval_ms {
+            os.write_int64(5, v)?;
+        }
+        if let Some(v) = self.rebalance_interval_ms {
+            os.write_int64(6, v)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> ConsumerGroupConfig {
+        ConsumerGroupConfig::new()
+    }
+
+    fn clear(&mut self) {
+        self.topic.clear();
+        self.group_id.clear();
+        self.member_id.clear();
+        self.lease_duration_ms = ::std::option::Option::None;
+        self.heartbeat_interval_ms = ::std::option::Option::None;
+        self.rebalance_interval_ms = ::std::option::Option::None;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static ConsumerGroupConfig {
+        static instance: ConsumerGroupConfig = ConsumerGroupConfig {
+            topic: ::protobuf::Chars::new(),
+            group_id: ::protobuf::Chars::new(),
+            member_id: ::protobuf::Chars::new(),
+            lease_duration_ms: ::std::option::Option::None,
+            heartbeat_interval_ms: ::std::option::Option::None,
+            rebalance_interval_ms: ::std::option::Option::None,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for ConsumerGroupConfig {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("ConsumerGroupConfig").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for ConsumerGroupConfig {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for ConsumerGroupConfig {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.ConsumerRuntimeConfig)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct ConsumerRuntimeConfig {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerRuntimeConfig.read)
+    pub read: ::protobuf::MessageField<ConsumerReadConfig>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerRuntimeConfig.group)
+    pub group: ::protobuf::MessageField<ConsumerGroupConfig>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerRuntimeConfig.stats_scope)
+    pub stats_scope: ::protobuf::Chars,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.ConsumerRuntimeConfig.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a ConsumerRuntimeConfig {
+    fn default() -> &'a ConsumerRuntimeConfig {
+        <ConsumerRuntimeConfig as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl ConsumerRuntimeConfig {
+    pub fn new() -> ConsumerRuntimeConfig {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(3);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ConsumerReadConfig>(
+            "read",
+            |m: &ConsumerRuntimeConfig| { &m.read },
+            |m: &mut ConsumerRuntimeConfig| { &mut m.read },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ConsumerGroupConfig>(
+            "group",
+            |m: &ConsumerRuntimeConfig| { &m.group },
+            |m: &mut ConsumerRuntimeConfig| { &mut m.group },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "stats_scope",
+            |m: &ConsumerRuntimeConfig| { &m.stats_scope },
+            |m: &mut ConsumerRuntimeConfig| { &mut m.stats_scope },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ConsumerRuntimeConfig>(
+            "ConsumerRuntimeConfig",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for ConsumerRuntimeConfig {
+    const NAME: &'static str = "ConsumerRuntimeConfig";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.read)?;
+                },
+                18 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.group)?;
+                },
+                26 => {
+                    self.stats_scope = is.read_tokio_chars()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if let Some(v) = self.read.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
+        if let Some(v) = self.group.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
+        if !self.stats_scope.is_empty() {
+            my_size += ::protobuf::rt::string_size(3, &self.stats_scope);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if let Some(v) = self.read.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(1, v, os)?;
+        }
+        if let Some(v) = self.group.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
+        }
+        if !self.stats_scope.is_empty() {
+            os.write_string(3, &self.stats_scope)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> ConsumerRuntimeConfig {
+        ConsumerRuntimeConfig::new()
+    }
+
+    fn clear(&mut self) {
+        self.read.clear();
+        self.group.clear();
+        self.stats_scope.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static ConsumerRuntimeConfig {
+        static instance: ConsumerRuntimeConfig = ConsumerRuntimeConfig {
+            read: ::protobuf::MessageField::none(),
+            group: ::protobuf::MessageField::none(),
+            stats_scope: ::protobuf::Chars::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for ConsumerRuntimeConfig {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("ConsumerRuntimeConfig").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for ConsumerRuntimeConfig {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for ConsumerRuntimeConfig {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
 #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
 // @@protoc_insertion_point(enum:blobstream.v1.ProducerCompression)
 pub enum ProducerCompression {
@@ -3346,9 +3876,25 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x1d.blobstream.v1.ProducerConfigR\x08producer\x12B\n\tdiscovery\x18\x02\
     \x20\x01(\x0b2$.blobstream.v1.BrokerDiscoveryConfigR\tdiscovery\x122\n\
     \x06topics\x18\x03\x20\x03(\x0b2\x1a.blobstream.v1.TopicConfigR\x06topic\
-    s\x12\x1f\n\x0bstats_scope\x18\x04\x20\x01(\tR\nstatsScope*U\n\x13Produc\
-    erCompression\x12\x1d\n\x19PRODUCER_COMPRESSION_NONE\x10\0\x12\x1f\n\x1b\
-    PRODUCER_COMPRESSION_SNAPPY\x10\x01b\x06proto3\
+    s\x12\x1f\n\x0bstats_scope\x18\x04\x20\x01(\tR\nstatsScope\"\xbc\x01\n\
+    \x12ConsumerReadConfig\x12\x14\n\x05topic\x18\x01\x20\x01(\tR\x05topic\
+    \x123\n\x13window_size_seconds\x18\x02\x20\x01(\x03H\0R\x11windowSizeSec\
+    onds\x88\x01\x01\x12.\n\x10lookback_windows\x18\x03\x20\x01(\rH\x01R\x0f\
+    lookbackWindows\x88\x01\x01B\x16\n\x14_window_size_secondsB\x13\n\x11_lo\
+    okback_windows\"\xd0\x02\n\x13ConsumerGroupConfig\x12\x14\n\x05topic\x18\
+    \x01\x20\x01(\tR\x05topic\x12\x19\n\x08group_id\x18\x02\x20\x01(\tR\x07g\
+    roupId\x12\x1b\n\tmember_id\x18\x03\x20\x01(\tR\x08memberId\x12/\n\x11le\
+    ase_duration_ms\x18\x04\x20\x01(\x03H\0R\x0fleaseDurationMs\x88\x01\x01\
+    \x127\n\x15heartbeat_interval_ms\x18\x05\x20\x01(\x03H\x01R\x13heartbeat\
+    IntervalMs\x88\x01\x01\x127\n\x15rebalance_interval_ms\x18\x06\x20\x01(\
+    \x03H\x02R\x13rebalanceIntervalMs\x88\x01\x01B\x14\n\x12_lease_duration_\
+    msB\x18\n\x16_heartbeat_interval_msB\x18\n\x16_rebalance_interval_ms\"\
+    \xa9\x01\n\x15ConsumerRuntimeConfig\x125\n\x04read\x18\x01\x20\x01(\x0b2\
+    !.blobstream.v1.ConsumerReadConfigR\x04read\x128\n\x05group\x18\x02\x20\
+    \x01(\x0b2\".blobstream.v1.ConsumerGroupConfigR\x05group\x12\x1f\n\x0bst\
+    ats_scope\x18\x03\x20\x01(\tR\nstatsScope*U\n\x13ProducerCompression\x12\
+    \x1d\n\x19PRODUCER_COMPRESSION_NONE\x10\0\x12\x1f\n\x1bPRODUCER_COMPRESS\
+    ION_SNAPPY\x10\x01b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -3366,7 +3912,7 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
     file_descriptor.get(|| {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
             let mut deps = ::std::vec::Vec::with_capacity(0);
-            let mut messages = ::std::vec::Vec::with_capacity(17);
+            let mut messages = ::std::vec::Vec::with_capacity(20);
             messages.push(BrokerConfig::generated_message_descriptor_data());
             messages.push(BrokerNodeIdentityConfig::generated_message_descriptor_data());
             messages.push(BrokerHostnameIdentity::generated_message_descriptor_data());
@@ -3384,6 +3930,9 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             messages.push(RuntimeConfig::generated_message_descriptor_data());
             messages.push(ProducerConfig::generated_message_descriptor_data());
             messages.push(ProducerRuntimeConfig::generated_message_descriptor_data());
+            messages.push(ConsumerReadConfig::generated_message_descriptor_data());
+            messages.push(ConsumerGroupConfig::generated_message_descriptor_data());
+            messages.push(ConsumerRuntimeConfig::generated_message_descriptor_data());
             let mut enums = ::std::vec::Vec::with_capacity(1);
             enums.push(ProducerCompression::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(

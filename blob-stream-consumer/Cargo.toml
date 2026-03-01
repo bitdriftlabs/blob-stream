@@ -10,12 +10,16 @@ doctest = false
 [dependencies]
 anyhow.workspace                = true
 async-trait.workspace           = true
+bd-server-stats.workspace       = true
 blob-stream-blob-store.path     = "../blob-stream-blob-store"
 blob-stream-metadata-store.path = "../blob-stream-metadata-store"
+blob-stream-proto.path          = "../blob-stream-proto"
 blob-stream-types.path          = "../blob-stream-types"
+log.workspace                   = true
+prometheus.workspace            = true
 serde_json.workspace            = true
+tokio.workspace                 = true
 zstd.workspace                  = true
 
 [dev-dependencies]
 bytes.workspace = true
-tokio.workspace = true
