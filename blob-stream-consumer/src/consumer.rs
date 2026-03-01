@@ -9,6 +9,7 @@
 #[path = "./consumer_test.rs"]
 mod tests;
 
+use crate::config::ConsumerReadConfig;
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use blob_stream_blob_store::{BlobStore, ByteRange};
@@ -23,7 +24,7 @@ use blob_stream_types::{
   VirtualPartitionId,
   Window,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -34,22 +35,22 @@ use std::sync::Arc;
 // deterministic algorithm:
 //
 // 1) Compute a trailing window set
-//    - For each read call, compute the current wall-clock window and include N lookback
-//      windows ending at "now". This is the core protection against delayed metadata writes.
+//    - For each read call, compute the current wall-clock window and include N lookback windows
+//      ending at "now". This is the core protection against delayed metadata writes.
 //
 // 2) Scan metadata per window
 //    - Query the metadata store for each window independently.
-//    - Because metadata scans are intentionally unordered for cost, sort segments by
-//      snowflake id to stabilize traversal order.
+//    - Because metadata scans are intentionally unordered for cost, sort segments by snowflake id
+//      to stabilize traversal order.
 //
 // 3) Filter to assigned virtual partitions
-//    - For each segment, only inspect segment_index entries that belong to the partitions
-//      assigned to this reader.
+//    - For each segment, only inspect segment_index entries that belong to the partitions assigned
+//      to this reader.
 //
 // 4) Sort and cursor-filter batches
 //    - Sort per-partition batch metadata by seq_start to keep processing deterministic.
-//    - Skip a batch when seq_end <= committed cursor, which dedupes both normal rescans
-//      and late metadata arrivals.
+//    - Skip a batch when seq_end <= committed cursor, which dedupes both normal rescans and late
+//      metadata arrivals.
 //
 // 5) Fetch blob byte range and decode
 //    - Read exactly the byte range for the batch from blob storage.
@@ -57,22 +58,21 @@ use std::sync::Arc;
 //    - Validate that decoded partition id matches metadata partition id.
 //
 // 6) Advance cursor monotonically
-//    - After successful decode, advance cursor to max(existing_cursor, batch.seq_end)
-//      and emit ConsumerBatch.
+//    - After successful decode, advance cursor to max(existing_cursor, batch.seq_end) and emit
+//      ConsumerBatch.
 //
 // Handling out-of-order and late metadata (why writes are not missed)
 //
 // The metadata store scan contract is unordered, and metadata writes can appear later than
 // expected due to retries/throttling/failover. The code handles this with two mechanisms:
 //
-// - Time-based lookback replay:
-//   read_available() always scans a trailing window set (scan_windows()), not only the newest
-//   window. This ensures previously scanned windows are revisited.
+// - Time-based lookback replay: read_available() always scans a trailing window set
+//   (scan_windows()), not only the newest window. This ensures previously scanned windows are
+//   revisited.
 //
-// - Cursor-based idempotence:
-//   For each virtual partition, a batch is skipped only when seq_end <= current_cursor.
-//   Therefore, a newly discovered late batch with seq_end > current_cursor is still processed,
-//   even if its metadata appears in an older window that was already scanned.
+// - Cursor-based idempotence: For each virtual partition, a batch is skipped only when seq_end <=
+//   current_cursor. Therefore, a newly discovered late batch with seq_end > current_cursor is still
+//   processed, even if its metadata appears in an older window that was already scanned.
 //
 // Worked example (matches the implementation in read_available())
 //
@@ -92,18 +92,17 @@ use std::sync::Arc;
 // The consumer algorithm relies on producer+broker write-path invariants for each virtual
 // partition:
 //
-// - Single active writer via lease fencing:
-//   Brokers must hold the producer-partition lease to accept writes for a virtual partition.
-//   A broker without the lease rejects writes, preventing concurrent seq assignment.
+// - Single active writer via lease fencing: Brokers must hold the producer-partition lease to
+//   accept writes for a virtual partition. A broker without the lease rejects writes, preventing
+//   concurrent seq assignment.
 //
-// - Monotonic sequence assignment:
-//   The sequence allocator (Hi-Lo reservation) hands out strictly increasing seq values per
-//   virtual partition. Reservations may introduce gaps, but overlapping/reused seq ranges are
-//   not allowed.
+// - Monotonic sequence assignment: The sequence allocator (Hi-Lo reservation) hands out strictly
+//   increasing seq values per virtual partition. Reservations may introduce gaps, but
+//   overlapping/reused seq ranges are not allowed.
 //
-// - Retry semantics preserve monotonic progress:
-//   If routing is stale or lease ownership changes, producers retry to the current lease holder.
-//   The accepted batch still receives seq ranges from the active monotonic allocator.
+// - Retry semantics preserve monotonic progress: If routing is stale or lease ownership changes,
+//   producers retry to the current lease holder. The accepted batch still receives seq ranges from
+//   the active monotonic allocator.
 //
 // Given these invariants, cursor-based filtering by seq_end is correct: once cursor reaches X,
 // any later valid batch for the same virtual partition must have seq_end > X (or be a duplicate
@@ -117,49 +116,6 @@ use std::sync::Arc;
 // This design optimizes for correctness and operational clarity over aggressive optimization:
 // no global ordering assumptions, resilient to delayed metadata writes, and deterministic
 // replay behavior through monotonic cursors.
-
-//
-// ConsumerReadConfig
-//
-
-#[derive(Clone, Debug)]
-pub struct ConsumerReadConfig {
-  pub topic: String,
-  pub window_size_seconds: i64,
-  pub lookback_windows: u32,
-  pub assigned_virtual_partitions: Vec<VirtualPartitionId>,
-  pub initial_cursors: HashMap<VirtualPartitionId, u64>,
-}
-
-impl ConsumerReadConfig {
-  pub fn validate(&self) -> Result<()> {
-    // Validate fundamental runtime parameters first so callers fail fast on invalid wiring.
-    ensure!(!self.topic.trim().is_empty(), "consumer topic is required");
-    ensure!(
-      self.window_size_seconds > 0,
-      "window_size_seconds must be greater than zero"
-    );
-    ensure!(
-      self.lookback_windows > 0,
-      "lookback_windows must be greater than zero"
-    );
-    ensure!(
-      !self.assigned_virtual_partitions.is_empty(),
-      "at least one virtual partition must be assigned"
-    );
-
-    // Duplicate partition assignment would cause duplicate reads and ambiguous cursor ownership.
-    let mut seen = HashSet::new();
-    for partition_id in &self.assigned_virtual_partitions {
-      ensure!(
-        seen.insert(*partition_id),
-        "duplicate virtual partition assignment: {partition_id}"
-      );
-    }
-
-    Ok(())
-  }
-}
 
 //
 // ConsumerBatch

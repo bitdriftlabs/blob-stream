@@ -16,6 +16,7 @@ blob-stream-broker-discovery.path = "../blob-stream-broker-discovery"
 blob-stream-proto.path            = "../blob-stream-proto"
 blob-stream-types.path            = "../blob-stream-types"
 log.workspace                     = true
+prometheus.workspace              = true
 thiserror.workspace               = true
 time.workspace                    = true
 tokio.workspace                   = true

@@ -614,18 +614,31 @@ Notes:
     - `blob-stream-consumer/src/consumer_test.rs`
     - `Cargo.toml` (workspace member registration)
 
-- [ ] Milestone 10: Consumer group coordination
-  - [ ] Implement cooperative sticky assignment logic.
-  - [ ] Implement lease heartbeat + commit on heartbeat.
-  - [ ] Implement rebalance flow with generation fencing.
-  - [ ] Add tests for assignment stability and lease fencing behavior.
+- [x] Milestone 10: Consumer group coordination
+  - [x] Implement cooperative sticky assignment logic.
+  - [x] Implement lease heartbeat + commit on heartbeat.
+  - [x] Implement rebalance flow with generation fencing.
+  - [x] Add tests for assignment stability and lease fencing behavior.
+  - Source map:
+    - `blob-stream-consumer/src/coordination.rs`
+    - `blob-stream-consumer/src/coordination_test.rs`
+    - `blob-stream-consumer/src/lib.rs`
 
-- [ ] Milestone 11: Observability + logging
+- [ ] Milestone 11: Consumer config + observability + ready library
+  - [ ] Define config in blob-stream-proto
+  - [ ] Add bd-server-stats metrics throughput, retries, and latency.
+  - [ ] Add logging throughout the code. High throughput logging should be trace/debug level. All
+        coordination changes should be info level.
+  - [ ] The end result is a library ready to use in applications.
+
+- [ ] Milestone 12: Observability + logging
   - [ ] Add bd-server-stats metrics for broker/producer/consumer throughput and lag.
   - [ ] Add structured logging with debug/trace for hot paths.
   - [ ] Apply warn_every for noisy warnings.
+  - [ ] Create an axum admin handler in the broker to expose prometheus metrics collected via
+        bd-server-stats.
 
-- [ ] Milestone 12: End-to-end integration
+- [ ] Milestone 13: End-to-end integration
   - [ ] Compose broker + producer + consumer in docker compose (local S3/Dynamo).
   - [ ] Verify autoscaling behaviors (simulated broker/consumer membership changes).
   - [ ] Validate duplicate handling and cursor monotonicity under retries.
@@ -637,6 +650,14 @@ Notes:
         and configuration, consumer library and configuration, and broker service setup. Also
         include details on all of the Dynamo tables required as well as any details about the
         required S3 bucket.
+
+- [ ] Milestone 14: Hardening
+  - Broker binary should use rust jemalloc allocator
+  - Consider RAM limits (driven from jemalloc internal metrics) in the broker binary used to apply
+    back pressure.
+  - Consider consumer pre-fetching for data.
+  - Consider whether broker should use disk for buffering incoming segment data instead of all in
+    RAM.
 
 ## Open Questions
 - None currently; iterate as implementation progresses.

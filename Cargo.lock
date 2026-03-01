@@ -1045,6 +1045,7 @@ dependencies = [
  "blob-stream-proto",
  "blob-stream-types",
  "log",
+ "prometheus",
  "thiserror 2.0.18",
  "time",
  "tokio",

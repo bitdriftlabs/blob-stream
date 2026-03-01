@@ -44,10 +44,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use thiserror::Error;
+use time::OffsetDateTime;
 use time::ext::NumericalDuration;
 use tokio::sync::{Mutex, oneshot, watch};
 
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
+type FlushCompletion = oneshot::Sender<Result<(), String>>;
 
 //
 // WriteRequest
@@ -261,11 +263,15 @@ impl WriteEngineImpl {
     tokio::spawn(async move {
       let mut ticker = tokio::time::interval(interval);
       loop {
+        // Time-based flushing is driven here. Even if no new writes arrive, this loop wakes up
+        // every flush_max_delay_ms and asks state for anything that has waited long enough.
         ticker.tick().await;
         let now = time_provider.now();
         let now_ts_ms = now.unix_timestamp_ms();
         let plans = {
           let mut guard = state.lock().await;
+          // Build flush plans from all topic/partition buffers that are currently eligible under
+          // size/time rules. This call drains eligible buffered batches from in-memory state.
           guard.collect_flush_plans(now_ts_ms, flush_context.config())
         };
 
@@ -273,7 +279,7 @@ impl WriteEngineImpl {
           continue;
         }
 
-        if let Err(error) = flush_context.flush_plans(plans, now).await {
+        if let Err(error) = flush_plans_and_notify(&flush_context, plans, now).await {
           warn_every!(15.seconds(), "write flush failed: {}", error);
         }
       }
@@ -346,6 +352,8 @@ impl WriteEngine for WriteEngineImpl {
       partition_state.seq_allocator.set_reservation(range);
     }
 
+    let (completion_tx, completion_rx) = oneshot::channel();
+
     let (seq_range, plans) = {
       let mut state = self.state.lock().await;
       let partition_state = state.partition_state_mut(&request.topic, request.virtual_partition_id);
@@ -365,20 +373,65 @@ impl WriteEngine for WriteEngineImpl {
           records: request.records,
           summary,
           seq_range: seq_range.clone(),
+          completion: Some(completion_tx),
         },
         now_ts_ms,
       );
 
+      // After adding this incoming batch, we immediately run flush planning once. This enables
+      // "flush on size" behavior in-line with produce: if the just-pushed data makes the buffer
+      // cross flush_max_bytes, we flush now instead of waiting for the background ticker.
+      //
+      // If thresholds are not met yet, no plans are produced and data stays buffered until either
+      // a future produce call or the periodic flush loop observes the time threshold.
       let plans = state.collect_flush_plans(now_ts_ms, &self.config);
       (seq_range, plans)
     };
 
     if !plans.is_empty() {
-      self.flush_context.flush_plans(plans, now).await?;
+      flush_plans_and_notify(&self.flush_context, plans, now).await?;
+    }
+
+    match completion_rx.await {
+      Ok(Ok(())) => {},
+      Ok(Err(error)) => return Err(WriteError::Internal(anyhow!(error))),
+      Err(_closed) => {
+        return Err(WriteError::Internal(anyhow!(
+          "flush completion channel closed before acknowledgment"
+        )));
+      },
     }
 
     Ok(WriteResponse { seq_range })
   }
+}
+
+async fn flush_plans_and_notify(
+  flush_context: &FlushContext,
+  mut plans: Vec<FlushPlan>,
+  now: OffsetDateTime,
+) -> Result<(), WriteError> {
+  let mut completions = Vec::new();
+  for plan in &mut plans {
+    for partition in &mut plan.partitions {
+      for batch in &mut partition.batches {
+        if let Some(completion) = batch.completion.take() {
+          completions.push(completion);
+        }
+      }
+    }
+  }
+
+  let result = flush_context.flush_plans(plans, now).await;
+  let completion_result = result
+    .as_ref()
+    .map_or_else(|error| Err(error.to_string()), |_ok| Ok(()));
+
+  for completion in completions {
+    let _ignored = completion.send(completion_result.clone());
+  }
+
+  result
 }
 
 //
@@ -406,6 +459,9 @@ impl WriteState {
   }
 
   fn collect_flush_plans(&mut self, now_ts_ms: i64, config: &WriteConfig) -> Vec<FlushPlan> {
+    // This method is the single place where buffered data becomes flush work. Callers (produce
+    // fast-path and background flush loop) both use it so size and time triggers share one
+    // consistent decision path.
     let mut plans = Vec::new();
 
     for (topic, topic_state) in &mut self.topics {
@@ -416,6 +472,8 @@ impl WriteState {
           continue;
         }
 
+        // Once flush is triggered, all currently buffered batches for the partition are moved as
+        // one partition plan. New writes arriving later start a new buffer epoch.
         let batches = std::mem::take(&mut partition_state.buffer.batches);
         if batches.is_empty() {
           partition_state.buffer.reset();
@@ -492,10 +550,12 @@ impl BufferState {
   }
 
   fn should_flush(&self, now_ts_ms: i64, config: &WriteConfig) -> bool {
+    // Empty buffers never flush.
     if self.batches.is_empty() {
       return false;
     }
 
+    // Size trigger: flush immediately once accumulated payload bytes cross threshold.
     if self.buffered_bytes >= config.flush_max_bytes {
       return true;
     }
@@ -504,6 +564,8 @@ impl BufferState {
       return false;
     };
 
+    // Time trigger: once oldest buffered batch has waited long enough, flush whatever is present.
+    // This ensures low-throughput partitions still make progress without waiting for size growth.
     now_ts_ms.saturating_sub(first_ts) >= config.flush_max_delay_ms
   }
 
@@ -523,6 +585,7 @@ struct BufferedBatch {
   records: Vec<Record>,
   summary: BatchSummary,
   seq_range: SeqRange,
+  completion: Option<FlushCompletion>,
 }
 
 //

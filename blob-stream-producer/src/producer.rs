@@ -45,6 +45,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 };
 use blob_stream_types::{VirtualPartitionId, virtual_partition_for_key};
 use log::{debug, trace};
+use prometheus::{Histogram, IntCounter};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,45 +61,27 @@ use tokio::time::{Instant, interval};
 
 #[derive(Clone)]
 struct ProducerMetrics {
-  scope: Scope,
+  records_enqueued: IntCounter,
+  batches_sent: IntCounter,
+  records_sent: IntCounter,
+  retries: IntCounter,
+  failures: IntCounter,
+  no_brokers: IntCounter,
+  send_latency_seconds: Histogram,
 }
 
 impl ProducerMetrics {
   fn new(scope: &Scope) -> Self {
+    let scope = scope.scope("producer");
     Self {
-      scope: scope.scope("producer"),
+      records_enqueued: scope.counter("records_enqueued"),
+      batches_sent: scope.counter("batches_sent"),
+      records_sent: scope.counter("records_sent"),
+      retries: scope.counter("retries"),
+      failures: scope.counter("failures"),
+      no_brokers: scope.counter("no_brokers"),
+      send_latency_seconds: scope.histogram("send_latency_seconds"),
     }
-  }
-
-  fn inc_records_enqueued(&self) {
-    self.scope.counter("records_enqueued").inc();
-  }
-
-  fn inc_batches_sent(&self) {
-    self.scope.counter("batches_sent").inc();
-  }
-
-  fn inc_records_sent_by(&self, count: u64) {
-    self.scope.counter("records_sent").inc_by(count);
-  }
-
-  fn inc_retries(&self) {
-    self.scope.counter("retries").inc();
-  }
-
-  fn inc_failures(&self) {
-    self.scope.counter("failures").inc();
-  }
-
-  fn inc_no_brokers(&self) {
-    self.scope.counter("no_brokers").inc();
-  }
-
-  fn observe_send_latency_seconds(&self, latency_seconds: f64) {
-    self
-      .scope
-      .histogram("send_latency_seconds")
-      .observe(latency_seconds);
   }
 }
 
@@ -436,7 +419,7 @@ impl ProducerClient for ProducerClientImpl {
       )
     };
 
-    self.metrics.inc_records_enqueued();
+    self.metrics.records_enqueued.inc();
     trace!(
       "record buffered: topic={}, virtual_partition_id={}, payload_bytes={}",
       record.topic, virtual_partition_id, payload_len
@@ -525,9 +508,11 @@ async fn send_batch_with_retry(
     let membership = membership_rx.borrow().clone();
     let Some(broker) = owner_for_partition(&batch.topic, batch.virtual_partition_id, &membership)
     else {
-      metrics.inc_no_brokers();
-      metrics.inc_failures();
-      metrics.observe_send_latency_seconds(started_at.elapsed().as_secs_f64());
+      metrics.no_brokers.inc();
+      metrics.failures.inc();
+      metrics
+        .send_latency_seconds
+        .observe(started_at.elapsed().as_secs_f64());
       debug!(
         "no broker owner available: topic={}, virtual_partition_id={}, membership_nodes={}",
         batch.topic,
@@ -572,9 +557,11 @@ async fn send_batch_with_retry(
         let status = response.status.enum_value_or_default();
         match status {
           ProduceStatus::PRODUCE_STATUS_OK => {
-            metrics.inc_batches_sent();
-            metrics.inc_records_sent_by(batch.records.len() as u64);
-            metrics.observe_send_latency_seconds(started_at.elapsed().as_secs_f64());
+            metrics.batches_sent.inc();
+            metrics.records_sent.inc_by(batch.records.len() as u64);
+            metrics
+              .send_latency_seconds
+              .observe(started_at.elapsed().as_secs_f64());
             return Ok(ProducerAck {
               topic: batch.topic.clone(),
               virtual_partition_id: batch.virtual_partition_id,
@@ -598,8 +585,10 @@ async fn send_batch_with_retry(
     };
 
     if attempt >= producer_max_retries(config) {
-      metrics.inc_failures();
-      metrics.observe_send_latency_seconds(started_at.elapsed().as_secs_f64());
+      metrics.failures.inc();
+      metrics
+        .send_latency_seconds
+        .observe(started_at.elapsed().as_secs_f64());
       debug!(
         "producer retries exhausted: topic={}, virtual_partition_id={}, attempts={}, error={}",
         batch.topic,
@@ -611,7 +600,7 @@ async fn send_batch_with_retry(
     }
 
     let delay_ms = retry_delay_ms(config, attempt);
-    metrics.inc_retries();
+    metrics.retries.inc();
     debug!(
       "producer retrying batch: topic={}, virtual_partition_id={}, attempt={}, delay_ms={}, \
        error={}",

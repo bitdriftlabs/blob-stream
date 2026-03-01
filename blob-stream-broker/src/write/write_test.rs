@@ -9,12 +9,14 @@
 
 use super::{TopicInfo, WriteConfig, WriteEngine, WriteEngineImpl, WriteRequest};
 use anyhow::Result;
+use async_trait::async_trait;
 use bd_time::{OffsetDateTimeExt, TestTimeProvider, TimeProvider};
 use blob_stream_blob_store::InMemoryBlobStore;
 use blob_stream_metadata_store::{
   InMemoryMetadataStore,
   InMemoryProducerPartitionLeaseStore,
   MetadataStore,
+  SegmentMetadata,
 };
 use blob_stream_types::{Compression, CompressionCodec, Record, SeqRange, Window};
 use std::collections::HashMap;
@@ -30,7 +32,7 @@ fn time_from_ms(ms: i64) -> OffsetDateTime {
 fn make_engine(
   time_provider: Arc<TestTimeProvider>,
   config: WriteConfig,
-) -> Result<(WriteEngineImpl, Arc<InMemoryMetadataStore>)> {
+) -> Result<(Arc<WriteEngineImpl>, Arc<InMemoryMetadataStore>)> {
   let mut topics = HashMap::new();
   topics.insert(
     "telemetry".to_string(),
@@ -56,7 +58,7 @@ fn make_engine(
     time_provider,
   )?;
 
-  Ok((engine, metadata_store))
+  Ok((Arc::new(engine), metadata_store))
 }
 
 #[tokio::test]
@@ -75,7 +77,11 @@ async fn buffers_until_size_rollover() -> Result<()> {
     records: vec![Record::new(vec![1; 6], 10)],
   };
 
-  engine.produce_batch(request).await?;
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move { first_engine.produce_batch(request).await });
+
+  tokio::task::yield_now().await;
+  assert!(!first.is_finished());
 
   let window = Window::for_timestamp(
     time_provider.now().unix_timestamp_ms() / 1_000,
@@ -93,6 +99,7 @@ async fn buffers_until_size_rollover() -> Result<()> {
   };
 
   engine.produce_batch(request).await?;
+  first.await??;
 
   let segments = metadata_store
     .scan_window(&window.key("telemetry"), None)
@@ -118,7 +125,10 @@ async fn flushes_on_time_rollover() -> Result<()> {
     records: vec![Record::new(vec![3; 4], 30)],
   };
 
-  engine.produce_batch(request).await?;
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move { first_engine.produce_batch(request).await });
+  tokio::task::yield_now().await;
+  assert!(!first.is_finished());
 
   let advance = TimeDuration::milliseconds(config.flush_max_delay_ms + 10);
   time_provider.advance(advance);
@@ -127,6 +137,8 @@ async fn flushes_on_time_rollover() -> Result<()> {
   ))
   .await;
   tokio::task::yield_now().await;
+
+  first.await??;
 
   let window = Window::for_timestamp(
     time_provider.now().unix_timestamp_ms() / 1_000,
@@ -143,7 +155,7 @@ async fn flushes_on_time_rollover() -> Result<()> {
 async fn assigns_monotonic_sequences() -> Result<()> {
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let mut config = WriteConfig::with_defaults();
-  config.flush_max_bytes = 1024;
+  config.flush_max_bytes = 1;
   config.flush_max_delay_ms = 60_000;
 
   let (engine, _metadata_store) = make_engine(time_provider.clone(), config)?;
@@ -199,5 +211,62 @@ async fn writes_compressed_metadata() -> Result<()> {
 
   let batch_metadata = segments[0].segment_index.get(&0).unwrap().first().unwrap();
   assert_eq!(batch_metadata.compression.codec, CompressionCodec::Zstd);
+  Ok(())
+}
+
+#[derive(Default)]
+struct FailingMetadataStore;
+
+#[async_trait]
+impl MetadataStore for FailingMetadataStore {
+  async fn write_segment(&self, _metadata: SegmentMetadata) -> Result<()> {
+    Err(anyhow::anyhow!("metadata write failed"))
+  }
+
+  async fn scan_window(
+    &self,
+    _window: &blob_stream_types::TopicWindowKey,
+    _min_snowflake_id: Option<blob_stream_types::SnowflakeId>,
+  ) -> Result<Vec<SegmentMetadata>> {
+    Ok(Vec::new())
+  }
+}
+
+#[tokio::test]
+async fn returns_error_when_flush_fails() -> Result<()> {
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let mut topics = HashMap::new();
+  topics.insert(
+    "telemetry".to_string(),
+    TopicInfo {
+      name: "telemetry".to_string(),
+      partition_count: 1,
+      num_writers: 1,
+    },
+  );
+
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  config.flush_max_delay_ms = 60_000;
+
+  let engine = WriteEngineImpl::new_with_time_provider(
+    config,
+    topics,
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(FailingMetadataStore),
+    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+    "test-node".to_string(),
+    None,
+    time_provider,
+  )?;
+
+  let request = WriteRequest {
+    topic: "telemetry".to_string(),
+    virtual_partition_id: 0,
+    records: vec![Record::new(vec![1, 2, 3], 10)],
+  };
+
+  let result = engine.produce_batch(request).await;
+  assert!(result.is_err());
   Ok(())
 }
