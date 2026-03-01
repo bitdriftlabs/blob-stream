@@ -26,15 +26,17 @@ use crate::coordination::{
 };
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
+use bd_log::warn_every;
 use bd_server_stats::stats::{Collector, Scope};
 use blob_stream_blob_store::BlobStore;
 use blob_stream_metadata_store::{ConsumerGroupLeaseStore, MetadataStore};
 use blob_stream_types::VirtualPartitionId;
-use log::{debug, info, trace};
+use log::{info, trace};
 use prometheus::{Histogram, IntCounter};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use time::ext::NumericalDuration;
 use tokio::sync::oneshot;
 
 const IDLE_POLL_DELAY_MS: u64 = 50;
@@ -436,10 +438,13 @@ impl ConsumerIterator for ConsumerIteratorImpl {
             if read_attempt == 0 {
               read_attempt = 1;
               self.metrics.retries.inc();
-              debug!(
+              warn_every!(
+                15.seconds(),
                 "consumer read retrying after error: topic={}, group_id={}, member_id={}, \
                  error={error}",
-                self.group_config.topic, self.group_config.group_id, self.group_config.member_id
+                self.group_config.topic,
+                self.group_config.group_id,
+                self.group_config.member_id
               );
               continue;
             }

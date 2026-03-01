@@ -20,6 +20,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use blob_stream_types::CommittedCursor;
+use log::trace;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
@@ -49,6 +50,11 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<ConsumerGroupAssignmentOutcome> {
+    trace!(
+      "consumer lease(memory) assign: topic={}, group_id={}, partition={}, owner_id={}, \
+       generation={}",
+      key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
+    );
     let mut guard = self.leases.write().await;
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
 
@@ -109,6 +115,11 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     lease_duration_ms: i64,
     committed_cursor: Option<CommittedCursor>,
   ) -> Result<ConsumerGroupHeartbeatOutcome> {
+    trace!(
+      "consumer lease(memory) heartbeat: topic={}, group_id={}, partition={}, owner_id={}, \
+       generation={}",
+      key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
+    );
     if let Some(cursor) = committed_cursor.as_ref() {
       validate_cursor(key, cursor)?;
     }
@@ -149,6 +160,16 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     now_ts_ms: i64,
     committed_cursor: CommittedCursor,
   ) -> Result<ConsumerGroupCommitOutcome> {
+    trace!(
+      "consumer lease(memory) commit: topic={}, group_id={}, partition={}, owner_id={}, \
+       generation={}, seq_end={}",
+      key.topic,
+      key.group_id,
+      key.virtual_partition_id,
+      owner_id,
+      generation,
+      committed_cursor.seq_end
+    );
     validate_cursor(key, &committed_cursor)?;
 
     let mut guard = self.leases.write().await;

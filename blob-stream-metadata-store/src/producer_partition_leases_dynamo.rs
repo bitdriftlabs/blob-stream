@@ -25,6 +25,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
 use blob_stream_types::SeqRange;
+use log::{debug, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -93,6 +94,11 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome> {
+    trace!(
+      "producer lease(dynamo) acquire: table={}, topic={}, writer_id={}, partition={}, \
+       holder_id={}",
+      self.table_name, key.topic, key.writer_id, key.virtual_partition_id, holder_id
+    );
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
     let pk = key.format();
 
@@ -141,11 +147,13 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
         let lease = Self::lease_from_item(attributes)?;
+        debug!("producer lease(dynamo) acquire result: acquired");
         Ok(LeaseAcquireOutcome::Acquired(lease))
       },
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
       {
+        debug!("producer lease(dynamo) acquire result: held_by_other");
         let lease = self
           .get_lease(&key)
           .await?
@@ -163,6 +171,11 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseHeartbeatOutcome> {
+    trace!(
+      "producer lease(dynamo) heartbeat: table={}, topic={}, writer_id={}, partition={}, \
+       holder_id={}",
+      self.table_name, key.topic, key.writer_id, key.virtual_partition_id, holder_id
+    );
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
 
     let mut values = HashMap::new();
@@ -197,17 +210,21 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
         let lease = Self::lease_from_item(attributes)?;
+        debug!("producer lease(dynamo) heartbeat result: renewed");
         Ok(LeaseHeartbeatOutcome::Renewed(lease))
       },
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
       {
         let Some(lease) = self.get_lease(key).await? else {
+          debug!("producer lease(dynamo) heartbeat result: expired");
           return Ok(LeaseHeartbeatOutcome::Expired);
         };
         if lease.lease_expiration_ts_ms <= now_ts_ms {
+          debug!("producer lease(dynamo) heartbeat result: expired");
           Ok(LeaseHeartbeatOutcome::Expired)
         } else {
+          debug!("producer lease(dynamo) heartbeat result: held_by_other");
           Ok(LeaseHeartbeatOutcome::HeldByOther(lease))
         }
       },
@@ -222,6 +239,16 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     now_ts_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
+    trace!(
+      "producer lease(dynamo) reserve: table={}, topic={}, writer_id={}, partition={}, \
+       holder_id={}, size={}",
+      self.table_name,
+      key.topic,
+      key.writer_id,
+      key.virtual_partition_id,
+      holder_id,
+      reservation_size
+    );
     if reservation_size == 0 {
       return Err(anyhow!("reservation_size must be greater than zero"));
     }
@@ -269,6 +296,10 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
           .await?
           .ok_or_else(|| anyhow!("lease missing after reservation"))?;
 
+        debug!(
+          "producer lease(dynamo) reserve result: start={}, end={}",
+          reservation.start, reservation.end
+        );
         Ok(SequenceReservationOutcome::Reserved(SequenceReservation {
           range: reservation,
           lease,
@@ -278,11 +309,14 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
         if service_error.err().is_conditional_check_failed_exception() =>
       {
         let Some(lease) = self.get_lease(key).await? else {
+          debug!("producer lease(dynamo) reserve result: expired");
           return Ok(SequenceReservationOutcome::Expired);
         };
         if lease.lease_expiration_ts_ms <= now_ts_ms {
+          debug!("producer lease(dynamo) reserve result: expired");
           Ok(SequenceReservationOutcome::Expired)
         } else {
+          debug!("producer lease(dynamo) reserve result: held_by_other");
           Ok(SequenceReservationOutcome::HeldByOther(lease))
         }
       },
@@ -296,6 +330,11 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     holder_id: &str,
     now_ts_ms: i64,
   ) -> Result<LeaseReleaseOutcome> {
+    trace!(
+      "producer lease(dynamo) release: table={}, topic={}, writer_id={}, partition={}, \
+       holder_id={}",
+      self.table_name, key.topic, key.writer_id, key.virtual_partition_id, holder_id
+    );
     let mut values = HashMap::new();
     values.insert(
       ":holder".to_string(),
@@ -315,16 +354,22 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       .await;
 
     match response {
-      Ok(_) => Ok(LeaseReleaseOutcome::Released),
+      Ok(_) => {
+        debug!("producer lease(dynamo) release result: released");
+        Ok(LeaseReleaseOutcome::Released)
+      },
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
       {
         let Some(lease) = self.get_lease(key).await? else {
+          debug!("producer lease(dynamo) release result: expired");
           return Ok(LeaseReleaseOutcome::Expired);
         };
         if lease.lease_expiration_ts_ms <= now_ts_ms {
+          debug!("producer lease(dynamo) release result: expired");
           Ok(LeaseReleaseOutcome::Expired)
         } else {
+          debug!("producer lease(dynamo) release result: held_by_other");
           Ok(LeaseReleaseOutcome::HeldByOther(lease))
         }
       },

@@ -5,6 +5,7 @@
 // LICENSE file or at:
 // https://polyformproject.org/wp-content/uploads/2020/06/PolyForm-Shield-1.0.0.txt
 
+use crate::metrics::BrokerMetrics;
 use crate::write::{WriteEngine, WriteEngineImpl};
 use anyhow::{Context, Result, anyhow, ensure};
 use aws_config::BehaviorVersion;
@@ -30,6 +31,7 @@ use blob_stream_proto::protos::blobstream::v1::config::{
 };
 use blob_stream_types::VirtualPartitionId;
 use hostname::get as get_hostname;
+use log::{debug, trace};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -137,7 +139,11 @@ impl TopicInfo {
 // build_write_engine
 //
 
-pub async fn build_write_engine(config: &RuntimeConfig) -> Result<Arc<dyn WriteEngine>> {
+pub async fn build_write_engine(
+  config: &RuntimeConfig,
+  metrics: &BrokerMetrics,
+) -> Result<Arc<dyn WriteEngine>> {
+  trace!("building broker write engine from runtime config");
   let broker = config
     .broker
     .as_ref()
@@ -162,8 +168,12 @@ pub async fn build_write_engine(config: &RuntimeConfig) -> Result<Arc<dyn WriteE
   let metadata_store = build_metadata_store(metadata_store_config).await?;
 
   let lease_store = build_producer_partition_lease_store(metadata_store_config).await?;
+  let metrics_scope = metrics.scope();
+  let writer_id = write_config.writer_id;
+  let topics_count = topics.len();
+  let holder_id_for_log = holder_id.clone();
 
-  let engine = WriteEngineImpl::new(
+  let engine = WriteEngineImpl::new_with_metrics_scope(
     write_config,
     topics,
     blob_store,
@@ -171,7 +181,13 @@ pub async fn build_write_engine(config: &RuntimeConfig) -> Result<Arc<dyn WriteE
     lease_store,
     holder_id,
     Some(membership_rx),
+    &metrics_scope,
   )?;
+
+  debug!(
+    "broker write engine built: holder_id={holder_id_for_log}, topics={topics_count}, \
+     writer_id={writer_id}"
+  );
 
   Ok(Arc::new(engine))
 }
@@ -180,12 +196,14 @@ async fn build_producer_partition_lease_store(
   config: &MetadataStoreConfig,
 ) -> Result<Arc<dyn ProducerPartitionLeaseStore>> {
   if config.has_in_memory() {
+    debug!("using in-memory producer partition lease store backend");
     let store: Arc<dyn ProducerPartitionLeaseStore> =
       Arc::new(InMemoryProducerPartitionLeaseStore::new());
     return Ok(store);
   }
 
   if config.has_dynamo() {
+    debug!("using dynamo producer partition lease store backend");
     let dynamo = config.dynamo();
     let table_name = dynamo.table_name.to_string();
     let region = dynamo.region.to_string();
@@ -220,6 +238,7 @@ async fn build_membership_watch(
 ) -> Result<watch::Receiver<BrokerMembership>> {
   if let Some(discovery) = broker.discovery.as_ref() {
     if discovery.has_static() {
+      debug!("using static broker discovery backend");
       let nodes = discovery
         .static_()
         .nodes
@@ -234,6 +253,7 @@ async fn build_membership_watch(
     }
 
     if discovery.has_k8s_service() {
+      debug!("using k8s service broker discovery backend");
       let k8s = discovery.k8s_service();
       ensure!(
         !k8s.namespace.is_empty(),
@@ -253,12 +273,17 @@ async fn build_membership_watch(
     node_id: holder_id.to_string(),
     address: holder_id.to_string(),
   }]);
+  debug!("using fallback single-node broker discovery for holder_id={holder_id}");
   let (tx, rx) = watch::channel(fallback);
   drop(tx);
   Ok(rx)
 }
 
 fn build_topics(topics: &[TopicConfig]) -> Result<HashMap<String, TopicInfo>> {
+  trace!(
+    "building topic map from {} configured topic(s)",
+    topics.len()
+  );
   let mut map = HashMap::new();
 
   for topic in topics {
@@ -304,11 +329,13 @@ async fn build_blob_store(
   config: &BlobStoreConfig,
 ) -> Result<(Arc<dyn BlobStore>, Option<String>)> {
   if config.has_in_memory() {
+    debug!("using in-memory blob store backend");
     let store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
     return Ok((store, None));
   }
 
   if config.has_s3() {
+    debug!("using s3 blob store backend");
     let s3 = config.s3();
     let bucket = s3.bucket.to_string();
     let region = s3.region.to_string();
@@ -338,11 +365,13 @@ async fn build_blob_store(
 
 async fn build_metadata_store(config: &MetadataStoreConfig) -> Result<Arc<dyn MetadataStore>> {
   if config.has_in_memory() {
+    debug!("using in-memory metadata store backend");
     let store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
     return Ok(store);
   }
 
   if config.has_dynamo() {
+    debug!("using dynamo metadata store backend");
     let dynamo = config.dynamo();
     let table_name = dynamo.table_name.to_string();
     let region = dynamo.region.to_string();

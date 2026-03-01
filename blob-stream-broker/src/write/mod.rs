@@ -17,6 +17,7 @@ use crate::write::flush::FlushContext;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use bd_log::warn_every;
+use bd_server_stats::stats::{Collector, Scope};
 use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobKey, BlobStore};
 use blob_stream_broker_discovery::BrokerMembership;
@@ -40,9 +41,10 @@ use blob_stream_types::{
   VirtualPartitionId,
 };
 pub use config::{TopicInfo, WriteConfig, build_write_engine};
+use log::{debug, trace};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::ext::NumericalDuration;
@@ -123,6 +125,68 @@ pub trait WriteEngine: Send + Sync {
 // WriteEngineImpl
 //
 
+#[derive(Clone)]
+struct WriteMetrics {
+  produce_requests_total: prometheus::IntCounter,
+  produce_records_total: prometheus::IntCounter,
+  produce_payload_bytes_total: prometheus::IntCounter,
+  produce_ok_total: prometheus::IntCounter,
+  produce_not_lease_holder_total: prometheus::IntCounter,
+  produce_overloaded_total: prometheus::IntCounter,
+  produce_unknown_topic_total: prometheus::IntCounter,
+  produce_latency_seconds: prometheus::Histogram,
+  flush_batches_total: prometheus::IntCounter,
+  flush_partitions_total: prometheus::IntCounter,
+  flush_plans_total: prometheus::IntCounter,
+  flush_failures_total: prometheus::IntCounter,
+  flush_latency_seconds: prometheus::Histogram,
+}
+
+impl WriteMetrics {
+  fn new(scope: &Scope) -> Self {
+    let scope = scope.scope("write");
+    Self {
+      produce_requests_total: scope.counter("produce_requests_total"),
+      produce_records_total: scope.counter("produce_records_total"),
+      produce_payload_bytes_total: scope.counter("produce_payload_bytes_total"),
+      produce_ok_total: scope.counter("produce_ok_total"),
+      produce_not_lease_holder_total: scope.counter("produce_not_lease_holder_total"),
+      produce_overloaded_total: scope.counter("produce_overloaded_total"),
+      produce_unknown_topic_total: scope.counter("produce_unknown_topic_total"),
+      produce_latency_seconds: scope.histogram("produce_latency_seconds"),
+      flush_batches_total: scope.counter("flush_batches_total"),
+      flush_partitions_total: scope.counter("flush_partitions_total"),
+      flush_plans_total: scope.counter("flush_plans_total"),
+      flush_failures_total: scope.counter("flush_failures_total"),
+      flush_latency_seconds: scope.histogram("flush_latency_seconds"),
+    }
+  }
+
+  fn record_produce_error(&self, error: &WriteError) {
+    match error {
+      WriteError::UnknownTopic(_) => self.produce_unknown_topic_total.inc(),
+      WriteError::NotLeaseHolder { .. } => self.produce_not_lease_holder_total.inc(),
+      WriteError::InvalidPartition { .. } | WriteError::Overloaded(_) | WriteError::Internal(_) => {
+        self.produce_overloaded_total.inc();
+      },
+    }
+  }
+
+  fn record_flush_plan_summary(&self, plans: &[FlushPlan]) {
+    self.flush_plans_total.inc_by(plans.len() as u64);
+    for plan in plans {
+      self
+        .flush_partitions_total
+        .inc_by(plan.partitions.len() as u64);
+      for partition in &plan.partitions {
+        self
+          .flush_batches_total
+          .inc_by(partition.batches.len() as u64);
+      }
+    }
+  }
+}
+
 pub struct WriteEngineImpl {
   config: WriteConfig,
   topics: HashMap<String, TopicInfo>,
@@ -130,6 +194,7 @@ pub struct WriteEngineImpl {
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
   holder_id: String,
   time_provider: Arc<dyn TimeProvider>,
+  metrics: WriteMetrics,
   state: Arc<Mutex<WriteState>>,
   lease_assignment_shutdown_tx: Option<oneshot::Sender<()>>,
 }
@@ -144,7 +209,8 @@ impl WriteEngineImpl {
     holder_id: String,
     membership_rx: Option<watch::Receiver<BrokerMembership>>,
   ) -> Result<Self> {
-    Self::new_with_time_provider(
+    let metrics_scope = Collector::default().scope("blob_stream_broker");
+    Self::new_with_time_provider_and_scope(
       config,
       topics,
       blob_store,
@@ -153,6 +219,30 @@ impl WriteEngineImpl {
       holder_id,
       membership_rx,
       Arc::new(SystemTimeProvider),
+      &metrics_scope,
+    )
+  }
+
+  pub fn new_with_metrics_scope(
+    config: WriteConfig,
+    topics: HashMap<String, TopicInfo>,
+    blob_store: Arc<dyn BlobStore>,
+    metadata_store: Arc<dyn MetadataStore>,
+    lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+    holder_id: String,
+    membership_rx: Option<watch::Receiver<BrokerMembership>>,
+    metrics_scope: &Scope,
+  ) -> Result<Self> {
+    Self::new_with_time_provider_and_scope(
+      config,
+      topics,
+      blob_store,
+      metadata_store,
+      lease_store,
+      holder_id,
+      membership_rx,
+      Arc::new(SystemTimeProvider),
+      metrics_scope,
     )
   }
 
@@ -166,6 +256,31 @@ impl WriteEngineImpl {
     membership_rx: Option<watch::Receiver<BrokerMembership>>,
     time_provider: Arc<dyn TimeProvider>,
   ) -> Result<Self> {
+    let metrics_scope = Collector::default().scope("blob_stream_broker");
+    Self::new_with_time_provider_and_scope(
+      config,
+      topics,
+      blob_store,
+      metadata_store,
+      lease_store,
+      holder_id,
+      membership_rx,
+      time_provider,
+      &metrics_scope,
+    )
+  }
+
+  fn new_with_time_provider_and_scope(
+    config: WriteConfig,
+    topics: HashMap<String, TopicInfo>,
+    blob_store: Arc<dyn BlobStore>,
+    metadata_store: Arc<dyn MetadataStore>,
+    lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+    holder_id: String,
+    membership_rx: Option<watch::Receiver<BrokerMembership>>,
+    time_provider: Arc<dyn TimeProvider>,
+    metrics_scope: &Scope,
+  ) -> Result<Self> {
     let snowflake = flush::SnowflakeGenerator::new()?;
     let state = Arc::new(Mutex::new(WriteState::default()));
     let flush_context = FlushContext::new(config.clone(), blob_store, metadata_store, snowflake);
@@ -177,6 +292,7 @@ impl WriteEngineImpl {
       lease_store,
       holder_id,
       time_provider,
+      metrics: WriteMetrics::new(metrics_scope),
       state,
       lease_assignment_shutdown_tx: None,
     };
@@ -259,6 +375,7 @@ impl WriteEngineImpl {
     let flush_context = self.flush_context.clone();
     let state = Arc::clone(&self.state);
     let time_provider = Arc::clone(&self.time_provider);
+    let metrics = self.metrics.clone();
 
     tokio::spawn(async move {
       let mut ticker = tokio::time::interval(interval);
@@ -279,9 +396,17 @@ impl WriteEngineImpl {
           continue;
         }
 
+        metrics.record_flush_plan_summary(&plans);
+        let flush_started = Instant::now();
+
         if let Err(error) = flush_plans_and_notify(&flush_context, plans, now).await {
+          metrics.flush_failures_total.inc();
           warn_every!(15.seconds(), "write flush failed: {}", error);
         }
+
+        metrics
+          .flush_latency_seconds
+          .observe(flush_started.elapsed().as_secs_f64());
       }
     });
   }
@@ -298,6 +423,27 @@ impl Drop for WriteEngineImpl {
 #[async_trait]
 impl WriteEngine for WriteEngineImpl {
   async fn produce_batch(&self, request: WriteRequest) -> Result<WriteResponse, WriteError> {
+    let started = Instant::now();
+    self.metrics.produce_requests_total.inc();
+    self
+      .metrics
+      .produce_records_total
+      .inc_by(request.records.len() as u64);
+    self.metrics.produce_payload_bytes_total.inc_by(
+      request
+        .records
+        .iter()
+        .map(|record| record.payload.len() as u64)
+        .sum::<u64>(),
+    );
+
+    trace!(
+      "broker write request accepted: topic={}, virtual_partition_id={}, records={}",
+      request.topic,
+      request.virtual_partition_id,
+      request.records.len()
+    );
+
     let topic_info = self
       .topics
       .get(&request.topic)
@@ -389,18 +535,61 @@ impl WriteEngine for WriteEngineImpl {
     };
 
     if !plans.is_empty() {
-      flush_plans_and_notify(&self.flush_context, plans, now).await?;
+      self.metrics.record_flush_plan_summary(&plans);
+      let flush_started = Instant::now();
+      if let Err(error) = flush_plans_and_notify(&self.flush_context, plans, now).await {
+        self.metrics.flush_failures_total.inc();
+        self
+          .metrics
+          .flush_latency_seconds
+          .observe(flush_started.elapsed().as_secs_f64());
+        self.metrics.record_produce_error(&error);
+        self
+          .metrics
+          .produce_latency_seconds
+          .observe(started.elapsed().as_secs_f64());
+        return Err(error);
+      }
+      self
+        .metrics
+        .flush_latency_seconds
+        .observe(flush_started.elapsed().as_secs_f64());
+
+      debug!(
+        "broker flushed buffered write data inline: topic={}, virtual_partition_id={}",
+        request.topic, request.virtual_partition_id
+      );
     }
 
     match completion_rx.await {
       Ok(Ok(())) => {},
-      Ok(Err(error)) => return Err(WriteError::Internal(anyhow!(error))),
+      Ok(Err(error)) => {
+        let write_error = WriteError::Internal(anyhow!(error));
+        self.metrics.record_produce_error(&write_error);
+        self
+          .metrics
+          .produce_latency_seconds
+          .observe(started.elapsed().as_secs_f64());
+        return Err(write_error);
+      },
       Err(_closed) => {
-        return Err(WriteError::Internal(anyhow!(
+        let write_error = WriteError::Internal(anyhow!(
           "flush completion channel closed before acknowledgment"
-        )));
+        ));
+        self.metrics.record_produce_error(&write_error);
+        self
+          .metrics
+          .produce_latency_seconds
+          .observe(started.elapsed().as_secs_f64());
+        return Err(write_error);
       },
     }
+
+    self.metrics.produce_ok_total.inc();
+    self
+      .metrics
+      .produce_latency_seconds
+      .observe(started.elapsed().as_secs_f64());
 
     Ok(WriteResponse { seq_range })
   }

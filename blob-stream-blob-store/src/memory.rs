@@ -13,6 +13,7 @@ use crate::{BlobKey, BlobStore, ByteRange};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
+use log::trace;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
@@ -35,12 +36,23 @@ impl InMemoryBlobStore {
 #[async_trait]
 impl BlobStore for InMemoryBlobStore {
   async fn put(&self, key: &BlobKey, payload: Bytes) -> Result<()> {
+    trace!(
+      "in-memory blob put: key={}, bytes={}",
+      key.as_str(),
+      payload.len()
+    );
     let mut guard = self.blobs.write().await;
     guard.insert(key.clone(), payload);
     Ok(())
   }
 
   async fn get_range(&self, key: &BlobKey, range: ByteRange) -> Result<Bytes> {
+    trace!(
+      "in-memory blob get_range: key={}, start={}, end={}",
+      key.as_str(),
+      range.start,
+      range.end
+    );
     if range.is_empty() {
       return Ok(Bytes::new());
     }

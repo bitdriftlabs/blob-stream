@@ -22,6 +22,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use blob_stream_types::SeqRange;
+use log::trace;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
@@ -50,6 +51,10 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome> {
+    trace!(
+      "producer lease(memory) acquire: topic={}, writer_id={}, partition={}, holder_id={}",
+      key.topic, key.writer_id, key.virtual_partition_id, holder_id
+    );
     let mut guard = self.leases.write().await;
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
 
@@ -85,6 +90,10 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseHeartbeatOutcome> {
+    trace!(
+      "producer lease(memory) heartbeat: topic={}, writer_id={}, partition={}, holder_id={}",
+      key.topic, key.writer_id, key.virtual_partition_id, holder_id
+    );
     let mut guard = self.leases.write().await;
     let Some(state) = guard.get_mut(key) else {
       return Ok(LeaseHeartbeatOutcome::Expired);
@@ -111,6 +120,10 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     now_ts_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
+    trace!(
+      "producer lease(memory) reserve: topic={}, writer_id={}, partition={}, holder_id={}, size={}",
+      key.topic, key.writer_id, key.virtual_partition_id, holder_id, reservation_size
+    );
     if reservation_size == 0 {
       return Err(anyhow!("reservation_size must be greater than zero"));
     }
@@ -145,6 +158,10 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     holder_id: &str,
     now_ts_ms: i64,
   ) -> Result<LeaseReleaseOutcome> {
+    trace!(
+      "producer lease(memory) release: topic={}, writer_id={}, partition={}, holder_id={}",
+      key.topic, key.writer_id, key.virtual_partition_id, holder_id
+    );
     let mut guard = self.leases.write().await;
     let Some(state) = guard.get(key).cloned() else {
       return Ok(LeaseReleaseOutcome::Expired);

@@ -20,6 +20,7 @@ use blob_stream_types::{
   Window,
 };
 use bytes::{Bytes, BytesMut};
+use log::{debug, trace};
 use sonyflake::Sonyflake;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -125,6 +126,7 @@ impl FlushContext {
     plan: FlushPlan,
     now: OffsetDateTime,
   ) -> Result<(Bytes, SegmentEnvelope)> {
+    trace!("building flush segment: topic={topic}");
     let now_ts_ms = now.unix_timestamp_ms();
     let window = Window::for_timestamp(now.unix_timestamp(), self.config.window_size_seconds);
     let snowflake_id = self.snowflake.next(now)?;
@@ -138,6 +140,12 @@ impl FlushContext {
     let mut max_event_ts_ms: Option<i64> = None;
 
     for partition in plan.partitions {
+      trace!(
+        "encoding partition batches: topic={}, virtual_partition_id={}, batches={}",
+        topic,
+        partition.virtual_partition_id,
+        partition.batches.len()
+      );
       for batch in partition.batches {
         let encoded = Self::encode_batch(partition.virtual_partition_id, &batch.records)?;
         let compressed = self.compress_batch(&encoded)?;
@@ -184,6 +192,14 @@ impl FlushContext {
       created_ts_ms: now_ts_ms,
     };
 
+    debug!(
+      "built segment envelope: topic={}, partitions={}, records={}, bytes={}",
+      topic,
+      envelope.segment_index.len(),
+      envelope.record_count,
+      payload.len()
+    );
+
     Ok((payload.freeze(), envelope))
   }
 
@@ -192,10 +208,14 @@ impl FlushContext {
     plans: Vec<FlushPlan>,
     now: OffsetDateTime,
   ) -> Result<(), WriteError> {
+    trace!("flush_plans invoked: plans={}", plans.len());
     for plan in plans {
       let topic = plan.topic.clone();
       let (payload, envelope) = self.build_segment(&topic, plan, now)?;
       let metadata = envelope.into_metadata();
+      let payload_bytes = payload.len();
+      let record_count = metadata.record_count;
+      let partition_count = metadata.segment_index.len();
 
       self
         .blob_store
@@ -207,6 +227,11 @@ impl FlushContext {
         .write_segment(metadata)
         .await
         .context("write segment metadata")?;
+
+      debug!(
+        "flush persisted segment: topic={topic}, partitions={partition_count}, \
+         records={record_count}, bytes={payload_bytes}"
+      );
     }
 
     Ok(())

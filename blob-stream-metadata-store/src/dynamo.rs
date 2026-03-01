@@ -18,6 +18,7 @@ use blob_stream_types::{
   TopicWindowKey,
   VirtualPartitionId,
 };
+use log::{debug, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -53,6 +54,13 @@ impl DynamoMetadataStore {
 #[async_trait]
 impl MetadataStore for DynamoMetadataStore {
   async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
+    trace!(
+      "metadata(dynamo) write_segment start: table={}, topic={}, window_start={}, snowflake_id={}",
+      self.table_name,
+      metadata.window.topic,
+      metadata.window.window_start_unix_seconds,
+      metadata.snowflake_id.as_u64()
+    );
     let item = DynamoSegmentItem::from_metadata(metadata);
     let item = serde_dynamo::to_item(item)?;
 
@@ -64,6 +72,11 @@ impl MetadataStore for DynamoMetadataStore {
       .send()
       .await?;
 
+    debug!(
+      "metadata(dynamo) write_segment complete: table={}",
+      self.table_name
+    );
+
     Ok(())
   }
 
@@ -72,6 +85,13 @@ impl MetadataStore for DynamoMetadataStore {
     window: &TopicWindowKey,
     min_snowflake_id: Option<SnowflakeId>,
   ) -> Result<Vec<SegmentMetadata>> {
+    trace!(
+      "metadata(dynamo) scan_window start: table={}, topic={}, window_start={}, min_snowflake={:?}",
+      self.table_name,
+      window.topic,
+      window.window_start_unix_seconds,
+      min_snowflake_id.map(SnowflakeId::as_u64)
+    );
     let mut values = HashMap::new();
     values.insert(":pk".to_string(), AttributeValue::S(window.format()));
 
@@ -91,7 +111,7 @@ impl MetadataStore for DynamoMetadataStore {
       .send()
       .await?;
 
-    response
+    let output: Result<Vec<SegmentMetadata>> = response
       .items
       .unwrap_or_default()
       .into_iter()
@@ -99,7 +119,17 @@ impl MetadataStore for DynamoMetadataStore {
         let entry: DynamoSegmentItem = serde_dynamo::from_item(item)?;
         SegmentMetadata::try_from(entry)
       })
-      .collect()
+      .collect();
+
+    if let Ok(ref segments) = output {
+      debug!(
+        "metadata(dynamo) scan_window complete: table={}, segments={}",
+        self.table_name,
+        segments.len()
+      );
+    }
+
+    output
   }
 }
 

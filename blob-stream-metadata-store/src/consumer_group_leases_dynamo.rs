@@ -23,6 +23,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
 use blob_stream_types::CommittedCursor;
+use log::{debug, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -97,6 +98,11 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<ConsumerGroupAssignmentOutcome> {
+    trace!(
+      "consumer lease(dynamo) assign: table={}, topic={}, group_id={}, partition={}, owner_id={}, \
+       generation={}",
+      self.table_name, key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
+    );
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
 
     let mut values = HashMap::new();
@@ -150,11 +156,13 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
         let lease = Self::lease_from_item(attributes)?;
+        debug!("consumer lease(dynamo) assign result: assigned");
         Ok(ConsumerGroupAssignmentOutcome::Assigned(lease))
       },
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
       {
+        debug!("consumer lease(dynamo) assign result: held_by_other");
         let lease = self
           .get_lease(&key)
           .await?
@@ -174,6 +182,11 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     lease_duration_ms: i64,
     committed_cursor: Option<CommittedCursor>,
   ) -> Result<ConsumerGroupHeartbeatOutcome> {
+    trace!(
+      "consumer lease(dynamo) heartbeat: table={}, topic={}, group_id={}, partition={}, \
+       owner_id={}, generation={}",
+      self.table_name, key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
+    );
     if let Some(cursor) = committed_cursor.as_ref() {
       validate_cursor(key, cursor)?;
     }
@@ -227,17 +240,21 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
         let lease = Self::lease_from_item(attributes)?;
+        debug!("consumer lease(dynamo) heartbeat result: renewed");
         Ok(ConsumerGroupHeartbeatOutcome::Renewed(lease))
       },
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
       {
         let Some(lease) = self.get_lease(key).await? else {
+          debug!("consumer lease(dynamo) heartbeat result: expired");
           return Ok(ConsumerGroupHeartbeatOutcome::Expired);
         };
         if lease.lease_expiration_ts_ms <= now_ts_ms {
+          debug!("consumer lease(dynamo) heartbeat result: expired");
           Ok(ConsumerGroupHeartbeatOutcome::Expired)
         } else {
+          debug!("consumer lease(dynamo) heartbeat result: held_by_other");
           Ok(ConsumerGroupHeartbeatOutcome::HeldByOther(lease))
         }
       },
@@ -253,6 +270,17 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     now_ts_ms: i64,
     committed_cursor: CommittedCursor,
   ) -> Result<ConsumerGroupCommitOutcome> {
+    trace!(
+      "consumer lease(dynamo) commit: table={}, topic={}, group_id={}, partition={}, owner_id={}, \
+       generation={}, seq_end={}",
+      self.table_name,
+      key.topic,
+      key.group_id,
+      key.virtual_partition_id,
+      owner_id,
+      generation,
+      committed_cursor.seq_end
+    );
     validate_cursor(key, &committed_cursor)?;
 
     let mut values = HashMap::new();
@@ -294,17 +322,21 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
         let lease = Self::lease_from_item(attributes)?;
+        debug!("consumer lease(dynamo) commit result: committed");
         Ok(ConsumerGroupCommitOutcome::Committed(lease))
       },
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
       {
         let Some(lease) = self.get_lease(key).await? else {
+          debug!("consumer lease(dynamo) commit result: expired");
           return Ok(ConsumerGroupCommitOutcome::Expired);
         };
         if lease.lease_expiration_ts_ms <= now_ts_ms {
+          debug!("consumer lease(dynamo) commit result: expired");
           Ok(ConsumerGroupCommitOutcome::Expired)
         } else {
+          debug!("consumer lease(dynamo) commit result: held_by_other");
           Ok(ConsumerGroupCommitOutcome::HeldByOther(lease))
         }
       },

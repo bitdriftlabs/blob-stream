@@ -18,6 +18,7 @@ pub use blob_stream_proto::protos::blobstream::v1::config::{
   ProducerRuntimeConfig,
   TopicConfig,
 };
+use log::{debug, trace};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -141,6 +142,7 @@ pub fn compression_as_grpc(compression: ProducerCompression) -> Compression {
 }
 
 pub fn validate_producer_config(config: &ProducerConfig) -> Result<()> {
+  trace!("validating producer config");
   let max_batch_records = producer_max_batch_records(config);
   let max_batch_bytes = producer_max_batch_bytes(config);
   let flush_max_delay_ms = producer_flush_max_delay_ms(config);
@@ -186,6 +188,7 @@ pub fn validate_producer_config(config: &ProducerConfig) -> Result<()> {
 }
 
 pub fn validate_topic_config(topic: &ProducerTopicConfig) -> Result<()> {
+  trace!("validating producer topic config: topic={}", topic.name);
   ensure!(!topic.name.trim().is_empty(), "topic name is required");
   ensure!(
     topic.partition_count > 0,
@@ -199,6 +202,11 @@ pub fn validate_topic_config(topic: &ProducerTopicConfig) -> Result<()> {
 }
 
 pub fn validate_runtime_config(runtime: &ProducerRuntimeConfig) -> Result<()> {
+  debug!(
+    "validating producer runtime config: topics={}, stats_scope={}",
+    runtime.topics.len(),
+    stats_scope(runtime)
+  );
   let producer = runtime
     .producer
     .as_ref()
@@ -237,6 +245,7 @@ pub fn validate_runtime_config(runtime: &ProducerRuntimeConfig) -> Result<()> {
 
 pub fn validate_discovery_config(discovery: &ProducerDiscoveryConfig) -> Result<()> {
   if discovery.has_static() {
+    trace!("validating producer static discovery config");
     let static_config = discovery.static_();
     ensure!(
       !static_config.nodes.is_empty(),
@@ -256,6 +265,7 @@ pub fn validate_discovery_config(discovery: &ProducerDiscoveryConfig) -> Result<
   }
 
   if discovery.has_k8s_service() {
+    trace!("validating producer k8s discovery config");
     let k8s = discovery.k8s_service();
     ensure!(
       !k8s.namespace.trim().is_empty(),
@@ -275,6 +285,7 @@ pub fn validate_discovery_config(discovery: &ProducerDiscoveryConfig) -> Result<
 
 pub fn into_discovery(discovery: &ProducerDiscoveryConfig) -> Result<Arc<dyn BrokerDiscovery>> {
   if discovery.has_static() {
+    debug!("constructing static producer discovery backend");
     let nodes = discovery
       .static_()
       .nodes
@@ -288,6 +299,7 @@ pub fn into_discovery(discovery: &ProducerDiscoveryConfig) -> Result<Arc<dyn Bro
   }
 
   if discovery.has_k8s_service() {
+    debug!("constructing k8s producer discovery backend");
     let k8s = discovery.k8s_service();
     return Ok(Arc::new(K8sServiceBrokerDiscovery::new(
       k8s.namespace.to_string(),

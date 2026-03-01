@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
+use log::{debug, trace};
 
 //
 // S3BlobStore
@@ -34,6 +35,12 @@ impl S3BlobStore {
 #[async_trait]
 impl BlobStore for S3BlobStore {
   async fn put(&self, key: &BlobKey, payload: Bytes) -> Result<()> {
+    trace!(
+      "s3 put start: bucket={}, key={}, bytes={}",
+      self.bucket,
+      key.as_str(),
+      payload.len()
+    );
     // TODO(multipart): Use S3 multipart uploads with parallel parts for large blobs.
     self
       .client
@@ -45,10 +52,23 @@ impl BlobStore for S3BlobStore {
       .await
       .with_context(|| format!("put S3 object {}", key.as_str()))?;
 
+    debug!(
+      "s3 put complete: bucket={}, key={}",
+      self.bucket,
+      key.as_str()
+    );
+
     Ok(())
   }
 
   async fn get_range(&self, key: &BlobKey, range: ByteRange) -> Result<Bytes> {
+    trace!(
+      "s3 get_range start: bucket={}, key={}, start={}, end={}",
+      self.bucket,
+      key.as_str(),
+      range.start,
+      range.end
+    );
     if range.is_empty() {
       return Ok(Bytes::new());
     }
@@ -67,7 +87,14 @@ impl BlobStore for S3BlobStore {
       .with_context(|| format!("get S3 object {}", key.as_str()))?;
 
     let body = response.body.collect().await.context("collect S3 body")?;
+    let bytes = body.into_bytes();
+    debug!(
+      "s3 get_range complete: bucket={}, key={}, bytes={}",
+      self.bucket,
+      key.as_str(),
+      bytes.len()
+    );
 
-    Ok(body.into_bytes())
+    Ok(bytes)
   }
 }

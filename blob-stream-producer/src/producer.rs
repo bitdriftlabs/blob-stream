@@ -35,6 +35,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use async_trait::async_trait;
 use bd_grpc::client::Client as GrpcClient;
 use bd_grpc::service::ServiceMethod;
+use bd_log::warn_every;
 use bd_server_stats::stats::{Collector, Scope};
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, owner_for_partition};
 use blob_stream_proto::protos::blobstream::v1::broker::{
@@ -51,6 +52,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use time::Duration as TimeDuration;
+use time::ext::NumericalDuration;
 use tokio::sync::{Mutex, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval};
@@ -513,8 +515,9 @@ async fn send_batch_with_retry(
       metrics
         .send_latency_seconds
         .observe(started_at.elapsed().as_secs_f64());
-      debug!(
-        "no broker owner available: topic={}, virtual_partition_id={}, membership_nodes={}",
+      warn_every!(
+        15.seconds(),
+        "producer no broker owner: topic={}, virtual_partition_id={}, membership_nodes={}",
         batch.topic,
         batch.virtual_partition_id,
         membership.nodes.len()
@@ -589,7 +592,8 @@ async fn send_batch_with_retry(
       metrics
         .send_latency_seconds
         .observe(started_at.elapsed().as_secs_f64());
-      debug!(
+      warn_every!(
+        15.seconds(),
         "producer retries exhausted: topic={}, virtual_partition_id={}, attempts={}, error={}",
         batch.topic,
         batch.virtual_partition_id,
@@ -601,7 +605,8 @@ async fn send_batch_with_retry(
 
     let delay_ms = retry_delay_ms(config, attempt);
     metrics.retries.inc();
-    debug!(
+    warn_every!(
+      15.seconds(),
       "producer retrying batch: topic={}, virtual_partition_id={}, attempt={}, delay_ms={}, \
        error={}",
       batch.topic,

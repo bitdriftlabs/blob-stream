@@ -640,14 +640,22 @@ Notes:
     - `blob-stream-consumer/src/lib.rs` (iterator/runtime API exports)
     - `blob-stream-consumer/Cargo.toml` (consumer observability + proto/runtime dependencies)
 
-- [ ] Milestone 12: Observability + logging
-  - [ ] Do another pass and add bd-server-stats metrics for broker/producer/consumer that will
-        provide operational value. Verify all crates.
-  - [ ] Add structured logging with debug/trace for hot paths. Use info logging for anything low
-        rate or related to startup/shutdown. Verify all crates. Use warn_every for any handled
-        errors that can fail at high rate.
-  - [ ] Create an axum admin handler in the broker to expose prometheus metrics collected via
-        bd-server-stats.
+- [x] Milestone 12: Observability + logging
+  - [x] Do another pass and add bd-server-stats metrics for broker/producer/consumer that will
+    provide operational value. Verify all crates.
+  - [x] Add structured logging with debug/trace for hot paths. Use info logging for anything low
+    rate or related to startup/shutdown. Verify all crates. Use warn_every for any handled
+    errors that can fail at high rate.
+  - [x] Create an axum admin handler in the broker to expose prometheus metrics collected via
+    bd-server-stats.
+  - Source map:
+    - `blob-stream-broker/src/metrics.rs` (broker-scoped bd-server-stats collector + prometheus export)
+    - `blob-stream-broker/src/grpc.rs` (gRPC request/response counters, latency histogram, `/metrics` admin route)
+    - `blob-stream-broker/src/write/mod.rs` (write-path throughput/error/flush metrics and hot-path trace/debug logs)
+    - `blob-stream-broker/src/write/lease_assignment.rs` (info-level ownership change logging)
+    - `blob-stream-broker/src/main.rs` (startup/listen/shutdown info logs)
+    - `blob-stream-broker/src/lib.rs` (metrics module export)
+    - `blob-stream-broker/Cargo.toml` (bd-server-stats + prometheus dependencies)
 
 - [ ] Milestone 13: End-to-end integration
   - [ ] Write integration tests for broker + producer + consumer using docker compose for

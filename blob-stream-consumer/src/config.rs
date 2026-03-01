@@ -11,6 +11,7 @@ pub use blob_stream_proto::protos::blobstream::v1::config::{
   ConsumerReadConfig,
   ConsumerRuntimeConfig,
 };
+use log::{debug, trace};
 
 const DEFAULT_WINDOW_SIZE_SECONDS: i64 = 300;
 const DEFAULT_LOOKBACK_WINDOWS: u32 = 3;
@@ -64,6 +65,7 @@ pub fn stats_scope(runtime: &ConsumerRuntimeConfig) -> &str {
 }
 
 pub fn validate_read_config(config: &ConsumerReadConfig) -> Result<()> {
+  trace!("validating consumer read config: topic={}", config.topic);
   ensure!(
     !config.topic.trim().is_empty(),
     "consumer topic is required"
@@ -81,6 +83,10 @@ pub fn validate_read_config(config: &ConsumerReadConfig) -> Result<()> {
 }
 
 pub fn validate_group_config(config: &ConsumerGroupConfig) -> Result<()> {
+  trace!(
+    "validating consumer group config: topic={}, group_id={}, member_id={}",
+    config.topic, config.group_id, config.member_id
+  );
   ensure!(
     !config.topic.trim().is_empty(),
     "consumer group topic is required"
@@ -109,6 +115,10 @@ pub fn validate_group_config(config: &ConsumerGroupConfig) -> Result<()> {
 }
 
 pub fn validate_runtime_config(runtime: &ConsumerRuntimeConfig) -> Result<()> {
+  debug!(
+    "validating consumer runtime config: stats_scope={}",
+    stats_scope(runtime)
+  );
   let read = runtime
     .read
     .as_ref()

@@ -20,6 +20,7 @@ use blob_stream_metadata_store::{
   SequenceReservationOutcome,
 };
 use blob_stream_types::{VirtualPartitionId, virtual_partition_for_logical};
+use log::info;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -106,6 +107,14 @@ impl WriteEngineImpl {
         let owned = Self::owned_virtual_partitions(&topics, writer_id, &holder_id, &membership);
         let currently_owned: HashSet<(String, VirtualPartitionId)> =
           owned.iter().cloned().collect();
+
+        if currently_owned != previously_owned {
+          info!(
+            "broker lease ownership changed: holder_id={}, owned_partitions={}",
+            holder_id,
+            currently_owned.len()
+          );
+        }
 
         // On membership changes (scale up/down), we release any partition that moved away from
         // this broker instead of waiting for lease TTL expiration. This shortens convergence and

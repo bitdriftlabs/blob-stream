@@ -29,6 +29,7 @@ use blob_stream_types::{
   VirtualPartitionId,
   Window,
 };
+use log::trace;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -165,6 +166,12 @@ impl ConsumerReaderImpl {
     metadata_store: Arc<dyn MetadataStore>,
   ) -> Result<Self> {
     validate_read_config(&config)?;
+    trace!(
+      "consumer reader init: topic={}, assigned_partitions={}, initial_cursors={}",
+      config.topic,
+      assigned_virtual_partitions.len(),
+      initial_cursors.len()
+    );
 
     // Seed runtime cursors from the caller-provided committed state.
     // Missing partitions default to cursor 0 during read processing.
@@ -196,6 +203,13 @@ impl ConsumerReaderImpl {
       });
     }
 
+    trace!(
+      "consumer scan windows computed: topic={}, count={}, now_unix_seconds={}",
+      self.config.topic,
+      windows.len(),
+      now_unix_seconds
+    );
+
     windows
   }
 
@@ -205,6 +219,14 @@ impl ConsumerReaderImpl {
     batch_metadata: &BatchMetadata,
     virtual_partition_id: VirtualPartitionId,
   ) -> Result<ConsumerBatch> {
+    trace!(
+      "consumer read batch start: topic={}, partition={}, blob_key={}, seq_start={}, seq_end={}",
+      self.config.topic,
+      virtual_partition_id,
+      metadata.blob_key.as_str(),
+      batch_metadata.seq_range.start,
+      batch_metadata.seq_range.end
+    );
     // Pull only the referenced byte range for this batch to avoid downloading full segments.
     let payload = self
       .blob_store
@@ -270,12 +292,23 @@ impl ConsumerReaderImpl {
 #[async_trait]
 impl ConsumerReader for ConsumerReaderImpl {
   async fn read_available(&mut self, now_unix_seconds: i64) -> Result<Vec<ConsumerBatch>> {
+    trace!(
+      "consumer read_available start: topic={}, assigned_partitions={}",
+      self.config.topic,
+      self.assigned_virtual_partitions.len()
+    );
     // Output contains only newly consumable batches according to per-partition cursor state.
     let mut output = Vec::new();
 
     // Iterate through the lookback scan region to catch both current and delayed metadata.
     for window in self.scan_windows(now_unix_seconds) {
       let mut segments = self.metadata_store.scan_window(&window, None).await?;
+      trace!(
+        "consumer scanned window: topic={}, window_start={}, segments={}",
+        window.topic,
+        window.window_start_unix_seconds,
+        segments.len()
+      );
 
       // Metadata scans are unordered by contract; sorting provides deterministic processing.
       segments.sort_by_key(|metadata| metadata.snowflake_id);
@@ -296,6 +329,10 @@ impl ConsumerReader for ConsumerReaderImpl {
             // Cursor semantics: seq_end <= cursor was already consumed and can be skipped.
             let current_cursor = self.cursors.get(partition_id).copied().unwrap_or(0);
             if batch_metadata.seq_range.end <= current_cursor {
+              trace!(
+                "consumer skipped batch by cursor: topic={}, partition={}, seq_end={}, cursor={}",
+                self.config.topic, partition_id, batch_metadata.seq_range.end, current_cursor
+              );
               continue;
             }
 
@@ -307,11 +344,27 @@ impl ConsumerReader for ConsumerReaderImpl {
             // Cursor always moves forward. max() keeps monotonicity if metadata ordering is odd.
             let next_cursor = batch.seq_range.end.max(current_cursor);
             self.cursors.insert(*partition_id, next_cursor);
+            trace!(
+              "consumer accepted batch: topic={}, partition={}, seq_start={}, seq_end={}, \
+               records={}, new_cursor={}",
+              self.config.topic,
+              partition_id,
+              batch.seq_range.start,
+              batch.seq_range.end,
+              batch.records.len(),
+              next_cursor
+            );
             output.push(batch);
           }
         }
       }
     }
+
+    trace!(
+      "consumer read_available complete: topic={}, output_batches={}",
+      self.config.topic,
+      output.len()
+    );
 
     Ok(output)
   }

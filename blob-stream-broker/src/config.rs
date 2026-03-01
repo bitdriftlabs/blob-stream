@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use blob_stream_proto::protos::blobstream::v1::config::RuntimeConfig;
+use log::{debug, trace};
 use std::fs;
 use std::path::Path;
 
@@ -28,6 +29,7 @@ impl ConfigFormat {
 }
 
 pub fn decode_runtime_config_str(input: &str, format: ConfigFormat) -> Result<RuntimeConfig> {
+  trace!("decoding broker runtime config payload: format={format:?}");
   let json_payload = match format {
     ConfigFormat::Json => input.to_string(),
     ConfigFormat::Yaml => {
@@ -43,6 +45,7 @@ pub fn decode_runtime_config_str(input: &str, format: ConfigFormat) -> Result<Ru
 }
 
 pub fn load_runtime_config(path: &Path) -> Result<RuntimeConfig> {
+  debug!("loading broker runtime config from path={}", path.display());
   let format = ConfigFormat::from_path(path).context("unsupported config file extension")?;
   let contents = fs::read_to_string(path)
     .with_context(|| format!("failed to read runtime config from {}", path.display()))?;
