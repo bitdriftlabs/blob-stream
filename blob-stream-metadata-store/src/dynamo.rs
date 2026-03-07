@@ -23,6 +23,8 @@ mod tests;
 
 const ATTR_PK: &str = "pk";
 const ATTR_SK: &str = "sk";
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+const DEFAULT_SEGMENT_TTL_BUFFER_SECONDS: u32 = 3_600;
 
 //
 // DynamoMetadataStore
@@ -32,15 +34,48 @@ const ATTR_SK: &str = "sk";
 pub struct DynamoMetadataStore {
   client: Client,
   table_name: String,
+  topic_retention_days: HashMap<String, u32>,
+  ttl_buffer_seconds: i64,
 }
 
 impl DynamoMetadataStore {
   #[must_use]
   pub fn new(client: Client, table_name: impl Into<String>) -> Self {
+    Self::with_segment_ttl(
+      client,
+      table_name,
+      HashMap::new(),
+      DEFAULT_SEGMENT_TTL_BUFFER_SECONDS,
+    )
+  }
+
+  #[must_use]
+  pub fn with_segment_ttl(
+    client: Client,
+    table_name: impl Into<String>,
+    topic_retention_days: HashMap<String, u32>,
+    ttl_buffer_seconds: u32,
+  ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
+      topic_retention_days,
+      ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
     }
+  }
+
+  fn metadata_ttl_epoch_seconds(&self, metadata: &SegmentMetadata) -> Option<i64> {
+    let retention_days = self.topic_retention_days.get(&metadata.window.topic)?;
+    if *retention_days == 0 {
+      return None;
+    }
+
+    let retention_seconds = i64::from(*retention_days).checked_mul(SECONDS_PER_DAY)?;
+    let created_seconds = metadata.created_ts_ms.checked_div(1_000)?;
+
+    created_seconds
+      .checked_add(retention_seconds)?
+      .checked_add(self.ttl_buffer_seconds)
   }
 }
 
@@ -54,7 +89,8 @@ impl MetadataStore for DynamoMetadataStore {
       metadata.window.window_start_unix_seconds,
       metadata.snowflake_id.as_u64()
     );
-    let item = DynamoSegmentItem::from_metadata(metadata);
+    let ttl_epoch_seconds = self.metadata_ttl_epoch_seconds(&metadata);
+    let item = DynamoSegmentItem::from_metadata(metadata, ttl_epoch_seconds);
     let item = serde_dynamo::to_item(item)?;
 
     self
@@ -142,10 +178,13 @@ struct DynamoSegmentItem {
   max_event_ts_ms: i64,
   checksum: Option<String>,
   created_ts_ms: i64,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  #[serde(rename = "ttl_epoch_seconds")]
+  ttl_epoch_seconds: Option<i64>,
 }
 
 impl DynamoSegmentItem {
-  fn from_metadata(metadata: SegmentMetadata) -> Self {
+  fn from_metadata(metadata: SegmentMetadata, ttl_epoch_seconds: Option<i64>) -> Self {
     let partition_key = metadata.partition_key();
     let sort_key = metadata.snowflake_key();
     let topic = metadata.window.topic;
@@ -177,6 +216,7 @@ impl DynamoSegmentItem {
       max_event_ts_ms,
       checksum,
       created_ts_ms,
+      ttl_epoch_seconds,
     }
   }
 }

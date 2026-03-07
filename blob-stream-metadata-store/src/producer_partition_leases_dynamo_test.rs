@@ -12,6 +12,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{
   AttributeDefinition,
+  AttributeValue,
   BillingMode,
   KeySchemaElement,
   KeyType,
@@ -23,6 +24,7 @@ use uuid::Uuid;
 
 const LOCAL_ENDPOINT: &str = "http://localhost:8000";
 const REGION: &str = "us-east-1";
+const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
 
 async fn dynamo_client() -> Result<Client> {
   unsafe {
@@ -178,6 +180,44 @@ async fn releases_lease_for_current_holder() -> Result<()> {
     .acquire_lease(key, "broker-b".to_string(), 1000, 100)
     .await?;
   assert!(matches!(reacquire, LeaseAcquireOutcome::Acquired(_)));
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn writes_ttl_attribute_for_lease_rows() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
+  create_leases_table(&client, &table_name).await?;
+
+  let store = DynamoProducerPartitionLeaseStore::with_ttl_buffer_seconds(
+    client.clone(),
+    table_name.clone(),
+    120,
+  );
+  let key = lease_key();
+
+  store
+    .acquire_lease(key.clone(), "broker-a".to_string(), 2_000, 1_000)
+    .await?;
+
+  let item = client
+    .get_item()
+    .table_name(&table_name)
+    .key("pk", AttributeValue::S(key.format()))
+    .send()
+    .await?
+    .item
+    .ok_or_else(|| anyhow!("expected lease item"))?;
+
+  let ttl = item
+    .get(TTL_ATTRIBUTE_NAME)
+    .and_then(|value| value.as_n().ok())
+    .ok_or_else(|| anyhow!("missing ttl attribute"))?
+    .parse::<i64>()?;
+
+  assert_eq!(ttl, 123);
 
   client.delete_table().table_name(table_name).send().await?;
   Ok(())

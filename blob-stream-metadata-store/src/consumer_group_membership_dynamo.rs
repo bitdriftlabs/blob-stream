@@ -17,6 +17,8 @@ const ATTR_GROUP_ID: &str = "group_id";
 const ATTR_MEMBER_ID: &str = "member_id";
 const ATTR_LEASE_EXPIRES: &str = "lease_expiry_ts";
 const ATTR_LAST_HEARTBEAT: &str = "last_heartbeat_ts";
+const ATTR_TTL: &str = "ttl_epoch_seconds";
+const DEFAULT_MEMBERSHIP_TTL_BUFFER_SECONDS: u32 = 3_600;
 
 //
 // DynamoConsumerGroupMembershipStore
@@ -26,14 +28,25 @@ const ATTR_LAST_HEARTBEAT: &str = "last_heartbeat_ts";
 pub struct DynamoConsumerGroupMembershipStore {
   client: Client,
   table_name: String,
+  ttl_buffer_seconds: i64,
 }
 
 impl DynamoConsumerGroupMembershipStore {
   #[must_use]
   pub fn new(client: Client, table_name: impl Into<String>) -> Self {
+    Self::with_ttl_buffer_seconds(client, table_name, DEFAULT_MEMBERSHIP_TTL_BUFFER_SECONDS)
+  }
+
+  #[must_use]
+  pub fn with_ttl_buffer_seconds(
+    client: Client,
+    table_name: impl Into<String>,
+    ttl_buffer_seconds: u32,
+  ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
+      ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
     }
   }
 
@@ -61,6 +74,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       self.table_name, topic, group_id, member_id
     );
     let expires_at = expires_at(now_ts_ms, ttl_ms)?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
 
     let mut values = HashMap::new();
     values.insert(":topic".to_string(), AttributeValue::S(topic.to_string()));
@@ -76,6 +90,10 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       ":expires".to_string(),
       AttributeValue::N(expires_at.to_string()),
     );
+    values.insert(
+      ":ttl".to_string(),
+      AttributeValue::N(ttl_epoch_seconds.to_string()),
+    );
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
 
     self
@@ -87,8 +105,8 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       .update_expression(format!(
         "SET {ATTR_TOPIC} = if_not_exists({ATTR_TOPIC}, :topic), {ATTR_GROUP_ID} = \
          if_not_exists({ATTR_GROUP_ID}, :group_id), {ATTR_MEMBER_ID} = \
-         if_not_exists({ATTR_MEMBER_ID}, :member_id), {ATTR_LEASE_EXPIRES} = :expires, \
-         {ATTR_LAST_HEARTBEAT} = :now"
+         if_not_exists({ATTR_MEMBER_ID}, :member_id), {ATTR_LEASE_EXPIRES} = :expires, {ATTR_TTL} \
+         = :ttl, {ATTR_LAST_HEARTBEAT} = :now"
       ))
       .set_expression_attribute_values(Some(values))
       .send()
@@ -195,4 +213,14 @@ fn expires_at(now_ts_ms: i64, ttl_ms: i64) -> Result<i64> {
   now_ts_ms
     .checked_add(ttl_ms)
     .ok_or_else(|| anyhow!("membership expiration overflow"))
+}
+
+fn ttl_epoch_seconds(expires_at_ms: i64, ttl_buffer_seconds: i64) -> Result<i64> {
+  let expires_at_seconds = expires_at_ms
+    .checked_div(1_000)
+    .ok_or_else(|| anyhow!("membership ttl conversion overflow"))?;
+
+  expires_at_seconds
+    .checked_add(ttl_buffer_seconds)
+    .ok_or_else(|| anyhow!("membership ttl overflow"))
 }

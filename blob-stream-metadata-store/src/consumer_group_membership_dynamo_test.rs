@@ -4,6 +4,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{
   AttributeDefinition,
+  AttributeValue,
   BillingMode,
   KeySchemaElement,
   KeyType,
@@ -15,6 +16,7 @@ use uuid::Uuid;
 
 const LOCAL_ENDPOINT: &str = "http://localhost:8000";
 const REGION: &str = "us-east-1";
+const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
 
 async fn dynamo_client() -> Result<Client> {
   unsafe {
@@ -146,6 +148,44 @@ async fn register_rejects_invalid_ttl() -> Result<()> {
       .to_string()
       .contains("membership ttl must be greater than zero")
   );
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn writes_ttl_attribute_for_membership_rows() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
+  create_membership_table(&client, &table_name).await?;
+
+  let store = DynamoConsumerGroupMembershipStore::with_ttl_buffer_seconds(
+    client.clone(),
+    table_name.clone(),
+    120,
+  );
+
+  store
+    .register_member("topic-a", "group-a", "member-a", 1_000, 1_000)
+    .await?;
+
+  let item = client
+    .get_item()
+    .table_name(&table_name)
+    .key("pk", AttributeValue::S("topic-a#group-a".to_string()))
+    .key("sk", AttributeValue::S("member-a".to_string()))
+    .send()
+    .await?
+    .item
+    .ok_or_else(|| anyhow!("expected membership item"))?;
+
+  let ttl = item
+    .get(TTL_ATTRIBUTE_NAME)
+    .and_then(|value| value.as_n().ok())
+    .ok_or_else(|| anyhow!("missing ttl attribute"))?
+    .parse::<i64>()?;
+
+  assert_eq!(ttl, 122);
 
   client.delete_table().table_name(table_name).send().await?;
   Ok(())

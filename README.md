@@ -8,6 +8,8 @@ The system uses:
 - Blob storage for payload segments (S3 in production)
 - Key-value metadata/indexes (DynamoDB in production)
 - Pull-based consumers with cursor progression per virtual partition
+- Writers allow for no cross AZ data transfer using virtual partitions. Consumers read all topic
+  data by consuming all virtual partitions.
 
 Delivery semantics are at-least-once. Duplicate records are possible on retries.
 
@@ -74,6 +76,8 @@ metadata_store:
     producer_partition_lease_table_name: "producer_partition_leases"
     consumer_group_lease_table_name: "consumer_group_leases"
     consumer_group_membership_table_name: "consumer_group_membership"
+    segment_ttl_buffer_seconds: 3600
+    lease_ttl_buffer_seconds: 3600
     region: "us-east-1"
     endpoint: "http://localhost:8000"
 ```
@@ -110,7 +114,7 @@ Keys:
 
 Representative attributes:
 - `topic`, `window_start_ts`, `blob_key`, `segment_index`, `compression`, `record_count`,
-  `min_event_ts_ms`, `max_event_ts_ms`, `checksum`, `created_ts_ms`
+  `min_event_ts_ms`, `max_event_ts_ms`, `checksum`, `created_ts_ms`, `ttl_epoch_seconds`
 
 ### 2) `producer_partition_leases`
 
@@ -122,7 +126,7 @@ Keys:
 
 Representative attributes:
 - `holder_id`, `lease_expiration_ts_ms`, `max_allocated_seq`, `topic`, `writer_id`,
-  `virtual_partition_id`
+  `virtual_partition_id`, `ttl_epoch_seconds`
 
 ### 3) `consumer_group_leases`
 
@@ -135,7 +139,7 @@ Keys:
 
 Representative attributes:
 - `owner_id`, `generation`, `lease_expiry_ts`, `last_heartbeat_ts`, `committed_cursor`,
-  `committed_ts`, `topic`, `group_id`, `virtual_partition_id`
+  `committed_ts`, `topic`, `group_id`, `virtual_partition_id`, `ttl_epoch_seconds`
 
 ### Provisioning note
 
@@ -164,7 +168,43 @@ Keys:
 - Sort key: `sk` = `"<member_id>"`
 
 Representative attributes:
-- `member_id`, `lease_expiry_ts`, `last_heartbeat_ts`, `topic`, `group_id`
+- `member_id`, `lease_expiry_ts`, `last_heartbeat_ts`, `topic`, `group_id`, `ttl_epoch_seconds`
+
+### Enable DynamoDB TTL
+
+All Dynamo tables should enable TTL on the same attribute name:
+- TTL attribute name: `ttl_epoch_seconds` (Unix epoch seconds)
+
+Example AWS CLI commands:
+
+```bash
+aws dynamodb update-time-to-live \
+  --table-name blob_segments \
+  --time-to-live-specification "Enabled=true,AttributeName=ttl_epoch_seconds"
+
+aws dynamodb update-time-to-live \
+  --table-name producer_partition_leases \
+  --time-to-live-specification "Enabled=true,AttributeName=ttl_epoch_seconds"
+
+aws dynamodb update-time-to-live \
+  --table-name consumer_group_leases \
+  --time-to-live-specification "Enabled=true,AttributeName=ttl_epoch_seconds"
+
+aws dynamodb update-time-to-live \
+  --table-name consumer_group_membership \
+  --time-to-live-specification "Enabled=true,AttributeName=ttl_epoch_seconds"
+```
+
+TTL behavior by table:
+- `blob_segments`: broker writes `ttl_epoch_seconds` using `topic.retention_days` plus
+  `metadata_store.dynamo.segment_ttl_buffer_seconds`.
+- `producer_partition_leases`, `consumer_group_leases`, `consumer_group_membership`: lease rows
+  write `ttl_epoch_seconds` from their lease expiration plus
+  `metadata_store.dynamo.lease_ttl_buffer_seconds`.
+
+Notes:
+- DynamoDB TTL is asynchronous; expired items are typically deleted within hours, not immediately.
+- Keep segment TTL aligned with S3 lifecycle to avoid metadata pointing at already-deleted blobs.
 
 ## S3 bucket requirements
 

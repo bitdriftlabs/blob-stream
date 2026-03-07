@@ -38,6 +38,7 @@ fn make_engine(
       name: "telemetry".to_string(),
       partition_count: 1,
       num_writers: 1,
+      retention_days: 7,
     },
   );
 
@@ -241,6 +242,7 @@ async fn returns_error_when_flush_fails() -> Result<()> {
       name: "telemetry".to_string(),
       partition_count: 1,
       num_writers: 1,
+      retention_days: 7,
     },
   );
 

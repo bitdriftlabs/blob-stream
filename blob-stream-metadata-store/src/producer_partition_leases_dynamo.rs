@@ -27,8 +27,10 @@ const ATTR_HOLDER: &str = "holder_id";
 const ATTR_EXPIRES: &str = "lease_expiration_ts_ms";
 const ATTR_MAX_SEQ: &str = "max_allocated_seq";
 const ATTR_TOPIC: &str = "topic";
+const ATTR_TTL: &str = "ttl_epoch_seconds";
 const ATTR_WRITER_ID: &str = "writer_id";
 const ATTR_VIRTUAL_PARTITION_ID: &str = "virtual_partition_id";
+const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
 
 //
 // DynamoProducerPartitionLeaseStore
@@ -38,14 +40,25 @@ const ATTR_VIRTUAL_PARTITION_ID: &str = "virtual_partition_id";
 pub struct DynamoProducerPartitionLeaseStore {
   client: Client,
   table_name: String,
+  ttl_buffer_seconds: i64,
 }
 
 impl DynamoProducerPartitionLeaseStore {
   #[must_use]
   pub fn new(client: Client, table_name: impl Into<String>) -> Self {
+    Self::with_ttl_buffer_seconds(client, table_name, DEFAULT_LEASE_TTL_BUFFER_SECONDS)
+  }
+
+  #[must_use]
+  pub fn with_ttl_buffer_seconds(
+    client: Client,
+    table_name: impl Into<String>,
+    ttl_buffer_seconds: u32,
+  ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
+      ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
     }
   }
 
@@ -93,6 +106,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       self.table_name, key.topic, key.writer_id, key.virtual_partition_id, holder_id
     );
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
     let pk = key.format();
 
     let mut values = HashMap::new();
@@ -100,6 +114,10 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     values.insert(
       ":expires".to_string(),
       AttributeValue::N(expires_at.to_string()),
+    );
+    values.insert(
+      ":ttl".to_string(),
+      AttributeValue::N(ttl_epoch_seconds.to_string()),
     );
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
     values.insert(":topic".to_string(), AttributeValue::S(key.topic.clone()));
@@ -113,7 +131,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     );
 
     let update = format!(
-      "SET {ATTR_HOLDER} = :holder, {ATTR_EXPIRES} = :expires, {ATTR_TOPIC} = \
+      "SET {ATTR_HOLDER} = :holder, {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl, {ATTR_TOPIC} = \
        if_not_exists({ATTR_TOPIC}, :topic), {ATTR_WRITER_ID} = if_not_exists({ATTR_WRITER_ID}, \
        :writer_id), {ATTR_VIRTUAL_PARTITION_ID} = if_not_exists({ATTR_VIRTUAL_PARTITION_ID}, \
        :virtual_partition_id)"
@@ -170,6 +188,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       self.table_name, key.topic, key.writer_id, key.virtual_partition_id, holder_id
     );
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
 
     let mut values = HashMap::new();
     values.insert(
@@ -180,9 +199,13 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       ":expires".to_string(),
       AttributeValue::N(expires_at.to_string()),
     );
+    values.insert(
+      ":ttl".to_string(),
+      AttributeValue::N(ttl_epoch_seconds.to_string()),
+    );
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
 
-    let update = format!("SET {ATTR_EXPIRES} = :expires");
+    let update = format!("SET {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl");
     let condition = format!("{ATTR_HOLDER} = :holder AND {ATTR_EXPIRES} > :now");
 
     let response = self
@@ -337,8 +360,12 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       ":expired".to_string(),
       AttributeValue::N(now_ts_ms.to_string()),
     );
+    values.insert(
+      ":ttl".to_string(),
+      AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer_seconds)?.to_string()),
+    );
 
-    let update = format!("SET {ATTR_EXPIRES} = :expired");
+    let update = format!("SET {ATTR_EXPIRES} = :expired, {ATTR_TTL} = :ttl");
     let condition = format!("{ATTR_HOLDER} = :holder");
     let response = self
       .client
@@ -442,4 +469,14 @@ fn expires_at(now_ts_ms: i64, lease_duration_ms: i64) -> Result<i64> {
   now_ts_ms
     .checked_add(lease_duration_ms)
     .ok_or_else(|| anyhow!("lease expiration overflow"))
+}
+
+fn ttl_epoch_seconds(expires_at_ms: i64, ttl_buffer_seconds: i64) -> Result<i64> {
+  let expires_at_seconds = expires_at_ms
+    .checked_div(1_000)
+    .ok_or_else(|| anyhow!("lease ttl conversion overflow"))?;
+
+  expires_at_seconds
+    .checked_add(ttl_buffer_seconds)
+    .ok_or_else(|| anyhow!("lease ttl overflow"))
 }

@@ -31,6 +31,8 @@ use blob_stream_proto::protos::blobstream::v1::config::{
 use blob_stream_types::{VirtualPartitionId, now_unix_millis};
 use std::sync::Arc;
 
+const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
+
 //
 // ConsumerBootstrapConfig
 //
@@ -287,12 +289,21 @@ async fn build_metadata_and_coordination_stores(
 
     let metadata_store: Arc<dyn MetadataStore> =
       Arc::new(DynamoMetadataStore::new(client.clone(), metadata_table));
-    let lease_store: Arc<dyn ConsumerGroupLeaseStore> = Arc::new(
-      DynamoConsumerGroupLeaseStore::new(client.clone(), consumer_lease_table),
-    );
-    let membership_store: Arc<dyn ConsumerGroupMembershipStore> = Arc::new(
-      DynamoConsumerGroupMembershipStore::new(client, consumer_membership_table),
-    );
+    let lease_ttl_buffer_seconds = dynamo
+      .lease_ttl_buffer_seconds
+      .unwrap_or(DEFAULT_LEASE_TTL_BUFFER_SECONDS);
+    let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+      Arc::new(DynamoConsumerGroupLeaseStore::with_ttl_buffer_seconds(
+        client.clone(),
+        consumer_lease_table,
+        lease_ttl_buffer_seconds,
+      ));
+    let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+      Arc::new(DynamoConsumerGroupMembershipStore::with_ttl_buffer_seconds(
+        client,
+        consumer_membership_table,
+        lease_ttl_buffer_seconds,
+      ));
     return Ok((metadata_store, lease_store, membership_store));
   }
 

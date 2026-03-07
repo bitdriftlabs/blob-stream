@@ -16,7 +16,8 @@
 //!
 //! - [`blob_stream_producer`](https://docs.rs/blob-stream-producer): produce records
 //! - [`blob_stream_consumer`](https://docs.rs/blob-stream-consumer): consume records
-//! - [`blob_stream_broker_discovery`](https://docs.rs/blob-stream-broker-discovery): broker discovery
+//! - [`blob_stream_broker_discovery`](https://docs.rs/blob-stream-broker-discovery): broker
+//!   discovery
 //! - [`blob_stream_types`](https://docs.rs/blob-stream-types): shared wire/storage types
 
 pub mod config;

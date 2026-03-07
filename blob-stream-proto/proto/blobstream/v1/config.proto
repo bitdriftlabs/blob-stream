@@ -112,6 +112,10 @@ message DynamoMetadataStoreConfig {
   string consumer_group_lease_table_name = 5;
   // DynamoDB table name for consumer group membership (`consumer_group_membership`).
   string consumer_group_membership_table_name = 6;
+  // Additional seconds added to segment metadata TTL beyond topic retention_days.
+  optional uint32 segment_ttl_buffer_seconds = 7;
+  // Additional seconds added to lease/membership TTL beyond lease expiration.
+  optional uint32 lease_ttl_buffer_seconds = 8;
 }
 
 // Metadata store configuration selection.

@@ -16,6 +16,7 @@ use aws_sdk_dynamodb::types::{
   KeySchemaElement,
   KeyType,
   ScalarAttributeType,
+  TimeToLiveSpecification,
 };
 use aws_sdk_s3::Client as S3Client;
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
@@ -37,6 +38,7 @@ use uuid::Uuid;
 const DYNAMO_ENDPOINT: &str = "http://localhost:8000";
 const S3_ENDPOINT: &str = "http://localhost:4566";
 const AWS_REGION: &str = "us-east-1";
+const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
 
 #[cfg(test)]
 #[ctor::ctor]
@@ -93,6 +95,10 @@ impl IntegrationResources {
     create_table_pk_only(&dynamo, &producer_lease_table).await?;
     create_table_pk_sk(&dynamo, &consumer_lease_table).await?;
     create_table_pk_sk(&dynamo, &consumer_membership_table).await?;
+    enable_table_ttl(&dynamo, &metadata_table).await?;
+    enable_table_ttl(&dynamo, &producer_lease_table).await?;
+    enable_table_ttl(&dynamo, &consumer_lease_table).await?;
+    enable_table_ttl(&dynamo, &consumer_membership_table).await?;
     create_bucket(&s3, &bucket).await?;
     verify_s3_roundtrip(&s3, &bucket).await?;
 
@@ -362,6 +368,33 @@ async fn wait_for_table_active(client: &DynamoClient, table_name: &str) -> Resul
   }
 
   Err(anyhow!("table {table_name} did not become active"))
+}
+
+async fn enable_table_ttl(client: &DynamoClient, table_name: &str) -> Result<()> {
+  let specification = TimeToLiveSpecification::builder()
+    .attribute_name(TTL_ATTRIBUTE_NAME)
+    .enabled(true)
+    .build()?;
+
+  // DynamoDB Local/LocalStack may not support TTL APIs uniformly across versions. Treat this as
+  // best-effort in integration setup because tests assert persisted ttl attributes directly.
+  let result = client
+    .update_time_to_live()
+    .table_name(table_name)
+    .time_to_live_specification(specification)
+    .send()
+    .await;
+
+  match result {
+    Ok(_) => Ok(()),
+    Err(error) => {
+      let text = error.to_string();
+      if text.contains("Time to Live") || text.contains("TimeToLive") {
+        return Ok(());
+      }
+      Err(error.into())
+    },
+  }
 }
 
 async fn create_bucket(client: &S3Client, bucket: &str) -> Result<()> {

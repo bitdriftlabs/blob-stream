@@ -35,6 +35,8 @@ const DEFAULT_FLUSH_MAX_DELAY_MS: i64 = 1_000;
 const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_RESERVATION_SIZE: u64 = 1_000;
 const DEFAULT_WINDOW_SIZE_SECONDS: i64 = 300;
+const DEFAULT_SEGMENT_TTL_BUFFER_SECONDS: u32 = 3_600;
+const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
 
 #[cfg(test)]
 #[path = "./config_test.rs"]
@@ -110,6 +112,7 @@ pub struct TopicInfo {
   pub name: String,
   pub partition_count: u32,
   pub num_writers: u32,
+  pub retention_days: u32,
 }
 
 impl TopicInfo {
@@ -129,6 +132,7 @@ impl TopicInfo {
       name,
       partition_count: proto.partition_count,
       num_writers: proto.num_writers,
+      retention_days: proto.retention_days,
     })
   }
 
@@ -169,7 +173,7 @@ pub async fn build_write_engine(
     .metadata_store
     .as_ref()
     .context("runtime config missing metadata_store config")?;
-  let metadata_store = build_metadata_store(metadata_store_config).await?;
+  let metadata_store = build_metadata_store(metadata_store_config, &topics).await?;
 
   let lease_store = build_producer_partition_lease_store(metadata_store_config).await?;
   let writer_id = write_config.writer_id;
@@ -228,8 +232,15 @@ async fn build_producer_partition_lease_store(
 
     let shared = loader.load().await;
     let client = aws_sdk_dynamodb::Client::new(&shared);
+    let ttl_buffer_seconds = dynamo
+      .lease_ttl_buffer_seconds
+      .unwrap_or(DEFAULT_LEASE_TTL_BUFFER_SECONDS);
     let store: Arc<dyn ProducerPartitionLeaseStore> =
-      Arc::new(DynamoProducerPartitionLeaseStore::new(client, table_name));
+      Arc::new(DynamoProducerPartitionLeaseStore::with_ttl_buffer_seconds(
+        client,
+        table_name,
+        ttl_buffer_seconds,
+      ));
     return Ok(store);
   }
 
@@ -367,7 +378,10 @@ async fn build_blob_store(
   Err(anyhow!("blob_store backend not configured"))
 }
 
-async fn build_metadata_store(config: &MetadataStoreConfig) -> Result<Arc<dyn MetadataStore>> {
+async fn build_metadata_store(
+  config: &MetadataStoreConfig,
+  topics: &HashMap<String, TopicInfo>,
+) -> Result<Arc<dyn MetadataStore>> {
   if config.has_in_memory() {
     debug!("using in-memory metadata store backend");
     let store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
@@ -397,8 +411,21 @@ async fn build_metadata_store(config: &MetadataStoreConfig) -> Result<Arc<dyn Me
     let shared = loader.load().await;
     let client = aws_sdk_dynamodb::Client::new(&shared);
 
+    let retention_days_by_topic = topics
+      .iter()
+      .map(|(topic, info)| (topic.clone(), info.retention_days))
+      .collect();
+    let ttl_buffer_seconds = dynamo
+      .segment_ttl_buffer_seconds
+      .unwrap_or(DEFAULT_SEGMENT_TTL_BUFFER_SECONDS);
+
     let store: Arc<dyn MetadataStore> = Arc::new(
-      blob_stream_metadata_store::DynamoMetadataStore::new(client, table_name),
+      blob_stream_metadata_store::DynamoMetadataStore::with_segment_ttl(
+        client,
+        table_name,
+        retention_days_by_topic,
+        ttl_buffer_seconds,
+      ),
     );
     return Ok(store);
   }

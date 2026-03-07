@@ -2133,6 +2133,10 @@ pub struct DynamoMetadataStoreConfig {
     pub consumer_group_lease_table_name: ::protobuf::Chars,
     // @@protoc_insertion_point(field:blobstream.v1.DynamoMetadataStoreConfig.consumer_group_membership_table_name)
     pub consumer_group_membership_table_name: ::protobuf::Chars,
+    // @@protoc_insertion_point(field:blobstream.v1.DynamoMetadataStoreConfig.segment_ttl_buffer_seconds)
+    pub segment_ttl_buffer_seconds: ::std::option::Option<u32>,
+    // @@protoc_insertion_point(field:blobstream.v1.DynamoMetadataStoreConfig.lease_ttl_buffer_seconds)
+    pub lease_ttl_buffer_seconds: ::std::option::Option<u32>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.DynamoMetadataStoreConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -2150,7 +2154,7 @@ impl DynamoMetadataStoreConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(6);
+        let mut fields = ::std::vec::Vec::with_capacity(8);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "region",
@@ -2181,6 +2185,16 @@ impl DynamoMetadataStoreConfig {
             "consumer_group_membership_table_name",
             |m: &DynamoMetadataStoreConfig| { &m.consumer_group_membership_table_name },
             |m: &mut DynamoMetadataStoreConfig| { &mut m.consumer_group_membership_table_name },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "segment_ttl_buffer_seconds",
+            |m: &DynamoMetadataStoreConfig| { &m.segment_ttl_buffer_seconds },
+            |m: &mut DynamoMetadataStoreConfig| { &mut m.segment_ttl_buffer_seconds },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "lease_ttl_buffer_seconds",
+            |m: &DynamoMetadataStoreConfig| { &m.lease_ttl_buffer_seconds },
+            |m: &mut DynamoMetadataStoreConfig| { &mut m.lease_ttl_buffer_seconds },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<DynamoMetadataStoreConfig>(
             "DynamoMetadataStoreConfig",
@@ -2218,6 +2232,12 @@ impl ::protobuf::Message for DynamoMetadataStoreConfig {
                 50 => {
                     self.consumer_group_membership_table_name = is.read_tokio_chars()?;
                 },
+                56 => {
+                    self.segment_ttl_buffer_seconds = ::std::option::Option::Some(is.read_uint32()?);
+                },
+                64 => {
+                    self.lease_ttl_buffer_seconds = ::std::option::Option::Some(is.read_uint32()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -2248,6 +2268,12 @@ impl ::protobuf::Message for DynamoMetadataStoreConfig {
         if !self.consumer_group_membership_table_name.is_empty() {
             my_size += ::protobuf::rt::string_size(6, &self.consumer_group_membership_table_name);
         }
+        if let Some(v) = self.segment_ttl_buffer_seconds {
+            my_size += ::protobuf::rt::uint32_size(7, v);
+        }
+        if let Some(v) = self.lease_ttl_buffer_seconds {
+            my_size += ::protobuf::rt::uint32_size(8, v);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -2272,6 +2298,12 @@ impl ::protobuf::Message for DynamoMetadataStoreConfig {
         if !self.consumer_group_membership_table_name.is_empty() {
             os.write_string(6, &self.consumer_group_membership_table_name)?;
         }
+        if let Some(v) = self.segment_ttl_buffer_seconds {
+            os.write_uint32(7, v)?;
+        }
+        if let Some(v) = self.lease_ttl_buffer_seconds {
+            os.write_uint32(8, v)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -2295,6 +2327,8 @@ impl ::protobuf::Message for DynamoMetadataStoreConfig {
         self.producer_partition_lease_table_name.clear();
         self.consumer_group_lease_table_name.clear();
         self.consumer_group_membership_table_name.clear();
+        self.segment_ttl_buffer_seconds = ::std::option::Option::None;
+        self.lease_ttl_buffer_seconds = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -2306,6 +2340,8 @@ impl ::protobuf::Message for DynamoMetadataStoreConfig {
             producer_partition_lease_table_name: ::protobuf::Chars::new(),
             consumer_group_lease_table_name: ::protobuf::Chars::new(),
             consumer_group_membership_table_name: ::protobuf::Chars::new(),
+            segment_ttl_buffer_seconds: ::std::option::Option::None,
+            lease_ttl_buffer_seconds: ::std::option::Option::None,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -4070,69 +4106,73 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x01\n\x0fBlobStoreConfig\x12E\n\tin_memory\x18\x01\x20\x01(\x0b2&.blobs\
     tream.v1.InMemoryBlobStoreConfigH\0R\x08inMemory\x122\n\x02s3\x18\x02\
     \x20\x01(\x0b2\x20.blobstream.v1.S3BlobStoreConfigH\0R\x02s3B\t\n\x07bac\
-    kend\"\x1d\n\x1bInMemoryMetadataStoreConfig\"\xf2\x02\n\x19DynamoMetadat\
+    kend\"\x1d\n\x1bInMemoryMetadataStoreConfig\"\xae\x04\n\x19DynamoMetadat\
     aStoreConfig\x12\x16\n\x06region\x18\x01\x20\x01(\tR\x06region\x12\x1a\n\
     \x08endpoint\x18\x02\x20\x01(\tR\x08endpoint\x12=\n\x1bsegment_metadata_\
     table_name\x18\x03\x20\x01(\tR\x18segmentMetadataTableName\x12L\n#produc\
     er_partition_lease_table_name\x18\x04\x20\x01(\tR\x1fproducerPartitionLe\
     aseTableName\x12D\n\x1fconsumer_group_lease_table_name\x18\x05\x20\x01(\
     \tR\x1bconsumerGroupLeaseTableName\x12N\n$consumer_group_membership_tabl\
-    e_name\x18\x06\x20\x01(\tR\x20consumerGroupMembershipTableName\"\xaf\x01\
-    \n\x13MetadataStoreConfig\x12I\n\tin_memory\x18\x01\x20\x01(\x0b2*.blobs\
-    tream.v1.InMemoryMetadataStoreConfigH\0R\x08inMemory\x12B\n\x06dynamo\
-    \x18\x02\x20\x01(\x0b2(.blobstream.v1.DynamoMetadataStoreConfigH\0R\x06d\
-    ynamoB\t\n\x07backend\"\x82\x02\n\rRuntimeConfig\x123\n\x06broker\x18\
-    \x01\x20\x01(\x0b2\x1b.blobstream.v1.BrokerConfigR\x06broker\x122\n\x06t\
-    opics\x18\x02\x20\x03(\x0b2\x1a.blobstream.v1.TopicConfigR\x06topics\x12\
-    =\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobstream.v1.BlobStoreConfigR\
-    \tblobStore\x12I\n\x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobstream.\
-    v1.MetadataStoreConfigR\rmetadataStore\"\xa4\x06\n\x0eProducerConfig\x12\
-    \x20\n\twriter_id\x18\x01\x20\x01(\rH\0R\x08writerId\x88\x01\x01\x12/\n\
-    \x11max_batch_records\x18\x02\x20\x01(\rH\x01R\x0fmaxBatchRecords\x88\
-    \x01\x01\x12+\n\x0fmax_batch_bytes\x18\x03\x20\x01(\rH\x02R\rmaxBatchByt\
-    es\x88\x01\x01\x120\n\x12flush_max_delay_ms\x18\x04\x20\x01(\x04H\x03R\
-    \x0fflushMaxDelayMs\x88\x01\x01\x12$\n\x0bmax_retries\x18\x05\x20\x01(\r\
-    H\x04R\nmaxRetries\x88\x01\x01\x122\n\x13retry_base_delay_ms\x18\x06\x20\
-    \x01(\x04H\x05R\x10retryBaseDelayMs\x88\x01\x01\x120\n\x12retry_max_dela\
-    y_ms\x18\x07\x20\x01(\x04H\x06R\x0fretryMaxDelayMs\x88\x01\x01\x121\n\
-    \x12connect_timeout_ms\x18\x08\x20\x01(\x03H\x07R\x10connectTimeoutMs\
-    \x88\x01\x01\x121\n\x12request_timeout_ms\x18\t\x20\x01(\x03H\x08R\x10re\
-    questTimeoutMs\x88\x01\x01\x12;\n\x17max_request_concurrency\x18\n\x20\
-    \x01(\x04H\tR\x15maxRequestConcurrency\x88\x01\x01\x12I\n\x0bcompression\
-    \x18\x0b\x20\x01(\x0e2\".blobstream.v1.ProducerCompressionH\nR\x0bcompre\
-    ssion\x88\x01\x01B\x0c\n\n_writer_idB\x14\n\x12_max_batch_recordsB\x12\n\
-    \x10_max_batch_bytesB\x15\n\x13_flush_max_delay_msB\x0e\n\x0c_max_retrie\
-    sB\x16\n\x14_retry_base_delay_msB\x15\n\x13_retry_max_delay_msB\x15\n\
-    \x13_connect_timeout_msB\x15\n\x13_request_timeout_msB\x1a\n\x18_max_req\
-    uest_concurrencyB\x0e\n\x0c_compression\"\xca\x01\n\x15ProducerRuntimeCo\
-    nfig\x129\n\x08producer\x18\x01\x20\x01(\x0b2\x1d.blobstream.v1.Producer\
-    ConfigR\x08producer\x12B\n\tdiscovery\x18\x02\x20\x01(\x0b2$.blobstream.\
-    v1.BrokerDiscoveryConfigR\tdiscovery\x122\n\x06topics\x18\x03\x20\x03(\
-    \x0b2\x1a.blobstream.v1.TopicConfigR\x06topics\"\xd9\x02\n\x12ConsumerRe\
-    adConfig\x12\x14\n\x05topic\x18\x01\x20\x01(\tR\x05topic\x123\n\x13windo\
-    w_size_seconds\x18\x02\x20\x01(\x03H\0R\x11windowSizeSeconds\x88\x01\x01\
-    \x12.\n\x10lookback_windows\x18\x03\x20\x01(\rH\x01R\x0flookbackWindows\
-    \x88\x01\x01\x120\n\x12idle_poll_delay_ms\x18\x04\x20\x01(\x04H\x02R\x0f\
-    idlePollDelayMs\x88\x01\x01\x127\n\x16max_idle_poll_delay_ms\x18\x05\x20\
-    \x01(\x04H\x03R\x12maxIdlePollDelayMs\x88\x01\x01B\x16\n\x14_window_size\
-    _secondsB\x13\n\x11_lookback_windowsB\x15\n\x13_idle_poll_delay_msB\x19\
-    \n\x17_max_idle_poll_delay_ms\"\xd0\x02\n\x13ConsumerGroupConfig\x12\x14\
-    \n\x05topic\x18\x01\x20\x01(\tR\x05topic\x12\x19\n\x08group_id\x18\x02\
-    \x20\x01(\tR\x07groupId\x12\x1b\n\tmember_id\x18\x03\x20\x01(\tR\x08memb\
-    erId\x12/\n\x11lease_duration_ms\x18\x04\x20\x01(\x03H\0R\x0fleaseDurati\
-    onMs\x88\x01\x01\x127\n\x15heartbeat_interval_ms\x18\x05\x20\x01(\x03H\
-    \x01R\x13heartbeatIntervalMs\x88\x01\x01\x127\n\x15rebalance_interval_ms\
-    \x18\x06\x20\x01(\x03H\x02R\x13rebalanceIntervalMs\x88\x01\x01B\x14\n\
-    \x12_lease_duration_msB\x18\n\x16_heartbeat_interval_msB\x18\n\x16_rebal\
-    ance_interval_ms\"\x88\x01\n\x15ConsumerRuntimeConfig\x125\n\x04read\x18\
-    \x01\x20\x01(\x0b2!.blobstream.v1.ConsumerReadConfigR\x04read\x128\n\x05\
-    group\x18\x02\x20\x01(\x0b2\".blobstream.v1.ConsumerGroupConfigR\x05grou\
-    p\"\x9d\x02\n\x1fConsumerIteratorBootstrapConfig\x12>\n\x07runtime\x18\
-    \x01\x20\x01(\x0b2$.blobstream.v1.ConsumerRuntimeConfigR\x07runtime\x120\
-    \n\x05topic\x18\x02\x20\x01(\x0b2\x1a.blobstream.v1.TopicConfigR\x05topi\
-    c\x12=\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobstream.v1.BlobStoreCo\
-    nfigR\tblobStore\x12I\n\x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobst\
-    ream.v1.MetadataStoreConfigR\rmetadataStore*U\n\x13ProducerCompression\
+    e_name\x18\x06\x20\x01(\tR\x20consumerGroupMembershipTableName\x12@\n\
+    \x1asegment_ttl_buffer_seconds\x18\x07\x20\x01(\rH\0R\x17segmentTtlBuffe\
+    rSeconds\x88\x01\x01\x12<\n\x18lease_ttl_buffer_seconds\x18\x08\x20\x01(\
+    \rH\x01R\x15leaseTtlBufferSeconds\x88\x01\x01B\x1d\n\x1b_segment_ttl_buf\
+    fer_secondsB\x1b\n\x19_lease_ttl_buffer_seconds\"\xaf\x01\n\x13MetadataS\
+    toreConfig\x12I\n\tin_memory\x18\x01\x20\x01(\x0b2*.blobstream.v1.InMemo\
+    ryMetadataStoreConfigH\0R\x08inMemory\x12B\n\x06dynamo\x18\x02\x20\x01(\
+    \x0b2(.blobstream.v1.DynamoMetadataStoreConfigH\0R\x06dynamoB\t\n\x07bac\
+    kend\"\x82\x02\n\rRuntimeConfig\x123\n\x06broker\x18\x01\x20\x01(\x0b2\
+    \x1b.blobstream.v1.BrokerConfigR\x06broker\x122\n\x06topics\x18\x02\x20\
+    \x03(\x0b2\x1a.blobstream.v1.TopicConfigR\x06topics\x12=\n\nblob_store\
+    \x18\x03\x20\x01(\x0b2\x1e.blobstream.v1.BlobStoreConfigR\tblobStore\x12\
+    I\n\x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobstream.v1.MetadataStor\
+    eConfigR\rmetadataStore\"\xa4\x06\n\x0eProducerConfig\x12\x20\n\twriter_\
+    id\x18\x01\x20\x01(\rH\0R\x08writerId\x88\x01\x01\x12/\n\x11max_batch_re\
+    cords\x18\x02\x20\x01(\rH\x01R\x0fmaxBatchRecords\x88\x01\x01\x12+\n\x0f\
+    max_batch_bytes\x18\x03\x20\x01(\rH\x02R\rmaxBatchBytes\x88\x01\x01\x120\
+    \n\x12flush_max_delay_ms\x18\x04\x20\x01(\x04H\x03R\x0fflushMaxDelayMs\
+    \x88\x01\x01\x12$\n\x0bmax_retries\x18\x05\x20\x01(\rH\x04R\nmaxRetries\
+    \x88\x01\x01\x122\n\x13retry_base_delay_ms\x18\x06\x20\x01(\x04H\x05R\
+    \x10retryBaseDelayMs\x88\x01\x01\x120\n\x12retry_max_delay_ms\x18\x07\
+    \x20\x01(\x04H\x06R\x0fretryMaxDelayMs\x88\x01\x01\x121\n\x12connect_tim\
+    eout_ms\x18\x08\x20\x01(\x03H\x07R\x10connectTimeoutMs\x88\x01\x01\x121\
+    \n\x12request_timeout_ms\x18\t\x20\x01(\x03H\x08R\x10requestTimeoutMs\
+    \x88\x01\x01\x12;\n\x17max_request_concurrency\x18\n\x20\x01(\x04H\tR\
+    \x15maxRequestConcurrency\x88\x01\x01\x12I\n\x0bcompression\x18\x0b\x20\
+    \x01(\x0e2\".blobstream.v1.ProducerCompressionH\nR\x0bcompression\x88\
+    \x01\x01B\x0c\n\n_writer_idB\x14\n\x12_max_batch_recordsB\x12\n\x10_max_\
+    batch_bytesB\x15\n\x13_flush_max_delay_msB\x0e\n\x0c_max_retriesB\x16\n\
+    \x14_retry_base_delay_msB\x15\n\x13_retry_max_delay_msB\x15\n\x13_connec\
+    t_timeout_msB\x15\n\x13_request_timeout_msB\x1a\n\x18_max_request_concur\
+    rencyB\x0e\n\x0c_compression\"\xca\x01\n\x15ProducerRuntimeConfig\x129\n\
+    \x08producer\x18\x01\x20\x01(\x0b2\x1d.blobstream.v1.ProducerConfigR\x08\
+    producer\x12B\n\tdiscovery\x18\x02\x20\x01(\x0b2$.blobstream.v1.BrokerDi\
+    scoveryConfigR\tdiscovery\x122\n\x06topics\x18\x03\x20\x03(\x0b2\x1a.blo\
+    bstream.v1.TopicConfigR\x06topics\"\xd9\x02\n\x12ConsumerReadConfig\x12\
+    \x14\n\x05topic\x18\x01\x20\x01(\tR\x05topic\x123\n\x13window_size_secon\
+    ds\x18\x02\x20\x01(\x03H\0R\x11windowSizeSeconds\x88\x01\x01\x12.\n\x10l\
+    ookback_windows\x18\x03\x20\x01(\rH\x01R\x0flookbackWindows\x88\x01\x01\
+    \x120\n\x12idle_poll_delay_ms\x18\x04\x20\x01(\x04H\x02R\x0fidlePollDela\
+    yMs\x88\x01\x01\x127\n\x16max_idle_poll_delay_ms\x18\x05\x20\x01(\x04H\
+    \x03R\x12maxIdlePollDelayMs\x88\x01\x01B\x16\n\x14_window_size_secondsB\
+    \x13\n\x11_lookback_windowsB\x15\n\x13_idle_poll_delay_msB\x19\n\x17_max\
+    _idle_poll_delay_ms\"\xd0\x02\n\x13ConsumerGroupConfig\x12\x14\n\x05topi\
+    c\x18\x01\x20\x01(\tR\x05topic\x12\x19\n\x08group_id\x18\x02\x20\x01(\tR\
+    \x07groupId\x12\x1b\n\tmember_id\x18\x03\x20\x01(\tR\x08memberId\x12/\n\
+    \x11lease_duration_ms\x18\x04\x20\x01(\x03H\0R\x0fleaseDurationMs\x88\
+    \x01\x01\x127\n\x15heartbeat_interval_ms\x18\x05\x20\x01(\x03H\x01R\x13h\
+    eartbeatIntervalMs\x88\x01\x01\x127\n\x15rebalance_interval_ms\x18\x06\
+    \x20\x01(\x03H\x02R\x13rebalanceIntervalMs\x88\x01\x01B\x14\n\x12_lease_\
+    duration_msB\x18\n\x16_heartbeat_interval_msB\x18\n\x16_rebalance_interv\
+    al_ms\"\x88\x01\n\x15ConsumerRuntimeConfig\x125\n\x04read\x18\x01\x20\
+    \x01(\x0b2!.blobstream.v1.ConsumerReadConfigR\x04read\x128\n\x05group\
+    \x18\x02\x20\x01(\x0b2\".blobstream.v1.ConsumerGroupConfigR\x05group\"\
+    \x9d\x02\n\x1fConsumerIteratorBootstrapConfig\x12>\n\x07runtime\x18\x01\
+    \x20\x01(\x0b2$.blobstream.v1.ConsumerRuntimeConfigR\x07runtime\x120\n\
+    \x05topic\x18\x02\x20\x01(\x0b2\x1a.blobstream.v1.TopicConfigR\x05topic\
+    \x12=\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobstream.v1.BlobStoreCon\
+    figR\tblobStore\x12I\n\x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobstr\
+    eam.v1.MetadataStoreConfigR\rmetadataStore*U\n\x13ProducerCompression\
     \x12\x1d\n\x19PRODUCER_COMPRESSION_NONE\x10\0\x12\x1f\n\x1bPRODUCER_COMP\
     RESSION_SNAPPY\x10\x01b\x06proto3\
 ";

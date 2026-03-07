@@ -358,6 +358,7 @@ fn build_write_engine(
         name: topic.to_string(),
         partition_count: PARTITION_COUNT,
         num_writers: topic_num_writers,
+        retention_days: 7,
       },
     );
   }

@@ -31,7 +31,9 @@ const ATTR_COMMITTED_CURSOR: &str = "committed_cursor";
 const ATTR_COMMITTED_TS: &str = "committed_ts";
 const ATTR_TOPIC: &str = "topic";
 const ATTR_GROUP_ID: &str = "group_id";
+const ATTR_TTL: &str = "ttl_epoch_seconds";
 const ATTR_VIRTUAL_PARTITION_ID: &str = "virtual_partition_id";
+const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
 
 //
 // DynamoConsumerGroupLeaseStore
@@ -41,14 +43,25 @@ const ATTR_VIRTUAL_PARTITION_ID: &str = "virtual_partition_id";
 pub struct DynamoConsumerGroupLeaseStore {
   client: Client,
   table_name: String,
+  ttl_buffer_seconds: i64,
 }
 
 impl DynamoConsumerGroupLeaseStore {
   #[must_use]
   pub fn new(client: Client, table_name: impl Into<String>) -> Self {
+    Self::with_ttl_buffer_seconds(client, table_name, DEFAULT_LEASE_TTL_BUFFER_SECONDS)
+  }
+
+  #[must_use]
+  pub fn with_ttl_buffer_seconds(
+    client: Client,
+    table_name: impl Into<String>,
+    ttl_buffer_seconds: u32,
+  ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
+      ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
     }
   }
 
@@ -98,12 +111,17 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       self.table_name, key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
     );
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
 
     let mut values = HashMap::new();
     values.insert(":owner".to_string(), AttributeValue::S(owner_id.clone()));
     values.insert(
       ":expires".to_string(),
       AttributeValue::N(expires_at.to_string()),
+    );
+    values.insert(
+      ":ttl".to_string(),
+      AttributeValue::N(ttl_epoch_seconds.to_string()),
     );
     values.insert(
       ":generation".to_string(),
@@ -122,9 +140,9 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
 
     let update = format!(
       "SET {ATTR_OWNER} = :owner, {ATTR_LEASE_EXPIRES} = :expires, {ATTR_GENERATION} = \
-       :generation, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TOPIC} = if_not_exists({ATTR_TOPIC}, \
-       :topic), {ATTR_GROUP_ID} = if_not_exists({ATTR_GROUP_ID}, :group_id), \
-       {ATTR_VIRTUAL_PARTITION_ID} = if_not_exists({ATTR_VIRTUAL_PARTITION_ID}, \
+       :generation, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl, {ATTR_TOPIC} = \
+       if_not_exists({ATTR_TOPIC}, :topic), {ATTR_GROUP_ID} = if_not_exists({ATTR_GROUP_ID}, \
+       :group_id), {ATTR_VIRTUAL_PARTITION_ID} = if_not_exists({ATTR_VIRTUAL_PARTITION_ID}, \
        :virtual_partition_id)"
     );
     let condition = format!(
@@ -186,6 +204,7 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     }
 
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
 
     let mut values = HashMap::new();
     values.insert(
@@ -200,16 +219,22 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       ":expires".to_string(),
       AttributeValue::N(expires_at.to_string()),
     );
+    values.insert(
+      ":ttl".to_string(),
+      AttributeValue::N(ttl_epoch_seconds.to_string()),
+    );
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
 
     let update = if let Some(cursor) = committed_cursor {
       values.insert(":cursor".to_string(), Self::cursor_value(&cursor)?);
       format!(
-        "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, \
+        "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl, \
          {ATTR_COMMITTED_CURSOR} = :cursor, {ATTR_COMMITTED_TS} = :now"
       )
     } else {
-      format!("SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now")
+      format!(
+        "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl"
+      )
     };
     let condition = format!(
       "{ATTR_OWNER} = :owner AND {ATTR_GENERATION} = :generation AND {ATTR_LEASE_EXPIRES} > :now"
@@ -361,7 +386,12 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       AttributeValue::N(generation.to_string()),
     );
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-    let update = format!("SET {ATTR_LEASE_EXPIRES} = :now, {ATTR_LAST_HEARTBEAT} = :now");
+    values.insert(
+      ":ttl".to_string(),
+      AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer_seconds)?.to_string()),
+    );
+    let update =
+      format!("SET {ATTR_LEASE_EXPIRES} = :now, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl");
     let condition = format!(
       "{ATTR_OWNER} = :owner AND {ATTR_GENERATION} = :generation AND {ATTR_LEASE_EXPIRES} > :now"
     );
@@ -462,4 +492,14 @@ fn expires_at(now_ts_ms: i64, lease_duration_ms: i64) -> Result<i64> {
   now_ts_ms
     .checked_add(lease_duration_ms)
     .ok_or_else(|| anyhow!("lease expiration overflow"))
+}
+
+fn ttl_epoch_seconds(expires_at_ms: i64, ttl_buffer_seconds: i64) -> Result<i64> {
+  let expires_at_seconds = expires_at_ms
+    .checked_div(1_000)
+    .ok_or_else(|| anyhow!("lease ttl conversion overflow"))?;
+
+  expires_at_seconds
+    .checked_add(ttl_buffer_seconds)
+    .ok_or_else(|| anyhow!("lease ttl overflow"))
 }

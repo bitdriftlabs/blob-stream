@@ -4,6 +4,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{
   AttributeDefinition,
+  AttributeValue,
   BillingMode,
   KeySchemaElement,
   KeyType,
@@ -26,6 +27,7 @@ use uuid::Uuid;
 
 const LOCAL_ENDPOINT: &str = "http://localhost:8000";
 const REGION: &str = "us-east-1";
+const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
 
 async fn dynamo_client() -> Result<Client> {
   unsafe {
@@ -182,5 +184,46 @@ async fn respects_min_snowflake_id() -> Result<()> {
 
   client.delete_table().table_name(table_name).send().await?;
 
+  Ok(())
+}
+
+#[tokio::test]
+async fn writes_segment_ttl_attribute() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("blob_segments_test_{}", Uuid::new_v4());
+  create_segments_table(&client, &table_name).await?;
+
+  let mut retention_days = HashMap::new();
+  retention_days.insert("topic-a".to_string(), 7);
+  let store = DynamoMetadataStore::with_segment_ttl(
+    client.clone(),
+    table_name.clone(),
+    retention_days,
+    3_600,
+  );
+  let segment = build_segment("topic-a", 100, 1);
+
+  store.write_segment(segment.clone()).await?;
+
+  let item = client
+    .get_item()
+    .table_name(&table_name)
+    .key("pk", AttributeValue::S(segment.partition_key()))
+    .key("sk", AttributeValue::S(segment.snowflake_key()))
+    .send()
+    .await?
+    .item
+    .ok_or_else(|| anyhow!("expected item"))?;
+
+  let ttl = item
+    .get(TTL_ATTRIBUTE_NAME)
+    .and_then(|value| value.as_n().ok())
+    .ok_or_else(|| anyhow!("missing ttl attribute"))?
+    .parse::<i64>()?;
+  let expected = (segment.created_ts_ms / 1_000) + (7 * 24 * 60 * 60) + 3_600;
+
+  assert_eq!(ttl, expected);
+
+  client.delete_table().table_name(table_name).send().await?;
   Ok(())
 }

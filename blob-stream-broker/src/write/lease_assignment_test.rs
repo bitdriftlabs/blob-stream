@@ -38,6 +38,7 @@ fn ownership_changes_with_membership() {
       name: "telemetry".to_string(),
       partition_count: 8,
       num_writers: 1,
+      retention_days: 7,
     },
   );
 
@@ -87,6 +88,7 @@ fn make_topic(partition_count: u32) -> HashMap<String, TopicInfo> {
       name: "telemetry".to_string(),
       partition_count,
       num_writers: 1,
+      retention_days: 7,
     },
   );
   topics
