@@ -5,6 +5,7 @@ use super::{
   ConsumerIterator,
   ConsumerIteratorImpl,
   CoordinationSnapshot,
+  IdlePollBackoff,
   NextResult,
 };
 use crate::config::{ConsumerGroupConfig, ConsumerReadConfig, ConsumerRuntimeConfig};
@@ -133,6 +134,29 @@ fn runtime_config() -> ConsumerRuntimeConfig {
 
 fn metrics_scope() -> bd_server_stats::stats::Scope {
   Collector::default().scope("blob_stream_consumer_test")
+}
+
+#[test]
+fn idle_poll_backoff_exponential_with_max_and_reset() {
+  let mut backoff = IdlePollBackoff::new(250, Some(2_000));
+
+  assert_eq!(backoff.next_delay_ms(), 250);
+  assert_eq!(backoff.next_delay_ms(), 500);
+  assert_eq!(backoff.next_delay_ms(), 1_000);
+  assert_eq!(backoff.next_delay_ms(), 2_000);
+  assert_eq!(backoff.next_delay_ms(), 2_000);
+
+  backoff.reset();
+  assert_eq!(backoff.next_delay_ms(), 250);
+}
+
+#[test]
+fn idle_poll_backoff_without_max_remains_constant() {
+  let mut backoff = IdlePollBackoff::new(250, None);
+
+  assert_eq!(backoff.next_delay_ms(), 250);
+  assert_eq!(backoff.next_delay_ms(), 250);
+  assert_eq!(backoff.next_delay_ms(), 250);
 }
 
 #[tokio::test]

@@ -6,7 +6,9 @@ use crate::config::{
   ConsumerGroupConfig,
   ConsumerRuntimeConfig,
   consumer_heartbeat_interval_ms,
+  consumer_idle_poll_delay_ms,
   consumer_lease_duration_ms,
+  consumer_max_idle_poll_delay_ms,
   consumer_rebalance_interval_ms,
   validate_runtime_config,
 };
@@ -38,8 +40,38 @@ use tokio::sync::oneshot;
 
 // TODO(mattklein123): Add prefetching.
 
-// TODO(mattklein123): Add backoff to stop wasting resources in low throughput scenarios.
-const IDLE_POLL_DELAY_MS: u64 = 50;
+//
+// IdlePollBackoff
+//
+
+#[derive(Clone, Debug)]
+struct IdlePollBackoff {
+  base_delay_ms: u64,
+  max_delay_ms: Option<u64>,
+  current_delay_ms: u64,
+}
+
+impl IdlePollBackoff {
+  fn new(base_delay_ms: u64, max_delay_ms: Option<u64>) -> Self {
+    Self {
+      base_delay_ms,
+      max_delay_ms,
+      current_delay_ms: base_delay_ms,
+    }
+  }
+
+  fn next_delay_ms(&mut self) -> u64 {
+    let delay_ms = self.current_delay_ms;
+    if let Some(max_delay_ms) = self.max_delay_ms {
+      self.current_delay_ms = self.current_delay_ms.saturating_mul(2).min(max_delay_ms);
+    }
+    delay_ms
+  }
+
+  fn reset(&mut self) {
+    self.current_delay_ms = self.base_delay_ms;
+  }
+}
 
 //
 // ConsumerIteratorMetrics
@@ -162,6 +194,7 @@ pub struct ConsumerIteratorImpl {
   pending_revocation_completion: Option<oneshot::Receiver<()>>,
   next_heartbeat_at_ms: i64,
   next_rebalance_at_ms: i64,
+  idle_poll_backoff: IdlePollBackoff,
 }
 
 impl ConsumerIteratorImpl {
@@ -185,6 +218,8 @@ impl ConsumerIteratorImpl {
       .as_ref()
       .ok_or_else(|| anyhow!("consumer group config is required"))?
       .clone();
+    let idle_poll_delay_ms = consumer_idle_poll_delay_ms(&read_config);
+    let max_idle_poll_delay_ms = consumer_max_idle_poll_delay_ms(&read_config);
 
     let active_assignment = HashSet::new();
     let reader = ConsumerReaderImpl::new(
@@ -222,6 +257,7 @@ impl ConsumerIteratorImpl {
       pending_revocation_completion: None,
       next_heartbeat_at_ms: now_ts_ms,
       next_rebalance_at_ms: now_ts_ms,
+      idle_poll_backoff: IdlePollBackoff::new(idle_poll_delay_ms, max_idle_poll_delay_ms),
     };
 
     let snapshot = iterator.coordination_source.snapshot().await?;
@@ -454,10 +490,12 @@ impl ConsumerIterator for ConsumerIteratorImpl {
         .observe(read_started_at.elapsed().as_secs_f64());
 
       if batches.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(IDLE_POLL_DELAY_MS)).await;
+        let idle_delay_ms = self.idle_poll_backoff.next_delay_ms();
+        tokio::time::sleep(std::time::Duration::from_millis(idle_delay_ms)).await;
         continue;
       }
 
+      self.idle_poll_backoff.reset();
       self.buffered_batches.extend(batches);
     }
   }

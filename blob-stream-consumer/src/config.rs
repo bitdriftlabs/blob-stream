@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "./config_test.rs"]
+mod tests;
+
 use anyhow::{Result, anyhow, ensure};
 pub use blob_stream_proto::protos::blobstream::v1::config::{
   ConsumerGroupConfig,
@@ -8,6 +12,7 @@ use log::{debug, trace};
 
 const DEFAULT_WINDOW_SIZE_SECONDS: i64 = 300;
 const DEFAULT_LOOKBACK_WINDOWS: u32 = 3;
+const DEFAULT_IDLE_POLL_DELAY_MS: u64 = 250;
 const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: i64 = 10_000;
 const DEFAULT_REBALANCE_INTERVAL_MS: i64 = 10_000;
@@ -26,6 +31,18 @@ pub fn consumer_window_size_seconds(config: &ConsumerReadConfig) -> i64 {
 #[must_use]
 pub fn consumer_lookback_windows(config: &ConsumerReadConfig) -> u32 {
   config.lookback_windows.unwrap_or(DEFAULT_LOOKBACK_WINDOWS)
+}
+
+#[must_use]
+pub fn consumer_idle_poll_delay_ms(config: &ConsumerReadConfig) -> u64 {
+  config
+    .idle_poll_delay_ms
+    .unwrap_or(DEFAULT_IDLE_POLL_DELAY_MS)
+}
+
+#[must_use]
+pub fn consumer_max_idle_poll_delay_ms(config: &ConsumerReadConfig) -> Option<u64> {
+  config.max_idle_poll_delay_ms
 }
 
 #[must_use]
@@ -63,6 +80,17 @@ pub fn validate_read_config(config: &ConsumerReadConfig) -> Result<()> {
     consumer_lookback_windows(config) > 0,
     "consumer.read.lookback_windows must be greater than zero"
   );
+  ensure!(
+    consumer_idle_poll_delay_ms(config) > 0,
+    "consumer.read.idle_poll_delay_ms must be greater than zero"
+  );
+  if let Some(max_idle_poll_delay_ms) = consumer_max_idle_poll_delay_ms(config) {
+    ensure!(
+      max_idle_poll_delay_ms >= consumer_idle_poll_delay_ms(config),
+      "consumer.read.max_idle_poll_delay_ms must be greater than or equal to \
+       consumer.read.idle_poll_delay_ms"
+    );
+  }
 
   Ok(())
 }

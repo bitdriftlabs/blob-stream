@@ -184,6 +184,10 @@ message ConsumerReadConfig {
   optional int64 window_size_seconds = 2;
   // Number of trailing windows to scan on each read.
   optional uint32 lookback_windows = 3;
+  // Base idle poll delay in milliseconds when no batches are available.
+  optional uint64 idle_poll_delay_ms = 4;
+  // Optional max idle poll delay in milliseconds for exponential backoff.
+  optional uint64 max_idle_poll_delay_ms = 5;
 }
 
 // Consumer group lease and heartbeat settings.

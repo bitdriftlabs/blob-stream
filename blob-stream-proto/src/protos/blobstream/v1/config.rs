@@ -3260,6 +3260,10 @@ pub struct ConsumerReadConfig {
     pub window_size_seconds: ::std::option::Option<i64>,
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.lookback_windows)
     pub lookback_windows: ::std::option::Option<u32>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.idle_poll_delay_ms)
+    pub idle_poll_delay_ms: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.max_idle_poll_delay_ms)
+    pub max_idle_poll_delay_ms: ::std::option::Option<u64>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.ConsumerReadConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -3277,7 +3281,7 @@ impl ConsumerReadConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(3);
+        let mut fields = ::std::vec::Vec::with_capacity(5);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "topic",
@@ -3293,6 +3297,16 @@ impl ConsumerReadConfig {
             "lookback_windows",
             |m: &ConsumerReadConfig| { &m.lookback_windows },
             |m: &mut ConsumerReadConfig| { &mut m.lookback_windows },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "idle_poll_delay_ms",
+            |m: &ConsumerReadConfig| { &m.idle_poll_delay_ms },
+            |m: &mut ConsumerReadConfig| { &mut m.idle_poll_delay_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "max_idle_poll_delay_ms",
+            |m: &ConsumerReadConfig| { &m.max_idle_poll_delay_ms },
+            |m: &mut ConsumerReadConfig| { &mut m.max_idle_poll_delay_ms },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ConsumerReadConfig>(
             "ConsumerReadConfig",
@@ -3321,6 +3335,12 @@ impl ::protobuf::Message for ConsumerReadConfig {
                 24 => {
                     self.lookback_windows = ::std::option::Option::Some(is.read_uint32()?);
                 },
+                32 => {
+                    self.idle_poll_delay_ms = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                40 => {
+                    self.max_idle_poll_delay_ms = ::std::option::Option::Some(is.read_uint64()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -3342,6 +3362,12 @@ impl ::protobuf::Message for ConsumerReadConfig {
         if let Some(v) = self.lookback_windows {
             my_size += ::protobuf::rt::uint32_size(3, v);
         }
+        if let Some(v) = self.idle_poll_delay_ms {
+            my_size += ::protobuf::rt::uint64_size(4, v);
+        }
+        if let Some(v) = self.max_idle_poll_delay_ms {
+            my_size += ::protobuf::rt::uint64_size(5, v);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -3356,6 +3382,12 @@ impl ::protobuf::Message for ConsumerReadConfig {
         }
         if let Some(v) = self.lookback_windows {
             os.write_uint32(3, v)?;
+        }
+        if let Some(v) = self.idle_poll_delay_ms {
+            os.write_uint64(4, v)?;
+        }
+        if let Some(v) = self.max_idle_poll_delay_ms {
+            os.write_uint64(5, v)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -3377,6 +3409,8 @@ impl ::protobuf::Message for ConsumerReadConfig {
         self.topic.clear();
         self.window_size_seconds = ::std::option::Option::None;
         self.lookback_windows = ::std::option::Option::None;
+        self.idle_poll_delay_ms = ::std::option::Option::None;
+        self.max_idle_poll_delay_ms = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -3385,6 +3419,8 @@ impl ::protobuf::Message for ConsumerReadConfig {
             topic: ::protobuf::Chars::new(),
             window_size_seconds: ::std::option::Option::None,
             lookback_windows: ::std::option::Option::None,
+            idle_poll_delay_ms: ::std::option::Option::None,
+            max_idle_poll_delay_ms: ::std::option::Option::None,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -4072,30 +4108,33 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     nfig\x129\n\x08producer\x18\x01\x20\x01(\x0b2\x1d.blobstream.v1.Producer\
     ConfigR\x08producer\x12B\n\tdiscovery\x18\x02\x20\x01(\x0b2$.blobstream.\
     v1.BrokerDiscoveryConfigR\tdiscovery\x122\n\x06topics\x18\x03\x20\x03(\
-    \x0b2\x1a.blobstream.v1.TopicConfigR\x06topics\"\xbc\x01\n\x12ConsumerRe\
+    \x0b2\x1a.blobstream.v1.TopicConfigR\x06topics\"\xd9\x02\n\x12ConsumerRe\
     adConfig\x12\x14\n\x05topic\x18\x01\x20\x01(\tR\x05topic\x123\n\x13windo\
     w_size_seconds\x18\x02\x20\x01(\x03H\0R\x11windowSizeSeconds\x88\x01\x01\
     \x12.\n\x10lookback_windows\x18\x03\x20\x01(\rH\x01R\x0flookbackWindows\
-    \x88\x01\x01B\x16\n\x14_window_size_secondsB\x13\n\x11_lookback_windows\
-    \"\xd0\x02\n\x13ConsumerGroupConfig\x12\x14\n\x05topic\x18\x01\x20\x01(\
-    \tR\x05topic\x12\x19\n\x08group_id\x18\x02\x20\x01(\tR\x07groupId\x12\
-    \x1b\n\tmember_id\x18\x03\x20\x01(\tR\x08memberId\x12/\n\x11lease_durati\
-    on_ms\x18\x04\x20\x01(\x03H\0R\x0fleaseDurationMs\x88\x01\x01\x127\n\x15\
-    heartbeat_interval_ms\x18\x05\x20\x01(\x03H\x01R\x13heartbeatIntervalMs\
-    \x88\x01\x01\x127\n\x15rebalance_interval_ms\x18\x06\x20\x01(\x03H\x02R\
-    \x13rebalanceIntervalMs\x88\x01\x01B\x14\n\x12_lease_duration_msB\x18\n\
-    \x16_heartbeat_interval_msB\x18\n\x16_rebalance_interval_ms\"\x88\x01\n\
-    \x15ConsumerRuntimeConfig\x125\n\x04read\x18\x01\x20\x01(\x0b2!.blobstre\
-    am.v1.ConsumerReadConfigR\x04read\x128\n\x05group\x18\x02\x20\x01(\x0b2\
-    \".blobstream.v1.ConsumerGroupConfigR\x05group\"\x9d\x02\n\x1fConsumerIt\
-    eratorBootstrapConfig\x12>\n\x07runtime\x18\x01\x20\x01(\x0b2$.blobstrea\
-    m.v1.ConsumerRuntimeConfigR\x07runtime\x120\n\x05topic\x18\x02\x20\x01(\
-    \x0b2\x1a.blobstream.v1.TopicConfigR\x05topic\x12=\n\nblob_store\x18\x03\
-    \x20\x01(\x0b2\x1e.blobstream.v1.BlobStoreConfigR\tblobStore\x12I\n\x0em\
-    etadata_store\x18\x04\x20\x01(\x0b2\".blobstream.v1.MetadataStoreConfigR\
-    \rmetadataStore*U\n\x13ProducerCompression\x12\x1d\n\x19PRODUCER_COMPRES\
-    SION_NONE\x10\0\x12\x1f\n\x1bPRODUCER_COMPRESSION_SNAPPY\x10\x01b\x06pro\
-    to3\
+    \x88\x01\x01\x120\n\x12idle_poll_delay_ms\x18\x04\x20\x01(\x04H\x02R\x0f\
+    idlePollDelayMs\x88\x01\x01\x127\n\x16max_idle_poll_delay_ms\x18\x05\x20\
+    \x01(\x04H\x03R\x12maxIdlePollDelayMs\x88\x01\x01B\x16\n\x14_window_size\
+    _secondsB\x13\n\x11_lookback_windowsB\x15\n\x13_idle_poll_delay_msB\x19\
+    \n\x17_max_idle_poll_delay_ms\"\xd0\x02\n\x13ConsumerGroupConfig\x12\x14\
+    \n\x05topic\x18\x01\x20\x01(\tR\x05topic\x12\x19\n\x08group_id\x18\x02\
+    \x20\x01(\tR\x07groupId\x12\x1b\n\tmember_id\x18\x03\x20\x01(\tR\x08memb\
+    erId\x12/\n\x11lease_duration_ms\x18\x04\x20\x01(\x03H\0R\x0fleaseDurati\
+    onMs\x88\x01\x01\x127\n\x15heartbeat_interval_ms\x18\x05\x20\x01(\x03H\
+    \x01R\x13heartbeatIntervalMs\x88\x01\x01\x127\n\x15rebalance_interval_ms\
+    \x18\x06\x20\x01(\x03H\x02R\x13rebalanceIntervalMs\x88\x01\x01B\x14\n\
+    \x12_lease_duration_msB\x18\n\x16_heartbeat_interval_msB\x18\n\x16_rebal\
+    ance_interval_ms\"\x88\x01\n\x15ConsumerRuntimeConfig\x125\n\x04read\x18\
+    \x01\x20\x01(\x0b2!.blobstream.v1.ConsumerReadConfigR\x04read\x128\n\x05\
+    group\x18\x02\x20\x01(\x0b2\".blobstream.v1.ConsumerGroupConfigR\x05grou\
+    p\"\x9d\x02\n\x1fConsumerIteratorBootstrapConfig\x12>\n\x07runtime\x18\
+    \x01\x20\x01(\x0b2$.blobstream.v1.ConsumerRuntimeConfigR\x07runtime\x120\
+    \n\x05topic\x18\x02\x20\x01(\x0b2\x1a.blobstream.v1.TopicConfigR\x05topi\
+    c\x12=\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobstream.v1.BlobStoreCo\
+    nfigR\tblobStore\x12I\n\x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobst\
+    ream.v1.MetadataStoreConfigR\rmetadataStore*U\n\x13ProducerCompression\
+    \x12\x1d\n\x19PRODUCER_COMPRESSION_NONE\x10\0\x12\x1f\n\x1bPRODUCER_COMP\
+    RESSION_SNAPPY\x10\x01b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
