@@ -10,11 +10,7 @@ use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client as DynamoClient;
 use aws_sdk_dynamodb::types::{
-  AttributeDefinition,
-  BillingMode,
-  KeySchemaElement,
-  KeyType,
-  ScalarAttributeType,
+  AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
 };
 use aws_sdk_s3::Client as S3Client;
 use blob_stream::grpc::make_broker_router;
@@ -23,28 +19,15 @@ use blob_stream::write::{TopicInfo, WriteConfig, WriteEngine, WriteEngineImpl};
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore};
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode};
 use blob_stream_consumer::{
-  ConsumerCoordinationSource,
-  ConsumerGroupConfig,
-  ConsumerReadConfig,
-  ConsumerReader,
-  ConsumerReaderImpl,
-  ConsumerRuntimeConfig,
-  CoordinationSnapshot,
+  ConsumerCoordinationSource, ConsumerGroupConfig, ConsumerReadConfig, ConsumerReader,
+  ConsumerReaderImpl, ConsumerRuntimeConfig, CoordinationSnapshot,
 };
 use blob_stream_metadata_store::{
-  ConsumerGroupLeaseStore,
-  DynamoConsumerGroupLeaseStore,
-  DynamoMetadataStore,
-  DynamoProducerPartitionLeaseStore,
-  MetadataStore,
-  ProducerPartitionLeaseStore,
+  ConsumerGroupLeaseStore, DynamoConsumerGroupLeaseStore, DynamoMetadataStore,
+  DynamoProducerPartitionLeaseStore, MetadataStore, ProducerPartitionLeaseStore,
 };
 use blob_stream_producer::{
-  ProducerClient,
-  ProducerClientImpl,
-  ProducerCompression,
-  ProducerConfig,
-  ProducerRecord,
+  ProducerClient, ProducerClientImpl, ProducerCompression, ProducerConfig, ProducerRecord,
   ProducerTopicConfig,
 };
 use blob_stream_types::VirtualPartitionId;
@@ -275,14 +258,69 @@ pub struct ClusterHarness {
   blob_store: Arc<dyn BlobStore>,
   metadata_store: Arc<dyn MetadataStore>,
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+  topic_num_writers: u32,
+}
+
+pub struct ClusterHarnessBuilder<'a> {
+  resources: &'a IntegrationResources,
+  broker_count: usize,
+  metadata_store: Option<Arc<dyn MetadataStore>>,
+  topic_num_writers: u32,
+}
+
+impl<'a> ClusterHarnessBuilder<'a> {
+  pub fn metadata_store(mut self, metadata_store: Arc<dyn MetadataStore>) -> Self {
+    self.metadata_store = Some(metadata_store);
+    self
+  }
+
+  pub fn topic_num_writers(mut self, topic_num_writers: u32) -> Self {
+    self.topic_num_writers = topic_num_writers;
+    self
+  }
+
+  pub async fn start(self) -> Result<ClusterHarness> {
+    let metadata_store = self
+      .metadata_store
+      .unwrap_or_else(|| self.resources.metadata_store());
+
+    ClusterHarness::start_from_builder(
+      self.resources,
+      self.broker_count,
+      metadata_store,
+      self.topic_num_writers,
+    )
+    .await
+  }
 }
 
 impl ClusterHarness {
-  pub async fn start(resources: &IntegrationResources, broker_count: usize) -> Result<Self> {
+  pub fn builder(
+    resources: &IntegrationResources,
+    broker_count: usize,
+  ) -> ClusterHarnessBuilder<'_> {
+    ClusterHarnessBuilder {
+      resources,
+      broker_count,
+      metadata_store: None,
+      topic_num_writers: 1,
+    }
+  }
+
+  async fn start_from_builder(
+    resources: &IntegrationResources,
+    broker_count: usize,
+    metadata_store: Arc<dyn MetadataStore>,
+    topic_num_writers: u32,
+  ) -> Result<Self> {
+    if topic_num_writers == 0 {
+      return Err(anyhow!("topic_num_writers must be greater than zero"));
+    }
+
     let mut listeners = Vec::with_capacity(broker_count);
     let mut nodes = Vec::with_capacity(broker_count);
 
-    for broker_index in 0 .. broker_count {
+    for broker_index in 0..broker_count {
       let holder_id = format!("broker-{broker_index}");
       let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
       let addr = listener.local_addr()?;
@@ -305,7 +343,6 @@ impl ClusterHarness {
       watch::channel(BrokerMembership::new(initial_nodes));
 
     let blob_store = resources.blob_store();
-    let metadata_store = resources.metadata_store();
     let lease_store = resources.producer_lease_store();
 
     let mut harness = Self {
@@ -315,10 +352,11 @@ impl ClusterHarness {
       blob_store,
       metadata_store,
       lease_store,
+      topic_num_writers,
     };
 
     for (listener, node) in listeners.into_iter().zip(nodes) {
-      let broker = harness.spawn_broker(listener, node)?;
+      let broker = harness.spawn_broker(listener, node, topic_num_writers)?;
       harness.brokers.push(broker);
     }
 
@@ -352,6 +390,7 @@ impl ClusterHarness {
     &self,
     listener: tokio::net::TcpListener,
     node: BrokerNode,
+    topic_num_writers: u32,
   ) -> Result<BrokerHandle> {
     let write_engine = build_write_engine(
       node.node_id.clone(),
@@ -359,6 +398,7 @@ impl ClusterHarness {
       Arc::clone(&self.blob_store),
       Arc::clone(&self.metadata_store),
       Arc::clone(&self.lease_store),
+      topic_num_writers,
     )?;
 
     let metrics = BrokerMetrics::new();
@@ -416,7 +456,8 @@ impl ClusterHarness {
       node_id: old_node.node_id,
       address: listener.local_addr()?.to_string(),
     };
-    let restarted_broker = self.spawn_broker(listener, restarted_node.clone())?;
+    let restarted_broker =
+      self.spawn_broker(listener, restarted_node.clone(), self.topic_num_writers)?;
     self.brokers.push(restarted_broker);
 
     self.sync_membership();
@@ -436,6 +477,7 @@ fn build_write_engine(
   blob_store: Arc<dyn BlobStore>,
   metadata_store: Arc<dyn MetadataStore>,
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+  topic_num_writers: u32,
 ) -> Result<Arc<dyn WriteEngine>> {
   let mut topics = HashMap::new();
   for topic in [TOPIC, SECOND_TOPIC] {
@@ -444,7 +486,7 @@ fn build_write_engine(
       TopicInfo {
         name: topic.to_string(),
         partition_count: PARTITION_COUNT,
-        num_writers: 1,
+        num_writers: topic_num_writers,
       },
     );
   }
@@ -469,8 +511,12 @@ fn build_write_engine(
 }
 
 pub fn producer_config(max_retries: u32) -> ProducerConfig {
+  producer_config_with_writer_id(max_retries, 0)
+}
+
+pub fn producer_config_with_writer_id(max_retries: u32, writer_id: u32) -> ProducerConfig {
   let mut config = ProducerConfig::new();
-  config.writer_id = Some(0);
+  config.writer_id = Some(writer_id);
   config.max_batch_records = Some(1);
   config.max_batch_bytes = Some(1_024);
   config.flush_max_delay_ms = Some(5);
@@ -485,14 +531,18 @@ pub fn producer_config(max_retries: u32) -> ProducerConfig {
 }
 
 pub fn producer_topic() -> ProducerTopicConfig {
-  producer_topic_named(TOPIC)
+  producer_topic_named_with_writers(TOPIC, 1)
 }
 
 pub fn producer_topic_named(topic: &str) -> ProducerTopicConfig {
+  producer_topic_named_with_writers(topic, 1)
+}
+
+pub fn producer_topic_named_with_writers(topic: &str, num_writers: u32) -> ProducerTopicConfig {
   ProducerTopicConfig {
     name: topic.to_string().into(),
     partition_count: PARTITION_COUNT,
-    num_writers: 1,
+    num_writers,
     retention_days: 0,
     ..Default::default()
   }
@@ -664,7 +714,7 @@ async fn create_table_pk_only(client: &DynamoClient, table_name: &str) -> Result
 }
 
 async fn wait_for_table_active(client: &DynamoClient, table_name: &str) -> Result<()> {
-  for _ in 0 .. 40 {
+  for _ in 0..40 {
     let response = client.describe_table().table_name(table_name).send().await;
     if let Ok(response) = response
       && let Some(status) = response.table().and_then(|table| table.table_status())

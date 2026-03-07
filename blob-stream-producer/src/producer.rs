@@ -57,6 +57,8 @@ use tokio::sync::{Mutex, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval};
 
+// TODO(mattklein123): Consider adding disk buffering of segments.
+
 //
 // ProducerMetrics
 //

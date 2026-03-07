@@ -673,7 +673,8 @@ Notes:
   - [ ] Write detailed README.md on how to use the system including details on the producer library
         and configuration, consumer library and configuration, and broker service setup. Also
         include details on all of the Dynamo tables required as well as any details about the
-        required S3 bucket.
+        required S3 bucket. Finally, document the appropriate K8s RBAC required for membership
+        discovery across the different components.
 
 - [ ] Milestone 14: Hardening
   - Broker binary should use rust jemalloc allocator
