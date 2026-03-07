@@ -1395,6 +1395,7 @@ dependencies = [
  "blob-stream-proto",
  "blob-stream-types",
  "bytes",
+ "futures",
  "log",
  "prometheus",
  "serde_json",

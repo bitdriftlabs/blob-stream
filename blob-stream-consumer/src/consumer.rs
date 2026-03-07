@@ -22,6 +22,7 @@ use blob_stream_types::{
   VirtualPartitionId,
   Window,
 };
+use futures::future::try_join_all;
 use log::trace;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -307,8 +308,19 @@ impl ConsumerReader for ConsumerReaderImpl {
     let mut output = Vec::new();
 
     // Iterate through the lookback scan region to catch both current and delayed metadata.
-    for window in self.scan_windows(now_unix_seconds) {
-      let mut segments = self.metadata_store.scan_window(&window, None).await?;
+    let windows = self.scan_windows(now_unix_seconds);
+    let scan_futures = windows.iter().map(|window| {
+      let metadata_store = Arc::clone(&self.metadata_store);
+      async move {
+        let segments = metadata_store.scan_window(window, None).await?;
+        Ok::<_, anyhow::Error>((window, segments))
+      }
+    });
+
+    // Run independent per-window metadata queries concurrently while preserving input order.
+    let window_results = try_join_all(scan_futures).await?;
+
+    for (window, mut segments) in window_results {
       trace!(
         "consumer scanned window: topic={}, window_start={}, segments={}",
         window.topic,

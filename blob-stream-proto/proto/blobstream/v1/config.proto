@@ -250,11 +250,38 @@ message ConsumerReadConfig {
   string topic = 1 [(validate.rules).string.min_len = 1];
 
   // Fixed window size used for metadata scanning.
-  // Default when unset: 300 seconds.
+  // Default when unset: 300 seconds (5 minutes).
+  //
+  // This controls how segment metadata is bucketed and therefore how many distinct
+  // Dynamo partition keys are touched by reads:
+  // - Smaller windows => more keys/windows to scan per hour, lower per-window fan-in.
+  // - Larger windows => fewer keys/windows to scan per hour, higher per-window fan-in.
+  //
+  // Practical tuning:
+  // - Keep this at 300s unless you have a clear need; it is a good cost/latency baseline.
+  // - Decrease (e.g., 60-120s) if you need tighter visibility granularity and can accept
+  //   more metadata scan overhead.
+  // - Increase (e.g., 600-900s) if throughput is very high and you want fewer Dynamo
+  //   partition-key scans, accepting coarser scan buckets.
   optional int64 window_size_seconds = 2 [(validate.rules).int64.gt = 0];
 
   // Number of trailing windows to scan on each read.
   // Default when unset: 3 windows.
+  //
+  // Effective late-arrival coverage is:
+  //   coverage_seconds = window_size_seconds * lookback_windows
+  //
+  // With defaults, coverage is 300 * 3 = 900 seconds (15 minutes).
+  //
+  // Why values > 1 are useful even with a 5-minute window:
+  // - Metadata visibility can be delayed by retries/backoff, transient store slowness,
+  //   or temporary outages.
+  // - Consumers can miss scans during rebalance pauses or process restarts.
+  // - Segments near window boundaries can be observed on a later scan cycle.
+  //
+  // Practical sizing rule:
+  // - Choose lookback_windows >= ceil(max_expected_metadata_delay / window_size_seconds) + 1.
+  // - Add an extra safety window for production jitter if loss is unacceptable.
   optional uint32 lookback_windows = 3 [(validate.rules).uint32.gt = 0];
 
   // Base idle poll delay in milliseconds when no batches are available.
