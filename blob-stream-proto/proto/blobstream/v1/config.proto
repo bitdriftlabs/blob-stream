@@ -9,13 +9,17 @@ message BrokerConfig {
   // Maximum buffered bytes per virtual partition before forcing a flush.
   // Default when unset/zero: 67,108,864 bytes (64 MiB).
   uint32 flush_max_bytes = 1;
+
   // Maximum time to wait before flushing buffered records, even if size is low.
   // Default when unset/zero: 1,000 ms.
   uint32 flush_max_delay_ms = 2;
+
   // Address to bind the broker listener (e.g. "0.0.0.0:8080").
   string bind_addr = 3 [(validate.rules).string.min_len = 1];
+
   // Node identity config used for lease holder ids.
   BrokerNodeIdentityConfig node_identity = 4 [(validate.rules).message.required = true];
+
   // Broker discovery config used to watch membership changes.
   BrokerDiscoveryConfig discovery = 5 [(validate.rules).message.required = true];
 }
@@ -27,6 +31,7 @@ message BrokerNodeIdentityConfig {
 
     // Explicit node identifier override.
     string static_id = 1 [(validate.rules).string.min_len = 1];
+
     // Use the runtime hostname as the node identifier.
     BrokerHostnameIdentity hostname = 2;
   }
@@ -42,6 +47,7 @@ message BrokerDiscoveryConfig {
 
     // Static broker topology.
     StaticBrokerDiscoveryConfig static = 1;
+
     // Discover brokers via Kubernetes service endpoints.
     K8sServiceBrokerDiscoveryConfig k8s_service = 2;
   }
@@ -56,6 +62,7 @@ message StaticBrokerDiscoveryConfig {
 message BrokerNode {
   // Unique node identifier.
   string node_id = 1 [(validate.rules).string.min_len = 1];
+
   // Broker address (e.g. "10.0.0.1:8080").
   string address = 2 [(validate.rules).string.min_len = 1];
 }
@@ -64,6 +71,7 @@ message BrokerNode {
 message K8sServiceBrokerDiscoveryConfig {
   // Namespace containing the broker service.
   string namespace = 1 [(validate.rules).string.min_len = 1];
+
   // Service name for the broker endpoints.
   string service_name = 2 [(validate.rules).string.min_len = 1];
 }
@@ -72,12 +80,15 @@ message K8sServiceBrokerDiscoveryConfig {
 message TopicConfig {
   // Unique topic name used by producers and consumers.
   string name = 1 [(validate.rules).string.min_len = 1];
+
   // Number of logical partitions for this topic.
   // No default; must be explicitly set to > 0.
   uint32 partition_count = 2 [(validate.rules).uint32.gt = 0];
+
   // Number of producer clusters that may write to this topic.
   // No default; must be explicitly set to > 0.
   uint32 num_writers = 3 [(validate.rules).uint32.gt = 0];
+
   // Retention window in days (used to drive storage TTL and lifecycle policies).
   // Default when unset: 0 days.
   uint32 retention_days = 4;
@@ -90,10 +101,13 @@ message InMemoryBlobStoreConfig {}
 message S3BlobStoreConfig {
   // S3 bucket name for blob segments.
   string bucket = 1 [(validate.rules).string.min_len = 1];
+
   // Optional prefix for blob objects (e.g., "blob-stream/").
   string prefix = 2;
+
   // AWS region (e.g., "us-east-1").
   string region = 3 [(validate.rules).string.min_len = 1];
+
   // Optional endpoint override for local testing (e.g., LocalStack).
   string endpoint = 4;
 }
@@ -115,19 +129,26 @@ message InMemoryMetadataStoreConfig {}
 message DynamoMetadataStoreConfig {
   // AWS region (e.g., "us-east-1").
   string region = 1 [(validate.rules).string.min_len = 1];
+
   // Optional endpoint override for local testing (e.g., LocalStack).
   string endpoint = 2;
+
   // DynamoDB table name for segment metadata (`blob_segments`).
   string segment_metadata_table_name = 3 [(validate.rules).string.min_len = 1];
+
   // DynamoDB table name for producer partition leases (`producer_partition_leases`).
   string producer_partition_lease_table_name = 4 [(validate.rules).string.min_len = 1];
+
   // DynamoDB table name for consumer group leases (`consumer_group_leases`).
   string consumer_group_lease_table_name = 5 [(validate.rules).string.min_len = 1];
+
   // DynamoDB table name for consumer group membership (`consumer_group_membership`).
   string consumer_group_membership_table_name = 6 [(validate.rules).string.min_len = 1];
+
   // Additional seconds added to segment metadata TTL beyond topic retention_days.
   // Default when unset: 3,600 seconds.
   optional uint32 segment_ttl_buffer_seconds = 7 [(validate.rules).uint32.gt = 0];
+
   // Additional seconds added to lease/membership TTL beyond lease expiration.
   // Default when unset: 3,600 seconds.
   optional uint32 lease_ttl_buffer_seconds = 8 [(validate.rules).uint32.gt = 0];
@@ -147,10 +168,13 @@ message MetadataStoreConfig {
 message RuntimeConfig {
   // Broker-wide settings applied across all topics.
   BrokerConfig broker = 1 [(validate.rules).message.required = true];
+
   // Topic definitions available to this broker.
   repeated TopicConfig topics = 2 [(validate.rules).repeated.min_items = 1];
+
   // Blob storage configuration for segments.
   BlobStoreConfig blob_store = 3 [(validate.rules).message.required = true];
+
   // Metadata storage configuration for segment indexes.
   MetadataStoreConfig metadata_store = 4 [(validate.rules).message.required = true];
 }
@@ -166,33 +190,43 @@ message ProducerConfig {
   // Writer id in range [0, num_writers) for each configured topic.
   // Default when unset: 0.
   optional uint32 writer_id = 1;
+
   // Maximum records in a producer-side batch.
   // Default when unset: 1,000 records.
   optional uint32 max_batch_records = 2 [(validate.rules).uint32.gt = 0];
+
   // Maximum uncompressed payload bytes in a producer-side batch.
   // Default when unset: 1,048,576 bytes (1 MiB).
   optional uint32 max_batch_bytes = 3 [(validate.rules).uint32.gt = 0];
+
   // Maximum delay before time-based flush.
   // Default when unset: 200 ms.
   optional uint64 flush_max_delay_ms = 4 [(validate.rules).uint64.gt = 0];
+
   // Maximum retry attempts for transient produce failures.
   // Default when unset: 5.
   optional uint32 max_retries = 5;
+
   // Exponential backoff base delay.
   // Default when unset: 25 ms.
   optional uint64 retry_base_delay_ms = 6 [(validate.rules).uint64.gt = 0];
+
   // Exponential backoff max delay.
   // Default when unset: 1,000 ms.
   optional uint64 retry_max_delay_ms = 7 [(validate.rules).uint64.gt = 0];
+
   // gRPC connect timeout.
   // Default when unset: 2,000 ms.
   optional int64 connect_timeout_ms = 8 [(validate.rules).int64.gt = 0];
+
   // gRPC request timeout.
   // Default when unset: 5,000 ms.
   optional int64 request_timeout_ms = 9 [(validate.rules).int64.gt = 0];
+
   // Maximum in-flight request concurrency.
   // Default when unset: 64.
   optional uint64 max_request_concurrency = 10 [(validate.rules).uint64.gt = 0];
+
   // Request compression strategy.
   // Default when unset: PRODUCER_COMPRESSION_NONE.
   optional ProducerCompression compression = 11 [(validate.rules).enum.defined_only = true];
@@ -202,8 +236,10 @@ message ProducerConfig {
 message ProducerRuntimeConfig {
   // Producer behavior/tuning parameters.
   ProducerConfig producer = 1 [(validate.rules).message.required = true];
+
   // Broker discovery backend (static or k8s service).
   BrokerDiscoveryConfig discovery = 2 [(validate.rules).message.required = true];
+
   // Topic definitions used by producer routing and validation.
   repeated TopicConfig topics = 3 [(validate.rules).repeated.min_items = 1];
 }
@@ -212,15 +248,19 @@ message ProducerRuntimeConfig {
 message ConsumerReadConfig {
   // Topic to scan for segment metadata.
   string topic = 1 [(validate.rules).string.min_len = 1];
+
   // Fixed window size used for metadata scanning.
   // Default when unset: 300 seconds.
   optional int64 window_size_seconds = 2 [(validate.rules).int64.gt = 0];
+
   // Number of trailing windows to scan on each read.
   // Default when unset: 3 windows.
   optional uint32 lookback_windows = 3 [(validate.rules).uint32.gt = 0];
+
   // Base idle poll delay in milliseconds when no batches are available.
   // Default when unset: 250 ms.
   optional uint64 idle_poll_delay_ms = 4 [(validate.rules).uint64.gt = 0];
+
   // Optional max idle poll delay in milliseconds for exponential backoff.
   // Default when unset: disabled (no max cap).
   optional uint64 max_idle_poll_delay_ms = 5;
@@ -230,16 +270,21 @@ message ConsumerReadConfig {
 message ConsumerGroupConfig {
   // Topic for the consumer group lease domain.
   string topic = 1 [(validate.rules).string.min_len = 1];
+
   // Consumer group id.
   string group_id = 2 [(validate.rules).string.min_len = 1];
+
   // Stable member id for this consumer instance.
   string member_id = 3 [(validate.rules).string.min_len = 1];
+
   // Lease duration in milliseconds.
   // Default when unset: 30,000 ms.
   optional int64 lease_duration_ms = 4 [(validate.rules).int64.gt = 0];
+
   // Heartbeat interval in milliseconds.
   // Default when unset: 10,000 ms.
   optional int64 heartbeat_interval_ms = 5 [(validate.rules).int64.gt = 0];
+
   // Rebalance interval in milliseconds.
   // Default when unset: 10,000 ms.
   optional int64 rebalance_interval_ms = 6 [(validate.rules).int64.gt = 0];
@@ -249,6 +294,7 @@ message ConsumerGroupConfig {
 message ConsumerRuntimeConfig {
   // Read path configuration.
   ConsumerReadConfig read = 1 [(validate.rules).message.required = true];
+
   // Group coordination configuration.
   ConsumerGroupConfig group = 2 [(validate.rules).message.required = true];
 }
@@ -257,10 +303,13 @@ message ConsumerRuntimeConfig {
 message ConsumerIteratorBootstrapConfig {
   // Consumer runtime behavior/tuning.
   ConsumerRuntimeConfig runtime = 1 [(validate.rules).message.required = true];
+
   // Topic shape used to derive virtual partitions.
   TopicConfig topic = 2 [(validate.rules).message.required = true];
+
   // Blob storage backend used by consumer reads.
   BlobStoreConfig blob_store = 3 [(validate.rules).message.required = true];
+
   // Metadata and lease storage backend used by reads/coordination.
   MetadataStoreConfig metadata_store = 4 [(validate.rules).message.required = true];
 }
