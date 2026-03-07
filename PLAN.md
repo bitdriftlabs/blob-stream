@@ -689,7 +689,9 @@ Notes:
       RBAC guidance.
 
 - [ ] Milestone 14: Hardening
-  - [ ] Broker binary should use rust jemalloc allocator
+  - [x] Broker binary should use rust jemalloc allocator
+  - [x] Redo broker `main()` to use `bd_rt`, `bd_panic`, and `bd_log`.
+  - [x] Add a broker admin log endpoint equivalent to loop-api (`/admin/log?rust_log=...`).
   - [ ] Dynamo TTL
   - [ ] Consider RAM limits (driven from jemalloc internal metrics) in the broker binary used to
     apply back pressure.

@@ -1,11 +1,12 @@
 use crate::metrics::BrokerMetrics;
 use crate::write::{WriteEngine, WriteError, WriteRequest};
 use axum::Router;
+use axum::extract::Query;
 use axum::http::header::CONTENT_TYPE;
-use axum::routing::get;
+use axum::routing::{get, post};
 use bd_grpc::Handler;
 use bd_grpc::service::ServiceMethod;
-use bd_log::warn_every;
+use bd_log::{SwapLogger, warn_every};
 use bd_server_stats::stats::Scope;
 use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchRequest,
@@ -15,6 +16,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 use blob_stream_types::Record;
 use http::{Extensions, HeaderMap};
 use log::trace;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use time::ext::NumericalDuration;
@@ -161,6 +163,14 @@ pub fn make_broker_router(write_engine: Arc<dyn WriteEngine>, metrics: &BrokerMe
       }
     }),
   )
+  .route("/admin/log", post(log))
+}
+
+// Handler for /admin/log. Allows changing the active log level.
+async fn log(Query(params): Query<HashMap<String, String>>) {
+  if let Some(rust_log) = params.get("rust_log") {
+    let _ = SwapLogger::swap(rust_log);
+  }
 }
 
 fn error_message(error: &WriteError) -> String {

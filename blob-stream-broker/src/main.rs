@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use bd_panic::PanicType;
 use blob_stream::config::load_runtime_config;
 use blob_stream::grpc::make_broker_router;
 use blob_stream::metrics::BrokerMetrics;
@@ -15,9 +16,18 @@ struct Cli {
   config: PathBuf,
 }
 
-// fixfix use bd-rt/bd-panic/bd-log
-#[tokio::main]
-async fn main() -> Result<()> {
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+fn main() -> Result<()> {
+  bd_panic::default(PanicType::ForceAbort);
+  bd_log::SwapLogger::initialize();
+
+  let runtime = bd_rt::new_runtime()?;
+  runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
   let cli = Cli::parse();
   let config = load_runtime_config(&cli.config)?;
   let broker_config = config
@@ -40,7 +50,7 @@ async fn main() -> Result<()> {
   let metrics_scope = metrics.scope();
   let write_engine = build_write_engine(&config, &metrics_scope).await?;
   let listener = tokio::net::TcpListener::bind(addr).await?;
-  info!("broker listening: bind_addr={addr}, metrics_path=/metrics");
+  info!("broker listening: bind_addr={addr}, metrics_path=/metrics, log_path=/admin/log");
   axum::serve(listener, make_broker_router(write_engine, &metrics)).await?;
   info!("broker shutdown complete");
   Ok(())
