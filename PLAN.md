@@ -657,7 +657,7 @@ Notes:
     - `blob-stream-broker/src/lib.rs` (metrics module export)
     - `blob-stream-broker/Cargo.toml` (bd-server-stats + prometheus dependencies)
 
-- [ ] Milestone 13: End-to-end integration
+- [x] Milestone 13: End-to-end integration
   - [x] Write integration tests for broker + producer + consumer using docker compose for
         dependencies (local S3/Dynamo). The integration tests should use real networking but all
         be run in the same process. Develop an integration test framework that is able to start
@@ -670,7 +670,7 @@ Notes:
         integration tests. This should use a simulated network and broker discovery implementation
         that can be driven during tests. Then use this to test failure cases across producers,
         brokers, and consumers.
-  - [ ] Write detailed README.md on how to use the system including details on the producer library
+  - [x] Write detailed README.md on how to use the system including details on the producer library
         and configuration, consumer library and configuration, and broker service setup. Also
         include details on all of the Dynamo tables required as well as any details about the
         required S3 bucket. Finally, document the appropriate K8s RBAC required for membership
@@ -684,6 +684,9 @@ Notes:
     - Phase gate verification completed with: `cargo +nightly fmt`,
       `cargo clippy -p blob-stream-integration-tests --tests -- -D warnings --no-deps`, and
       `RUST_LOG=off cargo nextest run -p blob-stream-integration-tests` (25/25 passed).
+    - Milestone documentation completed in `README.md` with project overview, producer/consumer
+      usage, broker setup, required DynamoDB tables, S3 requirements, and Kubernetes discovery
+      RBAC guidance.
 
 - [ ] Milestone 14: Hardening
   - Broker binary should use rust jemalloc allocator
