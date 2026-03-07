@@ -1,4 +1,4 @@
-use crate::framework::{PARTITION_COUNT, TOPIC, WINDOW_SIZE_SECONDS};
+use crate::test_framework::{PARTITION_COUNT, TOPIC, WINDOW_SIZE_SECONDS};
 use blob_stream_consumer::{ConsumerGroupConfig, ConsumerReadConfig, ConsumerRuntimeConfig};
 use blob_stream_producer::{ProducerCompression, ProducerConfig, ProducerTopicConfig};
 

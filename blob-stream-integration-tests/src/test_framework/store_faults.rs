@@ -1,4 +1,4 @@
-use crate::framework::event_log::TestEventLog;
+use crate::test_framework::event_log::TestEventLog;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange};
@@ -59,7 +59,6 @@ pub enum StoreFaultOperation {
 // StoreFaultAction
 //
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum StoreFaultAction {
   Fail { message: String },
@@ -86,7 +85,6 @@ pub struct StoreFaultRule {
 // StoreFaultScriptAction
 //
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum StoreFaultScriptAction {
   Enable(StoreFaultRule),
@@ -108,7 +106,6 @@ pub struct StoreFaultScriptStep {
 // StoreFaultEvent
 //
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct StoreFaultEvent {
   pub domain: StoreFaultDomain,
@@ -191,7 +188,6 @@ impl StoreFaultController {
     self.inner.lock().await.event_log = Some(event_log);
   }
 
-  #[allow(dead_code)]
   pub async fn enable_fault(&self, rule: StoreFaultRule) -> u64 {
     let mut guard = self.inner.lock().await;
     let id = guard.next_fault_id;
@@ -200,7 +196,6 @@ impl StoreFaultController {
     id
   }
 
-  #[allow(dead_code)]
   pub async fn disable_fault(&self, fault_id: u64) -> bool {
     let mut guard = self.inner.lock().await;
     let previous_len = guard.rules.len();
@@ -208,7 +203,6 @@ impl StoreFaultController {
     previous_len != guard.rules.len()
   }
 
-  #[allow(dead_code)]
   pub async fn clear_all_faults(&self) {
     let mut guard = self.inner.lock().await;
     guard.rules.clear();
@@ -216,19 +210,16 @@ impl StoreFaultController {
     guard.delayed_metadata.clear();
   }
 
-  #[allow(dead_code)]
   pub async fn load_script(&self, mut steps: Vec<StoreFaultScriptStep>) {
     steps.sort_by_key(|step| step.on_call_count);
     let mut guard = self.inner.lock().await;
     guard.script_steps = steps;
   }
 
-  #[allow(dead_code)]
   pub async fn events(&self) -> Vec<StoreFaultEvent> {
     self.inner.lock().await.events.clone()
   }
 
-  #[allow(dead_code)]
   pub async fn clear_events(&self) {
     self.inner.lock().await.events.clear();
   }

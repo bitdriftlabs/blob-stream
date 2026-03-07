@@ -1,8 +1,3 @@
-#![allow(clippy::unwrap_used)]
-
-#[path = "./support/framework.rs"]
-mod framework;
-
 use anyhow::{Result, anyhow};
 use blob_stream_broker_discovery::BrokerDiscovery;
 use blob_stream_consumer::{
@@ -13,6 +8,7 @@ use blob_stream_consumer::{
   ConsumerReaderImpl,
   NextResult,
 };
+use blob_stream_integration_tests::test_framework as framework;
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupCommitOutcome,

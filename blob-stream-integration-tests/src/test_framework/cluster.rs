@@ -9,7 +9,7 @@ use super::transport::{
   InMemoryTestTransport,
   NetworkFaultController,
 };
-use crate::framework::{PARTITION_COUNT, SECOND_TOPIC, TOPIC};
+use crate::test_framework::{PARTITION_COUNT, SECOND_TOPIC, TOPIC};
 use anyhow::{Result, anyhow};
 use blob_stream::grpc::make_broker_router;
 use blob_stream::metrics::BrokerMetrics;
@@ -56,7 +56,6 @@ impl BrokerHandle {
 
 pub struct ClusterHarness {
   brokers: Vec<BrokerHandle>,
-  #[allow(dead_code)]
   event_log: TestEventLog,
   producer_discovery: DynamicBrokerDiscovery,
   broker_membership_tx: watch::Sender<BrokerMembership>,
@@ -90,13 +89,6 @@ impl ClusterHarnessBuilder<'_> {
     self
   }
 
-  #[allow(dead_code)]
-  pub fn transport(mut self, transport: Arc<dyn BrokerTransport>) -> Self {
-    self.transport = transport;
-    self
-  }
-
-  #[allow(dead_code)]
   pub fn in_memory_transport(mut self) -> Self {
     self.transport = Arc::new(InMemoryTestTransport::new());
     self
@@ -199,12 +191,10 @@ impl ClusterHarness {
     self.producer_discovery.clone()
   }
 
-  #[allow(dead_code)]
   pub fn event_log(&self) -> TestEventLog {
     self.event_log.clone()
   }
 
-  #[allow(dead_code)]
   pub async fn wait_for_event(
     &self,
     matcher: &TestEventMatcher,
@@ -213,20 +203,10 @@ impl ClusterHarness {
     self.event_log.wait_for_event(matcher, timeout).await
   }
 
-  #[allow(dead_code)]
-  pub async fn assert_event_sequence_contains(&self, expected: &[TestEventMatcher]) -> Result<()> {
-    self
-      .event_log
-      .assert_event_sequence_contains(expected)
-      .await
-  }
-
-  #[allow(dead_code)]
   pub fn network_fault_controller(&self) -> Option<NetworkFaultController> {
     self.transport.fault_controller()
   }
 
-  #[allow(dead_code)]
   pub async fn create_producer(
     &self,
     config: ProducerConfig,

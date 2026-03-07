@@ -1,5 +1,5 @@
-use crate::framework::runtime::runtime_sleep;
-use crate::framework::store_faults::{
+use crate::test_framework::runtime::runtime_sleep;
+use crate::test_framework::store_faults::{
   FaultInjectedBlobStore,
   FaultInjectedConsumerGroupLeaseStore,
   FaultInjectedMetadataStore,
@@ -146,7 +146,6 @@ impl IntegrationResources {
     ))
   }
 
-  #[allow(dead_code)]
   pub fn store_fault_controller(&self) -> StoreFaultController {
     self.store_fault_controller.clone()
   }

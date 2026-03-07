@@ -23,7 +23,6 @@ pub struct TestEvent {
 //
 
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct TestEventMatcher {
   pub category: Option<String>,
   pub operation: Option<String>,
@@ -31,7 +30,6 @@ pub struct TestEventMatcher {
   pub status: Option<String>,
 }
 
-#[allow(dead_code)]
 impl TestEventMatcher {
   #[must_use]
   pub fn matches(&self, event: &TestEvent) -> bool {
@@ -108,17 +106,10 @@ impl TestEventLog {
     });
   }
 
-  #[allow(dead_code)]
   pub async fn snapshot(&self) -> Vec<TestEvent> {
     self.inner.lock().await.events.clone()
   }
 
-  #[allow(dead_code)]
-  pub async fn clear(&self) {
-    self.inner.lock().await.events.clear();
-  }
-
-  #[allow(dead_code)]
   pub async fn wait_for_event(
     &self,
     matcher: &TestEventMatcher,
@@ -152,36 +143,5 @@ impl TestEventLog {
 
       sleep(Duration::from_millis(10)).await;
     }
-  }
-
-  #[allow(dead_code)]
-  pub async fn assert_event_sequence_contains(&self, expected: &[TestEventMatcher]) -> Result<()> {
-    let events = self.snapshot().await;
-    let mut cursor = 0usize;
-
-    for matcher in expected {
-      let mut matched = false;
-      while cursor < events.len() {
-        if matcher.matches(&events[cursor]) {
-          matched = true;
-          cursor = cursor.saturating_add(1);
-          break;
-        }
-        cursor = cursor.saturating_add(1);
-      }
-
-      if !matched {
-        return Err(anyhow!(
-          "event sequence assertion failed at matcher: category={:?}, operation={:?}, \
-           key_contains={:?}, status={:?}",
-          matcher.category,
-          matcher.operation,
-          matcher.key_contains,
-          matcher.status
-        ));
-      }
-    }
-
-    Ok(())
   }
 }

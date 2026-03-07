@@ -32,31 +32,6 @@ impl TestRuntime for TokioTestRuntime {
   }
 }
 
-//
-// DeterministicTestRuntime
-//
-
-#[allow(dead_code)]
-pub struct DeterministicTestRuntime;
-
-impl DeterministicTestRuntime {
-  #[allow(dead_code)]
-  pub fn new() -> Self {
-    Self
-  }
-}
-
-#[async_trait]
-impl TestRuntime for DeterministicTestRuntime {
-  fn now_unix_millis(&self) -> i64 {
-    panic!("DeterministicTestRuntime::now_unix_millis is not wired in Phase A")
-  }
-
-  async fn sleep(&self, _duration: Duration) {
-    panic!("DeterministicTestRuntime::sleep is not wired in Phase A")
-  }
-}
-
 pub fn now_unix_millis() -> i64 {
   default_test_runtime().now_unix_millis()
 }

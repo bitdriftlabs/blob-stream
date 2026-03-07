@@ -666,7 +666,7 @@ Notes:
         to simulate k8s service discovery.
   - [x] Verify autoscaling behaviors (simulated broker/consumer membership changes).
   - [x] Validate duplicate handling and cursor monotonicity under retries.
-  - [ ] Additionally develop a deterministic fault injection framework that can be used during
+  - [x] Additionally develop a deterministic fault injection framework that can be used during
         integration tests. This should use a simulated network and broker discovery implementation
         that can be driven during tests. Then use this to test failure cases across producers,
         brokers, and consumers.
@@ -675,6 +675,15 @@ Notes:
         include details on all of the Dynamo tables required as well as any details about the
         required S3 bucket. Finally, document the appropriate K8s RBAC required for membership
         discovery across the different components.
+  - Status (2026-03-07):
+    - Fault injection Phase E is complete: FIT-001 through FIT-012 are implemented and passing in
+      `blob-stream-integration-tests/tests/fault_injection_test.rs`.
+    - Fault injection Phase F is complete: framework test support was moved to
+      `blob-stream-integration-tests/src/test_framework`, stale/unused APIs were removed, and
+      dead-code allowances tied to the old `tests/support` path were eliminated.
+    - Phase gate verification completed with: `cargo +nightly fmt`,
+      `cargo clippy -p blob-stream-integration-tests --tests -- -D warnings --no-deps`, and
+      `RUST_LOG=off cargo nextest run -p blob-stream-integration-tests` (25/25 passed).
 
 - [ ] Milestone 14: Hardening
   - Broker binary should use rust jemalloc allocator

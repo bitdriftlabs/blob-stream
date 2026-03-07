@@ -1,20 +1,15 @@
-#[path = "./framework/cluster.rs"]
+// Shared integration-test framework APIs are intentionally ergonomic; we don't require
+// #[must_use] on every helper constructor/accessor or generic hasher plumbing in test-only APIs.
+#![allow(clippy::must_use_candidate, clippy::implicit_hasher)]
+
 mod cluster;
-#[path = "./framework/config.rs"]
 mod config;
-#[path = "./framework/discovery.rs"]
 mod discovery;
-#[path = "./framework/event_log.rs"]
 mod event_log;
-#[path = "./framework/helpers.rs"]
 mod helpers;
-#[path = "./framework/resources.rs"]
 mod resources;
-#[path = "./framework/runtime.rs"]
 mod runtime;
-#[path = "./framework/store_faults.rs"]
 mod store_faults;
-#[path = "./framework/transport.rs"]
 mod transport;
 
 pub const TOPIC: &str = "telemetry";
@@ -32,12 +27,10 @@ pub use config::{
   producer_topic_named_with_writers,
 };
 pub use discovery::{DynamicBrokerDiscovery, DynamicCoordinationSource};
-#[allow(unused_imports)]
 pub use event_log::{TestEvent, TestEventLog, TestEventMatcher};
 pub use helpers::{drain_reader_until, produce_message, produce_message_for_topic};
 pub use resources::IntegrationResources;
 pub use runtime::now_unix_seconds;
-#[allow(unused_imports)]
 pub use store_faults::{
   StoreFaultAction,
   StoreFaultController,
@@ -48,3 +41,4 @@ pub use store_faults::{
   StoreFaultScriptAction,
   StoreFaultScriptStep,
 };
+pub use transport::{NetworkFault, NetworkFaultRule, NetworkOperation};

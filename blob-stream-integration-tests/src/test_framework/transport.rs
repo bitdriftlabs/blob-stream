@@ -1,4 +1,4 @@
-use crate::framework::event_log::TestEventLog;
+use crate::test_framework::event_log::TestEventLog;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use blob_stream::write::{WriteEngine, WriteError, WriteRequest};
@@ -20,7 +20,6 @@ use tokio::time::sleep as tokio_sleep;
 // BrokerEndpointBinding
 //
 
-#[allow(dead_code)]
 pub enum BrokerEndpointBinding {
   Tcp(tokio::net::TcpListener),
   InMemory,
@@ -43,17 +42,14 @@ pub trait BrokerTransport: Send + Sync {
     Ok(())
   }
 
-  #[allow(dead_code)]
   fn register_write_engine(&self, _node_id: &str, _engine: Arc<dyn WriteEngine>) -> Result<()> {
     Ok(())
   }
 
-  #[allow(dead_code)]
   fn producer_transport(&self) -> Option<Arc<dyn ProducerBrokerTransport>> {
     None
   }
 
-  #[allow(dead_code)]
   fn fault_controller(&self) -> Option<NetworkFaultController> {
     None
   }
@@ -86,7 +82,6 @@ impl BrokerTransport for GrpcTcpTransport {
 // NetworkOperation
 //
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkOperation {
   ProduceBatch,
@@ -96,7 +91,6 @@ pub enum NetworkOperation {
 // NetworkFault
 //
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NetworkFault {
   Drop,
@@ -111,7 +105,6 @@ pub enum NetworkFault {
 // NetworkFaultRule
 //
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct NetworkFaultRule {
   pub target_node_id: Option<String>,
@@ -124,7 +117,6 @@ pub struct NetworkFaultRule {
 // FaultScriptAction
 //
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum FaultScriptAction {
   Enable(NetworkFaultRule),
@@ -136,7 +128,6 @@ pub enum FaultScriptAction {
 // FaultScriptStep
 //
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct FaultScriptStep {
   pub on_call_count: u64,
@@ -147,7 +138,6 @@ pub struct FaultScriptStep {
 // NetworkFaultController
 //
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct NetworkFaultController {
   inner: Arc<Mutex<NetworkFaultControllerState>>,
@@ -157,7 +147,6 @@ pub struct NetworkFaultController {
 // NetworkFaultControllerState
 //
 
-#[allow(dead_code)]
 #[derive(Default)]
 struct NetworkFaultControllerState {
   next_fault_id: u64,
@@ -171,7 +160,6 @@ struct NetworkFaultControllerState {
 // ActiveNetworkFaultRule
 //
 
-#[allow(dead_code)]
 struct ActiveNetworkFaultRule {
   id: u64,
   rule: NetworkFaultRule,
@@ -181,7 +169,6 @@ struct ActiveNetworkFaultRule {
 // NetworkFaultEffects
 //
 
-#[allow(dead_code)]
 #[derive(Default)]
 struct NetworkFaultEffects {
   drop_request: bool,
@@ -204,7 +191,6 @@ impl Default for NetworkFaultController {
   }
 }
 
-#[allow(dead_code)]
 impl NetworkFaultController {
   pub async fn attach_event_log(&self, event_log: TestEventLog) {
     self.inner.lock().await.event_log = Some(event_log);
@@ -312,7 +298,6 @@ impl NetworkFaultController {
   }
 }
 
-#[allow(dead_code)]
 fn apply_script_steps_locked(state: &mut NetworkFaultControllerState) {
   // Apply all script steps that are due at the current call count.
   let total_calls = state.total_calls;
@@ -350,7 +335,6 @@ fn rule_matches(rule: &NetworkFaultRule, node_id: &str, operation: NetworkOperat
     .is_none_or(|target_node_id| target_node_id == node_id)
 }
 
-#[allow(dead_code)]
 fn max_duration(current: Option<Duration>, candidate: Duration) -> Duration {
   current.map_or(candidate, |duration| duration.max(candidate))
 }
@@ -365,7 +349,6 @@ fn describe_network_operation(operation: NetworkOperation) -> &'static str {
 // InMemoryTestTransport
 //
 
-#[allow(dead_code)]
 pub struct InMemoryTestTransport {
   fault_controller: NetworkFaultController,
   producer_transport: Arc<InMemoryProducerTransport>,
@@ -375,7 +358,6 @@ pub struct InMemoryTestTransport {
 // InMemoryTestTransport
 //
 
-#[allow(dead_code)]
 impl InMemoryTestTransport {
   pub fn new() -> Self {
     let fault_controller = NetworkFaultController::default();
@@ -391,7 +373,6 @@ impl InMemoryTestTransport {
 // InMemoryTestTransport
 //
 
-#[allow(dead_code)]
 impl Default for InMemoryTestTransport {
   fn default() -> Self {
     Self::new()
@@ -435,7 +416,6 @@ impl BrokerTransport for InMemoryTestTransport {
 // InMemoryProducerTransport
 //
 
-#[allow(dead_code)]
 struct InMemoryProducerTransport {
   engines: StdMutex<HashMap<String, Arc<dyn WriteEngine>>>,
   fault_controller: NetworkFaultController,
@@ -445,7 +425,6 @@ struct InMemoryProducerTransport {
 // InMemoryProducerTransport
 //
 
-#[allow(dead_code)]
 impl InMemoryProducerTransport {
   fn new(fault_controller: NetworkFaultController) -> Self {
     Self {
@@ -566,7 +545,6 @@ impl ProducerBrokerTransport for InMemoryProducerTransport {
   }
 }
 
-#[allow(dead_code)]
 fn write_error_message(error: &WriteError) -> String {
   match error {
     WriteError::Internal(inner) => inner.to_string(),

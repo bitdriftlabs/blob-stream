@@ -1,4 +1,4 @@
-use crate::framework::runtime::{now_unix_millis, now_unix_seconds, runtime_sleep};
+use crate::test_framework::runtime::{now_unix_millis, now_unix_seconds, runtime_sleep};
 use anyhow::{Result, anyhow};
 use blob_stream_consumer::{ConsumerReader, ConsumerReaderImpl};
 use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerRecord};
@@ -11,7 +11,7 @@ pub async fn produce_message(
   key: Vec<u8>,
   id: &str,
 ) -> Result<blob_stream_producer::ProducerAck> {
-  produce_message_for_topic(producer, crate::framework::TOPIC, key, id).await
+  produce_message_for_topic(producer, crate::test_framework::TOPIC, key, id).await
 }
 
 pub async fn produce_message_for_topic(
