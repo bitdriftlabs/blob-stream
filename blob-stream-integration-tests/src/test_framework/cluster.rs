@@ -12,10 +12,10 @@ use super::transport::{
 use crate::test_framework::{PARTITION_COUNT, SECOND_TOPIC, TOPIC};
 use anyhow::{Result, anyhow};
 use bd_server_stats::stats::Collector;
-use blob_stream::grpc::make_broker_router;
-use blob_stream::metrics::BrokerMetrics;
-use blob_stream::write::{TopicInfo, WriteConfig, WriteEngine, WriteEngineImpl};
 use blob_stream_blob_store::BlobStore;
+use blob_stream_broker::grpc::make_broker_router;
+use blob_stream_broker::metrics::BrokerMetrics;
+use blob_stream_broker::write::{TopicInfo, WriteConfig, WriteEngine, WriteEngineImpl};
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{MetadataStore, ProducerPartitionLeaseStore};
 use blob_stream_producer::{ProducerClientImpl, ProducerConfig, ProducerTopicConfig};

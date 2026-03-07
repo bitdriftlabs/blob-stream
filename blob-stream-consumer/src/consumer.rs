@@ -121,9 +121,13 @@ use std::sync::Arc;
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// A decoded batch returned by the consumer read path.
 pub struct ConsumerBatch {
+  /// Virtual partition that owns this batch.
   pub virtual_partition_id: VirtualPartitionId,
+  /// Inclusive sequence range for this batch.
   pub seq_range: SeqRange,
+  /// Decoded records for the batch.
   pub records: Vec<Record>,
 }
 
@@ -132,9 +136,13 @@ pub struct ConsumerBatch {
 //
 
 #[async_trait]
+/// Low-level batch reader over blob + metadata stores.
 pub trait ConsumerReader: Send {
+  /// Scan available windows and return newly available batches.
   async fn read_available(&mut self, now_unix_seconds: i64) -> Result<Vec<ConsumerBatch>>;
+  /// Return committed cursor for a virtual partition, if known.
   fn cursor(&self, virtual_partition_id: VirtualPartitionId) -> Option<u64>;
+  /// Return all tracked cursors.
   fn cursors(&self) -> HashMap<VirtualPartitionId, u64>;
 }
 
@@ -142,6 +150,7 @@ pub trait ConsumerReader: Send {
 // ConsumerReaderImpl
 //
 
+/// Default `ConsumerReader` implementation used by `ConsumerIteratorImpl`.
 pub struct ConsumerReaderImpl {
   config: ConsumerReadConfig,
   blob_store: Arc<dyn BlobStore>,
@@ -151,6 +160,7 @@ pub struct ConsumerReaderImpl {
 }
 
 impl ConsumerReaderImpl {
+  /// Create a reader with explicit assignment and initial cursor state.
   pub fn new(
     config: ConsumerReadConfig,
     assigned_virtual_partitions: Vec<VirtualPartitionId>,
@@ -258,6 +268,7 @@ impl ConsumerReaderImpl {
     })
   }
 
+  /// Replace the current assignment set.
   pub fn set_assigned_virtual_partitions(
     &mut self,
     assigned_virtual_partitions: Vec<VirtualPartitionId>,
@@ -266,10 +277,12 @@ impl ConsumerReaderImpl {
     Ok(())
   }
 
+  /// Set the in-memory cursor for a virtual partition.
   pub fn set_cursor(&mut self, virtual_partition_id: VirtualPartitionId, seq_end: u64) {
     self.cursors.insert(virtual_partition_id, seq_end);
   }
 
+  /// Update cursor monotonically with externally committed offset state.
   pub fn hydrate_cursor(&mut self, virtual_partition_id: VirtualPartitionId, seq_end: u64) {
     let current = self
       .cursors

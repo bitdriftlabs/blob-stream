@@ -110,8 +110,11 @@ impl ConsumerIteratorMetrics {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Snapshot of membership and partition space used during rebalance.
 pub struct CoordinationSnapshot {
+  /// Active member ids in the consumer group.
   pub members: Vec<String>,
+  /// Full partition space considered by the coordinator.
   pub virtual_partitions: Vec<VirtualPartitionId>,
 }
 
@@ -120,7 +123,9 @@ pub struct CoordinationSnapshot {
 //
 
 #[async_trait]
+/// Source of coordination snapshots for group rebalances.
 pub trait ConsumerCoordinationSource: Send + Sync {
+  /// Return current view of group members and partitions.
   async fn snapshot(&self) -> Result<CoordinationSnapshot>;
 }
 
@@ -129,8 +134,11 @@ pub trait ConsumerCoordinationSource: Send + Sync {
 //
 
 #[async_trait]
+/// Handle for acknowledging completion of partition revocations.
 pub trait RevokedPartitions: Send {
+  /// Revoked partition ids.
   fn partitions(&self) -> Vec<VirtualPartitionId>;
+  /// Signal that in-flight work for revoked partitions has drained.
   async fn complete(self: Box<Self>);
 }
 
@@ -156,8 +164,11 @@ impl RevokedPartitions for RevokedPartitionsImpl {
 // NextResult
 //
 
+/// Result of polling the iterator.
 pub enum NextResult {
+  /// Next available batch for an owned partition.
   Batch(ConsumerBatch),
+  /// Notification that partitions were revoked and must be drained.
   Revoked(Box<dyn RevokedPartitions>),
 }
 
@@ -166,12 +177,19 @@ pub enum NextResult {
 //
 
 #[async_trait]
+/// High-level pull API used by applications.
 pub trait ConsumerIterator: Send {
+  /// Start iterator processing and initialize internal timers/state.
   fn start(&mut self) -> Result<()>;
+  /// Poll for either a new batch or revocation event.
   async fn next(&mut self) -> Result<NextResult>;
+  /// Stage an offset for commit on the next `commit`/heartbeat.
   fn store_offset(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()>;
+  /// Flush staged offsets and heartbeat owned partitions.
   async fn commit(&mut self) -> Result<HeartbeatReport>;
+  /// Shutdown iterator and release owned partitions.
   async fn shutdown(self: Box<Self>) -> Result<()>;
+  /// Reposition read cursor for a partition.
   async fn seek(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()>;
 }
 
@@ -179,6 +197,7 @@ pub trait ConsumerIterator: Send {
 // ConsumerIteratorImpl
 //
 
+/// Default consumer iterator implementation.
 pub struct ConsumerIteratorImpl {
   group_config: ConsumerGroupConfig,
   reader: ConsumerReaderImpl,
@@ -198,6 +217,7 @@ pub struct ConsumerIteratorImpl {
 }
 
 impl ConsumerIteratorImpl {
+  /// Build an iterator from explicit runtime config and backend dependencies.
   pub async fn from_runtime_config(
     runtime: &ConsumerRuntimeConfig,
     blob_store: Arc<dyn BlobStore>,

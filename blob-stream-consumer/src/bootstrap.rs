@@ -36,10 +36,15 @@ use std::sync::Arc;
 //
 
 #[derive(Clone, Debug)]
+/// Strongly typed bootstrap configuration for building a consumer iterator.
 pub struct ConsumerBootstrapConfig {
+  /// Runtime consumer read and group settings.
   pub runtime: ConsumerRuntimeConfig,
+  /// Topic metadata used to derive partition space.
   pub topic: TopicConfig,
+  /// Blob storage backend configuration.
   pub blob_store: BlobStoreConfig,
+  /// Metadata/coordination backend configuration.
   pub metadata_store: MetadataStoreConfig,
 }
 
@@ -47,9 +52,11 @@ pub struct ConsumerBootstrapConfig {
 // ConsumerConfigFactory
 //
 
+/// Factory for constructing ready-to-run consumer iterators.
 pub struct ConsumerConfigFactory;
 
 impl ConsumerConfigFactory {
+  /// Build an iterator from typed bootstrap configuration.
   pub async fn build_iterator(
     config: ConsumerBootstrapConfig,
     metrics_scope: Scope,
@@ -57,6 +64,7 @@ impl ConsumerConfigFactory {
     ConsumerIteratorImpl::from_bootstrap_config(config, metrics_scope).await
   }
 
+  /// Build an iterator directly from protobuf bootstrap configuration.
   pub async fn build_iterator_from_proto_config(
     config: ConsumerIteratorBootstrapConfig,
     metrics_scope: Scope,
@@ -67,6 +75,7 @@ impl ConsumerConfigFactory {
 }
 
 impl ConsumerBootstrapConfig {
+  /// Build a typed bootstrap configuration.
   #[must_use]
   pub fn new(
     runtime: ConsumerRuntimeConfig,
@@ -82,6 +91,7 @@ impl ConsumerBootstrapConfig {
     }
   }
 
+  /// Convert protobuf bootstrap configuration into typed configuration.
   pub fn from_proto_config(config: &ConsumerIteratorBootstrapConfig) -> Result<Self> {
     let runtime = config
       .runtime
@@ -289,6 +299,7 @@ async fn build_metadata_and_coordination_stores(
   Err(anyhow!("metadata_store backend not configured"))
 }
 
+/// Dynamic coordination source backed by membership-store liveness entries.
 pub struct MembershipCoordinationSource {
   topic: String,
   group_id: String,
@@ -298,6 +309,7 @@ pub struct MembershipCoordinationSource {
 }
 
 impl MembershipCoordinationSource {
+  /// Create a membership-backed coordination source.
   #[must_use]
   pub fn new(
     topic: String,

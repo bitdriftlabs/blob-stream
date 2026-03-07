@@ -1,3 +1,5 @@
+//! Metadata and lease-store abstractions with in-memory and Dynamo backends.
+
 #[cfg(test)]
 #[path = "./metadata_store_test.rs"]
 mod tests;
@@ -39,20 +41,32 @@ pub use producer_partition_leases_memory::InMemoryProducerPartitionLeaseStore;
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Metadata index row for one flushed segment blob.
 pub struct SegmentMetadata {
+  /// Topic + time window key.
   pub window: TopicWindowKey,
+  /// Snowflake id for segment ordering.
   pub snowflake_id: SnowflakeId,
+  /// Blob key containing this segment.
   pub blob_key: BlobKey,
+  /// Per-partition batch index for byte-range and sequence lookups.
   pub segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
+  /// Segment compression settings.
   pub compression: Compression,
+  /// Total record count in this segment.
   pub record_count: u64,
+  /// Minimum event timestamp in milliseconds.
   pub min_event_ts_ms: i64,
+  /// Maximum event timestamp in milliseconds.
   pub max_event_ts_ms: i64,
+  /// Optional integrity checksum.
   pub checksum: Option<String>,
+  /// Creation timestamp in milliseconds.
   pub created_ts_ms: i64,
 }
 
 impl SegmentMetadata {
+  /// Build a segment metadata value.
   #[must_use]
   pub fn new(
     window: TopicWindowKey,
@@ -81,11 +95,13 @@ impl SegmentMetadata {
   }
 
   #[must_use]
+  /// Partition key used by Dynamo schema (`topic#window_start`).
   pub fn partition_key(&self) -> String {
     self.window.format()
   }
 
   #[must_use]
+  /// Lexicographic sort key for snowflake id.
   pub fn snowflake_key(&self) -> String {
     self.snowflake_id.format_lex()
   }
@@ -97,6 +113,7 @@ impl SegmentMetadata {
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
+/// Segment metadata index store.
 pub trait MetadataStore: Send + Sync {
   /// Persist metadata for a flushed segment.
   async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()>;
@@ -116,14 +133,19 @@ pub trait MetadataStore: Send + Sync {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Producer lease key scoped by topic, writer id, and virtual partition.
 pub struct ProducerPartitionLeaseKey {
+  /// Topic name.
   pub topic: String,
+  /// Producer writer id.
   pub writer_id: u32,
+  /// Virtual partition id.
   pub virtual_partition_id: VirtualPartitionId,
 }
 
 impl ProducerPartitionLeaseKey {
   #[must_use]
+  /// Format as `"{topic}#{writer_id}#{virtual_partition_id}"`.
   pub fn format(&self) -> String {
     format!(
       "{}#{}#{}",
@@ -137,10 +159,15 @@ impl ProducerPartitionLeaseKey {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Producer lease row.
 pub struct ProducerPartitionLease {
+  /// Lease key.
   pub key: ProducerPartitionLeaseKey,
+  /// Current holder id.
   pub holder_id: String,
+  /// Lease expiration timestamp in milliseconds.
   pub lease_expiration_ts_ms: i64,
+  /// High watermark for allocated sequence numbers.
   pub max_allocated_seq: Option<u64>,
 }
 
@@ -149,8 +176,11 @@ pub struct ProducerPartitionLease {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Successful sequence reservation and resulting lease state.
 pub struct SequenceReservation {
+  /// Reserved inclusive sequence range.
   pub range: SeqRange,
+  /// Lease state used to reserve the range.
   pub lease: ProducerPartitionLease,
 }
 
@@ -159,6 +189,7 @@ pub struct SequenceReservation {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Result of acquiring a producer lease.
 pub enum LeaseAcquireOutcome {
   Acquired(ProducerPartitionLease),
   HeldByOther(ProducerPartitionLease),
@@ -169,6 +200,7 @@ pub enum LeaseAcquireOutcome {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Result of heartbeating a producer lease.
 pub enum LeaseHeartbeatOutcome {
   Renewed(ProducerPartitionLease),
   HeldByOther(ProducerPartitionLease),
@@ -180,6 +212,7 @@ pub enum LeaseHeartbeatOutcome {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Result of reserving producer sequence numbers.
 pub enum SequenceReservationOutcome {
   Reserved(SequenceReservation),
   HeldByOther(ProducerPartitionLease),
@@ -191,6 +224,7 @@ pub enum SequenceReservationOutcome {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Result of releasing a producer lease.
 pub enum LeaseReleaseOutcome {
   Released,
   HeldByOther(ProducerPartitionLease),
@@ -203,6 +237,7 @@ pub enum LeaseReleaseOutcome {
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
+/// Lease store for producer writer fencing and sequence reservation.
 pub trait ProducerPartitionLeaseStore: Send + Sync {
   /// Acquire or renew a producer partition lease.
   async fn acquire_lease(
@@ -245,19 +280,25 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Consumer-group lease key scoped by topic, group id, and virtual partition.
 pub struct ConsumerGroupLeaseKey {
+  /// Topic name.
   pub topic: String,
+  /// Consumer group id.
   pub group_id: String,
+  /// Virtual partition id.
   pub virtual_partition_id: VirtualPartitionId,
 }
 
 impl ConsumerGroupLeaseKey {
   #[must_use]
+  /// Partition key used by Dynamo schema (`topic#group_id`).
   pub fn partition_key(&self) -> String {
     format!("{}#{}", self.topic, self.group_id)
   }
 
   #[must_use]
+  /// Sort key used by Dynamo schema (virtual partition id string).
   pub fn sort_key(&self) -> String {
     self.virtual_partition_id.to_string()
   }
@@ -268,13 +309,21 @@ impl ConsumerGroupLeaseKey {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Consumer-group lease row.
 pub struct ConsumerGroupLease {
+  /// Lease key.
   pub key: ConsumerGroupLeaseKey,
+  /// Owner member id.
   pub owner_id: String,
+  /// Assignment generation fence.
   pub generation: u64,
+  /// Lease expiration timestamp in milliseconds.
   pub lease_expiration_ts_ms: i64,
+  /// Last heartbeat timestamp in milliseconds.
   pub last_heartbeat_ts_ms: i64,
+  /// Last committed cursor.
   pub committed_cursor: Option<CommittedCursor>,
+  /// Timestamp for committed cursor in milliseconds.
   pub committed_ts_ms: Option<i64>,
 }
 
@@ -283,6 +332,7 @@ pub struct ConsumerGroupLease {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Result of assigning a consumer partition lease.
 pub enum ConsumerGroupAssignmentOutcome {
   Assigned(ConsumerGroupLease),
   HeldByOther(ConsumerGroupLease),
@@ -293,6 +343,7 @@ pub enum ConsumerGroupAssignmentOutcome {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Result of heartbeating a consumer partition lease.
 pub enum ConsumerGroupHeartbeatOutcome {
   Renewed(ConsumerGroupLease),
   HeldByOther(ConsumerGroupLease),
@@ -304,6 +355,7 @@ pub enum ConsumerGroupHeartbeatOutcome {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Result of committing a cursor for a consumer partition lease.
 pub enum ConsumerGroupCommitOutcome {
   Committed(ConsumerGroupLease),
   HeldByOther(ConsumerGroupLease),
@@ -315,6 +367,7 @@ pub enum ConsumerGroupCommitOutcome {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Result of releasing a consumer partition lease.
 pub enum ConsumerGroupReleaseOutcome {
   Released,
   HeldByOther(ConsumerGroupLease),
@@ -327,6 +380,7 @@ pub enum ConsumerGroupReleaseOutcome {
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
+/// Lease store used by consumer-group coordination and commits.
 pub trait ConsumerGroupLeaseStore: Send + Sync {
   /// Assign ownership of a virtual partition lease.
   async fn assign_partition(
@@ -375,6 +429,7 @@ pub trait ConsumerGroupLeaseStore: Send + Sync {
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
+/// Membership liveness store used by dynamic group coordination.
 pub trait ConsumerGroupMembershipStore: Send + Sync {
   /// Register member liveness for this consumer group.
   async fn register_member(

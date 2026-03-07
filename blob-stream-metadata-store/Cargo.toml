@@ -5,7 +5,7 @@ publish = false
 version = "0.1.0"
 
 [lib]
-doctest = false
+doctest = true
 
 [dependencies]
 anyhow.workspace            = true

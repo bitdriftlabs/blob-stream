@@ -1,7 +1,7 @@
 use crate::test_framework::event_log::TestEventLog;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use blob_stream::write::{WriteEngine, WriteError, WriteRequest};
+use blob_stream_broker::write::{WriteEngine, WriteError, WriteRequest};
 use blob_stream_broker_discovery::BrokerNode;
 use blob_stream_producer::BrokerTransport as ProducerBrokerTransport;
 use blob_stream_proto::protos::blobstream::v1::broker::{

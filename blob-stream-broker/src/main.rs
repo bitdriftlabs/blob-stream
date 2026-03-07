@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use bd_panic::PanicType;
-use blob_stream::config::load_runtime_config;
-use blob_stream::grpc::make_broker_router;
-use blob_stream::metrics::BrokerMetrics;
-use blob_stream::write::build_write_engine;
+use blob_stream_broker::config::load_runtime_config;
+use blob_stream_broker::grpc::make_broker_router;
+use blob_stream_broker::metrics::BrokerMetrics;
+use blob_stream_broker::write::build_write_engine;
 use clap::Parser;
 use log::info;
 use std::net::SocketAddr;

@@ -67,8 +67,11 @@ use std::sync::Arc;
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Heartbeat result summarizing renewed and fenced partitions.
 pub struct HeartbeatReport {
+  /// Partitions successfully renewed for this member/generation.
   pub renewed_partitions: Vec<VirtualPartitionId>,
+  /// Partitions lost due to fencing or lease expiry.
   pub fenced_partitions: Vec<VirtualPartitionId>,
 }
 
@@ -77,8 +80,11 @@ pub struct HeartbeatReport {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Rebalance result containing owned partitions and recovered committed cursors.
 pub struct RebalanceReport {
+  /// Partitions currently owned after rebalance.
   pub owned_partitions: Vec<VirtualPartitionId>,
+  /// Last committed cursor per owned partition, when present in lease store.
   pub committed_cursors: HashMap<VirtualPartitionId, u64>,
 }
 
@@ -87,7 +93,9 @@ pub struct RebalanceReport {
 //
 
 #[async_trait]
+/// Consumer-group coordinator interface over a lease-backed ownership store.
 pub trait ConsumerGroupCoordinator: Send {
+  /// Compute and apply ownership for current members and partition set.
   async fn rebalance(
     &mut self,
     members: Vec<String>,
@@ -95,15 +103,19 @@ pub trait ConsumerGroupCoordinator: Send {
     now_ts_ms: i64,
   ) -> Result<RebalanceReport>;
 
+  /// Heartbeat currently owned partitions and optionally commit cursors.
   async fn heartbeat_and_commit(
     &mut self,
     now_ts_ms: i64,
     cursors: &HashMap<VirtualPartitionId, u64>,
   ) -> Result<HeartbeatReport>;
 
+  /// Release all owned partitions (best-effort), usually during shutdown.
   async fn release_owned(&mut self, now_ts_ms: i64) -> Result<Vec<VirtualPartitionId>>;
 
+  /// Return current coordinator generation.
   fn generation(&self) -> u64;
+  /// Return locally owned partitions.
   fn owned_partitions(&self) -> Vec<VirtualPartitionId>;
 }
 
@@ -111,6 +123,7 @@ pub trait ConsumerGroupCoordinator: Send {
 // ConsumerGroupCoordinatorImpl
 //
 
+/// Default lease-store-backed coordinator implementation.
 pub struct ConsumerGroupCoordinatorImpl {
   config: ConsumerGroupConfig,
   lease_store: Arc<dyn ConsumerGroupLeaseStore>,
@@ -120,6 +133,7 @@ pub struct ConsumerGroupCoordinatorImpl {
 }
 
 impl ConsumerGroupCoordinatorImpl {
+  /// Create a coordinator from group configuration and lease store backend.
   pub fn new(
     config: ConsumerGroupConfig,
     lease_store: Arc<dyn ConsumerGroupLeaseStore>,
@@ -334,6 +348,9 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
 
 #[must_use]
 #[allow(clippy::implicit_hasher)]
+/// Compute a cooperative sticky assignment.
+///
+/// The result maps each partition to an owner member id.
 pub fn cooperative_sticky_assignment(
   members: &[String],
   partitions: &[VirtualPartitionId],

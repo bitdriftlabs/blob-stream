@@ -1,3 +1,5 @@
+//! Shared domain and wire/storage helper types for `blob-stream`.
+
 #[cfg(test)]
 #[path = "./types_test.rs"]
 mod tests;
@@ -8,19 +10,23 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+/// Identifier of a virtual partition (`logical_partition + writer_offset`).
 pub type VirtualPartitionId = u32;
 
 #[must_use]
+/// Return current Unix time in milliseconds.
 pub fn now_unix_millis() -> i64 {
   SystemTimeProvider.now().unix_timestamp_ms()
 }
 
 #[must_use]
+/// Return current Unix time in seconds.
 pub fn now_unix_seconds() -> i64 {
   SystemTimeProvider.now().unix_timestamp()
 }
 
 #[must_use]
+/// Compute logical partition from a record key and partition count.
 pub fn logical_partition_for_key(record_key: &[u8], partition_count: u32) -> u32 {
   let mut hasher = DefaultHasher::new();
   record_key.hash(&mut hasher);
@@ -29,6 +35,7 @@ pub fn logical_partition_for_key(record_key: &[u8], partition_count: u32) -> u32
 }
 
 #[must_use]
+/// Map a logical partition id to virtual partition id using writer id.
 pub fn virtual_partition_for_logical(
   logical_partition_id: u32,
   partition_count: u32,
@@ -38,6 +45,7 @@ pub fn virtual_partition_for_logical(
 }
 
 #[must_use]
+/// Compute virtual partition directly from record key.
 pub fn virtual_partition_for_key(
   record_key: &[u8],
   partition_count: u32,
@@ -52,12 +60,16 @@ pub fn virtual_partition_for_key(
 //
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A single user record payload with event time.
 pub struct Record {
+  /// Opaque payload bytes.
   pub payload: Vec<u8>,
+  /// Event time in Unix milliseconds.
   pub event_ts_ms: i64,
 }
 
 impl Record {
+  /// Build a `Record`.
   #[must_use]
   pub fn new(payload: Vec<u8>, event_ts_ms: i64) -> Self {
     Self {
@@ -72,12 +84,16 @@ impl Record {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Batch of records for a single virtual partition.
 pub struct RecordBatch {
+  /// Owning virtual partition id.
   pub virtual_partition_id: VirtualPartitionId,
+  /// Batch records.
   pub records: Vec<Record>,
 }
 
 impl RecordBatch {
+  /// Build a `RecordBatch`.
   #[must_use]
   pub fn new(virtual_partition_id: VirtualPartitionId, records: Vec<Record>) -> Self {
     Self {
@@ -87,6 +103,7 @@ impl RecordBatch {
   }
 
   #[must_use]
+  /// Summarize record count, payload bytes, and event-time bounds for this batch.
   pub fn summary(&self) -> Option<BatchSummary> {
     let mut iter = self.records.iter();
     let first = iter.next()?;
@@ -116,10 +133,15 @@ impl RecordBatch {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Aggregate statistics for a `RecordBatch`.
 pub struct BatchSummary {
+  /// Number of records in the batch.
   pub record_count: u32,
+  /// Total payload bytes across all records.
   pub payload_bytes: u64,
+  /// Minimum event timestamp in milliseconds.
   pub min_event_ts_ms: i64,
+  /// Maximum event timestamp in milliseconds.
   pub max_event_ts_ms: i64,
 }
 
@@ -128,18 +150,23 @@ pub struct BatchSummary {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Inclusive sequence range.
 pub struct SeqRange {
+  /// Inclusive start sequence.
   pub start: u64,
+  /// Inclusive end sequence.
   pub end: u64,
 }
 
 impl SeqRange {
   #[must_use]
+  /// Number of sequence values in the range.
   pub fn len(&self) -> u64 {
     self.end.saturating_sub(self.start).saturating_add(1)
   }
 
   #[must_use]
+  /// Whether the range is empty (`end < start`).
   pub fn is_empty(&self) -> bool {
     self.end < self.start
   }
@@ -150,8 +177,11 @@ impl SeqRange {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Committed cursor for one virtual partition.
 pub struct CommittedCursor {
+  /// Virtual partition id.
   pub virtual_partition_id: VirtualPartitionId,
+  /// Highest fully processed sequence.
   pub seq_end: u64,
 }
 
@@ -160,6 +190,7 @@ pub struct CommittedCursor {
 //
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Compression codec enum for stored batches.
 pub enum CompressionCodec {
   None,
   Zstd,
@@ -170,13 +201,17 @@ pub enum CompressionCodec {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Compression settings for a stored batch.
 pub struct Compression {
+  /// Compression codec.
   pub codec: CompressionCodec,
+  /// Optional codec level.
   pub level: Option<i32>,
 }
 
 impl Compression {
   #[must_use]
+  /// Compression disabled.
   pub fn none() -> Self {
     Self {
       codec: CompressionCodec::None,
@@ -185,6 +220,7 @@ impl Compression {
   }
 
   #[must_use]
+  /// Zstd compression with explicit level.
   pub fn zstd(level: i32) -> Self {
     Self {
       codec: CompressionCodec::Zstd,
@@ -198,10 +234,15 @@ impl Compression {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Metadata describing a batch location inside a segment blob.
 pub struct BatchMetadata {
+  /// Sequence interval covered by the batch.
   pub seq_range: SeqRange,
+  /// Byte range in the segment blob.
   pub byte_range: ByteRange,
+  /// Batch-level summary fields.
   pub summary: BatchSummary,
+  /// Stored compression settings.
   pub compression: Compression,
 }
 
@@ -210,13 +251,17 @@ pub struct BatchMetadata {
 //
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Fixed-size time window.
 pub struct Window {
+  /// Window start Unix timestamp in seconds.
   pub start_unix_seconds: i64,
+  /// Window size in seconds.
   pub size_seconds: i64,
 }
 
 impl Window {
   #[must_use]
+  /// Compute the aligned window for a timestamp.
   pub fn for_timestamp(unix_seconds: i64, size_seconds: i64) -> Self {
     let start_unix_seconds = unix_seconds.div_euclid(size_seconds) * size_seconds;
     Self {
@@ -226,6 +271,7 @@ impl Window {
   }
 
   #[must_use]
+  /// Build a topic-window key using this window start.
   pub fn key(self, topic: impl Into<String>) -> TopicWindowKey {
     TopicWindowKey {
       topic: topic.into(),
@@ -239,13 +285,17 @@ impl Window {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Compound key for topic + window start.
 pub struct TopicWindowKey {
+  /// Topic name.
   pub topic: String,
+  /// Window start Unix timestamp in seconds.
   pub window_start_unix_seconds: i64,
 }
 
 impl TopicWindowKey {
   #[must_use]
+  /// Format as `"{topic}#{window_start_unix_seconds}"`.
   pub fn format(&self) -> String {
     format!("{}#{}", self.topic, self.window_start_unix_seconds)
   }
@@ -256,15 +306,18 @@ impl TopicWindowKey {
 //
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// Monotonic sortable id used for segment ordering.
 pub struct SnowflakeId(pub u64);
 
 impl SnowflakeId {
   #[must_use]
+  /// Access raw numeric id.
   pub fn as_u64(self) -> u64 {
     self.0
   }
 
   #[must_use]
+  /// Lexicographically sortable fixed-width decimal representation.
   pub fn format_lex(self) -> String {
     format!("{:020}", self.0)
   }

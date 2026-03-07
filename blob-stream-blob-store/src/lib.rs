@@ -1,3 +1,5 @@
+//! Blob storage abstraction and built-in backends.
+
 #[cfg(test)]
 #[path = "./blob_store_test.rs"]
 mod tests;
@@ -18,15 +20,18 @@ pub use s3::S3BlobStore;
 //
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Logical blob object key.
 pub struct BlobKey(String);
 
 impl BlobKey {
+  /// Build a new blob key.
   #[must_use]
   pub fn new(key: impl Into<String>) -> Self {
     Self(key.into())
   }
 
   #[must_use]
+  /// Borrow key as `&str`.
   pub fn as_str(&self) -> &str {
     &self.0
   }
@@ -49,18 +54,23 @@ impl From<&str> for BlobKey {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Half-open byte range `[start, end)`.
 pub struct ByteRange {
+  /// Inclusive start offset.
   pub start: u64,
+  /// Exclusive end offset.
   pub end: u64,
 }
 
 impl ByteRange {
   #[must_use]
+  /// Byte length of the range.
   pub fn len(&self) -> u64 {
     self.end.saturating_sub(self.start)
   }
 
   #[must_use]
+  /// Whether `start >= end`.
   pub fn is_empty(&self) -> bool {
     self.end <= self.start
   }
@@ -72,6 +82,7 @@ impl ByteRange {
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
+/// Blob store interface used by broker and consumer paths.
 pub trait BlobStore: Send + Sync {
   /// Write the full blob payload for a key.
   async fn put(&self, key: &BlobKey, payload: Bytes) -> Result<()>;

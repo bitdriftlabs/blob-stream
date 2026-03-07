@@ -86,14 +86,20 @@ impl ProducerMetrics {
 //
 
 #[derive(Clone, Debug)]
+/// A single producer input record.
 pub struct ProducerRecord {
+  /// Target topic name.
   pub topic: String,
+  /// Partitioning key used to derive logical and virtual partition assignment.
   pub record_key: Vec<u8>,
+  /// Opaque payload bytes.
   pub payload: Vec<u8>,
+  /// Event time in Unix milliseconds.
   pub event_ts_ms: i64,
 }
 
 impl ProducerRecord {
+  /// Build a producer record.
   #[must_use]
   pub fn new(
     topic: impl Into<String>,
@@ -115,9 +121,13 @@ impl ProducerRecord {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Acknowledgement returned from a successful `produce` call.
 pub struct ProducerAck {
+  /// Topic that accepted the record.
   pub topic: String,
+  /// Virtual partition selected for this record.
   pub virtual_partition_id: VirtualPartitionId,
+  /// Number of attempts used (1 means no retry).
   pub attempts: u32,
 }
 
@@ -126,6 +136,7 @@ pub struct ProducerAck {
 //
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
+/// Producer-specific error variants.
 pub enum ProducerError {
   #[error("unknown topic: {0}")]
   UnknownTopic(String),
@@ -144,8 +155,11 @@ pub enum ProducerError {
 //
 
 #[async_trait]
+/// High-level producer interface.
 pub trait ProducerClient: Send + Sync {
+  /// Enqueue a record and wait for broker acknowledgement.
   async fn produce(&self, record: ProducerRecord) -> Result<ProducerAck, ProducerError>;
+  /// Flush any buffered records for all topics/partitions.
   async fn flush(&self) -> Result<(), ProducerError>;
 }
 
@@ -154,7 +168,9 @@ pub trait ProducerClient: Send + Sync {
 //
 
 #[async_trait]
+/// Transport abstraction used to send produce RPCs.
 pub trait BrokerTransport: Send + Sync {
+  /// Send a pre-built produce batch request to a specific broker address.
   async fn produce_batch(
     &self,
     broker_address: &str,
@@ -166,11 +182,13 @@ pub trait BrokerTransport: Send + Sync {
 // GrpcBrokerTransport
 //
 
+/// Default gRPC transport implementation used by `ProducerClientImpl`.
 pub struct GrpcBrokerTransport {
   config: ProducerConfig,
 }
 
 impl GrpcBrokerTransport {
+  /// Create a transport from producer configuration.
   #[must_use]
   pub fn new(config: ProducerConfig) -> Self {
     Self { config }
@@ -213,6 +231,7 @@ impl BrokerTransport for GrpcBrokerTransport {
 // ProducerClientImpl
 //
 
+/// Default producer implementation with discovery, batching, and retry handling.
 pub struct ProducerClientImpl {
   config: ProducerConfig,
   topics: HashMap<String, ProducerTopicConfig>,
@@ -224,6 +243,7 @@ pub struct ProducerClientImpl {
 }
 
 impl ProducerClientImpl {
+  /// Construct a producer from explicit dependencies using default gRPC transport.
   pub async fn new(
     config: ProducerConfig,
     topics: Vec<ProducerTopicConfig>,
@@ -234,6 +254,7 @@ impl ProducerClientImpl {
     Self::new_with_transport(config, topics, discovery, transport, metrics_scope).await
   }
 
+  /// Construct a producer directly from protobuf runtime config.
   pub async fn from_runtime_config(
     runtime: ProducerRuntimeConfig,
     metrics_scope: Scope,
@@ -255,6 +276,7 @@ impl ProducerClientImpl {
     Self::new_with_transport(producer, topics, discovery, transport, metrics_scope).await
   }
 
+  /// Construct a producer with a caller-provided transport.
   pub async fn new_with_transport(
     config: ProducerConfig,
     topics: Vec<ProducerTopicConfig>,
@@ -265,6 +287,7 @@ impl ProducerClientImpl {
     Self::new_with_transport_and_scope(config, topics, discovery, transport, metrics_scope).await
   }
 
+  /// Construct a producer with caller-provided transport and metrics scope.
   pub async fn new_with_transport_and_scope(
     config: ProducerConfig,
     topics: Vec<ProducerTopicConfig>,

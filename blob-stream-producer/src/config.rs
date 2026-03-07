@@ -25,7 +25,9 @@ const DEFAULT_CONNECT_TIMEOUT_MS: i64 = 2_000;
 const DEFAULT_REQUEST_TIMEOUT_MS: i64 = 5_000;
 const DEFAULT_MAX_REQUEST_CONCURRENCY: u64 = 64;
 
+/// Topic configuration message used by the producer runtime config.
 pub type ProducerTopicConfig = TopicConfig;
+/// Broker discovery configuration used by the producer runtime config.
 pub type ProducerDiscoveryConfig = BrokerDiscoveryConfig;
 
 #[must_use]

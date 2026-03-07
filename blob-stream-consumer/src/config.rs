@@ -22,6 +22,7 @@ const DEFAULT_REBALANCE_INTERVAL_MS: i64 = 10_000;
 //
 
 #[must_use]
+/// Return the configured read window size in seconds, applying defaults when omitted.
 pub fn consumer_window_size_seconds(config: &ConsumerReadConfig) -> i64 {
   config
     .window_size_seconds
@@ -29,11 +30,13 @@ pub fn consumer_window_size_seconds(config: &ConsumerReadConfig) -> i64 {
 }
 
 #[must_use]
+/// Return the number of trailing windows scanned on each read, applying defaults.
 pub fn consumer_lookback_windows(config: &ConsumerReadConfig) -> u32 {
   config.lookback_windows.unwrap_or(DEFAULT_LOOKBACK_WINDOWS)
 }
 
 #[must_use]
+/// Return the base idle poll delay in milliseconds, applying defaults.
 pub fn consumer_idle_poll_delay_ms(config: &ConsumerReadConfig) -> u64 {
   config
     .idle_poll_delay_ms
@@ -41,11 +44,13 @@ pub fn consumer_idle_poll_delay_ms(config: &ConsumerReadConfig) -> u64 {
 }
 
 #[must_use]
+/// Return the optional max idle poll delay used by exponential backoff.
 pub fn consumer_max_idle_poll_delay_ms(config: &ConsumerReadConfig) -> Option<u64> {
   config.max_idle_poll_delay_ms
 }
 
 #[must_use]
+/// Return consumer-group lease duration in milliseconds, applying defaults.
 pub fn consumer_lease_duration_ms(config: &ConsumerGroupConfig) -> i64 {
   config
     .lease_duration_ms
@@ -53,6 +58,7 @@ pub fn consumer_lease_duration_ms(config: &ConsumerGroupConfig) -> i64 {
 }
 
 #[must_use]
+/// Return consumer-group heartbeat interval in milliseconds, applying defaults.
 pub fn consumer_heartbeat_interval_ms(config: &ConsumerGroupConfig) -> i64 {
   config
     .heartbeat_interval_ms
@@ -60,12 +66,14 @@ pub fn consumer_heartbeat_interval_ms(config: &ConsumerGroupConfig) -> i64 {
 }
 
 #[must_use]
+/// Return consumer-group rebalance interval in milliseconds, applying defaults.
 pub fn consumer_rebalance_interval_ms(config: &ConsumerGroupConfig) -> i64 {
   config
     .rebalance_interval_ms
     .unwrap_or(DEFAULT_REBALANCE_INTERVAL_MS)
 }
 
+/// Validate consumer read configuration.
 pub fn validate_read_config(config: &ConsumerReadConfig) -> Result<()> {
   trace!("validating consumer read config: topic={}", config.topic);
   ensure!(
@@ -95,6 +103,7 @@ pub fn validate_read_config(config: &ConsumerReadConfig) -> Result<()> {
   Ok(())
 }
 
+/// Validate consumer group membership/lease configuration.
 pub fn validate_group_config(config: &ConsumerGroupConfig) -> Result<()> {
   trace!(
     "validating consumer group config: topic={}, group_id={}, member_id={}",
@@ -127,6 +136,7 @@ pub fn validate_group_config(config: &ConsumerGroupConfig) -> Result<()> {
   Ok(())
 }
 
+/// Validate full consumer runtime configuration.
 pub fn validate_runtime_config(runtime: &ConsumerRuntimeConfig) -> Result<()> {
   debug!("validating consumer runtime config");
   let read = runtime

@@ -1302,7 +1302,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
-name = "blob-stream"
+name = "blob-stream-blob-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "bytes",
+ "log",
+ "mockall",
+ "serde",
+ "tokio",
+]
+
+[[package]]
+name = "blob-stream-broker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1342,21 +1357,6 @@ dependencies = [
  "tokio",
  "uuid",
  "zstd",
-]
-
-[[package]]
-name = "blob-stream-blob-store"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aws-config",
- "aws-sdk-s3",
- "bytes",
- "log",
- "mockall",
- "serde",
- "tokio",
 ]
 
 [[package]]
@@ -1414,8 +1414,8 @@ dependencies = [
  "axum",
  "bd-server-stats",
  "bd-test-helpers",
- "blob-stream",
  "blob-stream-blob-store",
+ "blob-stream-broker",
  "blob-stream-broker-discovery",
  "blob-stream-consumer",
  "blob-stream-metadata-store",

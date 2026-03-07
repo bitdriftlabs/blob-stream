@@ -1,3 +1,8 @@
+//! Broker discovery abstractions and implementations.
+//!
+//! Use this crate to obtain broker membership snapshots and to map virtual partitions to owners
+//! with rendezvous hashing.
+
 #[cfg(test)]
 #[path = "./lib_test.rs"]
 mod tests;
@@ -17,8 +22,11 @@ use tokio::sync::watch;
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// A single broker node in membership state.
 pub struct BrokerNode {
+  /// Stable broker identity used for rendezvous hashing.
   pub node_id: String,
+  /// Network address used by producer/broker clients.
   pub address: String,
 }
 
@@ -27,11 +35,14 @@ pub struct BrokerNode {
 //
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Current broker membership view.
 pub struct BrokerMembership {
+  /// Known broker nodes.
   pub nodes: Vec<BrokerNode>,
 }
 
 impl BrokerMembership {
+  /// Build a membership set from nodes.
   #[must_use]
   pub fn new(nodes: Vec<BrokerNode>) -> Self {
     Self { nodes }
@@ -43,6 +54,7 @@ impl BrokerMembership {
 //
 
 #[must_use]
+/// Resolve the owner node for a virtual partition using rendezvous hashing.
 pub fn owner_for_partition<'a>(
   topic: &str,
   virtual_partition_id: u32,
@@ -73,6 +85,8 @@ pub fn owner_for_partition<'a>(
 //
 
 #[async_trait]
+/// Discovery source that provides watchable membership updates.
 pub trait BrokerDiscovery: Send + Sync {
+  /// Return a watch receiver seeded with current membership and updated on membership changes.
   async fn watch_membership(&self) -> Result<watch::Receiver<BrokerMembership>>;
 }
