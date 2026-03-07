@@ -130,6 +130,6 @@ async fn proto_bootstrap_rejects_missing_required_message_fields() {
   assert!(
     error
       .to_string()
-      .contains("consumer bootstrap runtime is required")
+      .contains("ConsumerIteratorBootstrapConfig.runtime")
   );
 }

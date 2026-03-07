@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use bd_pgv::proto_validate;
 use blob_stream_proto::protos::blobstream::v1::config::RuntimeConfig;
 use log::{debug, trace};
 use std::fs;
@@ -34,6 +35,7 @@ pub fn decode_runtime_config_str(input: &str, format: ConfigFormat) -> Result<Ru
 
   let config = protobuf_json_mapping::parse_from_str::<RuntimeConfig>(&json_payload)
     .context("failed to decode runtime config from JSON")?;
+  proto_validate::validate(&config).context("runtime config validation failed")?;
   Ok(config)
 }
 

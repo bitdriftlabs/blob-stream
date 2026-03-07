@@ -36,10 +36,6 @@ async fn async_main() -> Result<()> {
     .context("runtime config missing broker config")?;
   let bind_addr = broker_config.bind_addr.to_string();
   let bind_addr = bind_addr.trim().to_string();
-  anyhow::ensure!(
-    !bind_addr.is_empty(),
-    "broker.bind_addr is required in runtime config"
-  );
   let addr: SocketAddr = bind_addr
     .parse()
     .with_context(|| format!("invalid broker.bind_addr: {bind_addr}"))?;

@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow, ensure};
 use bd_grpc::compression::Compression;
+use bd_pgv::proto_validate;
 use blob_stream_broker_discovery::k8s::K8sServiceBrokerDiscovery;
 use blob_stream_broker_discovery::r#static::StaticBrokerDiscovery;
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerNode};
@@ -130,61 +131,13 @@ pub fn compression_as_grpc(compression: ProducerCompression) -> Compression {
 
 pub fn validate_producer_config(config: &ProducerConfig) -> Result<()> {
   trace!("validating producer config");
-  let max_batch_records = producer_max_batch_records(config);
-  let max_batch_bytes = producer_max_batch_bytes(config);
-  let flush_max_delay_ms = producer_flush_max_delay_ms(config);
-  let retry_base_delay_ms = producer_retry_base_delay_ms(config);
-  let retry_max_delay_ms = producer_retry_max_delay_ms(config);
-  let connect_timeout_ms = producer_connect_timeout_ms(config);
-  let request_timeout_ms = producer_request_timeout_ms(config);
-  let max_request_concurrency = producer_max_request_concurrency(config);
-
-  ensure!(
-    max_batch_records > 0,
-    "producer.max_batch_records must be greater than zero"
-  );
-  ensure!(
-    max_batch_bytes > 0,
-    "producer.max_batch_bytes must be greater than zero"
-  );
-  ensure!(
-    flush_max_delay_ms > 0,
-    "producer.flush_max_delay_ms must be greater than zero"
-  );
-  ensure!(
-    retry_base_delay_ms > 0,
-    "producer.retry_base_delay_ms must be greater than zero"
-  );
-  ensure!(
-    retry_max_delay_ms > 0,
-    "producer.retry_max_delay_ms must be greater than zero"
-  );
-  ensure!(
-    connect_timeout_ms > 0,
-    "producer.connect_timeout_ms must be greater than zero"
-  );
-  ensure!(
-    request_timeout_ms > 0,
-    "producer.request_timeout_ms must be greater than zero"
-  );
-  ensure!(
-    max_request_concurrency > 0,
-    "producer.max_request_concurrency must be greater than zero"
-  );
+  proto_validate::validate(config)?;
   Ok(())
 }
 
 pub fn validate_topic_config(topic: &ProducerTopicConfig) -> Result<()> {
   trace!("validating producer topic config: topic={}", topic.name);
-  ensure!(!topic.name.trim().is_empty(), "topic name is required");
-  ensure!(
-    topic.partition_count > 0,
-    "partition_count must be greater than zero"
-  );
-  ensure!(
-    topic.num_writers > 0,
-    "num_writers must be greater than zero"
-  );
+  proto_validate::validate(topic)?;
   Ok(())
 }
 
@@ -193,16 +146,12 @@ pub fn validate_runtime_config(runtime: &ProducerRuntimeConfig) -> Result<()> {
     "validating producer runtime config: topics={}",
     runtime.topics.len()
   );
+  proto_validate::validate(runtime)?;
+
   let producer = runtime
     .producer
     .as_ref()
     .ok_or_else(|| anyhow!("producer config is required"))?;
-  validate_producer_config(producer)?;
-
-  ensure!(
-    !runtime.topics.is_empty(),
-    "at least one topic must be configured"
-  );
 
   let mut names = HashSet::new();
   let writer_id = producer_writer_id(producer);
@@ -230,43 +179,9 @@ pub fn validate_runtime_config(runtime: &ProducerRuntimeConfig) -> Result<()> {
 }
 
 pub fn validate_discovery_config(discovery: &ProducerDiscoveryConfig) -> Result<()> {
-  if discovery.has_static() {
-    trace!("validating producer static discovery config");
-    let static_config = discovery.static_();
-    ensure!(
-      !static_config.nodes.is_empty(),
-      "producer.discovery.static.nodes must not be empty"
-    );
-    for node in &static_config.nodes {
-      ensure!(
-        !node.node_id.trim().is_empty(),
-        "producer.discovery.static.node_id is required"
-      );
-      ensure!(
-        !node.address.trim().is_empty(),
-        "producer.discovery.static.address is required"
-      );
-    }
-    return Ok(());
-  }
-
-  if discovery.has_k8s_service() {
-    trace!("validating producer k8s discovery config");
-    let k8s = discovery.k8s_service();
-    ensure!(
-      !k8s.namespace.trim().is_empty(),
-      "producer.discovery.k8s_service.namespace is required"
-    );
-    ensure!(
-      !k8s.service_name.trim().is_empty(),
-      "producer.discovery.k8s_service.service_name is required"
-    );
-    return Ok(());
-  }
-
-  Err(anyhow!(
-    "producer discovery backend is required (static or k8s_service)"
-  ))
+  trace!("validating producer discovery config");
+  proto_validate::validate(discovery)?;
+  Ok(())
 }
 
 pub fn into_discovery(discovery: &ProducerDiscoveryConfig) -> Result<Arc<dyn BrokerDiscovery>> {

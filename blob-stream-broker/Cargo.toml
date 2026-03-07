@@ -18,6 +18,7 @@ axum.workspace                    = true
 bd-grpc.workspace                 = true
 bd-log.workspace                  = true
 bd-panic.workspace                = true
+bd-pgv.workspace                  = true
 bd-rt.workspace                   = true
 bd-server-stats.workspace         = true
 bd-time.workspace                 = true

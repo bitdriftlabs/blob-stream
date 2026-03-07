@@ -3,6 +3,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
 use aws_types::region::Region;
+use bd_pgv::proto_validate;
 use bd_server_stats::stats::Scope;
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_broker_discovery::k8s::K8sServiceBrokerDiscovery;
@@ -90,15 +91,6 @@ impl WriteConfig {
       config.flush_max_delay_ms = i64::from(broker.flush_max_delay_ms);
     }
 
-    ensure!(
-      config.flush_max_bytes > 0,
-      "broker.flush_max_bytes must be greater than zero"
-    );
-    ensure!(
-      config.flush_max_delay_ms > 0,
-      "broker.flush_max_delay_ms must be greater than zero"
-    );
-
     Ok(config)
   }
 }
@@ -118,15 +110,6 @@ pub struct TopicInfo {
 impl TopicInfo {
   pub fn from_proto(proto: &TopicConfig) -> Result<Self> {
     let name = proto.name.to_string();
-    ensure!(!name.trim().is_empty(), "topic name is required");
-    ensure!(
-      proto.partition_count > 0,
-      "partition_count must be greater than zero"
-    );
-    ensure!(
-      proto.num_writers > 0,
-      "num_writers must be greater than zero"
-    );
 
     Ok(Self {
       name,
@@ -152,6 +135,8 @@ pub async fn build_write_engine(
   metrics_scope: &Scope,
 ) -> Result<Arc<dyn WriteEngine>> {
   trace!("building broker write engine from runtime config");
+  proto_validate::validate(config)?;
+
   let broker = config
     .broker
     .as_ref()
@@ -215,14 +200,6 @@ async fn build_producer_partition_lease_store(
     let table_name =
       dynamo_table_name(dynamo, DynamoTablePurpose::ProducerPartitionLeases).to_string();
     let region = dynamo.region.to_string();
-    ensure!(
-      !table_name.is_empty(),
-      "metadata_store.dynamo.producer_partition_lease_table_name is required"
-    );
-    ensure!(
-      !region.is_empty(),
-      "metadata_store.dynamo.region is required"
-    );
 
     let region_provider = RegionProviderChain::first_try(Some(Region::new(region)));
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(region_provider);
@@ -270,14 +247,6 @@ async fn build_membership_watch(
     if discovery.has_k8s_service() {
       debug!("using k8s service broker discovery backend");
       let k8s = discovery.k8s_service();
-      ensure!(
-        !k8s.namespace.is_empty(),
-        "broker.discovery.k8s_service.namespace is required"
-      );
-      ensure!(
-        !k8s.service_name.is_empty(),
-        "broker.discovery.k8s_service.service_name is required"
-      );
       let discovery =
         K8sServiceBrokerDiscovery::new(k8s.namespace.to_string(), k8s.service_name.to_string());
       return discovery.watch_membership().await;
@@ -318,10 +287,6 @@ fn resolve_node_id(broker: &BrokerConfig) -> Result<String> {
   if let Some(identity) = identity {
     if identity.has_static_id() {
       let value = identity.static_id().to_string();
-      ensure!(
-        !value.trim().is_empty(),
-        "broker.node_identity.static_id is empty"
-      );
       return Ok(value);
     }
 
@@ -354,8 +319,6 @@ async fn build_blob_store(
     let s3 = config.s3();
     let bucket = s3.bucket.to_string();
     let region = s3.region.to_string();
-    ensure!(!bucket.is_empty(), "blob_store.s3.bucket is required");
-    ensure!(!region.is_empty(), "blob_store.s3.region is required");
 
     let region_provider = RegionProviderChain::first_try(Some(Region::new(region)));
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(region_provider);
@@ -393,14 +356,6 @@ async fn build_metadata_store(
     let dynamo = config.dynamo();
     let table_name = dynamo_table_name(dynamo, DynamoTablePurpose::SegmentMetadata).to_string();
     let region = dynamo.region.to_string();
-    ensure!(
-      !table_name.is_empty(),
-      "metadata_store.dynamo.segment_metadata_table_name is required"
-    );
-    ensure!(
-      !region.is_empty(),
-      "metadata_store.dynamo.region is required"
-    );
 
     let region_provider = RegionProviderChain::first_try(Some(Region::new(region)));
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(region_provider);

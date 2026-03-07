@@ -8,6 +8,7 @@ version = "0.1.0"
 doctest = true
 
 [dependencies]
+bd-pgv.workspace   = true
 bytes.workspace    = true
 protobuf.workspace = true
 

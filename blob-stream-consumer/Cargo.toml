@@ -15,6 +15,7 @@ aws-sdk-dynamodb.workspace      = true
 aws-sdk-s3.workspace            = true
 aws-types.workspace             = true
 bd-log.workspace                = true
+bd-pgv.workspace                = true
 bd-server-stats.workspace       = true
 blob-stream-blob-store.path     = "../blob-stream-blob-store"
 blob-stream-metadata-store.path = "../blob-stream-metadata-store"

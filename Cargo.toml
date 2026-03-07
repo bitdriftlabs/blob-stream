@@ -23,6 +23,7 @@ axum                 = { version = "0.8.8", features = ["http2", "macros"] }
 bd-grpc.path         = "../shared-core/bd-grpc"
 bd-log.path          = "../shared-core/bd-log"
 bd-panic.path        = "../shared-core/bd-panic"
+bd-pgv.path          = "../shared-core/bd-pgv"
 bd-rt.path           = "../shared-core/bd-rt"
 bd-server-stats.path = "../shared-core/bd-server-stats"
 bd-test-helpers.path = "../shared-core/bd-test-helpers"

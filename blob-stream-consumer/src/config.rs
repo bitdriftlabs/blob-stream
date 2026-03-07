@@ -3,6 +3,7 @@
 mod tests;
 
 use anyhow::{Result, anyhow, ensure};
+use bd_pgv::proto_validate;
 pub use blob_stream_proto::protos::blobstream::v1::config::{
   ConsumerGroupConfig,
   ConsumerReadConfig,
@@ -76,22 +77,7 @@ pub fn consumer_rebalance_interval_ms(config: &ConsumerGroupConfig) -> i64 {
 /// Validate consumer read configuration.
 pub fn validate_read_config(config: &ConsumerReadConfig) -> Result<()> {
   trace!("validating consumer read config: topic={}", config.topic);
-  ensure!(
-    !config.topic.trim().is_empty(),
-    "consumer topic is required"
-  );
-  ensure!(
-    consumer_window_size_seconds(config) > 0,
-    "consumer.read.window_size_seconds must be greater than zero"
-  );
-  ensure!(
-    consumer_lookback_windows(config) > 0,
-    "consumer.read.lookback_windows must be greater than zero"
-  );
-  ensure!(
-    consumer_idle_poll_delay_ms(config) > 0,
-    "consumer.read.idle_poll_delay_ms must be greater than zero"
-  );
+  proto_validate::validate(config)?;
   if let Some(max_idle_poll_delay_ms) = consumer_max_idle_poll_delay_ms(config) {
     ensure!(
       max_idle_poll_delay_ms >= consumer_idle_poll_delay_ms(config),
@@ -109,47 +95,23 @@ pub fn validate_group_config(config: &ConsumerGroupConfig) -> Result<()> {
     "validating consumer group config: topic={}, group_id={}, member_id={}",
     config.topic, config.group_id, config.member_id
   );
-  ensure!(
-    !config.topic.trim().is_empty(),
-    "consumer group topic is required"
-  );
-  ensure!(
-    !config.group_id.trim().is_empty(),
-    "consumer group id is required"
-  );
-  ensure!(
-    !config.member_id.trim().is_empty(),
-    "consumer member id is required"
-  );
-  ensure!(
-    consumer_lease_duration_ms(config) > 0,
-    "consumer.group.lease_duration_ms must be greater than zero"
-  );
-  ensure!(
-    consumer_heartbeat_interval_ms(config) > 0,
-    "consumer.group.heartbeat_interval_ms must be greater than zero"
-  );
-  ensure!(
-    consumer_rebalance_interval_ms(config) > 0,
-    "consumer.group.rebalance_interval_ms must be greater than zero"
-  );
+  proto_validate::validate(config)?;
   Ok(())
 }
 
 /// Validate full consumer runtime configuration.
 pub fn validate_runtime_config(runtime: &ConsumerRuntimeConfig) -> Result<()> {
   debug!("validating consumer runtime config");
+  proto_validate::validate(runtime)?;
+
   let read = runtime
     .read
     .as_ref()
-    .ok_or_else(|| anyhow!("consumer read config is required"))?;
-  validate_read_config(read)?;
-
+    .ok_or_else(|| anyhow!("consumer runtime validation failed: missing read config"))?;
   let group = runtime
     .group
     .as_ref()
-    .ok_or_else(|| anyhow!("consumer group config is required"))?;
-  validate_group_config(group)?;
+    .ok_or_else(|| anyhow!("consumer runtime validation failed: missing group config"))?;
 
   ensure!(
     read.topic == group.topic,

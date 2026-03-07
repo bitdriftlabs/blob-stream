@@ -1330,6 +1330,7 @@ dependencies = [
  "bd-grpc",
  "bd-log",
  "bd-panic",
+ "bd-pgv",
  "bd-rt",
  "bd-server-stats",
  "bd-time",
@@ -1387,6 +1388,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-types",
  "bd-log",
+ "bd-pgv",
  "bd-server-stats",
  "blob-stream-blob-store",
  "blob-stream-metadata-store",
@@ -1455,6 +1457,7 @@ dependencies = [
  "async-trait",
  "bd-grpc",
  "bd-log",
+ "bd-pgv",
  "bd-server-stats",
  "blob-stream-broker-discovery",
  "blob-stream-proto",
@@ -1470,6 +1473,7 @@ dependencies = [
 name = "blob-stream-proto"
 version = "0.1.0"
 dependencies = [
+ "bd-pgv",
  "bytes",
  "protobuf 4.0.0-alpha.0",
  "protobuf-codegen",

@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
 use aws_types::region::Region;
+use bd_pgv::proto_validate;
 use bd_server_stats::stats::Scope;
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_metadata_store::{
@@ -95,6 +96,8 @@ impl ConsumerBootstrapConfig {
 
   /// Convert protobuf bootstrap configuration into typed configuration.
   pub fn from_proto_config(config: &ConsumerIteratorBootstrapConfig) -> Result<Self> {
+    proto_validate::validate(config)?;
+
     let runtime = config
       .runtime
       .as_ref()
@@ -131,7 +134,9 @@ impl ConsumerIteratorImpl {
     metrics_scope: Scope,
   ) -> Result<Self> {
     validate_runtime_config(&config.runtime)?;
-    validate_topic_config(&config.topic)?;
+    proto_validate::validate(&config.topic)?;
+    proto_validate::validate(&config.blob_store)?;
+    proto_validate::validate(&config.metadata_store)?;
 
     let group = config
       .runtime
@@ -171,22 +176,6 @@ impl ConsumerIteratorImpl {
   }
 }
 
-fn validate_topic_config(topic: &TopicConfig) -> Result<()> {
-  ensure!(
-    !topic.name.trim().is_empty(),
-    "bootstrap topic name is required"
-  );
-  ensure!(
-    topic.partition_count > 0,
-    "bootstrap topic partition_count must be greater than zero"
-  );
-  ensure!(
-    topic.num_writers > 0,
-    "bootstrap topic num_writers must be greater than zero"
-  );
-  Ok(())
-}
-
 fn virtual_partitions_for_topic(topic: &TopicConfig) -> Result<Vec<VirtualPartitionId>> {
   let total = topic.partition_count.saturating_mul(topic.num_writers);
   ensure!(
@@ -206,15 +195,6 @@ async fn build_blob_store(config: &BlobStoreConfig) -> Result<Arc<dyn BlobStore>
     let s3 = config.s3();
     let bucket = s3.bucket.to_string();
     let region = s3.region.to_string();
-
-    ensure!(
-      !bucket.trim().is_empty(),
-      "blob_store.s3.bucket is required"
-    );
-    ensure!(
-      !region.trim().is_empty(),
-      "blob_store.s3.region is required"
-    );
 
     let region_provider = RegionProviderChain::first_try(Some(Region::new(region)));
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(region_provider);
@@ -261,23 +241,6 @@ async fn build_metadata_and_coordination_stores(
     let metadata_table = dynamo.segment_metadata_table_name.to_string();
     let consumer_lease_table = dynamo.consumer_group_lease_table_name.to_string();
     let consumer_membership_table = dynamo.consumer_group_membership_table_name.to_string();
-
-    ensure!(
-      !region.trim().is_empty(),
-      "metadata_store.dynamo.region is required"
-    );
-    ensure!(
-      !metadata_table.trim().is_empty(),
-      "metadata_store.dynamo.segment_metadata_table_name is required"
-    );
-    ensure!(
-      !consumer_lease_table.trim().is_empty(),
-      "metadata_store.dynamo.consumer_group_lease_table_name is required"
-    );
-    ensure!(
-      !consumer_membership_table.trim().is_empty(),
-      "metadata_store.dynamo.consumer_group_membership_table_name is required"
-    );
 
     let region_provider = RegionProviderChain::first_try(Some(Region::new(region)));
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(region_provider);
