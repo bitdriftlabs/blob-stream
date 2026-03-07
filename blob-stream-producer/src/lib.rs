@@ -10,6 +10,7 @@ pub use config::{
   ProducerTopicConfig,
 };
 pub use producer::{
+  BrokerTransport,
   ProducerAck,
   ProducerClient,
   ProducerClientImpl,

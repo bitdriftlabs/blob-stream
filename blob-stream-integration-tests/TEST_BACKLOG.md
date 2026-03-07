@@ -39,3 +39,108 @@ This file tracks end-to-end integration test work items so we can add and valida
 ## Notes
 - Keep scope minimal per item; if extra work appears, add a new row instead of expanding current acceptance criteria.
 - If a test reveals a product bug, link fix PR/commit in `Evidence`.
+
+## Milestone 13 Item 4: Fault Injection Framework Plan
+
+### Framework Design Changes
+1. Add a deterministic integration runtime wrapper in test harness:
+   - `DeterministicTestRuntime` owns virtual clock, seeded RNG, and step-driven task progression.
+   - Replace direct `Instant::now()/sleep` usage in test harness loops with runtime clock APIs.
+   - Provide `advance(ms)` and `run_until(predicate, timeout_ms)` helpers so tests never rely on wall-clock races.
+2. Replace real socket binding (`127.0.0.1:0`) with injectable test transport:
+   - Introduce `BrokerTransport` trait with implementations:
+     - `GrpcTcpTransport` (existing behavior for compatibility).
+     - `InMemoryTestTransport` (deterministic request/response channels).
+   - Add transport hooks in `ClusterHarnessBuilder` so each broker/client path uses the selected transport.
+   - Add per-link fault controls for drop, delay, duplication, reordering, partition, and recovery.
+3. Add deterministic fault wrappers for persistence paths:
+   - Wrap `BlobStore`, `MetadataStore`, `ProducerPartitionLeaseStore`, and `ConsumerGroupLeaseStore` in fault-aware decorators.
+   - Support operation-level faults by method name and key pattern:
+     - fail once / fail N times / fail until cleared
+     - deterministic latency injection
+     - timeout simulation
+     - stale read / delayed visibility (for scans)
+   - Ensure wrappers emit structured events for assertions.
+4. Add scenario scripting primitives to the framework:
+   - `FaultScript` with ordered phases and trigger conditions (`on_call_count`, `on_partition`, `on_time`).
+   - `FaultController` API exposed to tests:
+     - `enable_fault(...)`, `disable_fault(...)`, `clear_all_faults()`
+     - `wait_for_event(...)` with deterministic timeout.
+5. Add deterministic observability for assertions:
+   - Central `TestEventLog` capturing transport operations, store operations, retries, lease ownership changes, and cursor commits.
+   - Assert against event sequences rather than timing-sensitive side effects.
+6. Keep current non-fault integration mode available:
+   - Default builder still supports current behavior for smoke/regression tests.
+   - Fault mode is opt-in through `ClusterHarness::builder(...).fault_injection(...)`.
+
+### Implementation Phases
+1. Phase A: Runtime + transport abstraction skeleton, no faults enabled yet. ✅ done (2026-03-07)
+   - Added `TestRuntime` abstraction (`TokioTestRuntime`, `DeterministicTestRuntime` skeleton).
+   - Added `BrokerTransport` abstraction (`GrpcTcpTransport` default) and wired `ClusterHarness` startup/restart through transport endpoint binding.
+   - Routed harness timing helpers through runtime APIs without changing default behavior.
+2. Phase B: In-memory transport path and scriptable network faults. ✅ done (2026-03-07)
+    - Added `InMemoryTestTransport` with `inmemory://` endpoint binding and direct write-engine routing.
+    - Added scriptable network fault primitives (`NetworkFaultController`, `NetworkFaultRule`, `FaultScriptStep`) covering drop/delay/duplicate/reorder/timeout/partition.
+    - Wired in-memory producer path via `ClusterHarness::create_producer(...)` and transport-provided producer transport injection.
+    - Gate evidence:
+       - `cargo +nightly fmt` -> pass
+       - `cargo clippy --workspace --bins --examples --tests -- -D warnings --no-deps` -> pass
+       - `RUST_LOG=off cargo nextest run -p blob-stream-integration-tests` -> pass (13/13)
+3. Phase C: Store wrappers and scriptable S3/Dynamo fault injection. ✅ done (2026-03-07)
+    - Added `store_faults.rs` fault-aware wrappers for `BlobStore`, `MetadataStore`,
+       `ProducerPartitionLeaseStore`, and `ConsumerGroupLeaseStore`.
+    - Added `StoreFaultController` + rules/scripts supporting fail, delay, timeout, stale reads,
+       delayed visibility, and operation/key-pattern scoping.
+    - Wired `IntegrationResources` to return fault-wrapped store implementations while preserving
+       default no-fault behavior when no rules are configured.
+    - Added structured `StoreFaultEvent` capture APIs on the controller for later assertion usage.
+    - Gate evidence:
+       - `cargo +nightly fmt` -> pass
+       - `cargo clippy -p blob-stream-integration-tests --tests -- -D warnings --no-deps` -> pass
+       - `RUST_LOG=off cargo nextest run -p blob-stream-integration-tests` -> pass (13/13)
+4. Phase D: Deterministic event log + helper assertions. ✅ done (2026-03-07)
+      - Added centralized `event_log.rs` with `TestEventLog`, `TestEventMatcher`,
+         `wait_for_event(...)`, and `assert_event_sequence_contains(...)` helpers.
+      - Wired shared event log into transport and store fault controllers via harness startup.
+      - Added transport/store event emission for operation calls and outcomes, including lease
+         ownership-related outcomes and cursor commit outcomes for deterministic assertions.
+      - Exposed harness-level helpers (`ClusterHarness::wait_for_event`,
+         `ClusterHarness::assert_event_sequence_contains`) for fault tests.
+      - Gate evidence:
+          - `cargo +nightly fmt` -> pass
+          - `cargo clippy -p blob-stream-integration-tests --tests -- -D warnings --no-deps` -> pass
+          - `RUST_LOG=off cargo nextest run -p blob-stream-integration-tests` -> pass (13/13, 2 leaky)
+5. Phase E: Port and stabilize all fault-injection tests below.
+6. Phase F: Cleanup any allow dead code annotations in the framework.
+
+### Per-Phase Exit Gate (Required)
+After every phase, run all of the following before marking the phase complete:
+1. Format per rust instructions
+2. Clippy per rust instructions
+3. Existing integration regression suite:
+   - `RUST_LOG=off cargo nextest run -p blob-stream-integration-tests`
+4. Record pass/fail evidence in this file alongside the completed phase.
+
+## Fault Injection Test Backlog (Deterministic)
+
+These tests should run under the deterministic runtime and test transport only.
+
+| ID | Status | Test Name | Fault Domain | Goal | Acceptance Criteria | Command | Evidence |
+|---|---|---|---|---|---|---|---|
+| FIT-001 | todo | network_drop_produce_retry_no_loss | Transport | Drop first producer->broker request per partition and verify retry path | All produced IDs are eventually consumed; no missing IDs; retries observed in event log | `RUST_LOG=off cargo test -p blob-stream-integration-tests --test fault_injection_test network_drop_produce_retry_no_loss` | |
+| FIT-002 | todo | network_delay_and_reorder_preserves_cursor_monotonicity | Transport | Inject deterministic delay + reorder of produce RPCs | Consumption completes without loss; per-partition cursor monotonicity preserved | `RUST_LOG=off cargo test -p blob-stream-integration-tests --test fault_injection_test network_delay_and_reorder_preserves_cursor_monotonicity` | |
+| FIT-003 | todo | network_partition_active_broker_takeover | Transport | Partition producer from active broker while standby remains reachable | Produce/consume progress resumes after deterministic reroute; final set matches expected | `RUST_LOG=off cargo test -p blob-stream-integration-tests --test fault_injection_test network_partition_active_broker_takeover` | |
+| FIT-004 | todo | broker_response_timeout_retry_budget_respected | Transport | Force timeout responses for bounded attempts | Producer retries up to configured budget; success/failure behavior is deterministic and asserted | `RUST_LOG=off cargo test -p blob-stream-integration-tests --test fault_injection_test broker_response_timeout_retry_budget_respected` | |
+| FIT-005 | todo | s3_put_transient_failures_recover_without_loss | BlobStore (S3 write path) | Fail blob `put` N times before success | Segment metadata eventually committed and all records consumed exactly once from reader perspective | `RUST_LOG=off cargo test -p blob-stream-integration-tests --test fault_injection_test s3_put_transient_failures_recover_without_loss` | |
+| FIT-006 | todo | s3_get_failures_consumer_rescan_recovers | BlobStore (S3 read path) | Inject transient blob `get` failures during consume | Reader eventually catches up via retry/re-scan; no missing IDs | `RUST_LOG=off cargo test -p blob-stream-integration-tests --test fault_injection_test s3_get_failures_consumer_rescan_recovers` | |
+| FIT-007 | todo | metadata_write_fail_then_retry_ack_semantics | MetadataStore (Dynamo write path) | Fail metadata `write_segment` before succeeding | Producer ack must only occur after successful metadata write; no phantom acks | `RUST_LOG=off cargo test -p blob-stream-integration-tests --test fault_injection_test metadata_write_fail_then_retry_ack_semantics` | |
+| FIT-008 | todo | metadata_scan_stale_visibility_no_duplicate_progress | MetadataStore (Dynamo scan path) | Return stale/partial scan windows for deterministic interval | Consumer eventually sees all data; duplicate scans do not regress cursor | `RUST_LOG=off cargo test -p blob-stream-integration-tests --test fault_injection_test metadata_scan_stale_visibility_no_duplicate_progress` | |
+| FIT-009 | todo | producer_lease_store_conflict_then_expiry_takeover | Lease store (producer) | Simulate lease conflicts and expiry-based takeover | Old holder fenced; new holder progresses; no split-write accepted | `RUST_LOG=off cargo test -p blob-stream-integration-tests --test fault_injection_test producer_lease_store_conflict_then_expiry_takeover` | |
+| FIT-010 | todo | consumer_lease_store_heartbeat_failover | Lease store (consumer) | Drop heartbeat commits for active owner until lease expires | Another member takes ownership and full progress is preserved | `RUST_LOG=off cargo test -p blob-stream-integration-tests --test fault_injection_test consumer_lease_store_heartbeat_failover` | |
+| FIT-011 | todo | combined_network_and_metadata_faults_end_to_end | Cross-domain | Combine transport drops with metadata write delays | System converges deterministically; final consumed set equals produced set | `RUST_LOG=off cargo test -p blob-stream-integration-tests --test fault_injection_test combined_network_and_metadata_faults_end_to_end` | |
+| FIT-012 | todo | deterministic_replay_same_seed_same_event_trace | Determinism guarantee | Re-run same scripted scenario with same seed | Event trace and terminal assertions are bit-for-bit equivalent across runs | `RUST_LOG=off cargo test -p blob-stream-integration-tests --test fault_injection_test deterministic_replay_same_seed_same_event_trace` | |
+
+## Fault Injection Notes
+- All FIT-* tests must use in-memory test transport and fault-wrapped stores; no ephemeral port binding.
+- All FIT-* tests must use deterministic runtime controls (virtual time + scripted triggers).
+- Use `RUST_LOG=blob_stream=trace,bd=trace` first during development, then finalize each with `RUST_LOG=off` evidence.

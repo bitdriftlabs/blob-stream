@@ -6,22 +6,45 @@ mod framework;
 use anyhow::{Result, anyhow};
 use blob_stream_broker_discovery::BrokerDiscovery;
 use blob_stream_consumer::{
-  ConsumerIterator, ConsumerIteratorImpl, ConsumerReadConfig, ConsumerReader, ConsumerReaderImpl,
+  ConsumerIterator,
+  ConsumerIteratorImpl,
+  ConsumerReadConfig,
+  ConsumerReader,
+  ConsumerReaderImpl,
   NextResult,
 };
 use blob_stream_metadata_store::{
-  ConsumerGroupAssignmentOutcome, ConsumerGroupCommitOutcome, ConsumerGroupHeartbeatOutcome,
-  ConsumerGroupLeaseKey, MetadataStore, SegmentMetadata,
+  ConsumerGroupAssignmentOutcome,
+  ConsumerGroupCommitOutcome,
+  ConsumerGroupHeartbeatOutcome,
+  ConsumerGroupLeaseKey,
+  MetadataStore,
+  SegmentMetadata,
 };
 use blob_stream_producer::{ProducerClient, ProducerRecord};
 use blob_stream_types::{
-  CommittedCursor, logical_partition_for_key, virtual_partition_for_logical,
+  CommittedCursor,
+  logical_partition_for_key,
+  virtual_partition_for_logical,
 };
 use framework::{
-  ClusterHarness, DynamicCoordinationSource, IntegrationResources, PARTITION_COUNT, SECOND_TOPIC,
-  TOPIC, WINDOW_SIZE_SECONDS, consumer_runtime_config, drain_reader_until, now_unix_seconds,
-  produce_message, produce_message_for_topic, producer_config, producer_config_with_writer_id,
-  producer_topic, producer_topic_named, producer_topic_named_with_writers,
+  ClusterHarness,
+  DynamicCoordinationSource,
+  IntegrationResources,
+  PARTITION_COUNT,
+  SECOND_TOPIC,
+  TOPIC,
+  WINDOW_SIZE_SECONDS,
+  consumer_runtime_config,
+  drain_reader_until,
+  now_unix_seconds,
+  produce_message,
+  produce_message_for_topic,
+  producer_config,
+  producer_config_with_writer_id,
+  producer_topic,
+  producer_topic_named,
+  producer_topic_named_with_writers,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -227,7 +250,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
 
   // Step 2: Create producers and a reader that tracks all virtual partitions.
   let mut producers = Vec::new();
-  for _ in 0..4 {
+  for _ in 0 .. 4 {
     producers.push(
       blob_stream_producer::ProducerClientImpl::new(
         producer_config(8),
@@ -248,7 +271,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
       lookback_windows: Some(20),
       ..Default::default()
     },
-    (0..PARTITION_COUNT).collect(),
+    (0 .. PARTITION_COUNT).collect(),
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
@@ -256,7 +279,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
 
   // Step 3: Produce and drain phase 1 traffic.
   let mut expected_ids = HashSet::new();
-  for message_id in 0..32 {
+  for message_id in 0 .. 32 {
     let id = format!("phase1-{message_id}");
     let producer = &producers[message_id % producers.len()];
     produce_message(
@@ -275,7 +298,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
   // Step 4: Simulate consumer scale-out and assert revocation callback is emitted.
   let coordination = DynamicCoordinationSource::new(
     vec!["consumer-0".to_string(), "consumer-1".to_string()],
-    (0..PARTITION_COUNT).collect(),
+    (0 .. PARTITION_COUNT).collect(),
   );
   let runtime_0 = consumer_runtime_config("consumer-0");
   let runtime_1 = consumer_runtime_config("consumer-1");
@@ -348,7 +371,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
   cluster.set_active_nodes(vec![failover_node.clone()]);
   cluster.remove_broker_by_id(&active_node.node_id).await?;
 
-  for message_id in 0..32 {
+  for message_id in 0 .. 32 {
     let id = format!("phase2-{message_id}");
     let producer = &producers[message_id % producers.len()];
     produce_message(
@@ -367,7 +390,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
       lookback_windows: Some(10),
       ..Default::default()
     },
-    (0..PARTITION_COUNT).collect(),
+    (0 .. PARTITION_COUNT).collect(),
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
@@ -425,7 +448,7 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
       lookback_windows: Some(10),
       ..Default::default()
     },
-    (0..PARTITION_COUNT).collect(),
+    (0 .. PARTITION_COUNT).collect(),
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
@@ -468,7 +491,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
 
   // Step 2: Produce phase 1 records.
   let mut phase1_expected = HashSet::new();
-  for message_id in 0..24 {
+  for message_id in 0 .. 24 {
     let id = format!("restart-phase1-{message_id}");
     produce_message(
       &producer,
@@ -482,7 +505,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
   // Step 3: Consume phase 1 with a group member and commit offsets as batches are processed.
   let coordination = DynamicCoordinationSource::new(
     vec!["consumer-0".to_string()],
-    (0..PARTITION_COUNT).collect(),
+    (0 .. PARTITION_COUNT).collect(),
   );
   let runtime = consumer_runtime_config("consumer-0");
   let blob_store = resources.blob_store();
@@ -537,7 +560,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
   let _ = consumer.shutdown().await;
 
   let mut phase2_expected = HashSet::new();
-  for message_id in 0..24 {
+  for message_id in 0 .. 24 {
     let id = format!("restart-phase2-{message_id}");
     produce_message(
       &producer,
@@ -629,7 +652,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
   // Step 2: Start three iterators and drive active members through 2 -> 3 -> 1.
   let coordination = DynamicCoordinationSource::new(
     vec!["consumer-0".to_string(), "consumer-1".to_string()],
-    (0..PARTITION_COUNT).collect(),
+    (0 .. PARTITION_COUNT).collect(),
   );
 
   let runtime_0 = consumer_runtime_config("consumer-0");
@@ -691,7 +714,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
   let mut consumed_ids = HashSet::new();
   let mut revocation_count = 0usize;
 
-  for message_id in 0..24 {
+  for message_id in 0 .. 24 {
     let id = format!("rebalance-{message_id}");
     produce_message(
       &producer,
@@ -741,7 +764,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
     handle_consumer_event(event, &mut consumed_ids, &mut revocation_count);
   }
 
-  for message_id in 24..48 {
+  for message_id in 24 .. 48 {
     let id = format!("rebalance-{message_id}");
     produce_message(
       &producer,
@@ -792,7 +815,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
     handle_consumer_event(event, &mut consumed_ids, &mut revocation_count);
   }
 
-  for message_id in 48..72 {
+  for message_id in 48 .. 72 {
     let id = format!("rebalance-{message_id}");
     produce_message(
       &producer,
@@ -882,7 +905,7 @@ async fn active_broker_restart_continuity() -> Result<()> {
       lookback_windows: Some(10),
       ..Default::default()
     },
-    (0..PARTITION_COUNT).collect(),
+    (0 .. PARTITION_COUNT).collect(),
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
@@ -894,7 +917,7 @@ async fn active_broker_restart_continuity() -> Result<()> {
   let mut expected_ids = HashSet::new();
   let mut consumed_ids = HashSet::new();
 
-  for message_id in 0..total_messages {
+  for message_id in 0 .. total_messages {
     if message_id == restart_at {
       // Keep routing available while the active node is down, then switch back to restarted node.
       cluster.set_active_nodes(vec![standby_node.clone()]);
@@ -963,7 +986,7 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
       lookback_windows: Some(10),
       ..Default::default()
     },
-    (0..PARTITION_COUNT).collect(),
+    (0 .. PARTITION_COUNT).collect(),
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
@@ -974,7 +997,7 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
   let mut expected_ids = HashSet::new();
   let mut produced_counts_by_partition = HashMap::new();
 
-  for message_id in 0..total_messages {
+  for message_id in 0 .. total_messages {
     let id = format!("seq-monotonic-{message_id}");
     let ack = produce_message(
       &producer,
@@ -1086,7 +1109,7 @@ async fn multi_topic_isolation() -> Result<()> {
       lookback_windows: Some(10),
       ..Default::default()
     },
-    (0..PARTITION_COUNT).collect(),
+    (0 .. PARTITION_COUNT).collect(),
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
@@ -1099,7 +1122,7 @@ async fn multi_topic_isolation() -> Result<()> {
       lookback_windows: Some(10),
       ..Default::default()
     },
-    (0..PARTITION_COUNT).collect(),
+    (0 .. PARTITION_COUNT).collect(),
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
@@ -1110,7 +1133,7 @@ async fn multi_topic_isolation() -> Result<()> {
   let mut topic_a_expected = HashSet::new();
   let mut topic_b_expected = HashSet::new();
 
-  for message_id in 0..total_per_topic {
+  for message_id in 0 .. total_per_topic {
     let topic_a_id = format!("topic-a-{message_id}");
     let topic_b_id = format!("topic-b-{message_id}");
 
@@ -1223,7 +1246,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
       lookback_windows: Some(10),
       ..Default::default()
     },
-    (0..PARTITION_COUNT).collect(),
+    (0 .. PARTITION_COUNT).collect(),
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
@@ -1255,7 +1278,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
 
   // Step 3: Produce concurrent small records on one key to force in-producer batching.
   let mut produce_tasks = Vec::new();
-  for message_id in 0..24 {
+  for message_id in 0 .. 24 {
     let producer = Arc::clone(&producer);
     let payload = format!("batching-{message_id}").into_bytes();
     *expected_payload_counts.entry(payload.clone()).or_insert(0) += 1;
@@ -1358,7 +1381,7 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
       lookback_windows: Some(10),
       ..Default::default()
     },
-    (0..PARTITION_COUNT).collect(),
+    (0 .. PARTITION_COUNT).collect(),
     HashMap::new(),
     resources.blob_store(),
     Arc::clone(&delayed_metadata_store),
@@ -1366,7 +1389,7 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
 
   // Step 2: Produce traffic while metadata remains temporarily invisible to readers.
   let mut expected_ids = HashSet::new();
-  for message_id in 0..24 {
+  for message_id in 0 .. 24 {
     let id = format!("delayed-meta-{message_id}");
     produce_message(
       &producer,
@@ -1615,11 +1638,12 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
   Ok(())
 }
 
-// High-level: verifies multi-writer virtual partitions are merged without loss or cursor regressions.
+// High-level: verifies multi-writer virtual partitions are merged without loss or cursor
+// regressions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
   fn key_for_logical_partition(logical_partition_id: u32) -> Vec<u8> {
-    for candidate in 0_u32..50_000 {
+    for candidate in 0_u32 .. 50_000 {
       let key = format!("logical-key-{logical_partition_id}-{candidate}").into_bytes();
       if logical_partition_for_key(&key, PARTITION_COUNT) == logical_partition_id {
         return key;
@@ -1651,7 +1675,7 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
   )
   .await?;
 
-  let virtual_partition_ids: Vec<u32> = (0..(PARTITION_COUNT * 2)).collect();
+  let virtual_partition_ids: Vec<u32> = (0 .. (PARTITION_COUNT * 2)).collect();
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
@@ -1675,7 +1699,7 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
   for logical_partition_id in logical_partitions {
     let key = key_for_logical_partition(logical_partition_id);
 
-    for sequence in 0..records_per_writer_per_partition {
+    for sequence in 0 .. records_per_writer_per_partition {
       let writer_0_id = format!("mw-w0-l{logical_partition_id}-s{sequence}");
       let writer_1_id = format!("mw-w1-l{logical_partition_id}-s{sequence}");
 
@@ -1787,7 +1811,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
   .await?;
 
   let mut expected_ids = HashSet::new();
-  for message_id in 0..48 {
+  for message_id in 0 .. 48 {
     let id = format!("lease-expiry-{message_id}");
     produce_message(
       &producer,
@@ -1809,7 +1833,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
   .expect("unix millis exceeds i64");
   let stale_lease_duration_ms = 800_i64;
 
-  for partition_id in 0..PARTITION_COUNT {
+  for partition_id in 0 .. PARTITION_COUNT {
     let key = ConsumerGroupLeaseKey {
       topic: TOPIC.to_string(),
       group_id: "integration-group".to_string(),
@@ -1835,7 +1859,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
   // Step 3: Start one live member without any coordination membership updates.
   let coordination = DynamicCoordinationSource::new(
     vec!["consumer-live".to_string()],
-    (0..PARTITION_COUNT).collect(),
+    (0 .. PARTITION_COUNT).collect(),
   );
   let runtime = consumer_runtime_config("consumer-live");
 
