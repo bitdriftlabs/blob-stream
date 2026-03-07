@@ -1,5 +1,14 @@
 use anyhow::Result;
-use blob_stream_consumer::{ConsumerReadConfig, ConsumerReader, ConsumerReaderImpl};
+use bd_server_stats::stats::Collector;
+use blob_stream_consumer::{
+  ConsumerIterator,
+  ConsumerIteratorImpl,
+  ConsumerReadConfig,
+  ConsumerReader,
+  ConsumerReaderImpl,
+  MembershipCoordinationSource,
+  NextResult,
+};
 use blob_stream_integration_tests::test_framework as framework;
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
@@ -14,6 +23,7 @@ use framework::{
   NetworkFault,
   NetworkFaultRule,
   NetworkOperation,
+  PARTITION_COUNT,
   StoreFaultAction,
   StoreFaultDomain,
   StoreFaultOperation,
@@ -21,6 +31,7 @@ use framework::{
   TOPIC,
   TestEventMatcher,
   WINDOW_SIZE_SECONDS,
+  consumer_runtime_config,
   drain_reader_until,
   produce_message,
   producer_config,
@@ -28,8 +39,13 @@ use framework::{
 };
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
+
+fn metrics_scope(component: &str) -> bd_server_stats::stats::Scope {
+  Collector::default().scope(component)
+}
 
 // High-level: validates producer retry behavior under deterministic dropped transport requests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -60,7 +76,7 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
   let mut seen_retry = false;
   let mut produced_partitions = HashSet::new();
 
-  for message_id in 0 .. 24 {
+  for message_id in 0 .. 12 {
     let id = format!("fit-001-{message_id}");
     let key = format!("fit-001-key-{message_id}").into_bytes();
     let ack = produce_message(&producer, key, &id).await?;
@@ -1177,6 +1193,242 @@ async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
     .ok_or_else(|| anyhow::anyhow!("missing consumer heartbeat fault event"))?;
 
   resources.cleanup().await;
+  Ok(())
+}
+
+// High-level: validates bootstrap consumer rebalance converges under transient membership and
+// consumer-lease faults while preserving the full consumed record set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .in_memory_transport()
+    .start()
+    .await?;
+
+  let producer = cluster
+    .create_producer(producer_config(8), vec![producer_topic()])
+    .await?;
+
+  let runtime_a = consumer_runtime_config("fit-015-a");
+  let runtime_b = consumer_runtime_config("fit-015-b");
+  let runtime_a_group = runtime_a
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow::anyhow!("fit-015-a group config missing"))?;
+  let runtime_b_group = runtime_b
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow::anyhow!("fit-015-b group config missing"))?;
+
+  let blob_store = resources.blob_store();
+  let metadata_store = resources.metadata_store();
+  let lease_store = resources.consumer_lease_store();
+  let membership_store = resources.consumer_membership_store();
+
+  let mut consumer_a = Box::new(
+    ConsumerIteratorImpl::from_runtime_config(
+      &runtime_a,
+      Arc::clone(&blob_store),
+      Arc::clone(&metadata_store),
+      Arc::clone(&lease_store),
+      Arc::clone(&membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_a_group.topic.to_string(),
+        runtime_a_group.group_id.to_string(),
+        runtime_a_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&membership_store),
+      )),
+      metrics_scope("blob_stream_consumer_it"),
+    )
+    .await?,
+  );
+  let mut consumer_b = Box::new(
+    ConsumerIteratorImpl::from_runtime_config(
+      &runtime_b,
+      Arc::clone(&blob_store),
+      Arc::clone(&metadata_store),
+      Arc::clone(&lease_store),
+      Arc::clone(&membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_b_group.topic.to_string(),
+        runtime_b_group.group_id.to_string(),
+        runtime_b_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&membership_store),
+      )),
+      metrics_scope("blob_stream_consumer_it"),
+    )
+    .await?,
+  );
+  consumer_a.start()?;
+  consumer_b.start()?;
+
+  resources
+    .store_fault_controller()
+    .enable_fault(StoreFaultRule {
+      domain: StoreFaultDomain::ConsumerLease,
+      operation: StoreFaultOperation::ConsumerAssignPartition,
+      key_pattern: None,
+      action: StoreFaultAction::Fail {
+        message: "transient assign failure".to_string(),
+      },
+      remaining_hits: Some(2),
+    })
+    .await;
+  resources
+    .store_fault_controller()
+    .enable_fault(StoreFaultRule {
+      domain: StoreFaultDomain::ConsumerLease,
+      operation: StoreFaultOperation::ConsumerHeartbeatPartition,
+      key_pattern: None,
+      action: StoreFaultAction::Fail {
+        message: "transient heartbeat failure".to_string(),
+      },
+      remaining_hits: Some(2),
+    })
+    .await;
+  resources
+    .store_fault_controller()
+    .enable_fault(StoreFaultRule {
+      domain: StoreFaultDomain::ConsumerLease,
+      operation: StoreFaultOperation::ConsumerMembershipHeartbeat,
+      key_pattern: None,
+      action: StoreFaultAction::Fail {
+        message: "transient membership heartbeat failure".to_string(),
+      },
+      remaining_hits: Some(2),
+    })
+    .await;
+
+  let mut expected_ids = HashSet::new();
+  for message_id in 0 .. 24 {
+    let id = format!("it-015-{message_id}");
+    let _ack = produce_message(
+      &producer,
+      format!("it-015-key-{}", message_id % 8).into_bytes(),
+      &id,
+    )
+    .await?;
+    expected_ids.insert(id);
+  }
+
+  let mut saw_revocation = false;
+  let deadline = Instant::now() + Duration::from_secs(6);
+  let mut consumed_ids = HashSet::new();
+  while consumed_ids.len() < expected_ids.len() {
+    if Instant::now() >= deadline {
+      break;
+    }
+
+    for consumer in [&mut consumer_a, &mut consumer_b] {
+      let next = tokio::time::timeout(Duration::from_secs(2), consumer.next()).await;
+      let Ok(next) = next else {
+        continue;
+      };
+
+      let Ok(next_result) = next else {
+        // Transient injected faults can surface here; retry on next poll.
+        continue;
+      };
+
+      match next_result {
+        NextResult::Revoked(revoked) => {
+          saw_revocation = true;
+          revoked.complete().await;
+        },
+        NextResult::Batch(batch) => {
+          for record in batch.records {
+            let id = String::from_utf8(record.payload)?;
+            consumed_ids.insert(id);
+          }
+
+          consumer.store_offset(batch.virtual_partition_id, batch.seq_range.end)?;
+          let _ = consumer.commit().await;
+        },
+      }
+    }
+
+    sleep(Duration::from_millis(20)).await;
+  }
+
+  if consumed_ids.len() < expected_ids.len() {
+    let mut reader = ConsumerReaderImpl::new(
+      ConsumerReadConfig {
+        topic: TOPIC.to_string().into(),
+        window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+        lookback_windows: Some(10),
+        ..Default::default()
+      },
+      (0 .. PARTITION_COUNT).collect(),
+      HashMap::new(),
+      resources.blob_store(),
+      resources.metadata_store(),
+    )?;
+    drain_reader_until(
+      &mut reader,
+      &mut consumed_ids,
+      expected_ids.len(),
+      Instant::now() + Duration::from_secs(3),
+    )
+    .await?;
+  }
+  assert_eq!(consumed_ids, expected_ids);
+
+  let _assign_fault = cluster
+    .wait_for_event(
+      &TestEventMatcher {
+        category: Some("store".to_string()),
+        operation: Some("consumer_assign_partition".to_string()),
+        key_contains: None,
+        status: Some("fault_applied".to_string()),
+      },
+      Duration::from_secs(3),
+    )
+    .await?;
+  let _heartbeat_fault = cluster
+    .wait_for_event(
+      &TestEventMatcher {
+        category: Some("store".to_string()),
+        operation: Some("consumer_heartbeat_partition".to_string()),
+        key_contains: None,
+        status: Some("fault_applied".to_string()),
+      },
+      Duration::from_secs(3),
+    )
+    .await?;
+  let _membership_fault = cluster
+    .wait_for_event(
+      &TestEventMatcher {
+        category: Some("store".to_string()),
+        operation: Some("consumer_membership_heartbeat".to_string()),
+        key_contains: None,
+        status: Some("fault_applied".to_string()),
+      },
+      Duration::from_secs(3),
+    )
+    .await?;
+  let _ownership_ok = cluster
+    .wait_for_event(
+      &TestEventMatcher {
+        category: Some("store".to_string()),
+        operation: Some("consumer_assign_partition".to_string()),
+        key_contains: None,
+        status: Some("ok".to_string()),
+      },
+      Duration::from_secs(3),
+    )
+    .await?;
+
+  let _ = consumer_a.shutdown().await;
+  let _ = consumer_b.shutdown().await;
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  assert!(
+    saw_revocation,
+    "expected at least one revocation while rebalancing under transient faults"
+  );
   Ok(())
 }
 

@@ -18,7 +18,7 @@ use aws_sdk_dynamodb::types::{
   ScalarAttributeType,
 };
 use aws_sdk_s3::Client as S3Client;
-use blob_stream_blob_store::{BlobStore, InMemoryBlobStore};
+use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_metadata_store::{
   ConsumerGroupLeaseStore,
   ConsumerGroupMembershipStore,
@@ -119,6 +119,10 @@ impl IntegrationResources {
     ))
   }
 
+  pub fn s3_blob_store(&self) -> Arc<dyn BlobStore> {
+    Arc::new(S3BlobStore::new(self.s3.clone(), self.bucket.clone()))
+  }
+
   pub fn metadata_store(&self) -> Arc<dyn MetadataStore> {
     let inner: Arc<dyn MetadataStore> = Arc::new(DynamoMetadataStore::new(
       self.dynamo.clone(),
@@ -167,6 +171,46 @@ impl IntegrationResources {
 
   pub fn store_fault_controller(&self) -> StoreFaultController {
     self.store_fault_controller.clone()
+  }
+
+  #[must_use]
+  pub fn aws_region(&self) -> &'static str {
+    AWS_REGION
+  }
+
+  #[must_use]
+  pub fn dynamo_endpoint(&self) -> &'static str {
+    DYNAMO_ENDPOINT
+  }
+
+  #[must_use]
+  pub fn s3_endpoint(&self) -> &'static str {
+    S3_ENDPOINT
+  }
+
+  #[must_use]
+  pub fn bucket_name(&self) -> &str {
+    &self.bucket
+  }
+
+  #[must_use]
+  pub fn segment_metadata_table_name(&self) -> &str {
+    &self.metadata_table
+  }
+
+  #[must_use]
+  pub fn producer_lease_table_name(&self) -> &str {
+    &self.producer_lease_table
+  }
+
+  #[must_use]
+  pub fn consumer_lease_table_name(&self) -> &str {
+    &self.consumer_lease_table
+  }
+
+  #[must_use]
+  pub fn consumer_membership_table_name(&self) -> &str {
+    &self.consumer_membership_table
   }
 
   pub async fn cleanup(&self) {

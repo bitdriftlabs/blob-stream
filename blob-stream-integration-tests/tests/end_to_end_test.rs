@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow};
+use bd_server_stats::stats::Collector;
 use blob_stream_broker_discovery::BrokerDiscovery;
 use blob_stream_consumer::{
+  ConsumerConfigFactory,
   ConsumerIterator,
   ConsumerIteratorImpl,
   ConsumerReadConfig,
@@ -22,6 +24,7 @@ use blob_stream_producer::{ProducerClient, ProducerRecord};
 use blob_stream_types::{
   CommittedCursor,
   logical_partition_for_key,
+  now_unix_millis,
   virtual_partition_for_logical,
 };
 use framework::{
@@ -31,6 +34,7 @@ use framework::{
   SECOND_TOPIC,
   TOPIC,
   WINDOW_SIZE_SECONDS,
+  consumer_bootstrap_config,
   consumer_runtime_config,
   drain_reader_until,
   now_unix_seconds,
@@ -47,6 +51,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep, timeout};
+
+fn metrics_scope(component: &str) -> bd_server_stats::stats::Scope {
+  Collector::default().scope(component)
+}
 
 struct DelayedVisibilityMetadataStore {
   inner: Arc<dyn MetadataStore>,
@@ -180,6 +188,39 @@ fn handle_consumer_event(
   }
 }
 
+async fn poll_consumer_once(
+  consumer: &mut ConsumerIteratorImpl,
+  consumed_ids: &mut HashSet<String>,
+) -> Result<(bool, bool)> {
+  let next_result = timeout(Duration::from_secs(2), consumer.next()).await;
+  let next_result = match next_result {
+    Err(_) => return Ok((false, false)),
+    Ok(Err(error)) => {
+      return Err(anyhow!("consumer next failed: {error}"));
+    },
+    Ok(Ok(next_result)) => next_result,
+  };
+
+  match next_result {
+    NextResult::Revoked(revoked) => {
+      revoked.complete().await;
+      Ok((false, true))
+    },
+    NextResult::Batch(batch) => {
+      let before = consumed_ids.len();
+      for record in batch.records {
+        let id = String::from_utf8(record.payload)
+          .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
+        consumed_ids.insert(id);
+      }
+
+      consumer.store_offset(batch.virtual_partition_id, batch.seq_range.end)?;
+      let _ = consumer.commit().await;
+      Ok((consumed_ids.len() > before, false))
+    },
+  }
+}
+
 // High-level: verifies the baseline single-broker produce/read path and duplicate-scan dedupe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_broker_single_record_end_to_end() -> Result<()> {
@@ -193,6 +234,7 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
     producer_config(8),
     vec![producer_topic()],
     Arc::clone(&discovery),
+    metrics_scope("blob_stream_producer_it"),
   )
   .await?;
 
@@ -252,6 +294,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
         producer_config(8),
         vec![producer_topic()],
         Arc::clone(&discovery),
+        metrics_scope("blob_stream_producer_it"),
       )
       .await?,
     );
@@ -324,6 +367,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
         (0 .. PARTITION_COUNT).collect(),
         Arc::clone(&consumer_membership_store),
       )),
+      metrics_scope("blob_stream_consumer_it"),
     )
     .await?,
   );
@@ -341,6 +385,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
         (0 .. PARTITION_COUNT).collect(),
         Arc::clone(&consumer_membership_store),
       )),
+      metrics_scope("blob_stream_consumer_it"),
     )
     .await?,
   );
@@ -361,6 +406,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
         (0 .. PARTITION_COUNT).collect(),
         Arc::clone(&consumer_membership_store),
       )),
+      metrics_scope("blob_stream_consumer_it"),
     )
     .await?,
   );
@@ -470,6 +516,7 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
     producer_config(12),
     vec![producer_topic()],
     Arc::clone(&producer_discovery),
+    metrics_scope("blob_stream_producer_it"),
   )
   .await?;
 
@@ -523,6 +570,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
     producer_config(8),
     vec![producer_topic()],
     Arc::clone(&discovery),
+    metrics_scope("blob_stream_producer_it"),
   )
   .await?;
 
@@ -564,6 +612,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
         (0 .. PARTITION_COUNT).collect(),
         Arc::clone(&consumer_membership_store),
       )),
+      metrics_scope("blob_stream_consumer_it"),
     )
     .await?,
   );
@@ -631,6 +680,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
         (0 .. PARTITION_COUNT).collect(),
         Arc::clone(&consumer_membership_store),
       )),
+      metrics_scope("blob_stream_consumer_it"),
     )
     .await?,
   );
@@ -698,6 +748,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
     producer_config(8),
     vec![producer_topic()],
     Arc::clone(&discovery),
+    metrics_scope("blob_stream_producer_it"),
   )
   .await?;
 
@@ -739,6 +790,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
         (0 .. PARTITION_COUNT).collect(),
         Arc::clone(&consumer_membership_store),
       )),
+      metrics_scope("blob_stream_consumer_it"),
     )
     .await?,
   );
@@ -756,6 +808,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
         (0 .. PARTITION_COUNT).collect(),
         Arc::clone(&consumer_membership_store),
       )),
+      metrics_scope("blob_stream_consumer_it"),
     )
     .await?,
   );
@@ -815,6 +868,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
         (0 .. PARTITION_COUNT).collect(),
         Arc::clone(&consumer_membership_store),
       )),
+      metrics_scope("blob_stream_consumer_it"),
     )
     .await?,
   );
@@ -1021,6 +1075,7 @@ async fn active_broker_restart_continuity() -> Result<()> {
     producer_config(12),
     vec![producer_topic()],
     Arc::clone(&discovery),
+    metrics_scope("blob_stream_producer_it"),
   )
   .await?;
 
@@ -1102,6 +1157,7 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
     producer_config(8),
     vec![producer_topic()],
     Arc::clone(&discovery),
+    metrics_scope("blob_stream_producer_it"),
   )
   .await?;
 
@@ -1225,6 +1281,7 @@ async fn multi_topic_isolation() -> Result<()> {
       producer_topic_named(SECOND_TOPIC),
     ],
     Arc::clone(&discovery),
+    metrics_scope("blob_stream_producer_it"),
   )
   .await?;
 
@@ -1361,6 +1418,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
       config,
       vec![producer_topic()],
       Arc::clone(&discovery),
+      metrics_scope("blob_stream_producer_it"),
     )
     .await?,
   );
@@ -1497,6 +1555,7 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
     producer_config(8),
     vec![producer_topic()],
     Arc::clone(&discovery),
+    metrics_scope("blob_stream_producer_it"),
   )
   .await?;
 
@@ -1792,12 +1851,14 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
     producer_config_with_writer_id(8, 0),
     vec![producer_topic_named_with_writers(TOPIC, 2)],
     Arc::clone(&discovery),
+    metrics_scope("blob_stream_producer_it"),
   )
   .await?;
   let producer_writer_1 = blob_stream_producer::ProducerClientImpl::new(
     producer_config_with_writer_id(8, 1),
     vec![producer_topic_named_with_writers(TOPIC, 2)],
     Arc::clone(&discovery),
+    metrics_scope("blob_stream_producer_it"),
   )
   .await?;
 
@@ -1933,6 +1994,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
     producer_config(8),
     vec![producer_topic()],
     Arc::clone(&discovery),
+    metrics_scope("blob_stream_producer_it"),
   )
   .await?;
 
@@ -2006,6 +2068,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
         (0 .. PARTITION_COUNT).collect(),
         Arc::clone(&membership_store),
       )),
+      metrics_scope("blob_stream_consumer_it"),
     )
     .await?,
   );
@@ -2048,6 +2111,268 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
 
   // Step 5: Clean up resources.
   let _ = consumer.shutdown().await;
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
+// High-level: validates production bootstrap path discovers new members and rebalances on
+// scale-out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
+  // Run broker + producer against S3/Dynamo-backed stores so bootstrap consumers exercise the
+  // same production storage path used by ConsumerConfigFactory.
+  let resources = IntegrationResources::create().await?;
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .blob_store(resources.s3_blob_store())
+    .start()
+    .await?;
+
+  let producer = cluster
+    .create_producer(producer_config(8), vec![producer_topic()])
+    .await?;
+
+  // Build two independent bootstrap consumers for the same group.
+  let config_a = consumer_bootstrap_config("bootstrap-a", &resources);
+  let config_b = consumer_bootstrap_config("bootstrap-b", &resources);
+
+  // Produce upfront so rebalance happens while data is already available to consume.
+  let mut expected_ids = HashSet::new();
+  for message_id in 0 .. 24 {
+    let id = format!("it-013-{message_id}");
+    produce_message(
+      &producer,
+      format!("it-013-key-{}", message_id % 8).into_bytes(),
+      &id,
+    )
+    .await?;
+    expected_ids.insert(id);
+  }
+
+  let mut consumer_a = Box::new(
+    ConsumerConfigFactory::build_iterator_from_proto_config(
+      config_a,
+      metrics_scope("blob_stream_consumer_it"),
+    )
+    .await?,
+  );
+  let mut consumer_b = Box::new(
+    ConsumerConfigFactory::build_iterator_from_proto_config(
+      config_b,
+      metrics_scope("blob_stream_consumer_it"),
+    )
+    .await?,
+  );
+  consumer_a.start()?;
+  consumer_b.start()?;
+
+  // Convergence signals:
+  // - `saw_revocation`: assignment changed after second member joined.
+  // - progress/renewal flags: each member did useful work (consumed or renewed ownership).
+  let mut saw_revocation = false;
+  let mut consumer_a_progress = false;
+  let mut consumer_b_progress = false;
+  let mut consumer_a_renewed = false;
+  let mut consumer_b_renewed = false;
+  let mut last_commit_at = Instant::now();
+  let mut consumed_by_a = HashSet::new();
+  let mut consumed_by_b = HashSet::new();
+  let deadline = Instant::now() + Duration::from_secs(8);
+  while !saw_revocation
+    || !(consumer_a_progress || consumer_a_renewed)
+    || !(consumer_b_progress || consumer_b_renewed)
+  {
+    if Instant::now() >= deadline {
+      return Err(anyhow!(
+        "deadline exceeded in IT-013: revocation={saw_revocation}, \
+         consumer_a_progress={consumer_a_progress}, consumer_b_progress={consumer_b_progress}, \
+         consumer_a_renewed={consumer_a_renewed}, consumer_b_renewed={consumer_b_renewed}"
+      ));
+    }
+
+    // Poll each consumer once so revocations and batches are observed in a balanced way.
+    let (progress_a, revoked_a) = poll_consumer_once(&mut consumer_a, &mut consumed_by_a).await?;
+    if revoked_a {
+      saw_revocation = true;
+    }
+    consumer_a_progress |= progress_a;
+
+    let (progress_b, revoked_b) = poll_consumer_once(&mut consumer_b, &mut consumed_by_b).await?;
+    if revoked_b {
+      saw_revocation = true;
+    }
+    consumer_b_progress |= progress_b;
+
+    // Periodic commits also force heartbeat/renew paths to run, providing a deterministic
+    // ownership-progress signal even when one member gets fewer batches in the window.
+    if last_commit_at.elapsed() >= Duration::from_millis(250) {
+      let report_a = consumer_a.commit().await?;
+      let report_b = consumer_b.commit().await?;
+      consumer_a_renewed |= !report_a.renewed_partitions.is_empty();
+      consumer_b_renewed |= !report_b.renewed_partitions.is_empty();
+      last_commit_at = Instant::now();
+    }
+  }
+
+  assert!(
+    saw_revocation,
+    "expected revocation during bootstrap scale-out"
+  );
+  assert!(
+    (consumer_a_progress || consumer_a_renewed) && (consumer_b_progress || consumer_b_renewed),
+    "expected both bootstrap consumers to make forward progress"
+  );
+
+  // Final correctness check: independent reader must recover the exact produced set (no loss).
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: TOPIC.to_string().into(),
+      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      lookback_windows: Some(10),
+      ..Default::default()
+    },
+    (0 .. PARTITION_COUNT).collect(),
+    HashMap::new(),
+    resources.s3_blob_store(),
+    resources.metadata_store(),
+  )?;
+  let mut consumed_ids = HashSet::new();
+  drain_reader_until(
+    &mut reader,
+    &mut consumed_ids,
+    expected_ids.len(),
+    Instant::now() + Duration::from_secs(8),
+  )
+  .await?;
+  assert_eq!(consumed_ids, expected_ids);
+
+  // Clean shutdown to avoid dangling members/resources across tests.
+  let _ = consumer_a.shutdown().await;
+  let _ = consumer_b.shutdown().await;
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
+// High-level: validates bootstrap scale-in by stopping one member without graceful shutdown and
+// waiting for membership expiry takeover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .blob_store(resources.s3_blob_store())
+    .start()
+    .await?;
+
+  let producer = cluster
+    .create_producer(producer_config(8), vec![producer_topic()])
+    .await?;
+  let membership_store = resources.consumer_membership_store();
+
+  let config_a = consumer_bootstrap_config("bootstrap-a", &resources);
+  let config_b = consumer_bootstrap_config("bootstrap-b", &resources);
+  let mut consumer_a = Box::new(
+    ConsumerConfigFactory::build_iterator_from_proto_config(
+      config_a,
+      metrics_scope("blob_stream_consumer_it"),
+    )
+    .await?,
+  );
+  let mut consumer_b = Box::new(
+    ConsumerConfigFactory::build_iterator_from_proto_config(
+      config_b,
+      metrics_scope("blob_stream_consumer_it"),
+    )
+    .await?,
+  );
+  consumer_a.start()?;
+  consumer_b.start()?;
+
+  let mut expected_ids = HashSet::new();
+  for message_id in 0 .. 24 {
+    let id = format!("it-014-{message_id}");
+    produce_message(
+      &producer,
+      format!("it-014-key-{}", message_id % 8).into_bytes(),
+      &id,
+    )
+    .await?;
+    expected_ids.insert(id);
+  }
+
+  let mut scratch = HashSet::new();
+  let mut saw_b_renewal = false;
+  let phase1_deadline = Instant::now() + Duration::from_secs(6);
+  while !saw_b_renewal {
+    if Instant::now() >= phase1_deadline {
+      return Err(anyhow!(
+        "deadline exceeded waiting for pre-crash ownership in IT-014"
+      ));
+    }
+
+    let _ = poll_consumer_once(&mut consumer_a, &mut scratch).await?;
+    let _ = poll_consumer_once(&mut consumer_b, &mut scratch).await?;
+    let report_b = consumer_b.commit().await?;
+    saw_b_renewal = !report_b.renewed_partitions.is_empty();
+  }
+
+  // Simulate abrupt member failure: drop the started iterator without calling shutdown.
+  drop(consumer_b);
+
+  let convergence_deadline = Instant::now() + Duration::from_secs(8);
+  loop {
+    if Instant::now() >= convergence_deadline {
+      let active_members = membership_store
+        .list_active_members(TOPIC, "integration-group", now_unix_millis())
+        .await?;
+      return Err(anyhow!(
+        "deadline exceeded waiting for scale-in membership convergence: \
+         active_members={active_members:?}"
+      ));
+    }
+
+    let active_members = membership_store
+      .list_active_members(TOPIC, "integration-group", now_unix_millis())
+      .await?;
+    if active_members == vec!["bootstrap-a".to_string()] {
+      break;
+    }
+
+    let _ = poll_consumer_once(&mut consumer_a, &mut scratch).await?;
+    let _ = consumer_a.commit().await;
+    sleep(Duration::from_millis(100)).await;
+  }
+
+  let report_a = consumer_a.commit().await?;
+  assert!(
+    !report_a.renewed_partitions.is_empty(),
+    "expected surviving bootstrap member to renew ownership after scale-in"
+  );
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: TOPIC.to_string().into(),
+      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      lookback_windows: Some(10),
+      ..Default::default()
+    },
+    (0 .. PARTITION_COUNT).collect(),
+    HashMap::new(),
+    resources.s3_blob_store(),
+    resources.metadata_store(),
+  )?;
+  let mut consumed_ids = HashSet::new();
+  drain_reader_until(
+    &mut reader,
+    &mut consumed_ids,
+    expected_ids.len(),
+    Instant::now() + Duration::from_secs(8),
+  )
+  .await?;
+
+  assert_eq!(consumed_ids, expected_ids);
+
+  let _ = consumer_a.shutdown().await;
   cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())

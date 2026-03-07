@@ -8,7 +8,6 @@ use crate::config::{
   consumer_heartbeat_interval_ms,
   consumer_lease_duration_ms,
   consumer_rebalance_interval_ms,
-  stats_scope,
   validate_runtime_config,
 };
 use crate::consumer::{ConsumerBatch, ConsumerReader, ConsumerReaderImpl};
@@ -21,7 +20,7 @@ use crate::coordination::{
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use bd_log::warn_every;
-use bd_server_stats::stats::{Collector, Scope};
+use bd_server_stats::stats::Scope;
 use blob_stream_blob_store::BlobStore;
 use blob_stream_metadata_store::{
   ConsumerGroupLeaseStore,
@@ -173,6 +172,7 @@ impl ConsumerIteratorImpl {
     lease_store: Arc<dyn ConsumerGroupLeaseStore>,
     membership_store: Arc<dyn ConsumerGroupMembershipStore>,
     coordination_source: Arc<dyn ConsumerCoordinationSource>,
+    metrics_scope: Scope,
   ) -> Result<Self> {
     validate_runtime_config(runtime)?;
     let read_config = runtime
@@ -207,7 +207,6 @@ impl ConsumerIteratorImpl {
       )
       .await?;
 
-    let metrics_scope = Collector::default().scope(stats_scope(runtime));
     let mut iterator = Self {
       group_config,
       reader,

@@ -8,6 +8,7 @@ use super::{
   NextResult,
 };
 use crate::config::{ConsumerGroupConfig, ConsumerReadConfig, ConsumerRuntimeConfig};
+use bd_server_stats::stats::Collector;
 use blob_stream_blob_store::{BlobKey, BlobStore, InMemoryBlobStore};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
@@ -130,6 +131,10 @@ fn runtime_config() -> ConsumerRuntimeConfig {
   runtime
 }
 
+fn metrics_scope() -> bd_server_stats::stats::Scope {
+  Collector::default().scope("blob_stream_consumer_test")
+}
+
 #[tokio::test]
 async fn next_returns_revocation_until_completed() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
@@ -152,6 +157,7 @@ async fn next_returns_revocation_until_completed() {
     lease_store,
     membership_store,
     source.clone(),
+    metrics_scope(),
   )
   .await
   .unwrap();
@@ -228,6 +234,7 @@ async fn next_delivers_batch_and_commit_renews() {
     lease_store,
     membership_store,
     source,
+    metrics_scope(),
   )
   .await
   .unwrap();
@@ -272,6 +279,7 @@ async fn shutdown_releases_owned_partitions() {
     lease_store,
     membership_store,
     source,
+    metrics_scope(),
   )
   .await
   .unwrap();

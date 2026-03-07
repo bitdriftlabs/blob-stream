@@ -11,6 +11,7 @@ use super::transport::{
 };
 use crate::test_framework::{PARTITION_COUNT, SECOND_TOPIC, TOPIC};
 use anyhow::{Result, anyhow};
+use bd_server_stats::stats::Collector;
 use blob_stream::grpc::make_broker_router;
 use blob_stream::metrics::BrokerMetrics;
 use blob_stream::write::{TopicInfo, WriteConfig, WriteEngine, WriteEngineImpl};
@@ -73,12 +74,18 @@ pub struct ClusterHarness {
 pub struct ClusterHarnessBuilder<'a> {
   resources: &'a IntegrationResources,
   broker_count: usize,
+  blob_store: Option<Arc<dyn BlobStore>>,
   metadata_store: Option<Arc<dyn MetadataStore>>,
   topic_num_writers: u32,
   transport: Arc<dyn BrokerTransport>,
 }
 
 impl ClusterHarnessBuilder<'_> {
+  pub fn blob_store(mut self, blob_store: Arc<dyn BlobStore>) -> Self {
+    self.blob_store = Some(blob_store);
+    self
+  }
+
   pub fn metadata_store(mut self, metadata_store: Arc<dyn MetadataStore>) -> Self {
     self.metadata_store = Some(metadata_store);
     self
@@ -95,6 +102,9 @@ impl ClusterHarnessBuilder<'_> {
   }
 
   pub async fn start(self) -> Result<ClusterHarness> {
+    let blob_store = self
+      .blob_store
+      .unwrap_or_else(|| self.resources.blob_store());
     // The metadata store can be overridden by tests that need wrapped behavior.
     let metadata_store = self
       .metadata_store
@@ -103,6 +113,7 @@ impl ClusterHarnessBuilder<'_> {
     ClusterHarness::start_from_builder(
       self.resources,
       self.broker_count,
+      blob_store,
       metadata_store,
       self.topic_num_writers,
       self.transport,
@@ -119,6 +130,7 @@ impl ClusterHarness {
     ClusterHarnessBuilder {
       resources,
       broker_count,
+      blob_store: None,
       metadata_store: None,
       topic_num_writers: 1,
       transport: Arc::new(GrpcTcpTransport),
@@ -128,6 +140,7 @@ impl ClusterHarness {
   async fn start_from_builder(
     resources: &IntegrationResources,
     broker_count: usize,
+    blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
     topic_num_writers: u32,
     transport: Arc<dyn BrokerTransport>,
@@ -164,7 +177,6 @@ impl ClusterHarness {
     let (broker_membership_tx, _broker_membership_rx) =
       watch::channel(BrokerMembership::new(initial_nodes));
 
-    let blob_store = resources.blob_store();
     let lease_store = resources.producer_lease_store();
 
     let mut harness = Self {
@@ -213,10 +225,12 @@ impl ClusterHarness {
     topics: Vec<ProducerTopicConfig>,
   ) -> Result<ProducerClientImpl> {
     let discovery: Arc<dyn BrokerDiscovery> = Arc::new(self.producer_discovery());
+    let metrics_scope = Collector::default().scope("blob_stream_producer_it");
     if let Some(transport) = self.transport.producer_transport() {
-      ProducerClientImpl::new_with_transport(config, topics, discovery, transport).await
+      ProducerClientImpl::new_with_transport(config, topics, discovery, transport, metrics_scope)
+        .await
     } else {
-      ProducerClientImpl::new(config, topics, discovery).await
+      ProducerClientImpl::new(config, topics, discovery, metrics_scope).await
     }
   }
 
@@ -362,6 +376,7 @@ fn build_write_engine(
     lease_store,
     holder_id,
     Some(membership_rx),
+    &Collector::default().scope("blob_stream_broker_it"),
   )?;
 
   Ok(Arc::new(engine))

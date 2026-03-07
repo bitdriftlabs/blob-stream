@@ -3,6 +3,7 @@
 use super::{TopicInfo, WriteConfig, WriteEngine, WriteEngineImpl, WriteRequest};
 use anyhow::Result;
 use async_trait::async_trait;
+use bd_server_stats::stats::Collector;
 use bd_time::{OffsetDateTimeExt, TestTimeProvider, TimeProvider};
 use blob_stream_blob_store::InMemoryBlobStore;
 use blob_stream_metadata_store::{
@@ -20,6 +21,10 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 fn time_from_ms(ms: i64) -> OffsetDateTime {
   OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
     .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+fn metrics_scope() -> bd_server_stats::stats::Scope {
+  Collector::default().scope("blob_stream_broker_test")
 }
 
 fn make_engine(
@@ -49,6 +54,7 @@ fn make_engine(
     "test-node".to_string(),
     None,
     time_provider,
+    &metrics_scope(),
   )?;
 
   Ok((Arc::new(engine), metadata_store))
@@ -251,6 +257,7 @@ async fn returns_error_when_flush_fails() -> Result<()> {
     "test-node".to_string(),
     None,
     time_provider,
+    &metrics_scope(),
   )?;
 
   let request = WriteRequest {

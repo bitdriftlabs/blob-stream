@@ -3099,8 +3099,6 @@ pub struct ProducerRuntimeConfig {
     pub discovery: ::protobuf::MessageField<BrokerDiscoveryConfig>,
     // @@protoc_insertion_point(field:blobstream.v1.ProducerRuntimeConfig.topics)
     pub topics: ::std::vec::Vec<TopicConfig>,
-    // @@protoc_insertion_point(field:blobstream.v1.ProducerRuntimeConfig.stats_scope)
-    pub stats_scope: ::protobuf::Chars,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.ProducerRuntimeConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -3118,7 +3116,7 @@ impl ProducerRuntimeConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(4);
+        let mut fields = ::std::vec::Vec::with_capacity(3);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ProducerConfig>(
             "producer",
@@ -3134,11 +3132,6 @@ impl ProducerRuntimeConfig {
             "topics",
             |m: &ProducerRuntimeConfig| { &m.topics },
             |m: &mut ProducerRuntimeConfig| { &mut m.topics },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "stats_scope",
-            |m: &ProducerRuntimeConfig| { &m.stats_scope },
-            |m: &mut ProducerRuntimeConfig| { &mut m.stats_scope },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ProducerRuntimeConfig>(
             "ProducerRuntimeConfig",
@@ -3167,9 +3160,6 @@ impl ::protobuf::Message for ProducerRuntimeConfig {
                 26 => {
                     self.topics.push(is.read_message()?);
                 },
-                34 => {
-                    self.stats_scope = is.read_tokio_chars()?;
-                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -3194,9 +3184,6 @@ impl ::protobuf::Message for ProducerRuntimeConfig {
             let len = value.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         };
-        if !self.stats_scope.is_empty() {
-            my_size += ::protobuf::rt::string_size(4, &self.stats_scope);
-        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -3212,9 +3199,6 @@ impl ::protobuf::Message for ProducerRuntimeConfig {
         for v in &self.topics {
             ::protobuf::rt::write_message_field_with_cached_size(3, v, os)?;
         };
-        if !self.stats_scope.is_empty() {
-            os.write_string(4, &self.stats_scope)?;
-        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -3235,7 +3219,6 @@ impl ::protobuf::Message for ProducerRuntimeConfig {
         self.producer.clear();
         self.discovery.clear();
         self.topics.clear();
-        self.stats_scope.clear();
         self.special_fields.clear();
     }
 
@@ -3244,7 +3227,6 @@ impl ::protobuf::Message for ProducerRuntimeConfig {
             producer: ::protobuf::MessageField::none(),
             discovery: ::protobuf::MessageField::none(),
             topics: ::std::vec::Vec::new(),
-            stats_scope: ::protobuf::Chars::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -3646,8 +3628,6 @@ pub struct ConsumerRuntimeConfig {
     pub read: ::protobuf::MessageField<ConsumerReadConfig>,
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerRuntimeConfig.group)
     pub group: ::protobuf::MessageField<ConsumerGroupConfig>,
-    // @@protoc_insertion_point(field:blobstream.v1.ConsumerRuntimeConfig.stats_scope)
-    pub stats_scope: ::protobuf::Chars,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.ConsumerRuntimeConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -3665,7 +3645,7 @@ impl ConsumerRuntimeConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(3);
+        let mut fields = ::std::vec::Vec::with_capacity(2);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ConsumerReadConfig>(
             "read",
@@ -3676,11 +3656,6 @@ impl ConsumerRuntimeConfig {
             "group",
             |m: &ConsumerRuntimeConfig| { &m.group },
             |m: &mut ConsumerRuntimeConfig| { &mut m.group },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "stats_scope",
-            |m: &ConsumerRuntimeConfig| { &m.stats_scope },
-            |m: &mut ConsumerRuntimeConfig| { &mut m.stats_scope },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ConsumerRuntimeConfig>(
             "ConsumerRuntimeConfig",
@@ -3706,9 +3681,6 @@ impl ::protobuf::Message for ConsumerRuntimeConfig {
                 18 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.group)?;
                 },
-                26 => {
-                    self.stats_scope = is.read_tokio_chars()?;
-                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -3729,9 +3701,6 @@ impl ::protobuf::Message for ConsumerRuntimeConfig {
             let len = v.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
-        if !self.stats_scope.is_empty() {
-            my_size += ::protobuf::rt::string_size(3, &self.stats_scope);
-        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -3743,9 +3712,6 @@ impl ::protobuf::Message for ConsumerRuntimeConfig {
         }
         if let Some(v) = self.group.as_ref() {
             ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
-        }
-        if !self.stats_scope.is_empty() {
-            os.write_string(3, &self.stats_scope)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -3766,7 +3732,6 @@ impl ::protobuf::Message for ConsumerRuntimeConfig {
     fn clear(&mut self) {
         self.read.clear();
         self.group.clear();
-        self.stats_scope.clear();
         self.special_fields.clear();
     }
 
@@ -3774,7 +3739,6 @@ impl ::protobuf::Message for ConsumerRuntimeConfig {
         static instance: ConsumerRuntimeConfig = ConsumerRuntimeConfig {
             read: ::protobuf::MessageField::none(),
             group: ::protobuf::MessageField::none(),
-            stats_scope: ::protobuf::Chars::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -4104,35 +4068,34 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x10_max_batch_bytesB\x15\n\x13_flush_max_delay_msB\x0e\n\x0c_max_retrie\
     sB\x16\n\x14_retry_base_delay_msB\x15\n\x13_retry_max_delay_msB\x15\n\
     \x13_connect_timeout_msB\x15\n\x13_request_timeout_msB\x1a\n\x18_max_req\
-    uest_concurrencyB\x0e\n\x0c_compression\"\xeb\x01\n\x15ProducerRuntimeCo\
+    uest_concurrencyB\x0e\n\x0c_compression\"\xca\x01\n\x15ProducerRuntimeCo\
     nfig\x129\n\x08producer\x18\x01\x20\x01(\x0b2\x1d.blobstream.v1.Producer\
     ConfigR\x08producer\x12B\n\tdiscovery\x18\x02\x20\x01(\x0b2$.blobstream.\
     v1.BrokerDiscoveryConfigR\tdiscovery\x122\n\x06topics\x18\x03\x20\x03(\
-    \x0b2\x1a.blobstream.v1.TopicConfigR\x06topics\x12\x1f\n\x0bstats_scope\
-    \x18\x04\x20\x01(\tR\nstatsScope\"\xbc\x01\n\x12ConsumerReadConfig\x12\
-    \x14\n\x05topic\x18\x01\x20\x01(\tR\x05topic\x123\n\x13window_size_secon\
-    ds\x18\x02\x20\x01(\x03H\0R\x11windowSizeSeconds\x88\x01\x01\x12.\n\x10l\
-    ookback_windows\x18\x03\x20\x01(\rH\x01R\x0flookbackWindows\x88\x01\x01B\
-    \x16\n\x14_window_size_secondsB\x13\n\x11_lookback_windows\"\xd0\x02\n\
-    \x13ConsumerGroupConfig\x12\x14\n\x05topic\x18\x01\x20\x01(\tR\x05topic\
-    \x12\x19\n\x08group_id\x18\x02\x20\x01(\tR\x07groupId\x12\x1b\n\tmember_\
-    id\x18\x03\x20\x01(\tR\x08memberId\x12/\n\x11lease_duration_ms\x18\x04\
-    \x20\x01(\x03H\0R\x0fleaseDurationMs\x88\x01\x01\x127\n\x15heartbeat_int\
-    erval_ms\x18\x05\x20\x01(\x03H\x01R\x13heartbeatIntervalMs\x88\x01\x01\
-    \x127\n\x15rebalance_interval_ms\x18\x06\x20\x01(\x03H\x02R\x13rebalance\
-    IntervalMs\x88\x01\x01B\x14\n\x12_lease_duration_msB\x18\n\x16_heartbeat\
-    _interval_msB\x18\n\x16_rebalance_interval_ms\"\xa9\x01\n\x15ConsumerRun\
-    timeConfig\x125\n\x04read\x18\x01\x20\x01(\x0b2!.blobstream.v1.ConsumerR\
-    eadConfigR\x04read\x128\n\x05group\x18\x02\x20\x01(\x0b2\".blobstream.v1\
-    .ConsumerGroupConfigR\x05group\x12\x1f\n\x0bstats_scope\x18\x03\x20\x01(\
-    \tR\nstatsScope\"\x9d\x02\n\x1fConsumerIteratorBootstrapConfig\x12>\n\
-    \x07runtime\x18\x01\x20\x01(\x0b2$.blobstream.v1.ConsumerRuntimeConfigR\
-    \x07runtime\x120\n\x05topic\x18\x02\x20\x01(\x0b2\x1a.blobstream.v1.Topi\
-    cConfigR\x05topic\x12=\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobstrea\
-    m.v1.BlobStoreConfigR\tblobStore\x12I\n\x0emetadata_store\x18\x04\x20\
-    \x01(\x0b2\".blobstream.v1.MetadataStoreConfigR\rmetadataStore*U\n\x13Pr\
-    oducerCompression\x12\x1d\n\x19PRODUCER_COMPRESSION_NONE\x10\0\x12\x1f\n\
-    \x1bPRODUCER_COMPRESSION_SNAPPY\x10\x01b\x06proto3\
+    \x0b2\x1a.blobstream.v1.TopicConfigR\x06topics\"\xbc\x01\n\x12ConsumerRe\
+    adConfig\x12\x14\n\x05topic\x18\x01\x20\x01(\tR\x05topic\x123\n\x13windo\
+    w_size_seconds\x18\x02\x20\x01(\x03H\0R\x11windowSizeSeconds\x88\x01\x01\
+    \x12.\n\x10lookback_windows\x18\x03\x20\x01(\rH\x01R\x0flookbackWindows\
+    \x88\x01\x01B\x16\n\x14_window_size_secondsB\x13\n\x11_lookback_windows\
+    \"\xd0\x02\n\x13ConsumerGroupConfig\x12\x14\n\x05topic\x18\x01\x20\x01(\
+    \tR\x05topic\x12\x19\n\x08group_id\x18\x02\x20\x01(\tR\x07groupId\x12\
+    \x1b\n\tmember_id\x18\x03\x20\x01(\tR\x08memberId\x12/\n\x11lease_durati\
+    on_ms\x18\x04\x20\x01(\x03H\0R\x0fleaseDurationMs\x88\x01\x01\x127\n\x15\
+    heartbeat_interval_ms\x18\x05\x20\x01(\x03H\x01R\x13heartbeatIntervalMs\
+    \x88\x01\x01\x127\n\x15rebalance_interval_ms\x18\x06\x20\x01(\x03H\x02R\
+    \x13rebalanceIntervalMs\x88\x01\x01B\x14\n\x12_lease_duration_msB\x18\n\
+    \x16_heartbeat_interval_msB\x18\n\x16_rebalance_interval_ms\"\x88\x01\n\
+    \x15ConsumerRuntimeConfig\x125\n\x04read\x18\x01\x20\x01(\x0b2!.blobstre\
+    am.v1.ConsumerReadConfigR\x04read\x128\n\x05group\x18\x02\x20\x01(\x0b2\
+    \".blobstream.v1.ConsumerGroupConfigR\x05group\"\x9d\x02\n\x1fConsumerIt\
+    eratorBootstrapConfig\x12>\n\x07runtime\x18\x01\x20\x01(\x0b2$.blobstrea\
+    m.v1.ConsumerRuntimeConfigR\x07runtime\x120\n\x05topic\x18\x02\x20\x01(\
+    \x0b2\x1a.blobstream.v1.TopicConfigR\x05topic\x12=\n\nblob_store\x18\x03\
+    \x20\x01(\x0b2\x1e.blobstream.v1.BlobStoreConfigR\tblobStore\x12I\n\x0em\
+    etadata_store\x18\x04\x20\x01(\x0b2\".blobstream.v1.MetadataStoreConfigR\
+    \rmetadataStore*U\n\x13ProducerCompression\x12\x1d\n\x19PRODUCER_COMPRES\
+    SION_NONE\x10\0\x12\x1f\n\x1bPRODUCER_COMPRESSION_SNAPPY\x10\x01b\x06pro\
+    to3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

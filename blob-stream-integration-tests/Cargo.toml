@@ -14,6 +14,7 @@ aws-types.workspace               = true
 axum.workspace                    = true
 bytes.workspace                   = true
 bd-test-helpers.workspace         = true
+bd-server-stats.workspace         = true
 blob-stream.path                  = "../blob-stream-broker"
 blob-stream-blob-store.path       = "../blob-stream-blob-store"
 blob-stream-broker-discovery.path = "../blob-stream-broker-discovery"

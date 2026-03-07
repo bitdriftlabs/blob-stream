@@ -56,6 +56,7 @@ pub enum StoreFaultOperation {
   ConsumerHeartbeatPartition,
   ConsumerCommitCursor,
   ConsumerReleasePartition,
+  ConsumerMembershipHeartbeat,
 }
 
 //
@@ -416,6 +417,7 @@ fn describe_store_operation(operation: StoreFaultOperation) -> &'static str {
     StoreFaultOperation::ConsumerHeartbeatPartition => "consumer_heartbeat_partition",
     StoreFaultOperation::ConsumerCommitCursor => "consumer_commit_cursor",
     StoreFaultOperation::ConsumerReleasePartition => "consumer_release_partition",
+    StoreFaultOperation::ConsumerMembershipHeartbeat => "consumer_membership_heartbeat",
   }
 }
 
@@ -915,11 +917,45 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> Result<()> {
-    let _ = &self.controller;
-    self
+    let key = format!("{topic}#{group_id}#{member_id}");
+    let effects = self
+      .controller
+      .effects_for_call(
+        StoreFaultDomain::ConsumerLease,
+        StoreFaultOperation::ConsumerMembershipHeartbeat,
+        &key,
+      )
+      .await;
+
+    if let Some(delay) = effects.delay {
+      sleep(delay).await;
+    }
+    if let Some(timeout) = effects.timeout {
+      sleep(timeout).await;
+      return Err(anyhow!(
+        "consumer membership heartbeat timed out for key {key}"
+      ));
+    }
+    if let Some(message) = effects.fail_message {
+      return Err(anyhow!(
+        "consumer membership heartbeat fault for key {key}: {message}"
+      ));
+    }
+
+    let result = self
       .inner
       .heartbeat_member(topic, group_id, member_id, now_ts_ms, ttl_ms)
-      .await
+      .await;
+    self
+      .controller
+      .record_operation_outcome(
+        StoreFaultOperation::ConsumerMembershipHeartbeat,
+        key,
+        if result.is_ok() { "ok" } else { "error" },
+        None,
+      )
+      .await;
+    result
   }
 
   async fn deregister_member(&self, topic: &str, group_id: &str, member_id: &str) -> Result<()> {

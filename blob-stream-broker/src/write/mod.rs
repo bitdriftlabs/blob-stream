@@ -10,7 +10,7 @@ use crate::write::flush::FlushContext;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use bd_log::warn_every;
-use bd_server_stats::stats::{Collector, Scope};
+use bd_server_stats::stats::Scope;
 use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobKey, BlobStore};
 use blob_stream_broker_discovery::BrokerMembership;
@@ -201,29 +201,6 @@ impl WriteEngineImpl {
     lease_store: Arc<dyn ProducerPartitionLeaseStore>,
     holder_id: String,
     membership_rx: Option<watch::Receiver<BrokerMembership>>,
-  ) -> Result<Self> {
-    let metrics_scope = Collector::default().scope("blob_stream_broker");
-    Self::new_with_time_provider_and_scope(
-      config,
-      topics,
-      blob_store,
-      metadata_store,
-      lease_store,
-      holder_id,
-      membership_rx,
-      Arc::new(SystemTimeProvider),
-      &metrics_scope,
-    )
-  }
-
-  pub fn new_with_metrics_scope(
-    config: WriteConfig,
-    topics: HashMap<String, TopicInfo>,
-    blob_store: Arc<dyn BlobStore>,
-    metadata_store: Arc<dyn MetadataStore>,
-    lease_store: Arc<dyn ProducerPartitionLeaseStore>,
-    holder_id: String,
-    membership_rx: Option<watch::Receiver<BrokerMembership>>,
     metrics_scope: &Scope,
   ) -> Result<Self> {
     Self::new_with_time_provider_and_scope(
@@ -248,8 +225,8 @@ impl WriteEngineImpl {
     holder_id: String,
     membership_rx: Option<watch::Receiver<BrokerMembership>>,
     time_provider: Arc<dyn TimeProvider>,
+    metrics_scope: &Scope,
   ) -> Result<Self> {
-    let metrics_scope = Collector::default().scope("blob_stream_broker");
     Self::new_with_time_provider_and_scope(
       config,
       topics,
@@ -259,7 +236,7 @@ impl WriteEngineImpl {
       holder_id,
       membership_rx,
       time_provider,
-      &metrics_scope,
+      metrics_scope,
     )
   }
 

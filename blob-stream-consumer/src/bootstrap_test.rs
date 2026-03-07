@@ -8,6 +8,7 @@ use crate::{
   ConsumerReadConfig,
   ConsumerRuntimeConfig,
 };
+use bd_server_stats::stats::Collector;
 use blob_stream_proto::protos::blobstream::v1::config::{
   BlobStoreConfig,
   ConsumerIteratorBootstrapConfig,
@@ -73,6 +74,10 @@ fn proto_bootstrap_config(member_id: &str) -> ConsumerIteratorBootstrapConfig {
   config
 }
 
+fn metrics_scope() -> bd_server_stats::stats::Scope {
+  Collector::default().scope("blob_stream_consumer_test")
+}
+
 #[tokio::test]
 async fn bootstrap_builds_iterator_for_in_memory_backends() {
   let config = ConsumerBootstrapConfig::new(
@@ -82,7 +87,9 @@ async fn bootstrap_builds_iterator_for_in_memory_backends() {
     in_memory_metadata_store(),
   );
 
-  let mut iterator = ConsumerConfigFactory::build_iterator(config).await.unwrap();
+  let mut iterator = ConsumerConfigFactory::build_iterator(config, metrics_scope())
+    .await
+    .unwrap();
   iterator.start().unwrap();
 }
 
@@ -95,7 +102,9 @@ async fn bootstrap_builds_iterator_without_static_members() {
     in_memory_metadata_store(),
   );
 
-  let mut iterator = ConsumerConfigFactory::build_iterator(config).await.unwrap();
+  let mut iterator = ConsumerConfigFactory::build_iterator(config, metrics_scope())
+    .await
+    .unwrap();
   iterator.start().unwrap();
 }
 
@@ -103,9 +112,10 @@ async fn bootstrap_builds_iterator_without_static_members() {
 async fn proto_bootstrap_builds_iterator_for_in_memory_backends() {
   let config = proto_bootstrap_config("member-a");
 
-  let mut iterator = ConsumerConfigFactory::build_iterator_from_proto_config(config)
-    .await
-    .unwrap();
+  let mut iterator =
+    ConsumerConfigFactory::build_iterator_from_proto_config(config, metrics_scope())
+      .await
+      .unwrap();
   iterator.start().unwrap();
 }
 
@@ -113,7 +123,7 @@ async fn proto_bootstrap_builds_iterator_for_in_memory_backends() {
 async fn proto_bootstrap_rejects_missing_required_message_fields() {
   let config = ConsumerIteratorBootstrapConfig::new();
 
-  let error = ConsumerConfigFactory::build_iterator_from_proto_config(config)
+  let error = ConsumerConfigFactory::build_iterator_from_proto_config(config, metrics_scope())
     .await
     .err()
     .unwrap();

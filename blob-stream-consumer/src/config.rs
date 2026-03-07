@@ -49,14 +49,6 @@ pub fn consumer_rebalance_interval_ms(config: &ConsumerGroupConfig) -> i64 {
     .unwrap_or(DEFAULT_REBALANCE_INTERVAL_MS)
 }
 
-pub fn stats_scope(runtime: &ConsumerRuntimeConfig) -> &str {
-  if runtime.stats_scope.is_empty() {
-    "blob_stream_consumer"
-  } else {
-    &runtime.stats_scope
-  }
-}
-
 pub fn validate_read_config(config: &ConsumerReadConfig) -> Result<()> {
   trace!("validating consumer read config: topic={}", config.topic);
   ensure!(
@@ -108,10 +100,7 @@ pub fn validate_group_config(config: &ConsumerGroupConfig) -> Result<()> {
 }
 
 pub fn validate_runtime_config(runtime: &ConsumerRuntimeConfig) -> Result<()> {
-  debug!(
-    "validating consumer runtime config: stats_scope={}",
-    stats_scope(runtime)
-  );
+  debug!("validating consumer runtime config");
   let read = runtime
     .read
     .as_ref()

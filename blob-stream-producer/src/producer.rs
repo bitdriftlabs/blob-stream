@@ -19,7 +19,6 @@ use crate::config::{
   producer_retry_base_delay_ms,
   producer_retry_max_delay_ms,
   producer_writer_id,
-  stats_scope,
   validate_producer_config,
   validate_runtime_config,
   validate_topic_config,
@@ -29,7 +28,7 @@ use async_trait::async_trait;
 use bd_grpc::client::Client as GrpcClient;
 use bd_grpc::service::ServiceMethod;
 use bd_log::warn_every;
-use bd_server_stats::stats::{Collector, Scope};
+use bd_server_stats::stats::Scope;
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, owner_for_partition};
 use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchRequest,
@@ -229,14 +228,17 @@ impl ProducerClientImpl {
     config: ProducerConfig,
     topics: Vec<ProducerTopicConfig>,
     discovery: Arc<dyn BrokerDiscovery>,
+    metrics_scope: Scope,
   ) -> Result<Self> {
     let transport: Arc<dyn BrokerTransport> = Arc::new(GrpcBrokerTransport::new(config.clone()));
-    Self::new_with_transport(config, topics, discovery, transport).await
+    Self::new_with_transport(config, topics, discovery, transport, metrics_scope).await
   }
 
-  pub async fn from_runtime_config(runtime: ProducerRuntimeConfig) -> Result<Self> {
+  pub async fn from_runtime_config(
+    runtime: ProducerRuntimeConfig,
+    metrics_scope: Scope,
+  ) -> Result<Self> {
     validate_runtime_config(&runtime)?;
-    let metrics_scope = Collector::default().scope(stats_scope(&runtime));
     let producer = runtime
       .producer
       .as_ref()
@@ -250,7 +252,7 @@ impl ProducerClientImpl {
     let topics = runtime.topics.clone();
     let discovery = into_discovery(&discovery)?;
     let transport: Arc<dyn BrokerTransport> = Arc::new(GrpcBrokerTransport::new(producer.clone()));
-    Self::new_with_transport_and_scope(producer, topics, discovery, transport, metrics_scope).await
+    Self::new_with_transport(producer, topics, discovery, transport, metrics_scope).await
   }
 
   pub async fn new_with_transport(
@@ -258,8 +260,8 @@ impl ProducerClientImpl {
     topics: Vec<ProducerTopicConfig>,
     discovery: Arc<dyn BrokerDiscovery>,
     transport: Arc<dyn BrokerTransport>,
+    metrics_scope: Scope,
   ) -> Result<Self> {
-    let metrics_scope = Collector::default().scope("blob_stream_producer");
     Self::new_with_transport_and_scope(config, topics, discovery, transport, metrics_scope).await
   }
 

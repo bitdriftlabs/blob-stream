@@ -174,8 +174,6 @@ message ProducerRuntimeConfig {
   BrokerDiscoveryConfig discovery = 2;
   // Topic definitions used by producer routing and validation.
   repeated TopicConfig topics = 3;
-  // Optional stats scope prefix.
-  string stats_scope = 4;
 }
 
 // Consumer read path settings.
@@ -210,8 +208,6 @@ message ConsumerRuntimeConfig {
   ConsumerReadConfig read = 1;
   // Group coordination configuration.
   ConsumerGroupConfig group = 2;
-  // Optional stats scope prefix.
-  string stats_scope = 3;
 }
 
 // Single-message bootstrap config for creating a production-ready consumer iterator.

@@ -361,19 +361,21 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       AttributeValue::N(generation.to_string()),
     );
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+    let update = format!("SET {ATTR_LEASE_EXPIRES} = :now, {ATTR_LAST_HEARTBEAT} = :now");
     let condition = format!(
       "{ATTR_OWNER} = :owner AND {ATTR_GENERATION} = :generation AND {ATTR_LEASE_EXPIRES} > :now"
     );
 
     let response = self
       .client
-      .delete_item()
+      .update_item()
       .table_name(&self.table_name)
       .key(ATTR_PK, AttributeValue::S(key.partition_key()))
       .key(ATTR_SK, AttributeValue::S(key.sort_key()))
+      .update_expression(update)
       .condition_expression(condition)
       .set_expression_attribute_values(Some(values))
-      .return_values(ReturnValue::AllOld)
+      .return_values(ReturnValue::AllNew)
       .send()
       .await;
 

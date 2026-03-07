@@ -203,7 +203,7 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     );
 
     let mut guard = self.leases.write().await;
-    let Some(state) = guard.get(key) else {
+    let Some(state) = guard.get_mut(key) else {
       return Ok(ConsumerGroupReleaseOutcome::Expired);
     };
 
@@ -217,7 +217,9 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
       ));
     }
 
-    guard.remove(key);
+    // Expire in place so the committed cursor remains available for the next owner.
+    state.lease_expiration_ts_ms = now_ts_ms;
+    state.last_heartbeat_ts_ms = now_ts_ms;
     Ok(ConsumerGroupReleaseOutcome::Released)
   }
 }

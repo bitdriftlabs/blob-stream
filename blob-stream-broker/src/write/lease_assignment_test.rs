@@ -2,6 +2,7 @@
 
 use crate::write::{TopicInfo, WriteConfig, WriteEngineImpl};
 use anyhow::Result;
+use bd_server_stats::stats::Collector;
 use bd_time::TestTimeProvider;
 use blob_stream_blob_store::InMemoryBlobStore;
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
@@ -22,6 +23,10 @@ use tokio::sync::watch;
 fn time_from_ms(ms: i64) -> OffsetDateTime {
   OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
     .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+fn metrics_scope() -> bd_server_stats::stats::Scope {
+  Collector::default().scope("blob_stream_broker_test")
 }
 
 #[test]
@@ -156,6 +161,7 @@ async fn scale_down_releases_previously_owned_leases() -> Result<()> {
     "node-a".to_string(),
     Some(membership_rx),
     time_provider,
+    &metrics_scope(),
   )?;
 
   acquire_all_partitions(&lease_store, "node-a", partition_count).await;
@@ -204,6 +210,7 @@ async fn shutdown_releases_currently_owned_leases() -> Result<()> {
     "node-a".to_string(),
     Some(membership_rx),
     time_provider,
+    &metrics_scope(),
   )?;
 
   acquire_all_partitions(&lease_store, "node-a", partition_count).await;

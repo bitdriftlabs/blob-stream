@@ -12,6 +12,7 @@ use crate::config::{producer_config_with_defaults, producer_writer_id};
 use crate::{ProducerCompression, ProducerConfig, ProducerTopicConfig};
 use anyhow::anyhow;
 use async_trait::async_trait;
+use bd_server_stats::stats::Collector;
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode, owner_for_partition};
 use blob_stream_proto::protos::blobstream::v1::broker::{ProduceBatchResponse, ProduceStatus};
 use std::collections::VecDeque;
@@ -118,6 +119,10 @@ fn membership() -> BrokerMembership {
   ])
 }
 
+fn metrics_scope() -> bd_server_stats::stats::Scope {
+  Collector::default().scope("blob_stream_producer_test")
+}
+
 #[tokio::test]
 async fn routes_to_expected_broker() {
   let config = default_config();
@@ -128,6 +133,7 @@ async fn routes_to_expected_broker() {
     vec![topic_config()],
     discovery,
     transport.clone(),
+    metrics_scope(),
   )
   .await
   .unwrap();
@@ -187,6 +193,7 @@ async fn retries_transient_status_until_success() {
     vec![topic_config()],
     discovery,
     transport.clone(),
+    metrics_scope(),
   )
   .await
   .unwrap();
@@ -219,6 +226,7 @@ async fn batches_by_partition_and_acks_waiters() {
       vec![topic_config()],
       discovery,
       transport.clone(),
+      metrics_scope(),
     )
     .await
     .unwrap(),
@@ -278,10 +286,15 @@ async fn surfaces_retry_exhaustion_for_transport_errors() {
     .enqueue_response(Err(anyhow!("network down")))
     .await;
 
-  let producer =
-    ProducerClientImpl::new_with_transport(config, vec![topic_config()], discovery, transport)
-      .await
-      .unwrap();
+  let producer = ProducerClientImpl::new_with_transport(
+    config,
+    vec![topic_config()],
+    discovery,
+    transport,
+    metrics_scope(),
+  )
+  .await
+  .unwrap();
 
   let error = producer
     .produce(ProducerRecord::new(

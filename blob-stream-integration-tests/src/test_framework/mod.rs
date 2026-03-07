@@ -19,6 +19,7 @@ pub const WINDOW_SIZE_SECONDS: i64 = 300;
 
 pub use cluster::ClusterHarness;
 pub use config::{
+  consumer_bootstrap_config,
   consumer_runtime_config,
   producer_config,
   producer_config_with_writer_id,

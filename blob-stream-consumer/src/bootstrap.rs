@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
 use aws_types::region::Region;
+use bd_server_stats::stats::Scope;
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_metadata_store::{
   ConsumerGroupLeaseStore,
@@ -49,15 +50,19 @@ pub struct ConsumerBootstrapConfig {
 pub struct ConsumerConfigFactory;
 
 impl ConsumerConfigFactory {
-  pub async fn build_iterator(config: ConsumerBootstrapConfig) -> Result<ConsumerIteratorImpl> {
-    ConsumerIteratorImpl::from_bootstrap_config(config).await
+  pub async fn build_iterator(
+    config: ConsumerBootstrapConfig,
+    metrics_scope: Scope,
+  ) -> Result<ConsumerIteratorImpl> {
+    ConsumerIteratorImpl::from_bootstrap_config(config, metrics_scope).await
   }
 
   pub async fn build_iterator_from_proto_config(
     config: ConsumerIteratorBootstrapConfig,
+    metrics_scope: Scope,
   ) -> Result<ConsumerIteratorImpl> {
     let bootstrap = ConsumerBootstrapConfig::from_proto_config(&config)?;
-    Self::build_iterator(bootstrap).await
+    Self::build_iterator(bootstrap, metrics_scope).await
   }
 }
 
@@ -109,7 +114,10 @@ impl ConsumerBootstrapConfig {
 }
 
 impl ConsumerIteratorImpl {
-  pub async fn from_bootstrap_config(config: ConsumerBootstrapConfig) -> Result<Self> {
+  pub async fn from_bootstrap_config(
+    config: ConsumerBootstrapConfig,
+    metrics_scope: Scope,
+  ) -> Result<Self> {
     validate_runtime_config(&config.runtime)?;
     validate_topic_config(&config.topic)?;
 
@@ -145,6 +153,7 @@ impl ConsumerIteratorImpl {
       lease_store,
       membership_store,
       coordination,
+      metrics_scope,
     )
     .await
   }
@@ -201,7 +210,15 @@ async fn build_blob_store(config: &BlobStoreConfig) -> Result<Arc<dyn BlobStore>
       loader = loader.endpoint_url(s3.endpoint.to_string());
     }
     let shared = loader.load().await;
-    let client = aws_sdk_s3::Client::new(&shared);
+    let client = if s3.endpoint.trim().is_empty() {
+      aws_sdk_s3::Client::new(&shared)
+    } else {
+      // Local S3-compatible endpoints (e.g. LocalStack) require path-style requests.
+      let conf = aws_sdk_s3::config::Builder::from(&shared)
+        .force_path_style(true)
+        .build();
+      aws_sdk_s3::Client::from_conf(conf)
+    };
 
     let store: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(client, bucket));
     return Ok(store);

@@ -37,7 +37,8 @@ async fn main() -> Result<()> {
   info!("broker starting: bind_addr={addr}");
 
   let metrics = BrokerMetrics::new();
-  let write_engine = build_write_engine(&config, &metrics).await?;
+  let metrics_scope = metrics.scope();
+  let write_engine = build_write_engine(&config, &metrics_scope).await?;
   let listener = tokio::net::TcpListener::bind(addr).await?;
   info!("broker listening: bind_addr={addr}, metrics_path=/metrics");
   axum::serve(listener, make_broker_router(write_engine, &metrics)).await?;

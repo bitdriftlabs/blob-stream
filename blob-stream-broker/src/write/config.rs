@@ -1,9 +1,9 @@
-use crate::metrics::BrokerMetrics;
 use crate::write::{WriteEngine, WriteEngineImpl};
 use anyhow::{Context, Result, anyhow, ensure};
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
 use aws_types::region::Region;
+use bd_server_stats::stats::Scope;
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_broker_discovery::k8s::K8sServiceBrokerDiscovery;
 use blob_stream_broker_discovery::r#static::StaticBrokerDiscovery;
@@ -145,7 +145,7 @@ impl TopicInfo {
 
 pub async fn build_write_engine(
   config: &RuntimeConfig,
-  metrics: &BrokerMetrics,
+  metrics_scope: &Scope,
 ) -> Result<Arc<dyn WriteEngine>> {
   trace!("building broker write engine from runtime config");
   let broker = config
@@ -172,12 +172,11 @@ pub async fn build_write_engine(
   let metadata_store = build_metadata_store(metadata_store_config).await?;
 
   let lease_store = build_producer_partition_lease_store(metadata_store_config).await?;
-  let metrics_scope = metrics.scope();
   let writer_id = write_config.writer_id;
   let topics_count = topics.len();
   let holder_id_for_log = holder_id.clone();
 
-  let engine = WriteEngineImpl::new_with_metrics_scope(
+  let engine = WriteEngineImpl::new(
     write_config,
     topics,
     blob_store,
@@ -185,7 +184,7 @@ pub async fn build_write_engine(
     lease_store,
     holder_id,
     Some(membership_rx),
-    &metrics_scope,
+    metrics_scope,
   )?;
 
   debug!(

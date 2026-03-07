@@ -119,14 +119,6 @@ pub fn producer_compression(config: &ProducerConfig) -> ProducerCompression {
   )
 }
 
-pub fn stats_scope(runtime: &ProducerRuntimeConfig) -> &str {
-  if runtime.stats_scope.is_empty() {
-    "blob_stream_producer"
-  } else {
-    &runtime.stats_scope
-  }
-}
-
 pub fn compression_as_grpc(compression: ProducerCompression) -> Compression {
   match compression {
     ProducerCompression::PRODUCER_COMPRESSION_NONE => Compression::None,
@@ -196,9 +188,8 @@ pub fn validate_topic_config(topic: &ProducerTopicConfig) -> Result<()> {
 
 pub fn validate_runtime_config(runtime: &ProducerRuntimeConfig) -> Result<()> {
   debug!(
-    "validating producer runtime config: topics={}, stats_scope={}",
-    runtime.topics.len(),
-    stats_scope(runtime)
+    "validating producer runtime config: topics={}",
+    runtime.topics.len()
   );
   let producer = runtime
     .producer

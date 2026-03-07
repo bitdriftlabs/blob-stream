@@ -1,6 +1,15 @@
+use super::resources::IntegrationResources;
 use crate::test_framework::{PARTITION_COUNT, TOPIC, WINDOW_SIZE_SECONDS};
 use blob_stream_consumer::{ConsumerGroupConfig, ConsumerReadConfig, ConsumerRuntimeConfig};
 use blob_stream_producer::{ProducerCompression, ProducerConfig, ProducerTopicConfig};
+use blob_stream_proto::protos::blobstream::v1::config::{
+  BlobStoreConfig,
+  ConsumerIteratorBootstrapConfig,
+  DynamoMetadataStoreConfig,
+  MetadataStoreConfig,
+  S3BlobStoreConfig,
+  TopicConfig,
+};
 
 pub fn producer_config(max_retries: u32) -> ProducerConfig {
   producer_config_with_writer_id(max_retries, 0)
@@ -60,4 +69,47 @@ pub fn consumer_runtime_config(member_id: &str) -> ConsumerRuntimeConfig {
   runtime.read = Some(read).into();
   runtime.group = Some(group).into();
   runtime
+}
+
+pub fn consumer_bootstrap_config(
+  member_id: &str,
+  resources: &IntegrationResources,
+) -> ConsumerIteratorBootstrapConfig {
+  let runtime = consumer_runtime_config(member_id);
+
+  let mut topic = TopicConfig::new();
+  topic.name = TOPIC.to_string().into();
+  topic.partition_count = PARTITION_COUNT;
+  topic.num_writers = 1;
+  topic.retention_days = 0;
+
+  let mut s3 = S3BlobStoreConfig::new();
+  s3.bucket = resources.bucket_name().to_string().into();
+  s3.region = resources.aws_region().to_string().into();
+  s3.endpoint = resources.s3_endpoint().to_string().into();
+  let mut blob_store = BlobStoreConfig::new();
+  blob_store.set_s3(s3);
+
+  let mut dynamo = DynamoMetadataStoreConfig::new();
+  dynamo.region = resources.aws_region().to_string().into();
+  dynamo.endpoint = resources.dynamo_endpoint().to_string().into();
+  dynamo.segment_metadata_table_name = resources.segment_metadata_table_name().to_string().into();
+  dynamo.producer_partition_lease_table_name =
+    resources.producer_lease_table_name().to_string().into();
+  dynamo.consumer_group_lease_table_name = resources.consumer_lease_table_name().to_string().into();
+  dynamo.consumer_group_membership_table_name = resources
+    .consumer_membership_table_name()
+    .to_string()
+    .into();
+
+  let mut metadata_store = MetadataStoreConfig::new();
+  metadata_store.set_dynamo(dynamo);
+
+  ConsumerIteratorBootstrapConfig {
+    runtime: Some(runtime).into(),
+    topic: Some(topic).into(),
+    blob_store: Some(blob_store).into(),
+    metadata_store: Some(metadata_store).into(),
+    ..Default::default()
+  }
 }
