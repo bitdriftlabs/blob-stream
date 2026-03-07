@@ -103,7 +103,10 @@ blob_store:
 
 metadata_store:
   dynamo:
-    table_name: "blob_segments"
+    segment_metadata_table_name: "blob_segments"
+    producer_partition_lease_table_name: "producer_partition_leases"
+    consumer_group_lease_table_name: "consumer_group_leases"
+    consumer_group_membership_table_name: "consumer_group_membership"
     region: "us-east-1"
     endpoint: "http://localhost:8000"
 ```
@@ -214,8 +217,12 @@ async fn main() -> Result<()> {
 
 The consumer API is in `blob-stream-consumer`.
 
-The runtime config (`ConsumerRuntimeConfig`) covers read + group behavior, while storage and lease
-backends are injected as trait objects.
+The primary production path is a single-proto bootstrap
+(`ConsumerIteratorBootstrapConfig`), which builds the required stores and iterator for you. For
+advanced deployments, you can still inject storage and coordination dependencies manually.
+
+Consumer group membership for this bootstrap path is derived dynamically from the consumer-group
+membership store; there is no static member list in production config.
 
 ### Runtime config fields
 
@@ -232,37 +239,38 @@ backends are injected as trait objects.
   - `rebalance_interval_ms`
 - `stats_scope` (optional)
 
-### Example (in-memory wiring)
+### Example (single-proto bootstrap)
 
 ```rust
 use anyhow::Result;
-use blob_stream_blob_store::InMemoryBlobStore;
 use blob_stream_consumer::{
+  ConsumerConfigFactory,
   ConsumerIterator,
-  ConsumerIteratorImpl,
-  ConsumerRuntimeConfig,
   NextResult,
-  StaticConsumerCoordinationSource,
 };
-use blob_stream_metadata_store::{
-  InMemoryConsumerGroupLeaseStore,
-  InMemoryMetadataStore,
+use blob_stream_proto::protos::blobstream::v1::config::{
+  BlobStoreConfig,
+  ConsumerGroupConfig,
+  ConsumerIteratorBootstrapConfig,
+  ConsumerReadConfig,
+  ConsumerRuntimeConfig,
+  DynamoMetadataStoreConfig,
+  MetadataStoreConfig,
+  S3BlobStoreConfig,
+  TopicConfig,
+  blob_store_config,
+  metadata_store_config,
 };
-use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-  let blob_store = Arc::new(InMemoryBlobStore::new());
-  let metadata_store = Arc::new(InMemoryMetadataStore::new());
-  let lease_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
-
   let mut runtime = ConsumerRuntimeConfig::new();
-  let mut read = blob_stream_consumer::ConsumerReadConfig::new();
+  let mut read = ConsumerReadConfig::new();
   read.topic = "telemetry".into();
   read.window_size_seconds = Some(300);
   read.lookback_windows = Some(3);
 
-  let mut group = blob_stream_consumer::ConsumerGroupConfig::new();
+  let mut group = ConsumerGroupConfig::new();
   group.topic = "telemetry".into();
   group.group_id = "group-a".into();
   group.member_id = "member-a".into();
@@ -273,19 +281,36 @@ async fn main() -> Result<()> {
   runtime.read = Some(read).into();
   runtime.group = Some(group).into();
 
-  let coordination = Arc::new(StaticConsumerCoordinationSource::new(
-    vec!["member-a".into()],
-    (0..128).collect(),
-  ));
+  let mut topic = TopicConfig::new();
+  topic.name = "telemetry".into();
+  topic.partition_count = 128;
+  topic.num_writers = 1;
+  topic.retention_days = 7;
 
-  let mut iter = ConsumerIteratorImpl::from_runtime_config(
-    &runtime,
-    blob_store,
-    metadata_store,
-    lease_store,
-    coordination,
-  )
-  .await?;
+  let mut s3 = S3BlobStoreConfig::new();
+  s3.bucket = "blob-stream-prod".into();
+  s3.prefix = "blob-stream/".into();
+  s3.region = "us-east-1".into();
+
+  let mut blob_store = BlobStoreConfig::new();
+  blob_store.backend = Some(blob_store_config::Backend::S3(s3));
+
+  let mut dynamo = DynamoMetadataStoreConfig::new();
+  dynamo.region = "us-east-1".into();
+  dynamo.segment_metadata_table_name = "blob_segments".into();
+  dynamo.consumer_group_lease_table_name = "consumer_group_leases".into();
+  dynamo.consumer_group_membership_table_name = "consumer_group_membership".into();
+
+  let mut metadata_store = MetadataStoreConfig::new();
+  metadata_store.backend = Some(metadata_store_config::Backend::Dynamo(dynamo));
+
+  let mut bootstrap = ConsumerIteratorBootstrapConfig::new();
+  bootstrap.runtime = Some(runtime).into();
+  bootstrap.topic = Some(topic).into();
+  bootstrap.blob_store = Some(blob_store).into();
+  bootstrap.metadata_store = Some(metadata_store).into();
+
+  let mut iter = ConsumerConfigFactory::build_iterator_from_proto_config(bootstrap).await?;
 
   iter.start()?;
 
@@ -304,6 +329,10 @@ async fn main() -> Result<()> {
   }
 }
 ```
+
+For advanced/custom deployments (custom discovery or custom stores), use
+`ConsumerConfigFactory::build_iterator(...)` (typed bootstrap config) or
+`ConsumerIteratorImpl::from_runtime_config(...)` (full manual wiring).
 
 ## DynamoDB tables required
 
@@ -347,21 +376,34 @@ Representative attributes:
 - `owner_id`, `generation`, `lease_expiry_ts`, `last_heartbeat_ts`, `committed_cursor`,
   `committed_ts`, `topic`, `group_id`, `virtual_partition_id`
 
-### 4) `topics`
-
-Purpose:
-- Topic control-plane configuration (`partition_count`, `num_writers`, retention, etc.).
-
-Keys:
-- Partition key: `topic_name`
-- Sort key: `sk` = `"__config__"`
-
-Representative attributes:
-- `partition_count`, `num_writers`, `retention_days`, `created_ts`
-
 ### Provisioning note
 
-The broker currently accepts one Dynamo table setting in runtime config (`metadata_store.dynamo.table_name`), while the full production model requires distinct logical data domains listed above. If you need strict table separation now, wire store implementations directly in your application/runtime composition or extend config wiring accordingly.
+Current implementation uses the three logical Dynamo data domains listed above (`blob_segments`,
+`producer_partition_leases`, and `consumer_group_leases`). Consumer-group membership is stored in
+an additional `consumer_group_membership` table. Configure explicit table names in
+`metadata_store.dynamo`:
+- `segment_metadata_table_name`
+- `producer_partition_lease_table_name`
+- `consumer_group_lease_table_name`
+- `consumer_group_membership_table_name`
+
+Context usage:
+- Broker context uses `segment_metadata_table_name` +
+  `producer_partition_lease_table_name`.
+- Consumer context uses `segment_metadata_table_name` +
+  `consumer_group_lease_table_name` + `consumer_group_membership_table_name`.
+
+### 4) `consumer_group_membership`
+
+Purpose:
+- Consumer member liveness used to compute dynamic rebalance membership.
+
+Keys:
+- Partition key: `pk` = `"<topic>#<group_id>"`
+- Sort key: `sk` = `"<member_id>"`
+
+Representative attributes:
+- `member_id`, `lease_expiry_ts`, `last_heartbeat_ts`, `topic`, `group_id`
 
 ## S3 bucket requirements
 

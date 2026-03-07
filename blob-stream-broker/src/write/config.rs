@@ -18,6 +18,7 @@ use blob_stream_metadata_store::{
 use blob_stream_proto::protos::blobstream::v1::config::{
   BlobStoreConfig,
   BrokerConfig,
+  DynamoMetadataStoreConfig,
   MetadataStoreConfig,
   RuntimeConfig,
   TopicConfig,
@@ -34,6 +35,16 @@ const DEFAULT_FLUSH_MAX_DELAY_MS: i64 = 1_000;
 const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_RESERVATION_SIZE: u64 = 1_000;
 const DEFAULT_WINDOW_SIZE_SECONDS: i64 = 300;
+
+#[cfg(test)]
+#[path = "./config_test.rs"]
+mod tests;
+
+#[derive(Clone, Copy, Debug)]
+enum DynamoTablePurpose {
+  SegmentMetadata,
+  ProducerPartitionLeases,
+}
 
 //
 // WriteConfig
@@ -198,11 +209,12 @@ async fn build_producer_partition_lease_store(
   if config.has_dynamo() {
     debug!("using dynamo producer partition lease store backend");
     let dynamo = config.dynamo();
-    let table_name = dynamo.table_name.to_string();
+    let table_name =
+      dynamo_table_name(dynamo, DynamoTablePurpose::ProducerPartitionLeases).to_string();
     let region = dynamo.region.to_string();
     ensure!(
       !table_name.is_empty(),
-      "metadata_store.dynamo.table_name is required"
+      "metadata_store.dynamo.producer_partition_lease_table_name is required"
     );
     ensure!(
       !region.is_empty(),
@@ -366,11 +378,11 @@ async fn build_metadata_store(config: &MetadataStoreConfig) -> Result<Arc<dyn Me
   if config.has_dynamo() {
     debug!("using dynamo metadata store backend");
     let dynamo = config.dynamo();
-    let table_name = dynamo.table_name.to_string();
+    let table_name = dynamo_table_name(dynamo, DynamoTablePurpose::SegmentMetadata).to_string();
     let region = dynamo.region.to_string();
     ensure!(
       !table_name.is_empty(),
-      "metadata_store.dynamo.table_name is required"
+      "metadata_store.dynamo.segment_metadata_table_name is required"
     );
     ensure!(
       !region.is_empty(),
@@ -393,4 +405,13 @@ async fn build_metadata_store(config: &MetadataStoreConfig) -> Result<Arc<dyn Me
   }
 
   Err(anyhow!("metadata_store backend not configured"))
+}
+
+fn dynamo_table_name(config: &DynamoMetadataStoreConfig, purpose: DynamoTablePurpose) -> &str {
+  match purpose {
+    DynamoTablePurpose::SegmentMetadata => config.segment_metadata_table_name.as_str(),
+    DynamoTablePurpose::ProducerPartitionLeases => {
+      config.producer_partition_lease_table_name.as_str()
+    },
+  }
 }

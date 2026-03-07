@@ -689,12 +689,13 @@ Notes:
       RBAC guidance.
 
 - [ ] Milestone 14: Hardening
-  - Broker binary should use rust jemalloc allocator
-  - Consider RAM limits (driven from jemalloc internal metrics) in the broker binary used to apply
-    back pressure.
-  - Consider consumer pre-fetching for data.
-  - Consider whether broker should use disk for buffering incoming segment data instead of all in
-    RAM.
+  - [ ] Broker binary should use rust jemalloc allocator
+  - [ ] Dynamo TTL
+  - [ ] Consider RAM limits (driven from jemalloc internal metrics) in the broker binary used to
+    apply back pressure.
+  - [ ] Consider consumer pre-fetching for data.
+  - [ ] Consider whether broker should use disk for buffering incoming segment data instead of all
+    in RAM.
 
 ## Open Questions
 - None currently; iterate as implementation progresses.
@@ -739,15 +740,6 @@ Notes:
   - coordinator_lease_expiry_ts
   - generation
   - last_heartbeat_ts
-
-### Table: topics
-- PK: topic_name
-- SK: __config__ (single row per topic; SK exists for future extensibility)
-- Attributes:
-  - partition_count
-  - num_writers
-  - created_ts
-  - retention_days (optional, defaults to global config)
 
 ### Table: producer_partition_leases
 - PK: topic#virtual_partition_id (distributed to prevent hot partitions)

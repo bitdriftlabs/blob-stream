@@ -10,6 +10,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupReleaseOutcome,
 };
 use blob_stream_types::{CommittedCursor, VirtualPartitionId};
 use log::info;
@@ -37,6 +38,10 @@ use std::sync::Arc;
 //    - For each locally owned partition, send heartbeat with optional cursor commit.
 //    - On `Renewed`, keep ownership.
 //    - On `HeldByOther` or `Expired`, drop local ownership immediately (fenced).
+//
+// C) Shutdown release (`release_owned`)
+//    - Best-effort explicit release for currently owned partitions.
+//    - This shortens scale-in convergence by avoiding lease-expiry waits.
 //
 // Why this avoids split-brain ownership
 //
@@ -95,6 +100,8 @@ pub trait ConsumerGroupCoordinator: Send {
     now_ts_ms: i64,
     cursors: &HashMap<VirtualPartitionId, u64>,
   ) -> Result<HeartbeatReport>;
+
+  async fn release_owned(&mut self, now_ts_ms: i64) -> Result<Vec<VirtualPartitionId>>;
 
   fn generation(&self) -> u64;
   fn owned_partitions(&self) -> Vec<VirtualPartitionId>;
@@ -277,6 +284,37 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       renewed_partitions: renewed,
       fenced_partitions: fenced,
     })
+  }
+
+  async fn release_owned(&mut self, now_ts_ms: i64) -> Result<Vec<VirtualPartitionId>> {
+    let owned = self.owned.iter().copied().collect::<Vec<_>>();
+    let mut released = Vec::new();
+
+    for partition_id in owned {
+      let key = ConsumerGroupLeaseKey {
+        topic: self.config.topic.to_string(),
+        group_id: self.config.group_id.to_string(),
+        virtual_partition_id: partition_id,
+      };
+
+      let outcome = self
+        .lease_store
+        .release_partition(&key, &self.config.member_id, self.generation, now_ts_ms)
+        .await?;
+
+      match outcome {
+        ConsumerGroupReleaseOutcome::Released => {
+          self.owned.remove(&partition_id);
+          released.push(partition_id);
+        },
+        ConsumerGroupReleaseOutcome::HeldByOther(_) | ConsumerGroupReleaseOutcome::Expired => {
+          self.owned.remove(&partition_id);
+        },
+      }
+    }
+
+    released.sort_unstable();
+    Ok(released)
   }
 
   fn generation(&self) -> u64 {

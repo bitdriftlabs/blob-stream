@@ -18,6 +18,8 @@ use std::collections::HashMap;
 
 mod consumer_group_leases_dynamo;
 mod consumer_group_leases_memory;
+mod consumer_group_membership_dynamo;
+mod consumer_group_membership_memory;
 mod dynamo;
 mod memory;
 mod producer_partition_leases_dynamo;
@@ -25,6 +27,8 @@ mod producer_partition_leases_memory;
 
 pub use consumer_group_leases_dynamo::DynamoConsumerGroupLeaseStore;
 pub use consumer_group_leases_memory::InMemoryConsumerGroupLeaseStore;
+pub use consumer_group_membership_dynamo::DynamoConsumerGroupMembershipStore;
+pub use consumer_group_membership_memory::InMemoryConsumerGroupMembershipStore;
 pub use dynamo::DynamoMetadataStore;
 pub use memory::InMemoryMetadataStore;
 pub use producer_partition_leases_dynamo::DynamoProducerPartitionLeaseStore;
@@ -307,10 +311,19 @@ pub enum ConsumerGroupCommitOutcome {
 }
 
 //
-// ConsumerGroupLeaseStore
+// ConsumerGroupReleaseOutcome
 //
 
-// TODO(mattklein123): Consumers should release the lease on shutdown to speed up convergence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConsumerGroupReleaseOutcome {
+  Released,
+  HeldByOther(ConsumerGroupLease),
+  Expired,
+}
+
+//
+// ConsumerGroupLeaseStore
+//
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
@@ -345,4 +358,52 @@ pub trait ConsumerGroupLeaseStore: Send + Sync {
     now_ts_ms: i64,
     committed_cursor: CommittedCursor,
   ) -> Result<ConsumerGroupCommitOutcome>;
+
+  /// Release a partition lease held by this owner/generation.
+  async fn release_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+  ) -> Result<ConsumerGroupReleaseOutcome>;
+}
+
+//
+// ConsumerGroupMembershipStore
+//
+
+#[cfg_attr(test, mockall::automock)]
+#[async_trait]
+pub trait ConsumerGroupMembershipStore: Send + Sync {
+  /// Register member liveness for this consumer group.
+  async fn register_member(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    now_ts_ms: i64,
+    ttl_ms: i64,
+  ) -> Result<()>;
+
+  /// Heartbeat an existing member liveness entry.
+  async fn heartbeat_member(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    now_ts_ms: i64,
+    ttl_ms: i64,
+  ) -> Result<()>;
+
+  /// Deregister a member from this consumer group.
+  async fn deregister_member(&self, topic: &str, group_id: &str, member_id: &str) -> Result<()>;
+
+  /// List active members at the provided time.
+  async fn list_active_members(
+    &self,
+    topic: &str,
+    group_id: &str,
+    now_ts_ms: i64,
+  ) -> Result<Vec<String>>;
 }

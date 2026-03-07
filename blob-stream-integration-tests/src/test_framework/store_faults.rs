@@ -8,6 +8,8 @@ use blob_stream_metadata_store::{
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupMembershipStore,
+  ConsumerGroupReleaseOutcome,
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
@@ -53,6 +55,7 @@ pub enum StoreFaultOperation {
   ConsumerAssignPartition,
   ConsumerHeartbeatPartition,
   ConsumerCommitCursor,
+  ConsumerReleasePartition,
 }
 
 //
@@ -412,6 +415,7 @@ fn describe_store_operation(operation: StoreFaultOperation) -> &'static str {
     StoreFaultOperation::ConsumerAssignPartition => "consumer_assign_partition",
     StoreFaultOperation::ConsumerHeartbeatPartition => "consumer_heartbeat_partition",
     StoreFaultOperation::ConsumerCommitCursor => "consumer_commit_cursor",
+    StoreFaultOperation::ConsumerReleasePartition => "consumer_release_partition",
   }
 }
 
@@ -868,6 +872,78 @@ pub struct FaultInjectedConsumerGroupLeaseStore {
   controller: StoreFaultController,
 }
 
+//
+// FaultInjectedConsumerGroupMembershipStore
+//
+
+pub struct FaultInjectedConsumerGroupMembershipStore {
+  inner: Arc<dyn ConsumerGroupMembershipStore>,
+  controller: StoreFaultController,
+}
+
+impl FaultInjectedConsumerGroupMembershipStore {
+  pub fn new(
+    inner: Arc<dyn ConsumerGroupMembershipStore>,
+    controller: StoreFaultController,
+  ) -> Self {
+    Self { inner, controller }
+  }
+}
+
+#[async_trait]
+impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore {
+  async fn register_member(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    now_ts_ms: i64,
+    ttl_ms: i64,
+  ) -> Result<()> {
+    let _ = &self.controller;
+    self
+      .inner
+      .register_member(topic, group_id, member_id, now_ts_ms, ttl_ms)
+      .await
+  }
+
+  async fn heartbeat_member(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    now_ts_ms: i64,
+    ttl_ms: i64,
+  ) -> Result<()> {
+    let _ = &self.controller;
+    self
+      .inner
+      .heartbeat_member(topic, group_id, member_id, now_ts_ms, ttl_ms)
+      .await
+  }
+
+  async fn deregister_member(&self, topic: &str, group_id: &str, member_id: &str) -> Result<()> {
+    let _ = &self.controller;
+    self
+      .inner
+      .deregister_member(topic, group_id, member_id)
+      .await
+  }
+
+  async fn list_active_members(
+    &self,
+    topic: &str,
+    group_id: &str,
+    now_ts_ms: i64,
+  ) -> Result<Vec<String>> {
+    let _ = &self.controller;
+    self
+      .inner
+      .list_active_members(topic, group_id, now_ts_ms)
+      .await
+  }
+}
+
 impl FaultInjectedConsumerGroupLeaseStore {
   pub fn new(inner: Arc<dyn ConsumerGroupLeaseStore>, controller: StoreFaultController) -> Self {
     Self { inner, controller }
@@ -1036,6 +1112,45 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
           ConsumerGroupCommitOutcome::Committed(_) => "committed".to_string(),
           ConsumerGroupCommitOutcome::HeldByOther(_) => "held_by_other".to_string(),
           ConsumerGroupCommitOutcome::Expired => "expired".to_string(),
+        }),
+      )
+      .await;
+    result
+  }
+
+  async fn release_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+  ) -> Result<ConsumerGroupReleaseOutcome> {
+    let key_str = format!("{}#{}", key.partition_key(), key.sort_key());
+    self
+      .controller
+      .record_operation_outcome(
+        StoreFaultOperation::ConsumerReleasePartition,
+        key_str.clone(),
+        "attempt",
+        None,
+      )
+      .await;
+
+    let result = self
+      .inner
+      .release_partition(key, owner_id, generation, now_ts_ms)
+      .await;
+
+    self
+      .controller
+      .record_operation_outcome(
+        StoreFaultOperation::ConsumerReleasePartition,
+        key_str,
+        if result.is_ok() { "ok" } else { "error" },
+        result.as_ref().ok().map(|outcome| match outcome {
+          ConsumerGroupReleaseOutcome::Released => "released".to_string(),
+          ConsumerGroupReleaseOutcome::HeldByOther(_) => "held_by_other".to_string(),
+          ConsumerGroupReleaseOutcome::Expired => "expired".to_string(),
         }),
       )
       .await;

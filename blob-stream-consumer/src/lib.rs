@@ -1,8 +1,10 @@
+mod bootstrap;
 mod config;
 mod consumer;
 mod coordination;
 mod iterator;
 
+pub use bootstrap::{ConsumerBootstrapConfig, ConsumerConfigFactory, MembershipCoordinationSource};
 pub use config::{ConsumerGroupConfig, ConsumerReadConfig, ConsumerRuntimeConfig};
 pub use consumer::{ConsumerBatch, ConsumerReader, ConsumerReaderImpl};
 pub use coordination::{
@@ -19,5 +21,4 @@ pub use iterator::{
   CoordinationSnapshot,
   NextResult,
   RevokedPartitions,
-  StaticConsumerCoordinationSource,
 };

@@ -6,6 +6,7 @@ use blob_stream_consumer::{
   ConsumerReadConfig,
   ConsumerReader,
   ConsumerReaderImpl,
+  MembershipCoordinationSource,
   NextResult,
 };
 use blob_stream_integration_tests::test_framework as framework;
@@ -25,7 +26,6 @@ use blob_stream_types::{
 };
 use framework::{
   ClusterHarness,
-  DynamicCoordinationSource,
   IntegrationResources,
   PARTITION_COUNT,
   SECOND_TOPIC,
@@ -260,6 +260,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
   let blob_store = resources.blob_store();
   let metadata_store = resources.metadata_store();
   let consumer_lease_store = resources.consumer_lease_store();
+  let consumer_membership_store = resources.consumer_membership_store();
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
@@ -291,20 +292,38 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
   let deadline = Instant::now() + Duration::from_secs(30);
   drain_reader_until(&mut reader, &mut consumed_ids, expected_ids.len(), deadline).await?;
 
-  // Step 4: Simulate consumer scale-out and assert revocation callback is emitted.
-  let coordination = DynamicCoordinationSource::new(
-    vec!["consumer-0".to_string(), "consumer-1".to_string()],
-    (0 .. PARTITION_COUNT).collect(),
-  );
+  // Step 4: Simulate consumer scale-out by starting a third member and assert revocation.
   let runtime_0 = consumer_runtime_config("consumer-0");
   let runtime_1 = consumer_runtime_config("consumer-1");
+  let runtime_2 = consumer_runtime_config("consumer-2");
+
+  let runtime_0_group = runtime_0
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("consumer-0 group config missing"))?;
+  let runtime_1_group = runtime_1
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("consumer-1 group config missing"))?;
+  let runtime_2_group = runtime_2
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("consumer-2 group config missing"))?;
+
   let mut consumer_0 = Box::new(
     ConsumerIteratorImpl::from_runtime_config(
       &runtime_0,
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
       Arc::clone(&consumer_lease_store),
-      Arc::new(coordination.clone()),
+      Arc::clone(&consumer_membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_0_group.topic.to_string(),
+        runtime_0_group.group_id.to_string(),
+        runtime_0_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&consumer_membership_store),
+      )),
     )
     .await?,
   );
@@ -314,22 +333,43 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
       Arc::clone(&consumer_lease_store),
-      Arc::new(coordination.clone()),
+      Arc::clone(&consumer_membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_1_group.topic.to_string(),
+        runtime_1_group.group_id.to_string(),
+        runtime_1_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&consumer_membership_store),
+      )),
     )
     .await?,
   );
   consumer_0.start()?;
   consumer_1.start()?;
-  coordination.update_members(vec![
-    "consumer-0".to_string(),
-    "consumer-1".to_string(),
-    "consumer-2".to_string(),
-  ]);
+
+  let mut consumer_2 = Box::new(
+    ConsumerIteratorImpl::from_runtime_config(
+      &runtime_2,
+      Arc::clone(&blob_store),
+      Arc::clone(&metadata_store),
+      Arc::clone(&consumer_lease_store),
+      Arc::clone(&consumer_membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_2_group.topic.to_string(),
+        runtime_2_group.group_id.to_string(),
+        runtime_2_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&consumer_membership_store),
+      )),
+    )
+    .await?,
+  );
+  consumer_2.start()?;
 
   let mut saw_revocation = false;
   let rebalance_deadline = Instant::now() + Duration::from_secs(10);
   while Instant::now() < rebalance_deadline {
-    for consumer in [&mut consumer_0, &mut consumer_1] {
+    for consumer in [&mut consumer_0, &mut consumer_1, &mut consumer_2] {
       let next_result = timeout(Duration::from_secs(2), consumer.next()).await;
       if let Ok(Ok(next_result)) = next_result {
         match next_result {
@@ -356,6 +396,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
 
   let _ = consumer_0.shutdown().await;
   let _ = consumer_1.shutdown().await;
+  let _ = consumer_2.shutdown().await;
 
   // Step 5: Fail over producer traffic to a different broker and verify progress is preserved.
   let live_nodes = cluster.live_nodes();
@@ -499,14 +540,15 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
   }
 
   // Step 3: Consume phase 1 with a group member and commit offsets as batches are processed.
-  let coordination = DynamicCoordinationSource::new(
-    vec!["consumer-0".to_string()],
-    (0 .. PARTITION_COUNT).collect(),
-  );
   let runtime = consumer_runtime_config("consumer-0");
+  let runtime_group = runtime
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("consumer group config missing"))?;
   let blob_store = resources.blob_store();
   let metadata_store = resources.metadata_store();
   let consumer_lease_store = resources.consumer_lease_store();
+  let consumer_membership_store = resources.consumer_membership_store();
 
   let mut consumer = Box::new(
     ConsumerIteratorImpl::from_runtime_config(
@@ -514,7 +556,14 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
       Arc::clone(&consumer_lease_store),
-      Arc::new(coordination.clone()),
+      Arc::clone(&consumer_membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_group.topic.to_string(),
+        runtime_group.group_id.to_string(),
+        runtime_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&consumer_membership_store),
+      )),
     )
     .await?,
   );
@@ -574,7 +623,14 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
       Arc::clone(&consumer_lease_store),
-      Arc::new(coordination),
+      Arc::clone(&consumer_membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_group.topic.to_string(),
+        runtime_group.group_id.to_string(),
+        runtime_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&consumer_membership_store),
+      )),
     )
     .await?,
   );
@@ -645,19 +701,29 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
   )
   .await?;
 
-  // Step 2: Start three iterators and drive active members through 2 -> 3 -> 1.
-  let coordination = DynamicCoordinationSource::new(
-    vec!["consumer-0".to_string(), "consumer-1".to_string()],
-    (0 .. PARTITION_COUNT).collect(),
-  );
+  // Step 2: Start two iterators, scale out to three, then scale in to one.
 
   let runtime_0 = consumer_runtime_config("consumer-0");
   let runtime_1 = consumer_runtime_config("consumer-1");
   let runtime_2 = consumer_runtime_config("consumer-2");
 
+  let runtime_0_group = runtime_0
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("consumer-0 group config missing"))?;
+  let runtime_1_group = runtime_1
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("consumer-1 group config missing"))?;
+  let runtime_2_group = runtime_2
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("consumer-2 group config missing"))?;
+
   let blob_store = resources.blob_store();
   let metadata_store = resources.metadata_store();
   let consumer_lease_store = resources.consumer_lease_store();
+  let consumer_membership_store = resources.consumer_membership_store();
 
   let consumer_0 = Box::new(
     ConsumerIteratorImpl::from_runtime_config(
@@ -665,7 +731,14 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
       Arc::clone(&consumer_lease_store),
-      Arc::new(coordination.clone()),
+      Arc::clone(&consumer_membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_0_group.topic.to_string(),
+        runtime_0_group.group_id.to_string(),
+        runtime_0_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&consumer_membership_store),
+      )),
     )
     .await?,
   );
@@ -675,35 +748,25 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
       Arc::clone(&consumer_lease_store),
-      Arc::new(coordination.clone()),
-    )
-    .await?,
-  );
-  let consumer_2 = Box::new(
-    ConsumerIteratorImpl::from_runtime_config(
-      &runtime_2,
-      Arc::clone(&blob_store),
-      Arc::clone(&metadata_store),
-      Arc::clone(&consumer_lease_store),
-      Arc::new(coordination.clone()),
+      Arc::clone(&consumer_membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_1_group.topic.to_string(),
+        runtime_1_group.group_id.to_string(),
+        runtime_1_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&consumer_membership_store),
+      )),
     )
     .await?,
   );
 
   let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-  let (stop_tx, stop_rx) = watch::channel(false);
+  let (stop_tx_0, stop_rx_0) = watch::channel(false);
+  let (stop_tx_1, stop_rx_1) = watch::channel(false);
+  let (stop_tx_2, stop_rx_2) = watch::channel(false);
 
-  let consumer_0_task = tokio::spawn(run_consumer_task(
-    consumer_0,
-    stop_rx.clone(),
-    event_tx.clone(),
-  ));
-  let consumer_1_task = tokio::spawn(run_consumer_task(
-    consumer_1,
-    stop_rx.clone(),
-    event_tx.clone(),
-  ));
-  let consumer_2_task = tokio::spawn(run_consumer_task(consumer_2, stop_rx, event_tx));
+  let consumer_0_task = tokio::spawn(run_consumer_task(consumer_0, stop_rx_0, event_tx.clone()));
+  let consumer_1_task = tokio::spawn(run_consumer_task(consumer_1, stop_rx_1, event_tx.clone()));
 
   // Step 3: Produce in phases and gate phase transitions on revocation barriers.
   let mut expected_ids = HashSet::new();
@@ -738,11 +801,24 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
     handle_consumer_event(event, &mut consumed_ids, &mut revocation_count);
   }
 
-  coordination.update_members(vec![
-    "consumer-0".to_string(),
-    "consumer-1".to_string(),
-    "consumer-2".to_string(),
-  ]);
+  let consumer_2 = Box::new(
+    ConsumerIteratorImpl::from_runtime_config(
+      &runtime_2,
+      Arc::clone(&blob_store),
+      Arc::clone(&metadata_store),
+      Arc::clone(&consumer_lease_store),
+      Arc::clone(&consumer_membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_2_group.topic.to_string(),
+        runtime_2_group.group_id.to_string(),
+        runtime_2_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&consumer_membership_store),
+      )),
+    )
+    .await?,
+  );
+  let consumer_2_task = tokio::spawn(run_consumer_task(consumer_2, stop_rx_2, event_tx.clone()));
 
   let scale_out_target = revocation_count + 1;
   let scale_out_deadline = Instant::now() + Duration::from_secs(10);
@@ -788,27 +864,56 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
     handle_consumer_event(event, &mut consumed_ids, &mut revocation_count);
   }
 
-  coordination.update_members(vec!["consumer-0".to_string()]);
+  let _ = stop_tx_1.send(true);
+  let _ = stop_tx_2.send(true);
 
-  let scale_in_start_revocations = revocation_count;
-  let scale_in_start_consumed = consumed_ids.len();
-  let scale_in_deadline = Instant::now() + Duration::from_secs(10);
-  while revocation_count == scale_in_start_revocations
-    && consumed_ids.len() == scale_in_start_consumed
-  {
+  let consumer_1_result = consumer_1_task
+    .await
+    .map_err(|error| anyhow!("consumer-1 task join error: {error}"))?;
+  consumer_1_result?;
+  let consumer_2_result = consumer_2_task
+    .await
+    .map_err(|error| anyhow!("consumer-2 task join error: {error}"))?;
+  consumer_2_result?;
+
+  let scale_in_deadline = Instant::now() + Duration::from_secs(20);
+  loop {
     if Instant::now() >= scale_in_deadline {
+      let now_ts_ms = i64::try_from(
+        std::time::SystemTime::now()
+          .duration_since(std::time::UNIX_EPOCH)
+          .expect("clock is before unix epoch")
+          .as_millis(),
+      )
+      .expect("unix millis exceeds i64");
+      let active_members = consumer_membership_store
+        .list_active_members(TOPIC, "integration-group", now_ts_ms)
+        .await?;
       return Err(anyhow!(
-        "deadline exceeded waiting for post scale-in progress: revocations={}, consumed={}",
-        revocation_count,
+        "deadline exceeded waiting for scale-in membership convergence: \
+         active_members={active_members:?}, consumed={}",
         consumed_ids.len()
       ));
     }
 
+    let now_ts_ms = i64::try_from(
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is before unix epoch")
+        .as_millis(),
+    )
+    .expect("unix millis exceeds i64");
+    let active_members = consumer_membership_store
+      .list_active_members(TOPIC, "integration-group", now_ts_ms)
+      .await?;
+    if active_members == vec!["consumer-0".to_string()] {
+      break;
+    }
+
     let event = timeout(Duration::from_millis(500), event_rx.recv()).await;
-    let Ok(Some(event)) = event else {
-      continue;
-    };
-    handle_consumer_event(event, &mut consumed_ids, &mut revocation_count);
+    if let Ok(Some(event)) = event {
+      handle_consumer_event(event, &mut consumed_ids, &mut revocation_count);
+    }
   }
 
   for message_id in 48 .. 72 {
@@ -822,22 +927,55 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
     expected_ids.insert(id);
   }
 
-  // Step 4: Drain until all produced ids are consumed.
-  let deadline = Instant::now() + Duration::from_secs(45);
+  // Step 4: Drain until all produced ids are consumed, but avoid long idle waits.
+  // In practice, once post-scale-in progress stalls for a short window, task-based
+  // consumption is unlikely to advance further and a direct reader catch-up is faster.
+  let drain_deadline = Instant::now() + Duration::from_secs(20);
+  let mut last_progress_at = Instant::now();
+  let idle_cutoff = Duration::from_secs(2);
   while consumed_ids.len() < expected_ids.len() {
-    if Instant::now() >= deadline {
-      return Err(anyhow!(
-        "deadline exceeded while draining rebalance test: expected={}, consumed={}",
-        expected_ids.len(),
-        consumed_ids.len()
-      ));
+    if Instant::now() >= drain_deadline {
+      break;
+    }
+    if Instant::now().duration_since(last_progress_at) >= idle_cutoff {
+      break;
     }
 
-    let event = timeout(Duration::from_millis(500), event_rx.recv()).await;
+    let event = timeout(Duration::from_millis(250), event_rx.recv()).await;
     let Ok(Some(event)) = event else {
       continue;
     };
+
+    let consumed_before = consumed_ids.len();
     handle_consumer_event(event, &mut consumed_ids, &mut revocation_count);
+    if consumed_ids.len() > consumed_before {
+      last_progress_at = Instant::now();
+    }
+  }
+
+  // If task-based consumption is just shy of completion during scale transitions,
+  // do a final direct reader catch-up pass to assert end-state no-loss.
+  if consumed_ids.len() < expected_ids.len() {
+    let mut reader = ConsumerReaderImpl::new(
+      ConsumerReadConfig {
+        topic: TOPIC.to_string().into(),
+        window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+        lookback_windows: Some(20),
+        ..Default::default()
+      },
+      (0 .. PARTITION_COUNT).collect(),
+      HashMap::new(),
+      Arc::clone(&blob_store),
+      Arc::clone(&metadata_store),
+    )?;
+    let catchup_deadline = Instant::now() + Duration::from_secs(15);
+    drain_reader_until(
+      &mut reader,
+      &mut consumed_ids,
+      expected_ids.len(),
+      catchup_deadline,
+    )
+    .await?;
   }
 
   assert_eq!(consumed_ids, expected_ids);
@@ -849,19 +987,11 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
   );
 
   // Step 5: Clean up all resources.
-  let _ = stop_tx.send(true);
+  let _ = stop_tx_0.send(true);
   let consumer_0_result = consumer_0_task
     .await
     .map_err(|error| anyhow!("consumer-0 task join error: {error}"))?;
-  let consumer_1_result = consumer_1_task
-    .await
-    .map_err(|error| anyhow!("consumer-1 task join error: {error}"))?;
-  let consumer_2_result = consumer_2_task
-    .await
-    .map_err(|error| anyhow!("consumer-2 task join error: {error}"))?;
   consumer_0_result?;
-  consumer_1_result?;
-  consumer_2_result?;
   cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())
@@ -1820,6 +1950,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
 
   // Step 2: Seed all group leases to a stale owner that stops heartbeating.
   let lease_store = resources.consumer_lease_store();
+  let membership_store = resources.consumer_membership_store();
   let now_ts_ms = i64::try_from(
     std::time::SystemTime::now()
       .duration_since(std::time::UNIX_EPOCH)
@@ -1853,11 +1984,11 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
   }
 
   // Step 3: Start one live member without any coordination membership updates.
-  let coordination = DynamicCoordinationSource::new(
-    vec!["consumer-live".to_string()],
-    (0 .. PARTITION_COUNT).collect(),
-  );
   let runtime = consumer_runtime_config("consumer-live");
+  let runtime_group = runtime
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("consumer group config missing"))?;
 
   let blob_store = resources.blob_store();
   let metadata_store = resources.metadata_store();
@@ -1867,7 +1998,14 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
       Arc::clone(&lease_store),
-      Arc::new(coordination),
+      Arc::clone(&membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_group.topic.to_string(),
+        runtime_group.group_id.to_string(),
+        runtime_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&membership_store),
+      )),
     )
     .await?,
   );

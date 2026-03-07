@@ -1,4 +1,8 @@
 use async_trait::async_trait;
+use blob_stream_types::{
+  now_unix_millis as shared_now_unix_millis,
+  now_unix_seconds as shared_now_unix_seconds,
+};
 use std::time::Duration;
 use tokio::time::sleep as tokio_sleep;
 
@@ -18,13 +22,7 @@ pub struct TokioTestRuntime;
 #[async_trait]
 impl TestRuntime for TokioTestRuntime {
   fn now_unix_millis(&self) -> i64 {
-    i64::try_from(
-      std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock is before unix epoch")
-        .as_millis(),
-    )
-    .expect("unix millis exceeds i64")
+    shared_now_unix_millis()
   }
 
   async fn sleep(&self, duration: Duration) {
@@ -37,7 +35,7 @@ pub fn now_unix_millis() -> i64 {
 }
 
 pub fn now_unix_seconds() -> i64 {
-  now_unix_millis() / 1_000
+  shared_now_unix_seconds()
 }
 
 fn default_test_runtime() -> &'static TokioTestRuntime {

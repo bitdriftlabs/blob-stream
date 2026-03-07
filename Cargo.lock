@@ -1370,6 +1370,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-config",
+ "aws-sdk-dynamodb",
+ "aws-sdk-s3",
+ "aws-types",
  "bd-log",
  "bd-server-stats",
  "blob-stream-blob-store",
@@ -1462,6 +1466,7 @@ dependencies = [
 name = "blob-stream-types"
 version = "0.1.0"
 dependencies = [
+ "bd-time",
  "blob-stream-blob-store",
  "serde",
  "serde_json",

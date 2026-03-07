@@ -4,6 +4,7 @@ use crate::{
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupReleaseOutcome,
   DynamoConsumerGroupLeaseStore,
 };
 use anyhow::{Context, Result, anyhow};
@@ -227,5 +228,65 @@ async fn heartbeat_fences_other_members() -> Result<()> {
 
   client.delete_table().table_name(table_name).send().await?;
 
+  Ok(())
+}
+
+#[tokio::test]
+async fn release_partition_allows_immediate_takeover() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
+  create_leases_table(&client, &table_name).await?;
+
+  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone());
+
+  let key = ConsumerGroupLeaseKey {
+    topic: "topic-a".to_string(),
+    group_id: "group-a".to_string(),
+    virtual_partition_id: 1,
+  };
+
+  store
+    .assign_partition(key.clone(), "member-a".to_string(), 2, 1000, 100)
+    .await?;
+
+  let release = store.release_partition(&key, "member-a", 2, 1010).await?;
+  assert_eq!(release, ConsumerGroupReleaseOutcome::Released);
+
+  let reassigned = store
+    .assign_partition(key, "member-b".to_string(), 3, 1010, 100)
+    .await?;
+  assert!(matches!(
+    reassigned,
+    ConsumerGroupAssignmentOutcome::Assigned(_)
+  ));
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn release_partition_rejects_stale_owner_or_generation() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
+  create_leases_table(&client, &table_name).await?;
+
+  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone());
+  let key = ConsumerGroupLeaseKey {
+    topic: "topic-a".to_string(),
+    group_id: "group-a".to_string(),
+    virtual_partition_id: 1,
+  };
+
+  store
+    .assign_partition(key.clone(), "member-a".to_string(), 2, 1000, 100)
+    .await?;
+
+  let release = store.release_partition(&key, "member-b", 2, 1010).await?;
+  assert!(matches!(
+    release,
+    ConsumerGroupReleaseOutcome::HeldByOther(_)
+  ));
+
+  client.delete_table().table_name(table_name).send().await?;
   Ok(())
 }

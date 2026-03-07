@@ -4,6 +4,7 @@ use crate::{
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupReleaseOutcome,
   InMemoryConsumerGroupLeaseStore,
 };
 use blob_stream_types::CommittedCursor;
@@ -129,5 +130,61 @@ async fn heartbeat_fences_other_members() {
   assert!(matches!(
     outcome,
     ConsumerGroupHeartbeatOutcome::HeldByOther(_)
+  ));
+}
+
+#[tokio::test]
+async fn release_partition_allows_immediate_takeover() {
+  let store = InMemoryConsumerGroupLeaseStore::new();
+
+  let key = ConsumerGroupLeaseKey {
+    topic: "topic-a".to_string(),
+    group_id: "group-a".to_string(),
+    virtual_partition_id: 1,
+  };
+
+  store
+    .assign_partition(key.clone(), "member-a".to_string(), 2, 1000, 100)
+    .await
+    .expect("assign lease");
+
+  let release = store
+    .release_partition(&key, "member-a", 2, 1010)
+    .await
+    .expect("release lease");
+  assert_eq!(release, ConsumerGroupReleaseOutcome::Released);
+
+  let reassigned = store
+    .assign_partition(key, "member-b".to_string(), 3, 1010, 100)
+    .await
+    .expect("assign lease after release");
+  assert!(matches!(
+    reassigned,
+    ConsumerGroupAssignmentOutcome::Assigned(_)
+  ));
+}
+
+#[tokio::test]
+async fn release_partition_rejects_stale_owner_or_generation() {
+  let store = InMemoryConsumerGroupLeaseStore::new();
+
+  let key = ConsumerGroupLeaseKey {
+    topic: "topic-a".to_string(),
+    group_id: "group-a".to_string(),
+    virtual_partition_id: 1,
+  };
+
+  store
+    .assign_partition(key.clone(), "member-a".to_string(), 2, 1000, 100)
+    .await
+    .expect("assign lease");
+
+  let release = store
+    .release_partition(&key, "member-b", 2, 1010)
+    .await
+    .expect("release lease");
+  assert!(matches!(
+    release,
+    ConsumerGroupReleaseOutcome::HeldByOther(_)
   ));
 }

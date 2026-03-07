@@ -6,6 +6,7 @@ use crate::config::{
   ConsumerGroupConfig,
   ConsumerRuntimeConfig,
   consumer_heartbeat_interval_ms,
+  consumer_lease_duration_ms,
   consumer_rebalance_interval_ms,
   stats_scope,
   validate_runtime_config,
@@ -22,13 +23,17 @@ use async_trait::async_trait;
 use bd_log::warn_every;
 use bd_server_stats::stats::{Collector, Scope};
 use blob_stream_blob_store::BlobStore;
-use blob_stream_metadata_store::{ConsumerGroupLeaseStore, MetadataStore};
-use blob_stream_types::VirtualPartitionId;
+use blob_stream_metadata_store::{
+  ConsumerGroupLeaseStore,
+  ConsumerGroupMembershipStore,
+  MetadataStore,
+};
+use blob_stream_types::{VirtualPartitionId, now_unix_millis, now_unix_seconds};
 use log::{info, trace};
 use prometheus::{Histogram, IntCounter};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use time::ext::NumericalDuration;
 use tokio::sync::oneshot;
 
@@ -86,35 +91,6 @@ pub struct CoordinationSnapshot {
 #[async_trait]
 pub trait ConsumerCoordinationSource: Send + Sync {
   async fn snapshot(&self) -> Result<CoordinationSnapshot>;
-}
-
-//
-// StaticConsumerCoordinationSource
-//
-
-pub struct StaticConsumerCoordinationSource {
-  members: Vec<String>,
-  virtual_partitions: Vec<VirtualPartitionId>,
-}
-
-impl StaticConsumerCoordinationSource {
-  #[must_use]
-  pub fn new(members: Vec<String>, virtual_partitions: Vec<VirtualPartitionId>) -> Self {
-    Self {
-      members,
-      virtual_partitions,
-    }
-  }
-}
-
-#[async_trait]
-impl ConsumerCoordinationSource for StaticConsumerCoordinationSource {
-  async fn snapshot(&self) -> Result<CoordinationSnapshot> {
-    Ok(CoordinationSnapshot {
-      members: self.members.clone(),
-      virtual_partitions: self.virtual_partitions.clone(),
-    })
-  }
 }
 
 //
@@ -176,6 +152,7 @@ pub struct ConsumerIteratorImpl {
   group_config: ConsumerGroupConfig,
   reader: ConsumerReaderImpl,
   coordinator: Box<dyn ConsumerGroupCoordinator>,
+  membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   coordination_source: Arc<dyn ConsumerCoordinationSource>,
   metrics: ConsumerIteratorMetrics,
   started: bool,
@@ -194,6 +171,7 @@ impl ConsumerIteratorImpl {
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
     lease_store: Arc<dyn ConsumerGroupLeaseStore>,
+    membership_store: Arc<dyn ConsumerGroupMembershipStore>,
     coordination_source: Arc<dyn ConsumerCoordinationSource>,
   ) -> Result<Self> {
     validate_runtime_config(runtime)?;
@@ -217,13 +195,24 @@ impl ConsumerIteratorImpl {
       metadata_store,
     )?;
     let coordinator = ConsumerGroupCoordinatorImpl::new(group_config.clone(), lease_store)?;
-    let now_ts_ms = current_unix_millis();
+    let now_ts_ms = now_unix_millis();
+
+    membership_store
+      .register_member(
+        &group_config.topic,
+        &group_config.group_id,
+        &group_config.member_id,
+        now_ts_ms,
+        consumer_lease_duration_ms(&group_config),
+      )
+      .await?;
 
     let metrics_scope = Collector::default().scope(stats_scope(runtime));
     let mut iterator = Self {
       group_config,
       reader,
       coordinator: Box::new(coordinator),
+      membership_store,
       coordination_source,
       metrics: ConsumerIteratorMetrics::new(&metrics_scope.scope("consumer")),
       started: false,
@@ -347,6 +336,17 @@ impl ConsumerIteratorImpl {
   }
 
   async fn heartbeat(&mut self, now_ts_ms: i64) -> Result<HeartbeatReport> {
+    self
+      .membership_store
+      .heartbeat_member(
+        &self.group_config.topic,
+        &self.group_config.group_id,
+        &self.group_config.member_id,
+        now_ts_ms,
+        consumer_lease_duration_ms(&self.group_config),
+      )
+      .await?;
+
     let report = self
       .coordinator
       .heartbeat_and_commit(now_ts_ms, &self.pending_commits)
@@ -400,7 +400,7 @@ impl ConsumerIterator for ConsumerIteratorImpl {
         ));
       }
 
-      let now_ts_ms = current_unix_millis();
+      let now_ts_ms = now_unix_millis();
       if let Some(revoked) = self.maybe_rebalance(now_ts_ms).await? {
         return Ok(revoked);
       }
@@ -427,8 +427,8 @@ impl ConsumerIterator for ConsumerIteratorImpl {
       let read_started_at = Instant::now();
       let mut read_attempt: u8 = 0;
       let batches = loop {
-        let now_unix_seconds = current_unix_seconds();
-        match self.reader.read_available(now_unix_seconds).await {
+        let now_s = now_unix_seconds();
+        match self.reader.read_available(now_s).await {
           Ok(batches) => break batches,
           Err(error) => {
             if read_attempt == 0 {
@@ -482,7 +482,7 @@ impl ConsumerIterator for ConsumerIteratorImpl {
       "consumer iterator must be started before commit"
     );
     let started_at = Instant::now();
-    let report = self.heartbeat(current_unix_millis()).await?;
+    let report = self.heartbeat(now_unix_millis()).await?;
     self
       .metrics
       .commit_latency_seconds
@@ -492,12 +492,26 @@ impl ConsumerIterator for ConsumerIteratorImpl {
 
   async fn shutdown(mut self: Box<Self>) -> Result<()> {
     if self.started {
-      let _ = self.commit().await?;
+      // Attempt commit and explicit lease release before membership deregistration.
+      // Releasing leases proactively shortens rebalance convergence on graceful shutdown.
+      let commit_result = self.commit().await;
+      let release_result = self.coordinator.release_owned(now_unix_millis()).await;
+      let _ = self
+        .membership_store
+        .deregister_member(
+          &self.group_config.topic,
+          &self.group_config.group_id,
+          &self.group_config.member_id,
+        )
+        .await;
       self.started = false;
       info!(
         "consumer iterator shutdown: topic={}, group_id={}, member_id={}",
         self.group_config.topic, self.group_config.group_id, self.group_config.member_id
       );
+
+      commit_result?;
+      release_result?;
     }
     Ok(())
   }
@@ -514,20 +528,4 @@ impl ConsumerIterator for ConsumerIteratorImpl {
     );
     Ok(())
   }
-}
-
-fn current_unix_seconds() -> i64 {
-  SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .map_or(0, |duration| {
-      i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
-    })
-}
-
-fn current_unix_millis() -> i64 {
-  SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .map_or(0, |duration| {
-      i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-    })
 }

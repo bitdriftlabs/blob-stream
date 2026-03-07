@@ -26,7 +26,7 @@ pub use config::{
   producer_topic_named,
   producer_topic_named_with_writers,
 };
-pub use discovery::{DynamicBrokerDiscovery, DynamicCoordinationSource};
+pub use discovery::DynamicBrokerDiscovery;
 pub use event_log::{TestEvent, TestEventLog, TestEventMatcher};
 pub use helpers::{drain_reader_until, produce_message, produce_message_for_topic};
 pub use resources::IntegrationResources;

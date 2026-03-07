@@ -8,9 +8,10 @@ version = "0.1.0"
 doctest = false
 
 [dependencies]
+bd-time.workspace      = true
 blob-stream-blob-store = { path = "../blob-stream-blob-store" }
-serde.workspace = true
-time.workspace  = true
+serde.workspace        = true
+time.workspace         = true
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -2,6 +2,7 @@ use crate::test_framework::runtime::runtime_sleep;
 use crate::test_framework::store_faults::{
   FaultInjectedBlobStore,
   FaultInjectedConsumerGroupLeaseStore,
+  FaultInjectedConsumerGroupMembershipStore,
   FaultInjectedMetadataStore,
   FaultInjectedProducerPartitionLeaseStore,
   StoreFaultController,
@@ -20,7 +21,9 @@ use aws_sdk_s3::Client as S3Client;
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore};
 use blob_stream_metadata_store::{
   ConsumerGroupLeaseStore,
+  ConsumerGroupMembershipStore,
   DynamoConsumerGroupLeaseStore,
+  DynamoConsumerGroupMembershipStore,
   DynamoMetadataStore,
   DynamoProducerPartitionLeaseStore,
   MetadataStore,
@@ -54,6 +57,7 @@ pub struct IntegrationResources {
   metadata_table: String,
   producer_lease_table: String,
   consumer_lease_table: String,
+  consumer_membership_table: String,
 }
 
 impl IntegrationResources {
@@ -82,11 +86,13 @@ impl IntegrationResources {
     let metadata_table = format!("blob_segments_it_{suffix}");
     let producer_lease_table = format!("producer_leases_it_{suffix}");
     let consumer_lease_table = format!("consumer_leases_it_{suffix}");
+    let consumer_membership_table = format!("consumer_membership_it_{suffix}");
     let bucket = format!("blob-stream-it-{}", Uuid::new_v4().simple());
 
     create_table_pk_sk(&dynamo, &metadata_table).await?;
     create_table_pk_only(&dynamo, &producer_lease_table).await?;
     create_table_pk_sk(&dynamo, &consumer_lease_table).await?;
+    create_table_pk_sk(&dynamo, &consumer_membership_table).await?;
     create_bucket(&s3, &bucket).await?;
     verify_s3_roundtrip(&s3, &bucket).await?;
 
@@ -102,6 +108,7 @@ impl IntegrationResources {
       metadata_table,
       producer_lease_table,
       consumer_lease_table,
+      consumer_membership_table,
     })
   }
 
@@ -146,6 +153,18 @@ impl IntegrationResources {
     ))
   }
 
+  pub fn consumer_membership_store(&self) -> Arc<dyn ConsumerGroupMembershipStore> {
+    let inner: Arc<dyn ConsumerGroupMembershipStore> =
+      Arc::new(DynamoConsumerGroupMembershipStore::new(
+        self.dynamo.clone(),
+        self.consumer_membership_table.clone(),
+      ));
+    Arc::new(FaultInjectedConsumerGroupMembershipStore::new(
+      inner,
+      self.store_fault_controller.clone(),
+    ))
+  }
+
   pub fn store_fault_controller(&self) -> StoreFaultController {
     self.store_fault_controller.clone()
   }
@@ -168,6 +187,12 @@ impl IntegrationResources {
       .dynamo
       .delete_table()
       .table_name(&self.consumer_lease_table)
+      .send()
+      .await;
+    let _ = self
+      .dynamo
+      .delete_table()
+      .table_name(&self.consumer_membership_table)
       .send()
       .await;
 

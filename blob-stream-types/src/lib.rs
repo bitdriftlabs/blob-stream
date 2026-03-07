@@ -2,12 +2,23 @@
 #[path = "./types_test.rs"]
 mod tests;
 
+use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 pub use blob_stream_blob_store::ByteRange;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 pub type VirtualPartitionId = u32;
+
+#[must_use]
+pub fn now_unix_millis() -> i64 {
+  SystemTimeProvider.now().unix_timestamp_ms()
+}
+
+#[must_use]
+pub fn now_unix_seconds() -> i64 {
+  SystemTimeProvider.now().unix_timestamp()
+}
 
 #[must_use]
 pub fn logical_partition_for_key(record_key: &[u8], partition_count: u32) -> u32 {

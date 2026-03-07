@@ -9,6 +9,7 @@ use crate::{
   ConsumerGroupLease,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupReleaseOutcome,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -331,6 +332,70 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
         } else {
           debug!("consumer lease(dynamo) commit result: held_by_other");
           Ok(ConsumerGroupCommitOutcome::HeldByOther(lease))
+        }
+      },
+      Err(error) => Err(error.into()),
+    }
+  }
+
+  async fn release_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+  ) -> Result<ConsumerGroupReleaseOutcome> {
+    trace!(
+      "consumer lease(dynamo) release: table={}, topic={}, group_id={}, partition={}, \
+       owner_id={}, generation={}",
+      self.table_name, key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
+    );
+
+    let mut values = HashMap::new();
+    values.insert(
+      ":owner".to_string(),
+      AttributeValue::S(owner_id.to_string()),
+    );
+    values.insert(
+      ":generation".to_string(),
+      AttributeValue::N(generation.to_string()),
+    );
+    values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+    let condition = format!(
+      "{ATTR_OWNER} = :owner AND {ATTR_GENERATION} = :generation AND {ATTR_LEASE_EXPIRES} > :now"
+    );
+
+    let response = self
+      .client
+      .delete_item()
+      .table_name(&self.table_name)
+      .key(ATTR_PK, AttributeValue::S(key.partition_key()))
+      .key(ATTR_SK, AttributeValue::S(key.sort_key()))
+      .condition_expression(condition)
+      .set_expression_attribute_values(Some(values))
+      .return_values(ReturnValue::AllOld)
+      .send()
+      .await;
+
+    match response {
+      Ok(_) => {
+        debug!("consumer lease(dynamo) release result: released");
+        Ok(ConsumerGroupReleaseOutcome::Released)
+      },
+      Err(SdkError::ServiceError(service_error))
+        if service_error.err().is_conditional_check_failed_exception() =>
+      {
+        let Some(lease) = self.get_lease(key).await? else {
+          debug!("consumer lease(dynamo) release result: expired");
+          return Ok(ConsumerGroupReleaseOutcome::Expired);
+        };
+
+        if lease.lease_expiration_ts_ms <= now_ts_ms {
+          debug!("consumer lease(dynamo) release result: expired");
+          Ok(ConsumerGroupReleaseOutcome::Expired)
+        } else {
+          debug!("consumer lease(dynamo) release result: held_by_other");
+          Ok(ConsumerGroupReleaseOutcome::HeldByOther(lease))
         }
       },
       Err(error) => Err(error.into()),

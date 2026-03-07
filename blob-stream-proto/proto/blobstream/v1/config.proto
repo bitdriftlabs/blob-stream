@@ -100,12 +100,18 @@ message InMemoryMetadataStoreConfig {}
 
 // DynamoDB-backed metadata store configuration.
 message DynamoMetadataStoreConfig {
-  // DynamoDB table name for segment metadata.
-  string table_name = 1;
   // AWS region (e.g., "us-east-1").
-  string region = 2;
+  string region = 1;
   // Optional endpoint override for local testing (e.g., LocalStack).
-  string endpoint = 3;
+  string endpoint = 2;
+  // DynamoDB table name for segment metadata (`blob_segments`).
+  string segment_metadata_table_name = 3;
+  // DynamoDB table name for producer partition leases (`producer_partition_leases`).
+  string producer_partition_lease_table_name = 4;
+  // DynamoDB table name for consumer group leases (`consumer_group_leases`).
+  string consumer_group_lease_table_name = 5;
+  // DynamoDB table name for consumer group membership (`consumer_group_membership`).
+  string consumer_group_membership_table_name = 6;
 }
 
 // Metadata store configuration selection.
@@ -206,4 +212,16 @@ message ConsumerRuntimeConfig {
   ConsumerGroupConfig group = 2;
   // Optional stats scope prefix.
   string stats_scope = 3;
+}
+
+// Single-message bootstrap config for creating a production-ready consumer iterator.
+message ConsumerIteratorBootstrapConfig {
+  // Consumer runtime behavior/tuning.
+  ConsumerRuntimeConfig runtime = 1;
+  // Topic shape used to derive virtual partitions.
+  TopicConfig topic = 2;
+  // Blob storage backend used by consumer reads.
+  BlobStoreConfig blob_store = 3;
+  // Metadata and lease storage backend used by reads/coordination.
+  MetadataStoreConfig metadata_store = 4;
 }

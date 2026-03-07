@@ -10,8 +10,12 @@ use super::{
 use crate::config::{ConsumerGroupConfig, ConsumerReadConfig, ConsumerRuntimeConfig};
 use blob_stream_blob_store::{BlobKey, BlobStore, InMemoryBlobStore};
 use blob_stream_metadata_store::{
+  ConsumerGroupAssignmentOutcome,
+  ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupMembershipStore,
   InMemoryConsumerGroupLeaseStore,
+  InMemoryConsumerGroupMembershipStore,
   InMemoryMetadataStore,
   MetadataStore,
   SegmentMetadata,
@@ -132,6 +136,8 @@ async fn next_returns_revocation_until_completed() {
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
     Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
 
   let runtime = runtime_config();
   let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
@@ -144,6 +150,7 @@ async fn next_returns_revocation_until_completed() {
     blob_store,
     metadata_store,
     lease_store,
+    membership_store,
     source.clone(),
   )
   .await
@@ -185,6 +192,8 @@ async fn next_delivers_batch_and_commit_renews() {
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
     Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
 
   let now_window = (SystemTime::now()
     .duration_since(UNIX_EPOCH)
@@ -217,6 +226,7 @@ async fn next_delivers_batch_and_commit_renews() {
     blob_store,
     metadata_store,
     lease_store,
+    membership_store,
     source,
   )
   .await
@@ -238,4 +248,55 @@ async fn next_delivers_batch_and_commit_renews() {
   let report = iterator.commit().await.unwrap();
   assert_eq!(report.renewed_partitions, vec![3]);
   assert!(report.fenced_partitions.is_empty());
+}
+
+#[tokio::test]
+async fn shutdown_releases_owned_partitions() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let concrete_lease_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> = concrete_lease_store.clone();
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+
+  let runtime = runtime_config();
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![3],
+    }));
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+    &runtime,
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+  )
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  Box::new(iterator).shutdown().await.unwrap();
+
+  let now_ts_ms = i64::try_from(
+    SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap()
+      .as_millis(),
+  )
+  .unwrap_or(i64::MAX);
+  let key = ConsumerGroupLeaseKey {
+    topic: "telemetry".to_string(),
+    group_id: "group-a".to_string(),
+    virtual_partition_id: 3,
+  };
+  let reassigned = concrete_lease_store
+    .assign_partition(key, "member-b".to_string(), 2, now_ts_ms, 1_000)
+    .await
+    .unwrap();
+  assert!(matches!(
+    reassigned,
+    ConsumerGroupAssignmentOutcome::Assigned(_)
+  ));
 }

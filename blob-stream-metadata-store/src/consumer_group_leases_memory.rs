@@ -9,6 +9,7 @@ use crate::{
   ConsumerGroupLease,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupReleaseOutcome,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -186,6 +187,38 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     Ok(ConsumerGroupCommitOutcome::Committed(
       state.to_lease(key.clone()),
     ))
+  }
+
+  async fn release_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+  ) -> Result<ConsumerGroupReleaseOutcome> {
+    trace!(
+      "consumer lease(memory) release: topic={}, group_id={}, partition={}, owner_id={}, \
+       generation={}",
+      key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
+    );
+
+    let mut guard = self.leases.write().await;
+    let Some(state) = guard.get(key) else {
+      return Ok(ConsumerGroupReleaseOutcome::Expired);
+    };
+
+    if state.is_expired(now_ts_ms) {
+      return Ok(ConsumerGroupReleaseOutcome::Expired);
+    }
+
+    if state.owner_id != owner_id || state.generation != generation {
+      return Ok(ConsumerGroupReleaseOutcome::HeldByOther(
+        state.to_lease(key.clone()),
+      ));
+    }
+
+    guard.remove(key);
+    Ok(ConsumerGroupReleaseOutcome::Released)
   }
 }
 

@@ -7,6 +7,7 @@ use crate::coordination::{
   cooperative_sticky_assignment,
 };
 use blob_stream_metadata_store::{
+  ConsumerGroupAssignmentOutcome,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
   InMemoryConsumerGroupLeaseStore,
@@ -126,4 +127,47 @@ async fn heartbeat_detects_fencing_by_new_generation() {
   assert!(report.renewed_partitions.is_empty());
   assert_eq!(report.fenced_partitions, vec![7]);
   assert!(coordinator.owned_partitions().is_empty());
+}
+
+#[tokio::test]
+async fn release_owned_releases_partitions_for_fast_takeover() {
+  let concrete_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let store: Arc<dyn ConsumerGroupLeaseStore> = concrete_store.clone();
+  let mut coordinator = ConsumerGroupCoordinatorImpl::new(
+    ConsumerGroupConfig {
+      topic: "topic-a".to_string().into(),
+      group_id: "group-a".to_string().into(),
+      member_id: "member-a".to_string().into(),
+      lease_duration_ms: Some(1_000),
+      heartbeat_interval_ms: Some(50),
+      rebalance_interval_ms: Some(50),
+      ..Default::default()
+    },
+    Arc::clone(&store),
+  )
+  .unwrap();
+
+  coordinator
+    .rebalance(vec!["member-a".to_string()], vec![7], 1_000)
+    .await
+    .unwrap();
+  assert_eq!(coordinator.owned_partitions(), vec![7]);
+
+  let released = coordinator.release_owned(1_010).await.unwrap();
+  assert_eq!(released, vec![7]);
+  assert!(coordinator.owned_partitions().is_empty());
+
+  let key = ConsumerGroupLeaseKey {
+    topic: "topic-a".to_string(),
+    group_id: "group-a".to_string(),
+    virtual_partition_id: 7,
+  };
+  let reassigned = concrete_store
+    .assign_partition(key, "member-b".to_string(), 2, 1_010, 1_000)
+    .await
+    .unwrap();
+  assert!(matches!(
+    reassigned,
+    ConsumerGroupAssignmentOutcome::Assigned(_)
+  ));
 }
