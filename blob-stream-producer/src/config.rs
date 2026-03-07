@@ -1,10 +1,3 @@
-// blob-stream - producer config
-// Copyright Bitdrift, Inc. All rights reserved.
-//
-// Use of this source code is governed by a source available license that can be found in the
-// LICENSE file or at:
-// https://polyformproject.org/wp-content/uploads/2020/06/PolyForm-Shield-1.0.0.txt
-
 use anyhow::{Result, anyhow, ensure};
 use bd_grpc::compression::Compression;
 use blob_stream_broker_discovery::k8s::K8sServiceBrokerDiscovery;
