@@ -291,6 +291,19 @@ message ConsumerReadConfig {
   // Optional max idle poll delay in milliseconds for exponential backoff.
   // Default when unset: disabled (no max cap).
   optional uint64 max_idle_poll_delay_ms = 5;
+
+  // Soft target RAM budget for iterator-side prefetch buffering.
+  // Default when unset: 67,108,864 bytes (64 MiB).
+  //
+  // The consumer iterator prefetches decoded batches in a background task and serves
+  // `next()` from this memory buffer. This value caps that buffer as a soft target:
+  // - The iterator may admit one additional batch that crosses the target boundary.
+  // - After crossing the boundary, prefetch pauses until buffered bytes drain below target.
+  //
+  // Tuning guidance:
+  // - Increase to reduce foreground `next()` latency and improve burst absorption.
+  // - Decrease to reduce process memory footprint when running many consumers per host.
+  optional uint64 prefetch_max_bytes = 6 [(validate.rules).uint64.gt = 0];
 }
 
 // Consumer group lease and heartbeat settings.

@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+use tokio::time::{Duration, sleep, timeout};
 
 struct MutableCoordinationSource {
   snapshot: Arc<Mutex<CoordinationSnapshot>>,
@@ -113,10 +114,17 @@ async fn write_segment(
 }
 
 fn runtime_config() -> ConsumerRuntimeConfig {
+  runtime_config_with_prefetch_max_bytes(None)
+}
+
+fn runtime_config_with_prefetch_max_bytes(
+  prefetch_max_bytes: Option<u64>,
+) -> ConsumerRuntimeConfig {
   let mut read = ConsumerReadConfig::new();
   read.topic = "telemetry".to_string().into();
   read.window_size_seconds = Some(300);
   read.lookback_windows = Some(2);
+  read.prefetch_max_bytes = prefetch_max_bytes;
 
   let mut group = ConsumerGroupConfig::new();
   group.topic = "telemetry".to_string().into();
@@ -130,6 +138,22 @@ fn runtime_config() -> ConsumerRuntimeConfig {
   runtime.read = Some(read).into();
   runtime.group = Some(group).into();
   runtime
+}
+
+async fn wait_for_prefetch_buffer_len(iterator: &ConsumerIteratorImpl, expected_min: usize) {
+  for _ in 0 .. 40 {
+    let len = iterator.prefetch_buffer.lock().await.batches.len();
+    if len >= expected_min {
+      return;
+    }
+    sleep(Duration::from_millis(25)).await;
+  }
+
+  let len = iterator.prefetch_buffer.lock().await.batches.len();
+  assert!(
+    len >= expected_min,
+    "prefetch buffer length {len} did not reach expected minimum {expected_min}"
+  );
 }
 
 fn metrics_scope() -> bd_server_stats::stats::Scope {
@@ -331,4 +355,179 @@ async fn shutdown_releases_owned_partitions() {
     reassigned,
     ConsumerGroupAssignmentOutcome::Assigned(_)
   ));
+}
+
+#[tokio::test]
+async fn prefetch_soft_budget_pauses_and_resumes_after_drain() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+
+  let now_window = (SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap()
+    .as_secs()
+    .try_into()
+    .unwrap_or(i64::MAX)
+    / 300)
+    * 300;
+
+  for snowflake_id in 1 ..= 3 {
+    let payload_byte = u8::try_from(snowflake_id).unwrap();
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      now_window,
+      snowflake_id,
+      7,
+      SeqRange {
+        start: (snowflake_id - 1) * 2 + 1,
+        end: snowflake_id * 2,
+      },
+      vec![
+        Record::new(vec![payload_byte; 6], now_window * 1_000),
+        Record::new(vec![payload_byte; 6], now_window * 1_000 + 1),
+      ],
+    )
+    .await;
+  }
+
+  // One batch carries 12 payload bytes, so this budget should hold only one batch at a time.
+  let runtime = runtime_config_with_prefetch_max_bytes(Some(16));
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![7],
+    }));
+
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+    &runtime,
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+  )
+  .await
+  .unwrap();
+  iterator.start().unwrap();
+
+  wait_for_prefetch_buffer_len(&iterator, 1).await;
+  let buffered_before = iterator.prefetch_buffer.lock().await.batches.len();
+  assert_eq!(buffered_before, 1);
+
+  let first = timeout(Duration::from_secs(2), iterator.next())
+    .await
+    .unwrap()
+    .unwrap();
+  let first_batch = match first {
+    NextResult::Batch(batch) => batch,
+    NextResult::Revoked(_) => panic!("expected batch"),
+  };
+  assert_eq!(first_batch.virtual_partition_id, 7);
+
+  // Drain should allow worker to admit another pending batch.
+  wait_for_prefetch_buffer_len(&iterator, 1).await;
+  let buffered_after = iterator.prefetch_buffer.lock().await.batches.len();
+  assert_eq!(buffered_after, 1);
+
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn revocation_drops_buffered_batches_for_revoked_partitions() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+
+  let now_window = (SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap()
+    .as_secs()
+    .try_into()
+    .unwrap_or(i64::MAX)
+    / 300)
+    * 300;
+
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    now_window,
+    1,
+    0,
+    SeqRange { start: 1, end: 1 },
+    vec![Record::new(vec![1], now_window * 1_000)],
+  )
+  .await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    now_window,
+    2,
+    1,
+    SeqRange { start: 1, end: 1 },
+    vec![Record::new(vec![2], now_window * 1_000)],
+  )
+  .await;
+
+  let runtime = runtime_config();
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![0, 1],
+  }));
+
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+    &runtime,
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source.clone(),
+    metrics_scope(),
+  )
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  wait_for_prefetch_buffer_len(&iterator, 2).await;
+
+  source
+    .update(CoordinationSnapshot {
+      members: vec!["member-a".to_string(), "member-b".to_string()],
+      virtual_partitions: vec![0, 1],
+    })
+    .await;
+
+  let revoked = iterator.next().await.unwrap();
+  let revoked = match revoked {
+    NextResult::Revoked(revoked) => revoked,
+    NextResult::Batch(_) => panic!("expected revocation callback"),
+  };
+  let revoked_partitions = revoked.partitions();
+  assert_eq!(revoked_partitions.len(), 1);
+  let revoked_partition = revoked_partitions[0];
+
+  {
+    let buffer = iterator.prefetch_buffer.lock().await;
+    assert!(
+      buffer
+        .batches
+        .iter()
+        .all(|batch| batch.virtual_partition_id != revoked_partition),
+      "revoked partition batch was not removed from prefetch buffer"
+    );
+  }
+
+  revoked.complete().await;
+  Box::new(iterator).shutdown().await.unwrap();
 }

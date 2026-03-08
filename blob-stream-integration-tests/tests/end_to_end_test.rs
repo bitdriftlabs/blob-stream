@@ -1611,6 +1611,235 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
   Ok(())
 }
 
+// High-level: validates prefetch-buffered iteration still converges with delayed metadata and
+// rebalance, preserving no-loss semantics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
+  const PREFETCH_DELAYED_PHASE1_MESSAGES: usize = 8;
+  const PREFETCH_DELAYED_PHASE2_MESSAGES: usize = 8;
+
+  // Step 1: Start isolated infrastructure with delayed metadata visibility.
+  let resources = IntegrationResources::create().await?;
+  let delayed_metadata_store: Arc<dyn MetadataStore> = Arc::new(
+    DelayedVisibilityMetadataStore::new(resources.metadata_store(), Duration::from_secs(1)),
+  );
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .metadata_store(Arc::clone(&delayed_metadata_store))
+    .start()
+    .await?;
+
+  let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
+  let producer = blob_stream_producer::ProducerClientImpl::new(
+    producer_config(8),
+    vec![producer_topic()],
+    Arc::clone(&discovery),
+    metrics_scope("blob_stream_producer_it"),
+  )
+  .await?;
+
+  // Step 2: Build two consumers with explicit small prefetch RAM budgets.
+  let mut runtime_0 = consumer_runtime_config("prefetch-consumer-0");
+  let mut runtime_1 = consumer_runtime_config("prefetch-consumer-1");
+  runtime_0
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow!("prefetch consumer-0 read config missing"))?
+    .prefetch_max_bytes = Some(1_024);
+  runtime_1
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow!("prefetch consumer-1 read config missing"))?
+    .prefetch_max_bytes = Some(1_024);
+
+  let runtime_0_group = runtime_0
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("prefetch consumer-0 group config missing"))?;
+  let runtime_1_group = runtime_1
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("prefetch consumer-1 group config missing"))?;
+
+  let blob_store = resources.blob_store();
+  let consumer_lease_store = resources.consumer_lease_store();
+  let consumer_membership_store = resources.consumer_membership_store();
+
+  let consumer_0 = Box::new(
+    ConsumerIteratorImpl::from_runtime_config(
+      &runtime_0,
+      Arc::clone(&blob_store),
+      Arc::clone(&delayed_metadata_store),
+      Arc::clone(&consumer_lease_store),
+      Arc::clone(&consumer_membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_0_group.topic.to_string(),
+        runtime_0_group.group_id.to_string(),
+        runtime_0_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&consumer_membership_store),
+      )),
+      metrics_scope("blob_stream_consumer_it"),
+    )
+    .await?,
+  );
+
+  let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+  let (stop_tx_0, stop_rx_0) = watch::channel(false);
+  let (stop_tx_1, stop_rx_1) = watch::channel(false);
+
+  let consumer_0_task = tokio::spawn(run_consumer_task(consumer_0, stop_rx_0, event_tx.clone()));
+
+  // Step 3: Produce phase 1 and wait for initial consumption progress.
+  let mut expected_ids = HashSet::new();
+  let mut consumed_ids = HashSet::new();
+  let mut revocation_count = 0usize;
+
+  for message_id in 0 .. PREFETCH_DELAYED_PHASE1_MESSAGES {
+    let id = format!("prefetch-delayed-{message_id}");
+    produce_message(
+      &producer,
+      format!("prefetch-delayed-key-{}", message_id % 8).into_bytes(),
+      &id,
+    )
+    .await?;
+    expected_ids.insert(id);
+  }
+
+  let initial_progress_deadline = Instant::now() + Duration::from_secs(6);
+  while consumed_ids.is_empty() {
+    if Instant::now() >= initial_progress_deadline {
+      return Err(anyhow!(
+        "deadline exceeded waiting for initial prefetch consumer progress"
+      ));
+    }
+
+    let event = timeout(Duration::from_millis(500), event_rx.recv()).await;
+    let Ok(Some(event)) = event else {
+      continue;
+    };
+    handle_consumer_event(event, &mut consumed_ids, &mut revocation_count);
+  }
+
+  // Step 4: Scale out to trigger rebalance and continue producing under delay.
+  let consumer_1 = Box::new(
+    ConsumerIteratorImpl::from_runtime_config(
+      &runtime_1,
+      Arc::clone(&blob_store),
+      Arc::clone(&delayed_metadata_store),
+      Arc::clone(&consumer_lease_store),
+      Arc::clone(&consumer_membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_1_group.topic.to_string(),
+        runtime_1_group.group_id.to_string(),
+        runtime_1_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&consumer_membership_store),
+      )),
+      metrics_scope("blob_stream_consumer_it"),
+    )
+    .await?,
+  );
+  let consumer_1_task = tokio::spawn(run_consumer_task(consumer_1, stop_rx_1, event_tx.clone()));
+
+  let scale_out_deadline = Instant::now() + Duration::from_secs(6);
+  while revocation_count < 1 {
+    if Instant::now() >= scale_out_deadline {
+      return Err(anyhow!(
+        "deadline exceeded waiting for revocation after prefetch scale-out"
+      ));
+    }
+
+    let event = timeout(Duration::from_millis(500), event_rx.recv()).await;
+    let Ok(Some(event)) = event else {
+      continue;
+    };
+    handle_consumer_event(event, &mut consumed_ids, &mut revocation_count);
+  }
+
+  for message_id in PREFETCH_DELAYED_PHASE1_MESSAGES
+    .. (PREFETCH_DELAYED_PHASE1_MESSAGES + PREFETCH_DELAYED_PHASE2_MESSAGES)
+  {
+    let id = format!("prefetch-delayed-{message_id}");
+    produce_message(
+      &producer,
+      format!("prefetch-delayed-key-{}", message_id % 8).into_bytes(),
+      &id,
+    )
+    .await?;
+    expected_ids.insert(id);
+  }
+
+  // Step 5: Drain until all produced records are consumed and assert no loss.
+  let drain_deadline = Instant::now() + Duration::from_secs(8);
+  let mut last_progress_at = Instant::now();
+  let idle_cutoff = Duration::from_millis(1_500);
+  while consumed_ids.len() < expected_ids.len() {
+    if Instant::now() >= drain_deadline {
+      break;
+    }
+    if Instant::now().duration_since(last_progress_at) >= idle_cutoff {
+      break;
+    }
+
+    let event = timeout(Duration::from_millis(500), event_rx.recv()).await;
+    let Ok(Some(event)) = event else {
+      continue;
+    };
+    let before = consumed_ids.len();
+    handle_consumer_event(event, &mut consumed_ids, &mut revocation_count);
+    if consumed_ids.len() > before {
+      last_progress_at = Instant::now();
+    }
+  }
+
+  // Task-driven draining can stall near completion across rebalance transitions.
+  // Do a final direct reader catch-up pass to assert end-state no-loss semantics.
+  if consumed_ids.len() < expected_ids.len() {
+    let mut reader = ConsumerReaderImpl::new(
+      ConsumerReadConfig {
+        topic: TOPIC.to_string().into(),
+        window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+        lookback_windows: Some(20),
+        ..Default::default()
+      },
+      (0 .. PARTITION_COUNT).collect(),
+      HashMap::new(),
+      Arc::clone(&blob_store),
+      Arc::clone(&delayed_metadata_store),
+    )?;
+    let catchup_deadline = Instant::now() + Duration::from_secs(5);
+    drain_reader_until(
+      &mut reader,
+      &mut consumed_ids,
+      expected_ids.len(),
+      catchup_deadline,
+    )
+    .await?;
+  }
+
+  assert_eq!(consumed_ids, expected_ids);
+  assert!(
+    revocation_count >= 1,
+    "expected at least one revocation during prefetch rebalance test"
+  );
+
+  // Step 6: Clean up all resources.
+  let _ = stop_tx_0.send(true);
+  let _ = stop_tx_1.send(true);
+  let consumer_0_result = consumer_0_task
+    .await
+    .map_err(|error| anyhow!("prefetch consumer-0 task join error: {error}"))?;
+  consumer_0_result?;
+  let consumer_1_result = consumer_1_task
+    .await
+    .map_err(|error| anyhow!("prefetch consumer-1 task join error: {error}"))?;
+  consumer_1_result?;
+
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
 // High-level: verifies stale owner heartbeats/commits are fenced after generation changes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {

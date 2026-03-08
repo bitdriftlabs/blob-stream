@@ -14,6 +14,7 @@ use log::{debug, trace};
 const DEFAULT_WINDOW_SIZE_SECONDS: i64 = 300;
 const DEFAULT_LOOKBACK_WINDOWS: u32 = 3;
 const DEFAULT_IDLE_POLL_DELAY_MS: u64 = 250;
+const DEFAULT_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: i64 = 10_000;
 const DEFAULT_REBALANCE_INTERVAL_MS: i64 = 10_000;
@@ -48,6 +49,14 @@ pub fn consumer_idle_poll_delay_ms(config: &ConsumerReadConfig) -> u64 {
 /// Return the optional max idle poll delay used by exponential backoff.
 pub fn consumer_max_idle_poll_delay_ms(config: &ConsumerReadConfig) -> Option<u64> {
   config.max_idle_poll_delay_ms
+}
+
+#[must_use]
+/// Return the soft-target prefetch RAM budget in bytes.
+pub fn consumer_prefetch_max_bytes(config: &ConsumerReadConfig) -> u64 {
+  config
+    .prefetch_max_bytes
+    .unwrap_or(DEFAULT_PREFETCH_MAX_BYTES)
 }
 
 #[must_use]

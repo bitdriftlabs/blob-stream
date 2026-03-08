@@ -3300,6 +3300,8 @@ pub struct ConsumerReadConfig {
     pub idle_poll_delay_ms: ::std::option::Option<u64>,
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.max_idle_poll_delay_ms)
     pub max_idle_poll_delay_ms: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.prefetch_max_bytes)
+    pub prefetch_max_bytes: ::std::option::Option<u64>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.ConsumerReadConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -3317,7 +3319,7 @@ impl ConsumerReadConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(5);
+        let mut fields = ::std::vec::Vec::with_capacity(6);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "topic",
@@ -3343,6 +3345,11 @@ impl ConsumerReadConfig {
             "max_idle_poll_delay_ms",
             |m: &ConsumerReadConfig| { &m.max_idle_poll_delay_ms },
             |m: &mut ConsumerReadConfig| { &mut m.max_idle_poll_delay_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "prefetch_max_bytes",
+            |m: &ConsumerReadConfig| { &m.prefetch_max_bytes },
+            |m: &mut ConsumerReadConfig| { &mut m.prefetch_max_bytes },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ConsumerReadConfig>(
             "ConsumerReadConfig",
@@ -3377,6 +3384,9 @@ impl ::protobuf::Message for ConsumerReadConfig {
                 40 => {
                     self.max_idle_poll_delay_ms = ::std::option::Option::Some(is.read_uint64()?);
                 },
+                48 => {
+                    self.prefetch_max_bytes = ::std::option::Option::Some(is.read_uint64()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -3404,6 +3414,9 @@ impl ::protobuf::Message for ConsumerReadConfig {
         if let Some(v) = self.max_idle_poll_delay_ms {
             my_size += ::protobuf::rt::uint64_size(5, v);
         }
+        if let Some(v) = self.prefetch_max_bytes {
+            my_size += ::protobuf::rt::uint64_size(6, v);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -3424,6 +3437,9 @@ impl ::protobuf::Message for ConsumerReadConfig {
         }
         if let Some(v) = self.max_idle_poll_delay_ms {
             os.write_uint64(5, v)?;
+        }
+        if let Some(v) = self.prefetch_max_bytes {
+            os.write_uint64(6, v)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -3447,6 +3463,7 @@ impl ::protobuf::Message for ConsumerReadConfig {
         self.lookback_windows = ::std::option::Option::None;
         self.idle_poll_delay_ms = ::std::option::Option::None;
         self.max_idle_poll_delay_ms = ::std::option::Option::None;
+        self.prefetch_max_bytes = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -3457,6 +3474,7 @@ impl ::protobuf::Message for ConsumerReadConfig {
             lookback_windows: ::std::option::Option::None,
             idle_poll_delay_ms: ::std::option::Option::None,
             max_idle_poll_delay_ms: ::std::option::Option::None,
+            prefetch_max_bytes: ::std::option::Option::None,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -4164,7 +4182,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x08\xfaB\x05\x8a\x01\x02\x10\x01\x12L\n\tdiscovery\x18\x02\x20\x01(\x0b\
     2$.blobstream.v1.BrokerDiscoveryConfigR\tdiscoveryB\x08\xfaB\x05\x8a\x01\
     \x02\x10\x01\x12<\n\x06topics\x18\x03\x20\x03(\x0b2\x1a.blobstream.v1.To\
-    picConfigR\x06topicsB\x08\xfaB\x05\x92\x01\x02\x08\x01\"\xfd\x02\n\x12Co\
+    picConfigR\x06topicsB\x08\xfaB\x05\x92\x01\x02\x08\x01\"\xd0\x03\n\x12Co\
     nsumerReadConfig\x12\x1d\n\x05topic\x18\x01\x20\x01(\tR\x05topicB\x07\
     \xfaB\x04r\x02\x10\x01\x12<\n\x13window_size_seconds\x18\x02\x20\x01(\
     \x03H\0R\x11windowSizeSecondsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\x01\x127\
@@ -4172,9 +4190,11 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \xfaB\x04*\x02\x20\0\x88\x01\x01\x129\n\x12idle_poll_delay_ms\x18\x04\
     \x20\x01(\x04H\x02R\x0fidlePollDelayMsB\x07\xfaB\x042\x02\x20\0\x88\x01\
     \x01\x127\n\x16max_idle_poll_delay_ms\x18\x05\x20\x01(\x04H\x03R\x12maxI\
-    dlePollDelayMs\x88\x01\x01B\x16\n\x14_window_size_secondsB\x13\n\x11_loo\
-    kback_windowsB\x15\n\x13_idle_poll_delay_msB\x19\n\x17_max_idle_poll_del\
-    ay_ms\"\x86\x03\n\x13ConsumerGroupConfig\x12\x1d\n\x05topic\x18\x01\x20\
+    dlePollDelayMs\x88\x01\x01\x12:\n\x12prefetch_max_bytes\x18\x06\x20\x01(\
+    \x04H\x04R\x10prefetchMaxBytesB\x07\xfaB\x042\x02\x20\0\x88\x01\x01B\x16\
+    \n\x14_window_size_secondsB\x13\n\x11_lookback_windowsB\x15\n\x13_idle_p\
+    oll_delay_msB\x19\n\x17_max_idle_poll_delay_msB\x15\n\x13_prefetch_max_b\
+    ytes\"\x86\x03\n\x13ConsumerGroupConfig\x12\x1d\n\x05topic\x18\x01\x20\
     \x01(\tR\x05topicB\x07\xfaB\x04r\x02\x10\x01\x12\"\n\x08group_id\x18\x02\
     \x20\x01(\tR\x07groupIdB\x07\xfaB\x04r\x02\x10\x01\x12$\n\tmember_id\x18\
     \x03\x20\x01(\tR\x08memberIdB\x07\xfaB\x04r\x02\x10\x01\x128\n\x11lease_\
