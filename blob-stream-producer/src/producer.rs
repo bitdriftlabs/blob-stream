@@ -527,44 +527,50 @@ async fn send_batch_with_retry(
   let mut previous_owner: Option<String> = None;
   let started_at = Instant::now();
   loop {
-    let membership = membership_rx.borrow().clone();
-    let Some(broker) = owner_for_partition(&batch.topic, batch.virtual_partition_id, &membership)
-    else {
-      metrics.no_brokers.inc();
-      metrics.failures.inc();
-      metrics
-        .send_latency_seconds
-        .observe(started_at.elapsed().as_secs_f64());
-      warn_every!(
-        15.seconds(),
-        "producer no broker owner: topic={}, virtual_partition_id={}, membership_nodes={}",
-        batch.topic,
-        batch.virtual_partition_id,
-        membership.nodes.len()
-      );
+    let Some((broker_node_id, broker_address)) = ({
+      let membership = membership_rx.borrow();
+      owner_for_partition(&batch.topic, batch.virtual_partition_id, &membership).map_or_else(
+        || {
+          metrics.no_brokers.inc();
+          metrics.failures.inc();
+          metrics
+            .send_latency_seconds
+            .observe(started_at.elapsed().as_secs_f64());
+          warn_every!(
+            15.seconds(),
+            "producer no broker owner: topic={}, virtual_partition_id={}, membership_nodes={}",
+            batch.topic,
+            batch.virtual_partition_id,
+            membership.nodes.len()
+          );
+          None
+        },
+        |broker| Some((broker.node_id.clone(), broker.address.clone())),
+      )
+    }) else {
       return Err(ProducerError::NoBrokersAvailable);
     };
 
     if previous_owner
       .as_deref()
-      .is_some_and(|old| old != broker.node_id)
+      .is_some_and(|old| old != broker_node_id)
     {
       debug!(
         "producer routing changed after retry: topic={}, virtual_partition_id={}, from={}, to={}",
         batch.topic,
         batch.virtual_partition_id,
         previous_owner.as_deref().unwrap_or_default(),
-        broker.node_id
+        broker_node_id
       );
     }
-    previous_owner = Some(broker.node_id.clone());
+    previous_owner = Some(broker_node_id);
 
     trace!(
       "send attempt: topic={}, virtual_partition_id={}, attempt={}, broker={}",
       batch.topic,
       batch.virtual_partition_id,
       attempt.saturating_add(1),
-      broker.address
+      broker_address
     );
 
     let request = ProduceBatchRequest {
@@ -574,7 +580,7 @@ async fn send_batch_with_retry(
       ..Default::default()
     };
 
-    let response = transport.produce_batch(&broker.address, request).await;
+    let response = transport.produce_batch(&broker_address, request).await;
     let current_error = match response {
       Ok(response) => {
         let status = response.status.enum_value_or_default();
@@ -746,12 +752,20 @@ impl ProducerState {
     max_batch_records: usize,
     max_batch_bytes: usize,
   ) -> Option<BufferedBatch> {
-    let key = (record.topic.clone(), record.virtual_partition_id);
-    let buffer = self.buffers.entry(key.clone()).or_default();
-    buffer.push(record.proto_record, record.waiter);
+    let BufferedRecord {
+      topic,
+      virtual_partition_id,
+      proto_record,
+      waiter,
+    } = record;
+    let buffer = self
+      .buffers
+      .entry((topic.clone(), virtual_partition_id))
+      .or_default();
+    buffer.push(proto_record, waiter);
 
     if buffer.should_flush_by_size(max_batch_records, max_batch_bytes) {
-      return buffer.take_batch(&key.0, key.1);
+      return buffer.take_batch(&topic, virtual_partition_id);
     }
 
     None

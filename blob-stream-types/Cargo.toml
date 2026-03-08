@@ -10,6 +10,7 @@ doctest = true
 [dependencies]
 bd-time.workspace      = true
 blob-stream-blob-store = { path = "../blob-stream-blob-store" }
+blob-stream-proto      = { path = "../blob-stream-proto" }
 serde.workspace        = true
 time.workspace         = true
 

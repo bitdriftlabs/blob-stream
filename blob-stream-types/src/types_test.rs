@@ -1,29 +1,13 @@
 use super::*;
 
 #[test]
-fn record_batch_roundtrip() {
-  let batch = RecordBatch::new(
-    42,
-    vec![
-      Record::new(vec![1, 2, 3], 1_700_000_000_000),
-      Record::new(vec![4, 5], 1_700_000_000_500),
-    ],
-  );
-
-  let json = serde_json::to_string(&batch).expect("serialize record batch");
-  let decoded: RecordBatch = serde_json::from_str(&json).expect("deserialize record batch");
-
-  assert_eq!(batch, decoded);
-}
-
-#[test]
 fn record_batch_summary() {
   let batch = RecordBatch::new(
     7,
     vec![
-      Record::new(vec![1, 2, 3, 4], 1_700_000_000_123),
-      Record::new(vec![9], 1_700_000_000_999),
-      Record::new(vec![5, 6], 1_699_999_999_999),
+      new_record(vec![1, 2, 3, 4], 1_700_000_000_123),
+      new_record(vec![9], 1_700_000_000_999),
+      new_record(vec![5, 6], 1_699_999_999_999),
     ],
   );
 

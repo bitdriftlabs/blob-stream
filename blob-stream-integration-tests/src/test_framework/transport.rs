@@ -9,7 +9,6 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchResponse,
   ProduceStatus,
 };
-use blob_stream_types::Record;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -503,11 +502,7 @@ impl ProducerBrokerTransport for InMemoryProducerTransport {
       let write_request = WriteRequest {
         topic: request.topic.to_string(),
         virtual_partition_id: request.virtual_partition_id,
-        records: request
-          .records
-          .iter()
-          .map(|record| Record::new(record.payload.to_vec(), record.event_ts_ms))
-          .collect(),
+        records: request.records.clone(),
       };
 
       let response = match write_engine.produce_batch(write_request).await {

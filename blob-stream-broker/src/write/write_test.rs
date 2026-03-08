@@ -12,7 +12,7 @@ use blob_stream_metadata_store::{
   MetadataStore,
   SegmentMetadata,
 };
-use blob_stream_types::{Compression, CompressionCodec, Record, SeqRange, Window};
+use blob_stream_types::{Compression, CompressionCodec, SeqRange, Window, new_record};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -74,7 +74,7 @@ async fn buffers_until_size_rollover() -> Result<()> {
   let request = WriteRequest {
     topic: "telemetry".to_string(),
     virtual_partition_id: 0,
-    records: vec![Record::new(vec![1; 6], 10)],
+    records: vec![new_record(vec![1; 6], 10)],
   };
 
   let first_engine = Arc::clone(&engine);
@@ -95,7 +95,7 @@ async fn buffers_until_size_rollover() -> Result<()> {
   let request = WriteRequest {
     topic: "telemetry".to_string(),
     virtual_partition_id: 0,
-    records: vec![Record::new(vec![2; 6], 20)],
+    records: vec![new_record(vec![2; 6], 20)],
   };
 
   engine.produce_batch(request).await?;
@@ -122,7 +122,7 @@ async fn flushes_on_time_rollover() -> Result<()> {
   let request = WriteRequest {
     topic: "telemetry".to_string(),
     virtual_partition_id: 0,
-    records: vec![Record::new(vec![3; 4], 30)],
+    records: vec![new_record(vec![3; 4], 30)],
   };
 
   let first_engine = Arc::clone(&engine);
@@ -163,7 +163,7 @@ async fn assigns_monotonic_sequences() -> Result<()> {
   let request = WriteRequest {
     topic: "telemetry".to_string(),
     virtual_partition_id: 0,
-    records: vec![Record::new(vec![9; 2], 10), Record::new(vec![9; 2], 11)],
+    records: vec![new_record(vec![9; 2], 10), new_record(vec![9; 2], 11)],
   };
 
   let response = engine.produce_batch(request).await?;
@@ -172,7 +172,7 @@ async fn assigns_monotonic_sequences() -> Result<()> {
   let request = WriteRequest {
     topic: "telemetry".to_string(),
     virtual_partition_id: 0,
-    records: vec![Record::new(vec![10; 3], 12)],
+    records: vec![new_record(vec![10; 3], 12)],
   };
 
   let response = engine.produce_batch(request).await?;
@@ -194,7 +194,7 @@ async fn writes_compressed_metadata() -> Result<()> {
   let request = WriteRequest {
     topic: "telemetry".to_string(),
     virtual_partition_id: 0,
-    records: vec![Record::new(vec![7; 6], 10)],
+    records: vec![new_record(vec![7; 6], 10)],
   };
 
   engine.produce_batch(request).await?;
@@ -265,7 +265,7 @@ async fn returns_error_when_flush_fails() -> Result<()> {
   let request = WriteRequest {
     topic: "telemetry".to_string(),
     virtual_partition_id: 0,
-    records: vec![Record::new(vec![1, 2, 3], 10)],
+    records: vec![new_record(vec![1, 2, 3], 10)],
   };
 
   let result = engine.produce_batch(request).await;

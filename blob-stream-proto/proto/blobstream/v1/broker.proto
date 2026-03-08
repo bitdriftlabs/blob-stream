@@ -16,6 +16,14 @@ message Record {
   int64 event_ts_ms = 2;
 }
 
+// Persisted on-blob batch payload format used between broker flush and consumer read paths.
+message StoredRecordBatch {
+  // Owning virtual partition for this batch payload.
+  uint32 virtual_partition_id = 1;
+  // Records persisted in this batch.
+  repeated Record records = 2;
+}
+
 // Request to append a batch of records for one virtual partition.
 message ProduceBatchRequest {
   // Target topic name.

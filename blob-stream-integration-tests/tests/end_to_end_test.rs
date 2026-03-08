@@ -152,7 +152,7 @@ async fn run_consumer_task(
           NextResult::Batch(batch) => {
             let mut ids = Vec::with_capacity(batch.records.len());
             for record in batch.records {
-              let id = String::from_utf8(record.payload)
+              let id = String::from_utf8(record.payload.to_vec())
                 .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
               ids.push(id);
             }
@@ -209,7 +209,7 @@ async fn poll_consumer_once(
     NextResult::Batch(batch) => {
       let before = consumed_ids.len();
       for record in batch.records {
-        let id = String::from_utf8(record.payload)
+        let id = String::from_utf8(record.payload.to_vec())
           .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
         consumed_ids.insert(id);
       }
@@ -638,7 +638,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
       NextResult::Revoked(revoked) => revoked.complete().await,
       NextResult::Batch(batch) => {
         for record in batch.records {
-          let id = String::from_utf8(record.payload)
+          let id = String::from_utf8(record.payload.to_vec())
             .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
           phase1_consumed.insert(id);
         }
@@ -707,7 +707,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
       NextResult::Revoked(revoked) => revoked.complete().await,
       NextResult::Batch(batch) => {
         for record in batch.records {
-          let id = String::from_utf8(record.payload)
+          let id = String::from_utf8(record.payload.to_vec())
             .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
           if phase1_expected.contains(&id) {
             replayed_phase1.insert(id.clone());
@@ -1126,7 +1126,7 @@ async fn active_broker_restart_continuity() -> Result<()> {
       let batches = reader.read_available(now_unix_seconds()).await?;
       for batch in batches {
         for record in batch.records {
-          let id = String::from_utf8(record.payload)
+          let id = String::from_utf8(record.payload.to_vec())
             .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
           consumed_ids.insert(id);
         }
@@ -1234,7 +1234,7 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
       *observed_batches += 1;
 
       for record in batch.records {
-        let id = String::from_utf8(record.payload)
+        let id = String::from_utf8(record.payload.to_vec())
           .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
         consumed_ids.insert(id);
       }
@@ -1360,7 +1360,7 @@ async fn multi_topic_isolation() -> Result<()> {
     let topic_a_batches = topic_a_reader.read_available(now_unix_seconds()).await?;
     for batch in topic_a_batches {
       for record in batch.records {
-        let id = String::from_utf8(record.payload)
+        let id = String::from_utf8(record.payload.to_vec())
           .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
         assert!(
           id.starts_with("topic-a-"),
@@ -1373,7 +1373,7 @@ async fn multi_topic_isolation() -> Result<()> {
     let topic_b_batches = topic_b_reader.read_available(now_unix_seconds()).await?;
     for batch in topic_b_batches {
       for record in batch.records {
-        let id = String::from_utf8(record.payload)
+        let id = String::from_utf8(record.payload.to_vec())
           .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
         assert!(
           id.starts_with("topic-b-"),
@@ -1519,7 +1519,9 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
       }
 
       for record in batch.records {
-        *consumed_payload_counts.entry(record.payload).or_insert(0) += 1;
+        *consumed_payload_counts
+          .entry(record.payload.to_vec())
+          .or_insert(0) += 1;
         consumed_total += 1;
       }
     }
@@ -2185,7 +2187,7 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
         .or_insert(0) += batch.records.len();
 
       for record in batch.records {
-        let id = String::from_utf8(record.payload)
+        let id = String::from_utf8(record.payload.to_vec())
           .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
         consumed_ids.insert(id);
       }
@@ -2325,7 +2327,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
       NextResult::Revoked(revoked) => revoked.complete().await,
       NextResult::Batch(batch) => {
         for record in batch.records {
-          let id = String::from_utf8(record.payload)
+          let id = String::from_utf8(record.payload.to_vec())
             .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
           consumed_ids.insert(id);
         }

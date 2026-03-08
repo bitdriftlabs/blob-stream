@@ -430,8 +430,7 @@ impl WriteEngine for WriteEngineImpl {
       return Err(WriteError::Overloaded("record batch is empty".to_string()));
     }
 
-    let summary = RecordBatch::new(request.virtual_partition_id, request.records.clone())
-      .summary()
+    let summary = RecordBatch::summary_from_records(&request.records)
       .ok_or_else(|| anyhow!("failed to summarize record batch"))?;
 
     let now = self.time_provider.now();

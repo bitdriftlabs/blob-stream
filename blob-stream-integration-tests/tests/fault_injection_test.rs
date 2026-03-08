@@ -227,7 +227,7 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
       last_seq_end_by_partition.insert(batch.virtual_partition_id, batch.seq_range.end);
 
       for record in batch.records {
-        let id = String::from_utf8(record.payload)?;
+        let id = String::from_utf8(record.payload.to_vec())?;
         consumed_ids.insert(id);
       }
     }
@@ -635,7 +635,7 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
       Ok(batches) => {
         for batch in batches {
           for record in batch.records {
-            let id = String::from_utf8(record.payload)?;
+            let id = String::from_utf8(record.payload.to_vec())?;
             consumed_ids.insert(id);
           }
         }
@@ -843,7 +843,7 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
 
     for batch in batches {
       for record in batch.records {
-        let id = String::from_utf8(record.payload)?;
+        let id = String::from_utf8(record.payload.to_vec())?;
         consumed_ids.insert(id);
       }
     }
@@ -858,7 +858,7 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
     let batches = reader.read_available(framework::now_unix_seconds()).await?;
     for batch in batches {
       for record in batch.records {
-        let id = String::from_utf8(record.payload)?;
+        let id = String::from_utf8(record.payload.to_vec())?;
         consumed_ids.insert(id);
       }
     }
@@ -1340,7 +1340,7 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
         },
         NextResult::Batch(batch) => {
           for record in batch.records {
-            let id = String::from_utf8(record.payload)?;
+            let id = String::from_utf8(record.payload.to_vec())?;
             consumed_ids.insert(id);
           }
 

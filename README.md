@@ -141,23 +141,6 @@ Representative attributes:
 - `owner_id`, `generation`, `lease_expiry_ts`, `last_heartbeat_ts`, `committed_cursor`,
   `committed_ts`, `topic`, `group_id`, `virtual_partition_id`, `ttl_epoch_seconds`
 
-### Provisioning note
-
-Current implementation uses the three logical Dynamo data domains listed above (`blob_segments`,
-`producer_partition_leases`, and `consumer_group_leases`). Consumer-group membership is stored in
-an additional `consumer_group_membership` table. Configure explicit table names in
-`metadata_store.dynamo`:
-- `segment_metadata_table_name`
-- `producer_partition_lease_table_name`
-- `consumer_group_lease_table_name`
-- `consumer_group_membership_table_name`
-
-Context usage:
-- Broker context uses `segment_metadata_table_name` +
-  `producer_partition_lease_table_name`.
-- Consumer context uses `segment_metadata_table_name` +
-  `consumer_group_lease_table_name` + `consumer_group_membership_table_name`.
-
 ### 4) `consumer_group_membership`
 
 Purpose:
@@ -169,6 +152,22 @@ Keys:
 
 Representative attributes:
 - `member_id`, `lease_expiry_ts`, `last_heartbeat_ts`, `topic`, `group_id`, `ttl_epoch_seconds`
+
+### Provisioning note
+
+Current implementation uses the 4 logical Dynamo data domains listed above (`blob_segments`,
+`producer_partition_leases`, a`consumer_group_leases`, `consumer_group_membership`). Configure
+explicit table names in `metadata_store.dynamo`:
+- `segment_metadata_table_name`
+- `producer_partition_lease_table_name`
+- `consumer_group_lease_table_name`
+- `consumer_group_membership_table_name`
+
+Context usage:
+- Broker context uses `segment_metadata_table_name` +
+  `producer_partition_lease_table_name`.
+- Consumer context uses `segment_metadata_table_name` +
+  `consumer_group_lease_table_name` + `consumer_group_membership_table_name`.
 
 ### Enable DynamoDB TTL
 

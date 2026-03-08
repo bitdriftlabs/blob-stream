@@ -165,6 +165,147 @@ impl ::protobuf::reflect::ProtobufValue for Record {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
+// @@protoc_insertion_point(message:blobstream.v1.StoredRecordBatch)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct StoredRecordBatch {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.StoredRecordBatch.virtual_partition_id)
+    pub virtual_partition_id: u32,
+    // @@protoc_insertion_point(field:blobstream.v1.StoredRecordBatch.records)
+    pub records: ::std::vec::Vec<Record>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.StoredRecordBatch.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a StoredRecordBatch {
+    fn default() -> &'a StoredRecordBatch {
+        <StoredRecordBatch as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl StoredRecordBatch {
+    pub fn new() -> StoredRecordBatch {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "virtual_partition_id",
+            |m: &StoredRecordBatch| { &m.virtual_partition_id },
+            |m: &mut StoredRecordBatch| { &mut m.virtual_partition_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
+            "records",
+            |m: &StoredRecordBatch| { &m.records },
+            |m: &mut StoredRecordBatch| { &mut m.records },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<StoredRecordBatch>(
+            "StoredRecordBatch",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for StoredRecordBatch {
+    const NAME: &'static str = "StoredRecordBatch";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                8 => {
+                    self.virtual_partition_id = is.read_uint32()?;
+                },
+                18 => {
+                    self.records.push(is.read_message()?);
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if self.virtual_partition_id != 0 {
+            my_size += ::protobuf::rt::uint32_size(1, self.virtual_partition_id);
+        }
+        for value in &self.records {
+            let len = value.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        };
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if self.virtual_partition_id != 0 {
+            os.write_uint32(1, self.virtual_partition_id)?;
+        }
+        for v in &self.records {
+            ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
+        };
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> StoredRecordBatch {
+        StoredRecordBatch::new()
+    }
+
+    fn clear(&mut self) {
+        self.virtual_partition_id = 0;
+        self.records.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static StoredRecordBatch {
+        static instance: StoredRecordBatch = StoredRecordBatch {
+            virtual_partition_id: 0,
+            records: ::std::vec::Vec::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for StoredRecordBatch {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("StoredRecordBatch").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for StoredRecordBatch {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for StoredRecordBatch {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
 // @@protoc_insertion_point(message:blobstream.v1.ProduceBatchRequest)
 #[derive(PartialEq,Clone,Default,Debug)]
 pub struct ProduceBatchRequest {
@@ -539,17 +680,20 @@ impl ProduceStatus {
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x1ablobstream/v1/broker.proto\x12\rblobstream.v1\"B\n\x06Record\x12\
     \x18\n\x07payload\x18\x01\x20\x01(\x0cR\x07payload\x12\x1e\n\x0bevent_ts\
-    _ms\x18\x02\x20\x01(\x03R\teventTsMs\"\x8e\x01\n\x13ProduceBatchRequest\
-    \x12\x14\n\x05topic\x18\x01\x20\x01(\tR\x05topic\x120\n\x14virtual_parti\
-    tion_id\x18\x02\x20\x01(\rR\x12virtualPartitionId\x12/\n\x07records\x18\
-    \x03\x20\x03(\x0b2\x15.blobstream.v1.RecordR\x07records\"q\n\x14ProduceB\
-    atchResponse\x124\n\x06status\x18\x01\x20\x01(\x0e2\x1c.blobstream.v1.Pr\
-    oduceStatusR\x06status\x12#\n\rerror_message\x18\x02\x20\x01(\tR\x0cerro\
-    rMessage*\x8c\x01\n\rProduceStatus\x12\x15\n\x11PRODUCE_STATUS_OK\x10\0\
-    \x12#\n\x1fPRODUCE_STATUS_NOT_LEASE_HOLDER\x10\x01\x12\x20\n\x1cPRODUCE_\
-    STATUS_UNKNOWN_TOPIC\x10\x02\x12\x1d\n\x19PRODUCE_STATUS_OVERLOADED\x10\
-    \x032h\n\rBrokerService\x12W\n\x0cProduceBatch\x12\".blobstream.v1.Produ\
-    ceBatchRequest\x1a#.blobstream.v1.ProduceBatchResponseb\x06proto3\
+    _ms\x18\x02\x20\x01(\x03R\teventTsMs\"v\n\x11StoredRecordBatch\x120\n\
+    \x14virtual_partition_id\x18\x01\x20\x01(\rR\x12virtualPartitionId\x12/\
+    \n\x07records\x18\x02\x20\x03(\x0b2\x15.blobstream.v1.RecordR\x07records\
+    \"\x8e\x01\n\x13ProduceBatchRequest\x12\x14\n\x05topic\x18\x01\x20\x01(\
+    \tR\x05topic\x120\n\x14virtual_partition_id\x18\x02\x20\x01(\rR\x12virtu\
+    alPartitionId\x12/\n\x07records\x18\x03\x20\x03(\x0b2\x15.blobstream.v1.\
+    RecordR\x07records\"q\n\x14ProduceBatchResponse\x124\n\x06status\x18\x01\
+    \x20\x01(\x0e2\x1c.blobstream.v1.ProduceStatusR\x06status\x12#\n\rerror_\
+    message\x18\x02\x20\x01(\tR\x0cerrorMessage*\x8c\x01\n\rProduceStatus\
+    \x12\x15\n\x11PRODUCE_STATUS_OK\x10\0\x12#\n\x1fPRODUCE_STATUS_NOT_LEASE\
+    _HOLDER\x10\x01\x12\x20\n\x1cPRODUCE_STATUS_UNKNOWN_TOPIC\x10\x02\x12\
+    \x1d\n\x19PRODUCE_STATUS_OVERLOADED\x10\x032h\n\rBrokerService\x12W\n\
+    \x0cProduceBatch\x12\".blobstream.v1.ProduceBatchRequest\x1a#.blobstream\
+    .v1.ProduceBatchResponseb\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -567,8 +711,9 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
     file_descriptor.get(|| {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
             let mut deps = ::std::vec::Vec::with_capacity(0);
-            let mut messages = ::std::vec::Vec::with_capacity(3);
+            let mut messages = ::std::vec::Vec::with_capacity(4);
             messages.push(Record::generated_message_descriptor_data());
+            messages.push(StoredRecordBatch::generated_message_descriptor_data());
             messages.push(ProduceBatchRequest::generated_message_descriptor_data());
             messages.push(ProduceBatchResponse::generated_message_descriptor_data());
             let mut enums = ::std::vec::Vec::with_capacity(1);

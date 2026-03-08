@@ -6,6 +6,7 @@ mod tests;
 
 use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 pub use blob_stream_blob_store::ByteRange;
+pub use blob_stream_proto::protos::blobstream::v1::broker::Record;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -55,27 +56,13 @@ pub fn virtual_partition_for_key(
   virtual_partition_for_logical(logical_partition_id, partition_count, writer_id)
 }
 
-//
-// Record
-//
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-/// A single user record payload with event time.
-pub struct Record {
-  /// Opaque payload bytes.
-  pub payload: Vec<u8>,
-  /// Event time in Unix milliseconds.
-  pub event_ts_ms: i64,
-}
-
-impl Record {
-  /// Build a `Record`.
-  #[must_use]
-  pub fn new(payload: Vec<u8>, event_ts_ms: i64) -> Self {
-    Self {
-      payload,
-      event_ts_ms,
-    }
+#[must_use]
+/// Build a protobuf-backed `Record` from owned payload bytes.
+pub fn new_record(payload: Vec<u8>, event_ts_ms: i64) -> Record {
+  Record {
+    payload: payload.into(),
+    event_ts_ms,
+    ..Default::default()
   }
 }
 
@@ -83,7 +70,7 @@ impl Record {
 // RecordBatch
 //
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 /// Batch of records for a single virtual partition.
 pub struct RecordBatch {
   /// Owning virtual partition id.
@@ -105,7 +92,13 @@ impl RecordBatch {
   #[must_use]
   /// Summarize record count, payload bytes, and event-time bounds for this batch.
   pub fn summary(&self) -> Option<BatchSummary> {
-    let mut iter = self.records.iter();
+    Self::summary_from_records(&self.records)
+  }
+
+  #[must_use]
+  /// Summarize record count, payload bytes, and event-time bounds for a record slice.
+  pub fn summary_from_records(records: &[Record]) -> Option<BatchSummary> {
+    let mut iter = records.iter();
     let first = iter.next()?;
     let mut min_event_ts_ms = first.event_ts_ms;
     let mut max_event_ts_ms = first.event_ts_ms;
@@ -117,7 +110,7 @@ impl RecordBatch {
       payload_bytes += record.payload.len() as u64;
     }
 
-    let record_count = u32::try_from(self.records.len()).ok()?;
+    let record_count = u32::try_from(records.len()).ok()?;
 
     Some(BatchSummary {
       record_count,
@@ -250,7 +243,7 @@ pub struct BatchMetadata {
 // Window
 //
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Fixed-size time window.
 pub struct Window {
   /// Window start Unix timestamp in seconds.
@@ -284,7 +277,7 @@ impl Window {
 // TopicWindowKey
 //
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 /// Compound key for topic + window start.
 pub struct TopicWindowKey {
   /// Topic name.
@@ -305,7 +298,7 @@ impl TopicWindowKey {
 // SnowflakeId
 //
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 /// Monotonic sortable id used for segment ordering.
 pub struct SnowflakeId(pub u64);
 

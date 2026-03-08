@@ -1398,6 +1398,7 @@ dependencies = [
  "futures",
  "log",
  "prometheus",
+ "protobuf 4.0.0-alpha.0",
  "serde_json",
  "time",
  "tokio",
@@ -1486,6 +1487,7 @@ version = "0.1.0"
 dependencies = [
  "bd-time",
  "blob-stream-blob-store",
+ "blob-stream-proto",
  "serde",
  "serde_json",
  "time",

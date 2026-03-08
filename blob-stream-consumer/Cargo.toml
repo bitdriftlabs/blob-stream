@@ -24,6 +24,7 @@ blob-stream-types.path          = "../blob-stream-types"
 futures.workspace               = true
 log.workspace                   = true
 prometheus.workspace            = true
+protobuf.workspace              = true
 serde_json.workspace            = true
 time.workspace                  = true
 tokio.workspace                 = true

@@ -50,7 +50,7 @@ pub async fn drain_reader_until(
     let batches = reader.read_available(now_unix_seconds()).await?;
     for batch in batches {
       for record in batch.records {
-        let id = String::from_utf8(record.payload)
+        let id = String::from_utf8(record.payload.to_vec())
           .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
         consumed_ids.insert(id);
       }

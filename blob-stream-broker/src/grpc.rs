@@ -13,7 +13,6 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchResponse,
   ProduceStatus,
 };
-use blob_stream_types::Record;
 use http::{Extensions, HeaderMap};
 use log::trace;
 use std::collections::HashMap;
@@ -101,11 +100,7 @@ impl Handler<ProduceBatchRequest, ProduceBatchResponse> for BrokerGrpc {
     let write_request = WriteRequest {
       topic: request.topic.to_string(),
       virtual_partition_id: request.virtual_partition_id,
-      records: request
-        .records
-        .into_iter()
-        .map(|record| Record::new(record.payload.to_vec(), record.event_ts_ms))
-        .collect(),
+      records: request.records,
     };
 
     let result = self.write_engine.produce_batch(write_request).await;

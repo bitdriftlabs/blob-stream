@@ -22,6 +22,7 @@ use blob_stream_metadata_store::{
   MetadataStore,
   SegmentMetadata,
 };
+use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
   BatchMetadata,
   Compression,
@@ -31,8 +32,10 @@ use blob_stream_types::{
   SnowflakeId,
   TopicWindowKey,
   VirtualPartitionId,
+  new_record,
 };
 use bytes::Bytes;
+use protobuf::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -73,7 +76,13 @@ async fn write_segment(
   records: Vec<Record>,
 ) {
   let batch = RecordBatch::new(virtual_partition_id, records.clone());
-  let payload = serde_json::to_vec(&batch).unwrap();
+  let payload = StoredRecordBatch {
+    virtual_partition_id,
+    records: records.clone(),
+    ..Default::default()
+  }
+  .write_to_bytes()
+  .unwrap();
 
   let blob_key = BlobKey::new(format!("{topic}/{window_start}/{snowflake_id}.bin"));
 
@@ -265,7 +274,7 @@ async fn next_delivers_batch_and_commit_renews() {
     1,
     3,
     SeqRange { start: 1, end: 2 },
-    vec![Record::new(vec![1, 2, 3], now_window * 1_000)],
+    vec![new_record(vec![1, 2, 3], now_window * 1_000)],
   )
   .await;
 
@@ -389,8 +398,8 @@ async fn prefetch_soft_budget_pauses_and_resumes_after_drain() {
         end: snowflake_id * 2,
       },
       vec![
-        Record::new(vec![payload_byte; 6], now_window * 1_000),
-        Record::new(vec![payload_byte; 6], now_window * 1_000 + 1),
+        new_record(vec![payload_byte; 6], now_window * 1_000),
+        new_record(vec![payload_byte; 6], now_window * 1_000 + 1),
       ],
     )
     .await;
@@ -465,7 +474,7 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
     1,
     0,
     SeqRange { start: 1, end: 1 },
-    vec![Record::new(vec![1], now_window * 1_000)],
+    vec![new_record(vec![1], now_window * 1_000)],
   )
   .await;
   write_segment(
@@ -476,7 +485,7 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
     2,
     1,
     SeqRange { start: 1, end: 1 },
-    vec![Record::new(vec![2], now_window * 1_000)],
+    vec![new_record(vec![2], now_window * 1_000)],
   )
   .await;
 

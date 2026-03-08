@@ -3,6 +3,7 @@
 use super::{ConsumerReadConfig, ConsumerReader, ConsumerReaderImpl};
 use blob_stream_blob_store::{BlobKey, BlobStore, InMemoryBlobStore};
 use blob_stream_metadata_store::{InMemoryMetadataStore, MetadataStore, SegmentMetadata};
+use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
   BatchMetadata,
   Compression,
@@ -13,8 +14,10 @@ use blob_stream_types::{
   SnowflakeId,
   TopicWindowKey,
   VirtualPartitionId,
+  new_record,
 };
 use bytes::Bytes;
+use protobuf::Message;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -31,7 +34,13 @@ async fn write_segment(
   compression: Compression,
 ) {
   let batch = RecordBatch::new(virtual_partition_id, records.clone());
-  let encoded = serde_json::to_vec(&batch).unwrap();
+  let encoded = StoredRecordBatch {
+    virtual_partition_id,
+    records: records.clone(),
+    ..Default::default()
+  }
+  .write_to_bytes()
+  .unwrap();
   let payload = match compression.codec {
     CompressionCodec::None => encoded,
     CompressionCodec::Zstd => {
@@ -97,7 +106,7 @@ async fn advances_cursor_and_dedupes_on_rescan() {
     1,
     7,
     SeqRange { start: 1, end: 2 },
-    vec![Record::new(vec![1], 1000), Record::new(vec![2], 1001)],
+    vec![new_record(vec![1], 1000), new_record(vec![2], 1001)],
     Compression::none(),
   )
   .await;
@@ -139,7 +148,7 @@ async fn catches_late_metadata_with_lookback_window() {
     1,
     11,
     SeqRange { start: 1, end: 2 },
-    vec![Record::new(vec![10], 700), Record::new(vec![11], 701)],
+    vec![new_record(vec![10], 700), new_record(vec![11], 701)],
     Compression::none(),
   )
   .await;
@@ -170,7 +179,7 @@ async fn catches_late_metadata_with_lookback_window() {
     2,
     11,
     SeqRange { start: 3, end: 4 },
-    vec![Record::new(vec![12], 702), Record::new(vec![13], 703)],
+    vec![new_record(vec![12], 702), new_record(vec![13], 703)],
     Compression::none(),
   )
   .await;
@@ -194,7 +203,7 @@ async fn decodes_zstd_compressed_batches() {
     9,
     3,
     SeqRange { start: 10, end: 10 },
-    vec![Record::new(vec![42, 43], 1_000)],
+    vec![new_record(vec![42, 43], 1_000)],
     Compression::zstd(3),
   )
   .await;

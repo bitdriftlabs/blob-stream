@@ -3,17 +3,18 @@ use anyhow::{Context, Result};
 use bd_time::OffsetDateTimeExt;
 use blob_stream_blob_store::{BlobKey, BlobStore};
 use blob_stream_metadata_store::MetadataStore;
+use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
   BatchMetadata,
   CompressionCodec,
   Record,
-  RecordBatch,
   SnowflakeId,
   VirtualPartitionId,
   Window,
 };
 use bytes::{Bytes, BytesMut};
 use log::{debug, trace};
+use protobuf::Message;
 use sonyflake::Sonyflake;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -96,9 +97,16 @@ impl FlushContext {
     BlobKey::new(key)
   }
 
-  fn encode_batch(virtual_partition_id: VirtualPartitionId, records: &[Record]) -> Result<Vec<u8>> {
-    let batch = RecordBatch::new(virtual_partition_id, records.to_vec());
-    serde_json::to_vec(&batch).context("encode record batch")
+  fn encode_batch(
+    virtual_partition_id: VirtualPartitionId,
+    records: Vec<Record>,
+  ) -> Result<Vec<u8>> {
+    let proto_batch = StoredRecordBatch {
+      virtual_partition_id,
+      records,
+      ..Default::default()
+    };
+    proto_batch.write_to_bytes().context("encode record batch")
   }
 
   fn compress_batch(&self, payload: &[u8]) -> Result<Bytes> {
@@ -140,7 +148,7 @@ impl FlushContext {
         partition.batches.len()
       );
       for batch in partition.batches {
-        let encoded = Self::encode_batch(partition.virtual_partition_id, &batch.records)?;
+        let encoded = Self::encode_batch(partition.virtual_partition_id, batch.records)?;
         let compressed = self.compress_batch(&encoded)?;
         let start = payload.len() as u64;
         payload.extend_from_slice(&compressed);

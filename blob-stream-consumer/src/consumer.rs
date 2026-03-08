@@ -12,11 +12,11 @@ use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use blob_stream_blob_store::{BlobStore, ByteRange};
 use blob_stream_metadata_store::MetadataStore;
+use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
   BatchMetadata,
   CompressionCodec,
   Record,
-  RecordBatch,
   SeqRange,
   TopicWindowKey,
   VirtualPartitionId,
@@ -24,6 +24,8 @@ use blob_stream_types::{
 };
 use futures::future::try_join_all;
 use log::trace;
+use protobuf::Message;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -121,7 +123,7 @@ use std::sync::Arc;
 // ConsumerBatch
 //
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 /// A decoded batch returned by the consumer read path.
 pub struct ConsumerBatch {
   /// Virtual partition that owns this batch.
@@ -244,15 +246,15 @@ impl ConsumerReaderImpl {
       .await?;
 
     // Decode in two stages: transport/storage compression first, then logical RecordBatch format.
-    let decoded = match batch_metadata.compression.codec {
-      CompressionCodec::None => payload.to_vec(),
+    let decoded: Cow<'_, [u8]> = match batch_metadata.compression.codec {
+      CompressionCodec::None => Cow::Borrowed(payload.as_ref()),
       CompressionCodec::Zstd => zstd::stream::decode_all(Cursor::new(payload.as_ref()))
+        .map(Cow::Owned)
         .map_err(|error| anyhow!("failed to decode zstd batch: {error}"))?,
     };
 
-    // Record batches are serialized as JSON in the current write path implementation.
-    let record_batch: RecordBatch = serde_json::from_slice(&decoded)
-      .map_err(|error| anyhow!("failed to decode record batch JSON: {error}"))?;
+    let record_batch = StoredRecordBatch::parse_from_bytes(decoded.as_ref())
+      .map_err(|error| anyhow!("failed to decode record batch protobuf: {error}"))?;
 
     // Defensive integrity check: segment index entry and decoded payload must agree on partition.
     ensure!(
@@ -340,7 +342,7 @@ impl ConsumerReader for ConsumerReaderImpl {
 
           // Metadata scans are unordered and can arrive late. Sorting by seq_start keeps
           // processing deterministic while cursor checks prevent replay.
-          let mut sorted_batches = partition_batches.clone();
+          let mut sorted_batches = partition_batches.iter().collect::<Vec<_>>();
           sorted_batches.sort_by_key(|batch| batch.seq_range.start);
 
           for batch_metadata in sorted_batches {
@@ -359,7 +361,7 @@ impl ConsumerReader for ConsumerReaderImpl {
 
             // Decode batch payload only after passing cursor filter to avoid unnecessary I/O.
             let batch = self
-              .read_batch(&segment, &batch_metadata, *partition_id)
+              .read_batch(&segment, batch_metadata, *partition_id)
               .await?;
 
             // Cursor always moves forward. max() keeps monotonicity if metadata ordering is odd.
