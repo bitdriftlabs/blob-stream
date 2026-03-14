@@ -149,17 +149,13 @@ async fn run_consumer_task(
             }
             revoked.complete().await;
           },
-          NextResult::Batch(batch) => {
-            let mut ids = Vec::with_capacity(batch.records.len());
-            for record in batch.records {
-              let id = String::from_utf8(record.payload.to_vec())
-                .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
-              ids.push(id);
-            }
+          NextResult::Record(record) => {
+            let id = String::from_utf8(record.record.payload.to_vec())
+              .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
 
-            consumer.store_offset(batch.virtual_partition_id, batch.seq_range.end)?;
+            consumer.store_offset(record.virtual_partition_id, record.offset)?;
             let _ = consumer.commit().await?;
-            let _ = event_tx.send(ConsumerTaskEvent::Batch { ids });
+            let _ = event_tx.send(ConsumerTaskEvent::Batch { ids: vec![id] });
           },
         }
       }
@@ -206,15 +202,13 @@ async fn poll_consumer_once(
       revoked.complete().await;
       Ok((false, true))
     },
-    NextResult::Batch(batch) => {
+    NextResult::Record(record) => {
       let before = consumed_ids.len();
-      for record in batch.records {
-        let id = String::from_utf8(record.payload.to_vec())
-          .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
-        consumed_ids.insert(id);
-      }
+      let id = String::from_utf8(record.record.payload.to_vec())
+        .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
+      consumed_ids.insert(id);
 
-      consumer.store_offset(batch.virtual_partition_id, batch.seq_range.end)?;
+      consumer.store_offset(record.virtual_partition_id, record.offset)?;
       let _ = consumer.commit().await;
       Ok((consumed_ids.len() > before, false))
     },
@@ -424,8 +418,8 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
             saw_revocation = true;
             break;
           },
-          NextResult::Batch(batch) => {
-            consumer.store_offset(batch.virtual_partition_id, batch.seq_range.end)?;
+          NextResult::Record(record) => {
+            consumer.store_offset(record.virtual_partition_id, record.offset)?;
             let _ = consumer.commit().await?;
           },
         }
@@ -636,14 +630,12 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
 
     match next_result {
       NextResult::Revoked(revoked) => revoked.complete().await,
-      NextResult::Batch(batch) => {
-        for record in batch.records {
-          let id = String::from_utf8(record.payload.to_vec())
-            .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
-          phase1_consumed.insert(id);
-        }
+      NextResult::Record(record) => {
+        let id = String::from_utf8(record.record.payload.to_vec())
+          .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
+        phase1_consumed.insert(id);
 
-        consumer.store_offset(batch.virtual_partition_id, batch.seq_range.end)?;
+        consumer.store_offset(record.virtual_partition_id, record.offset)?;
         let _ = consumer.commit().await?;
       },
     }
@@ -705,19 +697,17 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
 
     match next_result {
       NextResult::Revoked(revoked) => revoked.complete().await,
-      NextResult::Batch(batch) => {
-        for record in batch.records {
-          let id = String::from_utf8(record.payload.to_vec())
-            .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
-          if phase1_expected.contains(&id) {
-            replayed_phase1.insert(id.clone());
-          }
-          if phase2_expected.contains(&id) {
-            phase2_consumed.insert(id);
-          }
+      NextResult::Record(record) => {
+        let id = String::from_utf8(record.record.payload.to_vec())
+          .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
+        if phase1_expected.contains(&id) {
+          replayed_phase1.insert(id.clone());
+        }
+        if phase2_expected.contains(&id) {
+          phase2_consumed.insert(id);
         }
 
-        resumed_consumer.store_offset(batch.virtual_partition_id, batch.seq_range.end)?;
+        resumed_consumer.store_offset(record.virtual_partition_id, record.offset)?;
         let _ = resumed_consumer.commit().await?;
       },
     }
@@ -2325,14 +2315,12 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
 
     match next_result {
       NextResult::Revoked(revoked) => revoked.complete().await,
-      NextResult::Batch(batch) => {
-        for record in batch.records {
-          let id = String::from_utf8(record.payload.to_vec())
-            .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
-          consumed_ids.insert(id);
-        }
+      NextResult::Record(record) => {
+        let id = String::from_utf8(record.record.payload.to_vec())
+          .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
+        consumed_ids.insert(id);
 
-        consumer.store_offset(batch.virtual_partition_id, batch.seq_range.end)?;
+        consumer.store_offset(record.virtual_partition_id, record.offset)?;
         let _ = consumer.commit().await?;
       },
     }
