@@ -221,7 +221,7 @@ pub enum NextResult {
 
 #[async_trait]
 /// High-level pull API used by applications.
-pub trait ConsumerIterator: Send {
+pub trait ConsumerIterator: Send + Sync {
   /// Start iterator processing and initialize internal timers/state.
   fn start(&mut self) -> Result<()>;
   /// Poll for either a new batch or revocation event.
