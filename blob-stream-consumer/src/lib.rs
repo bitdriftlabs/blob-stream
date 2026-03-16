@@ -64,8 +64,8 @@
 //!   iter.start()?;
 //!
 //!   match iter.next().await? {
-//!     NextResult::Batch(batch) => {
-//!       iter.store_offset(batch.virtual_partition_id, batch.seq_range.end)?;
+//!     NextResult::Record(record) => {
+//!       iter.store_offset(record.virtual_partition_id, record.offset)?;
 //!       let _ = iter.commit().await?;
 //!     },
 //!     NextResult::Revoked(revoked) => {
@@ -96,6 +96,7 @@ pub use iterator::{
   ConsumerCoordinationSource,
   ConsumerIterator,
   ConsumerIteratorImpl,
+  ConsumerRecord,
   CoordinationSnapshot,
   NextResult,
   RevokedPartitions,

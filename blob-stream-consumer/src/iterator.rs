@@ -30,7 +30,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupMembershipStore,
   MetadataStore,
 };
-use blob_stream_types::{VirtualPartitionId, now_unix_millis, now_unix_seconds};
+use blob_stream_types::{Record, VirtualPartitionId, now_unix_millis, now_unix_seconds};
 use log::{info, trace};
 use prometheus::{Histogram, IntCounter, IntGauge};
 use std::cmp::max;
@@ -128,6 +128,16 @@ struct PrefetchBuffer {
 }
 
 //
+// BufferedBatch
+//
+
+struct BufferedBatch {
+  virtual_partition_id: VirtualPartitionId,
+  next_offset: u64,
+  records: std::vec::IntoIter<Record>,
+}
+
+//
 // CoordinationSnapshot
 //
 
@@ -186,10 +196,21 @@ impl RevokedPartitions for RevokedPartitionsImpl {
 // NextResult
 //
 
+#[derive(Clone, Debug, PartialEq)]
+/// A single decoded record surfaced by the iterator.
+pub struct ConsumerRecord {
+  /// Virtual partition that owns this record.
+  pub virtual_partition_id: VirtualPartitionId,
+  /// Inclusive sequence offset for this record.
+  pub offset: u64,
+  /// Decoded record payload and metadata.
+  pub record: Record,
+}
+
 /// Result of polling the iterator.
 pub enum NextResult {
-  /// Next available batch for an owned partition.
-  Batch(ConsumerBatch),
+  /// Next available record for an owned partition.
+  Record(ConsumerRecord),
   /// Notification that partitions were revoked and must be drained.
   Revoked(Box<dyn RevokedPartitions>),
 }
@@ -200,7 +221,7 @@ pub enum NextResult {
 
 #[async_trait]
 /// High-level pull API used by applications.
-pub trait ConsumerIterator: Send {
+pub trait ConsumerIterator: Send + Sync {
   /// Start iterator processing and initialize internal timers/state.
   fn start(&mut self) -> Result<()>;
   /// Poll for either a new batch or revocation event.
@@ -237,6 +258,7 @@ pub struct ConsumerIteratorImpl {
   prefetch_task: Option<JoinHandle<()>>,
   prefetch_idle_base_delay_ms: u64,
   prefetch_idle_max_delay_ms: Option<u64>,
+  current_batch: Option<BufferedBatch>,
   active_assignment: HashSet<VirtualPartitionId>,
   pending_assignment: Option<Vec<VirtualPartitionId>>,
   pending_revocation_completion: Option<oneshot::Receiver<()>>,
@@ -308,6 +330,7 @@ impl ConsumerIteratorImpl {
       prefetch_task: None,
       prefetch_idle_base_delay_ms: idle_poll_delay_ms,
       prefetch_idle_max_delay_ms: max_idle_poll_delay_ms,
+      current_batch: None,
       active_assignment,
       pending_assignment: None,
       pending_revocation_completion: None,
@@ -365,6 +388,44 @@ impl ConsumerIteratorImpl {
     Ok(())
   }
 
+  fn next_buffered_record(&mut self) -> Option<ConsumerRecord> {
+    loop {
+      let current_batch = self.current_batch.as_mut()?;
+      let Some(record) = current_batch.records.next() else {
+        self.current_batch = None;
+        continue;
+      };
+
+      let offset = current_batch.next_offset;
+      current_batch.next_offset = current_batch.next_offset.saturating_add(1);
+      self.metrics.records_delivered.inc();
+      return Some(ConsumerRecord {
+        virtual_partition_id: current_batch.virtual_partition_id,
+        offset,
+        record,
+      });
+    }
+  }
+
+  fn install_buffered_batch(&mut self, batch: ConsumerBatch) {
+    self.metrics.batches_delivered.inc();
+    self.current_batch = Some(BufferedBatch {
+      virtual_partition_id: batch.virtual_partition_id,
+      next_offset: batch.seq_range.start,
+      records: batch.records.into_iter(),
+    });
+  }
+
+  fn drop_current_revoked_partition(&mut self, revoked: &HashSet<VirtualPartitionId>) {
+    if self
+      .current_batch
+      .as_ref()
+      .is_some_and(|batch| revoked.contains(&batch.virtual_partition_id))
+    {
+      self.current_batch = None;
+    }
+  }
+
   async fn finish_pending_revocation_if_completed(&mut self) -> Result<bool> {
     let Some(recv) = self.pending_revocation_completion.as_mut() else {
       return Ok(true);
@@ -415,11 +476,13 @@ impl ConsumerIteratorImpl {
     }
 
     self.metrics.revocations.inc();
+    let revoked_set = revoked.iter().copied().collect::<HashSet<_>>();
+    self.drop_current_revoked_partition(&revoked_set);
     drop_buffered_prefetch_partitions(
       Arc::clone(&self.prefetch_buffer),
       Arc::clone(&self.prefetch_space_notify),
       self.metrics.clone(),
-      revoked.iter().copied().collect(),
+      revoked_set,
     )
     .await;
 
@@ -726,6 +789,14 @@ impl ConsumerIterator for ConsumerIteratorImpl {
         self.heartbeat(now_ts_ms).await?;
       }
 
+      if let Some(record) = self.next_buffered_record() {
+        trace!(
+          "consumer next delivering buffered record: topic={}, partition={}, offset={}",
+          self.group_config.topic, record.virtual_partition_id, record.offset
+        );
+        return Ok(NextResult::Record(record));
+      }
+
       let active_assignment = self.active_assignment.clone();
       let prefetch_buffer = Arc::clone(&self.prefetch_buffer);
       let prefetch_space_notify = Arc::clone(&self.prefetch_space_notify);
@@ -743,12 +814,8 @@ impl ConsumerIterator for ConsumerIteratorImpl {
           batch.virtual_partition_id,
           batch.records.len()
         );
-        self.metrics.batches_delivered.inc();
-        self
-          .metrics
-          .records_delivered
-          .inc_by(batch.records.len() as u64);
-        return Ok(NextResult::Batch(batch));
+        self.install_buffered_batch(batch);
+        continue;
       }
 
       let until_heartbeat_ms = (self.next_heartbeat_at_ms - now_ts_ms).max(0);

@@ -1338,13 +1338,11 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
           saw_revocation = true;
           revoked.complete().await;
         },
-        NextResult::Batch(batch) => {
-          for record in batch.records {
-            let id = String::from_utf8(record.payload.to_vec())?;
-            consumed_ids.insert(id);
-          }
+        NextResult::Record(record) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          consumed_ids.insert(id);
 
-          consumer.store_offset(batch.virtual_partition_id, batch.seq_range.end)?;
+          consumer.store_offset(record.virtual_partition_id, record.offset)?;
           let _ = consumer.commit().await;
         },
       }

@@ -231,7 +231,7 @@ async fn next_returns_revocation_until_completed() {
   let revoked = iterator.next().await.unwrap();
   let revoked = match revoked {
     NextResult::Revoked(revoked) => revoked,
-    NextResult::Batch(_) => panic!("expected revocation callback"),
+    NextResult::Record(_) => panic!("expected revocation callback"),
   };
 
   let revoked_partitions = revoked.partitions();
@@ -250,7 +250,7 @@ async fn next_returns_revocation_until_completed() {
 }
 
 #[tokio::test]
-async fn next_delivers_batch_and_commit_renews() {
+async fn next_delivers_records_and_commit_renews() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
@@ -274,7 +274,10 @@ async fn next_delivers_batch_and_commit_renews() {
     1,
     3,
     SeqRange { start: 1, end: 2 },
-    vec![new_record(vec![1, 2, 3], now_window * 1_000)],
+    vec![
+      new_record(vec![1, 2, 3], now_window * 1_000),
+      new_record(vec![4, 5, 6], now_window * 1_000 + 1),
+    ],
   )
   .await;
 
@@ -299,15 +302,25 @@ async fn next_delivers_batch_and_commit_renews() {
   iterator.start().unwrap();
 
   let next = iterator.next().await.unwrap();
-  let batch = match next {
-    NextResult::Batch(batch) => batch,
+  let record = match next {
+    NextResult::Record(record) => record,
     NextResult::Revoked(_) => panic!("expected batch"),
   };
-  assert_eq!(batch.virtual_partition_id, 3);
-  assert_eq!(batch.records.len(), 1);
+  assert_eq!(record.virtual_partition_id, 3);
+  assert_eq!(record.offset, 1);
+  assert_eq!(record.record.payload.to_vec(), vec![1, 2, 3]);
+
+  let next = iterator.next().await.unwrap();
+  let record = match next {
+    NextResult::Record(record) => record,
+    NextResult::Revoked(_) => panic!("expected record"),
+  };
+  assert_eq!(record.virtual_partition_id, 3);
+  assert_eq!(record.offset, 2);
+  assert_eq!(record.record.payload.to_vec(), vec![4, 5, 6]);
 
   iterator
-    .store_offset(batch.virtual_partition_id, batch.seq_range.end)
+    .store_offset(record.virtual_partition_id, record.offset)
     .unwrap();
   let report = iterator.commit().await.unwrap();
   assert_eq!(report.renewed_partitions, vec![3]);
@@ -434,11 +447,12 @@ async fn prefetch_soft_budget_pauses_and_resumes_after_drain() {
     .await
     .unwrap()
     .unwrap();
-  let first_batch = match first {
-    NextResult::Batch(batch) => batch,
+  let first_record = match first {
+    NextResult::Record(record) => record,
     NextResult::Revoked(_) => panic!("expected batch"),
   };
-  assert_eq!(first_batch.virtual_partition_id, 7);
+  assert_eq!(first_record.virtual_partition_id, 7);
+  assert_eq!(first_record.offset, 1);
 
   // Drain should allow worker to admit another pending batch.
   wait_for_prefetch_buffer_len(&iterator, 1).await;
@@ -520,7 +534,7 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
   let revoked = iterator.next().await.unwrap();
   let revoked = match revoked {
     NextResult::Revoked(revoked) => revoked,
-    NextResult::Batch(_) => panic!("expected revocation callback"),
+    NextResult::Record(_) => panic!("expected revocation callback"),
   };
   let revoked_partitions = revoked.partitions();
   assert_eq!(revoked_partitions.len(), 1);

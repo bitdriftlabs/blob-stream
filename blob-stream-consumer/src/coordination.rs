@@ -94,7 +94,7 @@ pub struct RebalanceReport {
 
 #[async_trait]
 /// Consumer-group coordinator interface over a lease-backed ownership store.
-pub trait ConsumerGroupCoordinator: Send {
+pub trait ConsumerGroupCoordinator: Send + Sync {
   /// Compute and apply ownership for current members and partition set.
   async fn rebalance(
     &mut self,
