@@ -136,7 +136,10 @@ pub fn validate_producer_config(config: &ProducerConfig) -> Result<()> {
 }
 
 pub fn validate_topic_config(topic: &ProducerTopicConfig) -> Result<()> {
-  trace!("validating producer topic config: topic={}", topic.name);
+  trace!(
+    "validating producer topic config: topic={name}",
+    name = topic.name
+  );
   proto_validate::validate(topic)?;
   Ok(())
 }

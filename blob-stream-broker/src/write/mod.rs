@@ -371,7 +371,7 @@ impl WriteEngineImpl {
 
         if let Err(error) = flush_plans_and_notify(&flush_context, plans, now).await {
           metrics.flush_failures_total.inc();
-          warn_every!(15.seconds(), "write flush failed: {}", error);
+          warn_every!(15.seconds(), "write flush failed: {error}");
         }
 
         metrics

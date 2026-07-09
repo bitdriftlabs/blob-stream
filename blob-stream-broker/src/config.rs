@@ -40,9 +40,16 @@ pub fn decode_runtime_config_str(input: &str, format: ConfigFormat) -> Result<Ru
 }
 
 pub fn load_runtime_config(path: &Path) -> Result<RuntimeConfig> {
-  debug!("loading broker runtime config from path={}", path.display());
+  debug!(
+    "loading broker runtime config from path={path}",
+    path = path.display()
+  );
   let format = ConfigFormat::from_path(path).context("unsupported config file extension")?;
-  let contents = fs::read_to_string(path)
-    .with_context(|| format!("failed to read runtime config from {}", path.display()))?;
+  let contents = fs::read_to_string(path).with_context(|| {
+    format!(
+      "failed to read runtime config from {path}",
+      path = path.display()
+    )
+  })?;
   decode_runtime_config_str(&contents, format)
 }

@@ -59,4 +59,7 @@ git-fetch-with-cli = true
 
 # Make sure we don't compile protoc
 [env]
+# Homebrew ld64.lld from the user Cargo config defaults to a macOS 11 deployment target,
+# which newer aws-lc/ring objects no longer satisfy on current Apple SDKs.
+MACOSX_DEPLOYMENT_TARGET = "26.0"
 PROTOC_NO_VENDOR = "true"

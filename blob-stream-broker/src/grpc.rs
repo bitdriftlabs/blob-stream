@@ -4,8 +4,8 @@ use axum::Router;
 use axum::extract::Query;
 use axum::http::header::CONTENT_TYPE;
 use axum::routing::{get, post};
-use bd_grpc::Handler;
 use bd_grpc::service::ServiceMethod;
+use bd_grpc::{Handler, UnaryRequestConfig, UnaryRouterBuilder, ValidationOptions};
 use bd_log::{SwapLogger, warn_every};
 use bd_server_stats::stats::Scope;
 use blob_stream_proto::protos::blobstream::v1::broker::{
@@ -137,15 +137,18 @@ pub fn make_broker_router(write_engine: Arc<dyn WriteEngine>, metrics: &BrokerMe
   let service_method = ServiceMethod::new("BrokerService", "ProduceBatch");
   let grpc_metrics_scope = metrics.scope();
   let admin_metrics = metrics.clone();
-  bd_grpc::make_unary_router(
+  UnaryRouterBuilder::new(
     &service_method,
     Arc::new(BrokerGrpc::new(write_engine, &grpc_metrics_scope)),
-    |error| {
-      warn_every!(15.seconds(), "broker gRPC handler error: {}", error);
-    },
-    None,
-    true,
   )
+  .request_config(
+    UnaryRequestConfig::default().with_validation_options(ValidationOptions::default()),
+  )
+  .error_handler(|error| {
+    warn_every!(15.seconds(), "broker gRPC handler error: {error}");
+  })
+  .build()
+  .expect("broker gRPC router should build")
   .route(
     "/metrics",
     get(move || {

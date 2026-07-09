@@ -9,7 +9,7 @@ services:
       - "8000:8000"
 
   localstack:
-    image: localstack/localstack:latest
+    image: localstack/localstack:4.14.0
     container_name: blob-stream-localstack
     environment:
       - SERVICES=s3
