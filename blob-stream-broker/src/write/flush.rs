@@ -209,7 +209,7 @@ impl FlushContext {
     plans: Vec<FlushPlan>,
     now: OffsetDateTime,
   ) -> Result<(), WriteError> {
-    trace!("flush_plans invoked: plans={}", plans.len());
+    trace!("flush_plans invoked: plans={plans}", plans = plans.len());
     for plan in plans {
       let topic = plan.topic.clone();
       let (payload, envelope) = self.build_segment(&topic, plan, now)?;

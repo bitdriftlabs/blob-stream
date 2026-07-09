@@ -720,8 +720,7 @@ async fn run_prefetch_worker(
             metrics.retries.inc();
             warn_every!(
               15.seconds(),
-              "consumer prefetch read retrying after error: error={}",
-              read_error
+              "consumer prefetch read retrying after error: error={read_error}"
             );
             continue;
           }
@@ -729,8 +728,7 @@ async fn run_prefetch_worker(
           metrics.failures.inc();
           warn_every!(
             15.seconds(),
-            "consumer prefetch read failed after retry: error={}",
-            read_error
+            "consumer prefetch read failed after retry: error={read_error}"
           );
           tokio::time::sleep(std::time::Duration::from_millis(base_idle_delay_ms)).await;
         },

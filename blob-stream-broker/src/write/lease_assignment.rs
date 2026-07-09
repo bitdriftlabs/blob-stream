@@ -175,8 +175,7 @@ impl WriteEngineImpl {
             Err(error) => {
               warn_every!(
                 15.seconds(),
-                "lease self-assignment acquire failed: {}",
-                error
+                "lease self-assignment acquire failed: {error}"
               );
               false
             },
@@ -220,8 +219,7 @@ impl WriteEngineImpl {
             Err(error) => {
               warn_every!(
                 15.seconds(),
-                "lease self-assignment reserve failed: {}",
-                error
+                "lease self-assignment reserve failed: {error}"
               );
             },
           }
@@ -265,8 +263,7 @@ impl WriteEngineImpl {
       Err(error) => {
         warn_every!(
           15.seconds(),
-          "lease self-assignment release failed: {}",
-          error
+          "lease self-assignment release failed: {error}"
         );
       },
     }

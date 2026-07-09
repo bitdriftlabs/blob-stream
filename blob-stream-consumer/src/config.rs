@@ -85,7 +85,10 @@ pub fn consumer_rebalance_interval_ms(config: &ConsumerGroupConfig) -> i64 {
 
 /// Validate consumer read configuration.
 pub fn validate_read_config(config: &ConsumerReadConfig) -> Result<()> {
-  trace!("validating consumer read config: topic={}", config.topic);
+  trace!(
+    "validating consumer read config: topic={topic}",
+    topic = config.topic
+  );
   proto_validate::validate(config)?;
   if let Some(max_idle_poll_delay_ms) = consumer_max_idle_poll_delay_ms(config) {
     ensure!(

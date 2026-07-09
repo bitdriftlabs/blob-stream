@@ -82,7 +82,7 @@ impl BrokerDiscovery for K8sServiceBrokerDiscovery {
             }
           },
           Err(error) => {
-            warn_every!(15.seconds(), "k8s discovery watch error: {}", error);
+            warn_every!(15.seconds(), "k8s discovery watch error: {error}");
           },
         }
       }

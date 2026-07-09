@@ -41,7 +41,7 @@ const AWS_REGION: &str = "us-east-1";
 const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
 
 #[cfg(test)]
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn global_init() {
   bd_test_helpers::test_global_init();
 }
