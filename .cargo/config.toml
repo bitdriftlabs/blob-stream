@@ -2,6 +2,13 @@
 # Optimization / Compile Configuration #
 ########################################
 
+[profile.release]
+# Debug disabled to increase CI speed and reduce image size. If we need to do profiling
+# we can temporarily enable this.
+debug           = false
+lto             = "thin"
+split-debuginfo = "off"
+
 [target.'cfg(target_vendor="apple")']
 rustflags = ["-Csplit-debuginfo=unpacked"]
 
