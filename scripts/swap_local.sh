@@ -35,15 +35,17 @@ SHARED_CORE_PATH="$PARENT_DIR/shared-core"
 # Create a temporary file
 TMP_FILE=$(mktemp)
 
+SHARED_CORE_GIT_URL="https://github.com/bitdriftlabs/shared-core.git"
+
 # Process file line by line
 while IFS= read -r line; do
-  if echo "$line" | grep -q "git = \"ssh://git@github.com/bitdriftlabs/shared-core\""; then
+  if echo "$line" | grep -q "git = \"$SHARED_CORE_GIT_URL\""; then
     crate_name=$(echo "$line" | sed -E 's/^([a-zA-Z0-9_-]+)[[:space:]]*=.*/\1/')
 
     if $USE_GIT_PATH; then
-      echo "$line" | sed "s#git = \"ssh://git@github.com/bitdriftlabs/shared-core\"#git = \"file://$SHARED_CORE_PATH\"#g" >> "$TMP_FILE"
+      echo "$line" | sed "s#git = \"$SHARED_CORE_GIT_URL\"#git = \"file://$SHARED_CORE_PATH\"#g" >> "$TMP_FILE"
     else
-      echo "$line" | sed "s#git = \"ssh://git@github.com/bitdriftlabs/shared-core\"#path = \"../shared-core/$crate_name\"#g" >> "$TMP_FILE"
+      echo "$line" | sed "s#git = \"$SHARED_CORE_GIT_URL\"#path = \"../shared-core/$crate_name\"#g" >> "$TMP_FILE"
     fi
   else
     echo "$line" >> "$TMP_FILE"
