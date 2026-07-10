@@ -20,14 +20,14 @@ aws-sdk-dynamodb = "1.117.0"
 aws-sdk-s3       = "1.138.0"
 aws-types        = "1.4.0"
 axum             = { version = "0.8.9", features = ["http2", "macros"] }
-bd-grpc          = { git = "ssh://git@github.com/bitdriftlabs/shared-core" }
-bd-log           = { git = "ssh://git@github.com/bitdriftlabs/shared-core" }
-bd-panic         = { git = "ssh://git@github.com/bitdriftlabs/shared-core" }
-bd-pgv           = { git = "ssh://git@github.com/bitdriftlabs/shared-core" }
-bd-rt            = { git = "ssh://git@github.com/bitdriftlabs/shared-core" }
-bd-server-stats  = { git = "ssh://git@github.com/bitdriftlabs/shared-core" }
-bd-test-helpers  = { git = "ssh://git@github.com/bitdriftlabs/shared-core" }
-bd-time          = { git = "ssh://git@github.com/bitdriftlabs/shared-core" }
+bd-grpc          = { git = "https://github.com/bitdriftlabs/shared-core.git" }
+bd-log           = { git = "https://github.com/bitdriftlabs/shared-core.git" }
+bd-panic         = { git = "https://github.com/bitdriftlabs/shared-core.git" }
+bd-pgv           = { git = "https://github.com/bitdriftlabs/shared-core.git" }
+bd-rt            = { git = "https://github.com/bitdriftlabs/shared-core.git" }
+bd-server-stats  = { git = "https://github.com/bitdriftlabs/shared-core.git" }
+bd-test-helpers  = { git = "https://github.com/bitdriftlabs/shared-core.git" }
+bd-time          = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bytes            = "1.12.1"
 clap             = { version = "4.6.1", features = ["derive", "env"] }
 ctor             = "1.0.8"
