@@ -1,9 +1,9 @@
 use crate::metrics::BrokerMetrics;
 use crate::write::{WriteEngine, WriteError, WriteRequest};
-use axum::Router;
 use axum::extract::Query;
 use axum::http::header::CONTENT_TYPE;
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use bd_grpc::service::ServiceMethod;
 use bd_grpc::{Handler, UnaryRequestConfig, UnaryRouterBuilder, ValidationOptions};
 use bd_log::{SwapLogger, warn_every};
@@ -137,6 +137,7 @@ pub fn make_broker_router(write_engine: Arc<dyn WriteEngine>, metrics: &BrokerMe
   let service_method = ServiceMethod::new("BrokerService", "ProduceBatch");
   let grpc_metrics_scope = metrics.scope();
   let admin_metrics = metrics.clone();
+  let admin_write_engine = write_engine.clone();
   UnaryRouterBuilder::new(
     &service_method,
     Arc::new(BrokerGrpc::new(write_engine, &grpc_metrics_scope)),
@@ -159,6 +160,13 @@ pub fn make_broker_router(write_engine: Arc<dyn WriteEngine>, metrics: &BrokerMe
           metrics.prometheus_output(),
         )
       }
+    }),
+  )
+  .route(
+    "/admin/state",
+    get(move || {
+      let write_engine = admin_write_engine.clone();
+      async move { Json(write_engine.state_snapshot().await) }
     }),
   )
   .route("/admin/log", post(log))

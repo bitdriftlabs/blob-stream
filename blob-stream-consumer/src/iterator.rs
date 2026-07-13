@@ -33,10 +33,11 @@ use blob_stream_metadata_store::{
 use blob_stream_types::{Record, VirtualPartitionId, now_unix_millis, now_unix_seconds};
 use log::{info, trace};
 use prometheus::{Histogram, IntCounter, IntGauge};
+use serde::Serialize;
 use std::cmp::max;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use time::ext::NumericalDuration;
 use tokio::sync::{Mutex, Notify, oneshot};
@@ -216,6 +217,154 @@ pub enum NextResult {
 }
 
 //
+// ConsumerStateSnapshot
+//
+
+#[derive(Debug, Serialize)]
+pub struct ConsumerStateSnapshot {
+  pub schema_version: u32,
+  pub generated_at_ts_ms: i64,
+  pub topic: String,
+  pub group_id: String,
+  pub member_id: String,
+  pub started: bool,
+  pub coordinator_generation: u64,
+  pub owned_partitions: Vec<VirtualPartitionId>,
+  pub active_assignment: Vec<VirtualPartitionId>,
+  pub pending_assignment: Option<Vec<VirtualPartitionId>>,
+  pub pending_revocation: bool,
+  pub pending_commits: Vec<ConsumerOffsetSnapshot>,
+  pub cursors: Vec<ConsumerOffsetSnapshot>,
+  pub next_heartbeat_at_ms: i64,
+  pub next_rebalance_at_ms: i64,
+  pub prefetch_buffered_batch_count: usize,
+  pub prefetch_buffered_bytes: u64,
+  pub prefetch_max_bytes: u64,
+  pub prefetch_worker_running: bool,
+}
+
+//
+// ConsumerOffsetSnapshot
+//
+
+#[derive(Debug, Serialize)]
+pub struct ConsumerOffsetSnapshot {
+  pub virtual_partition_id: VirtualPartitionId,
+  pub offset: u64,
+}
+
+//
+// ConsumerDiagnosticsRuntimeState
+//
+
+#[derive(Default)]
+struct ConsumerDiagnosticsRuntimeState {
+  coordinator_generation: u64,
+  owned_partitions: Vec<VirtualPartitionId>,
+  active_assignment: Vec<VirtualPartitionId>,
+  pending_assignment: Option<Vec<VirtualPartitionId>>,
+  pending_revocation: bool,
+  pending_commits: HashMap<VirtualPartitionId, u64>,
+  next_heartbeat_at_ms: i64,
+  next_rebalance_at_ms: i64,
+}
+
+//
+// ConsumerDiagnostics
+//
+
+#[derive(Clone)]
+pub struct ConsumerDiagnostics {
+  group_config: ConsumerGroupConfig,
+  reader: Arc<Mutex<ConsumerReaderImpl>>,
+  prefetch_buffer: Arc<Mutex<PrefetchBuffer>>,
+  prefetch_max_bytes: u64,
+  started: Arc<AtomicBool>,
+  prefetch_shutdown: Arc<AtomicBool>,
+  runtime_state: Arc<StdMutex<ConsumerDiagnosticsRuntimeState>>,
+}
+
+impl ConsumerDiagnostics {
+  #[must_use]
+  pub async fn state_snapshot(&self) -> ConsumerStateSnapshot {
+    let generated_at_ts_ms = now_unix_millis();
+    let (
+      mut owned_partitions,
+      mut active_assignment,
+      mut pending_assignment,
+      pending_revocation,
+      mut pending_commits,
+      coordinator_generation,
+      next_heartbeat_at_ms,
+      next_rebalance_at_ms,
+    ) = {
+      let runtime_state = self
+        .runtime_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+      (
+        runtime_state.owned_partitions.clone(),
+        runtime_state.active_assignment.clone(),
+        runtime_state.pending_assignment.clone(),
+        runtime_state.pending_revocation,
+        offsets_from_map(&runtime_state.pending_commits),
+        runtime_state.coordinator_generation,
+        runtime_state.next_heartbeat_at_ms,
+        runtime_state.next_rebalance_at_ms,
+      )
+    };
+    owned_partitions.sort_unstable();
+    active_assignment.sort_unstable();
+    if let Some(assignment) = &mut pending_assignment {
+      assignment.sort_unstable();
+    }
+
+    let mut cursors = offsets_from_map(&self.reader.lock().await.cursors());
+    let prefetch_buffer = self.prefetch_buffer.lock().await;
+
+    ConsumerStateSnapshot {
+      schema_version: 1,
+      generated_at_ts_ms,
+      topic: self.group_config.topic.to_string(),
+      group_id: self.group_config.group_id.to_string(),
+      member_id: self.group_config.member_id.to_string(),
+      started: self.started.load(Ordering::Acquire),
+      coordinator_generation,
+      owned_partitions,
+      active_assignment,
+      pending_assignment,
+      pending_revocation,
+      pending_commits: std::mem::take(&mut pending_commits),
+      cursors: std::mem::take(&mut cursors),
+      next_heartbeat_at_ms,
+      next_rebalance_at_ms,
+      prefetch_buffered_batch_count: prefetch_buffer.batches.len(),
+      prefetch_buffered_bytes: prefetch_buffer.buffered_bytes,
+      prefetch_max_bytes: self.prefetch_max_bytes,
+      prefetch_worker_running: self.started.load(Ordering::Acquire)
+        && !self.prefetch_shutdown.load(Ordering::Acquire),
+    }
+  }
+
+  #[cfg(feature = "admin")]
+  pub fn admin_router(self) -> axum::Router {
+    crate::admin::router(self)
+  }
+}
+
+fn offsets_from_map(offsets: &HashMap<VirtualPartitionId, u64>) -> Vec<ConsumerOffsetSnapshot> {
+  let mut snapshots = offsets
+    .iter()
+    .map(|(virtual_partition_id, offset)| ConsumerOffsetSnapshot {
+      virtual_partition_id: *virtual_partition_id,
+      offset: *offset,
+    })
+    .collect::<Vec<_>>();
+  snapshots.sort_by_key(|snapshot| snapshot.virtual_partition_id);
+  snapshots
+}
+
+//
 // ConsumerIterator
 //
 
@@ -234,6 +383,10 @@ pub trait ConsumerIterator: Send + Sync {
   async fn shutdown(self: Box<Self>) -> Result<()>;
   /// Reposition read cursor for a partition.
   async fn seek(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()>;
+  /// Returns a handle for observing this consumer's local runtime state.
+  fn diagnostics(&self) -> Option<ConsumerDiagnostics> {
+    None
+  }
 }
 
 //
@@ -264,6 +417,7 @@ pub struct ConsumerIteratorImpl {
   pending_revocation_completion: Option<oneshot::Receiver<()>>,
   next_heartbeat_at_ms: i64,
   next_rebalance_at_ms: i64,
+  diagnostics: ConsumerDiagnostics,
 }
 
 impl ConsumerIteratorImpl {
@@ -302,6 +456,22 @@ impl ConsumerIteratorImpl {
     )?));
     let coordinator = ConsumerGroupCoordinatorImpl::new(group_config.clone(), lease_store)?;
     let now_ts_ms = now_unix_millis();
+    let prefetch_buffer = Arc::new(Mutex::new(PrefetchBuffer::default()));
+    let started = Arc::new(AtomicBool::new(false));
+    let prefetch_shutdown = Arc::new(AtomicBool::new(false));
+    let diagnostics = ConsumerDiagnostics {
+      group_config: group_config.clone(),
+      reader: Arc::clone(&reader),
+      prefetch_buffer: Arc::clone(&prefetch_buffer),
+      prefetch_max_bytes,
+      started: Arc::clone(&started),
+      prefetch_shutdown: Arc::clone(&prefetch_shutdown),
+      runtime_state: Arc::new(StdMutex::new(ConsumerDiagnosticsRuntimeState {
+        next_heartbeat_at_ms: now_ts_ms,
+        next_rebalance_at_ms: now_ts_ms,
+        ..Default::default()
+      })),
+    };
 
     membership_store
       .register_member(
@@ -323,10 +493,10 @@ impl ConsumerIteratorImpl {
       started: false,
       pending_commits: HashMap::new(),
       prefetch_max_bytes,
-      prefetch_buffer: Arc::new(Mutex::new(PrefetchBuffer::default())),
+      prefetch_buffer,
       prefetch_data_notify: Arc::new(Notify::new()),
       prefetch_space_notify: Arc::new(Notify::new()),
-      prefetch_shutdown: Arc::new(AtomicBool::new(false)),
+      prefetch_shutdown,
       prefetch_task: None,
       prefetch_idle_base_delay_ms: idle_poll_delay_ms,
       prefetch_idle_max_delay_ms: max_idle_poll_delay_ms,
@@ -336,6 +506,7 @@ impl ConsumerIteratorImpl {
       pending_revocation_completion: None,
       next_heartbeat_at_ms: now_ts_ms,
       next_rebalance_at_ms: now_ts_ms,
+      diagnostics,
     };
 
     let snapshot = iterator.coordination_source.snapshot().await?;
@@ -381,11 +552,32 @@ impl ConsumerIteratorImpl {
     self
       .pending_commits
       .retain(|partition_id, _| self.active_assignment.contains(partition_id));
+    self.refresh_diagnostics();
     info!(
       "consumer assignment active: topic={}, group_id={}, member_id={}, partitions={:?}",
       self.group_config.topic, self.group_config.group_id, self.group_config.member_id, assignment
     );
     Ok(())
+  }
+
+  fn refresh_diagnostics(&self) {
+    let mut diagnostics = self
+      .diagnostics
+      .runtime_state
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
+    diagnostics.coordinator_generation = self.coordinator.generation();
+    diagnostics.owned_partitions = self.coordinator.owned_partitions();
+    diagnostics.active_assignment = self.active_assignment.iter().copied().collect();
+    diagnostics
+      .pending_assignment
+      .clone_from(&self.pending_assignment);
+    diagnostics.pending_revocation = self.pending_revocation_completion.is_some();
+    diagnostics
+      .pending_commits
+      .clone_from(&self.pending_commits);
+    diagnostics.next_heartbeat_at_ms = self.next_heartbeat_at_ms;
+    diagnostics.next_rebalance_at_ms = self.next_rebalance_at_ms;
   }
 
   fn next_buffered_record(&mut self) -> Option<ConsumerRecord> {
@@ -489,6 +681,7 @@ impl ConsumerIteratorImpl {
     let (completion_tx, completion_rx) = oneshot::channel();
     self.pending_assignment = Some(next_assignment);
     self.pending_revocation_completion = Some(completion_rx);
+    self.refresh_diagnostics();
 
     info!(
       "consumer revocation requested: topic={}, group_id={}, member_id={}, revoked={:?}",
@@ -581,6 +774,7 @@ impl ConsumerIteratorImpl {
     }
 
     self.next_heartbeat_at_ms = now_ts_ms + consumer_heartbeat_interval_ms(&self.group_config);
+    self.refresh_diagnostics();
     Ok(report)
   }
 }
@@ -756,7 +950,9 @@ impl ConsumerIterator for ConsumerIteratorImpl {
   fn start(&mut self) -> Result<()> {
     ensure!(!self.started, "consumer iterator already started");
     self.started = true;
+    self.diagnostics.started.store(true, Ordering::Release);
     self.spawn_prefetch_task();
+    self.refresh_diagnostics();
     info!(
       "consumer iterator started: topic={}, group_id={}, member_id={}",
       self.group_config.topic, self.group_config.group_id, self.group_config.member_id
@@ -834,6 +1030,7 @@ impl ConsumerIterator for ConsumerIteratorImpl {
       "cannot store cursor for unassigned virtual partition {virtual_partition_id}"
     );
     self.pending_commits.insert(virtual_partition_id, offset);
+    self.refresh_diagnostics();
     trace!(
       "consumer stored offset: topic={}, partition={}, offset={}",
       self.group_config.topic, virtual_partition_id, offset
@@ -871,6 +1068,8 @@ impl ConsumerIterator for ConsumerIteratorImpl {
         .await;
       self.stop_prefetch_task().await;
       self.started = false;
+      self.diagnostics.started.store(false, Ordering::Release);
+      self.refresh_diagnostics();
       info!(
         "consumer iterator shutdown: topic={}, group_id={}, member_id={}",
         self.group_config.topic, self.group_config.group_id, self.group_config.member_id
@@ -897,5 +1096,9 @@ impl ConsumerIterator for ConsumerIteratorImpl {
       self.group_config.topic, virtual_partition_id, offset
     );
     Ok(())
+  }
+
+  fn diagnostics(&self) -> Option<ConsumerDiagnostics> {
+    Some(self.diagnostics.clone())
   }
 }

@@ -35,6 +35,7 @@ use blob_stream_types::{
 };
 pub use config::{TopicInfo, WriteConfig, build_write_engine};
 use log::{debug, trace};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
@@ -64,6 +65,60 @@ pub struct WriteRequest {
 #[derive(Clone, Debug)]
 pub struct WriteResponse {
   pub seq_range: SeqRange,
+}
+
+//
+// BrokerStateSnapshot
+//
+
+#[derive(Debug, Serialize)]
+pub struct BrokerStateSnapshot {
+  pub schema_version: u32,
+  pub generated_at_ts_ms: i64,
+  pub holder_id: String,
+  pub writer_id: u32,
+  pub flush_max_bytes: u64,
+  pub flush_max_delay_ms: i64,
+  pub topics: Vec<BrokerTopicStateSnapshot>,
+}
+
+//
+// BrokerTopicStateSnapshot
+//
+
+#[derive(Debug, Serialize)]
+pub struct BrokerTopicStateSnapshot {
+  pub name: String,
+  pub partition_count: u32,
+  pub num_writers: u32,
+  pub retention_days: u32,
+  pub local_partitions: Vec<BrokerPartitionStateSnapshot>,
+}
+
+//
+// BrokerPartitionStateSnapshot
+//
+
+#[derive(Debug, Serialize)]
+pub struct BrokerPartitionStateSnapshot {
+  pub virtual_partition_id: VirtualPartitionId,
+  pub lease_expiration_ts_ms: Option<i64>,
+  pub buffered_batch_count: usize,
+  pub buffered_record_count: usize,
+  pub buffered_bytes: u64,
+  pub first_buffered_ts_ms: Option<i64>,
+  pub sequence_reservation: Option<SequenceReservationSnapshot>,
+  pub next_sequence: u64,
+}
+
+//
+// SequenceReservationSnapshot
+//
+
+#[derive(Debug, Serialize)]
+pub struct SequenceReservationSnapshot {
+  pub start: u64,
+  pub end: u64,
 }
 
 //
@@ -112,6 +167,9 @@ impl WriteError {
 pub trait WriteEngine: Send + Sync {
   /// Ingest a single batch into the broker write path.
   async fn produce_batch(&self, request: WriteRequest) -> Result<WriteResponse, WriteError>;
+
+  /// Returns a best-effort snapshot of state held by this broker process.
+  async fn state_snapshot(&self) -> BrokerStateSnapshot;
 }
 
 //
@@ -561,6 +619,70 @@ impl WriteEngine for WriteEngineImpl {
       .observe(started.elapsed().as_secs_f64());
 
     Ok(WriteResponse { seq_range })
+  }
+
+  async fn state_snapshot(&self) -> BrokerStateSnapshot {
+    let generated_at_ts_ms = self.time_provider.now().unix_timestamp_ms();
+    let state = self.state.lock().await;
+
+    let mut topics = self
+      .topics
+      .values()
+      .map(|topic| {
+        let mut local_partitions = state
+          .topics
+          .get(&topic.name)
+          .map(|topic_state| {
+            topic_state
+              .partitions
+              .iter()
+              .map(
+                |(virtual_partition_id, partition_state)| BrokerPartitionStateSnapshot {
+                  virtual_partition_id: *virtual_partition_id,
+                  lease_expiration_ts_ms: partition_state.lease_expiration_ts_ms,
+                  buffered_batch_count: partition_state.buffer.batches.len(),
+                  buffered_record_count: partition_state
+                    .buffer
+                    .batches
+                    .iter()
+                    .map(|batch| batch.records.len())
+                    .sum(),
+                  buffered_bytes: partition_state.buffer.buffered_bytes,
+                  first_buffered_ts_ms: partition_state.buffer.first_buffered_ts_ms,
+                  sequence_reservation: partition_state.seq_allocator.reservation.as_ref().map(
+                    |reservation| SequenceReservationSnapshot {
+                      start: reservation.start,
+                      end: reservation.end,
+                    },
+                  ),
+                  next_sequence: partition_state.seq_allocator.next_seq,
+                },
+              )
+              .collect::<Vec<_>>()
+          })
+          .unwrap_or_default();
+        local_partitions.sort_by_key(|partition| partition.virtual_partition_id);
+
+        BrokerTopicStateSnapshot {
+          name: topic.name.clone(),
+          partition_count: topic.partition_count,
+          num_writers: topic.num_writers,
+          retention_days: topic.retention_days,
+          local_partitions,
+        }
+      })
+      .collect::<Vec<_>>();
+    topics.sort_by(|left, right| left.name.cmp(&right.name));
+
+    BrokerStateSnapshot {
+      schema_version: 1,
+      generated_at_ts_ms,
+      holder_id: self.holder_id.clone(),
+      writer_id: self.config.writer_id,
+      flush_max_bytes: self.config.flush_max_bytes,
+      flush_max_delay_ms: self.config.flush_max_delay_ms,
+      topics,
+    }
   }
 }
 

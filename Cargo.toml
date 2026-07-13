@@ -56,5 +56,5 @@ tikv-jemallocator = "0.7.0"
 time              = { version = "0.3.53", features = ["serde-well-known", "macros", "parsing"] }
 tokio             = { version = "1.52.3", features = ["full"] }
 tokio-stream      = "0.1.18"
-uuid              = { version = "1.23.4", features = ["v4"] }
+uuid              = { version = "1.23.5", features = ["v4"] }
 zstd              = "0.13.3"

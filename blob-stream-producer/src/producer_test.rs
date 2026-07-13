@@ -124,6 +124,66 @@ fn metrics_scope() -> bd_server_stats::stats::Scope {
 }
 
 #[tokio::test]
+async fn diagnostics_report_buffered_partition_state() {
+  let mut config = default_config();
+  config.max_batch_records = Some(2);
+  config.flush_max_delay_ms = Some(60_000);
+
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let transport = Arc::new(FakeBrokerTransport::default());
+  let producer = Arc::new(
+    ProducerClientImpl::new_with_transport(
+      config,
+      vec![topic_config()],
+      discovery,
+      transport,
+      metrics_scope(),
+    )
+    .await
+    .unwrap(),
+  );
+
+  let pending_producer = Arc::clone(&producer);
+  let pending_produce = tokio::spawn(async move {
+    pending_producer
+      .produce(ProducerRecord::new(
+        "telemetry",
+        b"diagnostics-key".to_vec(),
+        vec![1, 2, 3],
+        100,
+      ))
+      .await
+  });
+
+  tokio::task::yield_now().await;
+
+  let snapshot = producer
+    .diagnostics()
+    .expect("producer implementation provides diagnostics")
+    .state_snapshot()
+    .await;
+  assert_eq!(snapshot.schema_version, 1);
+  assert_eq!(snapshot.writer_id, 1);
+  assert_eq!(snapshot.max_batch_records, 2);
+  assert_eq!(snapshot.broker_node_ids, vec!["node-a", "node-b"]);
+  assert_eq!(snapshot.topics.len(), 1);
+  assert_eq!(snapshot.topics[0].name, "telemetry");
+  assert_eq!(snapshot.partition_buffers.len(), 1);
+  assert_eq!(snapshot.partition_buffers[0].topic, "telemetry");
+  assert_eq!(snapshot.partition_buffers[0].buffered_record_count, 1);
+  assert_eq!(snapshot.partition_buffers[0].pending_ack_count, 1);
+  assert_eq!(snapshot.partition_buffers[0].buffered_bytes, 3);
+  assert!(
+    snapshot.partition_buffers[0]
+      .oldest_buffered_age_ms
+      .is_some()
+  );
+
+  pending_produce.abort();
+  let _ignored = pending_produce.await;
+}
+
+#[tokio::test]
 async fn routes_to_expected_broker() {
   let config = default_config();
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
