@@ -15,14 +15,12 @@ use log::{debug, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::fmt::Write;
 
 #[cfg(test)]
 #[path = "./dynamo_test.rs"]
 mod tests;
 
 const ATTR_PK: &str = "pk";
-const ATTR_SK: &str = "sk";
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 const DEFAULT_SEGMENT_TTL_BUFFER_SECONDS: u32 = 3_600;
 
@@ -109,32 +107,19 @@ impl MetadataStore for DynamoMetadataStore {
     Ok(())
   }
 
-  async fn scan_window(
-    &self,
-    window: &TopicWindowKey,
-    min_snowflake_id: Option<SnowflakeId>,
-  ) -> Result<Vec<SegmentMetadata>> {
+  async fn scan_window(&self, window: &TopicWindowKey) -> Result<Vec<SegmentMetadata>> {
     trace!(
-      "metadata(dynamo) scan_window start: table={}, topic={}, window_start={}, min_snowflake={:?}",
-      self.table_name,
-      window.topic,
-      window.window_start_unix_seconds,
-      min_snowflake_id.map(SnowflakeId::as_u64)
+      "metadata(dynamo) scan_window start: table={}, topic={}, window_start={}",
+      self.table_name, window.topic, window.window_start_unix_seconds
     );
     let mut values = HashMap::new();
     values.insert(":pk".to_string(), AttributeValue::S(window.format()));
-
-    let mut condition = format!("{ATTR_PK} = :pk");
-    if let Some(min) = min_snowflake_id {
-      write!(&mut condition, " and {ATTR_SK} >= :sk").expect("format condition");
-      values.insert(":sk".to_string(), AttributeValue::S(min.format_lex()));
-    }
 
     let response = self
       .client
       .query()
       .table_name(&self.table_name)
-      .key_condition_expression(condition)
+      .key_condition_expression(format!("{ATTR_PK} = :pk"))
       .set_expression_attribute_values(Some(values))
       .consistent_read(false)
       .send()

@@ -22,11 +22,13 @@ use blob_stream_proto::protos::blobstream::v1::config::{
   DynamoMetadataStoreConfig,
   MetadataStoreConfig,
   RuntimeConfig,
+  SegmentCompression,
   TopicConfig,
 };
-use blob_stream_types::VirtualPartitionId;
+use blob_stream_types::{Compression, VirtualPartitionId};
 use hostname::get as get_hostname;
 use log::{debug, trace};
+use protobuf::EnumOrUnknown;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -38,6 +40,7 @@ const DEFAULT_RESERVATION_SIZE: u64 = 1_000;
 const DEFAULT_WINDOW_SIZE_SECONDS: i64 = 300;
 const DEFAULT_SEGMENT_TTL_BUFFER_SECONDS: u32 = 3_600;
 const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
+const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
 #[cfg(test)]
 #[path = "./config_test.rs"]
@@ -75,7 +78,7 @@ impl WriteConfig {
       reservation_size: DEFAULT_RESERVATION_SIZE,
       window_size_seconds: DEFAULT_WINDOW_SIZE_SECONDS,
       writer_id: 0,
-      compression: blob_stream_types::Compression::none(),
+      compression: Compression::zstd(DEFAULT_ZSTD_LEVEL),
       blob_prefix: None,
     }
   }
@@ -89,6 +92,14 @@ impl WriteConfig {
 
     if broker.flush_max_delay_ms > 0 {
       config.flush_max_delay_ms = i64::from(broker.flush_max_delay_ms);
+    }
+
+    let compression = broker.segment_compression.as_ref().map_or(
+      SegmentCompression::SEGMENT_COMPRESSION_ZSTD,
+      EnumOrUnknown::enum_value_or_default,
+    );
+    if compression == SegmentCompression::SEGMENT_COMPRESSION_NONE {
+      config.compression = Compression::none();
     }
 
     Ok(config)

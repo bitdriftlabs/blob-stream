@@ -198,7 +198,7 @@ async fn diagnostics_report_assignment_and_start_state() {
     .diagnostics()
     .expect("consumer implementation provides diagnostics");
   let snapshot = diagnostics.state_snapshot().await;
-  assert_eq!(snapshot.schema_version, 1);
+  assert_eq!(snapshot.schema_version, 2);
   assert_eq!(snapshot.topic, "telemetry");
   assert_eq!(snapshot.group_id, "group-a");
   assert_eq!(snapshot.member_id, "member-a");
@@ -230,8 +230,8 @@ fn idle_poll_backoff_exponential_with_max_and_reset() {
 }
 
 #[test]
-fn idle_poll_backoff_without_max_remains_constant() {
-  let mut backoff = IdlePollBackoff::new(250, None);
+fn idle_poll_backoff_with_base_max_remains_constant() {
+  let mut backoff = IdlePollBackoff::new(250, Some(250));
 
   assert_eq!(backoff.next_delay_ms(), 250);
   assert_eq!(backoff.next_delay_ms(), 250);
@@ -371,6 +371,13 @@ async fn next_delivers_records_and_commit_renews() {
   let report = iterator.commit().await.unwrap();
   assert_eq!(report.renewed_partitions, vec![3]);
   assert!(report.fenced_partitions.is_empty());
+
+  let state = iterator.diagnostics.state_snapshot().await;
+  assert_eq!(state.staged_offsets.len(), 1);
+  assert_eq!(state.staged_offsets[0].virtual_partition_id, 3);
+  assert_eq!(state.staged_offsets[0].offset, 2);
+  assert_eq!(state.last_committed_offsets, state.staged_offsets);
+  assert!(state.last_successful_heartbeat_at_ms.is_some());
 }
 
 #[tokio::test]

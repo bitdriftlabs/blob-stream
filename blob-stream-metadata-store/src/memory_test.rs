@@ -68,33 +68,9 @@ async fn stores_and_scans_window() {
     topic: "topic-a".to_string(),
     window_start_unix_seconds: 100,
   };
-  let segments = store.scan_window(&window, None).await.expect("scan window");
+  let segments = store.scan_window(&window).await.expect("scan window");
 
   assert_eq!(segments.len(), 2);
   assert!(segments.contains(&first));
   assert!(segments.contains(&second));
-}
-
-#[tokio::test]
-async fn respects_min_snowflake_id() {
-  let store = InMemoryMetadataStore::new();
-  let first = build_segment("topic-a", 100, 1);
-  let second = build_segment("topic-a", 100, 9);
-
-  store.write_segment(first).await.expect("write first");
-  store
-    .write_segment(second.clone())
-    .await
-    .expect("write second");
-
-  let window = TopicWindowKey {
-    topic: "topic-a".to_string(),
-    window_start_unix_seconds: 100,
-  };
-  let segments = store
-    .scan_window(&window, Some(SnowflakeId(5)))
-    .await
-    .expect("scan window");
-
-  assert_eq!(segments, vec![second]);
 }

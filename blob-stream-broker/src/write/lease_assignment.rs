@@ -75,7 +75,7 @@ impl WriteEngineImpl {
       // If the watch sender closes, we continue on ticker-only cadence so lease maintenance keeps
       // running instead of silently stalling.
       let mut membership_updates_open = true;
-      let mut previously_owned: HashSet<(String, VirtualPartitionId)> = HashSet::new();
+      let mut previously_assigned: HashSet<(String, VirtualPartitionId)> = HashSet::new();
 
       loop {
         let shutting_down = if membership_updates_open {
@@ -101,18 +101,22 @@ impl WriteEngineImpl {
         let currently_owned: HashSet<(String, VirtualPartitionId)> =
           owned.iter().cloned().collect();
 
-        if currently_owned != previously_owned {
+        let gained_partitions = sorted_partition_delta(&currently_owned, &previously_assigned);
+        let lost_partitions = sorted_partition_delta(&previously_assigned, &currently_owned);
+        if !gained_partitions.is_empty() || !lost_partitions.is_empty() {
           info!(
-            "broker lease ownership changed: holder_id={}, owned_partitions={}",
-            holder_id,
-            currently_owned.len()
+            "broker partition assignment changed: holder_id={holder_id}, membership_nodes={:?}, \
+             assigned_partitions={}, gained_partitions={gained_partitions:?}, \
+             lost_partitions={lost_partitions:?}",
+            membership.nodes,
+            currently_owned.len(),
           );
         }
 
         // On membership changes (scale up/down), we release any partition that moved away from
         // this broker instead of waiting for lease TTL expiration. This shortens convergence and
         // reduces transient NOT_LEASE_HOLDER retries for producers during rebalance.
-        for (topic, virtual_partition_id) in previously_owned.difference(&currently_owned) {
+        for (topic, virtual_partition_id) in &lost_partitions {
           Self::release_partition_lease(
             &lease_store,
             &state,
@@ -128,7 +132,11 @@ impl WriteEngineImpl {
         // During shutdown we release all currently owned partitions so another broker can acquire
         // immediately. If release fails, normal lease expiry still guarantees eventual progress.
         if shutting_down {
-          for (topic, virtual_partition_id) in currently_owned {
+          info!(
+            "broker releasing assigned leases for shutdown: holder_id={holder_id}, \
+             partitions={owned:?}"
+          );
+          for (topic, virtual_partition_id) in owned {
             Self::release_partition_lease(
               &lease_store,
               &state,
@@ -143,8 +151,8 @@ impl WriteEngineImpl {
           break;
         }
 
-        // Record ownership after successful reconciliation so the next pass can compute deltas.
-        previously_owned = currently_owned;
+        // Record assignment after reconciling releases so the next pass can compute deltas.
+        previously_assigned = currently_owned;
 
         for (topic, virtual_partition_id) in owned {
           let key = ProducerPartitionLeaseKey {
@@ -268,4 +276,13 @@ impl WriteEngineImpl {
       },
     }
   }
+}
+
+fn sorted_partition_delta(
+  left: &HashSet<(String, VirtualPartitionId)>,
+  right: &HashSet<(String, VirtualPartitionId)>,
+) -> Vec<(String, VirtualPartitionId)> {
+  let mut partitions: Vec<_> = left.difference(right).cloned().collect();
+  partitions.sort_unstable();
+  partitions
 }

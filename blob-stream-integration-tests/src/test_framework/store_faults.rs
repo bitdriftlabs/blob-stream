@@ -19,7 +19,7 @@ use blob_stream_metadata_store::{
   SegmentMetadata,
   SequenceReservationOutcome,
 };
-use blob_stream_types::{CommittedCursor, SnowflakeId, TopicWindowKey};
+use blob_stream_types::{CommittedCursor, TopicWindowKey};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
@@ -589,11 +589,7 @@ impl MetadataStore for FaultInjectedMetadataStore {
     result
   }
 
-  async fn scan_window(
-    &self,
-    window: &TopicWindowKey,
-    min_snowflake_id: Option<SnowflakeId>,
-  ) -> Result<Vec<SegmentMetadata>> {
+  async fn scan_window(&self, window: &TopicWindowKey) -> Result<Vec<SegmentMetadata>> {
     let key = window.format();
     let effects = self
       .controller
@@ -620,7 +616,7 @@ impl MetadataStore for FaultInjectedMetadataStore {
       return Ok(visible);
     }
 
-    let mut scanned = self.inner.scan_window(window, min_snowflake_id).await?;
+    let mut scanned = self.inner.scan_window(window).await?;
     scanned.append(&mut visible);
     self
       .controller

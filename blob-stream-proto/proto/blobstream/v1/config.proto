@@ -6,7 +6,14 @@ import "validate/validate.proto";
 
 // Broker process configuration shared across all topics.
 message BrokerConfig {
-  // Maximum buffered bytes per virtual partition before forcing a flush.
+  // Maximum aggregate raw record-payload bytes buffered per virtual partition before forcing a
+  // flush. This is measured before protobuf encoding and before compression, and therefore is a
+  // flush trigger rather than an upper bound on the resulting blob size.
+  //
+  // A flushed segment can contain multiple buffered batches. Each batch is protobuf encoded and
+  // compressed independently, then the compressed batch payloads are concatenated into the
+  // segment blob; the segment is not compressed as one whole payload.
+  //
   // Default when unset/zero: 67,108,864 bytes (64 MiB).
   uint32 flush_max_bytes = 1;
 
@@ -22,6 +29,16 @@ message BrokerConfig {
 
   // Broker discovery config used to watch membership changes.
   BrokerDiscoveryConfig discovery = 5 [(validate.rules).message.required = true];
+
+  // Compression strategy for stored segment payloads.
+  // Default when unset: SEGMENT_COMPRESSION_ZSTD.
+  optional SegmentCompression segment_compression = 6 [(validate.rules).enum.defined_only = true];
+}
+
+// Compression strategy for stored segment payloads.
+enum SegmentCompression {
+  SEGMENT_COMPRESSION_NONE = 0;
+  SEGMENT_COMPRESSION_ZSTD = 1;
 }
 
 // Node identity selection for brokers.
@@ -266,12 +283,14 @@ message ConsumerReadConfig {
   optional int64 window_size_seconds = 2 [(validate.rules).int64.gt = 0];
 
   // Number of trailing windows to scan on each read.
-  // Default when unset: 3 windows.
+  // Default when unset: 2 windows.
   //
   // Effective late-arrival coverage is:
   //   coverage_seconds = window_size_seconds * lookback_windows
   //
-  // With defaults, coverage is 300 * 3 = 900 seconds (15 minutes).
+  // With defaults, coverage is 300 * 2 = 600 seconds (10 minutes). This scans the current
+  // window and its immediate predecessor, allowing metadata to arrive for up to one full window
+  // after the original window closes.
   //
   // Why values > 1 are useful even with a 5-minute window:
   // - Metadata visibility can be delayed by retries/backoff, transient store slowness,
@@ -281,7 +300,8 @@ message ConsumerReadConfig {
   //
   // Practical sizing rule:
   // - Choose lookback_windows >= ceil(max_expected_metadata_delay / window_size_seconds) + 1.
-  // - Add an extra safety window for production jitter if loss is unacceptable.
+  // - Increase this value when metadata can arrive later than one window after its original
+  //   window closes.
   optional uint32 lookback_windows = 3 [(validate.rules).uint32.gt = 0];
 
   // Base idle poll delay in milliseconds when no batches are available.
@@ -289,7 +309,8 @@ message ConsumerReadConfig {
   optional uint64 idle_poll_delay_ms = 4 [(validate.rules).uint64.gt = 0];
 
   // Optional max idle poll delay in milliseconds for exponential backoff.
-  // Default when unset: disabled (no max cap).
+  // Default when unset: 2,000 ms. With the default base delay, empty polls wait 250 ms, 500 ms,
+  // 1,000 ms, then 2,000 ms until data arrives.
   optional uint64 max_idle_poll_delay_ms = 5;
 
   // Soft target RAM budget for iterator-side prefetch buffering.

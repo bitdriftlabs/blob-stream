@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "./k8s_test.rs"]
+mod tests;
+
 use crate::{BrokerDiscovery, BrokerMembership, BrokerNode};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -121,11 +125,21 @@ fn membership_from_endpoints(endpoints: &Endpoints) -> BrokerMembership {
     };
 
     for address in addresses {
-      let address = format!("{}:{}", address.ip, port);
-      if seen.insert(address.clone()) {
+      let broker_address = format!("{}:{}", address.ip, port);
+      let node_id = address
+        .hostname
+        .clone()
+        .or_else(|| {
+          address
+            .target_ref
+            .as_ref()
+            .and_then(|target_ref| target_ref.name.clone())
+        })
+        .unwrap_or_else(|| broker_address.clone());
+      if seen.insert(broker_address.clone()) {
         nodes.push(BrokerNode {
-          node_id: address.clone(),
-          address,
+          node_id,
+          address: broker_address,
         });
       }
     }
