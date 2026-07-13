@@ -29,8 +29,17 @@ done
 # Get absolute paths for repositories
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-PARENT_DIR="$(dirname "$ROOT_DIR")"
-SHARED_CORE_PATH="$PARENT_DIR/shared-core"
+SEARCH_DIR="$ROOT_DIR"
+while [[ "$SEARCH_DIR" != "/" && ! -d "$SEARCH_DIR/shared-core" ]]; do
+  SEARCH_DIR="$(dirname "$SEARCH_DIR")"
+done
+
+if [[ ! -d "$SEARCH_DIR/shared-core" ]]; then
+  echo "Error: shared-core not found in any parent directory of $ROOT_DIR"
+  exit 1
+fi
+
+SHARED_CORE_PATH="$SEARCH_DIR/shared-core"
 
 # Create a temporary file
 TMP_FILE=$(mktemp)
@@ -45,7 +54,7 @@ while IFS= read -r line; do
     if $USE_GIT_PATH; then
       echo "$line" | sed "s#git = \"$SHARED_CORE_GIT_URL\"#git = \"file://$SHARED_CORE_PATH\"#g" >> "$TMP_FILE"
     else
-      echo "$line" | sed "s#git = \"$SHARED_CORE_GIT_URL\"#path = \"../shared-core/$crate_name\"#g" >> "$TMP_FILE"
+      echo "$line" | sed "s#git = \"$SHARED_CORE_GIT_URL\"#path = \"$SHARED_CORE_PATH/$crate_name\"#g" >> "$TMP_FILE"
     fi
   else
     echo "$line" >> "$TMP_FILE"
