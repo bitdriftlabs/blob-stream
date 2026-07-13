@@ -169,6 +169,52 @@ fn metrics_scope() -> bd_server_stats::stats::Scope {
   Collector::default().scope("blob_stream_consumer_test")
 }
 
+#[tokio::test]
+async fn diagnostics_report_assignment_and_start_state() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![0, 1],
+  }));
+
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+  )
+  .await
+  .unwrap();
+
+  let diagnostics = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics");
+  let snapshot = diagnostics.state_snapshot().await;
+  assert_eq!(snapshot.schema_version, 1);
+  assert_eq!(snapshot.topic, "telemetry");
+  assert_eq!(snapshot.group_id, "group-a");
+  assert_eq!(snapshot.member_id, "member-a");
+  assert!(!snapshot.started);
+  assert_eq!(snapshot.owned_partitions, vec![0, 1]);
+  assert_eq!(snapshot.active_assignment, vec![0, 1]);
+  assert_eq!(snapshot.prefetch_buffered_batch_count, 0);
+
+  iterator.start().unwrap();
+  let started_snapshot = diagnostics.state_snapshot().await;
+  assert!(started_snapshot.started);
+  assert!(started_snapshot.prefetch_worker_running);
+
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
 #[test]
 fn idle_poll_backoff_exponential_with_max_and_reset() {
   let mut backoff = IdlePollBackoff::new(250, Some(2_000));

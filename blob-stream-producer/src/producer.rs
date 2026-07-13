@@ -39,6 +39,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 use blob_stream_types::{VirtualPartitionId, virtual_partition_for_key};
 use log::{debug, trace};
 use prometheus::{Histogram, IntCounter};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,6 +133,126 @@ pub struct ProducerAck {
 }
 
 //
+// ProducerStateSnapshot
+//
+
+#[derive(Debug, Serialize)]
+pub struct ProducerStateSnapshot {
+  pub schema_version: u32,
+  pub generated_at_ts_ms: i64,
+  pub writer_id: u32,
+  pub max_batch_records: u32,
+  pub max_batch_bytes: u32,
+  pub flush_max_delay_ms: u64,
+  pub broker_node_ids: Vec<String>,
+  pub topics: Vec<ProducerTopicSnapshot>,
+  pub partition_buffers: Vec<ProducerPartitionBufferSnapshot>,
+}
+
+//
+// ProducerTopicSnapshot
+//
+
+#[derive(Debug, Serialize)]
+pub struct ProducerTopicSnapshot {
+  pub name: String,
+  pub partition_count: u32,
+  pub num_writers: u32,
+  pub retention_days: u32,
+}
+
+//
+// ProducerPartitionBufferSnapshot
+//
+
+#[derive(Debug, Serialize)]
+pub struct ProducerPartitionBufferSnapshot {
+  pub topic: String,
+  pub virtual_partition_id: VirtualPartitionId,
+  pub buffered_record_count: usize,
+  pub pending_ack_count: usize,
+  pub buffered_bytes: usize,
+  pub oldest_buffered_age_ms: Option<u64>,
+}
+
+//
+// ProducerDiagnostics
+//
+
+#[derive(Clone)]
+pub struct ProducerDiagnostics {
+  config: ProducerConfig,
+  topics: HashMap<String, ProducerTopicConfig>,
+  membership_rx: watch::Receiver<BrokerMembership>,
+  state: Arc<Mutex<ProducerState>>,
+}
+
+impl ProducerDiagnostics {
+  #[must_use]
+  pub async fn state_snapshot(&self) -> ProducerStateSnapshot {
+    let generated_at_ts_ms = time::OffsetDateTime::now_utc().unix_timestamp() * 1_000;
+    let mut broker_node_ids = self
+      .membership_rx
+      .borrow()
+      .nodes
+      .iter()
+      .map(|node| node.node_id.clone())
+      .collect::<Vec<_>>();
+    broker_node_ids.sort();
+
+    let mut topics = self
+      .topics
+      .values()
+      .map(|topic| ProducerTopicSnapshot {
+        name: topic.name.to_string(),
+        partition_count: topic.partition_count,
+        num_writers: topic.num_writers,
+        retention_days: topic.retention_days,
+      })
+      .collect::<Vec<_>>();
+    topics.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let state = self.state.lock().await;
+    let mut partition_buffers = state
+      .buffers
+      .iter()
+      .map(
+        |((topic, virtual_partition_id), buffer)| ProducerPartitionBufferSnapshot {
+          topic: topic.clone(),
+          virtual_partition_id: *virtual_partition_id,
+          buffered_record_count: buffer.records.len(),
+          pending_ack_count: buffer.waiters.len(),
+          buffered_bytes: buffer.buffered_bytes,
+          oldest_buffered_age_ms: buffer
+            .first_buffered_at
+            .map(|first| u64::try_from(first.elapsed().as_millis()).unwrap_or(u64::MAX)),
+        },
+      )
+      .collect::<Vec<_>>();
+    partition_buffers.sort_by(|left, right| {
+      (&left.topic, left.virtual_partition_id).cmp(&(&right.topic, right.virtual_partition_id))
+    });
+
+    ProducerStateSnapshot {
+      schema_version: 1,
+      generated_at_ts_ms,
+      writer_id: producer_writer_id(&self.config),
+      max_batch_records: producer_max_batch_records(&self.config),
+      max_batch_bytes: producer_max_batch_bytes(&self.config),
+      flush_max_delay_ms: producer_flush_max_delay_ms(&self.config),
+      broker_node_ids,
+      topics,
+      partition_buffers,
+    }
+  }
+
+  #[cfg(feature = "admin")]
+  pub fn admin_router(self) -> axum::Router {
+    crate::admin::router(self)
+  }
+}
+
+//
 // ProducerError
 //
 
@@ -161,6 +282,10 @@ pub trait ProducerClient: Send + Sync {
   async fn produce(&self, record: ProducerRecord) -> Result<ProducerAck, ProducerError>;
   /// Flush any buffered records for all topics/partitions.
   async fn flush(&self) -> Result<(), ProducerError>;
+  /// Returns a handle for observing this producer's local runtime state.
+  fn diagnostics(&self) -> Option<ProducerDiagnostics> {
+    None
+  }
 }
 
 //
@@ -499,6 +624,15 @@ impl ProducerClient for ProducerClientImpl {
       return Err(error);
     }
     Ok(())
+  }
+
+  fn diagnostics(&self) -> Option<ProducerDiagnostics> {
+    Some(ProducerDiagnostics {
+      config: self.config.clone(),
+      topics: self.topics.clone(),
+      membership_rx: self.membership_rx.clone(),
+      state: Arc::clone(&self.state),
+    })
   }
 }
 

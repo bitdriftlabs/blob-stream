@@ -99,6 +99,49 @@ Or with environment variable:
 BLOB_STREAM_CONFIG=configs/broker.local.yaml cargo run -p blob-stream-broker -- --config "$BLOB_STREAM_CONFIG"
 ```
 
+## Producer and consumer configuration
+
+Applications use the producer and consumer libraries rather than connecting to storage directly.
+Their configuration is defined by
+[`blobstream/v1/config.proto`](blob-stream-proto/proto/blobstream/v1/config.proto). Keep the
+`TopicConfig` for a topic identical across the broker, every producer, and every consumer:
+`name`, `partition_count`, `num_writers`, and retention are a shared contract. A producer's
+`writer_id` must be in `[0, num_writers)`; deployments with one writer use `writer_id: 0`.
+
+### Producers
+
+Configure producers with `ProducerRuntimeConfig`:
+
+- `producer` controls batching, retries, request concurrency, compression, and `writer_id`.
+- `discovery` selects either a static broker list or `k8s_service` discovery.
+- `topics` contains the topic definitions the process is allowed to publish.
+
+Records are keyed. The producer uses the key to select a logical partition, so choose a stable key
+when ordering for an entity matters. Producers require network access to brokers. With
+`k8s_service` discovery, their ServiceAccount also needs `get`, `list`, and `watch` on core
+`Endpoints` in the broker namespace.
+
+### Consumers
+
+Configure consumers with `ConsumerIteratorBootstrapConfig`:
+
+- `runtime.read` selects the topic and metadata scan/prefetch behavior.
+- `runtime.group` sets the topic, stable `group_id`, and a unique `member_id` for each running
+  instance.
+- `topic` repeats the shared `TopicConfig`.
+- `blob_store` and `metadata_store` select the S3 and DynamoDB resources used for reads and
+  coordination.
+
+Instances with the same `(topic, group_id)` cooperatively share virtual partitions. Use a stable
+group ID for one logical consumer application and a unique process or pod identity for
+`member_id`; reusing a member ID across concurrently running instances prevents correct group
+membership. Consumer offsets are committed to the consumer lease table, not Kafka.
+
+Delivery is at least once. Consumers must tolerate duplicate records, including records replayed
+after an interrupted commit or a partition rebalance. Consumers need S3 object read access,
+metadata-table query access, and read/write/delete access to the consumer lease and membership
+tables. Brokers need S3 object write access, segment-metadata writes, and producer-lease access.
+
 ## DynamoDB tables required
 
 Production deployments should provision the following logical tables.

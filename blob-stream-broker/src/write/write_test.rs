@@ -62,6 +62,63 @@ fn make_engine(
 }
 
 #[tokio::test]
+async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1024;
+  config.flush_max_delay_ms = 60_000;
+  config.writer_id = 42;
+
+  let (engine, _metadata_store) = make_engine(time_provider, config)?;
+  let pending_engine = Arc::clone(&engine);
+  let pending_write = tokio::spawn(async move {
+    pending_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1, 2, 3], 10)],
+      })
+      .await
+  });
+
+  tokio::task::yield_now().await;
+
+  let snapshot = engine.state_snapshot().await;
+  assert_eq!(snapshot.schema_version, 1);
+  assert_eq!(snapshot.generated_at_ts_ms, now_ms);
+  assert_eq!(snapshot.holder_id, "test-node");
+  assert_eq!(snapshot.writer_id, 42);
+  assert_eq!(snapshot.topics.len(), 1);
+
+  let topic = &snapshot.topics[0];
+  assert_eq!(topic.name, "telemetry");
+  assert_eq!(topic.partition_count, 1);
+  assert_eq!(topic.num_writers, 1);
+  assert_eq!(topic.local_partitions.len(), 1);
+
+  let partition = &topic.local_partitions[0];
+  assert_eq!(partition.virtual_partition_id, 0);
+  assert!(partition.lease_expiration_ts_ms.is_some());
+  assert_eq!(partition.buffered_batch_count, 1);
+  assert_eq!(partition.buffered_record_count, 1);
+  assert_eq!(partition.buffered_bytes, 3);
+  assert_eq!(partition.first_buffered_ts_ms, Some(now_ms));
+  assert_eq!(partition.next_sequence, 1);
+  assert_eq!(
+    partition
+      .sequence_reservation
+      .as_ref()
+      .map(|reservation| (reservation.start, reservation.end)),
+    Some((0, 999))
+  );
+
+  pending_write.abort();
+  let _ignored = pending_write.await;
+  Ok(())
+}
+
+#[tokio::test]
 async fn buffers_until_size_rollover() -> Result<()> {
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let mut config = WriteConfig::with_defaults();

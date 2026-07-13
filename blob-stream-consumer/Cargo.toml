@@ -7,9 +7,13 @@ version = "0.1.0"
 [lib]
 doctest = true
 
+[features]
+admin = ["dep:axum"]
+
 [dependencies]
 anyhow.workspace                = true
 async-trait.workspace           = true
+axum                            = { workspace = true, optional = true }
 aws-config.workspace            = true
 aws-sdk-dynamodb.workspace      = true
 aws-sdk-s3.workspace            = true
@@ -26,6 +30,7 @@ log.workspace                   = true
 prometheus.workspace            = true
 protobuf.workspace              = true
 serde_json.workspace            = true
+serde.workspace                 = true
 time.workspace                  = true
 tokio.workspace                 = true
 zstd.workspace                  = true

@@ -76,6 +76,8 @@
 //! }
 //! ```
 
+#[cfg(feature = "admin")]
+mod admin;
 mod config;
 mod producer;
 
@@ -92,6 +94,10 @@ pub use producer::{
   ProducerAck,
   ProducerClient,
   ProducerClientImpl,
+  ProducerDiagnostics,
   ProducerError,
+  ProducerPartitionBufferSnapshot,
   ProducerRecord,
+  ProducerStateSnapshot,
+  ProducerTopicSnapshot,
 };
