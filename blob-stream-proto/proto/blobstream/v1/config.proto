@@ -37,6 +37,10 @@ message BrokerConfig {
   // Writer ID / AZ isolation domain served by this broker deployment. This must be explicitly
   // configured even when the value is 0.
   optional uint32 writer_id = 7;
+
+  // Number of sequence values reserved from the lease store at once for each virtual partition.
+  // Default when unset: 10,000.
+  optional uint32 sequence_reservation_size = 8;
 }
 
 // Compression strategy for stored segment payloads.

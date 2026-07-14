@@ -37,6 +37,7 @@ use blob_stream_types::{
   SnowflakeId,
   TopicWindowKey,
   VirtualPartitionId,
+  format_unix_timestamp_ms,
 };
 pub use config::{TopicInfo, WriteConfig, build_write_engine};
 use log::{debug, trace};
@@ -79,7 +80,7 @@ pub struct WriteResponse {
 #[derive(Debug, Serialize)]
 pub struct BrokerStateSnapshot {
   pub schema_version: u32,
-  pub generated_at_ts_ms: i64,
+  pub generated_at: String,
   pub holder_id: String,
   pub writer_id: u32,
   pub flush_max_bytes: u64,
@@ -138,7 +139,7 @@ pub enum BrokerLeaseStatus {
 pub struct BrokerLeaseSnapshot {
   pub holder_id: String,
   pub holder_address: Option<String>,
-  pub expiration_ts_ms: i64,
+  pub expires_at: String,
   pub is_active: bool,
 }
 
@@ -162,11 +163,11 @@ pub struct BrokerTopicStateSnapshot {
 #[derive(Debug, Serialize)]
 pub struct BrokerPartitionStateSnapshot {
   pub virtual_partition_id: VirtualPartitionId,
-  pub lease_expiration_ts_ms: Option<i64>,
+  pub lease_expires_at: Option<String>,
   pub buffered_batch_count: usize,
   pub buffered_record_count: usize,
   pub buffered_bytes: u64,
-  pub first_buffered_ts_ms: Option<i64>,
+  pub first_buffered_at: Option<String>,
   pub sequence_reservation: Option<SequenceReservationSnapshot>,
   pub next_sequence: u64,
 }
@@ -246,6 +247,10 @@ struct WriteMetrics {
   produce_overloaded_total: prometheus::IntCounter,
   produce_unknown_topic_total: prometheus::IntCounter,
   produce_latency_seconds: prometheus::Histogram,
+  sequence_reservations_total: prometheus::IntCounter,
+  sequence_reservation_records_total: prometheus::IntCounter,
+  sequence_reservation_failures_total: prometheus::IntCounter,
+  sequence_reservation_latency_seconds: prometheus::Histogram,
   flush_batches_total: prometheus::IntCounter,
   flush_partitions_total: prometheus::IntCounter,
   flush_plans_total: prometheus::IntCounter,
@@ -265,6 +270,10 @@ impl WriteMetrics {
       produce_overloaded_total: scope.counter("produce_overloaded_total"),
       produce_unknown_topic_total: scope.counter("produce_unknown_topic_total"),
       produce_latency_seconds: scope.histogram("produce_latency_seconds"),
+      sequence_reservations_total: scope.counter("sequence_reservations_total"),
+      sequence_reservation_records_total: scope.counter("sequence_reservation_records_total"),
+      sequence_reservation_failures_total: scope.counter("sequence_reservation_failures_total"),
+      sequence_reservation_latency_seconds: scope.histogram("sequence_reservation_latency_seconds"),
       flush_batches_total: scope.counter("flush_batches_total"),
       flush_partitions_total: scope.counter("flush_partitions_total"),
       flush_plans_total: scope.counter("flush_plans_total"),
@@ -295,6 +304,13 @@ impl WriteMetrics {
           .inc_by(partition.batches.len() as u64);
       }
     }
+  }
+
+  fn record_sequence_reservation(&self, range: &SeqRange) {
+    self.sequence_reservations_total.inc();
+    self
+      .sequence_reservation_records_total
+      .inc_by(range.end.saturating_sub(range.start).saturating_add(1));
   }
 }
 
@@ -445,8 +461,9 @@ impl WriteEngineImpl {
       topic: topic.to_string(),
       virtual_partition_id,
     };
+    let started = Instant::now();
 
-    match self
+    let outcome = self
       .lease_store
       .reserve_sequences(
         &key,
@@ -455,14 +472,27 @@ impl WriteEngineImpl {
         self.config.reservation_size,
       )
       .await
-      .context("reserve sequences")?
-    {
-      SequenceReservationOutcome::Reserved(reservation) => Ok(reservation.range),
-      SequenceReservationOutcome::HeldByOther(_) | SequenceReservationOutcome::Expired => {
+      .context("reserve sequences");
+    self
+      .metrics
+      .sequence_reservation_latency_seconds
+      .observe(started.elapsed().as_secs_f64());
+
+    match outcome {
+      Ok(SequenceReservationOutcome::Reserved(reservation)) => {
+        self.metrics.record_sequence_reservation(&reservation.range);
+        Ok(reservation.range)
+      },
+      Ok(SequenceReservationOutcome::HeldByOther(_) | SequenceReservationOutcome::Expired) => {
+        self.metrics.sequence_reservation_failures_total.inc();
         Err(WriteError::NotLeaseHolder {
           topic: topic.to_string(),
           virtual_partition_id,
         })
+      },
+      Err(error) => {
+        self.metrics.sequence_reservation_failures_total.inc();
+        Err(error.into())
       },
     }
   }
@@ -693,6 +723,7 @@ impl WriteEngine for WriteEngineImpl {
 
   async fn state_snapshot(&self) -> BrokerStateSnapshot {
     let generated_at_ts_ms = self.time_provider.now().unix_timestamp_ms();
+    let generated_at = format_unix_timestamp_ms(generated_at_ts_ms);
     let state = self.state.lock().await;
 
     let membership = state.membership.clone();
@@ -725,7 +756,9 @@ impl WriteEngine for WriteEngineImpl {
               .map(
                 |(virtual_partition_id, partition_state)| BrokerPartitionStateSnapshot {
                   virtual_partition_id: *virtual_partition_id,
-                  lease_expiration_ts_ms: partition_state.lease_expiration_ts_ms,
+                  lease_expires_at: partition_state
+                    .lease_expiration_ts_ms
+                    .map(format_unix_timestamp_ms),
                   buffered_batch_count: partition_state.buffer.batches.len(),
                   buffered_record_count: partition_state
                     .buffer
@@ -734,7 +767,10 @@ impl WriteEngine for WriteEngineImpl {
                     .map(|batch| batch.records.len())
                     .sum(),
                   buffered_bytes: partition_state.buffer.buffered_bytes,
-                  first_buffered_ts_ms: partition_state.buffer.first_buffered_ts_ms,
+                  first_buffered_at: partition_state
+                    .buffer
+                    .first_buffered_ts_ms
+                    .map(format_unix_timestamp_ms),
                   sequence_reservation: partition_state.seq_allocator.reservation.as_ref().map(
                     |reservation| SequenceReservationSnapshot {
                       start: reservation.start,
@@ -809,7 +845,7 @@ impl WriteEngine for WriteEngineImpl {
             Some(BrokerLeaseSnapshot {
               holder_id: lease.holder_id,
               holder_address,
-              expiration_ts_ms: lease.lease_expiration_ts_ms,
+              expires_at: format_unix_timestamp_ms(lease.lease_expiration_ts_ms),
               is_active,
             }),
           )
@@ -849,8 +885,8 @@ impl WriteEngine for WriteEngineImpl {
     });
 
     BrokerStateSnapshot {
-      schema_version: 2,
-      generated_at_ts_ms,
+      schema_version: 3,
+      generated_at,
       holder_id: self.holder_id.clone(),
       writer_id: self.config.writer_id,
       flush_max_bytes: self.config.flush_max_bytes,

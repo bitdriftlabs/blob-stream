@@ -43,6 +43,8 @@ pub struct BrokerConfig {
     pub segment_compression: ::std::option::Option<::protobuf::EnumOrUnknown<SegmentCompression>>,
     // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.writer_id)
     pub writer_id: ::std::option::Option<u32>,
+    // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.sequence_reservation_size)
+    pub sequence_reservation_size: ::std::option::Option<u32>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.BrokerConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -60,7 +62,7 @@ impl BrokerConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(7);
+        let mut fields = ::std::vec::Vec::with_capacity(8);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "flush_max_bytes",
@@ -96,6 +98,11 @@ impl BrokerConfig {
             "writer_id",
             |m: &BrokerConfig| { &m.writer_id },
             |m: &mut BrokerConfig| { &mut m.writer_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "sequence_reservation_size",
+            |m: &BrokerConfig| { &m.sequence_reservation_size },
+            |m: &mut BrokerConfig| { &mut m.sequence_reservation_size },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<BrokerConfig>(
             "BrokerConfig",
@@ -136,6 +143,9 @@ impl ::protobuf::Message for BrokerConfig {
                 56 => {
                     self.writer_id = ::std::option::Option::Some(is.read_uint32()?);
                 },
+                64 => {
+                    self.sequence_reservation_size = ::std::option::Option::Some(is.read_uint32()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -171,6 +181,9 @@ impl ::protobuf::Message for BrokerConfig {
         if let Some(v) = self.writer_id {
             my_size += ::protobuf::rt::uint32_size(7, v);
         }
+        if let Some(v) = self.sequence_reservation_size {
+            my_size += ::protobuf::rt::uint32_size(8, v);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -198,6 +211,9 @@ impl ::protobuf::Message for BrokerConfig {
         if let Some(v) = self.writer_id {
             os.write_uint32(7, v)?;
         }
+        if let Some(v) = self.sequence_reservation_size {
+            os.write_uint32(8, v)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -222,6 +238,7 @@ impl ::protobuf::Message for BrokerConfig {
         self.discovery.clear();
         self.segment_compression = ::std::option::Option::None;
         self.writer_id = ::std::option::Option::None;
+        self.sequence_reservation_size = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -234,6 +251,7 @@ impl ::protobuf::Message for BrokerConfig {
             discovery: ::protobuf::MessageField::none(),
             segment_compression: ::std::option::Option::None,
             writer_id: ::std::option::Option::None,
+            sequence_reservation_size: ::std::option::Option::None,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -4194,7 +4212,7 @@ impl ProducerCompression {
 
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x1ablobstream/v1/config.proto\x12\rblobstream.v1\x1a\x17validate/vali\
-    date.proto\"\xda\x03\n\x0cBrokerConfig\x12&\n\x0fflush_max_bytes\x18\x01\
+    date.proto\"\xb9\x04\n\x0cBrokerConfig\x12&\n\x0fflush_max_bytes\x18\x01\
     \x20\x01(\rR\rflushMaxBytes\x12+\n\x12flush_max_delay_ms\x18\x02\x20\x01\
     (\rR\x0fflushMaxDelayMs\x12$\n\tbind_addr\x18\x03\x20\x01(\tR\x08bindAdd\
     rB\x07\xfaB\x04r\x02\x10\x01\x12V\n\rnode_identity\x18\x04\x20\x01(\x0b2\
@@ -4204,18 +4222,20 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x12a\n\x13segment_compression\x18\x06\x20\x01(\x0e2!.blobstream.v1.Segm\
     entCompressionH\0R\x12segmentCompressionB\x08\xfaB\x05\x82\x01\x02\x10\
     \x01\x88\x01\x01\x12\x20\n\twriter_id\x18\x07\x20\x01(\rH\x01R\x08writer\
-    Id\x88\x01\x01B\x16\n\x14_segment_compressionB\x0c\n\n_writer_id\"\x96\
-    \x01\n\x18BrokerNodeIdentityConfig\x12&\n\tstatic_id\x18\x01\x20\x01(\tH\
-    \0R\x08staticIdB\x07\xfaB\x04r\x02\x10\x01\x12C\n\x08hostname\x18\x02\
-    \x20\x01(\x0b2%.blobstream.v1.BrokerHostnameIdentityH\0R\x08hostnameB\r\
-    \n\x06source\x12\x03\xf8B\x01\"\x18\n\x16BrokerHostnameIdentity\"\xc0\
-    \x01\n\x15BrokerDiscoveryConfig\x12D\n\x06static\x18\x01\x20\x01(\x0b2*.\
-    blobstream.v1.StaticBrokerDiscoveryConfigH\0R\x06static\x12Q\n\x0bk8s_se\
-    rvice\x18\x02\x20\x01(\x0b2..blobstream.v1.K8sServiceBrokerDiscoveryConf\
-    igH\0R\nk8sServiceB\x0e\n\x07backend\x12\x03\xf8B\x01\"X\n\x1bStaticBrok\
-    erDiscoveryConfig\x129\n\x05nodes\x18\x01\x20\x03(\x0b2\x19.blobstream.v\
-    1.BrokerNodeR\x05nodesB\x08\xfaB\x05\x92\x01\x02\x08\x01\"Q\n\nBrokerNod\
-    e\x12\x20\n\x07node_id\x18\x01\x20\x01(\tR\x06nodeIdB\x07\xfaB\x04r\x02\
+    Id\x88\x01\x01\x12?\n\x19sequence_reservation_size\x18\x08\x20\x01(\rH\
+    \x02R\x17sequenceReservationSize\x88\x01\x01B\x16\n\x14_segment_compress\
+    ionB\x0c\n\n_writer_idB\x1c\n\x1a_sequence_reservation_size\"\x96\x01\n\
+    \x18BrokerNodeIdentityConfig\x12&\n\tstatic_id\x18\x01\x20\x01(\tH\0R\
+    \x08staticIdB\x07\xfaB\x04r\x02\x10\x01\x12C\n\x08hostname\x18\x02\x20\
+    \x01(\x0b2%.blobstream.v1.BrokerHostnameIdentityH\0R\x08hostnameB\r\n\
+    \x06source\x12\x03\xf8B\x01\"\x18\n\x16BrokerHostnameIdentity\"\xc0\x01\
+    \n\x15BrokerDiscoveryConfig\x12D\n\x06static\x18\x01\x20\x01(\x0b2*.blob\
+    stream.v1.StaticBrokerDiscoveryConfigH\0R\x06static\x12Q\n\x0bk8s_servic\
+    e\x18\x02\x20\x01(\x0b2..blobstream.v1.K8sServiceBrokerDiscoveryConfigH\
+    \0R\nk8sServiceB\x0e\n\x07backend\x12\x03\xf8B\x01\"X\n\x1bStaticBrokerD\
+    iscoveryConfig\x129\n\x05nodes\x18\x01\x20\x03(\x0b2\x19.blobstream.v1.B\
+    rokerNodeR\x05nodesB\x08\xfaB\x05\x92\x01\x02\x08\x01\"Q\n\nBrokerNode\
+    \x12\x20\n\x07node_id\x18\x01\x20\x01(\tR\x06nodeIdB\x07\xfaB\x04r\x02\
     \x10\x01\x12!\n\x07address\x18\x02\x20\x01(\tR\x07addressB\x07\xfaB\x04r\
     \x02\x10\x01\"t\n\x1fK8sServiceBrokerDiscoveryConfig\x12%\n\tnamespace\
     \x18\x01\x20\x01(\tR\tnamespaceB\x07\xfaB\x04r\x02\x10\x01\x12*\n\x0cser\

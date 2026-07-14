@@ -21,6 +21,7 @@ bd-server-stats.workspace         = true
 blob-stream-broker-discovery.path = "../blob-stream-broker-discovery"
 blob-stream-proto.path            = "../blob-stream-proto"
 blob-stream-types.path            = "../blob-stream-types"
+futures.workspace                 = true
 log.workspace                     = true
 prometheus.workspace              = true
 serde.workspace                   = true

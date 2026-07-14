@@ -3,7 +3,7 @@
 use super::{TopicInfo, WriteConfig, WriteEngine, WriteEngineImpl, WriteRequest};
 use anyhow::Result;
 use async_trait::async_trait;
-use bd_server_stats::stats::Collector;
+use bd_server_stats::stats::{Collector, Scope};
 use bd_time::{OffsetDateTimeExt, TestTimeProvider, TimeProvider};
 use blob_stream_blob_store::InMemoryBlobStore;
 use blob_stream_metadata_store::{
@@ -15,6 +15,7 @@ use blob_stream_metadata_store::{
   SegmentMetadata,
 };
 use blob_stream_types::{CompressionCodec, SeqRange, Window, new_record};
+use serde_json::to_value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -45,6 +46,19 @@ fn make_engine_with_lease_store(
   Arc<InMemoryMetadataStore>,
   Arc<InMemoryProducerPartitionLeaseStore>,
 )> {
+  let scope = metrics_scope();
+  make_engine_with_lease_store_and_scope(time_provider, config, &scope)
+}
+
+fn make_engine_with_lease_store_and_scope(
+  time_provider: Arc<TestTimeProvider>,
+  config: WriteConfig,
+  metrics_scope: &Scope,
+) -> Result<(
+  Arc<WriteEngineImpl>,
+  Arc<InMemoryMetadataStore>,
+  Arc<InMemoryProducerPartitionLeaseStore>,
+)> {
   let mut topics = HashMap::new();
   topics.insert(
     "telemetry".to_string(),
@@ -69,7 +83,7 @@ fn make_engine_with_lease_store(
     "test-node".to_string(),
     None,
     time_provider,
-    &metrics_scope(),
+    metrics_scope,
   )?;
 
   Ok((Arc::new(engine), metadata_store, lease_store))
@@ -99,8 +113,8 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   tokio::task::yield_now().await;
 
   let snapshot = engine.state_snapshot().await;
-  assert_eq!(snapshot.schema_version, 2);
-  assert_eq!(snapshot.generated_at_ts_ms, now_ms);
+  assert_eq!(snapshot.schema_version, 3);
+  assert_eq!(snapshot.generated_at, "2023-11-14T22:13:20Z");
   assert_eq!(snapshot.holder_id, "test-node");
   assert_eq!(snapshot.writer_id, 0);
   assert_eq!(snapshot.membership.len(), 1);
@@ -122,18 +136,36 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
 
   let partition = &topic.local_partitions[0];
   assert_eq!(partition.virtual_partition_id, 0);
-  assert!(partition.lease_expiration_ts_ms.is_some());
+  assert_eq!(
+    partition.lease_expires_at.as_deref(),
+    Some("2023-11-14T22:13:50Z")
+  );
   assert_eq!(partition.buffered_batch_count, 1);
   assert_eq!(partition.buffered_record_count, 1);
   assert_eq!(partition.buffered_bytes, 3);
-  assert_eq!(partition.first_buffered_ts_ms, Some(now_ms));
+  assert_eq!(
+    partition.first_buffered_at.as_deref(),
+    Some("2023-11-14T22:13:20Z")
+  );
   assert_eq!(partition.next_sequence, 1);
   assert_eq!(
     partition
       .sequence_reservation
       .as_ref()
       .map(|reservation| (reservation.start, reservation.end)),
-    Some((0, 999))
+    Some((0, 9_999))
+  );
+
+  let state_dump = to_value(&snapshot)?;
+  assert_eq!(state_dump["generated_at"], "2023-11-14T22:13:20Z");
+  assert!(state_dump.get("generated_at_ts_ms").is_none());
+  assert_eq!(
+    state_dump["topics"][0]["local_partitions"][0]["lease_expires_at"],
+    "2023-11-14T22:13:50Z"
+  );
+  assert_eq!(
+    state_dump["ownership"][0]["observed_lease"]["expires_at"],
+    "2023-11-14T22:13:50Z"
   );
 
   pending_write.abort();
@@ -172,6 +204,40 @@ async fn state_snapshot_reports_expired_observed_lease() -> Result<()> {
     .expect("expired lease is reported");
   assert_eq!(observed_lease.holder_id, "former-owner");
   assert!(!observed_lease.is_active);
+
+  Ok(())
+}
+
+#[tokio::test]
+async fn successful_sequence_reservation_records_metrics() -> Result<()> {
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  config.flush_max_delay_ms = 60_000;
+
+  let collector = Collector::default();
+  let scope = collector.scope("blob_stream_broker_test");
+  let (engine, _metadata_store, _lease_store) =
+    make_engine_with_lease_store_and_scope(time_provider, config, &scope)?;
+  engine
+    .produce_batch(WriteRequest {
+      topic: "telemetry".to_string(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![1], 10)],
+    })
+    .await?;
+
+  let metrics = String::from_utf8(collector.prometheus_output())?;
+  assert!(
+    metrics.contains("blob_stream_broker_test:write:sequence_reservations_total 1"),
+    "{metrics}"
+  );
+  assert!(
+    metrics.contains("blob_stream_broker_test:write:sequence_reservation_records_total 10000")
+  );
+  assert!(
+    metrics.contains("blob_stream_broker_test:write:sequence_reservation_latency_seconds_count 1")
+  );
 
   Ok(())
 }

@@ -198,7 +198,8 @@ async fn diagnostics_report_assignment_and_start_state() {
     .diagnostics()
     .expect("consumer implementation provides diagnostics");
   let snapshot = diagnostics.state_snapshot().await;
-  assert_eq!(snapshot.schema_version, 2);
+  assert_eq!(snapshot.schema_version, 3);
+  assert!(snapshot.generated_at.ends_with('Z'));
   assert_eq!(snapshot.topic, "telemetry");
   assert_eq!(snapshot.group_id, "group-a");
   assert_eq!(snapshot.member_id, "member-a");
@@ -377,7 +378,7 @@ async fn next_delivers_records_and_commit_renews() {
   assert_eq!(state.staged_offsets[0].virtual_partition_id, 3);
   assert_eq!(state.staged_offsets[0].offset, 2);
   assert_eq!(state.last_committed_offsets, state.staged_offsets);
-  assert!(state.last_successful_heartbeat_at_ms.is_some());
+  assert!(state.last_successful_heartbeat_at.is_some());
 }
 
 #[tokio::test]

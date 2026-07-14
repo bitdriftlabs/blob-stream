@@ -36,7 +36,7 @@ use tokio::sync::watch;
 const DEFAULT_FLUSH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_FLUSH_MAX_DELAY_MS: i64 = 1_000;
 const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
-const DEFAULT_RESERVATION_SIZE: u64 = 1_000;
+const DEFAULT_RESERVATION_SIZE: u64 = 10_000;
 const DEFAULT_WINDOW_SIZE_SECONDS: i64 = 300;
 const DEFAULT_SEGMENT_TTL_BUFFER_SECONDS: u32 = 3_600;
 const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
@@ -96,6 +96,10 @@ impl WriteConfig {
 
     if broker.flush_max_delay_ms > 0 {
       config.flush_max_delay_ms = i64::from(broker.flush_max_delay_ms);
+    }
+
+    if let Some(sequence_reservation_size) = broker.sequence_reservation_size {
+      config.reservation_size = u64::from(sequence_reservation_size);
     }
 
     let compression = broker.segment_compression.as_ref().map_or(

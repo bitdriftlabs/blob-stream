@@ -52,6 +52,7 @@ broker:
   bind_addr: "0.0.0.0:8080"
   flush_max_bytes: 67108864
   flush_max_delay_ms: 1000
+  sequence_reservation_size: 10000
   node_identity:
     hostname: {}
   discovery:

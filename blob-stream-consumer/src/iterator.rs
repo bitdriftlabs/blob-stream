@@ -30,7 +30,13 @@ use blob_stream_metadata_store::{
   ConsumerGroupMembershipStore,
   MetadataStore,
 };
-use blob_stream_types::{Record, VirtualPartitionId, now_unix_millis, now_unix_seconds};
+use blob_stream_types::{
+  Record,
+  VirtualPartitionId,
+  format_unix_timestamp_ms,
+  now_unix_millis,
+  now_unix_seconds,
+};
 use log::{info, trace};
 use prometheus::{Histogram, IntCounter, IntGauge};
 use serde::Serialize;
@@ -84,7 +90,6 @@ impl IdlePollBackoff {
 
 #[derive(Clone)]
 struct ConsumerIteratorMetrics {
-  next_calls: IntCounter,
   batches_delivered: IntCounter,
   records_delivered: IntCounter,
   retries: IntCounter,
@@ -108,7 +113,6 @@ impl ConsumerIteratorMetrics {
   fn new(scope: &Scope) -> Self {
     let scope = scope.scope("iterator");
     Self {
-      next_calls: scope.counter("next_calls"),
       batches_delivered: scope.counter("batches_delivered"),
       records_delivered: scope.counter("records_delivered"),
       retries: scope.counter("retries"),
@@ -235,7 +239,7 @@ pub enum NextResult {
 #[derive(Debug, Serialize)]
 pub struct ConsumerStateSnapshot {
   pub schema_version: u32,
-  pub generated_at_ts_ms: i64,
+  pub generated_at: String,
   pub topic: String,
   pub group_id: String,
   pub member_id: String,
@@ -248,10 +252,10 @@ pub struct ConsumerStateSnapshot {
   pub pending_commits: Vec<ConsumerOffsetSnapshot>,
   pub staged_offsets: Vec<ConsumerOffsetSnapshot>,
   pub last_committed_offsets: Vec<ConsumerOffsetSnapshot>,
-  pub last_successful_heartbeat_at_ms: Option<i64>,
+  pub last_successful_heartbeat_at: Option<String>,
   pub cursors: Vec<ConsumerOffsetSnapshot>,
-  pub next_heartbeat_at_ms: i64,
-  pub next_rebalance_at_ms: i64,
+  pub next_heartbeat_at: String,
+  pub next_rebalance_at: String,
   pub prefetch_buffered_batch_count: usize,
   pub prefetch_buffered_bytes: u64,
   pub prefetch_max_bytes: u64,
@@ -305,6 +309,7 @@ impl ConsumerDiagnostics {
   #[must_use]
   pub async fn state_snapshot(&self) -> ConsumerStateSnapshot {
     let generated_at_ts_ms = now_unix_millis();
+    let generated_at = format_unix_timestamp_ms(generated_at_ts_ms);
     let (
       mut owned_partitions,
       mut active_assignment,
@@ -344,8 +349,8 @@ impl ConsumerDiagnostics {
     let prefetch_buffer = self.prefetch_buffer.lock().await;
 
     ConsumerStateSnapshot {
-      schema_version: 2,
-      generated_at_ts_ms,
+      schema_version: 3,
+      generated_at,
       topic: self.group_config.topic.to_string(),
       group_id: self.group_config.group_id.to_string(),
       member_id: self.group_config.member_id.to_string(),
@@ -358,10 +363,10 @@ impl ConsumerDiagnostics {
       pending_commits: staged_offsets.clone(),
       staged_offsets,
       last_committed_offsets,
-      last_successful_heartbeat_at_ms,
+      last_successful_heartbeat_at: last_successful_heartbeat_at_ms.map(format_unix_timestamp_ms),
       cursors: std::mem::take(&mut cursors),
-      next_heartbeat_at_ms,
-      next_rebalance_at_ms,
+      next_heartbeat_at: format_unix_timestamp_ms(next_heartbeat_at_ms),
+      next_rebalance_at: format_unix_timestamp_ms(next_rebalance_at_ms),
       prefetch_buffered_batch_count: prefetch_buffer.batches.len(),
       prefetch_buffered_bytes: prefetch_buffer.buffered_bytes,
       prefetch_max_bytes: self.prefetch_max_bytes,
@@ -1101,7 +1106,6 @@ impl ConsumerIterator for ConsumerIteratorImpl {
       self.started,
       "consumer iterator must be started before next"
     );
-    self.metrics.next_calls.inc();
 
     loop {
       if !self.finish_pending_revocation_if_completed().await? {

@@ -75,6 +75,7 @@ impl WriteEngineImpl {
     let lease_store = Arc::clone(&self.lease_store);
     let state = Arc::clone(&self.state);
     let time_provider = Arc::clone(&self.time_provider);
+    let metrics = self.metrics.clone();
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
     tokio::spawn(async move {
@@ -214,11 +215,16 @@ impl WriteEngineImpl {
             continue;
           }
 
-          match lease_store
+          let reservation_started = std::time::Instant::now();
+          let reservation_outcome = lease_store
             .reserve_sequences(&key, &holder_id, now_ts_ms, reservation_size)
-            .await
-          {
+            .await;
+          metrics
+            .sequence_reservation_latency_seconds
+            .observe(reservation_started.elapsed().as_secs_f64());
+          match reservation_outcome {
             Ok(SequenceReservationOutcome::Reserved(reservation)) => {
+              metrics.record_sequence_reservation(&reservation.range);
               let mut guard = state.lock().await;
               let partition_state = guard.partition_state_mut(&topic, virtual_partition_id);
               partition_state
@@ -228,11 +234,13 @@ impl WriteEngineImpl {
             Ok(
               SequenceReservationOutcome::HeldByOther(_) | SequenceReservationOutcome::Expired,
             ) => {
+              metrics.sequence_reservation_failures_total.inc();
               // If reservation cannot be extended here, we do not fail the loop. Foreground
               // writes will attempt lease+reservation again in `produce_batch`; if ownership has
               // moved, those writes return NOT_LEASE_HOLDER and producers re-route.
             },
             Err(error) => {
+              metrics.sequence_reservation_failures_total.inc();
               warn_every!(
                 15.seconds(),
                 "lease self-assignment reserve failed: {error}"

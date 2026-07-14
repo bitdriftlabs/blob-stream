@@ -1574,6 +1574,7 @@ dependencies = [
  "blob-stream-broker-discovery",
  "blob-stream-proto",
  "blob-stream-types",
+ "futures",
  "log",
  "prometheus",
  "serde",
