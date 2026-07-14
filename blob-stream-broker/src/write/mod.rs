@@ -926,11 +926,32 @@ async fn collect_flush_plans(
   if max_plans == 0 {
     return Vec::new();
   }
-  let partition_states = { state.lock().await.partition_states_for_all_topics() };
+  let (mut partition_states, last_flush_topic) = {
+    let state = state.lock().await;
+    (
+      state.partition_states_for_all_topics(),
+      state.last_flush_topic.clone(),
+    )
+  };
+  partition_states.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+  let start = last_flush_topic.as_ref().map_or(0, |last_topic| {
+    partition_states
+      .iter()
+      .position(|(topic, ..)| topic > last_topic)
+      .unwrap_or(0)
+  });
+  let partition_state_count = partition_states.len();
   let mut plans_by_topic: HashMap<String, Vec<FlushPartition>> = HashMap::new();
+  let mut last_planned_topic = None;
 
-  for (topic, virtual_partition_id, partition_state) in partition_states {
-    if !plans_by_topic.contains_key(&topic) && plans_by_topic.len() == max_plans {
+  for (topic, virtual_partition_id, partition_state) in partition_states
+    .iter()
+    .cycle()
+    .skip(start)
+    .take(partition_state_count)
+  {
+    let is_new_topic = !plans_by_topic.contains_key(topic);
+    if is_new_topic && plans_by_topic.len() == max_plans {
       continue;
     }
     let mut partition_state = partition_state.lock().await;
@@ -949,12 +970,19 @@ async fn collect_flush_plans(
     partition_state.buffer.reset();
     partition_state.flush_in_flight = true;
     plans_by_topic
-      .entry(topic)
+      .entry(topic.clone())
       .or_default()
       .push(FlushPartition {
-        virtual_partition_id,
+        virtual_partition_id: *virtual_partition_id,
         batches,
       });
+    if is_new_topic {
+      last_planned_topic = Some(topic.clone());
+    }
+  }
+
+  if let Some(last_planned_topic) = last_planned_topic {
+    state.lock().await.last_flush_topic = Some(last_planned_topic);
   }
 
   plans_by_topic
@@ -971,6 +999,7 @@ async fn collect_flush_plans(
 struct WriteState {
   membership: BrokerMembership,
   topics: HashMap<String, TopicState>,
+  last_flush_topic: Option<String>,
 }
 
 impl WriteState {

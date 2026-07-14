@@ -35,6 +35,11 @@ struct GatedBlobStore {
   first_write: AtomicBool,
 }
 
+struct BlockingBlobStore {
+  entered_tx: mpsc::UnboundedSender<String>,
+  release: Arc<Semaphore>,
+}
+
 struct GatedReservationLeaseStore {
   inner: InMemoryProducerPartitionLeaseStore,
   entered_tx: mpsc::UnboundedSender<()>,
@@ -79,6 +84,27 @@ impl BlobStore for GatedBlobStore {
         .map_err(|_| anyhow::anyhow!("test gate closed"))?
         .forget();
     }
+    Ok(())
+  }
+
+  async fn get_range(&self, _key: &BlobKey, _range: ByteRange) -> Result<Bytes> {
+    Err(anyhow::anyhow!("reads are not used by this test"))
+  }
+}
+
+#[async_trait]
+impl BlobStore for BlockingBlobStore {
+  async fn put(&self, key: &BlobKey, _payload: Bytes) -> Result<()> {
+    self
+      .entered_tx
+      .send(key.as_str().to_string())
+      .map_err(|_| anyhow::anyhow!("test receiver dropped"))?;
+    self
+      .release
+      .acquire()
+      .await
+      .map_err(|_| anyhow::anyhow!("test gate closed"))?
+      .forget();
     Ok(())
   }
 
@@ -793,6 +819,104 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
   release_first.add_permits(1);
   first.await??;
   second.await??;
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1_024;
+  config.flush_max_delay_ms = 10;
+
+  let topics = (0 .. 5)
+    .map(|index| {
+      let topic = format!("topic-{index}");
+      (
+        topic.clone(),
+        TopicInfo {
+          name: topic,
+          partition_count: 1,
+          num_writers: 1,
+          retention_days: 7,
+        },
+      )
+    })
+    .collect();
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+    config.clone(),
+    topics,
+    Arc::new(BlockingBlobStore {
+      entered_tx,
+      release: Arc::clone(&release),
+    }),
+    Arc::new(InMemoryMetadataStore::new()),
+    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+    "test-node".to_string(),
+    None,
+    time_provider.clone(),
+    &metrics_scope(),
+  )?);
+
+  let mut writes = Vec::new();
+  for index in 0 .. 5 {
+    let engine = Arc::clone(&engine);
+    writes.push(tokio::spawn(async move {
+      engine
+        .produce_batch(WriteRequest {
+          topic: format!("topic-{index}"),
+          virtual_partition_id: 0,
+          records: vec![new_record(vec![index], i64::from(index))],
+        })
+        .await
+    }));
+  }
+  for _ in 0 .. 100 {
+    let buffered_batches = engine
+      .state_snapshot()
+      .await
+      .topics
+      .iter()
+      .flat_map(|topic| &topic.local_partitions)
+      .map(|partition| partition.buffered_batch_count)
+      .sum::<usize>();
+    if buffered_batches == 5 {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+
+  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
+  tokio::time::advance(StdDuration::from_millis(
+    config.flush_max_delay_ms.cast_unsigned(),
+  ))
+  .await;
+
+  let mut first_topics = Vec::new();
+  for _ in 0 .. 4 {
+    first_topics.push(receive_blob_write(&mut entered_rx).await);
+  }
+  first_topics.sort();
+  assert!(
+    first_topics
+      .iter()
+      .zip(0 .. 4)
+      .all(|(key, expected_topic)| key.contains(&format!("topic-{expected_topic}/")))
+  );
+  release.add_permits(1);
+  assert!(
+    receive_blob_write(&mut entered_rx)
+      .await
+      .contains("topic-4/")
+  );
+  release.add_permits(4);
+
+  for write in writes {
+    write.await??;
+  }
   Ok(())
 }
 
