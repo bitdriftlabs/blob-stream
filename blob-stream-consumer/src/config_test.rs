@@ -1,6 +1,7 @@
 use super::{
   ConsumerReadConfig,
   consumer_idle_poll_delay_ms,
+  consumer_lookback_windows,
   consumer_max_idle_poll_delay_ms,
   consumer_prefetch_max_bytes,
   validate_read_config,
@@ -13,10 +14,11 @@ fn read_config() -> ConsumerReadConfig {
 }
 
 #[test]
-fn idle_poll_delay_defaults_to_250ms() {
+fn read_defaults_use_two_windows_and_two_second_idle_cap() {
   let read = read_config();
+  assert_eq!(consumer_lookback_windows(&read), 2);
   assert_eq!(consumer_idle_poll_delay_ms(&read), 250);
-  assert_eq!(consumer_max_idle_poll_delay_ms(&read), None);
+  assert_eq!(consumer_max_idle_poll_delay_ms(&read), 2_000);
   assert_eq!(consumer_prefetch_max_bytes(&read), 64 * 1024 * 1024);
 }
 

@@ -12,8 +12,9 @@ pub use blob_stream_proto::protos::blobstream::v1::config::{
 use log::{debug, trace};
 
 const DEFAULT_WINDOW_SIZE_SECONDS: i64 = 300;
-const DEFAULT_LOOKBACK_WINDOWS: u32 = 3;
+const DEFAULT_LOOKBACK_WINDOWS: u32 = 2;
 const DEFAULT_IDLE_POLL_DELAY_MS: u64 = 250;
+const DEFAULT_MAX_IDLE_POLL_DELAY_MS: u64 = 2_000;
 const DEFAULT_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: i64 = 10_000;
@@ -46,9 +47,11 @@ pub fn consumer_idle_poll_delay_ms(config: &ConsumerReadConfig) -> u64 {
 }
 
 #[must_use]
-/// Return the optional max idle poll delay used by exponential backoff.
-pub fn consumer_max_idle_poll_delay_ms(config: &ConsumerReadConfig) -> Option<u64> {
-  config.max_idle_poll_delay_ms
+/// Return the max idle poll delay used by exponential backoff, applying defaults when omitted.
+pub fn consumer_max_idle_poll_delay_ms(config: &ConsumerReadConfig) -> u64 {
+  config
+    .max_idle_poll_delay_ms
+    .unwrap_or(DEFAULT_MAX_IDLE_POLL_DELAY_MS)
 }
 
 #[must_use]
@@ -90,13 +93,11 @@ pub fn validate_read_config(config: &ConsumerReadConfig) -> Result<()> {
     topic = config.topic
   );
   proto_validate::validate(config)?;
-  if let Some(max_idle_poll_delay_ms) = consumer_max_idle_poll_delay_ms(config) {
-    ensure!(
-      max_idle_poll_delay_ms >= consumer_idle_poll_delay_ms(config),
-      "consumer.read.max_idle_poll_delay_ms must be greater than or equal to \
-       consumer.read.idle_poll_delay_ms"
-    );
-  }
+  ensure!(
+    consumer_max_idle_poll_delay_ms(config) >= consumer_idle_poll_delay_ms(config),
+    "consumer.read.max_idle_poll_delay_ms must be greater than or equal to \
+     consumer.read.idle_poll_delay_ms"
+  );
 
   Ok(())
 }

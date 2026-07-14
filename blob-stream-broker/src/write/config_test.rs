@@ -1,5 +1,10 @@
-use super::{DynamoTablePurpose, dynamo_table_name};
-use blob_stream_proto::protos::blobstream::v1::config::DynamoMetadataStoreConfig;
+use super::{DynamoTablePurpose, WriteConfig, dynamo_table_name};
+use blob_stream_proto::protos::blobstream::v1::config::{
+  BrokerConfig,
+  DynamoMetadataStoreConfig,
+  SegmentCompression,
+};
+use blob_stream_types::CompressionCodec;
 
 fn dynamo_config() -> DynamoMetadataStoreConfig {
   let mut config = DynamoMetadataStoreConfig::new();
@@ -33,4 +38,23 @@ fn returns_empty_when_explicit_fields_are_unset() {
 
   assert_eq!(metadata_table, "");
   assert_eq!(producer_lease_table, "");
+}
+
+#[test]
+fn defaults_segment_compression_to_zstd() {
+  let config = WriteConfig::from_broker_config(&BrokerConfig::new()).unwrap();
+
+  assert_eq!(config.compression.codec, CompressionCodec::Zstd);
+  assert_eq!(config.compression.level, Some(3));
+}
+
+#[test]
+fn respects_uncompressed_segment_configuration() {
+  let mut broker_config = BrokerConfig::new();
+  broker_config.segment_compression = Some(SegmentCompression::SEGMENT_COMPRESSION_NONE.into());
+
+  let config = WriteConfig::from_broker_config(&broker_config).unwrap();
+
+  assert_eq!(config.compression.codec, CompressionCodec::None);
+  assert_eq!(config.compression.level, None);
 }

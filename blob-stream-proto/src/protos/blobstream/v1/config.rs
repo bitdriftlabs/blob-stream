@@ -39,6 +39,8 @@ pub struct BrokerConfig {
     pub node_identity: ::protobuf::MessageField<BrokerNodeIdentityConfig>,
     // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.discovery)
     pub discovery: ::protobuf::MessageField<BrokerDiscoveryConfig>,
+    // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.segment_compression)
+    pub segment_compression: ::std::option::Option<::protobuf::EnumOrUnknown<SegmentCompression>>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.BrokerConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -56,7 +58,7 @@ impl BrokerConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(5);
+        let mut fields = ::std::vec::Vec::with_capacity(6);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "flush_max_bytes",
@@ -82,6 +84,11 @@ impl BrokerConfig {
             "discovery",
             |m: &BrokerConfig| { &m.discovery },
             |m: &mut BrokerConfig| { &mut m.discovery },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "segment_compression",
+            |m: &BrokerConfig| { &m.segment_compression },
+            |m: &mut BrokerConfig| { &mut m.segment_compression },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<BrokerConfig>(
             "BrokerConfig",
@@ -116,6 +123,9 @@ impl ::protobuf::Message for BrokerConfig {
                 42 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.discovery)?;
                 },
+                48 => {
+                    self.segment_compression = ::std::option::Option::Some(is.read_enum_or_unknown()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -145,6 +155,9 @@ impl ::protobuf::Message for BrokerConfig {
             let len = v.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
+        if let Some(v) = self.segment_compression {
+            my_size += ::protobuf::rt::int32_size(6, v.value());
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -165,6 +178,9 @@ impl ::protobuf::Message for BrokerConfig {
         }
         if let Some(v) = self.discovery.as_ref() {
             ::protobuf::rt::write_message_field_with_cached_size(5, v, os)?;
+        }
+        if let Some(v) = self.segment_compression {
+            os.write_enum(6, ::protobuf::EnumOrUnknown::value(&v))?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -188,6 +204,7 @@ impl ::protobuf::Message for BrokerConfig {
         self.bind_addr.clear();
         self.node_identity.clear();
         self.discovery.clear();
+        self.segment_compression = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -198,6 +215,7 @@ impl ::protobuf::Message for BrokerConfig {
             bind_addr: ::protobuf::Chars::new(),
             node_identity: ::protobuf::MessageField::none(),
             discovery: ::protobuf::MessageField::none(),
+            segment_compression: ::std::option::Option::None,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -4033,6 +4051,68 @@ impl ::protobuf::reflect::ProtobufValue for ConsumerIteratorBootstrapConfig {
 }
 
 #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
+// @@protoc_insertion_point(enum:blobstream.v1.SegmentCompression)
+pub enum SegmentCompression {
+    // @@protoc_insertion_point(enum_value:blobstream.v1.SegmentCompression.SEGMENT_COMPRESSION_NONE)
+    SEGMENT_COMPRESSION_NONE = 0,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.SegmentCompression.SEGMENT_COMPRESSION_ZSTD)
+    SEGMENT_COMPRESSION_ZSTD = 1,
+}
+
+impl ::protobuf::Enum for SegmentCompression {
+    const NAME: &'static str = "SegmentCompression";
+
+    fn value(&self) -> i32 {
+        *self as i32
+    }
+
+    fn from_i32(value: i32) -> ::std::option::Option<SegmentCompression> {
+        match value {
+            0 => ::std::option::Option::Some(SegmentCompression::SEGMENT_COMPRESSION_NONE),
+            1 => ::std::option::Option::Some(SegmentCompression::SEGMENT_COMPRESSION_ZSTD),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    fn from_str(str: &str) -> ::std::option::Option<SegmentCompression> {
+        match str {
+            "SEGMENT_COMPRESSION_NONE" => ::std::option::Option::Some(SegmentCompression::SEGMENT_COMPRESSION_NONE),
+            "SEGMENT_COMPRESSION_ZSTD" => ::std::option::Option::Some(SegmentCompression::SEGMENT_COMPRESSION_ZSTD),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    const VALUES: &'static [SegmentCompression] = &[
+        SegmentCompression::SEGMENT_COMPRESSION_NONE,
+        SegmentCompression::SEGMENT_COMPRESSION_ZSTD,
+    ];
+}
+
+impl ::protobuf::EnumFull for SegmentCompression {
+    fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().enum_by_package_relative_name("SegmentCompression").unwrap()).clone()
+    }
+
+    fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
+        let index = *self as usize;
+        Self::enum_descriptor().value_by_index(index)
+    }
+}
+
+impl ::std::default::Default for SegmentCompression {
+    fn default() -> Self {
+        SegmentCompression::SEGMENT_COMPRESSION_NONE
+    }
+}
+
+impl SegmentCompression {
+    fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
+        ::protobuf::reflect::GeneratedEnumDescriptorData::new::<SegmentCompression>("SegmentCompression")
+    }
+}
+
+#[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
 // @@protoc_insertion_point(enum:blobstream.v1.ProducerCompression)
 pub enum ProducerCompression {
     // @@protoc_insertion_point(enum_value:blobstream.v1.ProducerCompression.PRODUCER_COMPRESSION_NONE)
@@ -4096,128 +4176,132 @@ impl ProducerCompression {
 
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x1ablobstream/v1/config.proto\x12\rblobstream.v1\x1a\x17validate/vali\
-    date.proto\"\xaf\x02\n\x0cBrokerConfig\x12&\n\x0fflush_max_bytes\x18\x01\
+    date.proto\"\xaa\x03\n\x0cBrokerConfig\x12&\n\x0fflush_max_bytes\x18\x01\
     \x20\x01(\rR\rflushMaxBytes\x12+\n\x12flush_max_delay_ms\x18\x02\x20\x01\
     (\rR\x0fflushMaxDelayMs\x12$\n\tbind_addr\x18\x03\x20\x01(\tR\x08bindAdd\
     rB\x07\xfaB\x04r\x02\x10\x01\x12V\n\rnode_identity\x18\x04\x20\x01(\x0b2\
     '.blobstream.v1.BrokerNodeIdentityConfigR\x0cnodeIdentityB\x08\xfaB\x05\
     \x8a\x01\x02\x10\x01\x12L\n\tdiscovery\x18\x05\x20\x01(\x0b2$.blobstream\
     .v1.BrokerDiscoveryConfigR\tdiscoveryB\x08\xfaB\x05\x8a\x01\x02\x10\x01\
-    \"\x96\x01\n\x18BrokerNodeIdentityConfig\x12&\n\tstatic_id\x18\x01\x20\
-    \x01(\tH\0R\x08staticIdB\x07\xfaB\x04r\x02\x10\x01\x12C\n\x08hostname\
-    \x18\x02\x20\x01(\x0b2%.blobstream.v1.BrokerHostnameIdentityH\0R\x08host\
-    nameB\r\n\x06source\x12\x03\xf8B\x01\"\x18\n\x16BrokerHostnameIdentity\"\
-    \xc0\x01\n\x15BrokerDiscoveryConfig\x12D\n\x06static\x18\x01\x20\x01(\
-    \x0b2*.blobstream.v1.StaticBrokerDiscoveryConfigH\0R\x06static\x12Q\n\
-    \x0bk8s_service\x18\x02\x20\x01(\x0b2..blobstream.v1.K8sServiceBrokerDis\
-    coveryConfigH\0R\nk8sServiceB\x0e\n\x07backend\x12\x03\xf8B\x01\"X\n\x1b\
-    StaticBrokerDiscoveryConfig\x129\n\x05nodes\x18\x01\x20\x03(\x0b2\x19.bl\
-    obstream.v1.BrokerNodeR\x05nodesB\x08\xfaB\x05\x92\x01\x02\x08\x01\"Q\n\
-    \nBrokerNode\x12\x20\n\x07node_id\x18\x01\x20\x01(\tR\x06nodeIdB\x07\xfa\
-    B\x04r\x02\x10\x01\x12!\n\x07address\x18\x02\x20\x01(\tR\x07addressB\x07\
-    \xfaB\x04r\x02\x10\x01\"t\n\x1fK8sServiceBrokerDiscoveryConfig\x12%\n\tn\
-    amespace\x18\x01\x20\x01(\tR\tnamespaceB\x07\xfaB\x04r\x02\x10\x01\x12*\
-    \n\x0cservice_name\x18\x02\x20\x01(\tR\x0bserviceNameB\x07\xfaB\x04r\x02\
-    \x10\x01\"\xad\x01\n\x0bTopicConfig\x12\x1b\n\x04name\x18\x01\x20\x01(\t\
-    R\x04nameB\x07\xfaB\x04r\x02\x10\x01\x120\n\x0fpartition_count\x18\x02\
-    \x20\x01(\rR\x0epartitionCountB\x07\xfaB\x04*\x02\x20\0\x12(\n\x0bnum_wr\
-    iters\x18\x03\x20\x01(\rR\nnumWritersB\x07\xfaB\x04*\x02\x20\0\x12%\n\
-    \x0eretention_days\x18\x04\x20\x01(\rR\rretentionDays\"\x19\n\x17InMemor\
-    yBlobStoreConfig\"\x89\x01\n\x11S3BlobStoreConfig\x12\x1f\n\x06bucket\
-    \x18\x01\x20\x01(\tR\x06bucketB\x07\xfaB\x04r\x02\x10\x01\x12\x16\n\x06p\
-    refix\x18\x02\x20\x01(\tR\x06prefix\x12\x1f\n\x06region\x18\x03\x20\x01(\
-    \tR\x06regionB\x07\xfaB\x04r\x02\x10\x01\x12\x1a\n\x08endpoint\x18\x04\
-    \x20\x01(\tR\x08endpoint\"\x9c\x01\n\x0fBlobStoreConfig\x12E\n\tin_memor\
-    y\x18\x01\x20\x01(\x0b2&.blobstream.v1.InMemoryBlobStoreConfigH\0R\x08in\
-    Memory\x122\n\x02s3\x18\x02\x20\x01(\x0b2\x20.blobstream.v1.S3BlobStoreC\
-    onfigH\0R\x02s3B\x0e\n\x07backend\x12\x03\xf8B\x01\"\x1d\n\x1bInMemoryMe\
-    tadataStoreConfig\"\xed\x04\n\x19DynamoMetadataStoreConfig\x12\x1f\n\x06\
-    region\x18\x01\x20\x01(\tR\x06regionB\x07\xfaB\x04r\x02\x10\x01\x12\x1a\
-    \n\x08endpoint\x18\x02\x20\x01(\tR\x08endpoint\x12F\n\x1bsegment_metadat\
-    a_table_name\x18\x03\x20\x01(\tR\x18segmentMetadataTableNameB\x07\xfaB\
-    \x04r\x02\x10\x01\x12U\n#producer_partition_lease_table_name\x18\x04\x20\
-    \x01(\tR\x1fproducerPartitionLeaseTableNameB\x07\xfaB\x04r\x02\x10\x01\
-    \x12M\n\x1fconsumer_group_lease_table_name\x18\x05\x20\x01(\tR\x1bconsum\
-    erGroupLeaseTableNameB\x07\xfaB\x04r\x02\x10\x01\x12W\n$consumer_group_m\
-    embership_table_name\x18\x06\x20\x01(\tR\x20consumerGroupMembershipTable\
-    NameB\x07\xfaB\x04r\x02\x10\x01\x12I\n\x1asegment_ttl_buffer_seconds\x18\
-    \x07\x20\x01(\rH\0R\x17segmentTtlBufferSecondsB\x07\xfaB\x04*\x02\x20\0\
-    \x88\x01\x01\x12E\n\x18lease_ttl_buffer_seconds\x18\x08\x20\x01(\rH\x01R\
-    \x15leaseTtlBufferSecondsB\x07\xfaB\x04*\x02\x20\0\x88\x01\x01B\x1d\n\
-    \x1b_segment_ttl_buffer_secondsB\x1b\n\x19_lease_ttl_buffer_seconds\"\
-    \xb4\x01\n\x13MetadataStoreConfig\x12I\n\tin_memory\x18\x01\x20\x01(\x0b\
-    2*.blobstream.v1.InMemoryMetadataStoreConfigH\0R\x08inMemory\x12B\n\x06d\
-    ynamo\x18\x02\x20\x01(\x0b2(.blobstream.v1.DynamoMetadataStoreConfigH\0R\
-    \x06dynamoB\x0e\n\x07backend\x12\x03\xf8B\x01\"\xaa\x02\n\rRuntimeConfig\
-    \x12=\n\x06broker\x18\x01\x20\x01(\x0b2\x1b.blobstream.v1.BrokerConfigR\
-    \x06brokerB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12<\n\x06topics\x18\x02\
+    \x12a\n\x13segment_compression\x18\x06\x20\x01(\x0e2!.blobstream.v1.Segm\
+    entCompressionH\0R\x12segmentCompressionB\x08\xfaB\x05\x82\x01\x02\x10\
+    \x01\x88\x01\x01B\x16\n\x14_segment_compression\"\x96\x01\n\x18BrokerNod\
+    eIdentityConfig\x12&\n\tstatic_id\x18\x01\x20\x01(\tH\0R\x08staticIdB\
+    \x07\xfaB\x04r\x02\x10\x01\x12C\n\x08hostname\x18\x02\x20\x01(\x0b2%.blo\
+    bstream.v1.BrokerHostnameIdentityH\0R\x08hostnameB\r\n\x06source\x12\x03\
+    \xf8B\x01\"\x18\n\x16BrokerHostnameIdentity\"\xc0\x01\n\x15BrokerDiscove\
+    ryConfig\x12D\n\x06static\x18\x01\x20\x01(\x0b2*.blobstream.v1.StaticBro\
+    kerDiscoveryConfigH\0R\x06static\x12Q\n\x0bk8s_service\x18\x02\x20\x01(\
+    \x0b2..blobstream.v1.K8sServiceBrokerDiscoveryConfigH\0R\nk8sServiceB\
+    \x0e\n\x07backend\x12\x03\xf8B\x01\"X\n\x1bStaticBrokerDiscoveryConfig\
+    \x129\n\x05nodes\x18\x01\x20\x03(\x0b2\x19.blobstream.v1.BrokerNodeR\x05\
+    nodesB\x08\xfaB\x05\x92\x01\x02\x08\x01\"Q\n\nBrokerNode\x12\x20\n\x07no\
+    de_id\x18\x01\x20\x01(\tR\x06nodeIdB\x07\xfaB\x04r\x02\x10\x01\x12!\n\
+    \x07address\x18\x02\x20\x01(\tR\x07addressB\x07\xfaB\x04r\x02\x10\x01\"t\
+    \n\x1fK8sServiceBrokerDiscoveryConfig\x12%\n\tnamespace\x18\x01\x20\x01(\
+    \tR\tnamespaceB\x07\xfaB\x04r\x02\x10\x01\x12*\n\x0cservice_name\x18\x02\
+    \x20\x01(\tR\x0bserviceNameB\x07\xfaB\x04r\x02\x10\x01\"\xad\x01\n\x0bTo\
+    picConfig\x12\x1b\n\x04name\x18\x01\x20\x01(\tR\x04nameB\x07\xfaB\x04r\
+    \x02\x10\x01\x120\n\x0fpartition_count\x18\x02\x20\x01(\rR\x0epartitionC\
+    ountB\x07\xfaB\x04*\x02\x20\0\x12(\n\x0bnum_writers\x18\x03\x20\x01(\rR\
+    \nnumWritersB\x07\xfaB\x04*\x02\x20\0\x12%\n\x0eretention_days\x18\x04\
+    \x20\x01(\rR\rretentionDays\"\x19\n\x17InMemoryBlobStoreConfig\"\x89\x01\
+    \n\x11S3BlobStoreConfig\x12\x1f\n\x06bucket\x18\x01\x20\x01(\tR\x06bucke\
+    tB\x07\xfaB\x04r\x02\x10\x01\x12\x16\n\x06prefix\x18\x02\x20\x01(\tR\x06\
+    prefix\x12\x1f\n\x06region\x18\x03\x20\x01(\tR\x06regionB\x07\xfaB\x04r\
+    \x02\x10\x01\x12\x1a\n\x08endpoint\x18\x04\x20\x01(\tR\x08endpoint\"\x9c\
+    \x01\n\x0fBlobStoreConfig\x12E\n\tin_memory\x18\x01\x20\x01(\x0b2&.blobs\
+    tream.v1.InMemoryBlobStoreConfigH\0R\x08inMemory\x122\n\x02s3\x18\x02\
+    \x20\x01(\x0b2\x20.blobstream.v1.S3BlobStoreConfigH\0R\x02s3B\x0e\n\x07b\
+    ackend\x12\x03\xf8B\x01\"\x1d\n\x1bInMemoryMetadataStoreConfig\"\xed\x04\
+    \n\x19DynamoMetadataStoreConfig\x12\x1f\n\x06region\x18\x01\x20\x01(\tR\
+    \x06regionB\x07\xfaB\x04r\x02\x10\x01\x12\x1a\n\x08endpoint\x18\x02\x20\
+    \x01(\tR\x08endpoint\x12F\n\x1bsegment_metadata_table_name\x18\x03\x20\
+    \x01(\tR\x18segmentMetadataTableNameB\x07\xfaB\x04r\x02\x10\x01\x12U\n#p\
+    roducer_partition_lease_table_name\x18\x04\x20\x01(\tR\x1fproducerPartit\
+    ionLeaseTableNameB\x07\xfaB\x04r\x02\x10\x01\x12M\n\x1fconsumer_group_le\
+    ase_table_name\x18\x05\x20\x01(\tR\x1bconsumerGroupLeaseTableNameB\x07\
+    \xfaB\x04r\x02\x10\x01\x12W\n$consumer_group_membership_table_name\x18\
+    \x06\x20\x01(\tR\x20consumerGroupMembershipTableNameB\x07\xfaB\x04r\x02\
+    \x10\x01\x12I\n\x1asegment_ttl_buffer_seconds\x18\x07\x20\x01(\rH\0R\x17\
+    segmentTtlBufferSecondsB\x07\xfaB\x04*\x02\x20\0\x88\x01\x01\x12E\n\x18l\
+    ease_ttl_buffer_seconds\x18\x08\x20\x01(\rH\x01R\x15leaseTtlBufferSecond\
+    sB\x07\xfaB\x04*\x02\x20\0\x88\x01\x01B\x1d\n\x1b_segment_ttl_buffer_sec\
+    ondsB\x1b\n\x19_lease_ttl_buffer_seconds\"\xb4\x01\n\x13MetadataStoreCon\
+    fig\x12I\n\tin_memory\x18\x01\x20\x01(\x0b2*.blobstream.v1.InMemoryMetad\
+    ataStoreConfigH\0R\x08inMemory\x12B\n\x06dynamo\x18\x02\x20\x01(\x0b2(.b\
+    lobstream.v1.DynamoMetadataStoreConfigH\0R\x06dynamoB\x0e\n\x07backend\
+    \x12\x03\xf8B\x01\"\xaa\x02\n\rRuntimeConfig\x12=\n\x06broker\x18\x01\
+    \x20\x01(\x0b2\x1b.blobstream.v1.BrokerConfigR\x06brokerB\x08\xfaB\x05\
+    \x8a\x01\x02\x10\x01\x12<\n\x06topics\x18\x02\x20\x03(\x0b2\x1a.blobstre\
+    am.v1.TopicConfigR\x06topicsB\x08\xfaB\x05\x92\x01\x02\x08\x01\x12G\n\nb\
+    lob_store\x18\x03\x20\x01(\x0b2\x1e.blobstream.v1.BlobStoreConfigR\tblob\
+    StoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12S\n\x0emetadata_store\x18\x04\
+    \x20\x01(\x0b2\".blobstream.v1.MetadataStoreConfigR\rmetadataStoreB\x08\
+    \xfaB\x05\x8a\x01\x02\x10\x01\"\xf6\x06\n\x0eProducerConfig\x12\x20\n\tw\
+    riter_id\x18\x01\x20\x01(\rH\0R\x08writerId\x88\x01\x01\x128\n\x11max_ba\
+    tch_records\x18\x02\x20\x01(\rH\x01R\x0fmaxBatchRecordsB\x07\xfaB\x04*\
+    \x02\x20\0\x88\x01\x01\x124\n\x0fmax_batch_bytes\x18\x03\x20\x01(\rH\x02\
+    R\rmaxBatchBytesB\x07\xfaB\x04*\x02\x20\0\x88\x01\x01\x129\n\x12flush_ma\
+    x_delay_ms\x18\x04\x20\x01(\x04H\x03R\x0fflushMaxDelayMsB\x07\xfaB\x042\
+    \x02\x20\0\x88\x01\x01\x12$\n\x0bmax_retries\x18\x05\x20\x01(\rH\x04R\nm\
+    axRetries\x88\x01\x01\x12;\n\x13retry_base_delay_ms\x18\x06\x20\x01(\x04\
+    H\x05R\x10retryBaseDelayMsB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x129\n\
+    \x12retry_max_delay_ms\x18\x07\x20\x01(\x04H\x06R\x0fretryMaxDelayMsB\
+    \x07\xfaB\x042\x02\x20\0\x88\x01\x01\x12:\n\x12connect_timeout_ms\x18\
+    \x08\x20\x01(\x03H\x07R\x10connectTimeoutMsB\x07\xfaB\x04\"\x02\x20\0\
+    \x88\x01\x01\x12:\n\x12request_timeout_ms\x18\t\x20\x01(\x03H\x08R\x10re\
+    questTimeoutMsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\x01\x12D\n\x17max_reque\
+    st_concurrency\x18\n\x20\x01(\x04H\tR\x15maxRequestConcurrencyB\x07\xfaB\
+    \x042\x02\x20\0\x88\x01\x01\x12S\n\x0bcompression\x18\x0b\x20\x01(\x0e2\
+    \".blobstream.v1.ProducerCompressionH\nR\x0bcompressionB\x08\xfaB\x05\
+    \x82\x01\x02\x10\x01\x88\x01\x01B\x0c\n\n_writer_idB\x14\n\x12_max_batch\
+    _recordsB\x12\n\x10_max_batch_bytesB\x15\n\x13_flush_max_delay_msB\x0e\n\
+    \x0c_max_retriesB\x16\n\x14_retry_base_delay_msB\x15\n\x13_retry_max_del\
+    ay_msB\x15\n\x13_connect_timeout_msB\x15\n\x13_request_timeout_msB\x1a\n\
+    \x18_max_request_concurrencyB\x0e\n\x0c_compression\"\xe8\x01\n\x15Produ\
+    cerRuntimeConfig\x12C\n\x08producer\x18\x01\x20\x01(\x0b2\x1d.blobstream\
+    .v1.ProducerConfigR\x08producerB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12L\n\
+    \tdiscovery\x18\x02\x20\x01(\x0b2$.blobstream.v1.BrokerDiscoveryConfigR\
+    \tdiscoveryB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12<\n\x06topics\x18\x03\
     \x20\x03(\x0b2\x1a.blobstream.v1.TopicConfigR\x06topicsB\x08\xfaB\x05\
-    \x92\x01\x02\x08\x01\x12G\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobst\
+    \x92\x01\x02\x08\x01\"\xd0\x03\n\x12ConsumerReadConfig\x12\x1d\n\x05topi\
+    c\x18\x01\x20\x01(\tR\x05topicB\x07\xfaB\x04r\x02\x10\x01\x12<\n\x13wind\
+    ow_size_seconds\x18\x02\x20\x01(\x03H\0R\x11windowSizeSecondsB\x07\xfaB\
+    \x04\"\x02\x20\0\x88\x01\x01\x127\n\x10lookback_windows\x18\x03\x20\x01(\
+    \rH\x01R\x0flookbackWindowsB\x07\xfaB\x04*\x02\x20\0\x88\x01\x01\x129\n\
+    \x12idle_poll_delay_ms\x18\x04\x20\x01(\x04H\x02R\x0fidlePollDelayMsB\
+    \x07\xfaB\x042\x02\x20\0\x88\x01\x01\x127\n\x16max_idle_poll_delay_ms\
+    \x18\x05\x20\x01(\x04H\x03R\x12maxIdlePollDelayMs\x88\x01\x01\x12:\n\x12\
+    prefetch_max_bytes\x18\x06\x20\x01(\x04H\x04R\x10prefetchMaxBytesB\x07\
+    \xfaB\x042\x02\x20\0\x88\x01\x01B\x16\n\x14_window_size_secondsB\x13\n\
+    \x11_lookback_windowsB\x15\n\x13_idle_poll_delay_msB\x19\n\x17_max_idle_\
+    poll_delay_msB\x15\n\x13_prefetch_max_bytes\"\x86\x03\n\x13ConsumerGroup\
+    Config\x12\x1d\n\x05topic\x18\x01\x20\x01(\tR\x05topicB\x07\xfaB\x04r\
+    \x02\x10\x01\x12\"\n\x08group_id\x18\x02\x20\x01(\tR\x07groupIdB\x07\xfa\
+    B\x04r\x02\x10\x01\x12$\n\tmember_id\x18\x03\x20\x01(\tR\x08memberIdB\
+    \x07\xfaB\x04r\x02\x10\x01\x128\n\x11lease_duration_ms\x18\x04\x20\x01(\
+    \x03H\0R\x0fleaseDurationMsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\x01\x12@\n\
+    \x15heartbeat_interval_ms\x18\x05\x20\x01(\x03H\x01R\x13heartbeatInterva\
+    lMsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\x01\x12@\n\x15rebalance_interval_m\
+    s\x18\x06\x20\x01(\x03H\x02R\x13rebalanceIntervalMsB\x07\xfaB\x04\"\x02\
+    \x20\0\x88\x01\x01B\x14\n\x12_lease_duration_msB\x18\n\x16_heartbeat_int\
+    erval_msB\x18\n\x16_rebalance_interval_ms\"\x9c\x01\n\x15ConsumerRuntime\
+    Config\x12?\n\x04read\x18\x01\x20\x01(\x0b2!.blobstream.v1.ConsumerReadC\
+    onfigR\x04readB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12B\n\x05group\x18\x02\
+    \x20\x01(\x0b2\".blobstream.v1.ConsumerGroupConfigR\x05groupB\x08\xfaB\
+    \x05\x8a\x01\x02\x10\x01\"\xc5\x02\n\x1fConsumerIteratorBootstrapConfig\
+    \x12H\n\x07runtime\x18\x01\x20\x01(\x0b2$.blobstream.v1.ConsumerRuntimeC\
+    onfigR\x07runtimeB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12:\n\x05topic\x18\
+    \x02\x20\x01(\x0b2\x1a.blobstream.v1.TopicConfigR\x05topicB\x08\xfaB\x05\
+    \x8a\x01\x02\x10\x01\x12G\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobst\
     ream.v1.BlobStoreConfigR\tblobStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\
     \x12S\n\x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobstream.v1.Metadata\
-    StoreConfigR\rmetadataStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\"\xf6\x06\
-    \n\x0eProducerConfig\x12\x20\n\twriter_id\x18\x01\x20\x01(\rH\0R\x08writ\
-    erId\x88\x01\x01\x128\n\x11max_batch_records\x18\x02\x20\x01(\rH\x01R\
-    \x0fmaxBatchRecordsB\x07\xfaB\x04*\x02\x20\0\x88\x01\x01\x124\n\x0fmax_b\
-    atch_bytes\x18\x03\x20\x01(\rH\x02R\rmaxBatchBytesB\x07\xfaB\x04*\x02\
-    \x20\0\x88\x01\x01\x129\n\x12flush_max_delay_ms\x18\x04\x20\x01(\x04H\
-    \x03R\x0fflushMaxDelayMsB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x12$\n\x0b\
-    max_retries\x18\x05\x20\x01(\rH\x04R\nmaxRetries\x88\x01\x01\x12;\n\x13r\
-    etry_base_delay_ms\x18\x06\x20\x01(\x04H\x05R\x10retryBaseDelayMsB\x07\
-    \xfaB\x042\x02\x20\0\x88\x01\x01\x129\n\x12retry_max_delay_ms\x18\x07\
-    \x20\x01(\x04H\x06R\x0fretryMaxDelayMsB\x07\xfaB\x042\x02\x20\0\x88\x01\
-    \x01\x12:\n\x12connect_timeout_ms\x18\x08\x20\x01(\x03H\x07R\x10connectT\
-    imeoutMsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\x01\x12:\n\x12request_timeout\
-    _ms\x18\t\x20\x01(\x03H\x08R\x10requestTimeoutMsB\x07\xfaB\x04\"\x02\x20\
-    \0\x88\x01\x01\x12D\n\x17max_request_concurrency\x18\n\x20\x01(\x04H\tR\
-    \x15maxRequestConcurrencyB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x12S\n\
-    \x0bcompression\x18\x0b\x20\x01(\x0e2\".blobstream.v1.ProducerCompressio\
-    nH\nR\x0bcompressionB\x08\xfaB\x05\x82\x01\x02\x10\x01\x88\x01\x01B\x0c\
-    \n\n_writer_idB\x14\n\x12_max_batch_recordsB\x12\n\x10_max_batch_bytesB\
-    \x15\n\x13_flush_max_delay_msB\x0e\n\x0c_max_retriesB\x16\n\x14_retry_ba\
-    se_delay_msB\x15\n\x13_retry_max_delay_msB\x15\n\x13_connect_timeout_msB\
-    \x15\n\x13_request_timeout_msB\x1a\n\x18_max_request_concurrencyB\x0e\n\
-    \x0c_compression\"\xe8\x01\n\x15ProducerRuntimeConfig\x12C\n\x08producer\
-    \x18\x01\x20\x01(\x0b2\x1d.blobstream.v1.ProducerConfigR\x08producerB\
-    \x08\xfaB\x05\x8a\x01\x02\x10\x01\x12L\n\tdiscovery\x18\x02\x20\x01(\x0b\
-    2$.blobstream.v1.BrokerDiscoveryConfigR\tdiscoveryB\x08\xfaB\x05\x8a\x01\
-    \x02\x10\x01\x12<\n\x06topics\x18\x03\x20\x03(\x0b2\x1a.blobstream.v1.To\
-    picConfigR\x06topicsB\x08\xfaB\x05\x92\x01\x02\x08\x01\"\xd0\x03\n\x12Co\
-    nsumerReadConfig\x12\x1d\n\x05topic\x18\x01\x20\x01(\tR\x05topicB\x07\
-    \xfaB\x04r\x02\x10\x01\x12<\n\x13window_size_seconds\x18\x02\x20\x01(\
-    \x03H\0R\x11windowSizeSecondsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\x01\x127\
-    \n\x10lookback_windows\x18\x03\x20\x01(\rH\x01R\x0flookbackWindowsB\x07\
-    \xfaB\x04*\x02\x20\0\x88\x01\x01\x129\n\x12idle_poll_delay_ms\x18\x04\
-    \x20\x01(\x04H\x02R\x0fidlePollDelayMsB\x07\xfaB\x042\x02\x20\0\x88\x01\
-    \x01\x127\n\x16max_idle_poll_delay_ms\x18\x05\x20\x01(\x04H\x03R\x12maxI\
-    dlePollDelayMs\x88\x01\x01\x12:\n\x12prefetch_max_bytes\x18\x06\x20\x01(\
-    \x04H\x04R\x10prefetchMaxBytesB\x07\xfaB\x042\x02\x20\0\x88\x01\x01B\x16\
-    \n\x14_window_size_secondsB\x13\n\x11_lookback_windowsB\x15\n\x13_idle_p\
-    oll_delay_msB\x19\n\x17_max_idle_poll_delay_msB\x15\n\x13_prefetch_max_b\
-    ytes\"\x86\x03\n\x13ConsumerGroupConfig\x12\x1d\n\x05topic\x18\x01\x20\
-    \x01(\tR\x05topicB\x07\xfaB\x04r\x02\x10\x01\x12\"\n\x08group_id\x18\x02\
-    \x20\x01(\tR\x07groupIdB\x07\xfaB\x04r\x02\x10\x01\x12$\n\tmember_id\x18\
-    \x03\x20\x01(\tR\x08memberIdB\x07\xfaB\x04r\x02\x10\x01\x128\n\x11lease_\
-    duration_ms\x18\x04\x20\x01(\x03H\0R\x0fleaseDurationMsB\x07\xfaB\x04\"\
-    \x02\x20\0\x88\x01\x01\x12@\n\x15heartbeat_interval_ms\x18\x05\x20\x01(\
-    \x03H\x01R\x13heartbeatIntervalMsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\x01\
-    \x12@\n\x15rebalance_interval_ms\x18\x06\x20\x01(\x03H\x02R\x13rebalance\
-    IntervalMsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\x01B\x14\n\x12_lease_durati\
-    on_msB\x18\n\x16_heartbeat_interval_msB\x18\n\x16_rebalance_interval_ms\
-    \"\x9c\x01\n\x15ConsumerRuntimeConfig\x12?\n\x04read\x18\x01\x20\x01(\
-    \x0b2!.blobstream.v1.ConsumerReadConfigR\x04readB\x08\xfaB\x05\x8a\x01\
-    \x02\x10\x01\x12B\n\x05group\x18\x02\x20\x01(\x0b2\".blobstream.v1.Consu\
-    merGroupConfigR\x05groupB\x08\xfaB\x05\x8a\x01\x02\x10\x01\"\xc5\x02\n\
-    \x1fConsumerIteratorBootstrapConfig\x12H\n\x07runtime\x18\x01\x20\x01(\
-    \x0b2$.blobstream.v1.ConsumerRuntimeConfigR\x07runtimeB\x08\xfaB\x05\x8a\
-    \x01\x02\x10\x01\x12:\n\x05topic\x18\x02\x20\x01(\x0b2\x1a.blobstream.v1\
-    .TopicConfigR\x05topicB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12G\n\nblob_st\
-    ore\x18\x03\x20\x01(\x0b2\x1e.blobstream.v1.BlobStoreConfigR\tblobStoreB\
-    \x08\xfaB\x05\x8a\x01\x02\x10\x01\x12S\n\x0emetadata_store\x18\x04\x20\
-    \x01(\x0b2\".blobstream.v1.MetadataStoreConfigR\rmetadataStoreB\x08\xfaB\
-    \x05\x8a\x01\x02\x10\x01*U\n\x13ProducerCompression\x12\x1d\n\x19PRODUCE\
-    R_COMPRESSION_NONE\x10\0\x12\x1f\n\x1bPRODUCER_COMPRESSION_SNAPPY\x10\
-    \x01b\x06proto3\
+    StoreConfigR\rmetadataStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01*P\n\x12Seg\
+    mentCompression\x12\x1c\n\x18SEGMENT_COMPRESSION_NONE\x10\0\x12\x1c\n\
+    \x18SEGMENT_COMPRESSION_ZSTD\x10\x01*U\n\x13ProducerCompression\x12\x1d\
+    \n\x19PRODUCER_COMPRESSION_NONE\x10\0\x12\x1f\n\x1bPRODUCER_COMPRESSION_\
+    SNAPPY\x10\x01b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -4258,7 +4342,8 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             messages.push(ConsumerGroupConfig::generated_message_descriptor_data());
             messages.push(ConsumerRuntimeConfig::generated_message_descriptor_data());
             messages.push(ConsumerIteratorBootstrapConfig::generated_message_descriptor_data());
-            let mut enums = ::std::vec::Vec::with_capacity(1);
+            let mut enums = ::std::vec::Vec::with_capacity(2);
+            enums.push(SegmentCompression::generated_enum_descriptor_data());
             enums.push(ProducerCompression::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),

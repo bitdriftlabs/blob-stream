@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::{ConsumerReadConfig, ConsumerReader, ConsumerReaderImpl};
+use bd_server_stats::stats::Collector;
 use blob_stream_blob_store::{BlobKey, BlobStore, InMemoryBlobStore};
 use blob_stream_metadata_store::{InMemoryMetadataStore, MetadataStore, SegmentMetadata};
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
@@ -21,6 +22,10 @@ use protobuf::Message;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
+
+fn metrics_scope() -> bd_server_stats::stats::Scope {
+  Collector::default().scope("blob_stream_consumer_test")
+}
 
 async fn write_segment(
   blob_store: &dyn BlobStore,
@@ -122,6 +127,7 @@ async fn advances_cursor_and_dedupes_on_rescan() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    &metrics_scope(),
   )
   .unwrap();
 
@@ -164,6 +170,7 @@ async fn catches_late_metadata_with_lookback_window() {
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    &metrics_scope(),
   )
   .unwrap();
 
@@ -219,6 +226,7 @@ async fn decodes_zstd_compressed_batches() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    &metrics_scope(),
   )
   .unwrap();
 

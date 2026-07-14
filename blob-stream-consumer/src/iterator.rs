@@ -94,6 +94,12 @@ struct ConsumerIteratorMetrics {
   prefetch_buffered_bytes: IntGauge,
   prefetch_paused_budget: IntCounter,
   prefetch_refill_cycles: IntCounter,
+  heartbeat_calls: IntCounter,
+  heartbeat_failures: IntCounter,
+  heartbeat_committed_offsets: IntCounter,
+  heartbeat_renewed_partitions: IntCounter,
+  heartbeat_fenced_partitions: IntCounter,
+  heartbeat_latency_seconds: Histogram,
   next_latency_seconds: Histogram,
   commit_latency_seconds: Histogram,
 }
@@ -112,6 +118,12 @@ impl ConsumerIteratorMetrics {
       prefetch_buffered_bytes: scope.gauge("prefetch_buffered_bytes"),
       prefetch_paused_budget: scope.counter("prefetch_paused_budget"),
       prefetch_refill_cycles: scope.counter("prefetch_refill_cycles"),
+      heartbeat_calls: scope.counter("heartbeat_calls"),
+      heartbeat_failures: scope.counter("heartbeat_failures"),
+      heartbeat_committed_offsets: scope.counter("heartbeat_committed_offsets"),
+      heartbeat_renewed_partitions: scope.counter("heartbeat_renewed_partitions"),
+      heartbeat_fenced_partitions: scope.counter("heartbeat_fenced_partitions"),
+      heartbeat_latency_seconds: scope.histogram("heartbeat_latency_seconds"),
       next_latency_seconds: scope.histogram("next_latency_seconds"),
       commit_latency_seconds: scope.histogram("commit_latency_seconds"),
     }
@@ -234,6 +246,9 @@ pub struct ConsumerStateSnapshot {
   pub pending_assignment: Option<Vec<VirtualPartitionId>>,
   pub pending_revocation: bool,
   pub pending_commits: Vec<ConsumerOffsetSnapshot>,
+  pub staged_offsets: Vec<ConsumerOffsetSnapshot>,
+  pub last_committed_offsets: Vec<ConsumerOffsetSnapshot>,
+  pub last_successful_heartbeat_at_ms: Option<i64>,
   pub cursors: Vec<ConsumerOffsetSnapshot>,
   pub next_heartbeat_at_ms: i64,
   pub next_rebalance_at_ms: i64,
@@ -247,7 +262,7 @@ pub struct ConsumerStateSnapshot {
 // ConsumerOffsetSnapshot
 //
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConsumerOffsetSnapshot {
   pub virtual_partition_id: VirtualPartitionId,
   pub offset: u64,
@@ -264,7 +279,9 @@ struct ConsumerDiagnosticsRuntimeState {
   active_assignment: Vec<VirtualPartitionId>,
   pending_assignment: Option<Vec<VirtualPartitionId>>,
   pending_revocation: bool,
-  pending_commits: HashMap<VirtualPartitionId, u64>,
+  staged_offsets: HashMap<VirtualPartitionId, u64>,
+  last_committed_offsets: HashMap<VirtualPartitionId, u64>,
+  last_successful_heartbeat_at_ms: Option<i64>,
   next_heartbeat_at_ms: i64,
   next_rebalance_at_ms: i64,
 }
@@ -293,7 +310,9 @@ impl ConsumerDiagnostics {
       mut active_assignment,
       mut pending_assignment,
       pending_revocation,
-      mut pending_commits,
+      staged_offsets,
+      last_committed_offsets,
+      last_successful_heartbeat_at_ms,
       coordinator_generation,
       next_heartbeat_at_ms,
       next_rebalance_at_ms,
@@ -307,7 +326,9 @@ impl ConsumerDiagnostics {
         runtime_state.active_assignment.clone(),
         runtime_state.pending_assignment.clone(),
         runtime_state.pending_revocation,
-        offsets_from_map(&runtime_state.pending_commits),
+        offsets_from_map(&runtime_state.staged_offsets),
+        offsets_from_map(&runtime_state.last_committed_offsets),
+        runtime_state.last_successful_heartbeat_at_ms,
         runtime_state.coordinator_generation,
         runtime_state.next_heartbeat_at_ms,
         runtime_state.next_rebalance_at_ms,
@@ -323,7 +344,7 @@ impl ConsumerDiagnostics {
     let prefetch_buffer = self.prefetch_buffer.lock().await;
 
     ConsumerStateSnapshot {
-      schema_version: 1,
+      schema_version: 2,
       generated_at_ts_ms,
       topic: self.group_config.topic.to_string(),
       group_id: self.group_config.group_id.to_string(),
@@ -334,7 +355,10 @@ impl ConsumerDiagnostics {
       active_assignment,
       pending_assignment,
       pending_revocation,
-      pending_commits: std::mem::take(&mut pending_commits),
+      pending_commits: staged_offsets.clone(),
+      staged_offsets,
+      last_committed_offsets,
+      last_successful_heartbeat_at_ms,
       cursors: std::mem::take(&mut cursors),
       next_heartbeat_at_ms,
       next_rebalance_at_ms,
@@ -443,7 +467,7 @@ impl ConsumerIteratorImpl {
       .ok_or_else(|| anyhow!("consumer group config is required"))?
       .clone();
     let idle_poll_delay_ms = consumer_idle_poll_delay_ms(&read_config);
-    let max_idle_poll_delay_ms = consumer_max_idle_poll_delay_ms(&read_config);
+    let max_idle_poll_delay_ms = Some(consumer_max_idle_poll_delay_ms(&read_config));
     let prefetch_max_bytes = consumer_prefetch_max_bytes(&read_config);
 
     let active_assignment = HashSet::new();
@@ -453,6 +477,7 @@ impl ConsumerIteratorImpl {
       HashMap::new(),
       blob_store,
       metadata_store,
+      &metrics_scope.scope("consumer"),
     )?));
     let coordinator = ConsumerGroupCoordinatorImpl::new(group_config.clone(), lease_store)?;
     let now_ts_ms = now_unix_millis();
@@ -531,32 +556,59 @@ impl ConsumerIteratorImpl {
     &mut self,
     report: RebalanceReport,
   ) -> Result<Vec<VirtualPartitionId>> {
-    {
-      let mut reader = self.reader.lock().await;
-      for (partition_id, seq_end) in report.committed_cursors {
-        reader.hydrate_cursor(partition_id, seq_end);
-      }
+    let RebalanceReport {
+      owned_partitions,
+      committed_cursors,
+    } = report;
+    self.hydrate_cursors(committed_cursors).await;
+
+    self.apply_assignment(&owned_partitions).await?;
+    Ok(owned_partitions)
+  }
+
+  async fn hydrate_cursors(&self, committed_cursors: HashMap<VirtualPartitionId, u64>) {
+    if committed_cursors.is_empty() {
+      return;
     }
 
-    self.apply_assignment(&report.owned_partitions).await?;
-    Ok(report.owned_partitions)
+    let mut reader = self.reader.lock().await;
+    for (partition_id, seq_end) in committed_cursors {
+      reader.hydrate_cursor(partition_id, seq_end);
+    }
   }
 
   async fn apply_assignment(&mut self, assignment: &[VirtualPartitionId]) -> Result<()> {
+    let active_assignment = assignment.iter().copied().collect();
+    self
+      .apply_assignment_with_active_set(assignment, active_assignment)
+      .await
+  }
+
+  async fn apply_assignment_with_active_set(
+    &mut self,
+    assignment: &[VirtualPartitionId],
+    active_assignment: HashSet<VirtualPartitionId>,
+  ) -> Result<()> {
+    let assignment_changed = self.active_assignment != active_assignment;
     self
       .reader
       .lock()
       .await
       .set_assigned_virtual_partitions(assignment.to_owned())?;
-    self.active_assignment = assignment.iter().copied().collect();
+    self.active_assignment = active_assignment;
     self
       .pending_commits
       .retain(|partition_id, _| self.active_assignment.contains(partition_id));
     self.refresh_diagnostics();
-    info!(
-      "consumer assignment active: topic={}, group_id={}, member_id={}, partitions={:?}",
-      self.group_config.topic, self.group_config.group_id, self.group_config.member_id, assignment
-    );
+    if assignment_changed {
+      info!(
+        "consumer assignment active: topic={}, group_id={}, member_id={}, partitions={:?}",
+        self.group_config.topic,
+        self.group_config.group_id,
+        self.group_config.member_id,
+        assignment
+      );
+    }
     Ok(())
   }
 
@@ -573,10 +625,18 @@ impl ConsumerIteratorImpl {
       .pending_assignment
       .clone_from(&self.pending_assignment);
     diagnostics.pending_revocation = self.pending_revocation_completion.is_some();
-    diagnostics
-      .pending_commits
-      .clone_from(&self.pending_commits);
+    diagnostics.staged_offsets.clone_from(&self.pending_commits);
     diagnostics.next_heartbeat_at_ms = self.next_heartbeat_at_ms;
+    diagnostics.next_rebalance_at_ms = self.next_rebalance_at_ms;
+  }
+
+  fn refresh_rebalance_diagnostics(&self) {
+    let mut diagnostics = self
+      .diagnostics
+      .runtime_state
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
+    diagnostics.coordinator_generation = self.coordinator.generation();
     diagnostics.next_rebalance_at_ms = self.next_rebalance_at_ms;
   }
 
@@ -640,30 +700,35 @@ impl ConsumerIteratorImpl {
     }
 
     let snapshot = self.coordination_source.snapshot().await?;
-    let previous_assignment = self.active_assignment.clone();
-    let report = self
+    let RebalanceReport {
+      owned_partitions: next_assignment,
+      committed_cursors,
+    } = self
       .coordinator
       .rebalance(snapshot.members, snapshot.virtual_partitions, now_ts_ms)
       .await?;
 
-    let next_assignment = report.owned_partitions.clone();
-    {
-      let mut reader = self.reader.lock().await;
-      for (partition_id, seq_end) in report.committed_cursors {
-        reader.hydrate_cursor(partition_id, seq_end);
-      }
-    }
-
     self.next_rebalance_at_ms = now_ts_ms + consumer_rebalance_interval_ms(&self.group_config);
 
     let next_assignment_set = next_assignment.iter().copied().collect::<HashSet<_>>();
-    let revoked = previous_assignment
+    let assignment_changed = self.active_assignment != next_assignment_set;
+    self.hydrate_cursors(committed_cursors).await;
+
+    if !assignment_changed {
+      self.refresh_rebalance_diagnostics();
+      return Ok(None);
+    }
+
+    let revoked = self
+      .active_assignment
       .difference(&next_assignment_set)
       .copied()
       .collect::<Vec<_>>();
 
     if revoked.is_empty() {
-      self.apply_assignment(&next_assignment).await?;
+      self
+        .apply_assignment_with_active_set(&next_assignment, next_assignment_set)
+        .await?;
       return Ok(None);
     }
 
@@ -737,8 +802,66 @@ impl ConsumerIteratorImpl {
     }
   }
 
-  async fn heartbeat(&mut self, now_ts_ms: i64) -> Result<HeartbeatReport> {
+  fn record_heartbeat_failure(&self, started_at: Instant) {
+    self.metrics.heartbeat_failures.inc();
     self
+      .metrics
+      .heartbeat_latency_seconds
+      .observe(started_at.elapsed().as_secs_f64());
+  }
+
+  fn record_successful_heartbeat(
+    &self,
+    now_ts_ms: i64,
+    report: &HeartbeatReport,
+    started_at: Instant,
+  ) {
+    self
+      .metrics
+      .heartbeat_renewed_partitions
+      .inc_by(u64::try_from(report.renewed_partitions.len()).unwrap_or(u64::MAX));
+    self
+      .metrics
+      .heartbeat_fenced_partitions
+      .inc_by(u64::try_from(report.fenced_partitions.len()).unwrap_or(u64::MAX));
+
+    let committed_offsets = report
+      .renewed_partitions
+      .iter()
+      .filter_map(|partition_id| {
+        self
+          .pending_commits
+          .get(partition_id)
+          .map(|offset| (*partition_id, *offset))
+      })
+      .collect::<Vec<_>>();
+    self
+      .metrics
+      .heartbeat_committed_offsets
+      .inc_by(u64::try_from(committed_offsets.len()).unwrap_or(u64::MAX));
+    self
+      .metrics
+      .heartbeat_latency_seconds
+      .observe(started_at.elapsed().as_secs_f64());
+
+    let mut diagnostics = self
+      .diagnostics
+      .runtime_state
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (partition_id, offset) in committed_offsets {
+      diagnostics
+        .last_committed_offsets
+        .insert(partition_id, offset);
+    }
+    diagnostics.last_successful_heartbeat_at_ms = Some(now_ts_ms);
+  }
+
+  async fn heartbeat(&mut self, now_ts_ms: i64) -> Result<HeartbeatReport> {
+    let started_at = Instant::now();
+    self.metrics.heartbeat_calls.inc();
+
+    if let Err(error) = self
       .membership_store
       .heartbeat_member(
         &self.group_config.topic,
@@ -747,12 +870,25 @@ impl ConsumerIteratorImpl {
         now_ts_ms,
         consumer_lease_duration_ms(&self.group_config),
       )
-      .await?;
+      .await
+    {
+      self.record_heartbeat_failure(started_at);
+      return Err(error);
+    }
 
-    let report = self
+    let report = match self
       .coordinator
       .heartbeat_and_commit(now_ts_ms, &self.pending_commits)
-      .await?;
+      .await
+    {
+      Ok(report) => report,
+      Err(error) => {
+        self.record_heartbeat_failure(started_at);
+        return Err(error);
+      },
+    };
+
+    self.record_successful_heartbeat(now_ts_ms, &report, started_at);
 
     if !report.fenced_partitions.is_empty() {
       for partition_id in &report.fenced_partitions {

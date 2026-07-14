@@ -105,10 +105,9 @@ impl MetadataStore for DelayedVisibilityMetadataStore {
   async fn scan_window(
     &self,
     window: &blob_stream_types::TopicWindowKey,
-    min_snowflake_id: Option<blob_stream_types::SnowflakeId>,
   ) -> Result<Vec<SegmentMetadata>> {
     self.flush_visible_segments().await?;
-    self.inner.scan_window(window, min_snowflake_id).await
+    self.inner.scan_window(window).await
   }
 }
 
@@ -248,6 +247,7 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut observed_ids = HashSet::new();
@@ -309,6 +309,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   // Step 3: Produce and drain phase 1 traffic.
@@ -471,6 +472,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut post_failover_consumed_ids = HashSet::new();
@@ -530,6 +532,7 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut observed_ids = HashSet::new();
@@ -1011,6 +1014,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
       HashMap::new(),
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
+      &metrics_scope("blob_stream_consumer_it"),
     )?;
     let catchup_deadline = Instant::now() + Duration::from_secs(15);
     drain_reader_until(
@@ -1080,6 +1084,7 @@ async fn active_broker_restart_continuity() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   // Step 2: Produce continuously, restart the active broker mid-stream, and continue producing.
@@ -1162,6 +1167,7 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   // Step 2: Produce a stream of records and track which virtual partitions were targeted.
@@ -1286,6 +1292,7 @@ async fn multi_topic_isolation() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut topic_b_reader = ConsumerReaderImpl::new(
@@ -1299,6 +1306,7 @@ async fn multi_topic_isolation() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   // Step 2: Produce interleaved traffic to both topics.
@@ -1424,6 +1432,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   // Step 2: Produce boundary payload sizes, including true empty and near-limit payloads.
@@ -1562,6 +1571,7 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     Arc::clone(&delayed_metadata_store),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   // Step 2: Produce traffic while metadata remains temporarily invisible to readers.
@@ -1798,6 +1808,7 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
       HashMap::new(),
       Arc::clone(&blob_store),
       Arc::clone(&delayed_metadata_store),
+      &metrics_scope("blob_stream_consumer_it"),
     )?;
     let catchup_deadline = Instant::now() + Duration::from_secs(5);
     drain_reader_until(
@@ -2095,6 +2106,7 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   // Step 3: Produce records into matching logical partitions from both writers.
@@ -2454,6 +2466,7 @@ async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
     HashMap::new(),
     resources.s3_blob_store(),
     resources.metadata_store(),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
   let mut consumed_ids = HashSet::new();
   drain_reader_until(
@@ -2579,6 +2592,7 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
     HashMap::new(),
     resources.s3_blob_store(),
     resources.metadata_store(),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
   let mut consumed_ids = HashSet::new();
   drain_reader_until(

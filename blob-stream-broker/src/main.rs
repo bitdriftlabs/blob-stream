@@ -40,7 +40,8 @@ async fn async_main() -> Result<()> {
     .parse()
     .with_context(|| format!("invalid broker.bind_addr: {bind_addr}"))?;
 
-  info!("broker starting: bind_addr={addr}");
+  let config_text = protobuf::text_format::print_to_string_pretty(&config);
+  info!("broker starting with config:\n{config_text}");
 
   let metrics = BrokerMetrics::new();
   let metrics_scope = metrics.scope();

@@ -179,16 +179,25 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       self.desired_assignment = desired_assignment;
     }
 
-    // Rebuild owned set from lease-store assignment outcomes for this pass.
-    // We do not assume local desired ownership implies real ownership.
-    self.owned.clear();
+    // Keep previously owned partitions that are still locally desired, then reconcile each lease
+    // outcome below. This avoids rebuilding the local ownership set on stable rebalances.
+    let member_id = self.config.member_id.to_string();
+    let mut assignment_changed = false;
+    self.owned.retain(|partition_id| {
+      let retain = self
+        .desired_assignment
+        .get(partition_id)
+        .is_some_and(|owner_id| owner_id == &member_id);
+      assignment_changed |= !retain;
+      retain
+    });
     let mut committed_cursors = HashMap::new();
     for partition_id in partitions {
       let Some(owner_id) = self.desired_assignment.get(&partition_id) else {
         continue;
       };
       // Skip partitions assigned to other members.
-      if owner_id != self.config.member_id.to_string().as_str() {
+      if owner_id != &member_id {
         continue;
       }
 
@@ -202,7 +211,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
         .lease_store
         .assign_partition(
           key,
-          self.config.member_id.to_string(),
+          member_id.clone(),
           self.generation,
           now_ts_ms,
           consumer_lease_duration_ms(&self.config),
@@ -211,24 +220,28 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
 
       // Track only partitions that the lease store actually granted to this member.
       if let ConsumerGroupAssignmentOutcome::Assigned(lease) = outcome {
-        self.owned.insert(partition_id);
+        assignment_changed |= self.owned.insert(partition_id);
         if let Some(committed_cursor) = lease.committed_cursor {
           committed_cursors.insert(partition_id, committed_cursor.seq_end);
         }
+      } else {
+        assignment_changed |= self.owned.remove(&partition_id);
       }
     }
 
     // Stable ordering helps deterministic tests and predictable downstream behavior.
     let mut owned = self.owned.iter().copied().collect::<Vec<_>>();
     owned.sort_unstable();
-    info!(
-      "consumer rebalance applied: topic={}, group_id={}, member_id={}, generation={}, owned={}",
-      self.config.topic,
-      self.config.group_id,
-      self.config.member_id,
-      self.generation,
-      owned.len()
-    );
+    if assignment_changed {
+      info!(
+        "consumer rebalance applied: topic={}, group_id={}, member_id={}, generation={}, owned={}",
+        self.config.topic,
+        self.config.group_id,
+        self.config.member_id,
+        self.generation,
+        owned.len()
+      );
+    }
     Ok(RebalanceReport {
       owned_partitions: owned,
       committed_cursors,

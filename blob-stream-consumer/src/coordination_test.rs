@@ -81,6 +81,41 @@ async fn heartbeat_commit_renews_and_commits_cursor() {
 }
 
 #[tokio::test]
+async fn stable_rebalance_preserves_owned_partitions_and_committed_cursor() {
+  let store: Arc<dyn ConsumerGroupLeaseStore> = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let mut coordinator = ConsumerGroupCoordinatorImpl::new(
+    ConsumerGroupConfig {
+      topic: "topic-a".to_string().into(),
+      group_id: "group-a".to_string().into(),
+      member_id: "member-a".to_string().into(),
+      lease_duration_ms: Some(100),
+      heartbeat_interval_ms: Some(50),
+      rebalance_interval_ms: Some(50),
+      ..Default::default()
+    },
+    Arc::clone(&store),
+  )
+  .unwrap();
+
+  coordinator
+    .rebalance(vec!["member-a".to_string()], vec![7], 1_000)
+    .await
+    .unwrap();
+  coordinator
+    .heartbeat_and_commit(1_010, &HashMap::from([(7_u32, 10_u64)]))
+    .await
+    .unwrap();
+
+  let report = coordinator
+    .rebalance(vec!["member-a".to_string()], vec![7], 1_020)
+    .await
+    .unwrap();
+
+  assert_eq!(report.owned_partitions, vec![7]);
+  assert_eq!(report.committed_cursors, HashMap::from([(7_u32, 10_u64)]));
+}
+
+#[tokio::test]
 async fn heartbeat_detects_fencing_by_new_generation() {
   let concrete_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
   let store: Arc<dyn ConsumerGroupLeaseStore> = concrete_store.clone();

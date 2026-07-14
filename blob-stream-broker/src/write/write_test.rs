@@ -12,7 +12,7 @@ use blob_stream_metadata_store::{
   MetadataStore,
   SegmentMetadata,
 };
-use blob_stream_types::{Compression, CompressionCodec, SeqRange, Window, new_record};
+use blob_stream_types::{CompressionCodec, SeqRange, Window, new_record};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -144,9 +144,7 @@ async fn buffers_until_size_rollover() -> Result<()> {
     time_provider.now().unix_timestamp_ms() / 1_000,
     config.window_size_seconds,
   );
-  let segments = metadata_store
-    .scan_window(&window.key("telemetry"), None)
-    .await?;
+  let segments = metadata_store.scan_window(&window.key("telemetry")).await?;
   assert!(segments.is_empty());
 
   let request = WriteRequest {
@@ -158,9 +156,7 @@ async fn buffers_until_size_rollover() -> Result<()> {
   engine.produce_batch(request).await?;
   first.await??;
 
-  let segments = metadata_store
-    .scan_window(&window.key("telemetry"), None)
-    .await?;
+  let segments = metadata_store.scan_window(&window.key("telemetry")).await?;
   assert_eq!(segments.len(), 1);
   assert_eq!(segments[0].record_count, 2);
   Ok(())
@@ -201,9 +197,7 @@ async fn flushes_on_time_rollover() -> Result<()> {
     time_provider.now().unix_timestamp_ms() / 1_000,
     config.window_size_seconds,
   );
-  let segments = metadata_store
-    .scan_window(&window.key("telemetry"), None)
-    .await?;
+  let segments = metadata_store.scan_window(&window.key("telemetry")).await?;
   assert_eq!(segments.len(), 1);
   Ok(())
 }
@@ -244,7 +238,6 @@ async fn writes_compressed_metadata() -> Result<()> {
   config.flush_max_bytes = 5;
   config.flush_max_delay_ms = 60_000;
   config.window_size_seconds = 60;
-  config.compression = Compression::zstd(1);
 
   let (engine, metadata_store) = make_engine(time_provider.clone(), config.clone())?;
 
@@ -260,9 +253,7 @@ async fn writes_compressed_metadata() -> Result<()> {
     time_provider.now().unix_timestamp_ms() / 1_000,
     config.window_size_seconds,
   );
-  let segments = metadata_store
-    .scan_window(&window.key("telemetry"), None)
-    .await?;
+  let segments = metadata_store.scan_window(&window.key("telemetry")).await?;
   assert_eq!(segments.len(), 1);
   assert_eq!(segments[0].compression.codec, CompressionCodec::Zstd);
 
@@ -283,7 +274,6 @@ impl MetadataStore for FailingMetadataStore {
   async fn scan_window(
     &self,
     _window: &blob_stream_types::TopicWindowKey,
-    _min_snowflake_id: Option<blob_stream_types::SnowflakeId>,
   ) -> Result<Vec<SegmentMetadata>> {
     Ok(Vec::new())
   }

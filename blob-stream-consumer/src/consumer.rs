@@ -10,6 +10,7 @@ use crate::config::{
 };
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
+use bd_server_stats::stats::Scope;
 use blob_stream_blob_store::{BlobStore, ByteRange};
 use blob_stream_metadata_store::MetadataStore;
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
@@ -24,11 +25,13 @@ use blob_stream_types::{
 };
 use futures::future::try_join_all;
 use log::trace;
+use prometheus::{Histogram, IntCounter};
 use protobuf::Message;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Instant;
 
 //
 // Scanning algorithm overview
@@ -135,6 +138,106 @@ pub struct ConsumerBatch {
 }
 
 //
+// ConsumerReaderMetrics
+//
+
+#[derive(Clone)]
+struct ConsumerReaderMetrics {
+  read_available_calls: IntCounter,
+  read_available_empty: IntCounter,
+  read_available_latency_seconds: Histogram,
+  metadata_scan_requests: IntCounter,
+  metadata_scan_segments: IntCounter,
+  metadata_scan_latency_seconds: Histogram,
+  metadata_batches_scanned: IntCounter,
+  metadata_batches_skipped_by_cursor: IntCounter,
+  blob_range_requests: IntCounter,
+  blob_range_bytes: IntCounter,
+  blob_range_latency_seconds: Histogram,
+  decompression_latency_seconds: Histogram,
+  protobuf_decode_latency_seconds: Histogram,
+  batches_read: IntCounter,
+  records_read: IntCounter,
+  record_payload_bytes: IntCounter,
+}
+
+impl ConsumerReaderMetrics {
+  fn new(scope: &Scope) -> Self {
+    let scope = scope.scope("reader");
+    Self {
+      read_available_calls: scope.counter("read_available_calls"),
+      read_available_empty: scope.counter("read_available_empty"),
+      read_available_latency_seconds: scope.histogram("read_available_latency_seconds"),
+      metadata_scan_requests: scope.counter("metadata_scan_requests"),
+      metadata_scan_segments: scope.counter("metadata_scan_segments"),
+      metadata_scan_latency_seconds: scope.histogram("metadata_scan_latency_seconds"),
+      metadata_batches_scanned: scope.counter("metadata_batches_scanned"),
+      metadata_batches_skipped_by_cursor: scope.counter("metadata_batches_skipped_by_cursor"),
+      blob_range_requests: scope.counter("blob_range_requests"),
+      blob_range_bytes: scope.counter("blob_range_bytes"),
+      blob_range_latency_seconds: scope.histogram("blob_range_latency_seconds"),
+      decompression_latency_seconds: scope.histogram("decompression_latency_seconds"),
+      protobuf_decode_latency_seconds: scope.histogram("protobuf_decode_latency_seconds"),
+      batches_read: scope.counter("batches_read"),
+      records_read: scope.counter("records_read"),
+      record_payload_bytes: scope.counter("record_payload_bytes"),
+    }
+  }
+
+  fn record_metadata_scan(&self, started_at: Instant, segment_count: usize) {
+    self.metadata_scan_requests.inc();
+    self
+      .metadata_scan_segments
+      .inc_by(u64::try_from(segment_count).unwrap_or(u64::MAX));
+    self
+      .metadata_scan_latency_seconds
+      .observe(started_at.elapsed().as_secs_f64());
+  }
+
+  fn record_blob_range(&self, started_at: Instant, bytes: usize) {
+    self.blob_range_requests.inc();
+    self
+      .blob_range_bytes
+      .inc_by(u64::try_from(bytes).unwrap_or(u64::MAX));
+    self
+      .blob_range_latency_seconds
+      .observe(started_at.elapsed().as_secs_f64());
+  }
+
+  fn record_batch(&self, record_count: usize, payload_bytes: usize) {
+    self.batches_read.inc();
+    self
+      .records_read
+      .inc_by(u64::try_from(record_count).unwrap_or(u64::MAX));
+    self
+      .record_payload_bytes
+      .inc_by(u64::try_from(payload_bytes).unwrap_or(u64::MAX));
+  }
+
+  fn record_read_available(
+    &self,
+    started_at: Instant,
+    batch_count: usize,
+    metadata_batches_scanned: usize,
+    metadata_batches_skipped_by_cursor: usize,
+  ) {
+    self.read_available_calls.inc();
+    if batch_count == 0 {
+      self.read_available_empty.inc();
+    }
+    self
+      .metadata_batches_scanned
+      .inc_by(u64::try_from(metadata_batches_scanned).unwrap_or(u64::MAX));
+    self
+      .metadata_batches_skipped_by_cursor
+      .inc_by(u64::try_from(metadata_batches_skipped_by_cursor).unwrap_or(u64::MAX));
+    self
+      .read_available_latency_seconds
+      .observe(started_at.elapsed().as_secs_f64());
+  }
+}
+
+//
 // ConsumerReader
 //
 
@@ -160,6 +263,7 @@ pub struct ConsumerReaderImpl {
   metadata_store: Arc<dyn MetadataStore>,
   assigned_virtual_partitions: Vec<VirtualPartitionId>,
   cursors: HashMap<VirtualPartitionId, u64>,
+  metrics: ConsumerReaderMetrics,
 }
 
 impl ConsumerReaderImpl {
@@ -170,6 +274,7 @@ impl ConsumerReaderImpl {
     initial_cursors: HashMap<VirtualPartitionId, u64>,
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
+    metrics_scope: &Scope,
   ) -> Result<Self> {
     validate_read_config(&config)?;
     trace!(
@@ -187,6 +292,7 @@ impl ConsumerReaderImpl {
       config,
       blob_store,
       metadata_store,
+      metrics: ConsumerReaderMetrics::new(metrics_scope),
     })
   }
 
@@ -234,6 +340,7 @@ impl ConsumerReaderImpl {
       batch_metadata.seq_range.end
     );
     // Pull only the referenced byte range for this batch to avoid downloading full segments.
+    let blob_read_started_at = Instant::now();
     let payload = self
       .blob_store
       .get_range(
@@ -244,17 +351,32 @@ impl ConsumerReaderImpl {
         },
       )
       .await?;
+    self
+      .metrics
+      .record_blob_range(blob_read_started_at, payload.len());
 
     // Decode in two stages: transport/storage compression first, then logical RecordBatch format.
+    let decompression_started_at = Instant::now();
     let decoded: Cow<'_, [u8]> = match batch_metadata.compression.codec {
       CompressionCodec::None => Cow::Borrowed(payload.as_ref()),
       CompressionCodec::Zstd => zstd::stream::decode_all(Cursor::new(payload.as_ref()))
         .map(Cow::Owned)
         .map_err(|error| anyhow!("failed to decode zstd batch: {error}"))?,
     };
+    if matches!(batch_metadata.compression.codec, CompressionCodec::Zstd) {
+      self
+        .metrics
+        .decompression_latency_seconds
+        .observe(decompression_started_at.elapsed().as_secs_f64());
+    }
 
+    let protobuf_decode_started_at = Instant::now();
     let record_batch = StoredRecordBatch::parse_from_bytes(decoded.as_ref())
       .map_err(|error| anyhow!("failed to decode record batch protobuf: {error}"))?;
+    self
+      .metrics
+      .protobuf_decode_latency_seconds
+      .observe(protobuf_decode_started_at.elapsed().as_secs_f64());
 
     // Defensive integrity check: segment index entry and decoded payload must agree on partition.
     ensure!(
@@ -263,6 +385,13 @@ impl ConsumerReaderImpl {
       record_batch.virtual_partition_id,
       virtual_partition_id
     );
+
+    let payload_bytes = record_batch.records.iter().fold(0_usize, |total, record| {
+      total.saturating_add(record.payload.len())
+    });
+    self
+      .metrics
+      .record_batch(record_batch.records.len(), payload_bytes);
 
     Ok(ConsumerBatch {
       virtual_partition_id,
@@ -301,6 +430,7 @@ impl ConsumerReaderImpl {
 #[async_trait]
 impl ConsumerReader for ConsumerReaderImpl {
   async fn read_available(&mut self, now_unix_seconds: i64) -> Result<Vec<ConsumerBatch>> {
+    let read_started_at = Instant::now();
     trace!(
       "consumer read_available start: topic={}, assigned_partitions={}",
       self.config.topic,
@@ -308,13 +438,18 @@ impl ConsumerReader for ConsumerReaderImpl {
     );
     // Output contains only newly consumable batches according to per-partition cursor state.
     let mut output = Vec::new();
+    let mut metadata_batches_scanned = 0_usize;
+    let mut metadata_batches_skipped_by_cursor = 0_usize;
 
     // Iterate through the lookback scan region to catch both current and delayed metadata.
     let windows = self.scan_windows(now_unix_seconds);
     let scan_futures = windows.iter().map(|window| {
       let metadata_store = Arc::clone(&self.metadata_store);
+      let metrics = self.metrics.clone();
       async move {
-        let segments = metadata_store.scan_window(window, None).await?;
+        let scan_started_at = Instant::now();
+        let segments = metadata_store.scan_window(window).await?;
+        metrics.record_metadata_scan(scan_started_at, segments.len());
         Ok::<_, anyhow::Error>((window, segments))
       }
     });
@@ -340,6 +475,22 @@ impl ConsumerReader for ConsumerReaderImpl {
             continue;
           };
 
+          metadata_batches_scanned =
+            metadata_batches_scanned.saturating_add(partition_batches.len());
+          let current_cursor = self.cursors.get(partition_id).copied();
+
+          // Avoid sorting historical batches when this partition has already consumed all of
+          // them. Any late batch beyond the cursor still uses the normal sorted path below.
+          if current_cursor.is_some_and(|cursor| {
+            partition_batches
+              .iter()
+              .all(|batch| batch.seq_range.end <= cursor)
+          }) {
+            metadata_batches_skipped_by_cursor =
+              metadata_batches_skipped_by_cursor.saturating_add(partition_batches.len());
+            continue;
+          }
+
           // Metadata scans are unordered and can arrive late. Sorting by seq_start keeps
           // processing deterministic while cursor checks prevent replay.
           let mut sorted_batches = partition_batches.iter().collect::<Vec<_>>();
@@ -356,6 +507,8 @@ impl ConsumerReader for ConsumerReaderImpl {
                 batch_metadata.seq_range.end,
                 current_cursor.unwrap_or(0)
               );
+              metadata_batches_skipped_by_cursor =
+                metadata_batches_skipped_by_cursor.saturating_add(1);
               continue;
             }
 
@@ -384,9 +537,19 @@ impl ConsumerReader for ConsumerReaderImpl {
     }
 
     trace!(
-      "consumer read_available complete: topic={}, output_batches={}",
+      "consumer read_available complete: topic={}, output_batches={}, \
+       metadata_batches_scanned={}, metadata_batches_skipped_by_cursor={}",
       self.config.topic,
-      output.len()
+      output.len(),
+      metadata_batches_scanned,
+      metadata_batches_skipped_by_cursor
+    );
+
+    self.metrics.record_read_available(
+      read_started_at,
+      output.len(),
+      metadata_batches_scanned,
+      metadata_batches_skipped_by_cursor,
     );
 
     Ok(output)
