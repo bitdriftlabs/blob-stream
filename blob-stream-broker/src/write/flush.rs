@@ -204,37 +204,33 @@ impl FlushContext {
     Ok((payload.freeze(), envelope))
   }
 
-  pub(super) async fn flush_plans(
+  pub(super) async fn flush_plan(
     &self,
-    plans: Vec<FlushPlan>,
+    plan: FlushPlan,
     now: OffsetDateTime,
   ) -> Result<(), WriteError> {
-    trace!("flush_plans invoked: plans={plans}", plans = plans.len());
-    for plan in plans {
-      let topic = plan.topic.clone();
-      let (payload, envelope) = self.build_segment(&topic, plan, now)?;
-      let metadata = envelope.into_metadata();
-      let payload_bytes = payload.len();
-      let record_count = metadata.record_count;
-      let partition_count = metadata.segment_index.len();
+    let topic = plan.topic.clone();
+    let (payload, envelope) = self.build_segment(&topic, plan, now)?;
+    let metadata = envelope.into_metadata();
+    let payload_bytes = payload.len();
+    let record_count = metadata.record_count;
+    let partition_count = metadata.segment_index.len();
 
-      self
-        .blob_store
-        .put(&metadata.blob_key, payload)
-        .await
-        .context("write segment blob")?;
-      self
-        .metadata_store
-        .write_segment(metadata)
-        .await
-        .context("write segment metadata")?;
+    self
+      .blob_store
+      .put(&metadata.blob_key, payload)
+      .await
+      .context("write segment blob")?;
+    self
+      .metadata_store
+      .write_segment(metadata)
+      .await
+      .context("write segment metadata")?;
 
-      debug!(
-        "flush persisted segment: topic={topic}, partitions={partition_count}, \
-         records={record_count}, bytes={payload_bytes}"
-      );
-    }
-
+    debug!(
+      "flush persisted segment: topic={topic}, partitions={partition_count}, \
+       records={record_count}, bytes={payload_bytes}"
+    );
     Ok(())
   }
 

@@ -1448,6 +1448,7 @@ dependencies = [
  "blob-stream-types",
  "bytes",
  "clap",
+ "futures",
  "hostname",
  "http 1.4.2",
  "log",

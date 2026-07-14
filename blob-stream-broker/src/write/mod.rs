@@ -40,17 +40,20 @@ use blob_stream_types::{
   format_unix_timestamp_ms,
 };
 pub use config::{TopicInfo, WriteConfig, build_write_engine};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use log::{debug, trace};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::ext::NumericalDuration;
-use tokio::sync::{Mutex, oneshot, watch};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
+const MAX_IN_FLIGHT_FLUSH_PLANS: usize = 4;
 type FlushCompletion = oneshot::Sender<Result<(), String>>;
 
 //
@@ -323,6 +326,7 @@ pub struct WriteEngineImpl {
   time_provider: Arc<dyn TimeProvider>,
   metrics: WriteMetrics,
   state: Arc<Mutex<WriteState>>,
+  flush_permits: Arc<Semaphore>,
   lease_assignment_shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -410,6 +414,7 @@ impl WriteEngineImpl {
       time_provider,
       metrics: WriteMetrics::new(metrics_scope),
       state,
+      flush_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_FLUSH_PLANS)),
       lease_assignment_shutdown_tx: None,
     };
 
@@ -504,37 +509,67 @@ impl WriteEngineImpl {
     let state = Arc::clone(&self.state);
     let time_provider = Arc::clone(&self.time_provider);
     let metrics = self.metrics.clone();
+    let flush_permits = Arc::clone(&self.flush_permits);
 
     tokio::spawn(async move {
       let mut ticker = tokio::time::interval(interval);
+      let mut pending_plans = VecDeque::new();
+      let mut flushes = FuturesUnordered::new();
       loop {
-        // Time-based flushing is driven here. Even if no new writes arrive, this loop wakes up
-        // every flush_max_delay_ms and asks state for anything that has waited long enough.
-        ticker.tick().await;
-        let now = time_provider.now();
-        let now_ts_ms = now.unix_timestamp_ms();
-        let plans = {
-          let mut guard = state.lock().await;
-          // Build flush plans from all topic/partition buffers that are currently eligible under
-          // size/time rules. This call drains eligible buffered batches from in-memory state.
-          guard.collect_flush_plans(now_ts_ms, flush_context.config())
-        };
-
-        if plans.is_empty() {
-          continue;
+        while let Some((plan, now)) = pending_plans.pop_front() {
+          let permit = match Arc::clone(&flush_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+              pending_plans.push_front((plan, now));
+              break;
+            },
+            Err(tokio::sync::TryAcquireError::Closed) => {
+              flush_plan_and_notify(
+                &flush_context,
+                plan,
+                now,
+                &metrics,
+                Err(WriteError::Internal(anyhow!("flush scheduler stopped"))),
+              )
+              .await;
+              while let Some((plan, now)) = pending_plans.pop_front() {
+                flush_plan_and_notify(
+                  &flush_context,
+                  plan,
+                  now,
+                  &metrics,
+                  Err(WriteError::Internal(anyhow!("flush scheduler stopped"))),
+                )
+                .await;
+              }
+              return;
+            },
+          };
+          let flush_context = flush_context.clone();
+          let metrics = metrics.clone();
+          flushes.push(async move {
+            flush_plan_and_notify(&flush_context, plan, now, &metrics, Ok(permit)).await;
+          });
         }
 
-        metrics.record_flush_plan_summary(&plans);
-        let flush_started = Instant::now();
+        tokio::select! {
+          // Time-based flushing is driven here. Persisting prior plans must not stop the timer
+          // from collecting a later buffer epoch that has become eligible.
+          _ = ticker.tick() => {
+            let now = time_provider.now();
+            let now_ts_ms = now.unix_timestamp_ms();
+            let plans = {
+              let mut guard = state.lock().await;
+              guard.collect_flush_plans(now_ts_ms, flush_context.config())
+            };
 
-        if let Err(error) = flush_plans_and_notify(&flush_context, plans, now).await {
-          metrics.flush_failures_total.inc();
-          warn_every!(15.seconds(), "write flush failed: {error}");
+            if !plans.is_empty() {
+              metrics.record_flush_plan_summary(&plans);
+              pending_plans.extend(plans.into_iter().map(|plan| (plan, now)));
+            }
+          },
+          Some(()) = flushes.next(), if !flushes.is_empty() => {},
         }
-
-        metrics
-          .flush_latency_seconds
-          .observe(flush_started.elapsed().as_secs_f64());
       }
     });
   }
@@ -663,24 +698,14 @@ impl WriteEngine for WriteEngineImpl {
 
     if !plans.is_empty() {
       self.metrics.record_flush_plan_summary(&plans);
-      let flush_started = Instant::now();
-      if let Err(error) = flush_plans_and_notify(&self.flush_context, plans, now).await {
-        self.metrics.flush_failures_total.inc();
-        self
-          .metrics
-          .flush_latency_seconds
-          .observe(flush_started.elapsed().as_secs_f64());
-        self.metrics.record_produce_error(&error);
-        self
-          .metrics
-          .produce_latency_seconds
-          .observe(started.elapsed().as_secs_f64());
-        return Err(error);
-      }
-      self
-        .metrics
-        .flush_latency_seconds
-        .observe(flush_started.elapsed().as_secs_f64());
+      flush_plans_and_notify(
+        &self.flush_context,
+        plans,
+        now,
+        &self.metrics,
+        &self.flush_permits,
+      )
+      .await;
 
       debug!(
         "broker flushed buffered write data inline: topic={}, virtual_partition_id={}",
@@ -900,30 +925,69 @@ impl WriteEngine for WriteEngineImpl {
 
 async fn flush_plans_and_notify(
   flush_context: &FlushContext,
-  mut plans: Vec<FlushPlan>,
+  plans: Vec<FlushPlan>,
   now: OffsetDateTime,
-) -> Result<(), WriteError> {
+  metrics: &WriteMetrics,
+  flush_permits: &Arc<Semaphore>,
+) {
+  let mut flushes = FuturesUnordered::new();
+  for plan in plans {
+    let flush_context = flush_context.clone();
+    let metrics = metrics.clone();
+    let flush_permits = Arc::clone(flush_permits);
+    flushes.push(async move {
+      let permit = flush_permits
+        .acquire_owned()
+        .await
+        .map_err(|_| WriteError::Internal(anyhow!("flush scheduler stopped")));
+      flush_plan_and_notify(&flush_context, plan, now, &metrics, permit).await;
+    });
+  }
+
+  // All plans are dispatched before this waits, so a slow durable write cannot serialize another
+  // plan in the same inline flush.
+  while flushes.next().await.is_some() {}
+}
+
+async fn flush_plan_and_notify(
+  flush_context: &FlushContext,
+  mut plan: FlushPlan,
+  now: OffsetDateTime,
+  metrics: &WriteMetrics,
+  permit: Result<OwnedSemaphorePermit, WriteError>,
+) {
   let mut completions = Vec::new();
-  for plan in &mut plans {
-    for partition in &mut plan.partitions {
-      for batch in &mut partition.batches {
-        if let Some(completion) = batch.completion.take() {
-          completions.push(completion);
-        }
+  for partition in &mut plan.partitions {
+    for batch in &mut partition.batches {
+      if let Some(completion) = batch.completion.take() {
+        completions.push(completion);
       }
     }
   }
 
-  let result = flush_context.flush_plans(plans, now).await;
+  let result = match permit {
+    Ok(_permit) => {
+      let flush_started = Instant::now();
+      let result = flush_context.flush_plan(plan, now).await;
+      if result.is_err() {
+        metrics.flush_failures_total.inc();
+      }
+      metrics
+        .flush_latency_seconds
+        .observe(flush_started.elapsed().as_secs_f64());
+      result
+    },
+    Err(error) => {
+      metrics.flush_failures_total.inc();
+      Err(error)
+    },
+  };
   let completion_result = result
     .as_ref()
     .map_or_else(|error| Err(error.to_string()), |_ok| Ok(()));
-
   for completion in completions {
     let _ignored = completion.send(completion_result.clone());
   }
-
-  result
 }
 
 //

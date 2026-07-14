@@ -5,7 +5,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bd_server_stats::stats::{Collector, Scope};
 use bd_time::{OffsetDateTimeExt, TestTimeProvider, TimeProvider};
-use blob_stream_blob_store::InMemoryBlobStore;
+use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
 use blob_stream_metadata_store::{
   InMemoryMetadataStore,
   InMemoryProducerPartitionLeaseStore,
@@ -15,11 +15,65 @@ use blob_stream_metadata_store::{
   SegmentMetadata,
 };
 use blob_stream_types::{CompressionCodec, SeqRange, Window, new_record};
+use bytes::Bytes;
 use serde_json::to_value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 use time::{Duration as TimeDuration, OffsetDateTime};
+use tokio::sync::{Semaphore, mpsc};
+
+struct GatedBlobStore {
+  entered_tx: mpsc::UnboundedSender<String>,
+  release_first: Arc<Semaphore>,
+  first_write: AtomicBool,
+}
+
+struct FailsTopicMetadataStore {
+  failed_topic: String,
+  inner: Arc<InMemoryMetadataStore>,
+}
+
+#[async_trait]
+impl MetadataStore for FailsTopicMetadataStore {
+  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
+    if metadata.window.topic == self.failed_topic {
+      return Err(anyhow::anyhow!("metadata write failed"));
+    }
+    self.inner.write_segment(metadata).await
+  }
+
+  async fn scan_window(
+    &self,
+    window: &blob_stream_types::TopicWindowKey,
+  ) -> Result<Vec<SegmentMetadata>> {
+    self.inner.scan_window(window).await
+  }
+}
+
+#[async_trait]
+impl BlobStore for GatedBlobStore {
+  async fn put(&self, key: &BlobKey, _payload: Bytes) -> Result<()> {
+    self
+      .entered_tx
+      .send(key.as_str().to_string())
+      .map_err(|_| anyhow::anyhow!("test receiver dropped"))?;
+    if self.first_write.swap(false, Ordering::SeqCst) {
+      self
+        .release_first
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("test gate closed"))?
+        .forget();
+    }
+    Ok(())
+  }
+
+  async fn get_range(&self, _key: &BlobKey, _range: ByteRange) -> Result<Bytes> {
+    Err(anyhow::anyhow!("reads are not used by this test"))
+  }
+}
 
 fn time_from_ms(ms: i64) -> OffsetDateTime {
   OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
@@ -87,6 +141,16 @@ fn make_engine_with_lease_store_and_scope(
   )?;
 
   Ok((Arc::new(engine), metadata_store, lease_store))
+}
+
+async fn receive_blob_write(receiver: &mut mpsc::UnboundedReceiver<String>) -> String {
+  for _ in 0 .. 100 {
+    if let Ok(key) = receiver.try_recv() {
+      return key;
+    }
+    tokio::task::yield_now().await;
+  }
+  panic!("expected blob write did not begin");
 }
 
 #[tokio::test]
@@ -323,6 +387,248 @@ async fn flushes_on_time_rollover() -> Result<()> {
   );
   let segments = metadata_store.scan_window(&window.key("telemetry")).await?;
   assert_eq!(segments.len(), 1);
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1_024;
+  config.flush_max_delay_ms = 10;
+
+  let mut topics = HashMap::new();
+  for topic in ["first", "second"] {
+    topics.insert(
+      topic.to_string(),
+      TopicInfo {
+        name: topic.to_string(),
+        partition_count: 1,
+        num_writers: 1,
+        retention_days: 7,
+      },
+    );
+  }
+
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release_first = Arc::new(Semaphore::new(0));
+  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+    config.clone(),
+    topics,
+    Arc::new(GatedBlobStore {
+      entered_tx,
+      release_first: Arc::clone(&release_first),
+      first_write: AtomicBool::new(true),
+    }),
+    Arc::new(InMemoryMetadataStore::new()),
+    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+    "test-node".to_string(),
+    None,
+    time_provider.clone(),
+    &metrics_scope(),
+  )?);
+
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "first".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  tokio::task::yield_now().await;
+  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
+  tokio::time::advance(StdDuration::from_millis(
+    config.flush_max_delay_ms.cast_unsigned(),
+  ))
+  .await;
+  assert!(receive_blob_write(&mut entered_rx).await.contains("first/"));
+
+  let second_engine = Arc::clone(&engine);
+  let second = tokio::spawn(async move {
+    second_engine
+      .produce_batch(WriteRequest {
+        topic: "second".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![2], 20)],
+      })
+      .await
+  });
+  tokio::task::yield_now().await;
+  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
+  tokio::time::advance(StdDuration::from_millis(
+    config.flush_max_delay_ms.cast_unsigned(),
+  ))
+  .await;
+
+  assert!(
+    receive_blob_write(&mut entered_rx)
+      .await
+      .contains("second/")
+  );
+  assert!(!first.is_finished());
+  assert!(second.is_finished());
+
+  release_first.add_permits(1);
+  first.await??;
+  second.await??;
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn inline_flush_dispatches_all_ready_plans_before_waiting() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1_024;
+  config.flush_max_delay_ms = 10;
+
+  let mut topics = HashMap::new();
+  for topic in ["first", "second"] {
+    topics.insert(
+      topic.to_string(),
+      TopicInfo {
+        name: topic.to_string(),
+        partition_count: 1,
+        num_writers: 1,
+        retention_days: 7,
+      },
+    );
+  }
+
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release_first = Arc::new(Semaphore::new(0));
+  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+    config.clone(),
+    topics,
+    Arc::new(GatedBlobStore {
+      entered_tx,
+      release_first: Arc::clone(&release_first),
+      first_write: AtomicBool::new(true),
+    }),
+    Arc::new(InMemoryMetadataStore::new()),
+    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+    "test-node".to_string(),
+    None,
+    time_provider.clone(),
+    &metrics_scope(),
+  )?);
+
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "first".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  let second_engine = Arc::clone(&engine);
+  let second = tokio::spawn(async move {
+    second_engine
+      .produce_batch(WriteRequest {
+        topic: "second".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![2], 20)],
+      })
+      .await
+  });
+  tokio::task::yield_now().await;
+  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
+
+  let third_engine = Arc::clone(&engine);
+  let third = tokio::spawn(async move {
+    third_engine
+      .produce_batch(WriteRequest {
+        topic: "first".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![3], 30)],
+      })
+      .await
+  });
+
+  let first_blob_key = receive_blob_write(&mut entered_rx).await;
+  let second_blob_key = receive_blob_write(&mut entered_rx).await;
+  assert_ne!(first_blob_key, second_blob_key);
+  assert!(!third.is_finished());
+
+  release_first.add_permits(1);
+  first.await??;
+  second.await??;
+  third.await??;
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1_024;
+  config.flush_max_delay_ms = 10;
+
+  let mut topics = HashMap::new();
+  for topic in ["first", "second"] {
+    topics.insert(
+      topic.to_string(),
+      TopicInfo {
+        name: topic.to_string(),
+        partition_count: 1,
+        num_writers: 1,
+        retention_days: 7,
+      },
+    );
+  }
+
+  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+    config.clone(),
+    topics,
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(FailsTopicMetadataStore {
+      failed_topic: "second".to_string(),
+      inner: Arc::new(InMemoryMetadataStore::new()),
+    }),
+    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+    "test-node".to_string(),
+    None,
+    time_provider.clone(),
+    &metrics_scope(),
+  )?);
+
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "first".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  let second_engine = Arc::clone(&engine);
+  let second = tokio::spawn(async move {
+    second_engine
+      .produce_batch(WriteRequest {
+        topic: "second".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![2], 20)],
+      })
+      .await
+  });
+
+  tokio::task::yield_now().await;
+  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
+  tokio::time::advance(StdDuration::from_millis(
+    config.flush_max_delay_ms.cast_unsigned(),
+  ))
+  .await;
+
+  first.await??;
+  assert!(second.await?.is_err());
   Ok(())
 }
 

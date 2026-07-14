@@ -581,31 +581,37 @@ impl ProducerClientImpl {
     tokio::spawn(async move {
       let tick_ms = (producer_flush_max_delay_ms(&config) / 2).max(10);
       let mut ticker = interval(Duration::from_millis(tick_ms));
+      let mut dispatches = FuturesUnordered::new();
 
       loop {
-        ticker.tick().await;
-        let batches = {
-          let mut guard = state.lock().await;
-          guard.collect_ready_batches(producer_flush_max_delay_ms(&config))
-        };
+        tokio::select! {
+          _ = ticker.tick() => {
+            let batches = {
+              let mut guard = state.lock().await;
+              guard.collect_ready_batches(producer_flush_max_delay_ms(&config))
+            };
 
-        if !batches.is_empty() {
-          trace!(
-            "producer flush loop found {} ready batch(es)",
-            batches.len()
-          );
+            if !batches.is_empty() {
+              trace!(
+                "producer flush loop found {} ready batch(es)",
+                batches.len()
+              );
+            }
+
+            for batch in batches {
+              dispatches.push(dispatch_batch_and_notify(
+                &config,
+                &topics,
+                &membership_rx,
+                &transport,
+                &metrics,
+                &dispatch_permits,
+                batch,
+              ));
+            }
+          },
+          Some(()) = dispatches.next(), if !dispatches.is_empty() => {},
         }
-
-        dispatch_batches(
-          batches,
-          &config,
-          &topics,
-          &membership_rx,
-          &transport,
-          &metrics,
-          &dispatch_permits,
-        )
-        .await;
       }
     })
   }
@@ -667,7 +673,7 @@ impl ProducerClient for ProducerClientImpl {
         batch.virtual_partition_id,
         batch.records.len()
       );
-      dispatch_batch(
+      dispatch_batch_and_notify(
         &self.config,
         &self.topics,
         &self.membership_rx,
@@ -676,7 +682,7 @@ impl ProducerClient for ProducerClientImpl {
         &self.dispatch_permits,
         batch,
       )
-      .await?;
+      .await;
     }
 
     rx.await
@@ -689,19 +695,32 @@ impl ProducerClient for ProducerClientImpl {
       guard.drain_all_batches()
     };
 
-    dispatch_batches(
-      batches,
-      &self.config,
-      &self.topics,
-      &self.membership_rx,
-      &self.transport,
-      &self.metrics,
-      &self.dispatch_permits,
-    )
-    .await
-    .into_iter()
-    .find_map(Result::err)
-    .map_or(Ok(()), Err)
+    let mut dispatches = FuturesUnordered::new();
+    let mut completions = Vec::with_capacity(batches.len());
+    for mut batch in batches {
+      let (completion_tx, completion_rx) = oneshot::channel();
+      batch.waiters.push(completion_tx);
+      dispatches.push(dispatch_batch_and_notify(
+        &self.config,
+        &self.topics,
+        &self.membership_rx,
+        &self.transport,
+        &self.metrics,
+        &self.dispatch_permits,
+        batch,
+      ));
+      completions.push(completion_rx);
+    }
+
+    // Start every batch before waiting for the notifications that deliver their results.
+    while dispatches.next().await.is_some() {}
+
+    for completion in completions {
+      completion
+        .await
+        .map_or(Err(ProducerError::Shutdown), |result| result)?;
+    }
+    Ok(())
   }
 
   fn diagnostics(&self) -> Option<ProducerDiagnostics> {
@@ -723,36 +742,7 @@ fn notify_waiters(
   }
 }
 
-async fn dispatch_batches(
-  batches: Vec<BufferedBatch>,
-  config: &ProducerConfig,
-  topics: &HashMap<String, ProducerTopicConfig>,
-  membership_rx: &watch::Receiver<BrokerMembership>,
-  transport: &Arc<dyn BrokerTransport>,
-  metrics: &Arc<ProducerMetrics>,
-  dispatch_permits: &Arc<Semaphore>,
-) -> Vec<Result<ProducerAck, ProducerError>> {
-  let mut dispatches = FuturesUnordered::new();
-  for batch in batches {
-    dispatches.push(dispatch_batch(
-      config,
-      topics,
-      membership_rx,
-      transport,
-      metrics,
-      dispatch_permits,
-      batch,
-    ));
-  }
-
-  let mut results = Vec::new();
-  while let Some(result) = dispatches.next().await {
-    results.push(result);
-  }
-  results
-}
-
-async fn dispatch_batch(
+async fn dispatch_batch_and_notify(
   config: &ProducerConfig,
   topics: &HashMap<String, ProducerTopicConfig>,
   membership_rx: &watch::Receiver<BrokerMembership>,
@@ -760,23 +750,22 @@ async fn dispatch_batch(
   metrics: &Arc<ProducerMetrics>,
   dispatch_permits: &Arc<Semaphore>,
   batch: BufferedBatch,
-) -> Result<ProducerAck, ProducerError> {
-  let _permit = dispatch_permits
-    .clone()
-    .acquire_owned()
-    .await
-    .map_err(|_| ProducerError::Shutdown)?;
-  let result = send_batch_with_retry(
-    config,
-    topics,
-    membership_rx,
-    transport.as_ref(),
-    &batch,
-    metrics,
-  )
-  .await;
+) {
+  let result = match dispatch_permits.clone().acquire_owned().await {
+    Ok(_permit) => {
+      send_batch_with_retry(
+        config,
+        topics,
+        membership_rx,
+        transport.as_ref(),
+        &batch,
+        metrics,
+      )
+      .await
+    },
+    Err(_) => Err(ProducerError::Shutdown),
+  };
   notify_waiters(batch.waiters, &result);
-  result
 }
 
 fn broker_assignment(
