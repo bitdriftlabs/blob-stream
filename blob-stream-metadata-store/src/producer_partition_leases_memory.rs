@@ -37,6 +37,14 @@ impl InMemoryProducerPartitionLeaseStore {
 
 #[async_trait]
 impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
+  async fn get_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+  ) -> Result<Option<ProducerPartitionLease>> {
+    let guard = self.leases.read().await;
+    Ok(guard.get(key).map(|state| state.to_lease(key.clone())))
+  }
+
   async fn acquire_lease(
     &self,
     key: ProducerPartitionLeaseKey,
@@ -45,8 +53,8 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome> {
     trace!(
-      "producer lease(memory) acquire: topic={}, writer_id={}, partition={}, holder_id={}",
-      key.topic, key.writer_id, key.virtual_partition_id, holder_id
+      "producer lease(memory) acquire: topic={}, partition={}, holder_id={}",
+      key.topic, key.virtual_partition_id, holder_id
     );
     let mut guard = self.leases.write().await;
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
@@ -84,8 +92,8 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     lease_duration_ms: i64,
   ) -> Result<LeaseHeartbeatOutcome> {
     trace!(
-      "producer lease(memory) heartbeat: topic={}, writer_id={}, partition={}, holder_id={}",
-      key.topic, key.writer_id, key.virtual_partition_id, holder_id
+      "producer lease(memory) heartbeat: topic={}, partition={}, holder_id={}",
+      key.topic, key.virtual_partition_id, holder_id
     );
     let mut guard = self.leases.write().await;
     let Some(state) = guard.get_mut(key) else {
@@ -114,8 +122,8 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
     trace!(
-      "producer lease(memory) reserve: topic={}, writer_id={}, partition={}, holder_id={}, size={}",
-      key.topic, key.writer_id, key.virtual_partition_id, holder_id, reservation_size
+      "producer lease(memory) reserve: topic={}, partition={}, holder_id={}, size={}",
+      key.topic, key.virtual_partition_id, holder_id, reservation_size
     );
     if reservation_size == 0 {
       return Err(anyhow!("reservation_size must be greater than zero"));
@@ -152,16 +160,15 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     now_ts_ms: i64,
   ) -> Result<LeaseReleaseOutcome> {
     trace!(
-      "producer lease(memory) release: topic={}, writer_id={}, partition={}, holder_id={}",
-      key.topic, key.writer_id, key.virtual_partition_id, holder_id
+      "producer lease(memory) release: topic={}, partition={}, holder_id={}",
+      key.topic, key.virtual_partition_id, holder_id
     );
     let mut guard = self.leases.write().await;
-    let Some(state) = guard.get(key).cloned() else {
+    let Some(mut state) = guard.get(key).cloned() else {
       return Ok(LeaseReleaseOutcome::Expired);
     };
 
     if state.is_expired(now_ts_ms) {
-      guard.remove(key);
       return Ok(LeaseReleaseOutcome::Expired);
     }
 
@@ -171,7 +178,8 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       ));
     }
 
-    guard.remove(key);
+    state.lease_expiration_ts_ms = now_ts_ms;
+    guard.insert(key.clone(), state);
     Ok(LeaseReleaseOutcome::Released)
   }
 }

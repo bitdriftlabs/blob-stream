@@ -34,6 +34,9 @@ Delivery semantics are at-least-once. Duplicate records are possible on retries.
 - Broker flushes compressed segment blobs and writes segment metadata indexes.
 - Consumer scans metadata windows, fetches blob byte ranges, decodes records, and commits cursors.
 
+For the implementation-backed architecture, correctness boundaries, and data-flow details, see
+[`DESIGN.md`](DESIGN.md). This README focuses on deployment and operator responsibilities.
+
 For build, test, local docs preview, and developer workflows, see `DEVELOPMENT.md`.
 
 ## Broker service setup
@@ -107,6 +110,9 @@ Their configuration is defined by
 `TopicConfig` for a topic identical across the broker, every producer, and every consumer:
 `name`, `partition_count`, `num_writers`, and retention are a shared contract. A producer's
 `writer_id` must be in `[0, num_writers)`; deployments with one writer use `writer_id: 0`.
+A broker deployment must also explicitly configure the same local `writer_id`. Its discovery
+configuration lists only brokers in that local writer/AZ domain; other writer IDs are not routing
+or failover targets.
 
 ### Producers
 
@@ -165,11 +171,11 @@ Purpose:
 - Lease fencing and sequence reservation for broker writes.
 
 Keys:
-- Partition key: `pk` = `"<topic>#<writer_id>#<virtual_partition_id>"`
+- Partition key: `pk` = `"<topic>#<virtual_partition_id>"`
 
 Representative attributes:
-- `holder_id`, `lease_expiration_ts_ms`, `max_allocated_seq`, `topic`, `writer_id`,
-  `virtual_partition_id`, `ttl_epoch_seconds`
+- `holder_id`, `lease_expiration_ts_ms`, `max_allocated_seq`, `topic`, `virtual_partition_id`,
+  `ttl_epoch_seconds`
 
 ### 3) `consumer_group_leases`
 
@@ -199,7 +205,7 @@ Representative attributes:
 ### Provisioning note
 
 Current implementation uses the 4 logical Dynamo data domains listed above (`blob_segments`,
-`producer_partition_leases`, a`consumer_group_leases`, `consumer_group_membership`). Configure
+`producer_partition_leases`, `consumer_group_leases`, `consumer_group_membership`). Configure
 explicit table names in `metadata_store.dynamo`:
 - `segment_metadata_table_name`
 - `producer_partition_lease_table_name`

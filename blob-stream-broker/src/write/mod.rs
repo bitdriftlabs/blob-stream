@@ -13,7 +13,12 @@ use bd_log::warn_every;
 use bd_server_stats::stats::Scope;
 use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobKey, BlobStore};
-use blob_stream_broker_discovery::BrokerMembership;
+use blob_stream_broker_discovery::{
+  BrokerMembership,
+  BrokerNode,
+  balanced_assignment,
+  writer_virtual_partitions,
+};
 use blob_stream_metadata_store::{
   LeaseAcquireOutcome,
   MetadataStore,
@@ -79,7 +84,62 @@ pub struct BrokerStateSnapshot {
   pub writer_id: u32,
   pub flush_max_bytes: u64,
   pub flush_max_delay_ms: i64,
+  pub membership: Vec<BrokerNodeSnapshot>,
+  pub ownership: Vec<BrokerPartitionOwnershipSnapshot>,
   pub topics: Vec<BrokerTopicStateSnapshot>,
+}
+
+//
+// BrokerNodeSnapshot
+//
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BrokerNodeSnapshot {
+  pub node_id: String,
+  pub address: String,
+}
+
+//
+// BrokerPartitionOwnershipSnapshot
+//
+
+#[derive(Debug, Serialize)]
+pub struct BrokerPartitionOwnershipSnapshot {
+  pub topic: String,
+  pub virtual_partition_id: VirtualPartitionId,
+  pub producer_writer_id: u32,
+  pub logical_partition_id: u32,
+  pub assigned_broker: Option<BrokerNodeSnapshot>,
+  pub assignment_is_local: bool,
+  pub lease_status: BrokerLeaseStatus,
+  pub observed_lease: Option<BrokerLeaseSnapshot>,
+}
+
+//
+// BrokerLeaseStatus
+//
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerLeaseStatus {
+  LocalActive,
+  RemoteActive,
+  AssignedLocalPending,
+  AssignedRemotePending,
+  UnleasedOrExpired,
+  LookupFailed,
+}
+
+//
+// BrokerLeaseSnapshot
+//
+
+#[derive(Debug, Serialize)]
+pub struct BrokerLeaseSnapshot {
+  pub holder_id: String,
+  pub holder_address: Option<String>,
+  pub expiration_ts_ms: i64,
+  pub is_active: bool,
 }
 
 //
@@ -310,7 +370,19 @@ impl WriteEngineImpl {
     metrics_scope: &Scope,
   ) -> Result<Self> {
     let snowflake = flush::SnowflakeGenerator::new()?;
-    let state = Arc::new(Mutex::new(WriteState::default()));
+    let initial_membership = membership_rx.as_ref().map_or_else(
+      || {
+        BrokerMembership::new(vec![BrokerNode {
+          node_id: holder_id.clone(),
+          address: holder_id.clone(),
+        }])
+      },
+      |membership_rx| membership_rx.borrow().clone(),
+    );
+    let state = Arc::new(Mutex::new(WriteState {
+      membership: initial_membership,
+      ..Default::default()
+    }));
     let flush_context = FlushContext::new(config.clone(), blob_store, metadata_store, snowflake);
 
     let mut engine = Self {
@@ -341,7 +413,6 @@ impl WriteEngineImpl {
   ) -> Result<i64, WriteError> {
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string(),
-      writer_id: self.config.writer_id,
       virtual_partition_id,
     };
 
@@ -372,7 +443,6 @@ impl WriteEngineImpl {
   ) -> Result<SeqRange, WriteError> {
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string(),
-      writer_id: self.config.writer_id,
       virtual_partition_id,
     };
 
@@ -625,6 +695,22 @@ impl WriteEngine for WriteEngineImpl {
     let generated_at_ts_ms = self.time_provider.now().unix_timestamp_ms();
     let state = self.state.lock().await;
 
+    let membership = state.membership.clone();
+    let mut membership_snapshot = membership
+      .nodes
+      .iter()
+      .map(|node| BrokerNodeSnapshot {
+        node_id: node.node_id.clone(),
+        address: node.address.clone(),
+      })
+      .collect::<Vec<_>>();
+    membership_snapshot.sort_by(|left, right| {
+      left
+        .node_id
+        .cmp(&right.node_id)
+        .then_with(|| left.address.cmp(&right.address))
+    });
+
     let mut topics = self
       .topics
       .values()
@@ -674,13 +760,103 @@ impl WriteEngine for WriteEngineImpl {
       .collect::<Vec<_>>();
     topics.sort_by(|left, right| left.name.cmp(&right.name));
 
+    drop(state);
+
+    let assignment = balanced_assignment(
+      writer_virtual_partitions(
+        self
+          .topics
+          .values()
+          .map(|topic| (topic.name.clone(), topic.partition_count, topic.num_writers)),
+        self.config.writer_id,
+      ),
+      &membership,
+    );
+    let mut ownership = Vec::new();
+    for (partition, assigned_broker) in assignment {
+      let topic = self
+        .topics
+        .get(&partition.topic)
+        .expect("assignment must reference a configured topic");
+      let key = ProducerPartitionLeaseKey {
+        topic: partition.topic.clone(),
+        virtual_partition_id: partition.virtual_partition_id,
+      };
+      let lease = self.lease_store.get_lease(&key).await;
+      let assignment_is_local = assigned_broker.node_id == self.holder_id;
+      let assigned_broker = BrokerNodeSnapshot {
+        node_id: assigned_broker.node_id,
+        address: assigned_broker.address,
+      };
+
+      let (lease_status, observed_lease) = match lease {
+        Ok(Some(lease)) => {
+          let is_active = lease.lease_expiration_ts_ms > generated_at_ts_ms;
+          let holder_address = membership
+            .nodes
+            .iter()
+            .find(|node| node.node_id == lease.holder_id)
+            .map(|node| node.address.clone());
+          let lease_status = if !is_active {
+            BrokerLeaseStatus::UnleasedOrExpired
+          } else if lease.holder_id == self.holder_id {
+            BrokerLeaseStatus::LocalActive
+          } else {
+            BrokerLeaseStatus::RemoteActive
+          };
+          (
+            lease_status,
+            Some(BrokerLeaseSnapshot {
+              holder_id: lease.holder_id,
+              holder_address,
+              expiration_ts_ms: lease.lease_expiration_ts_ms,
+              is_active,
+            }),
+          )
+        },
+        Ok(None) => {
+          let status = if assignment_is_local {
+            BrokerLeaseStatus::AssignedLocalPending
+          } else {
+            BrokerLeaseStatus::AssignedRemotePending
+          };
+          (status, None)
+        },
+        Err(error) => {
+          warn_every!(
+            15.seconds(),
+            "broker state lease lookup failed: topic={}, virtual_partition_id={}, error={error}",
+            partition.topic,
+            partition.virtual_partition_id,
+          );
+          (BrokerLeaseStatus::LookupFailed, None)
+        },
+      };
+
+      ownership.push(BrokerPartitionOwnershipSnapshot {
+        topic: partition.topic,
+        virtual_partition_id: partition.virtual_partition_id,
+        producer_writer_id: self.config.writer_id,
+        logical_partition_id: partition.virtual_partition_id % topic.partition_count,
+        assigned_broker: Some(assigned_broker),
+        assignment_is_local,
+        lease_status,
+        observed_lease,
+      });
+    }
+    ownership.sort_by(|left, right| {
+      (&left.topic, left.virtual_partition_id).cmp(&(&right.topic, right.virtual_partition_id))
+    });
+
     BrokerStateSnapshot {
-      schema_version: 1,
+      schema_version: 2,
       generated_at_ts_ms,
       holder_id: self.holder_id.clone(),
       writer_id: self.config.writer_id,
       flush_max_bytes: self.config.flush_max_bytes,
       flush_max_delay_ms: self.config.flush_max_delay_ms,
+      membership: membership_snapshot,
+      ownership,
       topics,
     }
   }
@@ -720,6 +896,7 @@ async fn flush_plans_and_notify(
 
 #[derive(Debug, Default)]
 struct WriteState {
+  membership: BrokerMembership,
   topics: HashMap<String, TopicState>,
 }
 

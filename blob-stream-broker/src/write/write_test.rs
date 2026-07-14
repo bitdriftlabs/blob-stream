@@ -10,6 +10,8 @@ use blob_stream_metadata_store::{
   InMemoryMetadataStore,
   InMemoryProducerPartitionLeaseStore,
   MetadataStore,
+  ProducerPartitionLeaseKey,
+  ProducerPartitionLeaseStore,
   SegmentMetadata,
 };
 use blob_stream_types::{CompressionCodec, SeqRange, Window, new_record};
@@ -31,6 +33,18 @@ fn make_engine(
   time_provider: Arc<TestTimeProvider>,
   config: WriteConfig,
 ) -> Result<(Arc<WriteEngineImpl>, Arc<InMemoryMetadataStore>)> {
+  let (engine, metadata_store, _lease_store) = make_engine_with_lease_store(time_provider, config)?;
+  Ok((engine, metadata_store))
+}
+
+fn make_engine_with_lease_store(
+  time_provider: Arc<TestTimeProvider>,
+  config: WriteConfig,
+) -> Result<(
+  Arc<WriteEngineImpl>,
+  Arc<InMemoryMetadataStore>,
+  Arc<InMemoryProducerPartitionLeaseStore>,
+)> {
   let mut topics = HashMap::new();
   topics.insert(
     "telemetry".to_string(),
@@ -51,14 +65,14 @@ fn make_engine(
     topics,
     blob_store,
     metadata_store.clone(),
-    lease_store,
+    lease_store.clone(),
     "test-node".to_string(),
     None,
     time_provider,
     &metrics_scope(),
   )?;
 
-  Ok((Arc::new(engine), metadata_store))
+  Ok((Arc::new(engine), metadata_store, lease_store))
 }
 
 #[tokio::test]
@@ -66,9 +80,9 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
   let mut config = WriteConfig::with_defaults();
+  config.writer_id = 0;
   config.flush_max_bytes = 1024;
   config.flush_max_delay_ms = 60_000;
-  config.writer_id = 42;
 
   let (engine, _metadata_store) = make_engine(time_provider, config)?;
   let pending_engine = Arc::clone(&engine);
@@ -85,10 +99,19 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   tokio::task::yield_now().await;
 
   let snapshot = engine.state_snapshot().await;
-  assert_eq!(snapshot.schema_version, 1);
+  assert_eq!(snapshot.schema_version, 2);
   assert_eq!(snapshot.generated_at_ts_ms, now_ms);
   assert_eq!(snapshot.holder_id, "test-node");
-  assert_eq!(snapshot.writer_id, 42);
+  assert_eq!(snapshot.writer_id, 0);
+  assert_eq!(snapshot.membership.len(), 1);
+  assert_eq!(snapshot.membership[0].node_id, "test-node");
+  assert_eq!(snapshot.membership[0].address, "test-node");
+  assert_eq!(snapshot.ownership.len(), 1);
+  assert!(snapshot.ownership[0].assignment_is_local);
+  assert_eq!(
+    snapshot.ownership[0].lease_status,
+    super::BrokerLeaseStatus::LocalActive
+  );
   assert_eq!(snapshot.topics.len(), 1);
 
   let topic = &snapshot.topics[0];
@@ -115,6 +138,41 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
 
   pending_write.abort();
   let _ignored = pending_write.await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn state_snapshot_reports_expired_observed_lease() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let mut config = WriteConfig::with_defaults();
+  config.writer_id = 0;
+
+  let (engine, _metadata_store, lease_store) = make_engine_with_lease_store(time_provider, config)?;
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".to_string(),
+    virtual_partition_id: 0,
+  };
+  lease_store
+    .acquire_lease(key, "former-owner".to_string(), now_ms - 1_000, 100)
+    .await?;
+
+  let snapshot = engine.state_snapshot().await;
+  let ownership = snapshot
+    .ownership
+    .first()
+    .expect("local ownership row exists");
+  assert_eq!(
+    ownership.lease_status,
+    super::BrokerLeaseStatus::UnleasedOrExpired
+  );
+  let observed_lease = ownership
+    .observed_lease
+    .as_ref()
+    .expect("expired lease is reported");
+  assert_eq!(observed_lease.holder_id, "former-owner");
+  assert!(!observed_lease.is_active);
+
   Ok(())
 }
 

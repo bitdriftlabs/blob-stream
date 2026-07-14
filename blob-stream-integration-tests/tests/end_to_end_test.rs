@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use bd_server_stats::stats::Collector;
+use blob_stream_broker::write::BrokerLeaseStatus;
 use blob_stream_broker_discovery::BrokerDiscovery;
 use blob_stream_consumer::{
   ConsumerConfigFactory,
@@ -260,6 +261,72 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
   assert!(duplicate_scan.is_empty());
 
   // Step 6: Tear down broker and dependency resources.
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
+// Ensures real broker lease reconciliation uses the shared fair plan rather than independently
+// selecting a broker per virtual partition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn broker_state_converges_to_balanced_local_partition_ownership() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let mut cluster = ClusterHarness::builder(&resources, 2)
+    .partition_count(4)
+    .in_memory_transport()
+    .start()
+    .await?;
+
+  let live_nodes = cluster.live_nodes();
+  cluster.set_active_nodes(live_nodes);
+
+  let deadline = Instant::now() + Duration::from_secs(15);
+  let snapshots = loop {
+    let snapshots = cluster.broker_state_snapshots().await;
+    let converged = snapshots.len() == 2
+      && snapshots.iter().all(|snapshot| {
+        snapshot.writer_id == 0
+          && snapshot.membership.len() == 2
+          && snapshot.ownership.len() == 8
+          && snapshot
+            .ownership
+            .iter()
+            .filter(|ownership| ownership.assignment_is_local)
+            .all(|ownership| ownership.lease_status == BrokerLeaseStatus::LocalActive)
+          && snapshot
+            .ownership
+            .iter()
+            .filter(|ownership| !ownership.assignment_is_local)
+            .all(|ownership| ownership.lease_status == BrokerLeaseStatus::RemoteActive)
+          && snapshot
+            .ownership
+            .iter()
+            .filter(|ownership| ownership.assignment_is_local)
+            .count()
+            == 4
+      });
+    if converged {
+      break snapshots;
+    }
+    if Instant::now() >= deadline {
+      return Err(anyhow!("broker ownership did not converge: {snapshots:#?}"));
+    }
+    sleep(Duration::from_millis(10)).await;
+  };
+
+  for snapshot in snapshots {
+    let local_ownership = snapshot
+      .ownership
+      .iter()
+      .filter(|ownership| ownership.assignment_is_local)
+      .count();
+    assert_eq!(
+      local_ownership, 4,
+      "broker {} ownership",
+      snapshot.holder_id
+    );
+  }
+
   cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())

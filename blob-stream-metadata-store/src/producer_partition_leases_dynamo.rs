@@ -28,7 +28,6 @@ const ATTR_EXPIRES: &str = "lease_expiration_ts_ms";
 const ATTR_MAX_SEQ: &str = "max_allocated_seq";
 const ATTR_TOPIC: &str = "topic";
 const ATTR_TTL: &str = "ttl_epoch_seconds";
-const ATTR_WRITER_ID: &str = "writer_id";
 const ATTR_VIRTUAL_PARTITION_ID: &str = "virtual_partition_id";
 const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
 
@@ -62,7 +61,7 @@ impl DynamoProducerPartitionLeaseStore {
     }
   }
 
-  async fn get_lease(
+  async fn read_lease(
     &self,
     key: &ProducerPartitionLeaseKey,
   ) -> Result<Option<ProducerPartitionLease>> {
@@ -93,6 +92,13 @@ impl DynamoProducerPartitionLeaseStore {
 
 #[async_trait]
 impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
+  async fn get_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+  ) -> Result<Option<ProducerPartitionLease>> {
+    self.read_lease(key).await
+  }
+
   async fn acquire_lease(
     &self,
     key: ProducerPartitionLeaseKey,
@@ -101,9 +107,8 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome> {
     trace!(
-      "producer lease(dynamo) acquire: table={}, topic={}, writer_id={}, partition={}, \
-       holder_id={}",
-      self.table_name, key.topic, key.writer_id, key.virtual_partition_id, holder_id
+      "producer lease(dynamo) acquire: table={}, topic={}, partition={}, holder_id={}",
+      self.table_name, key.topic, key.virtual_partition_id, holder_id
     );
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
     let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
@@ -122,19 +127,14 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
     values.insert(":topic".to_string(), AttributeValue::S(key.topic.clone()));
     values.insert(
-      ":writer_id".to_string(),
-      AttributeValue::N(key.writer_id.to_string()),
-    );
-    values.insert(
       ":virtual_partition_id".to_string(),
       AttributeValue::N(key.virtual_partition_id.to_string()),
     );
 
     let update = format!(
       "SET {ATTR_HOLDER} = :holder, {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl, {ATTR_TOPIC} = \
-       if_not_exists({ATTR_TOPIC}, :topic), {ATTR_WRITER_ID} = if_not_exists({ATTR_WRITER_ID}, \
-       :writer_id), {ATTR_VIRTUAL_PARTITION_ID} = if_not_exists({ATTR_VIRTUAL_PARTITION_ID}, \
-       :virtual_partition_id)"
+       if_not_exists({ATTR_TOPIC}, :topic), {ATTR_VIRTUAL_PARTITION_ID} = \
+       if_not_exists({ATTR_VIRTUAL_PARTITION_ID}, :virtual_partition_id)"
     );
     let condition = format!(
       "attribute_not_exists({ATTR_PK}) OR {ATTR_EXPIRES} <= :now OR {ATTR_HOLDER} = :holder"
@@ -166,7 +166,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       {
         debug!("producer lease(dynamo) acquire result: held_by_other");
         let lease = self
-          .get_lease(&key)
+          .read_lease(&key)
           .await?
           .ok_or_else(|| anyhow!("lease missing after conditional failure"))?;
         Ok(LeaseAcquireOutcome::HeldByOther(lease))
@@ -183,9 +183,8 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     lease_duration_ms: i64,
   ) -> Result<LeaseHeartbeatOutcome> {
     trace!(
-      "producer lease(dynamo) heartbeat: table={}, topic={}, writer_id={}, partition={}, \
-       holder_id={}",
-      self.table_name, key.topic, key.writer_id, key.virtual_partition_id, holder_id
+      "producer lease(dynamo) heartbeat: table={}, topic={}, partition={}, holder_id={}",
+      self.table_name, key.topic, key.virtual_partition_id, holder_id
     );
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
     let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
@@ -232,7 +231,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
       {
-        let Some(lease) = self.get_lease(key).await? else {
+        let Some(lease) = self.read_lease(key).await? else {
           debug!("producer lease(dynamo) heartbeat result: expired");
           return Ok(LeaseHeartbeatOutcome::Expired);
         };
@@ -256,14 +255,8 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
     trace!(
-      "producer lease(dynamo) reserve: table={}, topic={}, writer_id={}, partition={}, \
-       holder_id={}, size={}",
-      self.table_name,
-      key.topic,
-      key.writer_id,
-      key.virtual_partition_id,
-      holder_id,
-      reservation_size
+      "producer lease(dynamo) reserve: table={}, topic={}, partition={}, holder_id={}, size={}",
+      self.table_name, key.topic, key.virtual_partition_id, holder_id, reservation_size
     );
     if reservation_size == 0 {
       return Err(anyhow!("reservation_size must be greater than zero"));
@@ -308,7 +301,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
 
         let reservation = reservation_from_old(old_max, reservation_size)?;
         let lease = self
-          .get_lease(key)
+          .read_lease(key)
           .await?
           .ok_or_else(|| anyhow!("lease missing after reservation"))?;
 
@@ -324,7 +317,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
       {
-        let Some(lease) = self.get_lease(key).await? else {
+        let Some(lease) = self.read_lease(key).await? else {
           debug!("producer lease(dynamo) reserve result: expired");
           return Ok(SequenceReservationOutcome::Expired);
         };
@@ -347,9 +340,8 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     now_ts_ms: i64,
   ) -> Result<LeaseReleaseOutcome> {
     trace!(
-      "producer lease(dynamo) release: table={}, topic={}, writer_id={}, partition={}, \
-       holder_id={}",
-      self.table_name, key.topic, key.writer_id, key.virtual_partition_id, holder_id
+      "producer lease(dynamo) release: table={}, topic={}, partition={}, holder_id={}",
+      self.table_name, key.topic, key.virtual_partition_id, holder_id
     );
     let mut values = HashMap::new();
     values.insert(
@@ -413,7 +405,6 @@ struct DynamoLeaseItem {
   #[serde(rename = "pk")]
   partition_key: String,
   topic: String,
-  writer_id: u32,
   virtual_partition_id: u32,
   holder_id: String,
   lease_expiration_ts_ms: i64,
@@ -425,7 +416,6 @@ impl DynamoLeaseItem {
     ProducerPartitionLease {
       key: ProducerPartitionLeaseKey {
         topic: self.topic,
-        writer_id: self.writer_id,
         virtual_partition_id: self.virtual_partition_id,
       },
       holder_id: self.holder_id,

@@ -80,6 +80,45 @@ fn ownership_changes_with_membership() {
   assert!(owned_after_move.is_empty());
 }
 
+#[test]
+fn ownership_includes_only_local_producer_writer_virtual_partitions() {
+  let mut topics = HashMap::new();
+  topics.insert(
+    "telemetry".to_string(),
+    TopicInfo {
+      name: "telemetry".to_string(),
+      partition_count: 2,
+      num_writers: 2,
+      retention_days: 7,
+    },
+  );
+  let membership = BrokerMembership::new(vec![
+    BrokerNode {
+      node_id: "node-a".to_string(),
+      address: "10.0.0.1:8080".to_string(),
+    },
+    BrokerNode {
+      node_id: "node-b".to_string(),
+      address: "10.0.0.2:8080".to_string(),
+    },
+  ]);
+
+  let owned_a = WriteEngineImpl::owned_virtual_partitions(&topics, 1, "node-a", &membership)
+    .into_iter()
+    .collect::<HashSet<_>>();
+  let owned_b = WriteEngineImpl::owned_virtual_partitions(&topics, 1, "node-b", &membership)
+    .into_iter()
+    .collect::<HashSet<_>>();
+
+  assert_eq!(owned_a.len(), 1);
+  assert_eq!(owned_b.len(), 1);
+  assert!(owned_a.is_disjoint(&owned_b));
+  assert_eq!(
+    owned_a.union(&owned_b).cloned().collect::<HashSet<_>>(),
+    HashSet::from([("telemetry".to_string(), 2), ("telemetry".to_string(), 3)])
+  );
+}
+
 fn make_topic(partition_count: u32) -> HashMap<String, TopicInfo> {
   let mut topics = HashMap::new();
   topics.insert(
@@ -104,7 +143,6 @@ async fn acquire_all_partitions(
       virtual_partition_for_logical(logical_partition_id, partition_count, 0);
     let key = ProducerPartitionLeaseKey {
       topic: "telemetry".to_string(),
-      writer_id: 0,
       virtual_partition_id,
     };
     let _outcome = store
@@ -124,7 +162,6 @@ async fn all_partitions_acquired(
       virtual_partition_for_logical(logical_partition_id, partition_count, 0);
     let key = ProducerPartitionLeaseKey {
       topic: "telemetry".to_string(),
-      writer_id: 0,
       virtual_partition_id,
     };
     let outcome = store
@@ -146,7 +183,6 @@ async fn scale_down_releases_previously_owned_leases() -> Result<()> {
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_000)));
   let mut config = WriteConfig::with_defaults();
-  config.writer_id = 0;
   config.lease_duration_ms = 60_000;
 
   let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
@@ -195,7 +231,6 @@ async fn shutdown_releases_currently_owned_leases() -> Result<()> {
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_000)));
   let mut config = WriteConfig::with_defaults();
-  config.writer_id = 0;
   config.lease_duration_ms = 60_000;
 
   let (_membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {

@@ -86,6 +86,10 @@ impl WriteConfig {
   pub fn from_broker_config(broker: &BrokerConfig) -> Result<Self> {
     let mut config = Self::with_defaults();
 
+    config.writer_id = broker
+      .writer_id
+      .ok_or_else(|| anyhow!("broker writer_id must be explicitly configured"))?;
+
     if broker.flush_max_bytes > 0 {
       config.flush_max_bytes = u64::from(broker.flush_max_bytes);
     }
@@ -157,6 +161,7 @@ pub async fn build_write_engine(
   let membership_rx = build_membership_watch(broker, &holder_id).await?;
 
   let topics = build_topics(&config.topics)?;
+  validate_writer_id(write_config.writer_id, &topics)?;
 
   let blob_store_config = config
     .blob_store
@@ -172,9 +177,9 @@ pub async fn build_write_engine(
   let metadata_store = build_metadata_store(metadata_store_config, &topics).await?;
 
   let lease_store = build_producer_partition_lease_store(metadata_store_config).await?;
-  let writer_id = write_config.writer_id;
   let topics_count = topics.len();
   let holder_id_for_log = holder_id.clone();
+  let writer_id = write_config.writer_id;
 
   let engine = WriteEngineImpl::new(
     write_config,
@@ -290,6 +295,19 @@ fn build_topics(topics: &[TopicConfig]) -> Result<HashMap<String, TopicInfo>> {
   }
 
   Ok(map)
+}
+
+fn validate_writer_id(writer_id: u32, topics: &HashMap<String, TopicInfo>) -> Result<()> {
+  for topic in topics.values() {
+    ensure!(
+      writer_id < topic.num_writers,
+      "broker writer_id {writer_id} must be less than num_writers {} for topic {}",
+      topic.num_writers,
+      topic.name
+    );
+  }
+
+  Ok(())
 }
 
 fn resolve_node_id(broker: &BrokerConfig) -> Result<String> {

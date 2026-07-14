@@ -4,7 +4,7 @@ package blobstream.v1;
 
 // Broker gRPC API used by producers to append batches of records.
 service BrokerService {
-  // Append a batch of records to a virtual partition and return its seq range.
+  // Append a batch of records to a virtual partition and report persisted acceptance status.
   rpc ProduceBatch(ProduceBatchRequest) returns (ProduceBatchResponse);
 }
 
@@ -34,7 +34,7 @@ message ProduceBatchRequest {
   repeated Record records = 3;
 }
 
-// Response containing the assigned seq range for the batch.
+// Response reporting whether the broker accepted and durably persisted the batch.
 message ProduceBatchResponse {
   // Result status for the batch.
   ProduceStatus status = 1;

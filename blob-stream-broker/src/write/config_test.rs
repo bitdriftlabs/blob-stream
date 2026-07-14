@@ -1,10 +1,11 @@
-use super::{DynamoTablePurpose, WriteConfig, dynamo_table_name};
+use super::{DynamoTablePurpose, TopicInfo, WriteConfig, dynamo_table_name, validate_writer_id};
 use blob_stream_proto::protos::blobstream::v1::config::{
   BrokerConfig,
   DynamoMetadataStoreConfig,
   SegmentCompression,
 };
 use blob_stream_types::CompressionCodec;
+use std::collections::HashMap;
 
 fn dynamo_config() -> DynamoMetadataStoreConfig {
   let mut config = DynamoMetadataStoreConfig::new();
@@ -42,19 +43,54 @@ fn returns_empty_when_explicit_fields_are_unset() {
 
 #[test]
 fn defaults_segment_compression_to_zstd() {
-  let config = WriteConfig::from_broker_config(&BrokerConfig::new()).unwrap();
+  let mut broker_config = BrokerConfig::new();
+  broker_config.writer_id = Some(0);
+
+  let config = WriteConfig::from_broker_config(&broker_config).unwrap();
 
   assert_eq!(config.compression.codec, CompressionCodec::Zstd);
   assert_eq!(config.compression.level, Some(3));
+  assert_eq!(config.writer_id, 0);
 }
 
 #[test]
 fn respects_uncompressed_segment_configuration() {
   let mut broker_config = BrokerConfig::new();
+  broker_config.writer_id = Some(0);
   broker_config.segment_compression = Some(SegmentCompression::SEGMENT_COMPRESSION_NONE.into());
 
   let config = WriteConfig::from_broker_config(&broker_config).unwrap();
 
   assert_eq!(config.compression.codec, CompressionCodec::None);
   assert_eq!(config.compression.level, None);
+}
+
+#[test]
+fn rejects_broker_configuration_without_writer_id() {
+  let error = WriteConfig::from_broker_config(&BrokerConfig::new()).unwrap_err();
+
+  assert_eq!(
+    error.to_string(),
+    "broker writer_id must be explicitly configured"
+  );
+}
+
+#[test]
+fn rejects_writer_id_outside_a_topic_range() {
+  let topics = HashMap::from([(
+    "telemetry".to_string(),
+    TopicInfo {
+      name: "telemetry".to_string(),
+      partition_count: 2,
+      num_writers: 1,
+      retention_days: 7,
+    },
+  )]);
+
+  let error = validate_writer_id(1, &topics).unwrap_err();
+
+  assert_eq!(
+    error.to_string(),
+    "broker writer_id 1 must be less than num_writers 1 for topic telemetry"
+  );
 }
