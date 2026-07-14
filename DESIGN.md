@@ -227,16 +227,16 @@ For every `read_available()` call, a consumer:
 1. Computes the current aligned time window plus the configured trailing
    `lookback_windows`.
 2. Selects a scan mode:
-  - At startup, after an assignment change, and at each
-    `metadata_recovery_scan_interval_seconds`, performs an unbounded recovery scan of every
-    window in that lookback set. The default interval is one minute.
-  - Between recovery scans, queries only the current window with an inclusive lower bound equal
-    to the largest snowflake previously observed for that window.
-  - When `metadata_fast_scan_enabled` is `false`, performs the unbounded lookback scan on every
-    read, preserving the legacy behavior for rollback.
+   - At startup, after an assignment change, and at each
+     `metadata_recovery_scan_interval_seconds`, performs an unbounded recovery scan of every
+     window in that lookback set. The default interval is one minute.
+   - Between recovery scans, queries only the current window with an inclusive lower bound equal
+     to the largest snowflake previously observed for that window.
+   - When `metadata_fast_scan_enabled` is `false`, performs the unbounded lookback scan on every
+     read, preserving the legacy behavior for rollback.
 3. Queries the selected metadata windows concurrently. DynamoDB applies the optional snowflake
-  lower bound to its sort key and follows all result pages. Metadata-store results remain
-  intentionally unordered by contract.
+   lower bound to its sort key and follows all result pages. Metadata-store results remain
+   intentionally unordered by contract.
 4. Sorts segments by snowflake ID, filters their indexes to assigned virtual partitions, and sorts
    batches within each partition by `seq_start`.
 5. Skips ranges already covered by the in-memory cursor.

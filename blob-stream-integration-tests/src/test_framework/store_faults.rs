@@ -574,6 +574,10 @@ impl FaultInjectedMetadataStore {
       min_snowflake.is_none_or(|min_snowflake| segment.snowflake_id >= min_snowflake)
     });
     if effects.stale_read {
+      self
+        .controller
+        .record_operation_outcome(StoreFaultOperation::MetadataScanWindow, key, "ok", None)
+        .await;
       return Ok(visible);
     }
 
