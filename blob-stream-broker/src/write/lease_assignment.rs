@@ -5,14 +5,18 @@ mod tests;
 use super::{TopicInfo, WriteEngineImpl};
 use bd_log::warn_every;
 use bd_time::OffsetDateTimeExt;
-use blob_stream_broker_discovery::{BrokerMembership, owner_for_partition};
+use blob_stream_broker_discovery::{
+  BrokerMembership,
+  balanced_assignment,
+  writer_virtual_partitions,
+};
 use blob_stream_metadata_store::{
   LeaseAcquireOutcome,
   LeaseReleaseOutcome,
   ProducerPartitionLeaseKey,
   SequenceReservationOutcome,
 };
-use blob_stream_types::{VirtualPartitionId, virtual_partition_for_logical};
+use blob_stream_types::VirtualPartitionId;
 use log::info;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -30,23 +34,26 @@ impl WriteEngineImpl {
     // Empty membership means discovery is unavailable or intentionally static; in that case we
     // self-assign all partitions so writes can continue behind lease fencing.
     let static_self = membership.nodes.is_empty();
+    let partitions = writer_virtual_partitions(
+      topics
+        .values()
+        .map(|topic| (topic.name.clone(), topic.partition_count, topic.num_writers)),
+      writer_id,
+    );
 
-    let mut owned = Vec::new();
-    for (topic, topic_info) in topics {
-      for logical_partition_id in 0 .. topic_info.partition_count {
-        let virtual_partition_id = virtual_partition_for_logical(
-          logical_partition_id,
-          topic_info.partition_count,
-          writer_id,
-        );
-        if static_self
-          || owner_for_partition(topic, virtual_partition_id, membership)
-            .is_some_and(|owner| owner.node_id == holder_id)
-        {
-          owned.push((topic.clone(), virtual_partition_id));
-        }
-      }
-    }
+    let mut owned: Vec<(String, VirtualPartitionId)> = if static_self {
+      partitions
+        .into_iter()
+        .map(|partition| (partition.topic, partition.virtual_partition_id))
+        .collect()
+    } else {
+      balanced_assignment(partitions, membership)
+        .into_iter()
+        .filter_map(|(partition, owner)| {
+          (owner.node_id == holder_id).then_some((partition.topic, partition.virtual_partition_id))
+        })
+        .collect()
+    };
 
     owned.sort_unstable();
     owned
@@ -97,6 +104,10 @@ impl WriteEngineImpl {
         };
 
         let membership = membership_rx.borrow().clone();
+        {
+          let mut guard = state.lock().await;
+          guard.membership = membership.clone();
+        }
         let owned = Self::owned_virtual_partitions(&topics, writer_id, &holder_id, &membership);
         let currently_owned: HashSet<(String, VirtualPartitionId)> =
           owned.iter().cloned().collect();
@@ -120,7 +131,6 @@ impl WriteEngineImpl {
           Self::release_partition_lease(
             &lease_store,
             &state,
-            writer_id,
             &holder_id,
             topic,
             *virtual_partition_id,
@@ -140,7 +150,6 @@ impl WriteEngineImpl {
             Self::release_partition_lease(
               &lease_store,
               &state,
-              writer_id,
               &holder_id,
               &topic,
               virtual_partition_id,
@@ -157,7 +166,6 @@ impl WriteEngineImpl {
         for (topic, virtual_partition_id) in owned {
           let key = ProducerPartitionLeaseKey {
             topic: topic.clone(),
-            writer_id,
             virtual_partition_id,
           };
 
@@ -241,7 +249,6 @@ impl WriteEngineImpl {
   async fn release_partition_lease(
     lease_store: &Arc<dyn blob_stream_metadata_store::ProducerPartitionLeaseStore>,
     state: &Arc<tokio::sync::Mutex<super::WriteState>>,
-    writer_id: u32,
     holder_id: &str,
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
@@ -249,7 +256,6 @@ impl WriteEngineImpl {
   ) {
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string(),
-      writer_id,
       virtual_partition_id,
     };
 

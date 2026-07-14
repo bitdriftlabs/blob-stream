@@ -646,6 +646,13 @@ impl FaultInjectedProducerPartitionLeaseStore {
 
 #[async_trait]
 impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
+  async fn get_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+  ) -> Result<Option<blob_stream_metadata_store::ProducerPartitionLease>> {
+    self.inner.get_lease(key).await
+  }
+
   async fn acquire_lease(
     &self,
     key: ProducerPartitionLeaseKey,

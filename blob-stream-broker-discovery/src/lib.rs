@@ -12,8 +12,8 @@ pub mod r#static;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use std::cmp::Reverse;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use tokio::sync::watch;
 
@@ -50,34 +50,109 @@ impl BrokerMembership {
 }
 
 //
-// owner_for_partition
+// BrokerPartition
+//
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// A virtual partition that requires a broker assignment.
+pub struct BrokerPartition {
+  /// Topic containing the virtual partition.
+  pub topic: String,
+  /// Virtual partition ID, including the producer writer offset.
+  pub virtual_partition_id: u32,
+}
+
+//
+// writer_virtual_partitions
 //
 
 #[must_use]
-/// Resolve the owner node for a virtual partition using rendezvous hashing.
-pub fn owner_for_partition<'a>(
-  topic: &str,
-  virtual_partition_id: u32,
-  membership: &'a BrokerMembership,
-) -> Option<&'a BrokerNode> {
-  // Rendezvous (highest-random-weight) hashing: for each candidate node, hash the tuple
-  // (topic, virtual_partition_id, node_id) and choose the node with the highest score.
-  // We model "highest" with Reverse(score) + min_by_key so ordering is deterministic and
-  // stable for equal membership views across producers and brokers.
-  membership
-    .nodes
+/// Build the virtual-partition inventory for one configured producer writer.
+pub fn writer_virtual_partitions(
+  topics: impl IntoIterator<Item = (String, u32, u32)>,
+  writer_id: u32,
+) -> Vec<BrokerPartition> {
+  let mut partitions = Vec::new();
+  for (topic, partition_count, num_writers) in topics {
+    assert!(
+      writer_id < num_writers,
+      "writer_id {writer_id} is outside topic {topic} writer range {num_writers}"
+    );
+    let virtual_partition_start = writer_id
+      .checked_mul(partition_count)
+      .expect("topic virtual partition offset exceeds u32");
+    let virtual_partition_end = virtual_partition_start
+      .checked_add(partition_count)
+      .expect("topic virtual partition count exceeds u32");
+    for virtual_partition_id in virtual_partition_start .. virtual_partition_end {
+      partitions.push(BrokerPartition {
+        topic: topic.clone(),
+        virtual_partition_id,
+      });
+    }
+  }
+  partitions
+}
+
+//
+// balanced_assignment
+//
+
+#[must_use]
+/// Assign every requested virtual partition to a broker while keeping loads within one partition.
+pub fn balanced_assignment(
+  partitions: impl IntoIterator<Item = BrokerPartition>,
+  membership: &BrokerMembership,
+) -> BTreeMap<BrokerPartition, BrokerNode> {
+  let partitions = partitions.into_iter().collect::<BTreeSet<_>>();
+  let nodes = canonical_nodes(membership);
+  if nodes.is_empty() {
+    return BTreeMap::new();
+  }
+
+  let mut loads = nodes
     .iter()
-    .map(|node| {
-      // We intentionally hash node_id (not address) so ownership only changes when logical
-      // membership changes, not when endpoint strings are reformatted.
-      let mut hasher = DefaultHasher::new();
-      topic.hash(&mut hasher);
-      virtual_partition_id.hash(&mut hasher);
-      node.node_id.hash(&mut hasher);
-      (Reverse(hasher.finish()), node)
-    })
-    .min_by_key(|(score, _)| *score)
-    .map(|(_, node)| node)
+    .map(|node| (node.node_id.as_str(), 0_usize))
+    .collect::<HashMap<_, _>>();
+  let mut assignments = BTreeMap::new();
+
+  for partition in partitions {
+    let minimum_load = loads.values().copied().min().unwrap_or_default();
+    let owner = nodes
+      .iter()
+      .filter(|node| loads.get(node.node_id.as_str()) == Some(&minimum_load))
+      .max_by(|left, right| {
+        rendezvous_score(&partition, &left.node_id)
+          .cmp(&rendezvous_score(&partition, &right.node_id))
+          .then_with(|| right.node_id.cmp(&left.node_id))
+      })
+      .expect("non-empty canonical membership");
+
+    *loads.entry(owner.node_id.as_str()).or_default() += 1;
+    assignments.insert(partition, owner.clone());
+  }
+
+  assignments
+}
+
+fn canonical_nodes(membership: &BrokerMembership) -> Vec<BrokerNode> {
+  let mut nodes = membership.nodes.clone();
+  nodes.sort_unstable_by(|left, right| {
+    left
+      .node_id
+      .cmp(&right.node_id)
+      .then_with(|| left.address.cmp(&right.address))
+  });
+  nodes.dedup_by(|left, right| left.node_id == right.node_id);
+  nodes
+}
+
+fn rendezvous_score(partition: &BrokerPartition, node_id: &str) -> u64 {
+  let mut hasher = DefaultHasher::new();
+  partition.topic.hash(&mut hasher);
+  partition.virtual_partition_id.hash(&mut hasher);
+  node_id.hash(&mut hasher);
+  hasher.finish()
 }
 
 //

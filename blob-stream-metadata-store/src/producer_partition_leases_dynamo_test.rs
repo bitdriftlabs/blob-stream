@@ -83,7 +83,6 @@ async fn wait_for_table_active(client: &Client, table_name: &str) -> Result<()> 
 fn lease_key() -> ProducerPartitionLeaseKey {
   ProducerPartitionLeaseKey {
     topic: "topic-a".to_string(),
-    writer_id: 1,
     virtual_partition_id: 42,
   }
 }
@@ -173,13 +172,58 @@ async fn releases_lease_for_current_holder() -> Result<()> {
     .acquire_lease(key.clone(), "broker-a".to_string(), 1000, 100)
     .await?;
 
+  let reservation = store.reserve_sequences(&key, "broker-a", 1_000, 5).await?;
+  assert!(matches!(
+    reservation,
+    SequenceReservationOutcome::Reserved(_)
+  ));
+
   let release = store.release_lease(&key, "broker-a", 1000).await?;
   assert!(matches!(release, LeaseReleaseOutcome::Released));
 
+  let released_lease = store
+    .get_lease(&key)
+    .await?
+    .ok_or_else(|| anyhow!("released lease row should remain available"))?;
+  assert_eq!(released_lease.lease_expiration_ts_ms, 1_000);
+  assert_eq!(released_lease.max_allocated_seq, Some(4));
+
   let reacquire = store
-    .acquire_lease(key, "broker-b".to_string(), 1000, 100)
+    .acquire_lease(key.clone(), "broker-b".to_string(), 1000, 100)
     .await?;
   assert!(matches!(reacquire, LeaseAcquireOutcome::Acquired(_)));
+
+  let reservation = store.reserve_sequences(&key, "broker-b", 1_000, 2).await?;
+  let SequenceReservationOutcome::Reserved(reservation) = reservation else {
+    panic!("expected reservation");
+  };
+  assert_eq!(reservation.range.start, 5);
+  assert_eq!(reservation.range.end, 6);
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn lookup_reports_absent_and_active_leases() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
+  create_leases_table(&client, &table_name).await?;
+
+  let store = DynamoProducerPartitionLeaseStore::new(client.clone(), table_name.clone());
+  let key = lease_key();
+  assert!(store.get_lease(&key).await?.is_none());
+
+  store
+    .acquire_lease(key.clone(), "broker-a".to_string(), 1_000, 100)
+    .await?;
+
+  let lease = store
+    .get_lease(&key)
+    .await?
+    .ok_or_else(|| anyhow!("active lease should exist"))?;
+  assert_eq!(lease.holder_id, "broker-a");
+  assert_eq!(lease.lease_expiration_ts_ms, 1_100);
 
   client.delete_table().table_name(table_name).send().await?;
   Ok(())

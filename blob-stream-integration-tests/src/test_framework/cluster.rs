@@ -15,7 +15,13 @@ use bd_server_stats::stats::Collector;
 use blob_stream_blob_store::BlobStore;
 use blob_stream_broker::grpc::make_broker_router;
 use blob_stream_broker::metrics::BrokerMetrics;
-use blob_stream_broker::write::{TopicInfo, WriteConfig, WriteEngine, WriteEngineImpl};
+use blob_stream_broker::write::{
+  BrokerStateSnapshot,
+  TopicInfo,
+  WriteConfig,
+  WriteEngine,
+  WriteEngineImpl,
+};
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{MetadataStore, ProducerPartitionLeaseStore};
 use blob_stream_producer::{ProducerClientImpl, ProducerConfig, ProducerTopicConfig};
@@ -32,6 +38,7 @@ use tokio::time::timeout;
 
 struct BrokerHandle {
   node: BrokerNode,
+  write_engine: Arc<dyn WriteEngine>,
   shutdown_tx: Option<oneshot::Sender<()>>,
   serve_task: JoinHandle<()>,
 }
@@ -63,6 +70,7 @@ pub struct ClusterHarness {
   blob_store: Arc<dyn BlobStore>,
   metadata_store: Arc<dyn MetadataStore>,
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+  partition_count: u32,
   topic_num_writers: u32,
   transport: Arc<dyn BrokerTransport>,
 }
@@ -76,6 +84,7 @@ pub struct ClusterHarnessBuilder<'a> {
   broker_count: usize,
   blob_store: Option<Arc<dyn BlobStore>>,
   metadata_store: Option<Arc<dyn MetadataStore>>,
+  partition_count: u32,
   topic_num_writers: u32,
   transport: Arc<dyn BrokerTransport>,
 }
@@ -93,6 +102,11 @@ impl ClusterHarnessBuilder<'_> {
 
   pub fn topic_num_writers(mut self, topic_num_writers: u32) -> Self {
     self.topic_num_writers = topic_num_writers;
+    self
+  }
+
+  pub fn partition_count(mut self, partition_count: u32) -> Self {
+    self.partition_count = partition_count;
     self
   }
 
@@ -115,6 +129,7 @@ impl ClusterHarnessBuilder<'_> {
       self.broker_count,
       blob_store,
       metadata_store,
+      self.partition_count,
       self.topic_num_writers,
       self.transport,
     )
@@ -132,6 +147,7 @@ impl ClusterHarness {
       broker_count,
       blob_store: None,
       metadata_store: None,
+      partition_count: PARTITION_COUNT,
       topic_num_writers: 1,
       transport: Arc::new(GrpcTcpTransport),
     }
@@ -142,9 +158,13 @@ impl ClusterHarness {
     broker_count: usize,
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
+    partition_count: u32,
     topic_num_writers: u32,
     transport: Arc<dyn BrokerTransport>,
   ) -> Result<Self> {
+    if partition_count == 0 {
+      return Err(anyhow!("partition_count must be greater than zero"));
+    }
     if topic_num_writers == 0 {
       return Err(anyhow!("topic_num_writers must be greater than zero"));
     }
@@ -187,12 +207,13 @@ impl ClusterHarness {
       blob_store,
       metadata_store,
       lease_store,
+      partition_count,
       topic_num_writers,
       transport,
     };
 
     for endpoint in endpoints {
-      let broker = harness.spawn_broker(endpoint, topic_num_writers)?;
+      let broker = harness.spawn_broker(endpoint, partition_count, topic_num_writers)?;
       harness.brokers.push(broker);
     }
 
@@ -247,13 +268,27 @@ impl ClusterHarness {
       .collect()
   }
 
+  pub async fn broker_state_snapshots(&self) -> Vec<BrokerStateSnapshot> {
+    let mut snapshots = Vec::with_capacity(self.brokers.len());
+    for broker in &self.brokers {
+      snapshots.push(broker.write_engine.state_snapshot().await);
+    }
+    snapshots.sort_by(|left, right| left.holder_id.cmp(&right.holder_id));
+    snapshots
+  }
+
   fn sync_membership(&self) {
     let nodes = self.live_nodes();
     self.producer_discovery.update_nodes(nodes.clone());
     let _ = self.broker_membership_tx.send(BrokerMembership::new(nodes));
   }
 
-  fn spawn_broker(&self, endpoint: BrokerEndpoint, topic_num_writers: u32) -> Result<BrokerHandle> {
+  fn spawn_broker(
+    &self,
+    endpoint: BrokerEndpoint,
+    partition_count: u32,
+    topic_num_writers: u32,
+  ) -> Result<BrokerHandle> {
     let node = endpoint.node;
     let write_engine = build_write_engine(
       node.node_id.clone(),
@@ -261,6 +296,7 @@ impl ClusterHarness {
       Arc::clone(&self.blob_store),
       Arc::clone(&self.metadata_store),
       Arc::clone(&self.lease_store),
+      partition_count,
       topic_num_writers,
     )?;
 
@@ -273,7 +309,7 @@ impl ClusterHarness {
     // TCP bindings run the real axum server; in-memory bindings only wait for shutdown.
     let serve_task = match endpoint.binding {
       BrokerEndpointBinding::Tcp(listener) => {
-        let router = make_broker_router(write_engine, &metrics);
+        let router = make_broker_router(Arc::clone(&write_engine), &metrics);
         tokio::spawn(async move {
           let result = axum::serve(listener, router)
             .with_graceful_shutdown(async move {
@@ -293,6 +329,7 @@ impl ClusterHarness {
 
     Ok(BrokerHandle {
       node,
+      write_engine,
       shutdown_tx: Some(shutdown_tx),
       serve_task,
     })
@@ -328,7 +365,8 @@ impl ClusterHarness {
 
     let endpoint = self.transport.bind_endpoint(&old_node.node_id).await?;
     let restarted_node = endpoint.node.clone();
-    let restarted_broker = self.spawn_broker(endpoint, self.topic_num_writers)?;
+    let restarted_broker =
+      self.spawn_broker(endpoint, self.partition_count, self.topic_num_writers)?;
     self.brokers.push(restarted_broker);
 
     self.sync_membership();
@@ -348,6 +386,7 @@ fn build_write_engine(
   blob_store: Arc<dyn BlobStore>,
   metadata_store: Arc<dyn MetadataStore>,
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+  partition_count: u32,
   topic_num_writers: u32,
 ) -> Result<Arc<dyn WriteEngine>> {
   let mut topics = HashMap::new();
@@ -356,7 +395,7 @@ fn build_write_engine(
       topic.to_string(),
       TopicInfo {
         name: topic.to_string(),
-        partition_count: PARTITION_COUNT,
+        partition_count,
         num_writers: topic_num_writers,
         retention_days: 7,
       },
@@ -364,10 +403,10 @@ fn build_write_engine(
   }
 
   let mut config = WriteConfig::with_defaults();
+  config.writer_id = 0;
   config.flush_max_delay_ms = 10;
   config.flush_max_bytes = 1024;
   config.reservation_size = 64;
-  config.writer_id = 0;
 
   let engine = WriteEngineImpl::new(
     config,

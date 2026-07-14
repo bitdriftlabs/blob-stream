@@ -29,7 +29,14 @@ use bd_grpc::client::Client as GrpcClient;
 use bd_grpc::service::ServiceMethod;
 use bd_log::warn_every;
 use bd_server_stats::stats::Scope;
-use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, owner_for_partition};
+use blob_stream_broker_discovery::{
+  BrokerDiscovery,
+  BrokerMembership,
+  BrokerNode,
+  BrokerPartition,
+  balanced_assignment,
+  writer_virtual_partitions,
+};
 use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchRequest,
   ProduceBatchResponse,
@@ -40,7 +47,7 @@ use blob_stream_types::{VirtualPartitionId, virtual_partition_for_key};
 use log::{debug, trace};
 use prometheus::{Histogram, IntCounter};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -144,9 +151,20 @@ pub struct ProducerStateSnapshot {
   pub max_batch_records: u32,
   pub max_batch_bytes: u32,
   pub flush_max_delay_ms: u64,
-  pub broker_node_ids: Vec<String>,
+  pub brokers: Vec<ProducerBrokerSnapshot>,
   pub topics: Vec<ProducerTopicSnapshot>,
+  pub route_map: Vec<ProducerRouteSnapshot>,
   pub partition_buffers: Vec<ProducerPartitionBufferSnapshot>,
+}
+
+//
+// ProducerBrokerSnapshot
+//
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProducerBrokerSnapshot {
+  pub node_id: String,
+  pub address: String,
 }
 
 //
@@ -159,6 +177,19 @@ pub struct ProducerTopicSnapshot {
   pub partition_count: u32,
   pub num_writers: u32,
   pub retention_days: u32,
+}
+
+//
+// ProducerRouteSnapshot
+//
+
+#[derive(Debug, Serialize)]
+pub struct ProducerRouteSnapshot {
+  pub topic: String,
+  pub virtual_partition_id: VirtualPartitionId,
+  pub producer_writer_id: u32,
+  pub logical_partition_id: u32,
+  pub selected_broker: Option<ProducerBrokerSnapshot>,
 }
 
 //
@@ -191,14 +222,22 @@ impl ProducerDiagnostics {
   #[must_use]
   pub async fn state_snapshot(&self) -> ProducerStateSnapshot {
     let generated_at_ts_ms = time::OffsetDateTime::now_utc().unix_timestamp() * 1_000;
-    let mut broker_node_ids = self
-      .membership_rx
-      .borrow()
+    let writer_id = producer_writer_id(&self.config);
+    let membership = self.membership_rx.borrow().clone();
+    let mut brokers = membership
       .nodes
       .iter()
-      .map(|node| node.node_id.clone())
+      .map(|node| ProducerBrokerSnapshot {
+        node_id: node.node_id.clone(),
+        address: node.address.clone(),
+      })
       .collect::<Vec<_>>();
-    broker_node_ids.sort();
+    brokers.sort_by(|left, right| {
+      left
+        .node_id
+        .cmp(&right.node_id)
+        .then_with(|| left.address.cmp(&right.address))
+    });
 
     let mut topics = self
       .topics
@@ -211,6 +250,42 @@ impl ProducerDiagnostics {
       })
       .collect::<Vec<_>>();
     topics.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let assignment = broker_assignment(&self.topics, writer_id, &membership);
+    let mut route_map = writer_virtual_partitions(
+      self.topics.values().map(|topic| {
+        (
+          topic.name.to_string(),
+          topic.partition_count,
+          topic.num_writers,
+        )
+      }),
+      writer_id,
+    )
+    .into_iter()
+    .map(|partition| {
+      let topic = self
+        .topics
+        .get(&partition.topic)
+        .expect("partition inventory must reference a configured topic");
+      let selected_broker = assignment
+        .get(&partition)
+        .map(|broker| ProducerBrokerSnapshot {
+          node_id: broker.node_id.clone(),
+          address: broker.address.clone(),
+        });
+      ProducerRouteSnapshot {
+        topic: partition.topic,
+        virtual_partition_id: partition.virtual_partition_id,
+        producer_writer_id: writer_id,
+        logical_partition_id: partition.virtual_partition_id % topic.partition_count,
+        selected_broker,
+      }
+    })
+    .collect::<Vec<_>>();
+    route_map.sort_by(|left, right| {
+      (&left.topic, left.virtual_partition_id).cmp(&(&right.topic, right.virtual_partition_id))
+    });
 
     let state = self.state.lock().await;
     let mut partition_buffers = state
@@ -234,14 +309,15 @@ impl ProducerDiagnostics {
     });
 
     ProducerStateSnapshot {
-      schema_version: 1,
+      schema_version: 2,
       generated_at_ts_ms,
-      writer_id: producer_writer_id(&self.config),
+      writer_id,
       max_batch_records: producer_max_batch_records(&self.config),
       max_batch_bytes: producer_max_batch_bytes(&self.config),
       flush_max_delay_ms: producer_flush_max_delay_ms(&self.config),
-      broker_node_ids,
+      brokers,
       topics,
+      route_map,
       partition_buffers,
     }
   }
@@ -645,6 +721,26 @@ fn notify_waiters(
   }
 }
 
+fn broker_assignment(
+  topics: &HashMap<String, ProducerTopicConfig>,
+  writer_id: u32,
+  membership: &BrokerMembership,
+) -> BTreeMap<BrokerPartition, BrokerNode> {
+  balanced_assignment(
+    writer_virtual_partitions(
+      topics.values().map(|topic| {
+        (
+          topic.name.to_string(),
+          topic.partition_count,
+          topic.num_writers,
+        )
+      }),
+      writer_id,
+    ),
+    membership,
+  )
+}
+
 async fn send_batch_with_retry(
   config: &ProducerConfig,
   topics: &HashMap<String, ProducerTopicConfig>,
@@ -663,24 +759,29 @@ async fn send_batch_with_retry(
   loop {
     let Some((broker_node_id, broker_address)) = ({
       let membership = membership_rx.borrow();
-      owner_for_partition(&batch.topic, batch.virtual_partition_id, &membership).map_or_else(
-        || {
-          metrics.no_brokers.inc();
-          metrics.failures.inc();
-          metrics
-            .send_latency_seconds
-            .observe(started_at.elapsed().as_secs_f64());
-          warn_every!(
-            15.seconds(),
-            "producer no broker owner: topic={}, virtual_partition_id={}, membership_nodes={}",
-            batch.topic,
-            batch.virtual_partition_id,
-            membership.nodes.len()
-          );
-          None
-        },
-        |broker| Some((broker.node_id.clone(), broker.address.clone())),
-      )
+      broker_assignment(topics, producer_writer_id(config), &membership)
+        .get(&BrokerPartition {
+          topic: batch.topic.clone(),
+          virtual_partition_id: batch.virtual_partition_id,
+        })
+        .map_or_else(
+          || {
+            metrics.no_brokers.inc();
+            metrics.failures.inc();
+            metrics
+              .send_latency_seconds
+              .observe(started_at.elapsed().as_secs_f64());
+            warn_every!(
+              15.seconds(),
+              "producer no broker owner: topic={}, virtual_partition_id={}, membership_nodes={}",
+              batch.topic,
+              batch.virtual_partition_id,
+              membership.nodes.len()
+            );
+            None
+          },
+          |broker| Some((broker.node_id.clone(), broker.address.clone())),
+        )
     }) else {
       return Err(ProducerError::NoBrokersAvailable);
     };

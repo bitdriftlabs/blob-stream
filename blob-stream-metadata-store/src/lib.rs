@@ -127,24 +127,19 @@ pub trait MetadataStore: Send + Sync {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-/// Producer lease key scoped by topic, writer id, and virtual partition.
+/// Producer lease key scoped by topic and virtual partition.
 pub struct ProducerPartitionLeaseKey {
   /// Topic name.
   pub topic: String,
-  /// Producer writer id.
-  pub writer_id: u32,
   /// Virtual partition id.
   pub virtual_partition_id: VirtualPartitionId,
 }
 
 impl ProducerPartitionLeaseKey {
   #[must_use]
-  /// Format as `"{topic}#{writer_id}#{virtual_partition_id}"`.
+  /// Format as `"{topic}#{virtual_partition_id}"`.
   pub fn format(&self) -> String {
-    format!(
-      "{}#{}#{}",
-      self.topic, self.writer_id, self.virtual_partition_id
-    )
+    format!("{}#{}", self.topic, self.virtual_partition_id)
   }
 }
 
@@ -231,8 +226,14 @@ pub enum LeaseReleaseOutcome {
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
-/// Lease store for producer writer fencing and sequence reservation.
+/// Lease store for broker fencing and virtual-partition sequence reservation.
 pub trait ProducerPartitionLeaseStore: Send + Sync {
+  /// Read the current lease row without changing ownership or sequence state.
+  async fn get_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+  ) -> Result<Option<ProducerPartitionLease>>;
+
   /// Acquire or renew a producer partition lease.
   async fn acquire_lease(
     &self,

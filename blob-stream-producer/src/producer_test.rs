@@ -5,6 +5,7 @@ use super::{
   ProducerClientImpl,
   ProducerError,
   ProducerRecord,
+  broker_assignment,
   compute_virtual_partition_id,
   retry_delay_ms,
 };
@@ -13,9 +14,9 @@ use crate::{ProducerCompression, ProducerConfig, ProducerTopicConfig};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bd_server_stats::stats::Collector;
-use blob_stream_broker_discovery::{BrokerMembership, BrokerNode, owner_for_partition};
+use blob_stream_broker_discovery::{BrokerMembership, BrokerNode, BrokerPartition};
 use blob_stream_proto::protos::blobstream::v1::broker::{ProduceBatchResponse, ProduceStatus};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
 
@@ -162,12 +163,33 @@ async fn diagnostics_report_buffered_partition_state() {
     .expect("producer implementation provides diagnostics")
     .state_snapshot()
     .await;
-  assert_eq!(snapshot.schema_version, 1);
+  assert_eq!(snapshot.schema_version, 2);
   assert_eq!(snapshot.writer_id, 1);
   assert_eq!(snapshot.max_batch_records, 2);
-  assert_eq!(snapshot.broker_node_ids, vec!["node-a", "node-b"]);
+  assert_eq!(
+    snapshot.brokers,
+    vec![
+      super::ProducerBrokerSnapshot {
+        node_id: "node-a".to_string(),
+        address: "a:8080".to_string(),
+      },
+      super::ProducerBrokerSnapshot {
+        node_id: "node-b".to_string(),
+        address: "b:8080".to_string(),
+      },
+    ]
+  );
   assert_eq!(snapshot.topics.len(), 1);
   assert_eq!(snapshot.topics[0].name, "telemetry");
+  assert_eq!(snapshot.route_map.len(), 16);
+  let writer_one_partition = snapshot
+    .route_map
+    .iter()
+    .find(|route| route.virtual_partition_id == 16)
+    .expect("writer one partition should be present in the route map");
+  assert_eq!(writer_one_partition.producer_writer_id, 1);
+  assert_eq!(writer_one_partition.logical_partition_id, 0);
+  assert!(writer_one_partition.selected_broker.is_some());
   assert_eq!(snapshot.partition_buffers.len(), 1);
   assert_eq!(snapshot.partition_buffers[0].topic, "telemetry");
   assert_eq!(snapshot.partition_buffers[0].buffered_record_count, 1);
@@ -188,9 +210,10 @@ async fn routes_to_expected_broker() {
   let config = default_config();
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
   let transport = Arc::new(FakeBrokerTransport::default());
+  let topic = topic_config();
   let producer = ProducerClientImpl::new_with_transport(
     config.clone(),
-    vec![topic_config()],
+    vec![topic.clone()],
     discovery,
     transport.clone(),
     metrics_scope(),
@@ -212,8 +235,17 @@ async fn routes_to_expected_broker() {
   let expected_partition = compute_virtual_partition_id(&key, 16, producer_writer_id(&config));
   assert_eq!(ack.virtual_partition_id, expected_partition);
   let discovered_membership = membership();
-  let expected_owner =
-    owner_for_partition("telemetry", expected_partition, &discovered_membership).unwrap();
+  let expected_assignment = broker_assignment(
+    &HashMap::from([("telemetry".to_string(), topic)]),
+    producer_writer_id(&config),
+    &discovered_membership,
+  );
+  let expected_owner = expected_assignment
+    .get(&BrokerPartition {
+      topic: "telemetry".to_string(),
+      virtual_partition_id: expected_partition,
+    })
+    .unwrap();
 
   let sent = transport.sent.lock().await;
   assert_eq!(sent.len(), 1);

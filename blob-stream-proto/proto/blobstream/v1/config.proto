@@ -33,6 +33,10 @@ message BrokerConfig {
   // Compression strategy for stored segment payloads.
   // Default when unset: SEGMENT_COMPRESSION_ZSTD.
   optional SegmentCompression segment_compression = 6 [(validate.rules).enum.defined_only = true];
+
+  // Writer ID / AZ isolation domain served by this broker deployment. This must be explicitly
+  // configured even when the value is 0.
+  optional uint32 writer_id = 7;
 }
 
 // Compression strategy for stored segment payloads.
