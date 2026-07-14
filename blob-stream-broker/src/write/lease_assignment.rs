@@ -2,7 +2,7 @@
 #[path = "./lease_assignment_test.rs"]
 mod tests;
 
-use super::{TopicInfo, WriteEngineImpl};
+use super::{PartitionLocks, TopicInfo, WriteEngineImpl, lock_partition};
 use bd_log::warn_every;
 use bd_time::OffsetDateTimeExt;
 use blob_stream_broker_discovery::{
@@ -76,6 +76,7 @@ impl WriteEngineImpl {
     let state = Arc::clone(&self.state);
     let time_provider = Arc::clone(&self.time_provider);
     let metrics = self.metrics.clone();
+    let partition_locks = Arc::clone(&self.partition_locks);
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
     tokio::spawn(async move {
@@ -132,6 +133,7 @@ impl WriteEngineImpl {
           Self::release_partition_lease(
             &lease_store,
             &state,
+            &partition_locks,
             &holder_id,
             topic,
             *virtual_partition_id,
@@ -151,6 +153,7 @@ impl WriteEngineImpl {
             Self::release_partition_lease(
               &lease_store,
               &state,
+              &partition_locks,
               &holder_id,
               &topic,
               virtual_partition_id,
@@ -165,6 +168,8 @@ impl WriteEngineImpl {
         previously_assigned = currently_owned;
 
         for (topic, virtual_partition_id) in owned {
+          let _partition_guard =
+            lock_partition(&partition_locks, &topic, virtual_partition_id).await;
           let key = ProducerPartitionLeaseKey {
             topic: topic.clone(),
             virtual_partition_id,
@@ -257,11 +262,13 @@ impl WriteEngineImpl {
   async fn release_partition_lease(
     lease_store: &Arc<dyn blob_stream_metadata_store::ProducerPartitionLeaseStore>,
     state: &Arc<tokio::sync::Mutex<super::WriteState>>,
+    partition_locks: &PartitionLocks,
     holder_id: &str,
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
     now_ts_ms: i64,
   ) {
+    let _partition_guard = lock_partition(partition_locks, topic, virtual_partition_id).await;
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string(),
       virtual_partition_id,

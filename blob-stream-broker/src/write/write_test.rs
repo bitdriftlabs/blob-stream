@@ -9,10 +9,15 @@ use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
 use blob_stream_metadata_store::{
   InMemoryMetadataStore,
   InMemoryProducerPartitionLeaseStore,
+  LeaseAcquireOutcome,
+  LeaseHeartbeatOutcome,
+  LeaseReleaseOutcome,
   MetadataStore,
+  ProducerPartitionLease,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
   SegmentMetadata,
+  SequenceReservationOutcome,
 };
 use blob_stream_types::{CompressionCodec, SeqRange, Window, new_record};
 use bytes::Bytes;
@@ -28,6 +33,13 @@ struct GatedBlobStore {
   entered_tx: mpsc::UnboundedSender<String>,
   release_first: Arc<Semaphore>,
   first_write: AtomicBool,
+}
+
+struct GatedReservationLeaseStore {
+  inner: InMemoryProducerPartitionLeaseStore,
+  entered_tx: mpsc::UnboundedSender<()>,
+  release_first: Arc<Semaphore>,
+  first_reservation: AtomicBool,
 }
 
 struct FailsTopicMetadataStore {
@@ -72,6 +84,76 @@ impl BlobStore for GatedBlobStore {
 
   async fn get_range(&self, _key: &BlobKey, _range: ByteRange) -> Result<Bytes> {
     Err(anyhow::anyhow!("reads are not used by this test"))
+  }
+}
+
+#[async_trait]
+impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
+  async fn get_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+  ) -> Result<Option<ProducerPartitionLease>> {
+    self.inner.get_lease(key).await
+  }
+
+  async fn acquire_lease(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+  ) -> Result<LeaseAcquireOutcome> {
+    self
+      .inner
+      .acquire_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .await
+  }
+
+  async fn heartbeat_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+  ) -> Result<LeaseHeartbeatOutcome> {
+    self
+      .inner
+      .heartbeat_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .await
+  }
+
+  async fn reserve_sequences(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    now_ts_ms: i64,
+    reservation_size: u64,
+  ) -> Result<SequenceReservationOutcome> {
+    self
+      .entered_tx
+      .send(())
+      .map_err(|_| anyhow::anyhow!("test receiver dropped"))?;
+    if self.first_reservation.swap(false, Ordering::SeqCst) {
+      self
+        .release_first
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("test gate closed"))?
+        .forget();
+    }
+    self
+      .inner
+      .reserve_sequences(key, holder_id, now_ts_ms, reservation_size)
+      .await
+  }
+
+  async fn release_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    now_ts_ms: i64,
+  ) -> Result<LeaseReleaseOutcome> {
+    self.inner.release_lease(key, holder_id, now_ts_ms).await
   }
 }
 
@@ -350,6 +432,79 @@ async fn buffers_until_size_rollover() -> Result<()> {
   Ok(())
 }
 
+#[tokio::test]
+async fn same_partition_requests_serialize_sequence_reservations() -> Result<()> {
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  config.reservation_size = 1;
+
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release_first = Arc::new(Semaphore::new(0));
+  let lease_store = Arc::new(GatedReservationLeaseStore {
+    inner: InMemoryProducerPartitionLeaseStore::new(),
+    entered_tx,
+    release_first: Arc::clone(&release_first),
+    first_reservation: AtomicBool::new(true),
+  });
+  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+    config,
+    HashMap::from([(
+      "telemetry".to_string(),
+      TopicInfo {
+        name: "telemetry".to_string(),
+        partition_count: 1,
+        num_writers: 1,
+        retention_days: 7,
+      },
+    )]),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    lease_store,
+    "test-node".to_string(),
+    None,
+    time_provider,
+    &metrics_scope(),
+  )?);
+
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  entered_rx.recv().await.expect("first reservation entered");
+
+  let second_engine = Arc::clone(&engine);
+  let second = tokio::spawn(async move {
+    second_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![2], 20)],
+      })
+      .await
+  });
+  assert!(
+    tokio::time::timeout(StdDuration::from_millis(20), entered_rx.recv())
+      .await
+      .is_err(),
+    "second reservation began before the first was installed"
+  );
+
+  release_first.add_permits(1);
+  let first = first.await??;
+  entered_rx.recv().await.expect("second reservation entered");
+  let second = second.await??;
+  assert_eq!(first.seq_range, SeqRange { start: 0, end: 0 });
+  assert_eq!(second.seq_range, SeqRange { start: 1, end: 1 });
+  Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn flushes_on_time_rollover() -> Result<()> {
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
@@ -475,6 +630,98 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
   release_first.add_permits(1);
   first.await??;
   second.await??;
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  config.flush_max_delay_ms = 10;
+
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release_first = Arc::new(Semaphore::new(0));
+  let metadata_store = Arc::new(InMemoryMetadataStore::new());
+  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+    config.clone(),
+    HashMap::from([(
+      "telemetry".to_string(),
+      TopicInfo {
+        name: "telemetry".to_string(),
+        partition_count: 1,
+        num_writers: 1,
+        retention_days: 7,
+      },
+    )]),
+    Arc::new(GatedBlobStore {
+      entered_tx,
+      release_first: Arc::clone(&release_first),
+      first_write: AtomicBool::new(true),
+    }),
+    metadata_store.clone(),
+    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+    "test-node".to_string(),
+    None,
+    time_provider.clone(),
+    &metrics_scope(),
+  )?);
+
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  receive_blob_write(&mut entered_rx).await;
+
+  let second_engine = Arc::clone(&engine);
+  let second = tokio::spawn(async move {
+    second_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![2], 20)],
+      })
+      .await
+  });
+  tokio::task::yield_now().await;
+  assert!(entered_rx.try_recv().is_err());
+  assert!(!second.is_finished());
+
+  release_first.add_permits(1);
+  first.await??;
+  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
+  tokio::time::advance(StdDuration::from_millis(
+    config.flush_max_delay_ms.cast_unsigned(),
+  ))
+  .await;
+  receive_blob_write(&mut entered_rx).await;
+  second.await??;
+
+  let window = Window::for_timestamp(
+    time_provider.now().unix_timestamp_ms() / 1_000,
+    config.window_size_seconds,
+  );
+  let segments = metadata_store.scan_window(&window.key("telemetry")).await?;
+  let mut ranges: Vec<_> = segments
+    .iter()
+    .flat_map(|segment| {
+      segment.segment_index[&0]
+        .iter()
+        .map(|batch| batch.seq_range.clone())
+    })
+    .collect();
+  ranges.sort_by_key(|range| range.start);
+  assert_eq!(
+    ranges,
+    vec![SeqRange { start: 0, end: 0 }, SeqRange { start: 1, end: 1 }]
+  );
   Ok(())
 }
 

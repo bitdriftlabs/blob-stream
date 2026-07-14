@@ -120,6 +120,14 @@ then expose records in range order. A crash or ownership transfer can leave unus
 reserved block, creating gaps, but a new holder reserves only above the durable high-water mark
 and therefore cannot reuse a successfully reserved value.
 
+The broker serializes lease/refill/allocation transitions for each virtual partition, so a delayed
+reservation result cannot replace a newer local allocator range. It also permits only one durable
+flush plan per virtual partition at a time. Later accepted batches may buffer while an earlier
+plan uploads its blob and writes metadata, but they cannot become visible first. Flushes for
+different virtual partitions remain concurrent. This durable visibility order is required because
+a consumer cursor advances past a later `seq_end` and therefore cannot recover an earlier range
+that appears afterward.
+
 A consumer cursor is the greatest processed `seq_end` for one virtual partition. During scans,
 the consumer skips a batch when `batch.seq_end <= cursor` and advances its cursor only forward.
 This makes normal re-scans and late metadata discovery safe under the monotonic sequence
@@ -134,10 +142,13 @@ invariant.
 4. The broker validates the topic, validates the virtual partition range, acquires or renews the
    producer-partition lease, and reserves sequence space as necessary.
 5. The broker buffers accepted batches in memory. It flushes a virtual-partition buffer when its
-   raw payload bytes reach `flush_max_bytes` or its oldest batch reaches `flush_max_delay_ms`.
+  raw payload bytes reach `flush_max_bytes` or its oldest batch reaches `flush_max_delay_ms`. A
+  partition with a durable plan in progress continues buffering its next epoch until that prior
+  plan completes.
 6. A flush serializes each batch as `StoredRecordBatch`, compresses each serialized batch
-   independently, concatenates the stored bytes into a segment blob, uploads the blob, and then
-   writes the segment metadata row.
+  independently, concatenates the stored bytes into a segment blob, uploads the blob, and then
+  writes the segment metadata row. Plans may run concurrently for different virtual partitions,
+  but each virtual partition persists plans in sequence order.
 7. Only after both blob upload and metadata write succeed does the broker complete the waiting
    write and return `OK`. A producer acknowledgement therefore represents durable segment
    metadata, not merely in-memory buffering.
@@ -268,6 +279,8 @@ The design relies on these invariants:
   assigns or routes another writer ID's virtual partitions.
 - Hi-Lo reservations never overlap for a lease key. Unused values may create gaps.
 - Blob upload precedes segment metadata persistence. Producer acknowledgement follows both.
+- Durable metadata visibility follows sequence order within a virtual partition, even when flush
+  plans for other virtual partitions run concurrently.
 - Valid later batches for a virtual partition have `seq_end` greater than already processed
   batches, so cursors never regress.
 - A consumer lease generation fences stale ownership and stale cursor commits.

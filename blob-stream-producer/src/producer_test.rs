@@ -682,6 +682,64 @@ async fn timed_flush_collects_later_batches_while_a_prior_batch_is_in_flight() {
 }
 
 #[tokio::test]
+async fn timed_flush_keeps_ready_batches_buffered_when_dispatches_are_full() {
+  let mut config = default_config();
+  config.max_batch_records = Some(2);
+  config.flush_max_delay_ms = Some(10);
+  config.max_request_concurrency = Some(1);
+
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let transport = Arc::new(GatedBrokerTransport {
+    entered_tx,
+    release: Arc::clone(&release),
+  });
+  let producer = Arc::new(
+    ProducerClientImpl::new_with_transport(
+      config,
+      vec![topic_config()],
+      discovery,
+      transport,
+      metrics_scope(),
+    )
+    .await
+    .unwrap(),
+  );
+  let (first_key, second_key) = keys_for_distinct_partitions();
+
+  let first_producer = Arc::clone(&producer);
+  let first = tokio::spawn(async move {
+    first_producer
+      .produce(ProducerRecord::new("telemetry", first_key, vec![1], 100))
+      .await
+  });
+  entered_rx
+    .recv()
+    .await
+    .expect("first batch entered transport");
+
+  let second_producer = Arc::clone(&producer);
+  let second = tokio::spawn(async move {
+    second_producer
+      .produce(ProducerRecord::new("telemetry", second_key, vec![2], 101))
+      .await
+  });
+  wait_for_buffered_partitions(producer.as_ref(), 1).await;
+  tokio::time::sleep(Duration::from_millis(30)).await;
+  wait_for_buffered_partitions(producer.as_ref(), 1).await;
+
+  release.add_permits(1);
+  first.await.unwrap().unwrap();
+  entered_rx
+    .recv()
+    .await
+    .expect("second batch entered transport");
+  release.add_permits(1);
+  second.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn producer_dispatch_respects_the_shared_concurrency_limit() {
   let mut config = default_config();
   config.max_batch_records = Some(2);

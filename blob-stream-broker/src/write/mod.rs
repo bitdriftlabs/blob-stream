@@ -50,11 +50,29 @@ use std::time::{Duration as StdDuration, Instant};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::ext::NumericalDuration;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot, watch};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
 const MAX_IN_FLIGHT_FLUSH_PLANS: usize = 4;
 type FlushCompletion = oneshot::Sender<Result<(), String>>;
+type PartitionKey = (String, VirtualPartitionId);
+type PartitionLocks = Arc<Mutex<HashMap<PartitionKey, Arc<Mutex<()>>>>>;
+
+async fn lock_partition(
+  partition_locks: &PartitionLocks,
+  topic: &str,
+  virtual_partition_id: VirtualPartitionId,
+) -> OwnedMutexGuard<()> {
+  let partition_lock = {
+    let mut guard = partition_locks.lock().await;
+    Arc::clone(
+      guard
+        .entry((topic.to_string(), virtual_partition_id))
+        .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+  };
+  partition_lock.lock_owned().await
+}
 
 //
 // WriteRequest
@@ -326,6 +344,7 @@ pub struct WriteEngineImpl {
   time_provider: Arc<dyn TimeProvider>,
   metrics: WriteMetrics,
   state: Arc<Mutex<WriteState>>,
+  partition_locks: PartitionLocks,
   flush_permits: Arc<Semaphore>,
   lease_assignment_shutdown_tx: Option<oneshot::Sender<()>>,
 }
@@ -414,6 +433,7 @@ impl WriteEngineImpl {
       time_provider,
       metrics: WriteMetrics::new(metrics_scope),
       state,
+      partition_locks: Arc::new(Mutex::new(HashMap::new())),
       flush_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_FLUSH_PLANS)),
       lease_assignment_shutdown_tx: None,
     };
@@ -516,28 +536,30 @@ impl WriteEngineImpl {
       let mut pending_plans = VecDeque::new();
       let mut flushes = FuturesUnordered::new();
       loop {
-        while let Some((plan, now)) = pending_plans.pop_front() {
+        while let Some(plan) = pending_plans.pop_front() {
           let permit = match Arc::clone(&flush_permits).try_acquire_owned() {
             Ok(permit) => permit,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
-              pending_plans.push_front((plan, now));
+              pending_plans.push_front(plan);
               break;
             },
             Err(tokio::sync::TryAcquireError::Closed) => {
               flush_plan_and_notify(
                 &flush_context,
                 plan,
-                now,
+                time_provider.now(),
                 &metrics,
+                &state,
                 Err(WriteError::Internal(anyhow!("flush scheduler stopped"))),
               )
               .await;
-              while let Some((plan, now)) = pending_plans.pop_front() {
+              while let Some(plan) = pending_plans.pop_front() {
                 flush_plan_and_notify(
                   &flush_context,
                   plan,
-                  now,
+                  time_provider.now(),
                   &metrics,
+                  &state,
                   Err(WriteError::Internal(anyhow!("flush scheduler stopped"))),
                 )
                 .await;
@@ -547,8 +569,10 @@ impl WriteEngineImpl {
           };
           let flush_context = flush_context.clone();
           let metrics = metrics.clone();
+          let state = Arc::clone(&state);
+          let now = time_provider.now();
           flushes.push(async move {
-            flush_plan_and_notify(&flush_context, plan, now, &metrics, Ok(permit)).await;
+            flush_plan_and_notify(&flush_context, plan, now, &metrics, &state, Ok(permit)).await;
           });
         }
 
@@ -565,7 +589,7 @@ impl WriteEngineImpl {
 
             if !plans.is_empty() {
               metrics.record_flush_plan_summary(&plans);
-              pending_plans.extend(plans.into_iter().map(|plan| (plan, now)));
+              pending_plans.extend(plans);
             }
           },
           Some(()) = flushes.next(), if !flushes.is_empty() => {},
@@ -628,6 +652,12 @@ impl WriteEngine for WriteEngineImpl {
 
     let now = self.time_provider.now();
     let now_ts_ms = now.unix_timestamp_ms();
+    let partition_guard = lock_partition(
+      &self.partition_locks,
+      &request.topic,
+      request.virtual_partition_id,
+    )
+    .await;
 
     let needs_lease = {
       let mut state = self.state.lock().await;
@@ -695,6 +725,7 @@ impl WriteEngine for WriteEngineImpl {
       let plans = state.collect_flush_plans(now_ts_ms, &self.config);
       (seq_range, plans)
     };
+    drop(partition_guard);
 
     if !plans.is_empty() {
       self.metrics.record_flush_plan_summary(&plans);
@@ -703,6 +734,7 @@ impl WriteEngine for WriteEngineImpl {
         plans,
         now,
         &self.metrics,
+        &self.state,
         &self.flush_permits,
       )
       .await;
@@ -928,19 +960,21 @@ async fn flush_plans_and_notify(
   plans: Vec<FlushPlan>,
   now: OffsetDateTime,
   metrics: &WriteMetrics,
+  state: &Arc<Mutex<WriteState>>,
   flush_permits: &Arc<Semaphore>,
 ) {
   let mut flushes = FuturesUnordered::new();
   for plan in plans {
     let flush_context = flush_context.clone();
     let metrics = metrics.clone();
+    let state = Arc::clone(state);
     let flush_permits = Arc::clone(flush_permits);
     flushes.push(async move {
       let permit = flush_permits
         .acquire_owned()
         .await
         .map_err(|_| WriteError::Internal(anyhow!("flush scheduler stopped")));
-      flush_plan_and_notify(&flush_context, plan, now, &metrics, permit).await;
+      flush_plan_and_notify(&flush_context, plan, now, &metrics, &state, permit).await;
     });
   }
 
@@ -954,8 +988,15 @@ async fn flush_plan_and_notify(
   mut plan: FlushPlan,
   now: OffsetDateTime,
   metrics: &WriteMetrics,
+  state: &Arc<Mutex<WriteState>>,
   permit: Result<OwnedSemaphorePermit, WriteError>,
 ) {
+  let flushed_partitions: Vec<_> = plan
+    .partitions
+    .iter()
+    .map(|partition| partition.virtual_partition_id)
+    .collect();
+  let topic = plan.topic.clone();
   let mut completions = Vec::new();
   for partition in &mut plan.partitions {
     for batch in &mut partition.batches {
@@ -982,11 +1023,28 @@ async fn flush_plan_and_notify(
       Err(error)
     },
   };
+  mark_flush_complete(state, &topic, &flushed_partitions).await;
   let completion_result = result
     .as_ref()
     .map_or_else(|error| Err(error.to_string()), |_ok| Ok(()));
   for completion in completions {
     let _ignored = completion.send(completion_result.clone());
+  }
+}
+
+async fn mark_flush_complete(
+  state: &Arc<Mutex<WriteState>>,
+  topic: &str,
+  virtual_partition_ids: &[VirtualPartitionId],
+) {
+  let mut guard = state.lock().await;
+  let Some(topic_state) = guard.topics.get_mut(topic) else {
+    return;
+  };
+  for virtual_partition_id in virtual_partition_ids {
+    if let Some(partition_state) = topic_state.partitions.get_mut(virtual_partition_id) {
+      partition_state.flush_in_flight = false;
+    }
   }
 }
 
@@ -1025,7 +1083,9 @@ impl WriteState {
       let mut partitions = Vec::new();
 
       for (virtual_partition_id, partition_state) in &mut topic_state.partitions {
-        if !partition_state.buffer.should_flush(now_ts_ms, config) {
+        if partition_state.flush_in_flight
+          || !partition_state.buffer.should_flush(now_ts_ms, config)
+        {
           continue;
         }
 
@@ -1038,6 +1098,7 @@ impl WriteState {
         }
 
         partition_state.buffer.reset();
+        partition_state.flush_in_flight = true;
         partitions.push(FlushPartition {
           virtual_partition_id: *virtual_partition_id,
           batches,
@@ -1074,6 +1135,7 @@ struct PartitionState {
   buffer: BufferState,
   seq_allocator: SeqAllocator,
   lease_expiration_ts_ms: Option<i64>,
+  flush_in_flight: bool,
 }
 
 impl PartitionState {

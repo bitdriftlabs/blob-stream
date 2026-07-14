@@ -586,9 +586,15 @@ impl ProducerClientImpl {
       loop {
         tokio::select! {
           _ = ticker.tick() => {
+            let max_dispatches = usize::try_from(producer_max_request_concurrency(&config))
+              .unwrap_or(usize::MAX);
+            let dispatch_capacity = max_dispatches.saturating_sub(dispatches.len());
             let batches = {
               let mut guard = state.lock().await;
-              guard.collect_ready_batches(producer_flush_max_delay_ms(&config))
+              guard.collect_ready_batches(
+                producer_flush_max_delay_ms(&config),
+                dispatch_capacity,
+              )
             };
 
             if !batches.is_empty() {
@@ -1053,10 +1059,17 @@ impl ProducerState {
     None
   }
 
-  fn collect_ready_batches(&mut self, flush_max_delay_ms: u64) -> Vec<BufferedBatch> {
+  fn collect_ready_batches(
+    &mut self,
+    flush_max_delay_ms: u64,
+    max_batches: usize,
+  ) -> Vec<BufferedBatch> {
     let mut ready = Vec::new();
 
     for ((topic, virtual_partition_id), buffer) in &mut self.buffers {
+      if ready.len() == max_batches {
+        break;
+      }
       if !buffer.should_flush_by_time(flush_max_delay_ms) {
         continue;
       }
