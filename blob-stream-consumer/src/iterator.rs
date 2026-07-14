@@ -477,7 +477,7 @@ impl ConsumerIteratorImpl {
       HashMap::new(),
       blob_store,
       metadata_store,
-      metrics_scope.scope("consumer"),
+      &metrics_scope.scope("consumer"),
     )?));
     let coordinator = ConsumerGroupCoordinatorImpl::new(group_config.clone(), lease_store)?;
     let now_ts_ms = now_unix_millis();

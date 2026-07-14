@@ -274,7 +274,7 @@ impl ConsumerReaderImpl {
     initial_cursors: HashMap<VirtualPartitionId, u64>,
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
-    metrics_scope: Scope,
+    metrics_scope: &Scope,
   ) -> Result<Self> {
     validate_read_config(&config)?;
     trace!(
@@ -292,7 +292,7 @@ impl ConsumerReaderImpl {
       config,
       blob_store,
       metadata_store,
-      metrics: ConsumerReaderMetrics::new(&metrics_scope),
+      metrics: ConsumerReaderMetrics::new(metrics_scope),
     })
   }
 

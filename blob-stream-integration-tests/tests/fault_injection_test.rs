@@ -103,7 +103,7 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
-    metrics_scope("blob_stream_consumer_it"),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -194,7 +194,7 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
-    metrics_scope("blob_stream_consumer_it"),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -343,7 +343,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
-    metrics_scope("blob_stream_consumer_it"),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -448,7 +448,7 @@ async fn broker_response_timeout_retry_budget_respected() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
-    metrics_scope("blob_stream_consumer_it"),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -538,7 +538,7 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
-    metrics_scope("blob_stream_consumer_it"),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -619,7 +619,7 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
-    metrics_scope("blob_stream_consumer_it"),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -734,7 +734,7 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
-    metrics_scope("blob_stream_consumer_it"),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -829,7 +829,7 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
-    metrics_scope("blob_stream_consumer_it"),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -987,7 +987,7 @@ async fn producer_lease_store_conflict_then_expiry_takeover() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
-    metrics_scope("blob_stream_consumer_it"),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -1372,7 +1372,7 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
       HashMap::new(),
       resources.blob_store(),
       resources.metadata_store(),
-      metrics_scope("blob_stream_consumer_it"),
+      &metrics_scope("blob_stream_consumer_it"),
     )?;
     drain_reader_until(
       &mut reader,
@@ -1511,7 +1511,7 @@ async fn combined_network_and_metadata_faults_end_to_end() -> Result<()> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
-    metrics_scope("blob_stream_consumer_it"),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -1644,7 +1644,7 @@ async fn run_fit_012_scenario() -> Result<Fit012Outcome> {
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
-    metrics_scope("blob_stream_consumer_it"),
+    &metrics_scope("blob_stream_consumer_it"),
   )?;
 
   let mut consumed_ids = HashSet::new();

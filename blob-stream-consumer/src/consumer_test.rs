@@ -127,7 +127,7 @@ async fn advances_cursor_and_dedupes_on_rescan() {
     HashMap::new(),
     blob_store,
     metadata_store,
-    metrics_scope(),
+    &metrics_scope(),
   )
   .unwrap();
 
@@ -170,7 +170,7 @@ async fn catches_late_metadata_with_lookback_window() {
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
-    metrics_scope(),
+    &metrics_scope(),
   )
   .unwrap();
 
@@ -226,7 +226,7 @@ async fn decodes_zstd_compressed_batches() {
     HashMap::new(),
     blob_store,
     metadata_store,
-    metrics_scope(),
+    &metrics_scope(),
   )
   .unwrap();
 
