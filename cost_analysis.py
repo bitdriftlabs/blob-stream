@@ -51,6 +51,8 @@ class Inputs:
 
   window_size_s: float
   lookback_windows: float
+  metadata_recovery_scan_interval_s: float
+  metadata_fast_scan_enabled: bool
   heartbeat_cons_s: float
   rebalance_interval_s: float
 
@@ -175,13 +177,28 @@ def compute(i: Inputs) -> dict[str, float]:
   req_ddb_w_total *= 1.0 + max(i.f_write_conflict_overhead, 0.0)
 
   # ---------- DynamoDB read request counts ----------
-  # Metadata scans per poll: one query per lookback window, times pagination.
-  req_ddb_r_scan = (
-    i.n_cons
-    * (i.polls_per_s * 3600.0)
-    * i.lookback_windows
-    * i.pages_per_scan_window_query
-  )
+  # Metadata fast path: one current-window query per poll, times pagination. Recovery scans
+  # revisit every lookback window at the configured cadence to find lower-snowflake stragglers.
+  if i.metadata_fast_scan_enabled:
+    req_ddb_r_scan_fast = (
+      i.n_cons * (i.polls_per_s * 3600.0) * i.pages_per_scan_window_query
+    )
+    req_ddb_r_scan_recovery = (
+      i.n_cons
+      * (3600.0 / max(i.metadata_recovery_scan_interval_s, 1e-9))
+      * i.lookback_windows
+      * i.pages_per_scan_window_query
+    )
+  else:
+    # Rollback mode retains the legacy unbounded lookback scan for every poll.
+    req_ddb_r_scan_fast = 0.0
+    req_ddb_r_scan_recovery = (
+      i.n_cons
+      * (i.polls_per_s * 3600.0)
+      * i.lookback_windows
+      * i.pages_per_scan_window_query
+    )
+  req_ddb_r_scan = req_ddb_r_scan_fast + req_ddb_r_scan_recovery
 
   # Membership snapshot query at rebalance cadence, times pagination.
   req_ddb_r_membership = (
@@ -225,6 +242,8 @@ def compute(i: Inputs) -> dict[str, float]:
     "req_s3_put": req_s3_put,
     "req_s3_get": req_s3_get,
     "req_ddb_w_total": req_ddb_w_total,
+    "req_ddb_r_scan_fast": req_ddb_r_scan_fast,
+    "req_ddb_r_scan_recovery": req_ddb_r_scan_recovery,
     "req_ddb_r_total": req_ddb_r_total,
     "wru_hour": wru_hour,
     "rru_hour": rru_hour,
@@ -243,6 +262,8 @@ def print_report(i: Inputs, result: dict[str, float]) -> None:
   print(f"S3 PUT requests/hour:                {result['req_s3_put']:,.2f}")
   print(f"S3 GET requests/hour:                {result['req_s3_get']:,.2f}")
   print(f"Dynamo write requests/hour:          {result['req_ddb_w_total']:,.2f}")
+  print(f"Dynamo fast scan requests/hour:      {result['req_ddb_r_scan_fast']:,.2f}")
+  print(f"Dynamo recovery scan requests/hour:  {result['req_ddb_r_scan_recovery']:,.2f}")
   print(f"Dynamo read requests/hour:           {result['req_ddb_r_total']:,.2f}")
   print(f"Dynamo WRU/hour:                     {result['wru_hour']:,.2f}")
   print(f"Dynamo RRU/hour:                     {result['rru_hour']:,.2f}")
@@ -275,7 +296,9 @@ DEFAULTS = Inputs(
   lease_duration_prod_s=30.0,
   reservation_size=1000.0,
   window_size_s=300.0,
-  lookback_windows=3.0,
+  lookback_windows=2.0,
+  metadata_recovery_scan_interval_s=60.0,
+  metadata_fast_scan_enabled=True,
   heartbeat_cons_s=10.0,
   rebalance_interval_s=10.0,
   polls_per_s=2.0,

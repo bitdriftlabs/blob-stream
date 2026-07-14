@@ -129,6 +129,18 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
     )
     .await?;
 
+  let _scan_event = cluster
+    .wait_for_event(
+      &TestEventMatcher {
+        category: Some("store".to_string()),
+        operation: Some("metadata_scan_window".to_string()),
+        key_contains: None,
+        status: Some("ok".to_string()),
+      },
+      Duration::from_secs(5),
+    )
+    .await?;
+
   cluster.shutdown().await;
   resources.cleanup().await;
 

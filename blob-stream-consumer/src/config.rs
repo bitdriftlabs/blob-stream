@@ -16,6 +16,7 @@ const DEFAULT_LOOKBACK_WINDOWS: u32 = 2;
 const DEFAULT_IDLE_POLL_DELAY_MS: u64 = 250;
 const DEFAULT_MAX_IDLE_POLL_DELAY_MS: u64 = 2_000;
 const DEFAULT_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_METADATA_RECOVERY_SCAN_INTERVAL_SECONDS: u64 = 60;
 const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: i64 = 10_000;
 const DEFAULT_REBALANCE_INTERVAL_MS: i64 = 10_000;
@@ -60,6 +61,20 @@ pub fn consumer_prefetch_max_bytes(config: &ConsumerReadConfig) -> u64 {
   config
     .prefetch_max_bytes
     .unwrap_or(DEFAULT_PREFETCH_MAX_BYTES)
+}
+
+#[must_use]
+/// Return the interval between unbounded metadata recovery scans in seconds.
+pub fn consumer_metadata_recovery_scan_interval_seconds(config: &ConsumerReadConfig) -> u64 {
+  config
+    .metadata_recovery_scan_interval_seconds
+    .unwrap_or(DEFAULT_METADATA_RECOVERY_SCAN_INTERVAL_SECONDS)
+}
+
+#[must_use]
+/// Return whether bounded metadata scans are enabled between recovery scans.
+pub fn consumer_metadata_fast_scan_enabled(config: &ConsumerReadConfig) -> bool {
+  config.metadata_fast_scan_enabled.unwrap_or(true)
 }
 
 #[must_use]

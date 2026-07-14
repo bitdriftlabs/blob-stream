@@ -333,6 +333,22 @@ message ConsumerReadConfig {
   // - Increase to reduce foreground `next()` latency and improve burst absorption.
   // - Decrease to reduce process memory footprint when running many consumers per host.
   optional uint64 prefetch_max_bytes = 6 [(validate.rules).uint64.gt = 0];
+
+  // Interval between unbounded metadata recovery scans.
+  // Default when unset: 60 seconds.
+  //
+  // Between recovery scans, consumers query only the active window from their observed
+  // snowflake watermark. Recovery scans query all configured lookback windows without a
+  // snowflake bound so they discover metadata that becomes visible late with an earlier
+  // snowflake id.
+  optional uint64 metadata_recovery_scan_interval_seconds = 7 [(validate.rules).uint64.gt = 0];
+
+  // Enable bounded current-window metadata scans between recovery scans.
+  // Default when unset: true.
+  //
+  // Set to false to scan every configured lookback window without a snowflake bound on each
+  // read, preserving the legacy behavior while investigating a rollout issue.
+  optional bool metadata_fast_scan_enabled = 8;
 }
 
 // Consumer group lease and heartbeat settings.

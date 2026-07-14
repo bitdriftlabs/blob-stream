@@ -118,8 +118,13 @@ pub trait MetadataStore: Send + Sync {
   /// Persist metadata for a flushed segment.
   async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()>;
 
-  /// Scan a single window for segments. Results are unordered for cost and performance.
-  async fn scan_window(&self, window: &TopicWindowKey) -> Result<Vec<SegmentMetadata>>;
+  /// Scan a single window from an optional inclusive snowflake lower bound. Results are unordered
+  /// for cost and performance.
+  async fn scan_window_from_snowflake(
+    &self,
+    window: &TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
+  ) -> Result<Vec<SegmentMetadata>>;
 }
 
 //

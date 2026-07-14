@@ -226,15 +226,35 @@ For every `read_available()` call, a consumer:
 
 1. Computes the current aligned time window plus the configured trailing
    `lookback_windows`.
-2. Scans each metadata window concurrently. Metadata-store scans are intentionally unordered for
-   cost and performance.
-3. Sorts segments by snowflake ID, filters their indexes to assigned virtual partitions, and sorts
+2. Selects a scan mode:
+   - At startup, after an assignment change, and at each
+     `metadata_recovery_scan_interval_seconds`, performs an unbounded recovery scan of every
+     window in that lookback set. The default interval is one minute.
+   - Between recovery scans, queries only the current window with an inclusive lower bound equal
+     to the largest snowflake previously observed for that window.
+   - When `metadata_fast_scan_enabled` is `false`, performs the unbounded lookback scan on every
+     read, preserving the legacy behavior for rollback.
+3. Queries the selected metadata windows concurrently. DynamoDB applies the optional snowflake
+   lower bound to its sort key and follows all result pages. Metadata-store results remain
+   intentionally unordered by contract.
+4. Sorts segments by snowflake ID, filters their indexes to assigned virtual partitions, and sorts
    batches within each partition by `seq_start`.
-4. Skips ranges already covered by the in-memory cursor.
-5. Fetches only the indexed blob byte range, decompresses it, decodes `StoredRecordBatch`, and
+5. Skips ranges already covered by the in-memory cursor.
+6. Fetches only the indexed blob byte range, decompresses it, decodes `StoredRecordBatch`, and
    verifies its virtual partition matches the metadata entry.
-6. Emits the records and advances the cursor to the greater of its existing value and the batch
+7. Emits the records and advances the cursor to the greater of its existing value and the batch
    `seq_end`.
+
+The reader advances an in-memory per-window snowflake watermark only after the full scan and
+batch-processing cycle succeeds. It retains the bound inclusively, so the boundary row is replayed
+and removed by cursor deduplication. Watermarks are discarded after an assignment change and
+pruned once their windows leave the lookback horizon.
+
+Consumer metrics distinguish fast and recovery query volume. `metadata_recovery_scan_hits`
+counts successful recovery passes that emit one or more new batches, and
+`metadata_recovery_scan_batches_read` counts those emitted batches. These counters exclude
+recovery results discarded by cursor deduplication; `metadata_recovery_scan_segments` instead
+measures the raw recovery scan volume.
 
 The iterator adds a background prefetch buffer with a configurable soft byte budget. It pauses
 prefetch after crossing the budget and resumes when callers drain buffered records. A partition
@@ -242,17 +262,22 @@ revocation removes buffered data for that partition before the new assignment be
 
 ### Delayed Metadata Bound
 
-The reader repeatedly scans recent windows so a metadata row that becomes visible after an
-earlier scan can still be discovered. This protection is bounded:
+The fast path discovers newly written current-window metadata immediately when its snowflake is
+at or above the observed watermark. A metadata row that becomes visible late with an earlier
+snowflake is discovered on the next unbounded recovery scan. With the default one-minute interval,
+the additional detection delay is approximately one minute plus the next poll.
+
+Recovery scans only cover the configured recent windows, so this protection remains bounded:
 
 ```
 late-metadata coverage = window_size_seconds * lookback_windows
 ```
 
-Metadata that arrives after that horizon is not automatically rediscovered without increasing
-the lookback or performing an explicit recovery scan. The default five-minute window and two
-lookback windows provide ten minutes of coverage. Operators must size the horizon for expected
-metadata delays, retries, outages, and clock skew.
+Metadata that becomes visible after its window has left that horizon is not automatically
+rediscovered. The default five-minute window and two lookback windows provide ten minutes of
+recovery coverage. Event timestamps do not affect metadata selection; the bound is based on
+segment snowflakes. Operators must size the horizon and recovery interval for expected metadata
+delays, retries, outages, and clock skew.
 
 ## Consumer Group Coordination
 
@@ -271,7 +296,8 @@ handoff time.
 During rebalance, an iterator stops delivering revoked partitions, discards their prefetched
 records, invokes the configured revocation callback, and waits for callback completion before
 activating the replacement assignment. A replacement owner hydrates its reader from the committed
-cursor, then continues normal lookback scans.
+cursor, clears scan watermarks, and performs an unbounded lookback recovery scan before resuming
+the bounded fast path.
 
 ## Correctness and Failure Behavior
 
@@ -288,7 +314,8 @@ The design relies on these invariants:
 - Valid later batches for a virtual partition have `seq_end` greater than already processed
   batches, so cursors never regress.
 - A consumer lease generation fences stale ownership and stale cursor commits.
-- Lookback scanning finds late metadata only while it remains inside the configured scan horizon.
+- Recovery scans find late lower-snowflake metadata only while it remains inside the configured
+  scan horizon.
 
 These invariants prevent a consumer from treating an already committed cursor as unprocessed
 work, but they do not provide exactly-once delivery. Applications needing exactly-once effects
@@ -311,6 +338,8 @@ defaults are:
 | Producer retries | 5 |
 | Consumer metadata window | 300 seconds |
 | Consumer lookback | 2 windows |
+| Consumer metadata recovery scan | 60 seconds |
+| Consumer metadata fast scan | enabled |
 | Consumer prefetch target | 64 MiB |
 | Consumer lease duration | 30 seconds |
 | Consumer heartbeat and rebalance intervals | 10 seconds |

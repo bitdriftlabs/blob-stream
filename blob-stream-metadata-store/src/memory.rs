@@ -5,7 +5,7 @@ mod tests;
 use crate::{MetadataStore, SegmentMetadata};
 use anyhow::Result;
 use async_trait::async_trait;
-use blob_stream_types::TopicWindowKey;
+use blob_stream_types::{SnowflakeId, TopicWindowKey};
 use log::trace;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
@@ -41,16 +41,30 @@ impl MetadataStore for InMemoryMetadataStore {
     Ok(())
   }
 
-  async fn scan_window(&self, window: &TopicWindowKey) -> Result<Vec<SegmentMetadata>> {
+  async fn scan_window_from_snowflake(
+    &self,
+    window: &TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
+  ) -> Result<Vec<SegmentMetadata>> {
     trace!(
-      "metadata(memory) scan_window: topic={}, window_start={}",
-      window.topic, window.window_start_unix_seconds
+      "metadata(memory) scan_window: topic={}, window_start={}, min_snowflake={:?}",
+      window.topic,
+      window.window_start_unix_seconds,
+      min_snowflake.map(SnowflakeId::as_u64)
     );
     let guard = self.windows.read().await;
     let Some(segments) = guard.get(&window.format()) else {
       return Ok(Vec::new());
     };
 
-    Ok(segments.clone())
+    Ok(
+      segments
+        .iter()
+        .filter(|segment| {
+          min_snowflake.is_none_or(|min_snowflake| segment.snowflake_id >= min_snowflake)
+        })
+        .cloned()
+        .collect(),
+    )
   }
 }
