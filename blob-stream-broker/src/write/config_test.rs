@@ -66,6 +66,20 @@ fn respects_explicit_sequence_reservation_size() {
 }
 
 #[test]
+fn rejects_zero_sequence_reservation_size() {
+  let mut broker_config = BrokerConfig::new();
+  broker_config.writer_id = Some(0);
+  broker_config.sequence_reservation_size = Some(0);
+
+  let error = WriteConfig::from_broker_config(&broker_config).unwrap_err();
+
+  assert_eq!(
+    error.to_string(),
+    "broker sequence_reservation_size must be positive"
+  );
+}
+
+#[test]
 fn respects_uncompressed_segment_configuration() {
   let mut broker_config = BrokerConfig::new();
   broker_config.writer_id = Some(0);

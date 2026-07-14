@@ -734,24 +734,15 @@ async fn dispatch_batches(
 ) -> Vec<Result<ProducerAck, ProducerError>> {
   let mut dispatches = FuturesUnordered::new();
   for batch in batches {
-    let config = config.clone();
-    let topics = topics.clone();
-    let membership_rx = membership_rx.clone();
-    let transport = Arc::clone(transport);
-    let metrics = Arc::clone(metrics);
-    let dispatch_permits = Arc::clone(dispatch_permits);
-    dispatches.push(async move {
-      dispatch_batch(
-        &config,
-        &topics,
-        &membership_rx,
-        &transport,
-        &metrics,
-        &dispatch_permits,
-        batch,
-      )
-      .await
-    });
+    dispatches.push(dispatch_batch(
+      config,
+      topics,
+      membership_rx,
+      transport,
+      metrics,
+      dispatch_permits,
+      batch,
+    ));
   }
 
   let mut results = Vec::new();

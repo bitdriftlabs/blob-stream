@@ -31,9 +31,10 @@ pub fn now_unix_seconds() -> i64 {
 #[must_use]
 /// Format a Unix timestamp in milliseconds as an RFC 3339 UTC timestamp for diagnostics.
 pub fn format_unix_timestamp_ms(timestamp_ms: i64) -> String {
-  let Ok(timestamp) =
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp_ms) * 1_000_000)
-  else {
+  let Some(timestamp_ns) = i128::from(timestamp_ms).checked_mul(1_000_000) else {
+    return format!("invalid Unix timestamp: {timestamp_ms} ms");
+  };
+  let Ok(timestamp) = OffsetDateTime::from_unix_timestamp_nanos(timestamp_ns) else {
     return format!("invalid Unix timestamp: {timestamp_ms} ms");
   };
   timestamp

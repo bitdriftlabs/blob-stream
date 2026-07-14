@@ -99,6 +99,10 @@ impl WriteConfig {
     }
 
     if let Some(sequence_reservation_size) = broker.sequence_reservation_size {
+      ensure!(
+        sequence_reservation_size > 0,
+        "broker sequence_reservation_size must be positive"
+      );
       config.reservation_size = u64::from(sequence_reservation_size);
     }
 
