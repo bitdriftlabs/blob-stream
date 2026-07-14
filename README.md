@@ -321,4 +321,9 @@ Broker exposes Prometheus metrics at:
 - `GET /metrics`
 
 Producer and consumer libraries also emit metrics through `bd-server-stats`.
+For consumer metadata scans, monitor `metadata_recovery_scan_hits` and
+`metadata_recovery_scan_batches_read`: they count successful unbounded recovery passes that
+returned new batches. Compare them with `metadata_recovery_scan_requests`,
+`metadata_recovery_scan_segments`, and
+`metadata_recovery_scan_failures` when tuning the recovery interval and scan horizon.
 

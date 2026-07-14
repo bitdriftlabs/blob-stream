@@ -150,7 +150,7 @@ async fn writes_and_scans_window() -> Result<()> {
     topic: "topic-a".to_string(),
     window_start_unix_seconds: 100,
   };
-  let segments = store.scan_window(&window).await?;
+  let segments = store.scan_window_from_snowflake(&window, None).await?;
 
   assert_eq!(segments.len(), 2);
   assert!(segments.contains(&first));
@@ -158,6 +158,32 @@ async fn writes_and_scans_window() -> Result<()> {
 
   client.delete_table().table_name(table_name).send().await?;
 
+  Ok(())
+}
+
+#[tokio::test]
+async fn scans_window_from_inclusive_snowflake() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("blob_segments_test_{}", Uuid::new_v4());
+  create_segments_table(&client, &table_name).await?;
+
+  let store = DynamoMetadataStore::new(client.clone(), table_name.clone());
+  let first = build_segment("topic-a", 100, 1);
+  let second = build_segment("topic-a", 100, 2);
+  store.write_segment(first).await?;
+  store.write_segment(second.clone()).await?;
+
+  let window = TopicWindowKey {
+    topic: "topic-a".to_string(),
+    window_start_unix_seconds: 100,
+  };
+  let segments = store
+    .scan_window_from_snowflake(&window, Some(SnowflakeId(2)))
+    .await?;
+
+  assert_eq!(segments, vec![second]);
+
+  client.delete_table().table_name(&table_name).send().await?;
   Ok(())
 }
 

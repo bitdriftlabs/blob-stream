@@ -21,9 +21,10 @@ use blob_stream_metadata_store::{
   MetadataStore,
   SegmentMetadata,
 };
-use blob_stream_producer::{ProducerClient, ProducerRecord};
+use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerRecord};
 use blob_stream_types::{
   CommittedCursor,
+  SnowflakeId,
   logical_partition_for_key,
   now_unix_millis,
   virtual_partition_for_logical,
@@ -103,12 +104,16 @@ impl MetadataStore for DelayedVisibilityMetadataStore {
     Ok(())
   }
 
-  async fn scan_window(
+  async fn scan_window_from_snowflake(
     &self,
     window: &blob_stream_types::TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
   ) -> Result<Vec<SegmentMetadata>> {
     self.flush_visible_segments().await?;
-    self.inner.scan_window(window).await
+    self
+      .inner
+      .scan_window_from_snowflake(window, min_snowflake)
+      .await
   }
 }
 
@@ -1112,6 +1117,37 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
   Ok(())
 }
 
+async fn wait_for_producer_route(
+  producer: &ProducerClientImpl,
+  node_id: &str,
+  address: &str,
+  deadline: Instant,
+) -> Result<()> {
+  loop {
+    let snapshot = producer
+      .diagnostics()
+      .expect("producer diagnostics must be available")
+      .state_snapshot()
+      .await;
+    let routes_converged = !snapshot.route_map.is_empty()
+      && snapshot.route_map.iter().all(|route| {
+        route
+          .selected_broker
+          .as_ref()
+          .is_some_and(|broker| broker.node_id == node_id && broker.address == address)
+      });
+    if routes_converged {
+      return Ok(());
+    }
+    if Instant::now() >= deadline {
+      return Err(anyhow!(
+        "producer route did not converge to {node_id} at {address}: {snapshot:#?}"
+      ));
+    }
+    sleep(Duration::from_millis(10)).await;
+  }
+}
+
 // High-level: verifies progress and no-loss continuity while the active broker is restarted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn active_broker_restart_continuity() -> Result<()> {
@@ -1139,6 +1175,13 @@ async fn active_broker_restart_continuity() -> Result<()> {
     metrics_scope("blob_stream_producer_it"),
   )
   .await?;
+  wait_for_producer_route(
+    &producer,
+    &active_node.node_id,
+    &active_node.address,
+    Instant::now() + Duration::from_secs(10),
+  )
+  .await?;
 
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
@@ -1162,10 +1205,25 @@ async fn active_broker_restart_continuity() -> Result<()> {
 
   for message_id in 0 .. total_messages {
     if message_id == restart_at {
-      // Keep routing available while the active node is down, then switch back to restarted node.
+      // Let discovery reach the producer before stopping the active endpoint, then wait for the
+      // new endpoint after restart so the next produce does not retry a stale socket.
       cluster.set_active_nodes(vec![standby_node.clone()]);
+      wait_for_producer_route(
+        &producer,
+        &standby_node.node_id,
+        &standby_node.address,
+        Instant::now() + Duration::from_secs(10),
+      )
+      .await?;
       active_node = cluster.restart_broker_by_id(&active_node.node_id).await?;
       cluster.set_active_nodes(vec![active_node.clone()]);
+      wait_for_producer_route(
+        &producer,
+        &active_node.node_id,
+        &active_node.address,
+        Instant::now() + Duration::from_secs(10),
+      )
+      .await?;
     }
 
     let id = format!("restart-active-{message_id}");

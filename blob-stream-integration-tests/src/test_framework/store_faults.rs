@@ -19,7 +19,7 @@ use blob_stream_metadata_store::{
   SegmentMetadata,
   SequenceReservationOutcome,
 };
-use blob_stream_types::{CommittedCursor, TopicWindowKey};
+use blob_stream_types::{CommittedCursor, SnowflakeId, TopicWindowKey};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
@@ -542,6 +542,52 @@ impl FaultInjectedMetadataStore {
   pub fn new(inner: Arc<dyn MetadataStore>, controller: StoreFaultController) -> Self {
     Self { inner, controller }
   }
+
+  async fn scan_window_with_bound(
+    &self,
+    window: &TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
+  ) -> Result<Vec<SegmentMetadata>> {
+    let key = window.format();
+    let effects = self
+      .controller
+      .effects_for_call(
+        StoreFaultDomain::Metadata,
+        StoreFaultOperation::MetadataScanWindow,
+        &key,
+      )
+      .await;
+
+    if let Some(delay) = effects.delay {
+      sleep(delay).await;
+    }
+    if let Some(timeout) = effects.timeout {
+      sleep(timeout).await;
+      return Err(anyhow!("metadata scan timed out for window {key}"));
+    }
+    if let Some(message) = effects.fail_message {
+      return Err(anyhow!("metadata scan fault for window {key}: {message}"));
+    }
+
+    let mut visible = self.controller.visible_metadata_for_window(window).await;
+    visible.retain(|segment| {
+      min_snowflake.is_none_or(|min_snowflake| segment.snowflake_id >= min_snowflake)
+    });
+    if effects.stale_read {
+      return Ok(visible);
+    }
+
+    let mut scanned = self
+      .inner
+      .scan_window_from_snowflake(window, min_snowflake)
+      .await?;
+    scanned.append(&mut visible);
+    self
+      .controller
+      .record_operation_outcome(StoreFaultOperation::MetadataScanWindow, key, "ok", None)
+      .await;
+    Ok(scanned)
+  }
 }
 
 #[async_trait]
@@ -589,40 +635,12 @@ impl MetadataStore for FaultInjectedMetadataStore {
     result
   }
 
-  async fn scan_window(&self, window: &TopicWindowKey) -> Result<Vec<SegmentMetadata>> {
-    let key = window.format();
-    let effects = self
-      .controller
-      .effects_for_call(
-        StoreFaultDomain::Metadata,
-        StoreFaultOperation::MetadataScanWindow,
-        &key,
-      )
-      .await;
-
-    if let Some(delay) = effects.delay {
-      sleep(delay).await;
-    }
-    if let Some(timeout) = effects.timeout {
-      sleep(timeout).await;
-      return Err(anyhow!("metadata scan timed out for window {key}"));
-    }
-    if let Some(message) = effects.fail_message {
-      return Err(anyhow!("metadata scan fault for window {key}: {message}"));
-    }
-
-    let mut visible = self.controller.visible_metadata_for_window(window).await;
-    if effects.stale_read {
-      return Ok(visible);
-    }
-
-    let mut scanned = self.inner.scan_window(window).await?;
-    scanned.append(&mut visible);
-    self
-      .controller
-      .record_operation_outcome(StoreFaultOperation::MetadataScanWindow, key, "ok", None)
-      .await;
-    Ok(scanned)
+  async fn scan_window_from_snowflake(
+    &self,
+    window: &TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
+  ) -> Result<Vec<SegmentMetadata>> {
+    self.scan_window_with_bound(window, min_snowflake).await
   }
 }
 

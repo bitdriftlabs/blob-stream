@@ -107,43 +107,72 @@ impl MetadataStore for DynamoMetadataStore {
     Ok(())
   }
 
-  async fn scan_window(&self, window: &TopicWindowKey) -> Result<Vec<SegmentMetadata>> {
+  async fn scan_window_from_snowflake(
+    &self,
+    window: &TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
+  ) -> Result<Vec<SegmentMetadata>> {
     trace!(
-      "metadata(dynamo) scan_window start: table={}, topic={}, window_start={}",
-      self.table_name, window.topic, window.window_start_unix_seconds
+      "metadata(dynamo) scan_window start: table={}, topic={}, window_start={}, min_snowflake={:?}",
+      self.table_name,
+      window.topic,
+      window.window_start_unix_seconds,
+      min_snowflake.map(SnowflakeId::as_u64)
     );
-    let mut values = HashMap::new();
-    values.insert(":pk".to_string(), AttributeValue::S(window.format()));
 
-    let response = self
-      .client
-      .query()
-      .table_name(&self.table_name)
-      .key_condition_expression(format!("{ATTR_PK} = :pk"))
-      .set_expression_attribute_values(Some(values))
-      .consistent_read(false)
-      .send()
-      .await?;
+    let mut segments = Vec::new();
+    let mut start_key = None;
+    loop {
+      let mut values = HashMap::new();
+      values.insert(":pk".to_string(), AttributeValue::S(window.format()));
+      if let Some(min_snowflake) = min_snowflake {
+        values.insert(
+          ":min_snowflake".to_string(),
+          AttributeValue::S(min_snowflake.format_lex()),
+        );
+      }
 
-    let output: Result<Vec<SegmentMetadata>> = response
-      .items
-      .unwrap_or_default()
-      .into_iter()
-      .map(|item| {
-        let entry: DynamoSegmentItem = serde_dynamo::from_item(item)?;
-        SegmentMetadata::try_from(entry)
-      })
-      .collect();
+      let key_condition = if min_snowflake.is_some() {
+        format!("{ATTR_PK} = :pk AND sk >= :min_snowflake")
+      } else {
+        format!("{ATTR_PK} = :pk")
+      };
+      let mut query = self
+        .client
+        .query()
+        .table_name(&self.table_name)
+        .key_condition_expression(key_condition)
+        .set_expression_attribute_values(Some(values))
+        .consistent_read(false);
+      if let Some(key) = start_key.take() {
+        query = query.set_exclusive_start_key(Some(key));
+      }
 
-    if let Ok(ref segments) = output {
-      debug!(
-        "metadata(dynamo) scan_window complete: table={}, segments={}",
-        self.table_name,
-        segments.len()
+      let response = query.send().await?;
+      segments.extend(
+        response
+          .items
+          .unwrap_or_default()
+          .into_iter()
+          .map(|item| {
+            let entry: DynamoSegmentItem = serde_dynamo::from_item(item)?;
+            SegmentMetadata::try_from(entry)
+          })
+          .collect::<Result<Vec<_>>>()?,
       );
+
+      let Some(key) = response.last_evaluated_key else {
+        break;
+      };
+      start_key = Some(key);
     }
 
-    output
+    debug!(
+      "metadata(dynamo) scan_window complete: table={}, segments={}",
+      self.table_name,
+      segments.len()
+    );
+    Ok(segments)
   }
 }
 

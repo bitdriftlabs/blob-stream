@@ -19,7 +19,7 @@ use blob_stream_metadata_store::{
   SegmentMetadata,
   SequenceReservationOutcome,
 };
-use blob_stream_types::{CompressionCodec, SeqRange, Window, new_record};
+use blob_stream_types::{CompressionCodec, SeqRange, SnowflakeId, Window, new_record};
 use bytes::Bytes;
 use serde_json::to_value;
 use std::collections::HashMap;
@@ -61,11 +61,15 @@ impl MetadataStore for FailsTopicMetadataStore {
     self.inner.write_segment(metadata).await
   }
 
-  async fn scan_window(
+  async fn scan_window_from_snowflake(
     &self,
     window: &blob_stream_types::TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
   ) -> Result<Vec<SegmentMetadata>> {
-    self.inner.scan_window(window).await
+    self
+      .inner
+      .scan_window_from_snowflake(window, min_snowflake)
+      .await
   }
 }
 
@@ -440,7 +444,9 @@ async fn buffers_until_size_rollover() -> Result<()> {
     time_provider.now().unix_timestamp_ms() / 1_000,
     config.window_size_seconds,
   );
-  let segments = metadata_store.scan_window(&window.key("telemetry")).await?;
+  let segments = metadata_store
+    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .await?;
   assert!(segments.is_empty());
 
   let request = WriteRequest {
@@ -452,7 +458,9 @@ async fn buffers_until_size_rollover() -> Result<()> {
   engine.produce_batch(request).await?;
   first.await??;
 
-  let segments = metadata_store.scan_window(&window.key("telemetry")).await?;
+  let segments = metadata_store
+    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .await?;
   assert_eq!(segments.len(), 1);
   assert_eq!(segments[0].record_count, 2);
   Ok(())
@@ -566,7 +574,9 @@ async fn flushes_on_time_rollover() -> Result<()> {
     time_provider.now().unix_timestamp_ms() / 1_000,
     config.window_size_seconds,
   );
-  let segments = metadata_store.scan_window(&window.key("telemetry")).await?;
+  let segments = metadata_store
+    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .await?;
   assert_eq!(segments.len(), 1);
   Ok(())
 }
@@ -729,7 +739,9 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
     time_provider.now().unix_timestamp_ms() / 1_000,
     config.window_size_seconds,
   );
-  let segments = metadata_store.scan_window(&window.key("telemetry")).await?;
+  let segments = metadata_store
+    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .await?;
   let mut ranges: Vec<_> = segments
     .iter()
     .flat_map(|segment| {
@@ -1040,7 +1052,9 @@ async fn writes_compressed_metadata() -> Result<()> {
     time_provider.now().unix_timestamp_ms() / 1_000,
     config.window_size_seconds,
   );
-  let segments = metadata_store.scan_window(&window.key("telemetry")).await?;
+  let segments = metadata_store
+    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .await?;
   assert_eq!(segments.len(), 1);
   assert_eq!(segments[0].compression.codec, CompressionCodec::Zstd);
 
@@ -1058,9 +1072,10 @@ impl MetadataStore for FailingMetadataStore {
     Err(anyhow::anyhow!("metadata write failed"))
   }
 
-  async fn scan_window(
+  async fn scan_window_from_snowflake(
     &self,
     _window: &blob_stream_types::TopicWindowKey,
+    _min_snowflake: Option<SnowflakeId>,
   ) -> Result<Vec<SegmentMetadata>> {
     Ok(Vec::new())
   }
