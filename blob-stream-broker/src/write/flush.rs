@@ -218,41 +218,33 @@ impl FlushContext {
 
   pub(super) async fn flush_plan(
     &self,
-    plan: FlushPlan,
+    plan: &mut FlushPlan,
     now: OffsetDateTime,
-  ) -> (String, Result<(), WriteError>) {
-    let FlushPlan { topic, partitions } = plan;
-    let (payload, envelope) = match self.build_segment(&topic, partitions, now) {
-      Ok(segment) => segment,
-      Err(error) => return (topic, Err(error.into())),
-    };
+  ) -> Result<(), WriteError> {
+    let partitions = std::mem::take(&mut plan.partitions);
+    let (payload, envelope) = self.build_segment(&plan.topic, partitions, now)?;
     let metadata = envelope.into_metadata();
     let payload_bytes = payload.len();
     let record_count = metadata.record_count;
     let partition_count = metadata.segment_index.len();
 
-    let result = self
+    self
       .blob_store
       .put(&metadata.blob_key, payload)
       .await
-      .context("write segment blob");
-    if let Err(error) = result {
-      return (topic, Err(error.into()));
-    }
-    let result = self
+      .context("write segment blob")?;
+    self
       .metadata_store
       .write_segment(metadata)
       .await
-      .context("write segment metadata");
-    if let Err(error) = result {
-      return (topic, Err(error.into()));
-    }
+      .context("write segment metadata")?;
 
     debug!(
-      "flush persisted segment: topic={topic}, partitions={partition_count}, \
-       records={record_count}, bytes={payload_bytes}"
+      "flush persisted segment: topic={}, partitions={partition_count}, records={record_count}, \
+       bytes={payload_bytes}",
+      plan.topic
     );
-    (topic, Ok(()))
+    Ok(())
   }
 
   #[must_use]

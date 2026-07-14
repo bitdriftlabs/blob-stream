@@ -886,7 +886,8 @@ async fn flush_plan_and_notify(
   }
 
   let flush_started = Instant::now();
-  let (topic, result) = flush_context.flush_plan(plan, now).await;
+  let result = flush_context.flush_plan(&mut plan, now).await;
+  let topic = plan.topic;
   if result.is_err() {
     metrics.flush_failures_total.inc();
   }
