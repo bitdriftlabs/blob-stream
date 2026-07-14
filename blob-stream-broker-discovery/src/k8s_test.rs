@@ -16,6 +16,7 @@ fn membership_uses_pod_name_for_broker_identity() {
     subsets: Some(vec![EndpointSubset {
       addresses: Some(vec![EndpointAddress {
         ip: "10.0.0.1".to_string(),
+        hostname: Some("endpoint-hostname".to_string()),
         target_ref: Some(ObjectReference {
           name: Some("blob-stream-broker-0".to_string()),
           ..Default::default()

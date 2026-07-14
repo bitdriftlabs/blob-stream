@@ -447,8 +447,9 @@ impl ConsumerReader for ConsumerReaderImpl {
       let metadata_store = Arc::clone(&self.metadata_store);
       let metrics = self.metrics.clone();
       async move {
+        let scan_started_at = Instant::now();
         let segments = metadata_store.scan_window(window).await?;
-        metrics.record_metadata_scan(read_started_at, segments.len());
+        metrics.record_metadata_scan(scan_started_at, segments.len());
         Ok::<_, anyhow::Error>((window, segments))
       }
     });
