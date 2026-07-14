@@ -876,7 +876,6 @@ async fn flush_plan_and_notify(
     .iter()
     .map(|partition| partition.virtual_partition_id)
     .collect();
-  let topic = plan.topic.clone();
   let mut completions = Vec::new();
   for partition in &mut plan.partitions {
     for batch in &mut partition.batches {
@@ -887,7 +886,7 @@ async fn flush_plan_and_notify(
   }
 
   let flush_started = Instant::now();
-  let result = flush_context.flush_plan(plan, now).await;
+  let (topic, result) = flush_context.flush_plan(plan, now).await;
   if result.is_err() {
     metrics.flush_failures_total.inc();
   }

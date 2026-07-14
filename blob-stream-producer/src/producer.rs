@@ -633,20 +633,30 @@ impl Drop for ProducerClientImpl {
 #[async_trait]
 impl ProducerClient for ProducerClientImpl {
   async fn produce(&self, record: ProducerRecord) -> Result<ProducerAck, ProducerError> {
-    let topic = self
+    let ProducerRecord {
+      topic,
+      record_key,
+      payload,
+      event_ts_ms,
+    } = record;
+    let topic_config = self
       .topics
-      .get(&record.topic)
-      .ok_or_else(|| ProducerError::UnknownTopic(record.topic.clone()))?;
+      .get(&topic)
+      .ok_or_else(|| ProducerError::UnknownTopic(topic.clone()))?;
 
     let virtual_partition_id = compute_virtual_partition_id(
-      &record.record_key,
-      topic.partition_count,
+      &record_key,
+      topic_config.partition_count,
       producer_writer_id(&self.config),
     );
 
     let (tx, rx) = oneshot::channel();
-    let topic = record.topic.clone();
-    let payload_len = record.payload.len();
+    let payload_len = payload.len();
+
+    trace!(
+      "record buffered: topic={topic}, virtual_partition_id={virtual_partition_id}, \
+       payload_bytes={payload_len}"
+    );
 
     let maybe_batch = {
       let mut guard = self.state.lock().await;
@@ -655,8 +665,8 @@ impl ProducerClient for ProducerClientImpl {
           topic,
           virtual_partition_id,
           proto_record: Record {
-            payload: record.payload.into(),
-            event_ts_ms: record.event_ts_ms,
+            payload: payload.into(),
+            event_ts_ms,
             ..Default::default()
           },
           waiter: tx,
@@ -667,10 +677,6 @@ impl ProducerClient for ProducerClientImpl {
     };
 
     self.metrics.records_enqueued.inc();
-    trace!(
-      "record buffered: topic={}, virtual_partition_id={}, payload_bytes={}",
-      record.topic, virtual_partition_id, payload_len
-    );
 
     if let Some(batch) = maybe_batch {
       trace!(
