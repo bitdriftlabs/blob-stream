@@ -82,14 +82,43 @@ Broker admin state reports its configured writer ID, local membership as `{node_
 and one ownership row per local writer-scoped virtual partition. Each row distinguishes the
 deterministic planned owner from the observed lease holder. Producer state reports the same local
 membership shape and one route per logical partition for its configured writer ID. Neither state
-surface claims knowledge of another writer/AZ.
+surface claims knowledge of another writer/AZ. State snapshots use RFC 3339 UTC strings for
+absolute timestamps; elapsed durations remain numeric milliseconds.
 
 ### Sequence Numbers and Cursors
 
-The broker assigns an inclusive sequence range to each accepted batch. Sequence numbers are
-monotonic within a virtual partition. The broker reserves blocks from the lease store using a
-Hi-Lo allocator, then assigns individual values in memory. A crash or ownership transfer can
-leave unused gaps in sequence space, but cannot reuse a successfully reserved range.
+The broker assigns an inclusive sequence range to each accepted producer batch. Sequence numbers
+are monotonic within a virtual partition; they have no meaning across virtual partitions. The
+range `[S, E]` uses $S$ for the first (start) sequence number and $E$ for the last (end) sequence
+number, with both endpoints included. If a batch contains $R$ records, then $E = S + R - 1$: its
+first record has sequence $S$, its last record has sequence $E$, and each intervening record has
+the next sequence number. The batch metadata persists that range once; the records themselves do
+not each carry a separate durable sequence-allocation record.
+
+Sequence allocation uses a Hi-Lo allocator to avoid a metadata-store operation for every record
+or every producer batch. The durable producer-partition lease stores a high-water mark. While it
+holds that lease, a broker atomically advances the high-water mark by the configured reservation
+size and receives the resulting inclusive block, for example `[10,000, 10,999]`. This durable
+block is the "high" portion. The broker keeps the next unused value and the block end in memory,
+which is the "low" portion, and hands out contiguous subranges to accepted batches until the
+block is exhausted. A batch with 250 records can therefore consume `[10,000, 10,249]` entirely
+from memory; only the next exhausted-block refill requires another lease-store update.
+
+Broker metrics expose aggregate refill behavior without topic or partition labels:
+`sequence_reservations_total` counts successful durable block refills,
+`sequence_reservation_records_total` counts values included in those blocks,
+`sequence_reservation_failures_total` counts failed or fenced refill attempts, and
+`sequence_reservation_latency_seconds` measures lease-store refill latency. For steady-state
+traffic, the ratio of reservation rate to record rate should be close to one divided by the
+reservation size. A materially higher ratio indicates allocation waste from ownership churn,
+restarts, or unexpectedly small batches.
+
+The broker may combine several accepted producer batches from the same virtual partition into
+one flushed segment, but it preserves a distinct sequence range and metadata index entry for
+each original batch. Consumers use those batch ranges to skip data already covered by a cursor,
+then expose records in range order. A crash or ownership transfer can leave unused values from a
+reserved block, creating gaps, but a new holder reserves only above the durable high-water mark
+and therefore cannot reuse a successfully reserved value.
 
 A consumer cursor is the greatest processed `seq_end` for one virtual partition. During scans,
 the consumer skips a batch when `batch.seq_end <= cursor` and advances its cursor only forward.
@@ -257,6 +286,7 @@ defaults are:
 | --- | --- |
 | Broker flush bytes | 64 MiB raw buffered payload per virtual partition |
 | Broker flush delay | 1 second |
+| Broker sequence reservation | 10,000 sequence values per virtual partition |
 | Broker segment compression | zstd, level 3 |
 | Producer batch records | 1,000 |
 | Producer batch payload bytes | 1 MiB |

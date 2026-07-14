@@ -29,6 +29,22 @@ fn window_key_formatting() {
 }
 
 #[test]
+fn unix_timestamp_milliseconds_format_as_rfc3339() {
+  assert_eq!(
+    format_unix_timestamp_ms(1_700_000_000_000),
+    "2023-11-14T22:13:20Z"
+  );
+}
+
+#[test]
+fn invalid_unix_timestamp_milliseconds_are_reported() {
+  assert_eq!(
+    format_unix_timestamp_ms(i64::MAX),
+    format!("invalid Unix timestamp: {} ms", i64::MAX)
+  );
+}
+
+#[test]
 fn snowflake_formatting_is_lex_ordered() {
   let low = SnowflakeId(12);
   let high = SnowflakeId(1234);

@@ -51,6 +51,32 @@ fn defaults_segment_compression_to_zstd() {
   assert_eq!(config.compression.codec, CompressionCodec::Zstd);
   assert_eq!(config.compression.level, Some(3));
   assert_eq!(config.writer_id, 0);
+  assert_eq!(config.reservation_size, 10_000);
+}
+
+#[test]
+fn respects_explicit_sequence_reservation_size() {
+  let mut broker_config = BrokerConfig::new();
+  broker_config.writer_id = Some(0);
+  broker_config.sequence_reservation_size = Some(25_000);
+
+  let config = WriteConfig::from_broker_config(&broker_config).unwrap();
+
+  assert_eq!(config.reservation_size, 25_000);
+}
+
+#[test]
+fn rejects_zero_sequence_reservation_size() {
+  let mut broker_config = BrokerConfig::new();
+  broker_config.writer_id = Some(0);
+  broker_config.sequence_reservation_size = Some(0);
+
+  let error = WriteConfig::from_broker_config(&broker_config).unwrap_err();
+
+  assert_eq!(
+    error.to_string(),
+    "broker sequence_reservation_size must be positive"
+  );
 }
 
 #[test]

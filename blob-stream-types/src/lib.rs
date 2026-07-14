@@ -10,6 +10,8 @@ pub use blob_stream_proto::protos::blobstream::v1::broker::Record;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 /// Identifier of a virtual partition (`logical_partition + writer_offset`).
 pub type VirtualPartitionId = u32;
@@ -24,6 +26,20 @@ pub fn now_unix_millis() -> i64 {
 /// Return current Unix time in seconds.
 pub fn now_unix_seconds() -> i64 {
   SystemTimeProvider.now().unix_timestamp()
+}
+
+#[must_use]
+/// Format a Unix timestamp in milliseconds as an RFC 3339 UTC timestamp for diagnostics.
+pub fn format_unix_timestamp_ms(timestamp_ms: i64) -> String {
+  let Some(timestamp_ns) = i128::from(timestamp_ms).checked_mul(1_000_000) else {
+    return format!("invalid Unix timestamp: {timestamp_ms} ms");
+  };
+  let Ok(timestamp) = OffsetDateTime::from_unix_timestamp_nanos(timestamp_ns) else {
+    return format!("invalid Unix timestamp: {timestamp_ms} ms");
+  };
+  timestamp
+    .format(&Rfc3339)
+    .unwrap_or_else(|_| format!("invalid Unix timestamp: {timestamp_ms} ms"))
 }
 
 #[must_use]
