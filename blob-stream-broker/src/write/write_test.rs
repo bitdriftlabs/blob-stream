@@ -696,11 +696,6 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
 
   release_first.add_permits(1);
   first.await??;
-  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
-  tokio::time::advance(StdDuration::from_millis(
-    config.flush_max_delay_ms.cast_unsigned(),
-  ))
-  .await;
   receive_blob_write(&mut entered_rx).await;
   second.await??;
 
@@ -726,7 +721,7 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
 }
 
 #[tokio::test(start_paused = true)]
-async fn inline_flush_dispatches_all_ready_plans_before_waiting() -> Result<()> {
+async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
   let mut config = WriteConfig::with_defaults();
@@ -786,27 +781,18 @@ async fn inline_flush_dispatches_all_ready_plans_before_waiting() -> Result<()> 
   });
   tokio::task::yield_now().await;
   time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
-
-  let third_engine = Arc::clone(&engine);
-  let third = tokio::spawn(async move {
-    third_engine
-      .produce_batch(WriteRequest {
-        topic: "first".to_string(),
-        virtual_partition_id: 0,
-        records: vec![new_record(vec![3], 30)],
-      })
-      .await
-  });
+  tokio::time::advance(StdDuration::from_millis(
+    config.flush_max_delay_ms.cast_unsigned(),
+  ))
+  .await;
 
   let first_blob_key = receive_blob_write(&mut entered_rx).await;
   let second_blob_key = receive_blob_write(&mut entered_rx).await;
   assert_ne!(first_blob_key, second_blob_key);
-  assert!(!third.is_finished());
 
   release_first.add_permits(1);
   first.await??;
   second.await??;
-  third.await??;
   Ok(())
 }
 

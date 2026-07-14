@@ -1031,6 +1031,7 @@ impl PartitionBuffer {
 #[derive(Default)]
 struct ProducerState {
   buffers: HashMap<(String, VirtualPartitionId), PartitionBuffer>,
+  last_time_flush_partition: Option<(String, VirtualPartitionId)>,
 }
 
 impl ProducerState {
@@ -1065,16 +1066,34 @@ impl ProducerState {
     max_batches: usize,
   ) -> Vec<BufferedBatch> {
     let mut ready = Vec::new();
+    let mut partition_keys: Vec<_> = self.buffers.keys().cloned().collect();
+    partition_keys.sort_unstable();
+    let start = self.last_time_flush_partition.as_ref().map_or(0, |last| {
+      partition_keys
+        .iter()
+        .position(|partition| partition > last)
+        .unwrap_or(0)
+    });
 
-    for ((topic, virtual_partition_id), buffer) in &mut self.buffers {
+    for (topic, virtual_partition_id) in partition_keys
+      .into_iter()
+      .cycle()
+      .skip(start)
+      .take(self.buffers.len())
+    {
       if ready.len() == max_batches {
         break;
       }
+      let buffer = self
+        .buffers
+        .get_mut(&(topic.clone(), virtual_partition_id))
+        .expect("partition key must reference an existing buffer");
       if !buffer.should_flush_by_time(flush_max_delay_ms) {
         continue;
       }
 
-      if let Some(batch) = buffer.take_batch(topic, *virtual_partition_id) {
+      if let Some(batch) = buffer.take_batch(&topic, virtual_partition_id) {
+        self.last_time_flush_partition = Some((topic, virtual_partition_id));
         ready.push(batch);
       }
     }

@@ -137,6 +137,9 @@ invariant.
 
 1. A producer buffers records independently for each `(topic, virtual_partition_id)`.
 2. It flushes a producer batch when record count, payload-byte, or time thresholds are reached.
+  Producer dispatches batches concurrently up to its configured request limit and does not
+  preserve producer submission order, including within one virtual partition. The broker assigns
+  sequence ranges in the order that it accepts requests and preserves that durable order.
 3. It routes `ProduceBatch(topic, virtual_partition_id, records)` to the locally balanced broker
   selected for its configured writer ID.
 4. The broker validates the topic, validates the virtual partition range, acquires or renews the
@@ -144,7 +147,8 @@ invariant.
 5. The broker buffers accepted batches in memory. It flushes a virtual-partition buffer when its
   raw payload bytes reach `flush_max_bytes` or its oldest batch reaches `flush_max_delay_ms`. A
   partition with a durable plan in progress continues buffering its next epoch until that prior
-  plan completes.
+  plan completes. A single bounded flush scheduler wakes for eligible writes, timer ticks, and
+  durable-plan completions; a completion immediately promotes an eligible successor epoch.
 6. A flush serializes each batch as `StoredRecordBatch`, compresses each serialized batch
   independently, concatenates the stored bytes into a segment blob, uploads the blob, and then
   writes the segment metadata row. Plans may run concurrently for different virtual partitions,
