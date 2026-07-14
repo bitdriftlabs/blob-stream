@@ -23,7 +23,9 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 use blob_stream_types::VirtualPartitionId;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore, mpsc, watch};
+use tokio::time::timeout;
 
 struct TestBrokerDiscovery {
   membership: BrokerMembership,
@@ -484,6 +486,53 @@ async fn surfaces_retry_exhaustion_for_transport_errors() {
 }
 
 #[tokio::test]
+async fn flush_returns_batch_failure_after_notifying_waiters() {
+  let mut config = default_config();
+  config.max_batch_records = Some(2);
+  config.flush_max_delay_ms = Some(60_000);
+  config.max_retries = Some(0);
+
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let transport = Arc::new(FakeBrokerTransport::default());
+  transport
+    .enqueue_response(Err(anyhow!("network down")))
+    .await;
+  let producer = Arc::new(
+    ProducerClientImpl::new_with_transport(
+      config,
+      vec![topic_config()],
+      discovery,
+      transport,
+      metrics_scope(),
+    )
+    .await
+    .unwrap(),
+  );
+
+  let pending_producer = Arc::clone(&producer);
+  let pending_produce = tokio::spawn(async move {
+    pending_producer
+      .produce(ProducerRecord::new(
+        "telemetry",
+        b"flush-error-key".to_vec(),
+        vec![1],
+        0,
+      ))
+      .await
+  });
+  wait_for_buffered_partitions(producer.as_ref(), 1).await;
+
+  assert!(matches!(
+    producer.flush().await,
+    Err(ProducerError::RetriesExhausted(_))
+  ));
+  assert!(matches!(
+    pending_produce.await.unwrap(),
+    Err(ProducerError::RetriesExhausted(_))
+  ));
+}
+
+#[tokio::test]
 async fn flush_dispatches_distinct_partition_batches_concurrently() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
@@ -572,6 +621,204 @@ async fn timed_flush_dispatches_distinct_partition_batches_concurrently() {
   for pending_produce in pending_produces {
     pending_produce.await.unwrap().unwrap();
   }
+}
+
+#[tokio::test]
+async fn timed_flush_collects_later_batches_while_a_prior_batch_is_in_flight() {
+  let mut config = default_config();
+  config.max_batch_records = Some(2);
+  config.flush_max_delay_ms = Some(10);
+  config.max_request_concurrency = Some(2);
+
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let transport = Arc::new(GatedBrokerTransport {
+    entered_tx,
+    release: Arc::clone(&release),
+  });
+  let producer = Arc::new(
+    ProducerClientImpl::new_with_transport(
+      config,
+      vec![topic_config()],
+      discovery,
+      transport,
+      metrics_scope(),
+    )
+    .await
+    .unwrap(),
+  );
+  let (first_key, second_key) = keys_for_distinct_partitions();
+
+  let first_producer = Arc::clone(&producer);
+  let first = tokio::spawn(async move {
+    first_producer
+      .produce(ProducerRecord::new("telemetry", first_key, vec![1], 100))
+      .await
+  });
+  let first_partition = entered_rx
+    .recv()
+    .await
+    .expect("first batch entered transport");
+
+  let second_producer = Arc::clone(&producer);
+  let second = tokio::spawn(async move {
+    second_producer
+      .produce(ProducerRecord::new("telemetry", second_key, vec![2], 101))
+      .await
+  });
+  let second_partition = timeout(Duration::from_millis(100), entered_rx.recv()).await;
+
+  release.add_permits(2);
+  first.await.unwrap().unwrap();
+  second.await.unwrap().unwrap();
+
+  assert_ne!(
+    first_partition,
+    second_partition
+      .expect("later batch entered transport before the first batch completed")
+      .expect("transport remained available")
+  );
+}
+
+#[tokio::test]
+async fn timed_flush_keeps_ready_batches_buffered_when_dispatches_are_full() {
+  let mut config = default_config();
+  config.max_batch_records = Some(2);
+  config.flush_max_delay_ms = Some(10);
+  config.max_request_concurrency = Some(1);
+
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let transport = Arc::new(GatedBrokerTransport {
+    entered_tx,
+    release: Arc::clone(&release),
+  });
+  let producer = Arc::new(
+    ProducerClientImpl::new_with_transport(
+      config,
+      vec![topic_config()],
+      discovery,
+      transport,
+      metrics_scope(),
+    )
+    .await
+    .unwrap(),
+  );
+  let (first_key, second_key) = keys_for_distinct_partitions();
+
+  let first_producer = Arc::clone(&producer);
+  let first = tokio::spawn(async move {
+    first_producer
+      .produce(ProducerRecord::new("telemetry", first_key, vec![1], 100))
+      .await
+  });
+  entered_rx
+    .recv()
+    .await
+    .expect("first batch entered transport");
+
+  let second_producer = Arc::clone(&producer);
+  let second = tokio::spawn(async move {
+    second_producer
+      .produce(ProducerRecord::new("telemetry", second_key, vec![2], 101))
+      .await
+  });
+  wait_for_buffered_partitions(producer.as_ref(), 1).await;
+  tokio::time::sleep(Duration::from_millis(30)).await;
+  wait_for_buffered_partitions(producer.as_ref(), 1).await;
+
+  release.add_permits(1);
+  first.await.unwrap().unwrap();
+  entered_rx
+    .recv()
+    .await
+    .expect("second batch entered transport");
+  release.add_permits(1);
+  second.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn timed_flush_rotates_ready_partitions_when_capacity_is_limited() {
+  let mut config = default_config();
+  config.max_batch_records = Some(2);
+  config.flush_max_delay_ms = Some(10);
+  config.max_request_concurrency = Some(1);
+
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let transport = Arc::new(GatedBrokerTransport {
+    entered_tx,
+    release: Arc::clone(&release),
+  });
+  let producer = Arc::new(
+    ProducerClientImpl::new_with_transport(
+      config,
+      vec![topic_config()],
+      discovery,
+      transport,
+      metrics_scope(),
+    )
+    .await
+    .unwrap(),
+  );
+  let (first_key, second_key) = keys_for_distinct_partitions();
+  let first_partition = compute_virtual_partition_id(&first_key, 16, 1);
+  let second_partition = compute_virtual_partition_id(&second_key, 16, 1);
+
+  let first_producer = Arc::clone(&producer);
+  let initial_key = first_key.clone();
+  let first = tokio::spawn(async move {
+    first_producer
+      .produce(ProducerRecord::new("telemetry", initial_key, vec![1], 100))
+      .await
+  });
+  assert_eq!(
+    entered_rx
+      .recv()
+      .await
+      .expect("first batch entered transport"),
+    first_partition
+  );
+
+  let waiting_producer = Arc::clone(&producer);
+  let waiting = tokio::spawn(async move {
+    waiting_producer
+      .produce(ProducerRecord::new("telemetry", second_key, vec![2], 101))
+      .await
+  });
+  let hot_producer = Arc::clone(&producer);
+  let hot = tokio::spawn(async move {
+    hot_producer
+      .produce(ProducerRecord::new("telemetry", first_key, vec![3], 102))
+      .await
+  });
+  wait_for_buffered_partitions(producer.as_ref(), 2).await;
+  tokio::time::sleep(Duration::from_millis(30)).await;
+
+  release.add_permits(1);
+  assert_eq!(
+    entered_rx
+      .recv()
+      .await
+      .expect("waiting partition entered transport"),
+    second_partition
+  );
+  release.add_permits(1);
+  assert_eq!(
+    entered_rx
+      .recv()
+      .await
+      .expect("hot partition entered transport"),
+    first_partition
+  );
+  release.add_permits(1);
+
+  first.await.unwrap().unwrap();
+  waiting.await.unwrap().unwrap();
+  hot.await.unwrap().unwrap();
 }
 
 #[tokio::test]

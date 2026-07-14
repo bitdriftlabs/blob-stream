@@ -1,4 +1,12 @@
-use super::{DEFAULT_ZSTD_LEVEL, FlushPlan, SegmentEnvelope, WriteConfig, WriteError};
+use super::{
+  BufferedBatch,
+  DEFAULT_ZSTD_LEVEL,
+  FlushPartition,
+  FlushPlan,
+  SegmentEnvelope,
+  WriteConfig,
+  WriteError,
+};
 use anyhow::{Context, Result};
 use bd_time::OffsetDateTimeExt;
 use blob_stream_blob_store::{BlobKey, BlobStore};
@@ -124,7 +132,7 @@ impl FlushContext {
   fn build_segment(
     &self,
     topic: &str,
-    plan: FlushPlan,
+    partitions: Vec<FlushPartition>,
     now: OffsetDateTime,
   ) -> Result<(Bytes, SegmentEnvelope)> {
     trace!("building flush segment: topic={topic}");
@@ -140,7 +148,7 @@ impl FlushContext {
     let mut min_event_ts_ms: Option<i64> = None;
     let mut max_event_ts_ms: Option<i64> = None;
 
-    for partition in plan.partitions {
+    for partition in partitions {
       trace!(
         "encoding partition batches: topic={}, virtual_partition_id={}, batches={}",
         topic,
@@ -148,16 +156,30 @@ impl FlushContext {
         partition.batches.len()
       );
       for batch in partition.batches {
-        let encoded = Self::encode_batch(partition.virtual_partition_id, batch.records)?;
+        let BufferedBatch {
+          records,
+          summary,
+          seq_range,
+          ..
+        } = batch;
+        let encoded = Self::encode_batch(partition.virtual_partition_id, records)?;
         let compressed = self.compress_batch(&encoded)?;
         let start = payload.len() as u64;
         payload.extend_from_slice(&compressed);
         let end = payload.len() as u64;
 
+        record_count = record_count.saturating_add(u64::from(summary.record_count));
+        min_event_ts_ms = min_event_ts_ms.map_or(Some(summary.min_event_ts_ms), |current| {
+          Some(current.min(summary.min_event_ts_ms))
+        });
+        max_event_ts_ms = max_event_ts_ms.map_or(Some(summary.max_event_ts_ms), |current| {
+          Some(current.max(summary.max_event_ts_ms))
+        });
+
         let metadata = BatchMetadata {
-          seq_range: batch.seq_range.clone(),
+          seq_range,
           byte_range: blob_stream_types::ByteRange { start, end },
-          summary: batch.summary.clone(),
+          summary,
           compression: compression.clone(),
         };
 
@@ -165,16 +187,6 @@ impl FlushContext {
           .entry(partition.virtual_partition_id)
           .or_default()
           .push(metadata);
-
-        record_count = record_count.saturating_add(u64::from(batch.summary.record_count));
-        min_event_ts_ms = match min_event_ts_ms {
-          Some(current) => Some(current.min(batch.summary.min_event_ts_ms)),
-          None => Some(batch.summary.min_event_ts_ms),
-        };
-        max_event_ts_ms = match max_event_ts_ms {
-          Some(current) => Some(current.max(batch.summary.max_event_ts_ms)),
-          None => Some(batch.summary.max_event_ts_ms),
-        };
       }
     }
 
@@ -204,37 +216,34 @@ impl FlushContext {
     Ok((payload.freeze(), envelope))
   }
 
-  pub(super) async fn flush_plans(
+  pub(super) async fn flush_plan(
     &self,
-    plans: Vec<FlushPlan>,
+    plan: &mut FlushPlan,
     now: OffsetDateTime,
   ) -> Result<(), WriteError> {
-    trace!("flush_plans invoked: plans={plans}", plans = plans.len());
-    for plan in plans {
-      let topic = plan.topic.clone();
-      let (payload, envelope) = self.build_segment(&topic, plan, now)?;
-      let metadata = envelope.into_metadata();
-      let payload_bytes = payload.len();
-      let record_count = metadata.record_count;
-      let partition_count = metadata.segment_index.len();
+    let partitions = std::mem::take(&mut plan.partitions);
+    let (payload, envelope) = self.build_segment(&plan.topic, partitions, now)?;
+    let metadata = envelope.into_metadata();
+    let payload_bytes = payload.len();
+    let record_count = metadata.record_count;
+    let partition_count = metadata.segment_index.len();
 
-      self
-        .blob_store
-        .put(&metadata.blob_key, payload)
-        .await
-        .context("write segment blob")?;
-      self
-        .metadata_store
-        .write_segment(metadata)
-        .await
-        .context("write segment metadata")?;
+    self
+      .blob_store
+      .put(&metadata.blob_key, payload)
+      .await
+      .context("write segment blob")?;
+    self
+      .metadata_store
+      .write_segment(metadata)
+      .await
+      .context("write segment metadata")?;
 
-      debug!(
-        "flush persisted segment: topic={topic}, partitions={partition_count}, \
-         records={record_count}, bytes={payload_bytes}"
-      );
-    }
-
+    debug!(
+      "flush persisted segment: topic={}, partitions={partition_count}, records={record_count}, \
+       bytes={payload_bytes}",
+      plan.topic
+    );
     Ok(())
   }
 

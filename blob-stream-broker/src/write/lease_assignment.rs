@@ -165,6 +165,11 @@ impl WriteEngineImpl {
         previously_assigned = currently_owned;
 
         for (topic, virtual_partition_id) in owned {
+          let partition_state = {
+            let mut state = state.lock().await;
+            state.partition_state(&topic, virtual_partition_id)
+          };
+          let mut partition_state = partition_state.lock().await;
           let key = ProducerPartitionLeaseKey {
             topic: topic.clone(),
             virtual_partition_id,
@@ -178,14 +183,10 @@ impl WriteEngineImpl {
             .await
           {
             Ok(LeaseAcquireOutcome::Acquired(lease)) => {
-              let mut guard = state.lock().await;
-              let partition_state = guard.partition_state_mut(&topic, virtual_partition_id);
               partition_state.lease_expiration_ts_ms = Some(lease.lease_expiration_ts_ms);
               true
             },
             Ok(LeaseAcquireOutcome::HeldByOther(_)) => {
-              let mut guard = state.lock().await;
-              let partition_state = guard.partition_state_mut(&topic, virtual_partition_id);
               partition_state.lease_expiration_ts_ms = None;
               false
             },
@@ -203,8 +204,6 @@ impl WriteEngineImpl {
           }
 
           let needs_reservation = {
-            let mut guard = state.lock().await;
-            let partition_state = guard.partition_state_mut(&topic, virtual_partition_id);
             // Background maintenance only tops up when we cannot allocate even a single record.
             // This keeps steady-state churn low while ensuring foreground writes usually find
             // capacity already available.
@@ -225,8 +224,6 @@ impl WriteEngineImpl {
           match reservation_outcome {
             Ok(SequenceReservationOutcome::Reserved(reservation)) => {
               metrics.record_sequence_reservation(&reservation.range);
-              let mut guard = state.lock().await;
-              let partition_state = guard.partition_state_mut(&topic, virtual_partition_id);
               partition_state
                 .seq_allocator
                 .set_reservation(reservation.range);
@@ -262,6 +259,11 @@ impl WriteEngineImpl {
     virtual_partition_id: VirtualPartitionId,
     now_ts_ms: i64,
   ) {
+    let partition_state = {
+      let mut state = state.lock().await;
+      state.partition_state(topic, virtual_partition_id)
+    };
+    let mut partition_state = partition_state.lock().await;
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string(),
       virtual_partition_id,
@@ -269,16 +271,12 @@ impl WriteEngineImpl {
 
     match lease_store.release_lease(&key, holder_id, now_ts_ms).await {
       Ok(LeaseReleaseOutcome::Released | LeaseReleaseOutcome::Expired) => {
-        let mut guard = state.lock().await;
-        let partition_state = guard.partition_state_mut(topic, virtual_partition_id);
         // Clear local lease/allocator state immediately to avoid accepting writes based on stale
         // in-memory lease data after ownership moved away.
         partition_state.lease_expiration_ts_ms = None;
         partition_state.seq_allocator = super::SeqAllocator::default();
       },
       Ok(LeaseReleaseOutcome::HeldByOther(_)) => {
-        let mut guard = state.lock().await;
-        let partition_state = guard.partition_state_mut(topic, virtual_partition_id);
         partition_state.lease_expiration_ts_ms = None;
         partition_state.seq_allocator = super::SeqAllocator::default();
       },
