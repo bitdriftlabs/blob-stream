@@ -76,16 +76,29 @@ pub struct HeartbeatReport {
 }
 
 //
+// RecoveredCursor
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Committed source state recovered with a newly assigned lease.
+pub struct RecoveredCursor {
+  /// Cursor persisted by the previous lease owner.
+  pub committed_cursor: CommittedCursor,
+  /// Millisecond timestamp of the commit for legacy source-less cursors.
+  pub committed_ts_ms: Option<i64>,
+}
+
+//
 // RebalanceReport
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// Rebalance result containing owned partitions and recovered committed cursors.
+/// Rebalance result containing owned partitions and recovered cursor state.
 pub struct RebalanceReport {
   /// Partitions currently owned after rebalance.
   pub owned_partitions: Vec<VirtualPartitionId>,
-  /// Last committed cursor per owned partition, when present in lease store.
-  pub committed_cursors: HashMap<VirtualPartitionId, u64>,
+  /// Last committed cursor state per owned partition, when present in lease store.
+  pub recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
 }
 
 //
@@ -107,7 +120,7 @@ pub trait ConsumerGroupCoordinator: Send + Sync {
   async fn heartbeat_and_commit(
     &mut self,
     now_ts_ms: i64,
-    cursors: &HashMap<VirtualPartitionId, u64>,
+    cursors: &HashMap<VirtualPartitionId, CommittedCursor>,
   ) -> Result<HeartbeatReport>;
 
   /// Release all owned partitions (best-effort), usually during shutdown.
@@ -191,7 +204,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       assignment_changed |= !retain;
       retain
     });
-    let mut committed_cursors = HashMap::new();
+    let mut recovered_cursors = HashMap::new();
     for partition_id in partitions {
       let Some(owner_id) = self.desired_assignment.get(&partition_id) else {
         continue;
@@ -223,7 +236,13 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
         ConsumerGroupAssignmentOutcome::Assigned(lease) => {
           assignment_changed |= self.owned.insert(partition_id);
           if let Some(committed_cursor) = lease.committed_cursor {
-            committed_cursors.insert(partition_id, committed_cursor.seq_end);
+            recovered_cursors.insert(
+              partition_id,
+              RecoveredCursor {
+                committed_cursor,
+                committed_ts_ms: lease.committed_ts_ms,
+              },
+            );
           }
         },
         ConsumerGroupAssignmentOutcome::HeldByOther(lease) => {
@@ -272,14 +291,14 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     );
     Ok(RebalanceReport {
       owned_partitions: owned,
-      committed_cursors,
+      recovered_cursors,
     })
   }
 
   async fn heartbeat_and_commit(
     &mut self,
     now_ts_ms: i64,
-    cursors: &HashMap<VirtualPartitionId, u64>,
+    cursors: &HashMap<VirtualPartitionId, CommittedCursor>,
   ) -> Result<HeartbeatReport> {
     let mut renewed = Vec::new();
     let mut fenced = Vec::new();
@@ -289,13 +308,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     let owned_count = owned.len();
     for partition_id in owned {
       // Commit-on-heartbeat: include cursor when present, avoiding an additional write path.
-      let committed_cursor = cursors
-        .get(&partition_id)
-        .copied()
-        .map(|seq_end| CommittedCursor {
-          virtual_partition_id: partition_id,
-          seq_end,
-        });
+      let committed_cursor = cursors.get(&partition_id).cloned();
 
       let key = ConsumerGroupLeaseKey {
         topic: self.config.topic.to_string(),

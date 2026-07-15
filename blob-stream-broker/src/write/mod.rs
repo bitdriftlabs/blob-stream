@@ -30,7 +30,6 @@ use blob_stream_proto::protos::blobstream::v1::broker::ProduceStatus;
 use blob_stream_types::{
   BatchMetadata,
   BatchSummary,
-  Compression,
   Record,
   RecordBatch,
   SeqRange,
@@ -408,7 +407,13 @@ impl WriteEngineImpl {
       membership: initial_membership,
       ..Default::default()
     }));
-    let flush_context = FlushContext::new(config.clone(), blob_store, metadata_store, snowflake);
+    let flush_context = FlushContext::new(
+      config.clone(),
+      blob_store,
+      metadata_store,
+      snowflake,
+      Arc::clone(&time_provider),
+    );
 
     let mut engine = Self {
       config,
@@ -512,6 +517,7 @@ impl WriteEngineImpl {
     let interval = StdDuration::from_millis(interval_ms);
     let flush_context = self.flush_context.clone();
     let state = Arc::clone(&self.state);
+    let topics = self.topics.clone();
     let time_provider = Arc::clone(&self.time_provider);
     let metrics = self.metrics.clone();
     let flush_notifier = Arc::clone(&self.flush_notifier);
@@ -526,6 +532,7 @@ impl WriteEngineImpl {
           &state,
           now.unix_timestamp_ms(),
           flush_context.config(),
+          &topics,
           available_slots,
         )
         .await;
@@ -934,6 +941,7 @@ async fn collect_flush_plans(
   state: &Arc<Mutex<WriteState>>,
   now_ts_ms: i64,
   config: &WriteConfig,
+  topics: &HashMap<String, TopicInfo>,
   max_plans: usize,
 ) -> Vec<FlushPlan> {
   if max_plans == 0 {
@@ -1002,7 +1010,13 @@ async fn collect_flush_plans(
 
   plans_by_topic
     .into_iter()
-    .map(|(topic, partitions)| FlushPlan { topic, partitions })
+    .map(|(topic, partitions)| FlushPlan {
+      max_metadata_publication_lag_ms: topics.get(&topic).map_or(30_000, |topic_info| {
+        topic_info.max_metadata_publication_lag_ms
+      }),
+      topic,
+      partitions,
+    })
     .collect()
 }
 
@@ -1216,6 +1230,7 @@ impl SeqAllocator {
 struct FlushPlan {
   topic: String,
   partitions: Vec<FlushPartition>,
+  max_metadata_publication_lag_ms: u64,
 }
 
 //
@@ -1238,26 +1253,22 @@ struct SegmentEnvelope {
   snowflake_id: SnowflakeId,
   blob_key: BlobKey,
   segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
-  compression: Compression,
   record_count: u64,
-  min_event_ts_ms: i64,
-  max_event_ts_ms: i64,
   created_ts_ms: i64,
 }
 
 impl SegmentEnvelope {
-  fn into_metadata(self) -> blob_stream_metadata_store::SegmentMetadata {
+  fn into_metadata(
+    self,
+    metadata_published_ts_ms: i64,
+  ) -> blob_stream_metadata_store::SegmentMetadata {
     blob_stream_metadata_store::SegmentMetadata::new(
       self.window,
       self.snowflake_id,
       self.blob_key,
       self.segment_index,
-      self.compression,
-      self.record_count,
-      self.min_event_ts_ms,
-      self.max_event_ts_ms,
-      None,
       self.created_ts_ms,
+      metadata_published_ts_ms,
     )
   }
 }

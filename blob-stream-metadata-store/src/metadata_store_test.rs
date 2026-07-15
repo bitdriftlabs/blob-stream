@@ -34,11 +34,7 @@ fn formats_partition_and_snowflake_keys() {
     SnowflakeId(42),
     BlobKey::from("topic/300/42"),
     segment_index,
-    Compression::none(),
-    2,
-    100,
-    200,
-    None,
+    400,
     400,
   );
 

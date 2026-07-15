@@ -39,6 +39,7 @@ fn ownership_changes_with_membership() {
       partition_count: 8,
       num_writers: 1,
       retention_days: 7,
+      max_metadata_publication_lag_ms: 30_000,
     },
   );
 
@@ -90,6 +91,7 @@ fn ownership_includes_only_local_producer_writer_virtual_partitions() {
       partition_count: 2,
       num_writers: 2,
       retention_days: 7,
+      max_metadata_publication_lag_ms: 30_000,
     },
   );
   let membership = BrokerMembership::new(vec![
@@ -128,6 +130,7 @@ fn make_topic(partition_count: u32) -> HashMap<String, TopicInfo> {
       partition_count,
       num_writers: 1,
       retention_days: 7,
+      max_metadata_publication_lag_ms: 30_000,
     },
   );
   topics

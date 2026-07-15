@@ -148,6 +148,10 @@ impl ConsumerIteratorImpl {
       group.topic == config.topic.name,
       "consumer runtime topic and bootstrap topic must match"
     );
+    ensure!(
+      config.topic.retention_days > 0,
+      "consumer retention recovery requires topic retention_days greater than zero"
+    );
 
     let virtual_partitions = virtual_partitions_for_topic(&config.topic)?;
 
@@ -163,7 +167,7 @@ impl ConsumerIteratorImpl {
       membership_store.clone(),
     ));
 
-    Self::from_runtime_config(
+    Self::from_runtime_config_with_retention_and_publication_lag(
       &config.runtime,
       blob_store,
       metadata_store,
@@ -171,6 +175,11 @@ impl ConsumerIteratorImpl {
       membership_store,
       coordination,
       metrics_scope,
+      config.topic.retention_days,
+      config
+        .topic
+        .max_metadata_publication_lag_ms
+        .unwrap_or(crate::config::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS),
     )
     .await
   }

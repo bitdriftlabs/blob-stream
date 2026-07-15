@@ -4,13 +4,7 @@ use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use blob_stream_blob_store::BlobKey;
-use blob_stream_types::{
-  BatchMetadata,
-  Compression,
-  SnowflakeId,
-  TopicWindowKey,
-  VirtualPartitionId,
-};
+use blob_stream_types::{BatchMetadata, SnowflakeId, TopicWindowKey, VirtualPartitionId};
 use log::{debug, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -182,16 +176,11 @@ struct DynamoSegmentItem {
   partition_key: String,
   #[serde(rename = "sk")]
   sort_key: String,
-  topic: String,
-  window_start_ts: i64,
   blob_key: String,
   segment_index: HashMap<String, Vec<BatchMetadata>>,
-  compression: Compression,
-  record_count: u64,
-  min_event_ts_ms: i64,
-  max_event_ts_ms: i64,
-  checksum: Option<String>,
   created_ts_ms: i64,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  metadata_published_ts_ms: Option<i64>,
   #[serde(skip_serializing_if = "Option::is_none")]
   #[serde(rename = "ttl_epoch_seconds")]
   ttl_epoch_seconds: Option<i64>,
@@ -201,15 +190,9 @@ impl DynamoSegmentItem {
   fn from_metadata(metadata: SegmentMetadata, ttl_epoch_seconds: Option<i64>) -> Self {
     let partition_key = metadata.partition_key();
     let sort_key = metadata.snowflake_key();
-    let topic = metadata.window.topic;
-    let window_start_ts = metadata.window.window_start_unix_seconds;
     let blob_key = metadata.blob_key.as_str().to_string();
-    let compression = metadata.compression;
-    let record_count = metadata.record_count;
-    let min_event_ts_ms = metadata.min_event_ts_ms;
-    let max_event_ts_ms = metadata.max_event_ts_ms;
-    let checksum = metadata.checksum;
     let created_ts_ms = metadata.created_ts_ms;
+    let metadata_published_ts_ms = Some(metadata.metadata_published_ts_ms);
 
     let segment_index = metadata
       .segment_index
@@ -220,16 +203,10 @@ impl DynamoSegmentItem {
     Self {
       partition_key,
       sort_key,
-      topic,
-      window_start_ts,
       blob_key,
       segment_index,
-      compression,
-      record_count,
-      min_event_ts_ms,
-      max_event_ts_ms,
-      checksum,
       created_ts_ms,
+      metadata_published_ts_ms,
       ttl_epoch_seconds,
     }
   }
@@ -253,12 +230,19 @@ impl TryFrom<DynamoSegmentItem> for SegmentMetadata {
       })
       .collect::<Result<HashMap<_, _>>>()?;
 
+    let (topic, window_start) = item
+      .partition_key
+      .rsplit_once('#')
+      .ok_or_else(|| anyhow!("invalid metadata partition key {}", item.partition_key))?;
+    let window_start_unix_seconds = window_start
+      .parse::<i64>()
+      .map_err(|error| anyhow!("invalid metadata window start {window_start}: {error}"))?;
     let sort_key = item.sort_key;
 
     Ok(Self {
       window: TopicWindowKey {
-        topic: item.topic,
-        window_start_unix_seconds: item.window_start_ts,
+        topic: topic.to_string(),
+        window_start_unix_seconds,
       },
       snowflake_id: SnowflakeId(
         sort_key
@@ -267,12 +251,8 @@ impl TryFrom<DynamoSegmentItem> for SegmentMetadata {
       ),
       blob_key: BlobKey::from(item.blob_key),
       segment_index,
-      compression: item.compression,
-      record_count: item.record_count,
-      min_event_ts_ms: item.min_event_ts_ms,
-      max_event_ts_ms: item.max_event_ts_ms,
-      checksum: item.checksum,
       created_ts_ms: item.created_ts_ms,
+      metadata_published_ts_ms: item.metadata_published_ts_ms.unwrap_or(item.created_ts_ms),
     })
   }
 }

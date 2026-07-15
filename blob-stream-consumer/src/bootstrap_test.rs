@@ -24,7 +24,6 @@ fn runtime(member_id: &str) -> ConsumerRuntimeConfig {
   let mut read = ConsumerReadConfig::new();
   read.topic = "telemetry".into();
   read.window_size_seconds = Some(300);
-  read.lookback_windows = Some(3);
 
   let mut group = ConsumerGroupConfig::new();
   group.topic = "telemetry".into();
@@ -131,5 +130,27 @@ async fn proto_bootstrap_rejects_missing_required_message_fields() {
     error
       .to_string()
       .contains("ConsumerIteratorBootstrapConfig.runtime")
+  );
+}
+
+#[tokio::test]
+async fn bootstrap_rejects_zero_retention_for_recovery() {
+  let mut topic = topic();
+  topic.retention_days = 0;
+  let config = ConsumerBootstrapConfig::new(
+    runtime("member-a"),
+    topic,
+    in_memory_blob_store(),
+    in_memory_metadata_store(),
+  );
+
+  let error = ConsumerConfigFactory::build_iterator(config, metrics_scope())
+    .await
+    .err()
+    .unwrap();
+  assert!(
+    error
+      .to_string()
+      .contains("retention_days greater than zero")
   );
 }

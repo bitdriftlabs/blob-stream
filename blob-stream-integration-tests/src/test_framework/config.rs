@@ -55,7 +55,6 @@ pub fn consumer_runtime_config(member_id: &str) -> ConsumerRuntimeConfig {
   let mut read = ConsumerReadConfig::new();
   read.topic = TOPIC.to_string().into();
   read.window_size_seconds = Some(WINDOW_SIZE_SECONDS);
-  read.lookback_windows = Some(10);
 
   let mut group = ConsumerGroupConfig::new();
   group.topic = TOPIC.to_string().into();
@@ -81,7 +80,7 @@ pub fn consumer_bootstrap_config(
   topic.name = TOPIC.to_string().into();
   topic.partition_count = PARTITION_COUNT;
   topic.num_writers = 1;
-  topic.retention_days = 0;
+  topic.retention_days = 1;
 
   let mut s3 = S3BlobStoreConfig::new();
   s3.bucket = resources.bucket_name().to_string().into();

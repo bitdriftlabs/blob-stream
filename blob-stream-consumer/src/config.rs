@@ -12,11 +12,11 @@ pub use blob_stream_proto::protos::blobstream::v1::config::{
 use log::{debug, trace};
 
 const DEFAULT_WINDOW_SIZE_SECONDS: i64 = 300;
-const DEFAULT_LOOKBACK_WINDOWS: u32 = 2;
 const DEFAULT_IDLE_POLL_DELAY_MS: u64 = 250;
 const DEFAULT_MAX_IDLE_POLL_DELAY_MS: u64 = 2_000;
 const DEFAULT_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const DEFAULT_METADATA_RECOVERY_SCAN_INTERVAL_SECONDS: u64 = 60;
+const DEFAULT_METADATA_VISIBILITY_DELAY_MS: u64 = 2_000;
+pub const DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS: u64 = 30_000;
 const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: i64 = 10_000;
 const DEFAULT_REBALANCE_INTERVAL_MS: i64 = 10_000;
@@ -31,12 +31,6 @@ pub fn consumer_window_size_seconds(config: &ConsumerReadConfig) -> i64 {
   config
     .window_size_seconds
     .unwrap_or(DEFAULT_WINDOW_SIZE_SECONDS)
-}
-
-#[must_use]
-/// Return the number of trailing windows scanned on each read, applying defaults.
-pub fn consumer_lookback_windows(config: &ConsumerReadConfig) -> u32 {
-  config.lookback_windows.unwrap_or(DEFAULT_LOOKBACK_WINDOWS)
 }
 
 #[must_use]
@@ -64,17 +58,31 @@ pub fn consumer_prefetch_max_bytes(config: &ConsumerReadConfig) -> u64 {
 }
 
 #[must_use]
-/// Return the interval between unbounded metadata recovery scans in seconds.
-pub fn consumer_metadata_recovery_scan_interval_seconds(config: &ConsumerReadConfig) -> u64 {
+/// Return the delay before newly published metadata ranges become eligible for consumption.
+pub fn consumer_metadata_visibility_delay_ms(config: &ConsumerReadConfig) -> u64 {
   config
-    .metadata_recovery_scan_interval_seconds
-    .unwrap_or(DEFAULT_METADATA_RECOVERY_SCAN_INTERVAL_SECONDS)
+    .metadata_visibility_delay_ms
+    .unwrap_or(DEFAULT_METADATA_VISIBILITY_DELAY_MS)
 }
 
-#[must_use]
-/// Return whether bounded metadata scans are enabled between recovery scans.
-pub fn consumer_metadata_fast_scan_enabled(config: &ConsumerReadConfig) -> bool {
-  config.metadata_fast_scan_enabled.unwrap_or(true)
+/// Derive the candidate windows needed to cover publication and visibility delay.
+pub fn consumer_candidate_window_count(
+  config: &ConsumerReadConfig,
+  maximum_metadata_publication_lag_ms: u64,
+) -> Result<usize> {
+  let window_size_ms = u64::try_from(consumer_window_size_seconds(config))
+    .map_err(|_| anyhow!("consumer.read.window_size_seconds must be positive"))?
+    .checked_mul(1_000)
+    .ok_or_else(|| anyhow!("consumer.read.window_size_seconds is too large"))?;
+  let coverage_ms = maximum_metadata_publication_lag_ms
+    .checked_add(consumer_metadata_visibility_delay_ms(config))
+    .ok_or_else(|| anyhow!("metadata availability horizon is too large"))?;
+  let trailing_windows = coverage_ms
+    .checked_add(window_size_ms.saturating_sub(1))
+    .ok_or_else(|| anyhow!("metadata availability horizon is too large"))?
+    / window_size_ms;
+  usize::try_from(trailing_windows.saturating_add(1))
+    .map_err(|_| anyhow!("metadata availability horizon has too many windows"))
 }
 
 #[must_use]

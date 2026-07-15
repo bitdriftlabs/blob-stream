@@ -110,6 +110,7 @@ fn rejects_writer_id_outside_a_topic_range() {
       partition_count: 2,
       num_writers: 1,
       retention_days: 7,
+      max_metadata_publication_lag_ms: 30_000,
     },
   )]);
 

@@ -403,6 +403,7 @@ fn build_write_engine(
         partition_count,
         num_writers: topic_num_writers,
         retention_days: 7,
+        max_metadata_publication_lag_ms: 30_000,
       },
     );
   }

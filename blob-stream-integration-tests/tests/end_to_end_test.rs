@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use bd_server_stats::stats::Collector;
+use blob_stream_blob_store::{BlobKey, BlobStore};
 use blob_stream_broker::write::BrokerLeaseStatus;
 use blob_stream_broker_discovery::BrokerDiscovery;
 use blob_stream_consumer::{
@@ -9,6 +10,7 @@ use blob_stream_consumer::{
   ConsumerReadConfig,
   ConsumerReader,
   ConsumerReaderImpl,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   MembershipCoordinationSource,
   NextResult,
 };
@@ -22,13 +24,23 @@ use blob_stream_metadata_store::{
   SegmentMetadata,
 };
 use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerRecord};
+use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
+  BatchMetadata,
   CommittedCursor,
+  CommittedSourceCheckpoint,
+  Compression,
+  RecordBatch,
+  SeqRange,
   SnowflakeId,
+  TopicWindowKey,
+  Window,
   logical_partition_for_key,
+  new_record,
   now_unix_millis,
   virtual_partition_for_logical,
 };
+use bytes::Bytes;
 use framework::{
   ClusterHarness,
   IntegrationResources,
@@ -48,6 +60,7 @@ use framework::{
   producer_topic_named,
   producer_topic_named_with_writers,
 };
+use protobuf::Message;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,6 +70,63 @@ use tokio::time::{Instant, sleep, timeout};
 
 fn metrics_scope(component: &str) -> bd_server_stats::stats::Scope {
   Collector::default().scope(component)
+}
+
+async fn write_recovery_segment(
+  blob_store: &dyn BlobStore,
+  metadata_store: &dyn MetadataStore,
+  window_start_unix_seconds: i64,
+  snowflake_id: u64,
+  sequence: u64,
+  payload: &str,
+  published_ts_ms: i64,
+) -> Result<()> {
+  let record = new_record(
+    payload.as_bytes().to_vec(),
+    window_start_unix_seconds * 1_000,
+  );
+  let encoded = StoredRecordBatch {
+    virtual_partition_id: 0,
+    records: vec![record.clone()],
+    ..Default::default()
+  }
+  .write_to_bytes()?;
+  let blob_key = BlobKey::new(format!(
+    "recovery/{window_start_unix_seconds}/{snowflake_id}.bin"
+  ));
+  blob_store
+    .put(&blob_key, Bytes::from(encoded.clone()))
+    .await?;
+
+  metadata_store
+    .write_segment(SegmentMetadata::new(
+      TopicWindowKey {
+        topic: TOPIC.to_string(),
+        window_start_unix_seconds,
+      },
+      SnowflakeId(snowflake_id),
+      blob_key,
+      HashMap::from([(
+        0,
+        vec![BatchMetadata {
+          seq_range: SeqRange {
+            start: sequence,
+            end: sequence,
+          },
+          byte_range: blob_stream_types::ByteRange {
+            start: 0,
+            end: u64::try_from(encoded.len())?,
+          },
+          summary: RecordBatch::new(0, vec![record])
+            .summary()
+            .ok_or_else(|| anyhow!("recovery segment must contain one record"))?,
+          compression: Compression::none(),
+        }],
+      )]),
+      window_start_unix_seconds * 1_000,
+      published_ts_ms,
+    ))
+    .await
 }
 
 struct DelayedVisibilityMetadataStore {
@@ -257,11 +327,10 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
   assert!(ack.attempts >= 1);
 
   // Step 4: Read from the exact virtual partition and assert the record is visible.
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      lookback_windows: Some(10),
       ..Default::default()
     },
     vec![ack.virtual_partition_id],
@@ -269,6 +338,8 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )?;
 
   let mut observed_ids = HashSet::new();
@@ -385,11 +456,10 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
   let metadata_store = resources.metadata_store();
   let consumer_lease_store = resources.consumer_lease_store();
   let consumer_membership_store = resources.consumer_membership_store();
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      lookback_windows: Some(20),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -397,6 +467,8 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
     &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )?;
 
   // Step 3: Produce and drain phase 1 traffic.
@@ -436,7 +508,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
     .ok_or_else(|| anyhow!("consumer-2 group config missing"))?;
 
   let mut consumer_0 = Box::new(
-    ConsumerIteratorImpl::from_runtime_config(
+    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
       &runtime_0,
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
@@ -450,11 +522,13 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
         Arc::clone(&consumer_membership_store),
       )),
       metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
     )
     .await?,
   );
   let mut consumer_1 = Box::new(
-    ConsumerIteratorImpl::from_runtime_config(
+    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
       &runtime_1,
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
@@ -468,6 +542,8 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
         Arc::clone(&consumer_membership_store),
       )),
       metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
     )
     .await?,
   );
@@ -475,7 +551,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
   consumer_1.start()?;
 
   let mut consumer_2 = Box::new(
-    ConsumerIteratorImpl::from_runtime_config(
+    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
       &runtime_2,
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
@@ -489,6 +565,8 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
         Arc::clone(&consumer_membership_store),
       )),
       metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
     )
     .await?,
   );
@@ -548,11 +626,10 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
     expected_ids.insert(id);
   }
 
-  let mut post_failover_reader = ConsumerReaderImpl::new(
+  let mut post_failover_reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      lookback_windows: Some(10),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -560,6 +637,8 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
     &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )?;
 
   let mut post_failover_consumed_ids = HashSet::new();
@@ -608,11 +687,10 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
   assert!(first_ack.attempts >= 1);
 
   // Step 3: Read the produced data and validate dedupe/cursor monotonicity on repeated scans.
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      lookback_windows: Some(10),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -620,6 +698,8 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )?;
 
   let mut observed_ids = HashSet::new();
@@ -683,7 +763,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
   let consumer_membership_store = resources.consumer_membership_store();
 
   let mut consumer = Box::new(
-    ConsumerIteratorImpl::from_runtime_config(
+    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
       &runtime,
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
@@ -697,6 +777,8 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
         Arc::clone(&consumer_membership_store),
       )),
       metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
     )
     .await?,
   );
@@ -749,7 +831,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
 
   // Step 5: New iterator with same member/group should resume from committed cursors.
   let mut resumed_consumer = Box::new(
-    ConsumerIteratorImpl::from_runtime_config(
+    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
       &runtime,
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
@@ -763,6 +845,8 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
         Arc::clone(&consumer_membership_store),
       )),
       metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
     )
     .await?,
   );
@@ -816,6 +900,178 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
   Ok(())
 }
 
+// High-level: verifies a persisted source checkpoint drives iterator recovery through more than
+// two bounded scan slices before current-window delivery begins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices() -> Result<()> {
+  const RECOVERY_WINDOW_COUNT: i64 = 80;
+
+  let resources = IntegrationResources::create().await?;
+  let blob_store = resources.blob_store();
+  let metadata_store = resources.metadata_store();
+  let lease_store = resources.consumer_lease_store();
+  let membership_store = resources.consumer_membership_store();
+  let now_ts_ms = now_unix_millis();
+  let current_window_start =
+    Window::for_timestamp(now_ts_ms / 1_000, WINDOW_SIZE_SECONDS).start_unix_seconds;
+  let recovery_start = current_window_start - (RECOVERY_WINDOW_COUNT * WINDOW_SIZE_SECONDS);
+  let published_ts_ms = now_ts_ms.saturating_sub(10_000);
+
+  // Seed one committed record followed by unread records in the first, middle, and final slices.
+  for (window_offset, snowflake_id, sequence, payload) in [
+    (0, 1, 1, "recovery-checkpoint"),
+    (31, 2, 2, "recovery-first-slice"),
+    (32, 3, 3, "recovery-second-slice"),
+    (64, 4, 4, "recovery-final-slice"),
+    (80, 5, 5, "recovery-cutover"),
+  ] {
+    write_recovery_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      recovery_start + (window_offset * WINDOW_SIZE_SECONDS),
+      snowflake_id,
+      sequence,
+      payload,
+      published_ts_ms,
+    )
+    .await?;
+  }
+
+  // Dynamo scans are eventually consistent. Establish the fixture before starting recovery so
+  // this test exercises bounded traversal rather than timing-dependent metadata visibility.
+  for (window_offset, snowflake_id) in [(0, 1), (31, 2), (32, 3), (64, 4), (80, 5)] {
+    let window = TopicWindowKey {
+      topic: TOPIC.to_string(),
+      window_start_unix_seconds: recovery_start + (window_offset * WINDOW_SIZE_SECONDS),
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+      let visible = metadata_store
+        .scan_window_from_snowflake(&window, Some(SnowflakeId(snowflake_id)))
+        .await?
+        .iter()
+        .any(|segment| segment.snowflake_id == SnowflakeId(snowflake_id));
+      if visible {
+        break;
+      }
+      if Instant::now() >= deadline {
+        return Err(anyhow!(
+          "deadline exceeded waiting for recovery metadata: window_start={}, \
+           snowflake_id={snowflake_id}",
+          window.window_start_unix_seconds
+        ));
+      }
+      sleep(Duration::from_millis(10)).await;
+    }
+  }
+
+  let lease_key = ConsumerGroupLeaseKey {
+    topic: TOPIC.to_string(),
+    group_id: "integration-group".to_string(),
+    virtual_partition_id: 0,
+  };
+  lease_store
+    .assign_partition(
+      lease_key.clone(),
+      "previous-owner".to_string(),
+      1,
+      now_ts_ms,
+      2_000,
+    )
+    .await?;
+  lease_store
+    .commit_cursor(
+      &lease_key,
+      "previous-owner",
+      1,
+      now_ts_ms,
+      CommittedCursor {
+        virtual_partition_id: 0,
+        seq_end: 1,
+        source_checkpoint: Some(CommittedSourceCheckpoint {
+          window_start_unix_seconds: recovery_start,
+          snowflake_id: 1,
+        }),
+      },
+    )
+    .await?;
+  let _ = lease_store
+    .release_partition(&lease_key, "previous-owner", 1, now_ts_ms)
+    .await?;
+
+  let mut runtime = consumer_runtime_config("recovery-member");
+  runtime
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow!("recovery reader config missing"))?
+    .metadata_visibility_delay_ms = Some(0);
+  let runtime_group = runtime
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("recovery group config missing"))?;
+  let mut iterator = Box::new(
+    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+      &runtime,
+      Arc::clone(&blob_store),
+      Arc::clone(&metadata_store),
+      Arc::clone(&lease_store),
+      Arc::clone(&membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_group.topic.to_string(),
+        runtime_group.group_id.to_string(),
+        runtime_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&membership_store),
+      )),
+      metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    )
+    .await?,
+  );
+  iterator.start()?;
+
+  let expected = HashSet::from([
+    "recovery-first-slice".to_string(),
+    "recovery-second-slice".to_string(),
+    "recovery-final-slice".to_string(),
+    "recovery-cutover".to_string(),
+  ]);
+  let mut observed = HashSet::new();
+  let mut last_offset = None;
+  let deadline = Instant::now() + Duration::from_secs(15);
+  while observed.len() < expected.len() {
+    if Instant::now() >= deadline {
+      return Err(anyhow!(
+        "deadline exceeded recovering retained records: observed={observed:?}"
+      ));
+    }
+
+    let next_result = timeout(Duration::from_secs(2), iterator.next()).await;
+    let Ok(Ok(next_result)) = next_result else {
+      continue;
+    };
+    match next_result {
+      NextResult::Revoked(revoked) => revoked.complete().await,
+      NextResult::Record(record) => {
+        let payload = String::from_utf8(record.record.payload.to_vec())
+          .map_err(|error| anyhow!("recovery payload was not utf-8: {error}"))?;
+        assert_ne!(payload, "recovery-checkpoint");
+        observed.insert(payload);
+        last_offset = Some((record.virtual_partition_id, record.offset));
+      },
+    }
+  }
+
+  assert_eq!(observed, expected);
+  let (partition_id, offset) = last_offset.ok_or_else(|| anyhow!("no recovery offset observed"))?;
+  iterator.store_offset(partition_id, offset)?;
+  let _ = iterator.commit().await?;
+  iterator.shutdown().await?;
+  resources.cleanup().await;
+  Ok(())
+}
+
 // High-level: verifies no data loss while consumer-group membership changes from 2 -> 3 -> 1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
@@ -834,9 +1090,20 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
 
   // Step 2: Start two iterators, scale out to three, then scale in to one.
 
-  let runtime_0 = consumer_runtime_config("consumer-0");
-  let runtime_1 = consumer_runtime_config("consumer-1");
-  let runtime_2 = consumer_runtime_config("consumer-2");
+  let mut runtime_0 = consumer_runtime_config("consumer-0");
+  let mut runtime_1 = consumer_runtime_config("consumer-1");
+  let mut runtime_2 = consumer_runtime_config("consumer-2");
+  for (member_id, runtime) in [
+    ("consumer-0", &mut runtime_0),
+    ("consumer-1", &mut runtime_1),
+    ("consumer-2", &mut runtime_2),
+  ] {
+    runtime
+      .read
+      .as_mut()
+      .ok_or_else(|| anyhow!("{member_id} read config missing"))?
+      .metadata_visibility_delay_ms = Some(0);
+  }
 
   let runtime_0_group = runtime_0
     .group
@@ -857,7 +1124,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
   let consumer_membership_store = resources.consumer_membership_store();
 
   let consumer_0 = Box::new(
-    ConsumerIteratorImpl::from_runtime_config(
+    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
       &runtime_0,
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
@@ -871,11 +1138,13 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
         Arc::clone(&consumer_membership_store),
       )),
       metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
     )
     .await?,
   );
   let consumer_1 = Box::new(
-    ConsumerIteratorImpl::from_runtime_config(
+    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
       &runtime_1,
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
@@ -889,6 +1158,8 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
         Arc::clone(&consumer_membership_store),
       )),
       metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
     )
     .await?,
   );
@@ -935,7 +1206,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
   }
 
   let consumer_2 = Box::new(
-    ConsumerIteratorImpl::from_runtime_config(
+    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
       &runtime_2,
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
@@ -949,6 +1220,8 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
         Arc::clone(&consumer_membership_store),
       )),
       metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
     )
     .await?,
   );
@@ -1090,11 +1363,11 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
   // If task-based consumption is just shy of completion during scale transitions,
   // do a final direct reader catch-up pass to assert end-state no-loss.
   if consumed_ids.len() < expected_ids.len() {
-    let mut reader = ConsumerReaderImpl::new(
+    let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
       ConsumerReadConfig {
         topic: TOPIC.to_string().into(),
         window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-        lookback_windows: Some(20),
+        metadata_visibility_delay_ms: Some(0),
         ..Default::default()
       },
       (0 .. PARTITION_COUNT).collect(),
@@ -1102,6 +1375,8 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
       &metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
     )?;
     let catchup_deadline = Instant::now() + Duration::from_secs(15);
     drain_reader_until(
@@ -1233,11 +1508,10 @@ async fn active_broker_restart_continuity() -> Result<()> {
   )
   .await?;
 
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      lookback_windows: Some(10),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -1245,6 +1519,8 @@ async fn active_broker_restart_continuity() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )?;
 
   // Step 2: Produce continuously, restart the active broker mid-stream, and continue producing.
@@ -1358,11 +1634,10 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
   )
   .await?;
 
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      lookback_windows: Some(10),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -1370,6 +1645,8 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )?;
 
   // Step 2: Produce a stream of records and track which virtual partitions were targeted.
@@ -1483,11 +1760,10 @@ async fn multi_topic_isolation() -> Result<()> {
   )
   .await?;
 
-  let mut topic_a_reader = ConsumerReaderImpl::new(
+  let mut topic_a_reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      lookback_windows: Some(10),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -1495,13 +1771,14 @@ async fn multi_topic_isolation() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )?;
 
-  let mut topic_b_reader = ConsumerReaderImpl::new(
+  let mut topic_b_reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: SECOND_TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      lookback_windows: Some(10),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -1509,6 +1786,8 @@ async fn multi_topic_isolation() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )?;
 
   // Step 2: Produce interleaved traffic to both topics.
@@ -1623,11 +1902,10 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
     .await?,
   );
 
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      lookback_windows: Some(10),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -1635,6 +1913,8 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )?;
 
   // Step 2: Produce boundary payload sizes, including true empty and near-limit payloads.
@@ -1766,12 +2046,10 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
   )
   .await?;
 
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      lookback_windows: Some(10),
-      metadata_recovery_scan_interval_seconds: Some(1),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -1779,6 +2057,8 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
     resources.blob_store(),
     metadata_store,
     &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )?;
 
   // Step 2: Produce traffic while metadata remains temporarily invisible to readers.
@@ -1875,7 +2155,7 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
   let consumer_membership_store = resources.consumer_membership_store();
 
   let consumer_0 = Box::new(
-    ConsumerIteratorImpl::from_runtime_config(
+    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
       &runtime_0,
       Arc::clone(&blob_store),
       Arc::clone(&delayed_metadata_store),
@@ -1889,6 +2169,8 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
         Arc::clone(&consumer_membership_store),
       )),
       metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
     )
     .await?,
   );
@@ -1932,7 +2214,7 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
 
   // Step 4: Scale out to trigger rebalance and continue producing under delay.
   let consumer_1 = Box::new(
-    ConsumerIteratorImpl::from_runtime_config(
+    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
       &runtime_1,
       Arc::clone(&blob_store),
       Arc::clone(&delayed_metadata_store),
@@ -1946,6 +2228,8 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
         Arc::clone(&consumer_membership_store),
       )),
       metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
     )
     .await?,
   );
@@ -2005,11 +2289,10 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
   // Task-driven draining can stall near completion across rebalance transitions.
   // Do a final direct reader catch-up pass to assert end-state no-loss semantics.
   if consumed_ids.len() < expected_ids.len() {
-    let mut reader = ConsumerReaderImpl::new(
+    let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
       ConsumerReadConfig {
         topic: TOPIC.to_string().into(),
         window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-        lookback_windows: Some(20),
         ..Default::default()
       },
       (0 .. PARTITION_COUNT).collect(),
@@ -2017,6 +2300,8 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
       Arc::clone(&blob_store),
       Arc::clone(&delayed_metadata_store),
       &metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
     )?;
     let catchup_deadline = Instant::now() + Duration::from_secs(5);
     drain_reader_until(
@@ -2093,6 +2378,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       Some(CommittedCursor {
         virtual_partition_id: key.virtual_partition_id,
         seq_end: 10,
+        source_checkpoint: None,
       }),
     )
     .await?;
@@ -2106,6 +2392,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
     Some(CommittedCursor {
       virtual_partition_id: key.virtual_partition_id,
       seq_end: 10,
+      source_checkpoint: None,
     })
   );
 
@@ -2135,6 +2422,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       Some(CommittedCursor {
         virtual_partition_id: key.virtual_partition_id,
         seq_end: 20,
+        source_checkpoint: None,
       }),
     )
     .await?;
@@ -2148,6 +2436,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
     Some(CommittedCursor {
       virtual_partition_id: key.virtual_partition_id,
       seq_end: 20,
+      source_checkpoint: None,
     })
   );
 
@@ -2162,6 +2451,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       Some(CommittedCursor {
         virtual_partition_id: key.virtual_partition_id,
         seq_end: 999,
+        source_checkpoint: None,
       }),
     )
     .await?;
@@ -2175,6 +2465,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
     Some(CommittedCursor {
       virtual_partition_id: key.virtual_partition_id,
       seq_end: 20,
+      source_checkpoint: None,
     })
   );
 
@@ -2187,6 +2478,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       CommittedCursor {
         virtual_partition_id: key.virtual_partition_id,
         seq_end: 999,
+        source_checkpoint: None,
       },
     )
     .await?;
@@ -2200,6 +2492,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
     Some(CommittedCursor {
       virtual_partition_id: key.virtual_partition_id,
       seq_end: 20,
+      source_checkpoint: None,
     })
   );
 
@@ -2213,6 +2506,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       CommittedCursor {
         virtual_partition_id: key.virtual_partition_id,
         seq_end: 21,
+        source_checkpoint: None,
       },
     )
     .await?;
@@ -2226,6 +2520,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
     Some(CommittedCursor {
       virtual_partition_id: key.virtual_partition_id,
       seq_end: 21,
+      source_checkpoint: None,
     })
   );
 
@@ -2239,6 +2534,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       Some(CommittedCursor {
         virtual_partition_id: key.virtual_partition_id,
         seq_end: 1_000,
+        source_checkpoint: None,
       }),
     )
     .await?;
@@ -2255,6 +2551,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
     Some(CommittedCursor {
       virtual_partition_id: key.virtual_partition_id,
       seq_end: 21,
+      source_checkpoint: None,
     })
   );
 
@@ -2303,11 +2600,10 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
   .await?;
 
   let virtual_partition_ids: Vec<u32> = (0 .. (PARTITION_COUNT * 2)).collect();
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      lookback_windows: Some(10),
       ..Default::default()
     },
     virtual_partition_ids,
@@ -2315,6 +2611,8 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )?;
 
   // Step 3: Produce records into matching logical partitions from both writers.
@@ -2496,7 +2794,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
   let blob_store = resources.blob_store();
   let metadata_store = resources.metadata_store();
   let mut consumer = Box::new(
-    ConsumerIteratorImpl::from_runtime_config(
+    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
       &runtime,
       Arc::clone(&blob_store),
       Arc::clone(&metadata_store),
@@ -2510,6 +2808,8 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
         Arc::clone(&membership_store),
       )),
       metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
     )
     .await?,
   );
@@ -2663,11 +2963,10 @@ async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
   );
 
   // Final correctness check: independent reader must recover the exact produced set (no loss).
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      lookback_windows: Some(10),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -2675,6 +2974,8 @@ async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
     resources.s3_blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )?;
   let mut consumed_ids = HashSet::new();
   drain_reader_until(
@@ -2789,11 +3090,10 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
     "expected surviving bootstrap member to renew ownership after scale-in"
   );
 
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      lookback_windows: Some(10),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -2801,6 +3101,8 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
     resources.s3_blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )?;
   let mut consumed_ids = HashSet::new();
   drain_reader_until(

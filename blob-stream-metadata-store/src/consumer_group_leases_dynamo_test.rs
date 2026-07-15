@@ -18,7 +18,7 @@ use aws_sdk_dynamodb::types::{
   KeyType,
   ScalarAttributeType,
 };
-use blob_stream_types::CommittedCursor;
+use blob_stream_types::{CommittedCursor, CommittedSourceCheckpoint};
 use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -101,10 +101,14 @@ fn lease_key() -> ConsumerGroupLeaseKey {
   }
 }
 
-fn cursor(virtual_partition_id: u32, seq_end: u64) -> CommittedCursor {
+fn cursor_with_source(virtual_partition_id: u32, seq_end: u64) -> CommittedCursor {
   CommittedCursor {
     virtual_partition_id,
     seq_end,
+    source_checkpoint: Some(CommittedSourceCheckpoint {
+      window_start_unix_seconds: 1_200,
+      snowflake_id: 42,
+    }),
   }
 }
 
@@ -169,7 +173,7 @@ async fn heartbeats_and_commits() -> Result<()> {
       1,
       1010,
       100,
-      Some(cursor(key.virtual_partition_id, 10)),
+      Some(cursor_with_source(key.virtual_partition_id, 10)),
     )
     .await?;
 
@@ -179,7 +183,7 @@ async fn heartbeats_and_commits() -> Result<()> {
 
   assert_eq!(
     lease.committed_cursor,
-    Some(cursor(key.virtual_partition_id, 10))
+    Some(cursor_with_source(key.virtual_partition_id, 10))
   );
 
   let outcome = store
@@ -188,7 +192,7 @@ async fn heartbeats_and_commits() -> Result<()> {
       "member-a",
       1,
       1020,
-      cursor(key.virtual_partition_id, 12),
+      cursor_with_source(key.virtual_partition_id, 12),
     )
     .await?;
 
@@ -198,7 +202,7 @@ async fn heartbeats_and_commits() -> Result<()> {
 
   assert_eq!(
     lease.committed_cursor,
-    Some(cursor(key.virtual_partition_id, 12))
+    Some(cursor_with_source(key.virtual_partition_id, 12))
   );
 
   client.delete_table().table_name(table_name).send().await?;
@@ -324,6 +328,12 @@ async fn writes_ttl_attribute_for_consumer_leases() -> Result<()> {
     .parse::<i64>()?;
 
   assert_eq!(ttl, 122);
+  for attribute in ["topic", "group_id", "virtual_partition_id"] {
+    assert!(
+      !item.contains_key(attribute),
+      "consumer lease item unexpectedly contains {attribute}"
+    );
+  }
 
   client.delete_table().table_name(table_name).send().await?;
   Ok(())

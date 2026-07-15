@@ -122,11 +122,7 @@ fn build_segment(
     SnowflakeId(snowflake_id),
     BlobKey::from("topic/1/segment"),
     segment_index,
-    Compression::none(),
-    10,
-    1000,
-    2000,
-    None,
+    3000,
     3000,
   )
 }
@@ -223,6 +219,20 @@ async fn writes_segment_ttl_attribute() -> Result<()> {
   let expected = (segment.created_ts_ms / 1_000) + (7 * 24 * 60 * 60) + 3_600;
 
   assert_eq!(ttl, expected);
+  for attribute in [
+    "topic",
+    "window_start_ts",
+    "compression",
+    "record_count",
+    "min_event_ts_ms",
+    "max_event_ts_ms",
+    "checksum",
+  ] {
+    assert!(
+      !item.contains_key(attribute),
+      "metadata item unexpectedly contains {attribute}"
+    );
+  }
 
   client.delete_table().table_name(table_name).send().await?;
   Ok(())

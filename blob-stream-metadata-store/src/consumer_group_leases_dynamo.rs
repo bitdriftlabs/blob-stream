@@ -29,10 +29,7 @@ const ATTR_GENERATION: &str = "generation";
 const ATTR_LAST_HEARTBEAT: &str = "last_heartbeat_ts";
 const ATTR_COMMITTED_CURSOR: &str = "committed_cursor";
 const ATTR_COMMITTED_TS: &str = "committed_ts";
-const ATTR_TOPIC: &str = "topic";
-const ATTR_GROUP_ID: &str = "group_id";
 const ATTR_TTL: &str = "ttl_epoch_seconds";
-const ATTR_VIRTUAL_PARTITION_ID: &str = "virtual_partition_id";
 const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
 
 //
@@ -81,12 +78,15 @@ impl DynamoConsumerGroupLeaseStore {
     };
 
     let entry: DynamoLeaseItem = serde_dynamo::from_item(item)?;
-    Ok(Some(entry.into_lease()))
+    Ok(Some(entry.into_lease(key.clone())))
   }
 
-  fn lease_from_item(attributes: HashMap<String, AttributeValue>) -> Result<ConsumerGroupLease> {
+  fn lease_from_item(
+    attributes: HashMap<String, AttributeValue>,
+    key: ConsumerGroupLeaseKey,
+  ) -> Result<ConsumerGroupLease> {
     let entry: DynamoLeaseItem = serde_dynamo::from_item(attributes)?;
-    Ok(entry.into_lease())
+    Ok(entry.into_lease(key))
   }
 
   fn cursor_value(cursor: &CommittedCursor) -> Result<AttributeValue> {
@@ -128,22 +128,9 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       AttributeValue::N(generation.to_string()),
     );
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-    values.insert(":topic".to_string(), AttributeValue::S(key.topic.clone()));
-    values.insert(
-      ":group_id".to_string(),
-      AttributeValue::S(key.group_id.clone()),
-    );
-    values.insert(
-      ":virtual_partition_id".to_string(),
-      AttributeValue::N(key.virtual_partition_id.to_string()),
-    );
-
     let update = format!(
       "SET {ATTR_OWNER} = :owner, {ATTR_LEASE_EXPIRES} = :expires, {ATTR_GENERATION} = \
-       :generation, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl, {ATTR_TOPIC} = \
-       if_not_exists({ATTR_TOPIC}, :topic), {ATTR_GROUP_ID} = if_not_exists({ATTR_GROUP_ID}, \
-       :group_id), {ATTR_VIRTUAL_PARTITION_ID} = if_not_exists({ATTR_VIRTUAL_PARTITION_ID}, \
-       :virtual_partition_id)"
+       :generation, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl"
     );
     let condition = format!(
       "attribute_not_exists({ATTR_PK}) OR {ATTR_LEASE_EXPIRES} <= :now OR {ATTR_OWNER} = :owner"
@@ -167,7 +154,7 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
         let attributes = output
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
-        let lease = Self::lease_from_item(attributes)?;
+        let lease = Self::lease_from_item(attributes, key.clone())?;
         debug!("consumer lease(dynamo) assign result: assigned");
         Ok(ConsumerGroupAssignmentOutcome::Assigned(lease))
       },
@@ -258,7 +245,7 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
         let attributes = output
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
-        let lease = Self::lease_from_item(attributes)?;
+        let lease = Self::lease_from_item(attributes, key.clone())?;
         debug!("consumer lease(dynamo) heartbeat result: renewed");
         Ok(ConsumerGroupHeartbeatOutcome::Renewed(lease))
       },
@@ -340,7 +327,7 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
         let attributes = output
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
-        let lease = Self::lease_from_item(attributes)?;
+        let lease = Self::lease_from_item(attributes, key.clone())?;
         debug!("consumer lease(dynamo) commit result: committed");
         Ok(ConsumerGroupCommitOutcome::Committed(lease))
       },
@@ -441,13 +428,6 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DynamoLeaseItem {
-  #[serde(rename = "pk")]
-  partition_key: String,
-  #[serde(rename = "sk")]
-  sort_key: String,
-  topic: String,
-  group_id: String,
-  virtual_partition_id: u32,
   owner_id: String,
   generation: u64,
   #[serde(rename = "lease_expiry_ts")]
@@ -459,13 +439,9 @@ struct DynamoLeaseItem {
 }
 
 impl DynamoLeaseItem {
-  fn into_lease(self) -> ConsumerGroupLease {
+  fn into_lease(self, key: ConsumerGroupLeaseKey) -> ConsumerGroupLease {
     ConsumerGroupLease {
-      key: ConsumerGroupLeaseKey {
-        topic: self.topic,
-        group_id: self.group_id,
-        virtual_partition_id: self.virtual_partition_id,
-      },
+      key,
       owner_id: self.owner_id,
       generation: self.generation,
       lease_expiration_ts_ms: self.lease_expiration_ts_ms,

@@ -21,6 +21,7 @@ fn cursor(virtual_partition_id: u32, seq_end: u64) -> CommittedCursor {
   CommittedCursor {
     virtual_partition_id,
     seq_end,
+    source_checkpoint: None,
   }
 }
 

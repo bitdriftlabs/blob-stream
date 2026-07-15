@@ -234,6 +234,7 @@ fn make_engine_with_lease_store_and_scope(
       partition_count: 1,
       num_writers: 1,
       retention_days: 7,
+      max_metadata_publication_lag_ms: 30_000,
     },
   );
 
@@ -485,7 +486,13 @@ async fn buffers_until_size_rollover() -> Result<()> {
     .scan_window_from_snowflake(&window.key("telemetry"), None)
     .await?;
   assert_eq!(segments.len(), 1);
-  assert_eq!(segments[0].record_count, 2);
+  assert_eq!(
+    segments[0].segment_index[&0]
+      .iter()
+      .map(|batch| batch.summary.record_count)
+      .sum::<u32>(),
+    2
+  );
   Ok(())
 }
 
@@ -513,6 +520,7 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
+        max_metadata_publication_lag_ms: 30_000,
       },
     )]),
     Arc::new(InMemoryBlobStore::new()),
@@ -621,6 +629,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
+        max_metadata_publication_lag_ms: 30_000,
       },
     );
   }
@@ -712,6 +721,7 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
+        max_metadata_publication_lag_ms: 30_000,
       },
     )]),
     Arc::new(GatedBlobStore {
@@ -806,6 +816,7 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
+        max_metadata_publication_lag_ms: 30_000,
       },
     )]),
     Arc::new(BlockingBlobStore {
@@ -929,6 +940,7 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
+        max_metadata_publication_lag_ms: 30_000,
       },
     );
   }
@@ -1006,6 +1018,7 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
           partition_count: 1,
           num_writers: 1,
           retention_days: 7,
+          max_metadata_publication_lag_ms: 30_000,
         },
       )
     })
@@ -1103,6 +1116,7 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
+        max_metadata_publication_lag_ms: 30_000,
       },
     );
   }
@@ -1210,7 +1224,6 @@ async fn writes_compressed_metadata() -> Result<()> {
     .scan_window_from_snowflake(&window.key("telemetry"), None)
     .await?;
   assert_eq!(segments.len(), 1);
-  assert_eq!(segments[0].compression.codec, CompressionCodec::Zstd);
 
   let batch_metadata = segments[0].segment_index.get(&0).unwrap().first().unwrap();
   assert_eq!(batch_metadata.compression.codec, CompressionCodec::Zstd);
@@ -1246,6 +1259,7 @@ async fn returns_error_when_flush_fails() -> Result<()> {
       partition_count: 1,
       num_writers: 1,
       retention_days: 7,
+      max_metadata_publication_lag_ms: 30_000,
     },
   );
 

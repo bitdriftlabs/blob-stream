@@ -26,9 +26,7 @@ const ATTR_PK: &str = "pk";
 const ATTR_HOLDER: &str = "holder_id";
 const ATTR_EXPIRES: &str = "lease_expiration_ts_ms";
 const ATTR_MAX_SEQ: &str = "max_allocated_seq";
-const ATTR_TOPIC: &str = "topic";
 const ATTR_TTL: &str = "ttl_epoch_seconds";
-const ATTR_VIRTUAL_PARTITION_ID: &str = "virtual_partition_id";
 const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
 
 //
@@ -79,14 +77,15 @@ impl DynamoProducerPartitionLeaseStore {
     };
 
     let entry: DynamoLeaseItem = serde_dynamo::from_item(item)?;
-    Ok(Some(entry.into_lease()))
+    Ok(Some(entry.into_lease(key.clone())))
   }
 
   fn lease_from_item(
     attributes: HashMap<String, AttributeValue>,
+    key: ProducerPartitionLeaseKey,
   ) -> Result<ProducerPartitionLease> {
     let entry: DynamoLeaseItem = serde_dynamo::from_item(attributes)?;
-    Ok(entry.into_lease())
+    Ok(entry.into_lease(key))
   }
 }
 
@@ -125,17 +124,9 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       AttributeValue::N(ttl_epoch_seconds.to_string()),
     );
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-    values.insert(":topic".to_string(), AttributeValue::S(key.topic.clone()));
-    values.insert(
-      ":virtual_partition_id".to_string(),
-      AttributeValue::N(key.virtual_partition_id.to_string()),
-    );
 
-    let update = format!(
-      "SET {ATTR_HOLDER} = :holder, {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl, {ATTR_TOPIC} = \
-       if_not_exists({ATTR_TOPIC}, :topic), {ATTR_VIRTUAL_PARTITION_ID} = \
-       if_not_exists({ATTR_VIRTUAL_PARTITION_ID}, :virtual_partition_id)"
-    );
+    let update =
+      format!("SET {ATTR_HOLDER} = :holder, {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl");
     let condition = format!(
       "attribute_not_exists({ATTR_PK}) OR {ATTR_EXPIRES} <= :now OR {ATTR_HOLDER} = :holder"
     );
@@ -157,7 +148,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
         let attributes = output
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
-        let lease = Self::lease_from_item(attributes)?;
+        let lease = Self::lease_from_item(attributes, key.clone())?;
         debug!("producer lease(dynamo) acquire result: acquired");
         Ok(LeaseAcquireOutcome::Acquired(lease))
       },
@@ -224,7 +215,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
         let attributes = output
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
-        let lease = Self::lease_from_item(attributes)?;
+        let lease = Self::lease_from_item(attributes, key.clone())?;
         debug!("producer lease(dynamo) heartbeat result: renewed");
         Ok(LeaseHeartbeatOutcome::Renewed(lease))
       },
@@ -402,22 +393,15 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DynamoLeaseItem {
-  #[serde(rename = "pk")]
-  partition_key: String,
-  topic: String,
-  virtual_partition_id: u32,
   holder_id: String,
   lease_expiration_ts_ms: i64,
   max_allocated_seq: Option<u64>,
 }
 
 impl DynamoLeaseItem {
-  fn into_lease(self) -> ProducerPartitionLease {
+  fn into_lease(self, key: ProducerPartitionLeaseKey) -> ProducerPartitionLease {
     ProducerPartitionLease {
-      key: ProducerPartitionLeaseKey {
-        topic: self.topic,
-        virtual_partition_id: self.virtual_partition_id,
-      },
+      key,
       holder_id: self.holder_id,
       lease_expiration_ts_ms: self.lease_expiration_ts_ms,
       max_allocated_seq: self.max_allocated_seq,
