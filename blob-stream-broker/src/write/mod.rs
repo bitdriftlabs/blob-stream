@@ -260,6 +260,8 @@ struct WriteMetrics {
   flush_plans_total: prometheus::IntCounter,
   flush_failures_total: prometheus::IntCounter,
   flush_latency_seconds: prometheus::Histogram,
+  lease_drain_starts_total: prometheus::IntCounter,
+  lease_drain_completions_total: prometheus::IntCounter,
 }
 
 impl WriteMetrics {
@@ -283,6 +285,8 @@ impl WriteMetrics {
       flush_plans_total: scope.counter("flush_plans_total"),
       flush_failures_total: scope.counter("flush_failures_total"),
       flush_latency_seconds: scope.histogram("flush_latency_seconds"),
+      lease_drain_starts_total: scope.counter("lease_drain_starts_total"),
+      lease_drain_completions_total: scope.counter("lease_drain_completions_total"),
     }
   }
 
@@ -610,6 +614,13 @@ impl WriteEngine for WriteEngineImpl {
     };
     let mut partition_state = partition_state.lock().await;
 
+    if partition_state.draining {
+      return Err(WriteError::NotLeaseHolder {
+        topic: request.topic,
+        virtual_partition_id: request.virtual_partition_id,
+      });
+    }
+
     let needs_lease = partition_state.needs_lease(now_ts_ms);
 
     if needs_lease {
@@ -913,7 +924,9 @@ async fn mark_flush_complete(
     state.partition_states(topic, virtual_partition_ids)
   };
   for partition_state in partition_states {
-    partition_state.lock().await.flush_in_flight = false;
+    let mut partition_state = partition_state.lock().await;
+    partition_state.flush_in_flight = false;
+    partition_state.drain_notify.notify_waiters();
   }
 }
 
@@ -955,7 +968,9 @@ async fn collect_flush_plans(
       continue;
     }
     let mut partition_state = partition_state.lock().await;
-    if partition_state.flush_in_flight || !partition_state.buffer.should_flush(now_ts_ms, config) {
+    if partition_state.flush_in_flight
+      || (!partition_state.draining && !partition_state.buffer.should_flush(now_ts_ms, config))
+    {
       continue;
     }
 
@@ -1075,6 +1090,8 @@ struct PartitionState {
   seq_allocator: SeqAllocator,
   lease_expiration_ts_ms: Option<i64>,
   flush_in_flight: bool,
+  draining: bool,
+  drain_notify: Arc<Notify>,
 }
 
 impl PartitionState {
@@ -1082,6 +1099,10 @@ impl PartitionState {
     self
       .lease_expiration_ts_ms
       .is_none_or(|expires_at| now_ts_ms >= expires_at)
+  }
+
+  fn is_drained(&self) -> bool {
+    !self.flush_in_flight && self.buffer.batches.is_empty()
   }
 }
 
