@@ -266,7 +266,7 @@ async fn receive_blob_write(receiver: &mut mpsc::UnboundedReceiver<String>) -> S
   panic!("expected blob write did not begin");
 }
 
-async fn wait_for_partition_drain(engine: &WriteEngineImpl) {
+async fn wait_for_partition_draining_start(engine: &WriteEngineImpl) {
   for _ in 0 .. 100 {
     let partition_state = {
       let state = engine.state.lock().await;
@@ -850,7 +850,7 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
     node_id: "node-b".to_string(),
     address: "10.0.0.2:8080".to_string(),
   }]))?;
-  wait_for_partition_drain(&engine).await;
+  wait_for_partition_draining_start(&engine).await;
 
   let second = engine
     .produce_batch(WriteRequest {

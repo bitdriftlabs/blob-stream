@@ -287,6 +287,9 @@ impl WriteEngineImpl {
     );
     flush_notifier.notify_one();
 
+    // TODO(mattklein123): Renew the producer lease while waiting for a drain that can approach
+    // the lease duration. The default 30-second lease makes this unlikely in normal operation,
+    // but a slow blob upload can otherwise let a successor acquire before this drain completes.
     Self::wait_for_partition_drain(&partition_state).await;
     metrics.lease_drain_completions_total.inc();
     info!(
