@@ -1148,6 +1148,41 @@ async fn wait_for_producer_route(
   }
 }
 
+async fn wait_for_broker_lease_ownership(
+  cluster: &ClusterHarness,
+  node_id: &str,
+  topic: &str,
+  virtual_partition_ids: &[u32],
+  deadline: Instant,
+) -> Result<()> {
+  loop {
+    let snapshots = cluster.broker_state_snapshots().await;
+    let broker_owns_partition = snapshots
+      .iter()
+      .find(|snapshot| snapshot.holder_id == node_id)
+      .is_some_and(|snapshot| {
+        virtual_partition_ids.iter().all(|virtual_partition_id| {
+          snapshot.ownership.iter().any(|ownership| {
+            ownership.topic == topic
+              && ownership.virtual_partition_id == *virtual_partition_id
+              && ownership.assignment_is_local
+              && ownership.lease_status == BrokerLeaseStatus::LocalActive
+          })
+        })
+      });
+    if broker_owns_partition {
+      return Ok(());
+    }
+    if Instant::now() >= deadline {
+      return Err(anyhow!(
+        "broker {node_id} did not acquire producer leases for {topic} partitions \
+         {virtual_partition_ids:?}: {snapshots:#?}"
+      ));
+    }
+    sleep(Duration::from_millis(10)).await;
+  }
+}
+
 // High-level: verifies progress and no-loss continuity while the active broker is restarted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn active_broker_restart_continuity() -> Result<()> {
@@ -1200,18 +1235,37 @@ async fn active_broker_restart_continuity() -> Result<()> {
   // Step 2: Produce continuously, restart the active broker mid-stream, and continue producing.
   let total_messages = 64;
   let restart_at = 28;
+  let restart_partitions = (0 .. 8)
+    .map(|key_index| {
+      let record_key = format!("restart-active-key-{key_index}").into_bytes();
+      virtual_partition_for_logical(
+        logical_partition_for_key(&record_key, PARTITION_COUNT),
+        PARTITION_COUNT,
+        0,
+      )
+    })
+    .collect::<Vec<_>>();
   let mut expected_ids = HashSet::new();
   let mut consumed_ids = HashSet::new();
 
   for message_id in 0 .. total_messages {
     if message_id == restart_at {
       // Let discovery reach the producer before stopping the active endpoint, then wait for the
-      // new endpoint after restart so the next produce does not retry a stale socket.
+      // new endpoint and the partitions used below after restart so produce does not retry a
+      // stale endpoint or race lease convergence.
       cluster.set_active_nodes(vec![standby_node.clone()]);
       wait_for_producer_route(
         &producer,
         &standby_node.node_id,
         &standby_node.address,
+        Instant::now() + Duration::from_secs(10),
+      )
+      .await?;
+      wait_for_broker_lease_ownership(
+        &cluster,
+        &standby_node.node_id,
+        TOPIC,
+        &restart_partitions,
         Instant::now() + Duration::from_secs(10),
       )
       .await?;
@@ -1221,6 +1275,14 @@ async fn active_broker_restart_continuity() -> Result<()> {
         &producer,
         &active_node.node_id,
         &active_node.address,
+        Instant::now() + Duration::from_secs(10),
+      )
+      .await?;
+      wait_for_broker_lease_ownership(
+        &cluster,
+        &active_node.node_id,
+        TOPIC,
+        &restart_partitions,
         Instant::now() + Duration::from_secs(10),
       )
       .await?;

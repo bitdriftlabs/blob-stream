@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use bd_server_stats::stats::{Collector, Scope};
 use bd_time::{OffsetDateTimeExt, TestTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
+use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{
   InMemoryMetadataStore,
   InMemoryProducerPartitionLeaseStore,
@@ -27,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 
 struct GatedBlobStore {
   entered_tx: mpsc::UnboundedSender<String>,
@@ -263,6 +264,28 @@ async fn receive_blob_write(receiver: &mut mpsc::UnboundedReceiver<String>) -> S
     tokio::task::yield_now().await;
   }
   panic!("expected blob write did not begin");
+}
+
+async fn wait_for_partition_draining_start(engine: &WriteEngineImpl) {
+  for _ in 0 .. 100 {
+    let partition_state = {
+      let state = engine.state.lock().await;
+      Arc::clone(
+        state
+          .topics
+          .get("telemetry")
+          .expect("telemetry topic state")
+          .partitions
+          .get(&0)
+          .expect("partition state"),
+      )
+    };
+    if partition_state.lock().await.draining {
+      return;
+    }
+    tokio::time::sleep(StdDuration::from_millis(1)).await;
+  }
+  panic!("partition did not begin draining");
 }
 
 #[tokio::test]
@@ -755,6 +778,137 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
     ranges,
     vec![SeqRange { start: 0, end: 0 }, SeqRange { start: 1, end: 1 }]
   );
+  Ok(())
+}
+
+#[tokio::test]
+async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  config.flush_max_delay_ms = 60_000;
+
+  let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-a".to_string(),
+    address: "10.0.0.1:8080".to_string(),
+  }]));
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let metadata_store = Arc::new(InMemoryMetadataStore::new());
+  let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
+  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+    config,
+    HashMap::from([(
+      "telemetry".to_string(),
+      TopicInfo {
+        name: "telemetry".to_string(),
+        partition_count: 1,
+        num_writers: 1,
+        retention_days: 7,
+      },
+    )]),
+    Arc::new(BlockingBlobStore {
+      entered_tx,
+      release: Arc::clone(&release),
+    }),
+    metadata_store.clone(),
+    lease_store.clone(),
+    "node-a".to_string(),
+    Some(membership_rx),
+    time_provider.clone(),
+    &metrics_scope(),
+  )?);
+
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  receive_blob_write(&mut entered_rx).await;
+  tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+  let buffered_engine = Arc::clone(&engine);
+  let buffered = tokio::spawn(async move {
+    buffered_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![2], 20)],
+      })
+      .await
+  });
+  tokio::task::yield_now().await;
+  assert!(!buffered.is_finished());
+
+  membership_tx.send(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-b".to_string(),
+    address: "10.0.0.2:8080".to_string(),
+  }]))?;
+  wait_for_partition_draining_start(&engine).await;
+
+  let second = engine
+    .produce_batch(WriteRequest {
+      topic: "telemetry".to_string(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![3], 30)],
+    })
+    .await;
+  assert!(matches!(
+    second,
+    Err(super::WriteError::NotLeaseHolder { .. })
+  ));
+
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".to_string(),
+    virtual_partition_id: 0,
+  };
+  let held_by_a = lease_store
+    .acquire_lease(key.clone(), "node-b".to_string(), now_ms, 30_000)
+    .await?;
+  assert!(matches!(held_by_a, LeaseAcquireOutcome::HeldByOther(_)));
+
+  release.add_permits(1);
+  first.await??;
+  receive_blob_write(&mut entered_rx).await;
+
+  let still_held_by_a = lease_store
+    .acquire_lease(key.clone(), "node-b".to_string(), now_ms, 30_000)
+    .await?;
+  assert!(matches!(
+    still_held_by_a,
+    LeaseAcquireOutcome::HeldByOther(_)
+  ));
+
+  release.add_permits(1);
+  buffered.await??;
+
+  let mut acquired_by_b = false;
+  for _ in 0 .. 100 {
+    let outcome = lease_store
+      .acquire_lease(key.clone(), "node-b".to_string(), now_ms, 30_000)
+      .await?;
+    if matches!(outcome, LeaseAcquireOutcome::Acquired(_)) {
+      acquired_by_b = true;
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+  assert!(acquired_by_b, "lease was not released after drain");
+
+  let window = Window::for_timestamp(
+    time_provider.now().unix_timestamp_ms() / 1_000,
+    WriteConfig::with_defaults().window_size_seconds,
+  );
+  let segments = metadata_store
+    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .await?;
+  assert_eq!(segments.len(), 2);
   Ok(())
 }
 

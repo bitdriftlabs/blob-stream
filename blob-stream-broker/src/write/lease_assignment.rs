@@ -76,6 +76,7 @@ impl WriteEngineImpl {
     let state = Arc::clone(&self.state);
     let time_provider = Arc::clone(&self.time_provider);
     let metrics = self.metrics.clone();
+    let flush_notifier = Arc::clone(&self.flush_notifier);
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
     tokio::spawn(async move {
@@ -132,6 +133,8 @@ impl WriteEngineImpl {
           Self::release_partition_lease(
             &lease_store,
             &state,
+            &flush_notifier,
+            &metrics,
             &holder_id,
             topic,
             *virtual_partition_id,
@@ -151,6 +154,8 @@ impl WriteEngineImpl {
             Self::release_partition_lease(
               &lease_store,
               &state,
+              &flush_notifier,
+              &metrics,
               &holder_id,
               &topic,
               virtual_partition_id,
@@ -184,6 +189,7 @@ impl WriteEngineImpl {
           {
             Ok(LeaseAcquireOutcome::Acquired(lease)) => {
               partition_state.lease_expiration_ts_ms = Some(lease.lease_expiration_ts_ms);
+              partition_state.draining = false;
               true
             },
             Ok(LeaseAcquireOutcome::HeldByOther(_)) => {
@@ -254,6 +260,8 @@ impl WriteEngineImpl {
   async fn release_partition_lease(
     lease_store: &Arc<dyn blob_stream_metadata_store::ProducerPartitionLeaseStore>,
     state: &Arc<tokio::sync::Mutex<super::WriteState>>,
+    flush_notifier: &Arc<tokio::sync::Notify>,
+    metrics: &super::WriteMetrics,
     holder_id: &str,
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
@@ -263,20 +271,42 @@ impl WriteEngineImpl {
       let mut state = state.lock().await;
       state.partition_state(topic, virtual_partition_id)
     };
-    let mut partition_state = partition_state.lock().await;
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string(),
       virtual_partition_id,
     };
 
+    {
+      let mut partition_state = partition_state.lock().await;
+      partition_state.draining = true;
+    }
+    metrics.lease_drain_starts_total.inc();
+    info!(
+      "broker partition drain started: holder_id={holder_id}, topic={topic}, \
+       virtual_partition_id={virtual_partition_id}"
+    );
+    flush_notifier.notify_one();
+
+    // TODO(mattklein123): Renew the producer lease while waiting for a drain that can approach
+    // the lease duration. The default 30-second lease makes this unlikely in normal operation,
+    // but a slow blob upload can otherwise let a successor acquire before this drain completes.
+    Self::wait_for_partition_drain(&partition_state).await;
+    metrics.lease_drain_completions_total.inc();
+    info!(
+      "broker partition drain complete: holder_id={holder_id}, topic={topic}, \
+       virtual_partition_id={virtual_partition_id}"
+    );
+
     match lease_store.release_lease(&key, holder_id, now_ts_ms).await {
       Ok(LeaseReleaseOutcome::Released | LeaseReleaseOutcome::Expired) => {
         // Clear local lease/allocator state immediately to avoid accepting writes based on stale
         // in-memory lease data after ownership moved away.
+        let mut partition_state = partition_state.lock().await;
         partition_state.lease_expiration_ts_ms = None;
         partition_state.seq_allocator = super::SeqAllocator::default();
       },
       Ok(LeaseReleaseOutcome::HeldByOther(_)) => {
+        let mut partition_state = partition_state.lock().await;
         partition_state.lease_expiration_ts_ms = None;
         partition_state.seq_allocator = super::SeqAllocator::default();
       },
@@ -286,6 +316,19 @@ impl WriteEngineImpl {
           "lease self-assignment release failed: {error}"
         );
       },
+    }
+  }
+
+  async fn wait_for_partition_drain(partition_state: &super::PartitionStateHandle) {
+    loop {
+      let notified = {
+        let partition_state = partition_state.lock().await;
+        if partition_state.is_drained() {
+          return;
+        }
+        partition_state.drain_notify.clone().notified_owned()
+      };
+      notified.await;
     }
   }
 }

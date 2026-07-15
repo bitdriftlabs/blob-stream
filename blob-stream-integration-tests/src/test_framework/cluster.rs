@@ -363,6 +363,11 @@ impl ClusterHarness {
     let mut removed = self.brokers.remove(index);
     removed.shutdown().await?;
 
+    // Drop the retired write engine before starting its same-ID replacement. Its lease-assignment
+    // loop performs asynchronous cleanup on drop; keeping it alive could release a lease that the
+    // replacement has just acquired.
+    drop(removed);
+
     let endpoint = self.transport.bind_endpoint(&old_node.node_id).await?;
     let restarted_node = endpoint.node.clone();
     let restarted_broker =

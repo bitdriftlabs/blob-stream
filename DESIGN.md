@@ -120,13 +120,19 @@ then expose records in range order. A crash or ownership transfer can leave unus
 reserved block, creating gaps, but a new holder reserves only above the durable high-water mark
 and therefore cannot reuse a successfully reserved value.
 
-The broker serializes lease/refill/allocation transitions for each virtual partition, so a delayed
-reservation result cannot replace a newer local allocator range. It also permits only one durable
-flush plan per virtual partition at a time. Later accepted batches may buffer while an earlier
-plan uploads its blob and writes metadata, but they cannot become visible first. Flushes for
-different virtual partitions remain concurrent. This durable visibility order is required because
-a consumer cursor advances past a later `seq_end` and therefore cannot recover an earlier range
-that appears afterward.
+The broker serializes lease/refill/allocation transitions and durable flush plans for each virtual
+partition within one live broker. Later accepted batches buffer while an earlier plan uploads its
+blob and writes metadata, and therefore cannot become visible first from that broker. During a
+graceful membership handoff or orderly shutdown, the broker stops accepting new batches for the
+partition, drains its already accepted work, and only then voluntarily releases the producer
+lease. Flushes for different virtual partitions remain concurrent.
+
+This is not a durable cross-process publication fence. A broker crash, long pause, network
+partition, or stale process resuming after its lease expires can still result in a former holder
+attempting its unconditional metadata write after a successor has published higher sequences. A
+consumer cursor advances past a later `seq_end` and cannot recover an earlier range that appears
+afterward, so this remains a known limitation until metadata publication is transactionally
+conditioned on a unique producer lease session or epoch.
 
 A consumer cursor is the greatest processed `seq_end` for one virtual partition. During scans,
 the consumer skips a batch when `batch.seq_end <= cursor` and advances its cursor only forward.
@@ -278,6 +284,42 @@ rediscovered. The default five-minute window and two lookback windows provide te
 recovery coverage. Event timestamps do not affect metadata selection; the bound is based on
 segment snowflakes. Operators must size the horizon and recovery interval for expected metadata
 delays, retries, outages, and clock skew.
+
+The recovery interval and horizon are rediscovery controls, not a DynamoDB replication-lag
+guarantee. DynamoDB does not provide a maximum convergence delay for eventually consistent
+metadata queries.
+
+### Read Consistency and Delivery Tradeoffs
+
+The current implementation uses eventually consistent DynamoDB metadata queries. A broker returns
+`OK` only after it uploads the segment blob and writes its metadata row, but this does not mean an
+eventually consistent reader replica can observe the row immediately. The current-window fast
+path and periodic lookback recovery reduce ordinary discovery delay; they do not create a strict
+visibility bound or recover metadata after it leaves the configured lookback horizon.
+
+The reader's cursor filtering relies on metadata becoming visible in compatible sequence order.
+Graceful broker handoff drains locally accepted work before lease release, but the expiry/stale
+writer limitation described above remains. Applications must tolerate duplicates, and deployments
+that require a stronger at-least-once contract across all writer failures need a transactional
+producer publication fence in addition to any reader-consistency choice.
+
+Future reader modes may offer the following cost/correctness tradeoffs:
+
+- **Strongly consistent metadata queries:** Querying every metadata page with DynamoDB strong
+  consistency removes read-replica staleness at approximately twice the metadata-query RRU
+  component. It does not by itself prevent a stale former producer from publishing metadata after
+  lease expiry, so it must be paired with a publication fence for a complete ordering guarantee.
+- **Delayed eventual visibility:** An eventual-read mode could defer processing metadata until it
+  is older than a configured delay. This may absorb typical replication lag at lower cost, but is
+  probabilistic because DynamoDB supplies no maximum eventual-consistency delay. It must not be
+  documented as a correctness guarantee.
+
+A future delayed-visibility mode needs an immutable publication timestamp written when metadata
+is committed. The current `created_ts_ms` is generated while building a segment, before blob
+upload and metadata publication, and therefore cannot safely define metadata visibility age.
+Use `cost_analysis.py` with real page sizes, poll rates, consumer counts, and regional pricing
+before selecting a future mode: strong reads approximately double metadata scan RRUs, while
+shorter recovery intervals or delayed-visibility horizons add rescans.
 
 ## Consumer Group Coordination
 
