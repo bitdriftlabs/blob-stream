@@ -1,11 +1,14 @@
 #![allow(clippy::unwrap_used)]
 
 use super::{
+  BufferedBatch,
   ConsumerCoordinationSource,
   ConsumerDeliveryState,
   ConsumerIterator,
   ConsumerIteratorImpl,
+  ConsumerIteratorMetrics,
   CoordinationSnapshot,
+  DeliveryState,
   IdlePollBackoff,
   NextResult,
 };
@@ -37,7 +40,7 @@ use blob_stream_types::{
 };
 use bytes::Bytes;
 use protobuf::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -177,6 +180,28 @@ impl ConsumerCoordinationSource for MutableCoordinationSource {
   async fn snapshot(&self) -> anyhow::Result<CoordinationSnapshot> {
     Ok(self.snapshot.lock().await.clone())
   }
+}
+
+#[test]
+fn current_batch_for_fenced_partition_is_not_delivered() {
+  let mut delivery_state = DeliveryState {
+    current_batch: Some(BufferedBatch {
+      virtual_partition_id: 7,
+      next_offset: 1,
+      records: vec![new_record(vec![1], 0)].into_iter(),
+    }),
+    ..Default::default()
+  };
+
+  assert!(
+    delivery_state
+      .try_take_next(
+        &HashSet::new(),
+        &ConsumerIteratorMetrics::new(&metrics_scope())
+      )
+      .is_none()
+  );
+  assert!(delivery_state.current_batch.is_none());
 }
 
 async fn write_segment(

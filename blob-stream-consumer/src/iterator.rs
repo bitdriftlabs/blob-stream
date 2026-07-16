@@ -189,6 +189,15 @@ impl DeliveryState {
     }
 
     loop {
+      if self
+        .current_batch
+        .as_ref()
+        .is_some_and(|batch| !active_assignment.contains(&batch.virtual_partition_id))
+      {
+        self.current_batch = None;
+        continue;
+      }
+
       if let Some(current_batch) = self.current_batch.as_mut() {
         if let Some(record) = current_batch.records.next() {
           let offset = current_batch.next_offset;
