@@ -1304,6 +1304,19 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
     )
     .await?,
   );
+
+  resources
+    .store_fault_controller()
+    .enable_fault(StoreFaultRule {
+      domain: StoreFaultDomain::ConsumerLease,
+      operation: StoreFaultOperation::ConsumerPublishAssignmentPlan,
+      key_pattern: None,
+      action: StoreFaultAction::Fail {
+        message: "transient planner publication failure".to_string(),
+      },
+      remaining_hits: Some(1),
+    })
+    .await;
   consumer_a.start()?;
   consumer_b.start()?;
 
@@ -1445,6 +1458,17 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
       &TestEventMatcher {
         category: Some("store".to_string()),
         operation: Some("consumer_membership_heartbeat".to_string()),
+        key_contains: None,
+        status: Some("fault_applied".to_string()),
+      },
+      Duration::from_secs(3),
+    )
+    .await?;
+  let _planner_publish_fault = cluster
+    .wait_for_event(
+      &TestEventMatcher {
+        category: Some("store".to_string()),
+        operation: Some("consumer_publish_assignment_plan".to_string()),
         key_contains: None,
         status: Some("fault_applied".to_string()),
       },

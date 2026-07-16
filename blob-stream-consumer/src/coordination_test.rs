@@ -212,7 +212,14 @@ async fn coordinator_does_not_create_local_assignment_without_shared_plan() {
   let membership_store = membership_store();
   assert_eq!(
     membership_store
-      .acquire_or_renew_planner("topic-a", "group-a", "member-b", 1_000, 1_000)
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        "member-b",
+        "member-b-session",
+        1_000,
+        1_000,
+      )
       .await
       .unwrap(),
     blob_stream_metadata_store::ConsumerGroupPlannerLeaseOutcome::Acquired

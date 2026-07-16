@@ -465,12 +465,19 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    planner_session_id: &str,
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> Result<ConsumerGroupPlannerLeaseOutcome>;
 
   /// Release the planner lease when it is still held by this member.
-  async fn release_planner(&self, topic: &str, group_id: &str, member_id: &str) -> Result<bool>;
+  async fn release_planner(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    planner_session_id: &str,
+  ) -> Result<bool>;
 
   /// Publish a plan only while the caller still owns an unexpired planner lease.
   async fn publish_assignment_plan(
@@ -478,6 +485,7 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    planner_session_id: &str,
     now_ts_ms: i64,
     plan: ConsumerGroupAssignmentPlan,
   ) -> Result<bool>;
@@ -524,6 +532,8 @@ pub struct ConsumerGroupAssignmentPlan {
 pub struct ConsumerGroupPlannerLease {
   /// Member currently responsible for refreshing or replacing the assignment plan.
   pub member_id: String,
+  /// Unique coordinator session that owns this planner lease.
+  pub planner_session_id: String,
   /// Millisecond timestamp after which another member may become planner.
   pub lease_expiration_ts_ms: i64,
 }

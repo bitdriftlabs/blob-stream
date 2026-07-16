@@ -96,6 +96,7 @@ impl ConsumerCoordinationSource for BlockingCoordinationSource {
 struct BlockingMembershipStore {
   inner: InMemoryConsumerGroupMembershipStore,
   block_heartbeats: AtomicBool,
+  fail_deregistration: AtomicBool,
   heartbeat_calls: AtomicUsize,
   heartbeat_started: Arc<tokio::sync::Notify>,
   heartbeat_release: Arc<tokio::sync::Notify>,
@@ -106,6 +107,7 @@ impl BlockingMembershipStore {
     Self {
       inner: InMemoryConsumerGroupMembershipStore::new(),
       block_heartbeats: AtomicBool::new(false),
+      fail_deregistration: AtomicBool::new(false),
       heartbeat_calls: AtomicUsize::new(0),
       heartbeat_started: Arc::new(tokio::sync::Notify::new()),
       heartbeat_release: Arc::new(tokio::sync::Notify::new()),
@@ -123,6 +125,9 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> anyhow::Result<()> {
+    if self.fail_deregistration.load(Ordering::SeqCst) {
+      return Err(anyhow::anyhow!("injected deregistration failure"));
+    }
     self
       .inner
       .register_member(topic, group_id, member_id, now_ts_ms, ttl_ms)
@@ -193,12 +198,20 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    planner_session_id: &str,
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> anyhow::Result<ConsumerGroupPlannerLeaseOutcome> {
     self
       .inner
-      .acquire_or_renew_planner(topic, group_id, member_id, now_ts_ms, ttl_ms)
+      .acquire_or_renew_planner(
+        topic,
+        group_id,
+        member_id,
+        planner_session_id,
+        now_ts_ms,
+        ttl_ms,
+      )
       .await
   }
 
@@ -207,8 +220,12 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    planner_session_id: &str,
   ) -> anyhow::Result<bool> {
-    self.inner.release_planner(topic, group_id, member_id).await
+    self
+      .inner
+      .release_planner(topic, group_id, member_id, planner_session_id)
+      .await
   }
 
   async fn publish_assignment_plan(
@@ -216,12 +233,20 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    planner_session_id: &str,
     now_ts_ms: i64,
     plan: ConsumerGroupAssignmentPlan,
   ) -> anyhow::Result<bool> {
     self
       .inner
-      .publish_assignment_plan(topic, group_id, member_id, now_ts_ms, plan)
+      .publish_assignment_plan(
+        topic,
+        group_id,
+        member_id,
+        planner_session_id,
+        now_ts_ms,
+        plan,
+      )
       .await
   }
 }
@@ -655,12 +680,12 @@ async fn next_delivers_records_and_commit_renews() {
 }
 
 #[tokio::test]
-async fn shutdown_releases_owned_partitions() {
+async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let concrete_lease_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
   let lease_store: Arc<dyn ConsumerGroupLeaseStore> = concrete_lease_store.clone();
-  let concrete_membership_store = Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let concrete_membership_store = Arc::new(BlockingMembershipStore::new());
   let membership_store: Arc<dyn ConsumerGroupMembershipStore> = concrete_membership_store.clone();
 
   let runtime = runtime_config();
@@ -686,16 +711,21 @@ async fn shutdown_releases_owned_partitions() {
   iterator.start().unwrap();
   assert_eq!(
     concrete_membership_store
+      .inner
       .get_planner_lease("telemetry", "group-a")
       .await
       .unwrap()
       .map(|lease| lease.member_id),
     Some("member-a".to_string())
   );
+  concrete_membership_store
+    .fail_deregistration
+    .store(true, Ordering::SeqCst);
   Box::new(iterator).shutdown().await.unwrap();
 
   assert!(
     concrete_membership_store
+      .inner
       .get_planner_lease("telemetry", "group-a")
       .await
       .unwrap()
@@ -703,10 +733,12 @@ async fn shutdown_releases_owned_partitions() {
   );
   assert_eq!(
     concrete_membership_store
+      .inner
       .acquire_or_renew_planner(
         "telemetry",
         "group-a",
         "member-b",
+        "member-b-session",
         now_unix_millis(),
         30_000
       )

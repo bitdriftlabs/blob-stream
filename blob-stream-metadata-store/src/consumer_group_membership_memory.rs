@@ -131,6 +131,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
         .get(&GroupKey::new(topic, group_id))
         .map(|planner| ConsumerGroupPlannerLease {
           member_id: planner.member_id.clone(),
+          planner_session_id: planner.planner_session_id.clone(),
           lease_expiration_ts_ms: planner.lease_expiration_ts_ms,
         }),
     )
@@ -141,6 +142,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    planner_session_id: &str,
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> Result<ConsumerGroupPlannerLeaseOutcome> {
@@ -150,7 +152,9 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
 
     match state.planners.get(&group_key) {
       Some(planner)
-        if planner.lease_expiration_ts_ms > now_ts_ms && planner.member_id != member_id =>
+        if planner.lease_expiration_ts_ms > now_ts_ms
+          && (planner.member_id != member_id
+            || planner.planner_session_id != planner_session_id) =>
       {
         Ok(ConsumerGroupPlannerLeaseOutcome::HeldByOther)
       },
@@ -159,6 +163,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
           group_key,
           PlannerState {
             member_id: member_id.to_string(),
+            planner_session_id: planner_session_id.to_string(),
             lease_expiration_ts_ms: expires_at,
           },
         );
@@ -167,14 +172,18 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     }
   }
 
-  async fn release_planner(&self, topic: &str, group_id: &str, member_id: &str) -> Result<bool> {
+  async fn release_planner(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    planner_session_id: &str,
+  ) -> Result<bool> {
     let group_key = GroupKey::new(topic, group_id);
     let mut state = self.state.write().await;
-    if state
-      .planners
-      .get(&group_key)
-      .is_none_or(|planner| planner.member_id != member_id)
-    {
+    if state.planners.get(&group_key).is_none_or(|planner| {
+      planner.member_id != member_id || planner.planner_session_id != planner_session_id
+    }) {
       return Ok(false);
     }
 
@@ -187,6 +196,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    planner_session_id: &str,
     now_ts_ms: i64,
     plan: ConsumerGroupAssignmentPlan,
   ) -> Result<bool> {
@@ -196,7 +206,11 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
       return Ok(false);
     };
 
-    if planner.member_id != member_id || planner.lease_expiration_ts_ms <= now_ts_ms {
+    if planner.member_id != member_id
+      || planner.planner_session_id != planner_session_id
+      || planner.lease_expiration_ts_ms <= now_ts_ms
+      || plan.planner_member_id != member_id
+    {
       return Ok(false);
     }
 
@@ -272,6 +286,7 @@ struct MemberState {
 #[derive(Clone, Debug)]
 struct PlannerState {
   member_id: String,
+  planner_session_id: String,
   lease_expiration_ts_ms: i64,
 }
 

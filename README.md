@@ -203,12 +203,14 @@ Keys:
 Representative attributes:
 - `member_id`, `lease_expiry_ts`, `last_heartbeat_ts`, `topic`, `group_id`, `ttl_epoch_seconds`
 
-The same `pk` also stores two reserved system rows; no additional DynamoDB table is required for
-consumer coordination:
+Assignment control records use a distinct reserved partition key,
+`"__blob_stream_assignment_control_v1__#<topic>#<group_id>"`, in the same table. This keeps
+the legacy member query partition limited to member rows during rolling upgrades and avoids
+reading the complete plan when listing active members. No additional DynamoDB table is required:
 - `sk = "__blob_stream_assignment_plan_v1__"`: a complete, versioned virtual-partition to member
   assignment map and the member set used to calculate it.
-- `sk = "__blob_stream_assignment_planner_v1__"`: the short-lived planner lease that authorizes
-  plan publication.
+- `sk = "__blob_stream_assignment_planner_v1__"`: the short-lived session-fenced planner lease
+  that authorizes plan publication.
 
 Member IDs beginning with `__blob_stream_` are reserved. Member rows carry `record_type = member`
 so active-member reads exclude coordination system rows; legacy untyped member rows remain

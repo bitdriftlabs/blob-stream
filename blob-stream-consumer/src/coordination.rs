@@ -20,6 +20,7 @@ use blob_stream_types::{CommittedCursor, VirtualPartitionId};
 use log::{debug, info};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use uuid::Uuid;
 
 //
 // Coordination algorithm overview
@@ -134,6 +135,8 @@ pub trait ConsumerGroupCoordinator: Send + Sync {
   fn generation(&self) -> u64;
   /// Return locally owned partitions.
   fn owned_partitions(&self) -> Vec<VirtualPartitionId>;
+  /// Return the session that fences this coordinator's planner lease.
+  fn planner_session_id(&self) -> &str;
 }
 
 //
@@ -145,6 +148,7 @@ pub struct ConsumerGroupCoordinatorImpl {
   config: ConsumerGroupConfig,
   lease_store: Arc<dyn ConsumerGroupLeaseStore>,
   membership_store: Arc<dyn ConsumerGroupMembershipStore>,
+  planner_session_id: String,
   generation: u64,
   owned: HashSet<VirtualPartitionId>,
 }
@@ -163,6 +167,7 @@ impl ConsumerGroupCoordinatorImpl {
       config,
       lease_store,
       membership_store,
+      planner_session_id: Uuid::new_v4().to_string(),
       generation: 0,
       owned: HashSet::new(),
     })
@@ -205,6 +210,7 @@ impl ConsumerGroupCoordinatorImpl {
             &self.config.topic,
             &self.config.group_id,
             &self.config.member_id,
+            &self.planner_session_id,
             now_ts_ms,
             consumer_lease_duration_ms(&self.config),
           )
@@ -221,6 +227,7 @@ impl ConsumerGroupCoordinatorImpl {
         &self.config.topic,
         &self.config.group_id,
         &self.config.member_id,
+        &self.planner_session_id,
         now_ts_ms,
         consumer_lease_duration_ms(&self.config),
       )
@@ -252,6 +259,7 @@ impl ConsumerGroupCoordinatorImpl {
           &self.config.topic,
           &self.config.group_id,
           &self.config.member_id,
+          &self.planner_session_id,
           now_ts_ms,
           plan.clone(),
         )
@@ -541,6 +549,10 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     let mut owned = self.owned.iter().copied().collect::<Vec<_>>();
     owned.sort_unstable();
     owned
+  }
+
+  fn planner_session_id(&self) -> &str {
+    &self.planner_session_id
   }
 }
 

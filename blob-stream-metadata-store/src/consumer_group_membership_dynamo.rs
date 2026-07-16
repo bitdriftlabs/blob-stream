@@ -24,6 +24,7 @@ const ATTR_LAST_HEARTBEAT: &str = "last_heartbeat_ts";
 const ATTR_TTL: &str = "ttl_epoch_seconds";
 const ATTR_RECORD_TYPE: &str = "record_type";
 const ATTR_OWNER: &str = "owner_id";
+const ATTR_PLANNER_SESSION: &str = "planner_session_id";
 const ATTR_PLAN_VERSION: &str = "plan_version";
 const ATTR_PLAN_PLANNER: &str = "plan_planner_member_id";
 const ATTR_PLAN_MEMBERS: &str = "plan_members";
@@ -34,6 +35,7 @@ const ATTR_ASSIGNMENT_MEMBER: &str = "member_id";
 const RECORD_TYPE_MEMBER: &str = "member";
 const RECORD_TYPE_ASSIGNMENT_PLAN: &str = "assignment_plan";
 const RECORD_TYPE_PLANNER_LEASE: &str = "assignment_planner_lease";
+const ASSIGNMENT_CONTROL_PARTITION_PREFIX: &str = "__blob_stream_assignment_control_v1__";
 const ASSIGNMENT_PLAN_SORT_KEY: &str = "__blob_stream_assignment_plan_v1__";
 const PLANNER_LEASE_SORT_KEY: &str = "__blob_stream_assignment_planner_v1__";
 const DEFAULT_MEMBERSHIP_TTL_BUFFER_SECONDS: u32 = 3_600;
@@ -70,6 +72,10 @@ impl DynamoConsumerGroupMembershipStore {
 
   fn pk(topic: &str, group_id: &str) -> String {
     format!("{topic}#{group_id}")
+  }
+
+  fn control_pk(topic: &str, group_id: &str) -> String {
+    format!("{ASSIGNMENT_CONTROL_PARTITION_PREFIX}#{topic}#{group_id}")
   }
 
   fn sk(member_id: &str) -> String {
@@ -208,6 +214,11 @@ impl DynamoConsumerGroupMembershipStore {
       .and_then(|value| value.as_s().ok())
       .ok_or_else(|| anyhow!("assignment planner owner missing"))?
       .clone();
+    let planner_session_id = item
+      .get(ATTR_PLANNER_SESSION)
+      .and_then(|value| value.as_s().ok())
+      .ok_or_else(|| anyhow!("assignment planner session missing"))?
+      .clone();
     let lease_expiration_ts_ms = item
       .get(ATTR_LEASE_EXPIRES)
       .and_then(|value| value.as_n().ok())
@@ -215,6 +226,7 @@ impl DynamoConsumerGroupMembershipStore {
       .parse()?;
     Ok(ConsumerGroupPlannerLease {
       member_id,
+      planner_session_id,
       lease_expiration_ts_ms,
     })
   }
@@ -375,7 +387,10 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       .client
       .get_item()
       .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(Self::pk(topic, group_id)))
+      .key(
+        ATTR_PK,
+        AttributeValue::S(Self::control_pk(topic, group_id)),
+      )
       .key(ATTR_SK, AttributeValue::S(Self::plan_key()))
       .consistent_read(true)
       .send()
@@ -404,7 +419,10 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       .client
       .get_item()
       .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(Self::pk(topic, group_id)))
+      .key(
+        ATTR_PK,
+        AttributeValue::S(Self::control_pk(topic, group_id)),
+      )
       .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
       .consistent_read(true)
       .send()
@@ -427,6 +445,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    planner_session_id: &str,
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> Result<ConsumerGroupPlannerLeaseOutcome> {
@@ -436,6 +455,10 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     values.insert(
       ":owner".to_string(),
       AttributeValue::S(member_id.to_string()),
+    );
+    values.insert(
+      ":session".to_string(),
+      AttributeValue::S(planner_session_id.to_string()),
     );
     values.insert(
       ":expires".to_string(),
@@ -455,14 +478,19 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       .client
       .update_item()
       .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(Self::pk(topic, group_id)))
+      .key(
+        ATTR_PK,
+        AttributeValue::S(Self::control_pk(topic, group_id)),
+      )
       .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
       .update_expression(format!(
-        "SET {ATTR_RECORD_TYPE} = :planner_type, {ATTR_OWNER} = :owner, {ATTR_LEASE_EXPIRES} = \
-         :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl"
+        "SET {ATTR_RECORD_TYPE} = :planner_type, {ATTR_OWNER} = :owner, {ATTR_PLANNER_SESSION} = \
+         :session, {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = \
+         :ttl"
       ))
       .condition_expression(format!(
-        "attribute_not_exists({ATTR_PK}) OR {ATTR_LEASE_EXPIRES} <= :now OR {ATTR_OWNER} = :owner"
+        "attribute_not_exists({ATTR_PK}) OR {ATTR_LEASE_EXPIRES} <= :now OR ({ATTR_OWNER} = \
+         :owner AND {ATTR_PLANNER_SESSION} = :session)"
       ))
       .set_expression_attribute_values(Some(values))
       .send()
@@ -479,19 +507,34 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     }
   }
 
-  async fn release_planner(&self, topic: &str, group_id: &str, member_id: &str) -> Result<bool> {
+  async fn release_planner(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    planner_session_id: &str,
+  ) -> Result<bool> {
     let mut values = HashMap::new();
     values.insert(
       ":owner".to_string(),
       AttributeValue::S(member_id.to_string()),
     );
+    values.insert(
+      ":session".to_string(),
+      AttributeValue::S(planner_session_id.to_string()),
+    );
     let response = self
       .client
       .delete_item()
       .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(Self::pk(topic, group_id)))
+      .key(
+        ATTR_PK,
+        AttributeValue::S(Self::control_pk(topic, group_id)),
+      )
       .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
-      .condition_expression(format!("{ATTR_OWNER} = :owner"))
+      .condition_expression(format!(
+        "{ATTR_OWNER} = :owner AND {ATTR_PLANNER_SESSION} = :session"
+      ))
       .set_expression_attribute_values(Some(values))
       .send()
       .await;
@@ -512,24 +555,34 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    planner_session_id: &str,
     now_ts_ms: i64,
     plan: ConsumerGroupAssignmentPlan,
   ) -> Result<bool> {
+    if plan.planner_member_id != member_id {
+      return Ok(false);
+    }
+
     let mut planner_values = HashMap::new();
     planner_values.insert(
       ":owner".to_string(),
       AttributeValue::S(member_id.to_string()),
     );
+    planner_values.insert(
+      ":session".to_string(),
+      AttributeValue::S(planner_session_id.to_string()),
+    );
     planner_values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
     let plan_values = Self::plan_values(&plan);
-    let group_key = Self::pk(topic, group_id);
+    let group_key = Self::control_pk(topic, group_id);
 
     let planner_check = ConditionCheck::builder()
       .table_name(&self.table_name)
       .key(ATTR_PK, AttributeValue::S(group_key.clone()))
       .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
       .condition_expression(format!(
-        "{ATTR_OWNER} = :owner AND {ATTR_LEASE_EXPIRES} > :now"
+        "{ATTR_OWNER} = :owner AND {ATTR_PLANNER_SESSION} = :session AND {ATTR_LEASE_EXPIRES} > \
+         :now"
       ))
       .set_expression_attribute_values(Some(planner_values))
       .build()?;

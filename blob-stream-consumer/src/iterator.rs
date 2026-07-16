@@ -1624,28 +1624,34 @@ impl ConsumerDriver {
       // Releasing leases proactively shortens rebalance convergence on graceful shutdown.
       let commit_result = self.commit().await;
       let release_result = self.coordinator.release_owned(now_unix_millis()).await;
-      let deregistered = self
+      let deregistration_result = self
         .membership_store
         .deregister_member(
           &self.group_config.topic,
           &self.group_config.group_id,
           &self.group_config.member_id,
         )
+        .await;
+      if let Err(error) = self
+        .membership_store
+        .release_planner(
+          &self.group_config.topic,
+          &self.group_config.group_id,
+          &self.group_config.member_id,
+          self.coordinator.planner_session_id(),
+        )
         .await
-        .is_ok();
-      if deregistered
-        && let Err(error) = self
-          .membership_store
-          .release_planner(
-            &self.group_config.topic,
-            &self.group_config.group_id,
-            &self.group_config.member_id,
-          )
-          .await
       {
         debug!(
           "consumer planner release failed during shutdown: topic={}, group_id={}, member_id={}, \
            error={error}",
+          self.group_config.topic, self.group_config.group_id, self.group_config.member_id
+        );
+      }
+      if let Err(error) = deregistration_result {
+        debug!(
+          "consumer membership deregistration failed during shutdown: topic={}, group_id={}, \
+           member_id={}, error={error}",
           self.group_config.topic, self.group_config.group_id, self.group_config.member_id
         );
       }
