@@ -49,6 +49,83 @@ fn sticky_assignment_moves_minimal_partitions_on_scale_out() {
 }
 
 #[tokio::test]
+async fn oversubscribed_consumers_keep_stable_assignments_without_fencing() {
+  let store: Arc<dyn ConsumerGroupLeaseStore> = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let members = (0 .. 4)
+    .map(|member_index| format!("member-{member_index}"))
+    .collect::<Vec<_>>();
+  let partitions = vec![0, 1];
+  let mut coordinators = members
+    .iter()
+    .map(|member_id| {
+      ConsumerGroupCoordinatorImpl::new(
+        ConsumerGroupConfig {
+          topic: "topic-a".to_string().into(),
+          group_id: "group-a".to_string().into(),
+          member_id: member_id.clone().into(),
+          lease_duration_ms: Some(1_000),
+          heartbeat_interval_ms: Some(50),
+          rebalance_interval_ms: Some(50),
+          ..Default::default()
+        },
+        Arc::clone(&store),
+      )
+      .unwrap()
+    })
+    .collect::<Vec<_>>();
+
+  let mut expected_ownership = Vec::with_capacity(coordinators.len());
+  for coordinator in &mut coordinators {
+    let report = coordinator
+      .rebalance(members.clone(), partitions.clone(), 1_000)
+      .await
+      .unwrap();
+    expected_ownership.push(report.owned_partitions);
+  }
+
+  assert_eq!(
+    expected_ownership
+      .iter()
+      .flatten()
+      .copied()
+      .collect::<std::collections::HashSet<_>>()
+      .len(),
+    partitions.len()
+  );
+  assert_eq!(
+    expected_ownership
+      .iter()
+      .filter(|ownership| ownership.is_empty())
+      .count(),
+    members.len() - partitions.len()
+  );
+
+  for coordinator in &mut coordinators {
+    let report = coordinator
+      .heartbeat_and_commit(1_010, &HashMap::new())
+      .await
+      .unwrap();
+    assert!(report.fenced_partitions.is_empty());
+  }
+
+  for (coordinator, ownership) in coordinators.iter_mut().zip(&expected_ownership) {
+    let report = coordinator
+      .rebalance(members.clone(), partitions.clone(), 1_020)
+      .await
+      .unwrap();
+    assert_eq!(report.owned_partitions, *ownership);
+    assert_eq!(coordinator.generation(), 1);
+
+    let heartbeat = coordinator
+      .heartbeat_and_commit(1_030, &HashMap::new())
+      .await
+      .unwrap();
+    assert_eq!(heartbeat.renewed_partitions, *ownership);
+    assert!(heartbeat.fenced_partitions.is_empty());
+  }
+}
+
+#[tokio::test]
 async fn heartbeat_commit_renews_and_commits_cursor() {
   let store: Arc<dyn ConsumerGroupLeaseStore> = Arc::new(InMemoryConsumerGroupLeaseStore::new());
   let mut coordinator = ConsumerGroupCoordinatorImpl::new(

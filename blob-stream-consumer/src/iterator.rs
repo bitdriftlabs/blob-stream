@@ -37,7 +37,7 @@ use blob_stream_types::{
   now_unix_millis,
   now_unix_seconds,
 };
-use log::{info, trace};
+use log::{debug, info, trace};
 use prometheus::{Histogram, IntCounter, IntGauge};
 use serde::Serialize;
 use std::cmp::max;
@@ -48,8 +48,6 @@ use std::time::Instant;
 use time::ext::NumericalDuration;
 use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::task::JoinHandle;
-
-// TODO(mattklein123): Add prefetching.
 
 //
 // IdlePollBackoff
@@ -100,6 +98,8 @@ struct ConsumerIteratorMetrics {
   prefetch_paused_budget: IntCounter,
   prefetch_refill_cycles: IntCounter,
   heartbeat_calls: IntCounter,
+  heartbeat_scheduled_calls: IntCounter,
+  heartbeat_commit_calls: IntCounter,
   heartbeat_failures: IntCounter,
   heartbeat_committed_offsets: IntCounter,
   heartbeat_renewed_partitions: IntCounter,
@@ -123,6 +123,8 @@ impl ConsumerIteratorMetrics {
       prefetch_paused_budget: scope.counter("prefetch_paused_budget"),
       prefetch_refill_cycles: scope.counter("prefetch_refill_cycles"),
       heartbeat_calls: scope.counter("heartbeat_calls"),
+      heartbeat_scheduled_calls: scope.counter("heartbeat_scheduled_calls"),
+      heartbeat_commit_calls: scope.counter("heartbeat_commit_calls"),
       heartbeat_failures: scope.counter("heartbeat_failures"),
       heartbeat_committed_offsets: scope.counter("heartbeat_committed_offsets"),
       heartbeat_renewed_partitions: scope.counter("heartbeat_renewed_partitions"),
@@ -130,6 +132,25 @@ impl ConsumerIteratorMetrics {
       heartbeat_latency_seconds: scope.histogram("heartbeat_latency_seconds"),
       next_latency_seconds: scope.histogram("next_latency_seconds"),
       commit_latency_seconds: scope.histogram("commit_latency_seconds"),
+    }
+  }
+}
+
+//
+// HeartbeatTrigger
+//
+
+#[derive(Clone, Copy)]
+enum HeartbeatTrigger {
+  Scheduled,
+  Commit,
+}
+
+impl HeartbeatTrigger {
+  fn as_str(self) -> &'static str {
+    match self {
+      Self::Scheduled => "scheduled",
+      Self::Commit => "commit",
     }
   }
 }
@@ -429,6 +450,7 @@ pub struct ConsumerIteratorImpl {
   coordinator: Box<dyn ConsumerGroupCoordinator>,
   membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   coordination_source: Arc<dyn ConsumerCoordinationSource>,
+  last_coordination_snapshot: Option<CoordinationSnapshot>,
   metrics: ConsumerIteratorMetrics,
   started: bool,
   pending_commits: HashMap<VirtualPartitionId, u64>,
@@ -519,6 +541,7 @@ impl ConsumerIteratorImpl {
       coordinator: Box::new(coordinator),
       membership_store,
       coordination_source,
+      last_coordination_snapshot: None,
       metrics: ConsumerIteratorMetrics::new(&metrics_scope.scope("consumer")),
       started: false,
       pending_commits: HashMap::new(),
@@ -540,6 +563,7 @@ impl ConsumerIteratorImpl {
     };
 
     let snapshot = iterator.coordination_source.snapshot().await?;
+    iterator.record_coordination_snapshot(&snapshot);
     let report = iterator
       .coordinator
       .rebalance(snapshot.members, snapshot.virtual_partitions, now_ts_ms)
@@ -580,6 +604,52 @@ impl ConsumerIteratorImpl {
     for (partition_id, seq_end) in committed_cursors {
       reader.hydrate_cursor(partition_id, seq_end);
     }
+  }
+
+  fn record_coordination_snapshot(&mut self, snapshot: &CoordinationSnapshot) {
+    let Some(previous) = self.last_coordination_snapshot.as_ref() else {
+      info!(
+        "consumer membership snapshot initialized: topic={}, group_id={}, member_id={}, \
+         members={:?}, partitions={:?}",
+        self.group_config.topic,
+        self.group_config.group_id,
+        self.group_config.member_id,
+        snapshot.members,
+        snapshot.virtual_partitions
+      );
+      self.last_coordination_snapshot = Some(snapshot.clone());
+      return;
+    };
+
+    if previous == snapshot {
+      return;
+    }
+
+    if previous.members != snapshot.members {
+      info!(
+        "consumer membership changed: topic={}, group_id={}, member_id={}, previous_members={:?}, \
+         members={:?}",
+        self.group_config.topic,
+        self.group_config.group_id,
+        self.group_config.member_id,
+        previous.members,
+        snapshot.members
+      );
+    }
+
+    if previous.virtual_partitions != snapshot.virtual_partitions {
+      info!(
+        "consumer partition space changed: topic={}, group_id={}, member_id={}, \
+         previous_partitions={:?}, partitions={:?}",
+        self.group_config.topic,
+        self.group_config.group_id,
+        self.group_config.member_id,
+        previous.virtual_partitions,
+        snapshot.virtual_partitions
+      );
+    }
+
+    self.last_coordination_snapshot = Some(snapshot.clone());
   }
 
   async fn apply_assignment(&mut self, assignment: &[VirtualPartitionId]) -> Result<()> {
@@ -705,6 +775,7 @@ impl ConsumerIteratorImpl {
     }
 
     let snapshot = self.coordination_source.snapshot().await?;
+    self.record_coordination_snapshot(&snapshot);
     let RebalanceReport {
       owned_partitions: next_assignment,
       committed_cursors,
@@ -862,9 +933,28 @@ impl ConsumerIteratorImpl {
     diagnostics.last_successful_heartbeat_at_ms = Some(now_ts_ms);
   }
 
-  async fn heartbeat(&mut self, now_ts_ms: i64) -> Result<HeartbeatReport> {
+  async fn heartbeat(
+    &mut self,
+    now_ts_ms: i64,
+    trigger: HeartbeatTrigger,
+  ) -> Result<HeartbeatReport> {
     let started_at = Instant::now();
     self.metrics.heartbeat_calls.inc();
+    match trigger {
+      HeartbeatTrigger::Scheduled => self.metrics.heartbeat_scheduled_calls.inc(),
+      HeartbeatTrigger::Commit => self.metrics.heartbeat_commit_calls.inc(),
+    }
+    trace!(
+      "consumer heartbeat started: topic={}, group_id={}, member_id={}, trigger={}, \
+       generation={}, active_partitions={:?}, pending_commits={}",
+      self.group_config.topic,
+      self.group_config.group_id,
+      self.group_config.member_id,
+      trigger.as_str(),
+      self.coordinator.generation(),
+      self.active_assignment,
+      self.pending_commits.len()
+    );
 
     if let Err(error) = self
       .membership_store
@@ -877,6 +967,16 @@ impl ConsumerIteratorImpl {
       )
       .await
     {
+      debug!(
+        "consumer membership heartbeat failed: topic={}, group_id={}, member_id={}, trigger={}, \
+         generation={}, elapsed_ms={}, error={error}",
+        self.group_config.topic,
+        self.group_config.group_id,
+        self.group_config.member_id,
+        trigger.as_str(),
+        self.coordinator.generation(),
+        started_at.elapsed().as_millis()
+      );
       self.record_heartbeat_failure(started_at);
       return Err(error);
     }
@@ -888,6 +988,16 @@ impl ConsumerIteratorImpl {
     {
       Ok(report) => report,
       Err(error) => {
+        debug!(
+          "consumer coordinator heartbeat failed: topic={}, group_id={}, member_id={}, \
+           trigger={}, generation={}, elapsed_ms={}, error={error}",
+          self.group_config.topic,
+          self.group_config.group_id,
+          self.group_config.member_id,
+          trigger.as_str(),
+          self.coordinator.generation(),
+          started_at.elapsed().as_millis()
+        );
         self.record_heartbeat_failure(started_at);
         return Err(error);
       },
@@ -916,6 +1026,26 @@ impl ConsumerIteratorImpl {
 
     self.next_heartbeat_at_ms = now_ts_ms + consumer_heartbeat_interval_ms(&self.group_config);
     self.refresh_diagnostics();
+    let committed_offsets = report
+      .renewed_partitions
+      .iter()
+      .filter(|partition_id| self.pending_commits.contains_key(partition_id))
+      .count();
+    trace!(
+      "consumer heartbeat completed: topic={}, group_id={}, member_id={}, trigger={}, \
+       generation={}, renewed={:?}, fenced={:?}, committed_offsets={}, elapsed_ms={}, \
+       next_heartbeat_at_ms={}",
+      self.group_config.topic,
+      self.group_config.group_id,
+      self.group_config.member_id,
+      trigger.as_str(),
+      self.coordinator.generation(),
+      report.renewed_partitions,
+      report.fenced_partitions,
+      committed_offsets,
+      started_at.elapsed().as_millis(),
+      self.next_heartbeat_at_ms
+    );
     Ok(report)
   }
 }
@@ -1120,7 +1250,22 @@ impl ConsumerIterator for ConsumerIteratorImpl {
       }
 
       if now_ts_ms >= self.next_heartbeat_at_ms {
-        self.heartbeat(now_ts_ms).await?;
+        trace!(
+          "consumer scheduled heartbeat due: topic={}, group_id={}, member_id={}, generation={}, \
+           now_ts_ms={}, due_at_ms={}, overdue_ms={}, active_partitions={:?}, pending_commits={}",
+          self.group_config.topic,
+          self.group_config.group_id,
+          self.group_config.member_id,
+          self.coordinator.generation(),
+          now_ts_ms,
+          self.next_heartbeat_at_ms,
+          now_ts_ms.saturating_sub(self.next_heartbeat_at_ms),
+          self.active_assignment,
+          self.pending_commits.len()
+        );
+        self
+          .heartbeat(now_ts_ms, HeartbeatTrigger::Scheduled)
+          .await?;
       }
 
       if let Some(record) = self.next_buffered_record() {
@@ -1183,8 +1328,20 @@ impl ConsumerIterator for ConsumerIteratorImpl {
       self.started,
       "consumer iterator must be started before commit"
     );
+    debug!(
+      "consumer commit requested heartbeat: topic={}, group_id={}, member_id={}, generation={}, \
+       active_partitions={:?}, pending_commits={:?}",
+      self.group_config.topic,
+      self.group_config.group_id,
+      self.group_config.member_id,
+      self.coordinator.generation(),
+      self.active_assignment,
+      self.pending_commits
+    );
     let started_at = Instant::now();
-    let report = self.heartbeat(now_unix_millis()).await?;
+    let report = self
+      .heartbeat(now_unix_millis(), HeartbeatTrigger::Commit)
+      .await?;
     self
       .metrics
       .commit_latency_seconds
