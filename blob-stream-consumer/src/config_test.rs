@@ -38,6 +38,20 @@ fn candidate_windows_cover_publication_and_visibility_delay() {
 }
 
 #[test]
+fn candidate_windows_rejects_unbounded_scan_horizon() {
+  let mut read = read_config();
+  read.window_size_seconds = Some(300);
+  read.metadata_visibility_delay_ms = Some(9_600_000);
+
+  let error = consumer_candidate_window_count(&read, 300_000).unwrap_err();
+  assert!(
+    error
+      .to_string()
+      .contains("metadata availability horizon exceeds")
+  );
+}
+
+#[test]
 fn metadata_visibility_delay_uses_explicit_value() {
   let mut read = read_config();
   read.metadata_visibility_delay_ms = Some(1_500);

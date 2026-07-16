@@ -41,7 +41,7 @@ use blob_stream_types::{
 pub use config::{TopicInfo, WriteConfig, build_write_engine};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use log::trace;
+use log::{error, trace};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -971,6 +971,13 @@ async fn collect_flush_plans(
     .skip(start)
     .take(partition_state_count)
   {
+    if !topics.contains_key(topic) {
+      error!(
+        "refusing to flush state for unknown topic: topic={topic}, \
+         virtual_partition_id={virtual_partition_id}"
+      );
+      continue;
+    }
     let is_new_topic = !plans_by_topic.contains_key(topic);
     if is_new_topic && plans_by_topic.len() == max_plans {
       continue;
@@ -1011,9 +1018,10 @@ async fn collect_flush_plans(
   plans_by_topic
     .into_iter()
     .map(|(topic, partitions)| FlushPlan {
-      max_metadata_publication_lag_ms: topics.get(&topic).map_or(30_000, |topic_info| {
-        topic_info.max_metadata_publication_lag_ms
-      }),
+      max_metadata_publication_lag_ms: topics
+        .get(&topic)
+        .expect("flush plans are created only for configured topics")
+        .max_metadata_publication_lag_ms,
       topic,
       partitions,
     })

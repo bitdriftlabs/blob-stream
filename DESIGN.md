@@ -341,8 +341,8 @@ The design relies on these invariants:
 - Valid later batches for a virtual partition have `seq_end` greater than already processed
   batches, so cursors never regress.
 - A consumer lease generation fences stale ownership and stale cursor commits.
-- Resumed-partition recovery scans find late lower-snowflake metadata while it remains inside the
-  topic retention horizon; periodic fast-path rediscovery remains limited to `lookback_windows`.
+- Resumed-partition recovery scans find late lower-snowflake metadata throughout the topic
+  retention horizon; fast-path rediscovery covers the derived publication and visibility horizon.
 
 These invariants prevent a consumer from treating an already committed cursor as unprocessed
 work, but they do not provide exactly-once delivery. Applications needing exactly-once effects

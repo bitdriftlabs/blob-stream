@@ -17,6 +17,7 @@ const DEFAULT_MAX_IDLE_POLL_DELAY_MS: u64 = 2_000;
 const DEFAULT_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_METADATA_VISIBILITY_DELAY_MS: u64 = 2_000;
 pub const DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS: u64 = 30_000;
+const MAX_CANDIDATE_WINDOWS: usize = 32;
 const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: i64 = 10_000;
 const DEFAULT_REBALANCE_INTERVAL_MS: i64 = 10_000;
@@ -81,8 +82,13 @@ pub fn consumer_candidate_window_count(
     .checked_add(window_size_ms.saturating_sub(1))
     .ok_or_else(|| anyhow!("metadata availability horizon is too large"))?
     / window_size_ms;
-  usize::try_from(trailing_windows.saturating_add(1))
-    .map_err(|_| anyhow!("metadata availability horizon has too many windows"))
+  let candidate_windows = usize::try_from(trailing_windows.saturating_add(1))
+    .map_err(|_| anyhow!("metadata availability horizon has too many windows"))?;
+  ensure!(
+    candidate_windows <= MAX_CANDIDATE_WINDOWS,
+    "metadata availability horizon exceeds {MAX_CANDIDATE_WINDOWS} windows"
+  );
+  Ok(candidate_windows)
 }
 
 #[must_use]
