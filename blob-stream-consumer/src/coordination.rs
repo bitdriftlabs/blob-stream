@@ -6,10 +6,14 @@ use crate::config::{ConsumerGroupConfig, consumer_lease_duration_ms, validate_gr
 use anyhow::Result;
 use async_trait::async_trait;
 use blob_stream_metadata_store::{
+  ConsumerGroupAssignment,
   ConsumerGroupAssignmentOutcome,
+  ConsumerGroupAssignmentPlan,
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupMembershipStore,
+  ConsumerGroupPlannerLeaseOutcome,
   ConsumerGroupReleaseOutcome,
 };
 use blob_stream_types::{CommittedCursor, VirtualPartitionId};
@@ -22,13 +26,14 @@ use std::sync::Arc;
 //
 // This module implements consumer-group coordination with a clear split between:
 //
-// 1) Desired ownership computation (local, deterministic, cooperative sticky)
+// 1) Desired ownership computation (shared, durable, cooperative sticky)
 // 2) Actual ownership claim/renewal (backed by ConsumerGroupLeaseStore fencing semantics)
 //
 // High-level flow
 //
 // A) Rebalance phase (`rebalance`)
-//    - Build a desired partition->member map using cooperative sticky assignment.
+//    - The elected planner builds a desired partition->member map using cooperative sticky
+//      assignment, then persists it as the shared plan.
 //    - If desired map changed, bump generation. Generation is the fence token carried in assignment
 //      and heartbeat operations.
 //    - For partitions assigned to this member, call `assign_partition` in the lease store. Only
@@ -58,9 +63,8 @@ use std::sync::Arc;
 // - A bounded rebalance step moves the minimum number of partitions from overloaded to underloaded
 //   members to reach a near-even distribution.
 //
-// This design intentionally reuses the lease store for all correctness-critical state (leases,
-// generation checks, ownership fences) and keeps the coordinator focused on deterministic planning
-// + orchestration.
+// This design uses the membership store for a durable desired plan and the lease store for
+// correctness-critical ownership state (leases, generation checks, and ownership fences).
 
 //
 // HeartbeatReport
@@ -140,16 +144,17 @@ pub trait ConsumerGroupCoordinator: Send + Sync {
 pub struct ConsumerGroupCoordinatorImpl {
   config: ConsumerGroupConfig,
   lease_store: Arc<dyn ConsumerGroupLeaseStore>,
+  membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   generation: u64,
-  desired_assignment: HashMap<VirtualPartitionId, String>,
   owned: HashSet<VirtualPartitionId>,
 }
 
 impl ConsumerGroupCoordinatorImpl {
-  /// Create a coordinator from group configuration and lease store backend.
+  /// Create a coordinator from group configuration and shared membership/lease stores.
   pub fn new(
     config: ConsumerGroupConfig,
     lease_store: Arc<dyn ConsumerGroupLeaseStore>,
+    membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   ) -> Result<Self> {
     // Validate static configuration once at construction so runtime paths stay focused on
     // coordination logic.
@@ -157,10 +162,120 @@ impl ConsumerGroupCoordinatorImpl {
     Ok(Self {
       config,
       lease_store,
+      membership_store,
       generation: 0,
-      desired_assignment: HashMap::new(),
       owned: HashSet::new(),
     })
+  }
+
+  async fn shared_assignment(
+    &self,
+    members: &[String],
+    partitions: &[VirtualPartitionId],
+    now_ts_ms: i64,
+  ) -> Result<Option<ConsumerGroupAssignmentPlan>> {
+    let current_plan = self
+      .membership_store
+      .get_assignment_plan(&self.config.topic, &self.config.group_id)
+      .await?;
+    let current_plan_is_valid = current_plan
+      .as_ref()
+      .is_some_and(|plan| assignment_plan_is_valid(plan, partitions));
+    let current_members = canonical_members(members, &self.config.member_id);
+    let topology_changed = current_plan
+      .as_ref()
+      .is_some_and(|plan| plan.members != current_members);
+    if let Some(plan) = current_plan.as_ref()
+      && current_plan_is_valid
+    {
+      let planner_lease = self
+        .membership_store
+        .get_planner_lease(&self.config.topic, &self.config.group_id)
+        .await?;
+      let planner_is_active = planner_lease.as_ref().is_some_and(|lease| {
+        lease.member_id == plan.planner_member_id && lease.lease_expiration_ts_ms > now_ts_ms
+      });
+      if planner_is_active && plan.planner_member_id != self.config.member_id.as_ref() {
+        return Ok(Some(plan.clone()));
+      }
+      if planner_is_active && !topology_changed {
+        let outcome = self
+          .membership_store
+          .acquire_or_renew_planner(
+            &self.config.topic,
+            &self.config.group_id,
+            &self.config.member_id,
+            now_ts_ms,
+            consumer_lease_duration_ms(&self.config),
+          )
+          .await?;
+        if outcome == ConsumerGroupPlannerLeaseOutcome::Acquired {
+          return Ok(Some(plan.clone()));
+        }
+      }
+    }
+
+    let planner_outcome = self
+      .membership_store
+      .acquire_or_renew_planner(
+        &self.config.topic,
+        &self.config.group_id,
+        &self.config.member_id,
+        now_ts_ms,
+        consumer_lease_duration_ms(&self.config),
+      )
+      .await?;
+    if planner_outcome == ConsumerGroupPlannerLeaseOutcome::Acquired {
+      let previous_assignment = current_plan
+        .as_ref()
+        .map(plan_assignment_map)
+        .unwrap_or_default();
+      let assignment = cooperative_sticky_assignment(
+        members,
+        partitions,
+        &previous_assignment,
+        &self.config.member_id,
+      );
+      let plan = assignment_plan(
+        current_plan
+          .as_ref()
+          .map_or(1, |current| current.version.saturating_add(1)),
+        members,
+        partitions,
+        &assignment,
+        &self.config.member_id,
+        now_ts_ms,
+      );
+      if self
+        .membership_store
+        .publish_assignment_plan(
+          &self.config.topic,
+          &self.config.group_id,
+          &self.config.member_id,
+          now_ts_ms,
+          plan.clone(),
+        )
+        .await?
+      {
+        info!(
+          "consumer assignment plan published: topic={}, group_id={}, member_id={}, version={}, \
+           members={}, partitions={}",
+          self.config.topic,
+          self.config.group_id,
+          self.config.member_id,
+          plan.version,
+          plan.members.len(),
+          plan.assignments.len()
+        );
+        return Ok(Some(plan));
+      }
+    }
+
+    let refreshed_plan = self
+      .membership_store
+      .get_assignment_plan(&self.config.topic, &self.config.group_id)
+      .await?;
+    Ok(refreshed_plan.filter(|plan| assignment_plan_is_valid(plan, partitions)))
   }
 }
 
@@ -172,33 +287,25 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     partitions: Vec<VirtualPartitionId>,
     now_ts_ms: i64,
   ) -> Result<RebalanceReport> {
-    // Compute target assignment from current membership + partition set while preserving prior
-    // placements when possible.
-    let desired_assignment = cooperative_sticky_assignment(
-      &members,
-      &partitions,
-      &self.desired_assignment,
-      &self.config.member_id,
-    );
-
-    // Generation increments only when desired topology changes. This generation is later used by
-    // lease operations to fence stale coordinators/owners.
-    if self.desired_assignment != desired_assignment {
-      self.generation = self.generation.saturating_add(1);
-      info!(
-        "consumer rebalance plan changed: topic={}, group_id={}, member_id={}, generation={}",
-        self.config.topic, self.config.group_id, self.config.member_id, self.generation
-      );
-      self.desired_assignment = desired_assignment;
+    // Desired ownership is accepted only from a valid persisted plan. During a planner transition
+    // without one, this member makes no local ownership decision.
+    let shared_plan = self
+      .shared_assignment(&members, &partitions, now_ts_ms)
+      .await?;
+    if let Some(plan) = shared_plan.as_ref() {
+      self.generation = plan.version;
     }
+    let desired_assignment = shared_plan
+      .as_ref()
+      .map(plan_assignment_map)
+      .unwrap_or_default();
 
     // Keep previously owned partitions that are still locally desired, then reconcile each lease
     // outcome below. This avoids rebuilding the local ownership set on stable rebalances.
     let member_id = self.config.member_id.to_string();
     let mut assignment_changed = false;
     self.owned.retain(|partition_id| {
-      let retain = self
-        .desired_assignment
+      let retain = desired_assignment
         .get(partition_id)
         .is_some_and(|owner_id| owner_id == &member_id);
       assignment_changed |= !retain;
@@ -206,7 +313,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     });
     let mut recovered_cursors = HashMap::new();
     for partition_id in partitions {
-      let Some(owner_id) = self.desired_assignment.get(&partition_id) else {
+      let Some(owner_id) = desired_assignment.get(&partition_id) else {
         continue;
       };
       // Skip partitions assigned to other members.
@@ -286,7 +393,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       self.config.member_id,
       self.generation,
       members.len(),
-      self.desired_assignment.len(),
+      desired_assignment.len(),
       owned.len()
     );
     Ok(RebalanceReport {
@@ -571,4 +678,113 @@ fn least_loaded_member(members: &[String], load: &HashMap<String, usize>) -> Str
   }
 
   selected
+}
+
+fn assignment_plan(
+  version: u64,
+  members: &[String],
+  partitions: &[VirtualPartitionId],
+  assignments: &HashMap<VirtualPartitionId, String>,
+  local_member_id: &str,
+  published_ts_ms: i64,
+) -> ConsumerGroupAssignmentPlan {
+  let members = canonical_members(members, local_member_id);
+  let mut partitions = partitions.to_vec();
+  partitions.sort_unstable();
+  partitions.dedup();
+  let assignments = partitions
+    .into_iter()
+    .filter_map(|virtual_partition_id| {
+      assignments
+        .get(&virtual_partition_id)
+        .map(|member_id| ConsumerGroupAssignment {
+          virtual_partition_id,
+          member_id: member_id.clone(),
+        })
+    })
+    .collect();
+
+  ConsumerGroupAssignmentPlan {
+    version,
+    planner_member_id: local_member_id.to_string(),
+    members,
+    assignments,
+    published_ts_ms,
+  }
+}
+
+fn assignment_plan_is_valid(
+  plan: &ConsumerGroupAssignmentPlan,
+  partitions: &[VirtualPartitionId],
+) -> bool {
+  if plan.members.is_empty()
+    || !plan
+      .members
+      .iter()
+      .any(|member| member == &plan.planner_member_id)
+  {
+    return false;
+  }
+
+  let mut expected_partitions = partitions.to_vec();
+  expected_partitions.sort_unstable();
+  expected_partitions.dedup();
+  if plan.assignments.len() != expected_partitions.len() {
+    return false;
+  }
+
+  let member_set = plan.members.iter().collect::<HashSet<_>>();
+  let mut assignment_partitions = HashSet::new();
+  let mut load = plan
+    .members
+    .iter()
+    .map(|member| (member, 0_usize))
+    .collect::<HashMap<_, _>>();
+  for assignment in &plan.assignments {
+    if !member_set.contains(&assignment.member_id)
+      || !assignment_partitions.insert(assignment.virtual_partition_id)
+    {
+      return false;
+    }
+    if let Some(member_load) = load.get_mut(&assignment.member_id) {
+      *member_load += 1;
+    }
+  }
+  if !expected_partitions
+    .iter()
+    .all(|partition| assignment_partitions.contains(partition))
+  {
+    return false;
+  }
+
+  let min_load = load.values().min().copied().unwrap_or_default();
+  let max_load = load.values().max().copied().unwrap_or_default();
+  max_load.saturating_sub(min_load) <= 1
+}
+
+fn plan_assignment_map(plan: &ConsumerGroupAssignmentPlan) -> HashMap<VirtualPartitionId, String> {
+  plan
+    .assignments
+    .iter()
+    .map(|assignment| {
+      (
+        assignment.virtual_partition_id,
+        assignment.member_id.clone(),
+      )
+    })
+    .collect()
+}
+
+fn canonical_members(members: &[String], local_member_id: &str) -> Vec<String> {
+  let mut canonical = members
+    .iter()
+    .filter(|member| !member.trim().is_empty())
+    .cloned()
+    .collect::<Vec<_>>();
+  if !canonical.iter().any(|member| member == local_member_id) {
+    canonical.push(local_member_id.to_string());
+  }
+  canonical.sort();
+  canonical.dedup();
+  canonical
 }

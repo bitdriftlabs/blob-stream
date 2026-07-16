@@ -11,11 +11,17 @@ use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupMembershipStore,
   InMemoryConsumerGroupLeaseStore,
+  InMemoryConsumerGroupMembershipStore,
 };
 use blob_stream_types::CommittedCursor;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+fn membership_store() -> Arc<dyn ConsumerGroupMembershipStore> {
+  Arc::new(InMemoryConsumerGroupMembershipStore::new())
+}
 
 fn committed_cursor(virtual_partition_id: u32, seq_end: u64) -> CommittedCursor {
   CommittedCursor {
@@ -61,6 +67,7 @@ fn sticky_assignment_moves_minimal_partitions_on_scale_out() {
 #[tokio::test]
 async fn oversubscribed_consumers_keep_stable_assignments_without_fencing() {
   let store: Arc<dyn ConsumerGroupLeaseStore> = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store = membership_store();
   let members = (0 .. 4)
     .map(|member_index| format!("member-{member_index}"))
     .collect::<Vec<_>>();
@@ -79,6 +86,7 @@ async fn oversubscribed_consumers_keep_stable_assignments_without_fencing() {
           ..Default::default()
         },
         Arc::clone(&store),
+        Arc::clone(&membership_store),
       )
       .unwrap()
     })
@@ -136,8 +144,107 @@ async fn oversubscribed_consumers_keep_stable_assignments_without_fencing() {
 }
 
 #[tokio::test]
+async fn shared_plan_covers_every_partition_despite_divergent_member_snapshots() {
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let members = (0 .. 4)
+    .map(|member_index| format!("member-{member_index}"))
+    .collect::<Vec<_>>();
+  let partitions = (0 .. 32).collect::<Vec<_>>();
+  let mut coordinators = members
+    .iter()
+    .map(|member_id| {
+      ConsumerGroupCoordinatorImpl::new(
+        ConsumerGroupConfig {
+          topic: "topic-a".to_string().into(),
+          group_id: "group-a".to_string().into(),
+          member_id: member_id.clone().into(),
+          lease_duration_ms: Some(1_000),
+          heartbeat_interval_ms: Some(50),
+          rebalance_interval_ms: Some(50),
+          ..Default::default()
+        },
+        Arc::clone(&lease_store),
+        Arc::clone(&membership_store),
+      )
+      .unwrap()
+    })
+    .collect::<Vec<_>>();
+
+  // Member 0 publishes the initial complete plan. The remaining coordinators deliberately see
+  // different incomplete snapshots, matching the stale local-view failure that left partitions
+  // uncovered before plans were shared.
+  let mut owned = coordinators[0]
+    .rebalance(members.clone(), partitions.clone(), 1_000)
+    .await
+    .unwrap()
+    .owned_partitions;
+  for (coordinator, snapshot) in coordinators.iter_mut().skip(1).zip([
+    vec!["member-1".to_string(), "member-2".to_string()],
+    vec!["member-0".to_string(), "member-2".to_string()],
+    vec!["member-3".to_string()],
+  ]) {
+    owned.extend(
+      coordinator
+        .rebalance(snapshot, partitions.clone(), 1_010)
+        .await
+        .unwrap()
+        .owned_partitions,
+    );
+  }
+
+  owned.sort_unstable();
+  owned.dedup();
+  assert_eq!(owned, partitions);
+  assert!(
+    coordinators
+      .iter()
+      .all(|coordinator| coordinator.generation() == 1)
+  );
+}
+
+#[tokio::test]
+async fn coordinator_does_not_create_local_assignment_without_shared_plan() {
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store = membership_store();
+  assert_eq!(
+    membership_store
+      .acquire_or_renew_planner("topic-a", "group-a", "member-b", 1_000, 1_000)
+      .await
+      .unwrap(),
+    blob_stream_metadata_store::ConsumerGroupPlannerLeaseOutcome::Acquired
+  );
+  let mut coordinator = ConsumerGroupCoordinatorImpl::new(
+    ConsumerGroupConfig {
+      topic: "topic-a".to_string().into(),
+      group_id: "group-a".to_string().into(),
+      member_id: "member-a".to_string().into(),
+      lease_duration_ms: Some(1_000),
+      heartbeat_interval_ms: Some(50),
+      rebalance_interval_ms: Some(50),
+      ..Default::default()
+    },
+    lease_store,
+    membership_store,
+  )
+  .unwrap();
+
+  let report = coordinator
+    .rebalance(vec!["member-a".to_string()], vec![0, 1], 1_001)
+    .await
+    .unwrap();
+
+  assert!(report.owned_partitions.is_empty());
+  assert_eq!(coordinator.generation(), 0);
+}
+
+#[tokio::test]
 async fn heartbeat_commit_renews_and_commits_cursor() {
   let store: Arc<dyn ConsumerGroupLeaseStore> = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store = membership_store();
   let mut coordinator = ConsumerGroupCoordinatorImpl::new(
     ConsumerGroupConfig {
       topic: "topic-a".to_string().into(),
@@ -149,6 +256,7 @@ async fn heartbeat_commit_renews_and_commits_cursor() {
       ..Default::default()
     },
     Arc::clone(&store),
+    membership_store,
   )
   .unwrap();
 
@@ -170,6 +278,7 @@ async fn heartbeat_commit_renews_and_commits_cursor() {
 #[tokio::test]
 async fn stable_rebalance_preserves_owned_partitions_and_committed_cursor() {
   let store: Arc<dyn ConsumerGroupLeaseStore> = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store = membership_store();
   let mut coordinator = ConsumerGroupCoordinatorImpl::new(
     ConsumerGroupConfig {
       topic: "topic-a".to_string().into(),
@@ -181,6 +290,7 @@ async fn stable_rebalance_preserves_owned_partitions_and_committed_cursor() {
       ..Default::default()
     },
     Arc::clone(&store),
+    membership_store,
   )
   .unwrap();
 
@@ -215,6 +325,7 @@ async fn stable_rebalance_preserves_owned_partitions_and_committed_cursor() {
 async fn heartbeat_detects_fencing_by_new_generation() {
   let concrete_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
   let store: Arc<dyn ConsumerGroupLeaseStore> = concrete_store.clone();
+  let membership_store = membership_store();
   let mut coordinator = ConsumerGroupCoordinatorImpl::new(
     ConsumerGroupConfig {
       topic: "topic-a".to_string().into(),
@@ -226,6 +337,7 @@ async fn heartbeat_detects_fencing_by_new_generation() {
       ..Default::default()
     },
     Arc::clone(&store),
+    membership_store,
   )
   .unwrap();
 
@@ -264,6 +376,7 @@ async fn heartbeat_detects_fencing_by_new_generation() {
 async fn release_owned_releases_partitions_for_fast_takeover() {
   let concrete_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
   let store: Arc<dyn ConsumerGroupLeaseStore> = concrete_store.clone();
+  let membership_store = membership_store();
   let mut coordinator = ConsumerGroupCoordinatorImpl::new(
     ConsumerGroupConfig {
       topic: "topic-a".to_string().into(),
@@ -275,6 +388,7 @@ async fn release_owned_releases_partitions_for_fast_takeover() {
       ..Default::default()
     },
     Arc::clone(&store),
+    membership_store,
   )
   .unwrap();
 

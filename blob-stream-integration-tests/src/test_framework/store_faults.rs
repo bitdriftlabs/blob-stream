@@ -4,11 +4,14 @@ use async_trait::async_trait;
 use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
+  ConsumerGroupAssignmentPlan,
   ConsumerGroupCommitOutcome,
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
   ConsumerGroupMembershipStore,
+  ConsumerGroupPlannerLease,
+  ConsumerGroupPlannerLeaseOutcome,
   ConsumerGroupReleaseOutcome,
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
@@ -1001,6 +1004,54 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
     self
       .inner
       .list_active_members(topic, group_id, now_ts_ms)
+      .await
+  }
+
+  async fn get_assignment_plan(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> Result<Option<ConsumerGroupAssignmentPlan>> {
+    self.inner.get_assignment_plan(topic, group_id).await
+  }
+
+  async fn get_planner_lease(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> Result<Option<ConsumerGroupPlannerLease>> {
+    self.inner.get_planner_lease(topic, group_id).await
+  }
+
+  async fn acquire_or_renew_planner(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    now_ts_ms: i64,
+    ttl_ms: i64,
+  ) -> Result<ConsumerGroupPlannerLeaseOutcome> {
+    self
+      .inner
+      .acquire_or_renew_planner(topic, group_id, member_id, now_ts_ms, ttl_ms)
+      .await
+  }
+
+  async fn release_planner(&self, topic: &str, group_id: &str, member_id: &str) -> Result<bool> {
+    self.inner.release_planner(topic, group_id, member_id).await
+  }
+
+  async fn publish_assignment_plan(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    now_ts_ms: i64,
+    plan: ConsumerGroupAssignmentPlan,
+  ) -> Result<bool> {
+    self
+      .inner
+      .publish_assignment_plan(topic, group_id, member_id, now_ts_ms, plan)
       .await
   }
 }

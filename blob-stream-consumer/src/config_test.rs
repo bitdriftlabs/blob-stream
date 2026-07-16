@@ -6,8 +6,10 @@ use super::{
   consumer_max_idle_poll_delay_ms,
   consumer_metadata_visibility_delay_ms,
   consumer_prefetch_max_bytes,
+  validate_group_config,
   validate_read_config,
 };
+use crate::config::ConsumerGroupConfig;
 
 fn read_config() -> ConsumerReadConfig {
   let mut read = ConsumerReadConfig::new();
@@ -87,4 +89,15 @@ fn validate_read_config_accepts_idle_backoff_range() {
   read.max_idle_poll_delay_ms = Some(2_000);
 
   validate_read_config(&read).unwrap();
+}
+
+#[test]
+fn validate_group_config_rejects_reserved_member_id_prefix() {
+  let mut group = ConsumerGroupConfig::new();
+  group.topic = "telemetry".to_string().into();
+  group.group_id = "group-a".to_string().into();
+  group.member_id = "__blob_stream_assignment_plan_v1__".to_string().into();
+
+  let error = validate_group_config(&group).unwrap_err();
+  assert!(error.to_string().contains("uses reserved prefix"));
 }

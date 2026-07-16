@@ -2,7 +2,12 @@
 #[path = "./consumer_group_membership_memory_test.rs"]
 mod tests;
 
-use crate::ConsumerGroupMembershipStore;
+use crate::{
+  ConsumerGroupAssignmentPlan,
+  ConsumerGroupMembershipStore,
+  ConsumerGroupPlannerLease,
+  ConsumerGroupPlannerLeaseOutcome,
+};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use log::trace;
@@ -15,7 +20,7 @@ use tokio::sync::RwLock;
 
 #[derive(Default)]
 pub struct InMemoryConsumerGroupMembershipStore {
-  members: RwLock<HashMap<MemberKey, MemberState>>,
+  state: RwLock<MembershipState>,
 }
 
 impl InMemoryConsumerGroupMembershipStore {
@@ -44,7 +49,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     let state = MemberState {
       lease_expiration_ts_ms: expires_at,
     };
-    self.members.write().await.insert(key, state);
+    self.state.write().await.members.insert(key, state);
     Ok(())
   }
 
@@ -71,7 +76,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
        member_id={member_id}"
     );
     let key = MemberKey::new(topic, group_id, member_id);
-    self.members.write().await.remove(&key);
+    self.state.write().await.members.remove(&key);
     Ok(())
   }
 
@@ -82,9 +87,9 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     now_ts_ms: i64,
   ) -> Result<Vec<String>> {
     trace!("consumer membership(memory) list_active_members: topic={topic}, group_id={group_id}");
-    let guard = self.members.read().await;
+    let guard = self.state.read().await;
     let mut members = HashSet::new();
-    for (key, state) in guard.iter() {
+    for (key, state) in &guard.members {
       if key.topic == topic && key.group_id == group_id && state.lease_expiration_ts_ms > now_ts_ms
       {
         members.insert(key.member_id.clone());
@@ -94,6 +99,139 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     let mut members = members.into_iter().collect::<Vec<_>>();
     members.sort();
     Ok(members)
+  }
+
+  async fn get_assignment_plan(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> Result<Option<ConsumerGroupAssignmentPlan>> {
+    Ok(
+      self
+        .state
+        .read()
+        .await
+        .plans
+        .get(&GroupKey::new(topic, group_id))
+        .cloned(),
+    )
+  }
+
+  async fn get_planner_lease(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> Result<Option<ConsumerGroupPlannerLease>> {
+    Ok(
+      self
+        .state
+        .read()
+        .await
+        .planners
+        .get(&GroupKey::new(topic, group_id))
+        .map(|planner| ConsumerGroupPlannerLease {
+          member_id: planner.member_id.clone(),
+          lease_expiration_ts_ms: planner.lease_expiration_ts_ms,
+        }),
+    )
+  }
+
+  async fn acquire_or_renew_planner(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    now_ts_ms: i64,
+    ttl_ms: i64,
+  ) -> Result<ConsumerGroupPlannerLeaseOutcome> {
+    let expires_at = expires_at(now_ts_ms, ttl_ms)?;
+    let group_key = GroupKey::new(topic, group_id);
+    let mut state = self.state.write().await;
+
+    match state.planners.get(&group_key) {
+      Some(planner)
+        if planner.lease_expiration_ts_ms > now_ts_ms && planner.member_id != member_id =>
+      {
+        Ok(ConsumerGroupPlannerLeaseOutcome::HeldByOther)
+      },
+      _ => {
+        state.planners.insert(
+          group_key,
+          PlannerState {
+            member_id: member_id.to_string(),
+            lease_expiration_ts_ms: expires_at,
+          },
+        );
+        Ok(ConsumerGroupPlannerLeaseOutcome::Acquired)
+      },
+    }
+  }
+
+  async fn release_planner(&self, topic: &str, group_id: &str, member_id: &str) -> Result<bool> {
+    let group_key = GroupKey::new(topic, group_id);
+    let mut state = self.state.write().await;
+    if state
+      .planners
+      .get(&group_key)
+      .is_none_or(|planner| planner.member_id != member_id)
+    {
+      return Ok(false);
+    }
+
+    state.planners.remove(&group_key);
+    Ok(true)
+  }
+
+  async fn publish_assignment_plan(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    now_ts_ms: i64,
+    plan: ConsumerGroupAssignmentPlan,
+  ) -> Result<bool> {
+    let group_key = GroupKey::new(topic, group_id);
+    let mut state = self.state.write().await;
+    let Some(planner) = state.planners.get(&group_key) else {
+      return Ok(false);
+    };
+
+    if planner.member_id != member_id || planner.lease_expiration_ts_ms <= now_ts_ms {
+      return Ok(false);
+    }
+
+    state.plans.insert(group_key, plan);
+    Ok(true)
+  }
+}
+
+//
+// MembershipState
+//
+
+#[derive(Default)]
+struct MembershipState {
+  members: HashMap<MemberKey, MemberState>,
+  planners: HashMap<GroupKey, PlannerState>,
+  plans: HashMap<GroupKey, ConsumerGroupAssignmentPlan>,
+}
+
+//
+// GroupKey
+//
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+struct GroupKey {
+  topic: String,
+  group_id: String,
+}
+
+impl GroupKey {
+  fn new(topic: &str, group_id: &str) -> Self {
+    Self {
+      topic: topic.to_string(),
+      group_id: group_id.to_string(),
+    }
   }
 }
 
@@ -124,6 +262,16 @@ impl MemberKey {
 
 #[derive(Clone, Copy, Debug)]
 struct MemberState {
+  lease_expiration_ts_ms: i64,
+}
+
+//
+// PlannerState
+//
+
+#[derive(Clone, Debug)]
+struct PlannerState {
+  member_id: String,
   lease_expiration_ts_ms: i64,
 }
 

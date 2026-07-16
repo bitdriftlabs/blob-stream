@@ -1,4 +1,8 @@
-use crate::{ConsumerGroupMembershipStore, DynamoConsumerGroupMembershipStore};
+use crate::{
+  ConsumerGroupMembershipStore,
+  ConsumerGroupPlannerLeaseOutcome,
+  DynamoConsumerGroupMembershipStore,
+};
 use anyhow::{Context, Result, anyhow};
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client;
@@ -17,6 +21,7 @@ use uuid::Uuid;
 const LOCAL_ENDPOINT: &str = "http://localhost:8000";
 const REGION: &str = "us-east-1";
 const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
+const RECORD_TYPE_ATTRIBUTE_NAME: &str = "record_type";
 
 async fn dynamo_client() -> Result<Client> {
   unsafe {
@@ -186,12 +191,59 @@ async fn writes_ttl_attribute_for_membership_rows() -> Result<()> {
     .parse::<i64>()?;
 
   assert_eq!(ttl, 122);
+  assert_eq!(
+    item
+      .get(RECORD_TYPE_ATTRIBUTE_NAME)
+      .and_then(|value| value.as_s().ok().map(String::as_str)),
+    Some("member")
+  );
   for attribute in ["topic", "group_id", "member_id"] {
     assert!(
       !item.contains_key(attribute),
       "membership item unexpectedly contains {attribute}"
     );
   }
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn planner_release_allows_immediate_takeover_and_fences_stale_owner() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
+  create_membership_table(&client, &table_name).await?;
+
+  let store = DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone());
+  assert_eq!(
+    store
+      .acquire_or_renew_planner("topic-a", "group-a", "member-a", 1_000, 1_000)
+      .await?,
+    ConsumerGroupPlannerLeaseOutcome::Acquired
+  );
+  assert!(
+    store
+      .release_planner("topic-a", "group-a", "member-a")
+      .await?
+  );
+  assert_eq!(
+    store
+      .acquire_or_renew_planner("topic-a", "group-a", "member-b", 1_001, 1_000)
+      .await?,
+    ConsumerGroupPlannerLeaseOutcome::Acquired
+  );
+  assert!(
+    !store
+      .release_planner("topic-a", "group-a", "member-a")
+      .await?
+  );
+  assert_eq!(
+    store
+      .get_planner_lease("topic-a", "group-a")
+      .await?
+      .map(|lease| lease.member_id),
+    Some("member-b".to_string())
+  );
 
   client.delete_table().table_name(table_name).send().await?;
   Ok(())

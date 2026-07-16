@@ -220,11 +220,32 @@ The production metadata configuration names four DynamoDB tables:
 | `blob_segments` | topic-window and snowflake ID | Segment index used by consumers. |
 | `producer_partition_leases` | topic and virtual partition | Broker write fencing and Hi-Lo sequence reservation. |
 | `consumer_group_leases` | topic-group and virtual partition | Consumer ownership, generation fencing, and committed cursor. |
-| `consumer_group_membership` | topic-group and member ID | Consumer member liveness used for dynamic rebalancing. |
+| `consumer_group_membership` | topic-group and member ID | Consumer member liveness plus shared assignment-plan/planner records. |
 
 Lease and membership rows receive TTL values based on their expiration plus the configured lease
 TTL buffer. DynamoDB TTL cleanup is asynchronous, so expiry checks in the store also use the
 stored lease timestamp.
+
+### Consumer Assignment Plan
+
+Consumers use one shared, versioned assignment plan per topic-group instead of independently
+retaining local sticky maps. The plan is stored in the existing `consumer_group_membership` table
+under reserved sort key `__blob_stream_assignment_plan_v1__`; the separate
+`__blob_stream_assignment_planner_v1__` row carries the expiring planner lease. This retains the
+four-table deployment model.
+
+On a membership or partition-inventory change, the current planner derives a complete sticky map
+from the previous persisted plan and conditionally publishes it while it owns the planner lease.
+Every plan must cover each configured virtual partition exactly once and name only a plan member.
+Consumers use the plan version as their existing per-partition lease generation. Partition leases
+continue to fence actual ownership and preserve committed cursors; they do not determine desired
+coverage.
+
+If a consumer observes a stale local membership view while the elected planner remains live, it
+continues using the last structurally valid shared plan rather than creating an incompatible local
+map. Once the planner lease expires, any live member can acquire it and publish a successor plan.
+On graceful shutdown, a member deregisters before conditionally releasing its own planner lease,
+allowing a remaining member to elect immediately without discarding the sticky assignment plan.
 
 ## Read Path
 

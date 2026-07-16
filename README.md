@@ -194,7 +194,7 @@ Representative attributes:
 ### 4) `consumer_group_membership`
 
 Purpose:
-- Consumer member liveness used to compute dynamic rebalance membership.
+- Consumer member liveness and the authoritative dynamic consumer-group assignment plan.
 
 Keys:
 - Partition key: `pk` = `"<topic>#<group_id>"`
@@ -202,6 +202,17 @@ Keys:
 
 Representative attributes:
 - `member_id`, `lease_expiry_ts`, `last_heartbeat_ts`, `topic`, `group_id`, `ttl_epoch_seconds`
+
+The same `pk` also stores two reserved system rows; no additional DynamoDB table is required for
+consumer coordination:
+- `sk = "__blob_stream_assignment_plan_v1__"`: a complete, versioned virtual-partition to member
+  assignment map and the member set used to calculate it.
+- `sk = "__blob_stream_assignment_planner_v1__"`: the short-lived planner lease that authorizes
+  plan publication.
+
+Member IDs beginning with `__blob_stream_` are reserved. Member rows carry `record_type = member`
+so active-member reads exclude coordination system rows; legacy untyped member rows remain
+compatible.
 
 ### Provisioning note
 

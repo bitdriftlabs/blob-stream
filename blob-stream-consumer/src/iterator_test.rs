@@ -22,9 +22,12 @@ use bd_server_stats::stats::Collector;
 use blob_stream_blob_store::{BlobKey, BlobStore, InMemoryBlobStore};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
+  ConsumerGroupAssignmentPlan,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
   ConsumerGroupMembershipStore,
+  ConsumerGroupPlannerLease,
+  ConsumerGroupPlannerLeaseOutcome,
   InMemoryConsumerGroupLeaseStore,
   InMemoryConsumerGroupMembershipStore,
   InMemoryMetadataStore,
@@ -43,6 +46,7 @@ use blob_stream_types::{
   TopicWindowKey,
   VirtualPartitionId,
   new_record,
+  now_unix_millis,
 };
 use bytes::Bytes;
 use protobuf::Message;
@@ -165,6 +169,59 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     self
       .inner
       .list_active_members(topic, group_id, now_ts_ms)
+      .await
+  }
+
+  async fn get_assignment_plan(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> anyhow::Result<Option<ConsumerGroupAssignmentPlan>> {
+    self.inner.get_assignment_plan(topic, group_id).await
+  }
+
+  async fn get_planner_lease(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> anyhow::Result<Option<ConsumerGroupPlannerLease>> {
+    self.inner.get_planner_lease(topic, group_id).await
+  }
+
+  async fn acquire_or_renew_planner(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    now_ts_ms: i64,
+    ttl_ms: i64,
+  ) -> anyhow::Result<ConsumerGroupPlannerLeaseOutcome> {
+    self
+      .inner
+      .acquire_or_renew_planner(topic, group_id, member_id, now_ts_ms, ttl_ms)
+      .await
+  }
+
+  async fn release_planner(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+  ) -> anyhow::Result<bool> {
+    self.inner.release_planner(topic, group_id, member_id).await
+  }
+
+  async fn publish_assignment_plan(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    now_ts_ms: i64,
+    plan: ConsumerGroupAssignmentPlan,
+  ) -> anyhow::Result<bool> {
+    self
+      .inner
+      .publish_assignment_plan(topic, group_id, member_id, now_ts_ms, plan)
       .await
   }
 }
@@ -381,7 +438,7 @@ async fn diagnostics_report_assignment_and_start_state() {
     .diagnostics()
     .expect("consumer implementation provides diagnostics");
   let snapshot = diagnostics.state_snapshot().await;
-  assert_eq!(snapshot.schema_version, 6);
+  assert_eq!(snapshot.schema_version, 7);
   assert!(snapshot.generated_at.ends_with('Z'));
   assert_eq!(snapshot.topic, "telemetry");
   assert_eq!(snapshot.group_id, "group-a");
@@ -389,6 +446,13 @@ async fn diagnostics_report_assignment_and_start_state() {
   assert!(!snapshot.started);
   assert_eq!(snapshot.owned_partitions, vec![0, 1]);
   assert_eq!(snapshot.active_assignment, vec![0, 1]);
+  assert_eq!(
+    snapshot
+      .assignment_plan
+      .as_ref()
+      .map(|plan| (plan.version, plan.assignments.len())),
+    Some((1, 2))
+  );
   assert_eq!(snapshot.prefetch_buffered_batch_count, 0);
 
   iterator.start().unwrap();
@@ -596,8 +660,8 @@ async fn shutdown_releases_owned_partitions() {
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let concrete_lease_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
   let lease_store: Arc<dyn ConsumerGroupLeaseStore> = concrete_lease_store.clone();
-  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
-    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let concrete_membership_store = Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> = concrete_membership_store.clone();
 
   let runtime = runtime_config();
   let source: Arc<dyn ConsumerCoordinationSource> =
@@ -620,7 +684,36 @@ async fn shutdown_releases_owned_partitions() {
   .unwrap();
 
   iterator.start().unwrap();
+  assert_eq!(
+    concrete_membership_store
+      .get_planner_lease("telemetry", "group-a")
+      .await
+      .unwrap()
+      .map(|lease| lease.member_id),
+    Some("member-a".to_string())
+  );
   Box::new(iterator).shutdown().await.unwrap();
+
+  assert!(
+    concrete_membership_store
+      .get_planner_lease("telemetry", "group-a")
+      .await
+      .unwrap()
+      .is_none()
+  );
+  assert_eq!(
+    concrete_membership_store
+      .acquire_or_renew_planner(
+        "telemetry",
+        "group-a",
+        "member-b",
+        now_unix_millis(),
+        30_000
+      )
+      .await
+      .unwrap(),
+    ConsumerGroupPlannerLeaseOutcome::Acquired
+  );
 
   let now_ts_ms = i64::try_from(
     SystemTime::now()

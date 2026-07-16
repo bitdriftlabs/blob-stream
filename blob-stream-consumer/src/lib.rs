@@ -101,12 +101,14 @@ pub use coordination::{
   cooperative_sticky_assignment,
 };
 pub use iterator::{
+  ConsumerAssignmentPlanSnapshot,
   ConsumerCoordinationSource,
   ConsumerDeliveryState,
   ConsumerDiagnostics,
   ConsumerIterator,
   ConsumerIteratorImpl,
   ConsumerOffsetSnapshot,
+  ConsumerPartitionAssignmentSnapshot,
   ConsumerRecord,
   ConsumerStateSnapshot,
   CoordinationSnapshot,

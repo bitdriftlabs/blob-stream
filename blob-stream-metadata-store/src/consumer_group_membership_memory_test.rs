@@ -1,4 +1,10 @@
-use crate::{ConsumerGroupMembershipStore, InMemoryConsumerGroupMembershipStore};
+use crate::{
+  ConsumerGroupAssignment,
+  ConsumerGroupAssignmentPlan,
+  ConsumerGroupMembershipStore,
+  ConsumerGroupPlannerLeaseOutcome,
+  InMemoryConsumerGroupMembershipStore,
+};
 
 #[tokio::test]
 async fn register_heartbeat_list_and_deregister() {
@@ -60,5 +66,125 @@ async fn register_rejects_invalid_ttl() {
     err
       .to_string()
       .contains("membership ttl must be greater than zero")
+  );
+}
+
+#[tokio::test]
+async fn planner_lease_fences_plan_publication() {
+  let store = InMemoryConsumerGroupMembershipStore::new();
+  let acquired = store
+    .acquire_or_renew_planner("topic-a", "group-a", "member-a", 1_000, 100)
+    .await
+    .expect("acquire planner");
+  assert_eq!(acquired, ConsumerGroupPlannerLeaseOutcome::Acquired);
+
+  let held = store
+    .acquire_or_renew_planner("topic-a", "group-a", "member-b", 1_050, 100)
+    .await
+    .expect("planner held by member-a");
+  assert_eq!(held, ConsumerGroupPlannerLeaseOutcome::HeldByOther);
+
+  let plan = ConsumerGroupAssignmentPlan {
+    version: 1,
+    planner_member_id: "member-a".to_string(),
+    members: vec!["member-a".to_string(), "member-b".to_string()],
+    assignments: vec![
+      ConsumerGroupAssignment {
+        virtual_partition_id: 0,
+        member_id: "member-a".to_string(),
+      },
+      ConsumerGroupAssignment {
+        virtual_partition_id: 1,
+        member_id: "member-b".to_string(),
+      },
+    ],
+    published_ts_ms: 1_000,
+  };
+  assert!(
+    store
+      .publish_assignment_plan("topic-a", "group-a", "member-a", 1_001, plan.clone())
+      .await
+      .expect("publish plan")
+  );
+  assert!(
+    !store
+      .publish_assignment_plan("topic-a", "group-a", "member-b", 1_001, plan.clone())
+      .await
+      .expect("reject non-planner publication")
+  );
+  assert_eq!(
+    store
+      .get_assignment_plan("topic-a", "group-a")
+      .await
+      .expect("read plan"),
+    Some(plan)
+  );
+
+  let replacement = store
+    .acquire_or_renew_planner("topic-a", "group-a", "member-b", 1_100, 100)
+    .await
+    .expect("acquire expired planner");
+  assert_eq!(replacement, ConsumerGroupPlannerLeaseOutcome::Acquired);
+}
+
+#[tokio::test]
+async fn planner_release_allows_immediate_takeover_and_preserves_successor() {
+  let store = InMemoryConsumerGroupMembershipStore::new();
+  let plan = ConsumerGroupAssignmentPlan {
+    version: 1,
+    planner_member_id: "member-a".to_string(),
+    members: vec!["member-a".to_string()],
+    assignments: vec![ConsumerGroupAssignment {
+      virtual_partition_id: 0,
+      member_id: "member-a".to_string(),
+    }],
+    published_ts_ms: 1_000,
+  };
+  assert_eq!(
+    store
+      .acquire_or_renew_planner("topic-a", "group-a", "member-a", 1_000, 1_000)
+      .await
+      .expect("acquire member-a planner"),
+    ConsumerGroupPlannerLeaseOutcome::Acquired
+  );
+  assert!(
+    store
+      .publish_assignment_plan("topic-a", "group-a", "member-a", 1_000, plan.clone())
+      .await
+      .expect("publish member-a plan")
+  );
+  assert!(
+    store
+      .release_planner("topic-a", "group-a", "member-a")
+      .await
+      .expect("release member-a planner")
+  );
+  assert_eq!(
+    store
+      .get_assignment_plan("topic-a", "group-a")
+      .await
+      .expect("read retained plan"),
+    Some(plan)
+  );
+  assert_eq!(
+    store
+      .acquire_or_renew_planner("topic-a", "group-a", "member-b", 1_001, 1_000)
+      .await
+      .expect("acquire member-b planner"),
+    ConsumerGroupPlannerLeaseOutcome::Acquired
+  );
+  assert!(
+    !store
+      .release_planner("topic-a", "group-a", "member-a")
+      .await
+      .expect("reject stale planner release")
+  );
+  assert_eq!(
+    store
+      .get_planner_lease("topic-a", "group-a")
+      .await
+      .expect("read member-b planner")
+      .map(|lease| lease.member_id),
+    Some("member-b".to_string())
   );
 }
