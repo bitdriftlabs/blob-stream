@@ -66,6 +66,14 @@ fn respects_explicit_sequence_reservation_size() {
 }
 
 #[test]
+fn derives_produce_request_timeout_from_flush_delay() {
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_delay_ms = 250;
+
+  assert_eq!(config.produce_request_timeout().as_millis(), 2_500);
+}
+
+#[test]
 fn rejects_zero_sequence_reservation_size() {
   let mut broker_config = BrokerConfig::new();
   broker_config.writer_id = Some(0);

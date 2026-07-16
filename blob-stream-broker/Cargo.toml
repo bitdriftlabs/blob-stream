@@ -33,6 +33,7 @@ futures.workspace                 = true
 hostname.workspace                = true
 http.workspace                    = true
 log.workspace                     = true
+parking_lot.workspace             = true
 prometheus.workspace              = true
 protobuf.workspace                = true
 protobuf-json-mapping.workspace   = true

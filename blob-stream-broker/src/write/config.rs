@@ -31,6 +31,7 @@ use log::{debug, trace};
 use protobuf::EnumOrUnknown;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 
 const DEFAULT_FLUSH_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -42,6 +43,7 @@ const DEFAULT_SEGMENT_TTL_BUFFER_SECONDS: u32 = 3_600;
 const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
 const DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS: u64 = 30_000;
+const PRODUCE_REQUEST_TIMEOUT_FLUSH_DELAY_MULTIPLIER: u64 = 10;
 
 #[cfg(test)]
 #[path = "./config_test.rs"]
@@ -116,6 +118,14 @@ impl WriteConfig {
     }
 
     Ok(config)
+  }
+
+  #[must_use]
+  pub fn produce_request_timeout(&self) -> Duration {
+    let flush_delay_ms = self.flush_max_delay_ms.max(1).unsigned_abs();
+    Duration::from_millis(
+      flush_delay_ms.saturating_mul(PRODUCE_REQUEST_TIMEOUT_FLUSH_DELAY_MULTIPLIER),
+    )
   }
 }
 

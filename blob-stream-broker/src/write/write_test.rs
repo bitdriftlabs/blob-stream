@@ -269,19 +269,15 @@ async fn receive_blob_write(receiver: &mut mpsc::UnboundedReceiver<String>) -> S
 
 async fn wait_for_partition_draining_start(engine: &WriteEngineImpl) {
   for _ in 0 .. 100 {
-    let partition_state = {
-      let state = engine.state.lock().await;
-      Arc::clone(
-        state
-          .topics
-          .get("telemetry")
-          .expect("telemetry topic state")
-          .partitions
-          .get(&0)
-          .expect("partition state"),
-      )
+    let draining = {
+      let state = engine.state.lock();
+      state
+        .topics
+        .get("telemetry")
+        .and_then(|topic_state| topic_state.partitions.get(&0))
+        .is_some_and(|partition_state| partition_state.draining)
     };
-    if partition_state.lock().await.draining {
+    if draining {
       return;
     }
     tokio::time::sleep(StdDuration::from_millis(1)).await;
@@ -313,7 +309,7 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   tokio::task::yield_now().await;
 
   let snapshot = engine.state_snapshot().await;
-  assert_eq!(snapshot.schema_version, 3);
+  assert_eq!(snapshot.schema_version, 4);
   assert_eq!(snapshot.generated_at, "2023-11-14T22:13:20Z");
   assert_eq!(snapshot.holder_id, "test-node");
   assert_eq!(snapshot.writer_id, 0);
@@ -567,6 +563,80 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
   let second = second.await??;
   assert_eq!(first.seq_range, SeqRange { start: 0, end: 0 });
   assert_eq!(second.seq_range, SeqRange { start: 1, end: 1 });
+  Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  config.reservation_size = 1;
+
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let lease_store = Arc::new(GatedReservationLeaseStore {
+    inner: InMemoryProducerPartitionLeaseStore::new(),
+    entered_tx,
+    release_first: Arc::new(Semaphore::new(0)),
+    first_reservation: AtomicBool::new(true),
+  });
+  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+    config,
+    HashMap::from([(
+      "telemetry".to_string(),
+      TopicInfo {
+        name: "telemetry".to_string(),
+        partition_count: 1,
+        num_writers: 1,
+        retention_days: 7,
+        max_metadata_publication_lag_ms: 30_000,
+      },
+    )]),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    lease_store,
+    "test-node".to_string(),
+    None,
+    time_provider,
+    &metrics_scope(),
+  )?);
+
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  entered_rx.recv().await.expect("first reservation entered");
+
+  let snapshot = tokio::time::timeout(StdDuration::from_millis(20), engine.state_snapshot())
+    .await
+    .expect("state snapshot blocked behind reservation I/O");
+  let partition = &snapshot.topics[0].local_partitions[0];
+  assert!(partition.allocation_in_flight);
+  assert_eq!(
+    partition.allocation_started_at.as_deref(),
+    Some("2023-11-14T22:13:20Z")
+  );
+
+  first.abort();
+  assert!(first.await.is_err(), "reservation task should be cancelled");
+
+  let response = tokio::time::timeout(
+    StdDuration::from_millis(100),
+    engine.produce_batch(WriteRequest {
+      topic: "telemetry".to_string(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![2], 20)],
+    }),
+  )
+  .await
+  .expect("allocation transition remained stuck after cancellation")?;
+  assert_eq!(response.seq_range, SeqRange { start: 0, end: 0 });
   Ok(())
 }
 
