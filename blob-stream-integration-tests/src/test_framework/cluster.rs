@@ -65,6 +65,7 @@ impl BrokerHandle {
 
 pub struct ClusterHarness {
   brokers: Vec<BrokerHandle>,
+  machine_ids: HashMap<String, u16>,
   event_log: TestEventLog,
   producer_discovery: DynamicBrokerDiscovery,
   broker_membership_tx: watch::Sender<BrokerMembership>,
@@ -73,6 +74,7 @@ pub struct ClusterHarness {
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
   partition_count: u32,
   topic_num_writers: u32,
+  broker_flush_max_delay: Duration,
   transport: Arc<dyn BrokerTransport>,
 }
 
@@ -87,6 +89,8 @@ pub struct ClusterHarnessBuilder<'a> {
   metadata_store: Option<Arc<dyn MetadataStore>>,
   partition_count: u32,
   topic_num_writers: u32,
+  broker_flush_max_delay: Duration,
+  start_with_all_nodes: bool,
   transport: Arc<dyn BrokerTransport>,
 }
 
@@ -111,6 +115,16 @@ impl ClusterHarnessBuilder<'_> {
     self
   }
 
+  pub fn broker_flush_max_delay(mut self, broker_flush_max_delay: Duration) -> Self {
+    self.broker_flush_max_delay = broker_flush_max_delay;
+    self
+  }
+
+  pub fn start_with_all_nodes(mut self) -> Self {
+    self.start_with_all_nodes = true;
+    self
+  }
+
   pub fn in_memory_transport(mut self) -> Self {
     self.transport = Arc::new(InMemoryTestTransport::new());
     self
@@ -132,6 +146,8 @@ impl ClusterHarnessBuilder<'_> {
       metadata_store,
       self.partition_count,
       self.topic_num_writers,
+      self.broker_flush_max_delay,
+      self.start_with_all_nodes,
       self.transport,
     )
     .await
@@ -150,6 +166,8 @@ impl ClusterHarness {
       metadata_store: None,
       partition_count: PARTITION_COUNT,
       topic_num_writers: 1,
+      broker_flush_max_delay: Duration::from_millis(10),
+      start_with_all_nodes: false,
       transport: Arc::new(GrpcTcpTransport),
     }
   }
@@ -161,6 +179,8 @@ impl ClusterHarness {
     metadata_store: Arc<dyn MetadataStore>,
     partition_count: u32,
     topic_num_writers: u32,
+    broker_flush_max_delay: Duration,
+    start_with_all_nodes: bool,
     transport: Arc<dyn BrokerTransport>,
   ) -> Result<Self> {
     if partition_count == 0 {
@@ -168,6 +188,9 @@ impl ClusterHarness {
     }
     if topic_num_writers == 0 {
       return Err(anyhow!("topic_num_writers must be greater than zero"));
+    }
+    if broker_flush_max_delay.is_zero() {
+      return Err(anyhow!("broker_flush_max_delay must be greater than zero"));
     }
 
     let event_log = TestEventLog::default();
@@ -187,13 +210,26 @@ impl ClusterHarness {
       .iter()
       .map(|endpoint| endpoint.node.clone())
       .collect();
+    let machine_ids = nodes
+      .iter()
+      .enumerate()
+      .map(|(index, node)| {
+        let machine_id = u16::try_from(index)
+          .map_err(|_| anyhow!("broker count exceeds Sonyflake machine ID capacity"))?;
+        Ok((node.node_id.clone(), machine_id))
+      })
+      .collect::<Result<HashMap<_, _>>>()?;
 
-    let initial_nodes = vec![
+    let initial_nodes = if start_with_all_nodes {
       nodes
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow!("broker list cannot be empty"))?,
-    ];
+    } else {
+      vec![
+        nodes
+          .first()
+          .cloned()
+          .ok_or_else(|| anyhow!("broker list cannot be empty"))?,
+      ]
+    };
     let producer_discovery = DynamicBrokerDiscovery::new(initial_nodes.clone());
     let (broker_membership_tx, _broker_membership_rx) =
       watch::channel(BrokerMembership::new(initial_nodes));
@@ -202,6 +238,7 @@ impl ClusterHarness {
 
     let mut harness = Self {
       brokers: Vec::with_capacity(broker_count),
+      machine_ids,
       event_log,
       producer_discovery,
       broker_membership_tx,
@@ -210,6 +247,7 @@ impl ClusterHarness {
       lease_store,
       partition_count,
       topic_num_writers,
+      broker_flush_max_delay,
       transport,
     };
 
@@ -218,7 +256,9 @@ impl ClusterHarness {
       harness.brokers.push(broker);
     }
 
-    harness.wait_for_initial_lease_assignment().await?;
+    if !start_with_all_nodes {
+      harness.wait_for_initial_lease_assignment().await?;
+    }
     Ok(harness)
   }
 
@@ -324,14 +364,20 @@ impl ClusterHarness {
     topic_num_writers: u32,
   ) -> Result<BrokerHandle> {
     let node = endpoint.node;
+    let machine_id = *self
+      .machine_ids
+      .get(&node.node_id)
+      .ok_or_else(|| anyhow!("missing machine ID for broker {}", node.node_id))?;
     let write_engine = build_write_engine(
       node.node_id.clone(),
+      machine_id,
       self.broker_membership_tx.subscribe(),
       Arc::clone(&self.blob_store),
       Arc::clone(&self.metadata_store),
       Arc::clone(&self.lease_store),
       partition_count,
       topic_num_writers,
+      self.broker_flush_max_delay,
     )?;
 
     self
@@ -421,12 +467,14 @@ impl ClusterHarness {
 
 fn build_write_engine(
   holder_id: String,
+  machine_id: u16,
   membership_rx: watch::Receiver<BrokerMembership>,
   blob_store: Arc<dyn BlobStore>,
   metadata_store: Arc<dyn MetadataStore>,
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
   partition_count: u32,
   topic_num_writers: u32,
+  broker_flush_max_delay: Duration,
 ) -> Result<Arc<dyn WriteEngine>> {
   let mut topics = HashMap::new();
   for topic in [TOPIC, SECOND_TOPIC] {
@@ -444,17 +492,19 @@ fn build_write_engine(
 
   let mut config = WriteConfig::with_defaults();
   config.writer_id = 0;
-  config.flush_max_delay_ms = 10;
+  config.flush_max_delay_ms = i64::try_from(broker_flush_max_delay.as_millis())
+    .map_err(|_| anyhow!("broker_flush_max_delay exceeds milliseconds as i64"))?;
   config.flush_max_bytes = 1024;
   config.reservation_size = 64;
 
-  let engine = WriteEngineImpl::new(
+  let engine = WriteEngineImpl::new_with_snowflake_machine_id(
     config,
     topics,
     blob_store,
     metadata_store,
     lease_store,
     holder_id,
+    machine_id,
     Some(membership_rx),
     &Collector::default().scope("blob_stream_broker_it"),
   )?;

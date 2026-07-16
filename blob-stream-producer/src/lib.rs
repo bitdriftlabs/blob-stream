@@ -97,6 +97,9 @@ pub use producer::{
   ProducerError,
   ProducerPartitionBufferSnapshot,
   ProducerRecord,
+  ProducerRetryReason,
+  ProducerRetrySample,
+  ProducerRetrySummary,
   ProducerStateSnapshot,
   ProducerTopicSnapshot,
 };

@@ -39,6 +39,9 @@ For the implementation-backed architecture, correctness boundaries, and data-flo
 
 For build, test, local docs preview, and developer workflows, see `DEVELOPMENT.md`.
 
+For a local S3/DynamoDB-backed correctness stress run with configurable broker, producer, and
+consumer counts, see the **Local stress runner** section in `DEVELOPMENT.md`.
+
 ## Broker service setup
 
 The broker binary is in `blob-stream-broker` (crate name `blob-stream-broker`).

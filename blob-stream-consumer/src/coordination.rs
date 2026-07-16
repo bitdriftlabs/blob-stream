@@ -180,6 +180,13 @@ pub trait ConsumerGroupCoordinator: Send + Sync {
     cursors: &HashMap<VirtualPartitionId, CommittedCursor>,
   ) -> Result<HeartbeatReport>;
 
+  /// Release specific owned partitions after their consumer has completed revocation.
+  async fn release_partitions(
+    &mut self,
+    partitions: &[VirtualPartitionId],
+    now_ts_ms: i64,
+  ) -> Result<Vec<VirtualPartitionId>>;
+
   /// Release all owned partitions (best-effort), usually during shutdown.
   async fn release_owned(&mut self, now_ts_ms: i64) -> Result<Vec<VirtualPartitionId>>;
 
@@ -202,7 +209,7 @@ pub struct ConsumerGroupCoordinatorImpl {
   membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   planner_session_id: String,
   generation: u64,
-  owned: HashSet<VirtualPartitionId>,
+  owned: HashMap<VirtualPartitionId, u64>,
 }
 
 impl ConsumerGroupCoordinatorImpl {
@@ -221,7 +228,7 @@ impl ConsumerGroupCoordinatorImpl {
       membership_store,
       planner_session_id: Uuid::new_v4().to_string(),
       generation: 0,
-      owned: HashSet::new(),
+      owned: HashMap::new(),
     })
   }
 
@@ -466,21 +473,24 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       .map(plan_assignment_map)
       .unwrap_or_default();
 
-    // Keep previously owned partitions that are still locally desired, then reconcile each lease
-    // outcome below. This avoids rebuilding the local ownership set on stable rebalances.
+    // Retain revoking leases so their staged cursors can be committed before the consumer
+    // acknowledges revocation. Current assignments are reported separately below.
     let member_id = self.config.member_id.to_string();
     let desired_partitions = desired_assignment
       .values()
       .filter(|owner_id| *owner_id == &member_id)
       .count();
-    let mut assignment_changed = false;
-    self.owned.retain(|partition_id| {
-      let retain = desired_assignment
-        .get(partition_id)
-        .is_some_and(|owner_id| owner_id == &member_id);
-      assignment_changed |= !retain;
-      retain
-    });
+    let mut owned_partitions = self
+      .owned
+      .keys()
+      .filter(|partition_id| {
+        desired_assignment
+          .get(partition_id)
+          .is_some_and(|owner_id| owner_id == &member_id)
+      })
+      .copied()
+      .collect::<HashSet<_>>();
+    let mut assignment_changed = owned_partitions.len() != self.owned.len();
     let topic = self.config.topic.to_string();
     let group_id = self.config.group_id.to_string();
     let generation = self.generation;
@@ -524,7 +534,8 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       // Track only partitions that the lease store actually granted to this member.
       match outcome {
         ConsumerGroupAssignmentOutcome::Assigned(lease) => {
-          assignment_changed |= self.owned.insert(partition_id);
+          assignment_changed |= owned_partitions.insert(partition_id);
+          self.owned.insert(partition_id, lease.generation);
           if let Some(committed_cursor) = lease.committed_cursor {
             recovered_cursors.insert(
               partition_id,
@@ -536,7 +547,8 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
           }
         },
         ConsumerGroupAssignmentOutcome::HeldByOther(lease) => {
-          assignment_changed |= self.owned.remove(&partition_id);
+          assignment_changed |= owned_partitions.remove(&partition_id);
+          self.owned.remove(&partition_id);
           debug!(
             "consumer assignment held by another member: topic={}, group_id={}, partition={}, \
              member_id={}, generation={}, owner_id={}, owner_generation={}, lease_expires_at={}, \
@@ -560,7 +572,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     }
 
     // Stable ordering helps deterministic tests and predictable downstream behavior.
-    let mut owned = self.owned.iter().copied().collect::<Vec<_>>();
+    let mut owned = owned_partitions.into_iter().collect::<Vec<_>>();
     owned.sort_unstable();
     if assignment_changed {
       info!(
@@ -605,14 +617,17 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
 
     // Bound independent lease writes so a large assignment cannot overwhelm the lease store.
     // Reconcile every completed outcome before returning an error from another partition.
-    let owned = self.owned.iter().copied().collect::<Vec<_>>();
+    let owned = self
+      .owned
+      .iter()
+      .map(|(partition_id, generation)| (*partition_id, *generation))
+      .collect::<Vec<_>>();
     let owned_count = owned.len();
     let topic = self.config.topic.to_string();
     let group_id = self.config.group_id.to_string();
     let member_id = self.config.member_id.to_string();
-    let generation = self.generation;
     let lease_duration_ms = consumer_lease_duration_ms(&self.config);
-    let outcomes = stream::iter(owned.into_iter().map(|partition_id| {
+    let outcomes = stream::iter(owned.into_iter().map(|(partition_id, generation)| {
       let lease_store = Arc::clone(&self.lease_store);
       let key = ConsumerGroupLeaseKey {
         topic: topic.clone(),
@@ -720,29 +735,35 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     })
   }
 
-  async fn release_owned(&mut self, now_ts_ms: i64) -> Result<Vec<VirtualPartitionId>> {
-    let owned = self.owned.iter().copied().collect::<Vec<_>>();
+  async fn release_partitions(
+    &mut self,
+    partitions: &[VirtualPartitionId],
+    now_ts_ms: i64,
+  ) -> Result<Vec<VirtualPartitionId>> {
     let mut released = Vec::new();
 
-    for partition_id in owned {
+    for partition_id in partitions {
+      let Some(generation) = self.owned.get(partition_id).copied() else {
+        continue;
+      };
       let key = ConsumerGroupLeaseKey {
         topic: self.config.topic.to_string(),
         group_id: self.config.group_id.to_string(),
-        virtual_partition_id: partition_id,
+        virtual_partition_id: *partition_id,
       };
 
       let outcome = self
         .lease_store
-        .release_partition(&key, &self.config.member_id, self.generation, now_ts_ms)
+        .release_partition(&key, &self.config.member_id, generation, now_ts_ms)
         .await?;
 
       match outcome {
         ConsumerGroupReleaseOutcome::Released => {
-          self.owned.remove(&partition_id);
-          released.push(partition_id);
+          self.owned.remove(partition_id);
+          released.push(*partition_id);
         },
         ConsumerGroupReleaseOutcome::HeldByOther(_) | ConsumerGroupReleaseOutcome::Expired => {
-          self.owned.remove(&partition_id);
+          self.owned.remove(partition_id);
         },
       }
     }
@@ -751,12 +772,17 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     Ok(released)
   }
 
+  async fn release_owned(&mut self, now_ts_ms: i64) -> Result<Vec<VirtualPartitionId>> {
+    let owned = self.owned.keys().copied().collect::<Vec<_>>();
+    self.release_partitions(&owned, now_ts_ms).await
+  }
+
   fn generation(&self) -> u64 {
     self.generation
   }
 
   fn owned_partitions(&self) -> Vec<VirtualPartitionId> {
-    let mut owned = self.owned.iter().copied().collect::<Vec<_>>();
+    let mut owned = self.owned.keys().copied().collect::<Vec<_>>();
     owned.sort_unstable();
     owned
   }

@@ -20,11 +20,13 @@ pub const WINDOW_SIZE_SECONDS: i64 = 300;
 pub use cluster::ClusterHarness;
 pub use config::{
   consumer_bootstrap_config,
+  consumer_bootstrap_config_for,
   consumer_runtime_config,
   producer_config,
   producer_config_with_writer_id,
   producer_topic,
   producer_topic_named,
+  producer_topic_named_with_partition_count,
   producer_topic_named_with_writers,
 };
 pub use discovery::DynamicBrokerDiscovery;
