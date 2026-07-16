@@ -220,11 +220,41 @@ The production metadata configuration names four DynamoDB tables:
 | `blob_segments` | topic-window and snowflake ID | Segment index used by consumers. |
 | `producer_partition_leases` | topic and virtual partition | Broker write fencing and Hi-Lo sequence reservation. |
 | `consumer_group_leases` | topic-group and virtual partition | Consumer ownership, generation fencing, and committed cursor. |
-| `consumer_group_membership` | topic-group and member ID | Consumer member liveness used for dynamic rebalancing. |
+| `consumer_group_membership` | topic-group and member ID | Consumer member liveness plus shared assignment-plan/planner records. |
 
 Lease and membership rows receive TTL values based on their expiration plus the configured lease
 TTL buffer. DynamoDB TTL cleanup is asynchronous, so expiry checks in the store also use the
 stored lease timestamp.
+
+### Consumer Assignment Plan
+
+Consumers use one shared, versioned assignment plan per topic-group instead of independently
+retaining local sticky maps. The plan and planner lease are stored in the existing
+`consumer_group_membership` table under the separate reserved partition key
+`__blob_stream_assignment_control_v1__#<topic>#<group_id>`, with reserved sort keys
+`__blob_stream_assignment_plan_v1__` and `__blob_stream_assignment_planner_v1__`. Member rows
+remain under `<topic>#<group_id>`, so rolling deployments with legacy membership queries neither
+interpret the planner lease as a member nor read the full plan item. This retains the four-table
+deployment model.
+
+On a membership or partition-inventory change, the current planner derives a complete sticky map
+from the previous persisted plan and conditionally publishes it while it owns the planner lease.
+Every plan must cover each configured virtual partition exactly once and name only a plan member.
+Consumers use the plan version as their existing per-partition lease generation. Partition leases
+continue to fence actual ownership and preserve committed cursors; they do not determine desired
+coverage.
+
+If a consumer observes a stale local membership view while the elected planner remains live, it
+continues using the last structurally valid shared plan rather than creating an incompatible local
+map. The lease is fenced by a unique coordinator session, preventing a stale process that reused
+the same member ID from publishing or releasing a successor's lease. Once the planner lease
+expires, any live member can acquire it and publish a successor plan. On graceful shutdown, a
+member attempts deregistration before conditionally releasing its own planner lease, allowing a
+remaining member to elect immediately without discarding the sticky assignment plan.
+
+TODO: A single DynamoDB assignment-plan item is limited to 400 KB. If group plans can approach
+that limit, replace it with sharded or S3-backed plan storage; an S3-backed design will require
+the corresponding consumer IAM read permissions.
 
 ## Read Path
 

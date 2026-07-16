@@ -27,6 +27,7 @@ use bd_log::warn_every;
 use bd_server_stats::stats::Scope;
 use blob_stream_blob_store::BlobStore;
 use blob_stream_metadata_store::{
+  ConsumerGroupAssignmentPlan,
   ConsumerGroupLeaseStore,
   ConsumerGroupMembershipStore,
   MetadataStore,
@@ -411,6 +412,7 @@ pub struct ConsumerStateSnapshot {
   pub member_id: String,
   pub started: bool,
   pub coordinator_generation: u64,
+  pub assignment_plan: Option<ConsumerAssignmentPlanSnapshot>,
   pub owned_partitions: Vec<VirtualPartitionId>,
   pub active_assignment: Vec<VirtualPartitionId>,
   pub pending_assignment: Option<Vec<VirtualPartitionId>>,
@@ -428,6 +430,31 @@ pub struct ConsumerStateSnapshot {
   pub prefetch_buffered_partitions: Vec<VirtualPartitionId>,
   pub prefetch_max_bytes: u64,
   pub prefetch_worker_running: bool,
+}
+
+//
+// ConsumerAssignmentPlanSnapshot
+//
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// Shared desired group ownership plan observed by this iterator.
+pub struct ConsumerAssignmentPlanSnapshot {
+  pub version: u64,
+  pub planner_member_id: String,
+  pub members: Vec<String>,
+  pub assignments: Vec<ConsumerPartitionAssignmentSnapshot>,
+  pub published_at: String,
+}
+
+//
+// ConsumerPartitionAssignmentSnapshot
+//
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// Desired shared-plan owner for one virtual partition.
+pub struct ConsumerPartitionAssignmentSnapshot {
+  pub virtual_partition_id: VirtualPartitionId,
+  pub member_id: String,
 }
 
 //
@@ -479,6 +506,7 @@ struct ConsumerSharedState {
 #[derive(Clone)]
 pub struct ConsumerDiagnostics {
   group_config: ConsumerGroupConfig,
+  membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   reader: Arc<Mutex<ConsumerReaderImpl>>,
   shared_state: Arc<ParkingLotMutex<ConsumerSharedState>>,
   prefetch_max_bytes: u64,
@@ -548,14 +576,23 @@ impl ConsumerDiagnostics {
 
     let mut cursors = offsets_from_map(&self.reader.lock().await.cursors());
 
+    let assignment_plan = self
+      .membership_store
+      .get_assignment_plan(&self.group_config.topic, &self.group_config.group_id)
+      .await
+      .ok()
+      .flatten()
+      .map(assignment_plan_snapshot);
+
     ConsumerStateSnapshot {
-      schema_version: 6,
+      schema_version: 7,
       generated_at,
       topic: self.group_config.topic.to_string(),
       group_id: self.group_config.group_id.to_string(),
       member_id: self.group_config.member_id.to_string(),
       started: self.started.load(Ordering::Acquire),
       coordinator_generation,
+      assignment_plan,
       owned_partitions,
       active_assignment,
       pending_assignment,
@@ -580,6 +617,23 @@ impl ConsumerDiagnostics {
   #[cfg(feature = "admin")]
   pub fn admin_router(self) -> axum::Router {
     crate::admin::router(self)
+  }
+}
+
+fn assignment_plan_snapshot(plan: ConsumerGroupAssignmentPlan) -> ConsumerAssignmentPlanSnapshot {
+  ConsumerAssignmentPlanSnapshot {
+    version: plan.version,
+    planner_member_id: plan.planner_member_id,
+    members: plan.members,
+    assignments: plan
+      .assignments
+      .into_iter()
+      .map(|assignment| ConsumerPartitionAssignmentSnapshot {
+        virtual_partition_id: assignment.virtual_partition_id,
+        member_id: assignment.member_id,
+      })
+      .collect(),
+    published_at: format_unix_timestamp_ms(plan.published_ts_ms),
   }
 }
 
@@ -742,7 +796,11 @@ impl ConsumerIteratorImpl {
         maximum_metadata_publication_lag_ms,
       )?,
     ));
-    let coordinator = ConsumerGroupCoordinatorImpl::new(group_config.clone(), lease_store)?;
+    let coordinator = ConsumerGroupCoordinatorImpl::new(
+      group_config.clone(),
+      lease_store,
+      Arc::clone(&membership_store),
+    )?;
     let now_ts_ms = now_unix_millis();
     let delivery_notify = Arc::new(Notify::new());
     let prefetch_space_notify = Arc::new(Notify::new());
@@ -751,6 +809,7 @@ impl ConsumerIteratorImpl {
     let prefetch_shutdown = Arc::new(AtomicBool::new(false));
     let diagnostics = ConsumerDiagnostics {
       group_config: group_config.clone(),
+      membership_store: Arc::clone(&membership_store),
       reader: Arc::clone(&reader),
       shared_state: Arc::clone(&shared_state),
       prefetch_max_bytes,
@@ -1565,7 +1624,7 @@ impl ConsumerDriver {
       // Releasing leases proactively shortens rebalance convergence on graceful shutdown.
       let commit_result = self.commit().await;
       let release_result = self.coordinator.release_owned(now_unix_millis()).await;
-      let _ = self
+      let deregistration_result = self
         .membership_store
         .deregister_member(
           &self.group_config.topic,
@@ -1573,6 +1632,29 @@ impl ConsumerDriver {
           &self.group_config.member_id,
         )
         .await;
+      if let Err(error) = self
+        .membership_store
+        .release_planner(
+          &self.group_config.topic,
+          &self.group_config.group_id,
+          &self.group_config.member_id,
+          self.coordinator.planner_session_id(),
+        )
+        .await
+      {
+        debug!(
+          "consumer planner release failed during shutdown: topic={}, group_id={}, member_id={}, \
+           error={error}",
+          self.group_config.topic, self.group_config.group_id, self.group_config.member_id
+        );
+      }
+      if let Err(error) = deregistration_result {
+        debug!(
+          "consumer membership deregistration failed during shutdown: topic={}, group_id={}, \
+           member_id={}, error={error}",
+          self.group_config.topic, self.group_config.group_id, self.group_config.member_id
+        );
+      }
       self.stop_prefetch_task().await;
       self.started = false;
       self.diagnostics.started.store(false, Ordering::Release);

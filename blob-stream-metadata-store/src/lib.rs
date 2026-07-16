@@ -444,4 +444,109 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
     group_id: &str,
     now_ts_ms: i64,
   ) -> Result<Vec<String>>;
+
+  /// Return the last published complete assignment plan for this group.
+  async fn get_assignment_plan(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> Result<Option<ConsumerGroupAssignmentPlan>>;
+
+  /// Return the current planner lease without changing it.
+  async fn get_planner_lease(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> Result<Option<ConsumerGroupPlannerLease>>;
+
+  /// Conditionally acquire or renew the group planner lease.
+  async fn acquire_or_renew_planner(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    planner_session_id: &str,
+    now_ts_ms: i64,
+    ttl_ms: i64,
+  ) -> Result<ConsumerGroupPlannerLeaseOutcome>;
+
+  /// Release the planner lease when it is still held by this member.
+  async fn release_planner(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    planner_session_id: &str,
+  ) -> Result<bool>;
+
+  /// Publish a plan only while the caller still owns an unexpired planner lease.
+  async fn publish_assignment_plan(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    planner_session_id: &str,
+    now_ts_ms: i64,
+    plan: ConsumerGroupAssignmentPlan,
+  ) -> Result<bool>;
+}
+
+//
+// ConsumerGroupAssignment
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Desired owner of one consumer-group virtual partition.
+pub struct ConsumerGroupAssignment {
+  /// Virtual partition covered by this assignment.
+  pub virtual_partition_id: VirtualPartitionId,
+  /// Active member expected to claim the partition lease.
+  pub member_id: String,
+}
+
+//
+// ConsumerGroupAssignmentPlan
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Versioned, complete desired ownership map shared by all consumers in a group.
+pub struct ConsumerGroupAssignmentPlan {
+  /// Monotonically increasing plan generation used for consumer lease fencing.
+  pub version: u64,
+  /// Member that most recently published and renews the planner lease for this plan.
+  pub planner_member_id: String,
+  /// Canonically sorted active members used to construct this plan.
+  pub members: Vec<String>,
+  /// Canonically sorted partition ownership entries.
+  pub assignments: Vec<ConsumerGroupAssignment>,
+  /// Millisecond timestamp when the planner published this map.
+  pub published_ts_ms: i64,
+}
+
+//
+// ConsumerGroupPlannerLease
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Planner ownership lease for a consumer group assignment plan.
+pub struct ConsumerGroupPlannerLease {
+  /// Member currently responsible for refreshing or replacing the assignment plan.
+  pub member_id: String,
+  /// Unique coordinator session that owns this planner lease.
+  pub planner_session_id: String,
+  /// Millisecond timestamp after which another member may become planner.
+  pub lease_expiration_ts_ms: i64,
+}
+
+//
+// ConsumerGroupPlannerLeaseOutcome
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Result of conditionally acquiring the single planner lease for a consumer group.
+pub enum ConsumerGroupPlannerLeaseOutcome {
+  /// The caller owns the planner lease until its configured expiration.
+  Acquired,
+  /// A different active member currently owns the planner lease.
+  HeldByOther,
 }

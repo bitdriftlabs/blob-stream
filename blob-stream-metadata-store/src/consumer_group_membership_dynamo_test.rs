@@ -1,4 +1,10 @@
-use crate::{ConsumerGroupMembershipStore, DynamoConsumerGroupMembershipStore};
+use crate::{
+  ConsumerGroupAssignment,
+  ConsumerGroupAssignmentPlan,
+  ConsumerGroupMembershipStore,
+  ConsumerGroupPlannerLeaseOutcome,
+  DynamoConsumerGroupMembershipStore,
+};
 use anyhow::{Context, Result, anyhow};
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client;
@@ -17,6 +23,7 @@ use uuid::Uuid;
 const LOCAL_ENDPOINT: &str = "http://localhost:8000";
 const REGION: &str = "us-east-1";
 const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
+const RECORD_TYPE_ATTRIBUTE_NAME: &str = "record_type";
 
 async fn dynamo_client() -> Result<Client> {
   unsafe {
@@ -186,12 +193,190 @@ async fn writes_ttl_attribute_for_membership_rows() -> Result<()> {
     .parse::<i64>()?;
 
   assert_eq!(ttl, 122);
+  assert_eq!(
+    item
+      .get(RECORD_TYPE_ATTRIBUTE_NAME)
+      .and_then(|value| value.as_s().ok().map(String::as_str)),
+    Some("member")
+  );
   for attribute in ["topic", "group_id", "member_id"] {
     assert!(
       !item.contains_key(attribute),
       "membership item unexpectedly contains {attribute}"
     );
   }
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn planner_release_allows_immediate_takeover_and_fences_stale_owner() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
+  create_membership_table(&client, &table_name).await?;
+
+  let store = DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone());
+  assert_eq!(
+    store
+      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-a", 1_000, 1_000)
+      .await?,
+    ConsumerGroupPlannerLeaseOutcome::Acquired
+  );
+  assert!(
+    store
+      .release_planner("topic-a", "group-a", "member-a", "session-a")
+      .await?
+  );
+  assert_eq!(
+    store
+      .acquire_or_renew_planner("topic-a", "group-a", "member-b", "session-b", 1_001, 1_000)
+      .await?,
+    ConsumerGroupPlannerLeaseOutcome::Acquired
+  );
+  assert!(
+    !store
+      .release_planner("topic-a", "group-a", "member-a", "session-a")
+      .await?
+  );
+  assert_eq!(
+    store
+      .get_planner_lease("topic-a", "group-a")
+      .await?
+      .map(|lease| lease.member_id),
+    Some("member-b".to_string())
+  );
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn planner_records_do_not_appear_in_legacy_member_partition() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
+  create_membership_table(&client, &table_name).await?;
+
+  let store = DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone());
+  store
+    .register_member("topic-a", "group-a", "member-a", 1_000, 1_000)
+    .await?;
+  assert_eq!(
+    store
+      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-a", 1_000, 1_000)
+      .await?,
+    ConsumerGroupPlannerLeaseOutcome::Acquired
+  );
+  assert!(
+    store
+      .publish_assignment_plan(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-a",
+        1_000,
+        ConsumerGroupAssignmentPlan {
+          version: 1,
+          planner_member_id: "member-a".to_string(),
+          members: vec!["member-a".to_string()],
+          assignments: vec![ConsumerGroupAssignment {
+            virtual_partition_id: 0,
+            member_id: "member-a".to_string(),
+          }],
+          published_ts_ms: 1_000,
+        },
+      )
+      .await?
+  );
+
+  let legacy_members = client
+    .query()
+    .table_name(&table_name)
+    .key_condition_expression("pk = :pk")
+    .expression_attribute_values(":pk", AttributeValue::S("topic-a#group-a".to_string()))
+    .send()
+    .await?;
+  assert_eq!(legacy_members.count(), 1);
+  assert_eq!(
+    legacy_members
+      .items()
+      .first()
+      .and_then(|item| item.get("sk"))
+      .and_then(|value| value.as_s().ok().map(String::as_str)),
+    Some("member-a")
+  );
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn planner_session_fences_stale_process_and_mismatched_plan_publisher() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
+  create_membership_table(&client, &table_name).await?;
+
+  let store = DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone());
+  assert_eq!(
+    store
+      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-old", 1_000, 100)
+      .await?,
+    ConsumerGroupPlannerLeaseOutcome::Acquired
+  );
+  assert_eq!(
+    store
+      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-new", 1_100, 100)
+      .await?,
+    ConsumerGroupPlannerLeaseOutcome::Acquired
+  );
+
+  let plan = ConsumerGroupAssignmentPlan {
+    version: 1,
+    planner_member_id: "member-a".to_string(),
+    members: vec!["member-a".to_string()],
+    assignments: vec![ConsumerGroupAssignment {
+      virtual_partition_id: 0,
+      member_id: "member-a".to_string(),
+    }],
+    published_ts_ms: 1_100,
+  };
+  assert!(
+    !store
+      .publish_assignment_plan(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-old",
+        1_101,
+        plan.clone(),
+      )
+      .await?
+  );
+  assert!(
+    !store
+      .release_planner("topic-a", "group-a", "member-a", "session-old")
+      .await?
+  );
+
+  let mut mismatched_plan = plan.clone();
+  mismatched_plan.planner_member_id = "member-b".to_string();
+  assert!(
+    !store
+      .publish_assignment_plan(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-new",
+        1_101,
+        mismatched_plan,
+      )
+      .await?
+  );
+  assert!(
+    store
+      .publish_assignment_plan("topic-a", "group-a", "member-a", "session-new", 1_101, plan)
+      .await?
+  );
 
   client.delete_table().table_name(table_name).send().await?;
   Ok(())

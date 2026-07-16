@@ -4,11 +4,14 @@ use async_trait::async_trait;
 use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
+  ConsumerGroupAssignmentPlan,
   ConsumerGroupCommitOutcome,
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
   ConsumerGroupMembershipStore,
+  ConsumerGroupPlannerLease,
+  ConsumerGroupPlannerLeaseOutcome,
   ConsumerGroupReleaseOutcome,
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
@@ -57,6 +60,11 @@ pub enum StoreFaultOperation {
   ConsumerCommitCursor,
   ConsumerReleasePartition,
   ConsumerMembershipHeartbeat,
+  ConsumerGetAssignmentPlan,
+  ConsumerGetPlannerLease,
+  ConsumerAcquireOrRenewPlanner,
+  ConsumerReleasePlanner,
+  ConsumerPublishAssignmentPlan,
 }
 
 //
@@ -418,6 +426,11 @@ fn describe_store_operation(operation: StoreFaultOperation) -> &'static str {
     StoreFaultOperation::ConsumerCommitCursor => "consumer_commit_cursor",
     StoreFaultOperation::ConsumerReleasePartition => "consumer_release_partition",
     StoreFaultOperation::ConsumerMembershipHeartbeat => "consumer_membership_heartbeat",
+    StoreFaultOperation::ConsumerGetAssignmentPlan => "consumer_get_assignment_plan",
+    StoreFaultOperation::ConsumerGetPlannerLease => "consumer_get_planner_lease",
+    StoreFaultOperation::ConsumerAcquireOrRenewPlanner => "consumer_acquire_or_renew_planner",
+    StoreFaultOperation::ConsumerReleasePlanner => "consumer_release_planner",
+    StoreFaultOperation::ConsumerPublishAssignmentPlan => "consumer_publish_assignment_plan",
   }
 }
 
@@ -915,6 +928,42 @@ impl FaultInjectedConsumerGroupMembershipStore {
   ) -> Self {
     Self { inner, controller }
   }
+
+  async fn apply_faults(&self, operation: StoreFaultOperation, key: &str) -> Result<()> {
+    let effects = self
+      .controller
+      .effects_for_call(StoreFaultDomain::ConsumerLease, operation, key)
+      .await;
+    if let Some(delay) = effects.delay {
+      sleep(delay).await;
+    }
+    if let Some(timeout) = effects.timeout {
+      sleep(timeout).await;
+      return Err(anyhow!("{operation:?} timed out for key {key}"));
+    }
+    if let Some(message) = effects.fail_message {
+      return Err(anyhow!("{operation:?} fault for key {key}: {message}"));
+    }
+    Ok(())
+  }
+
+  async fn record_outcome<T>(
+    &self,
+    operation: StoreFaultOperation,
+    key: String,
+    result: Result<T>,
+  ) -> Result<T> {
+    self
+      .controller
+      .record_operation_outcome(
+        operation,
+        key,
+        if result.is_ok() { "ok" } else { "error" },
+        None,
+      )
+      .await;
+    result
+  }
 }
 
 #[async_trait]
@@ -1001,6 +1050,129 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
     self
       .inner
       .list_active_members(topic, group_id, now_ts_ms)
+      .await
+  }
+
+  async fn get_assignment_plan(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> Result<Option<ConsumerGroupAssignmentPlan>> {
+    let key = format!("{topic}#{group_id}");
+    self
+      .apply_faults(StoreFaultOperation::ConsumerGetAssignmentPlan, &key)
+      .await?;
+    self
+      .record_outcome(
+        StoreFaultOperation::ConsumerGetAssignmentPlan,
+        key,
+        self.inner.get_assignment_plan(topic, group_id).await,
+      )
+      .await
+  }
+
+  async fn get_planner_lease(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> Result<Option<ConsumerGroupPlannerLease>> {
+    let key = format!("{topic}#{group_id}");
+    self
+      .apply_faults(StoreFaultOperation::ConsumerGetPlannerLease, &key)
+      .await?;
+    self
+      .record_outcome(
+        StoreFaultOperation::ConsumerGetPlannerLease,
+        key,
+        self.inner.get_planner_lease(topic, group_id).await,
+      )
+      .await
+  }
+
+  async fn acquire_or_renew_planner(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    planner_session_id: &str,
+    now_ts_ms: i64,
+    ttl_ms: i64,
+  ) -> Result<ConsumerGroupPlannerLeaseOutcome> {
+    let key = format!("{topic}#{group_id}#{member_id}");
+    self
+      .apply_faults(StoreFaultOperation::ConsumerAcquireOrRenewPlanner, &key)
+      .await?;
+    self
+      .record_outcome(
+        StoreFaultOperation::ConsumerAcquireOrRenewPlanner,
+        key,
+        self
+          .inner
+          .acquire_or_renew_planner(
+            topic,
+            group_id,
+            member_id,
+            planner_session_id,
+            now_ts_ms,
+            ttl_ms,
+          )
+          .await,
+      )
+      .await
+  }
+
+  async fn release_planner(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    planner_session_id: &str,
+  ) -> Result<bool> {
+    let key = format!("{topic}#{group_id}#{member_id}");
+    self
+      .apply_faults(StoreFaultOperation::ConsumerReleasePlanner, &key)
+      .await?;
+    self
+      .record_outcome(
+        StoreFaultOperation::ConsumerReleasePlanner,
+        key,
+        self
+          .inner
+          .release_planner(topic, group_id, member_id, planner_session_id)
+          .await,
+      )
+      .await
+  }
+
+  async fn publish_assignment_plan(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    planner_session_id: &str,
+    now_ts_ms: i64,
+    plan: ConsumerGroupAssignmentPlan,
+  ) -> Result<bool> {
+    let key = format!("{topic}#{group_id}#{member_id}");
+    self
+      .apply_faults(StoreFaultOperation::ConsumerPublishAssignmentPlan, &key)
+      .await?;
+    self
+      .record_outcome(
+        StoreFaultOperation::ConsumerPublishAssignmentPlan,
+        key,
+        self
+          .inner
+          .publish_assignment_plan(
+            topic,
+            group_id,
+            member_id,
+            planner_session_id,
+            now_ts_ms,
+            plan,
+          )
+          .await,
+      )
       .await
   }
 }

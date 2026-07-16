@@ -21,6 +21,7 @@ const MAX_CANDIDATE_WINDOWS: usize = 32;
 const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: i64 = 10_000;
 const DEFAULT_REBALANCE_INTERVAL_MS: i64 = 10_000;
+const RESERVED_MEMBER_ID_PREFIX: &str = "__blob_stream_";
 
 //
 // ConsumerReadConfig
@@ -138,6 +139,10 @@ pub fn validate_group_config(config: &ConsumerGroupConfig) -> Result<()> {
     config.topic, config.group_id, config.member_id
   );
   proto_validate::validate(config)?;
+  ensure!(
+    !config.member_id.starts_with(RESERVED_MEMBER_ID_PREFIX),
+    "consumer group member_id uses reserved prefix {RESERVED_MEMBER_ID_PREFIX}"
+  );
   Ok(())
 }
 
