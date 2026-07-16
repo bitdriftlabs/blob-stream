@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
-use super::{ConsumerReadConfig, ConsumerReader, ConsumerReaderImpl};
+use super::{ConsumerReadConfig, ConsumerReader, ConsumerReaderImpl, PartitionReadState};
+use crate::config::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS;
 use anyhow::Result;
 use async_trait::async_trait;
 use bd_server_stats::stats::Collector;
@@ -9,6 +10,8 @@ use blob_stream_metadata_store::{InMemoryMetadataStore, MetadataStore, SegmentMe
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
   BatchMetadata,
+  CommittedCursor,
+  CommittedSourceCheckpoint,
   Compression,
   CompressionCodec,
   Record,
@@ -78,6 +81,33 @@ async fn write_segment(
   records: Vec<Record>,
   compression: Compression,
 ) {
+  write_segment_with_publication_time(
+    blob_store,
+    metadata_store,
+    topic,
+    window_start,
+    snowflake_id,
+    virtual_partition_id,
+    seq_range,
+    records,
+    compression,
+    window_start * 1_000,
+  )
+  .await;
+}
+
+async fn write_segment_with_publication_time(
+  blob_store: &dyn BlobStore,
+  metadata_store: &dyn MetadataStore,
+  topic: &str,
+  window_start: i64,
+  snowflake_id: u64,
+  virtual_partition_id: VirtualPartitionId,
+  seq_range: SeqRange,
+  records: Vec<Record>,
+  compression: Compression,
+  metadata_published_ts_ms: i64,
+) {
   let batch = RecordBatch::new(virtual_partition_id, records.clone());
   let encoded = StoredRecordBatch {
     virtual_partition_id,
@@ -127,15 +157,401 @@ async fn write_segment(
         compression,
       }],
     )]),
-    Compression::none(),
-    records.len() as u64,
-    records.first().map_or(0, |record| record.event_ts_ms),
-    records.last().map_or(0, |record| record.event_ts_ms),
-    None,
     window_start * 1_000,
+    metadata_published_ts_ms,
   );
 
   metadata_store.write_segment(metadata).await.unwrap();
+}
+
+#[tokio::test]
+async fn visibility_delay_defers_newly_published_metadata() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+
+  write_segment_with_publication_time(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    7,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![1], 902_000)],
+    Compression::none(),
+    902_000,
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      metadata_visibility_delay_ms: Some(1_000),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    Arc::clone(&blob_store),
+    Arc::clone(&metadata_store),
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  )
+  .unwrap();
+
+  assert!(reader.read_available(902).await.unwrap().is_empty());
+  let batches = reader.read_available(903).await.unwrap();
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].seq_range, SeqRange { start: 1, end: 1 });
+}
+
+#[tokio::test]
+async fn derived_horizon_retries_visibility_deferred_metadata_across_window_boundary() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+
+  write_segment_with_publication_time(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    7,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![1], 901_000)],
+    Compression::none(),
+    1_200_000,
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      metadata_visibility_delay_ms: Some(300_000),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    Arc::clone(&blob_store),
+    Arc::clone(&metadata_store),
+    &metrics_scope(),
+    1,
+    30_000,
+  )
+  .unwrap();
+
+  assert!(reader.read_available(1_200).await.unwrap().is_empty());
+  let batches = reader.read_available(1_500).await.unwrap();
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].seq_range, SeqRange { start: 1, end: 1 });
+}
+
+#[tokio::test]
+async fn retention_recovery_scans_from_checkpoint_before_fast_path() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
+
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store_dyn.as_ref(),
+    "telemetry",
+    15_000,
+    2,
+    7,
+    SeqRange { start: 5, end: 5 },
+    vec![new_record(vec![5], 15_001_000)],
+    Compression::none(),
+  )
+  .await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store_dyn.as_ref(),
+    "telemetry",
+    90_000,
+    3,
+    7,
+    SeqRange { start: 6, end: 6 },
+    vec![new_record(vec![6], 90_001_000)],
+    Compression::none(),
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    Arc::clone(&blob_store),
+    metadata_store_dyn,
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  )
+  .unwrap();
+  reader.hydrate_cursor_with_source(
+    7,
+    &CommittedCursor {
+      virtual_partition_id: 7,
+      seq_end: 4,
+      source_checkpoint: Some(CommittedSourceCheckpoint {
+        window_start_unix_seconds: 15_000,
+        snowflake_id: 1,
+      }),
+    },
+    Some(15_000_000),
+    90_000,
+  );
+  reader
+    .set_assigned_virtual_partitions(vec![7], 90_000)
+    .unwrap();
+
+  let batches = reader.read_available(90_000).await.unwrap();
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].seq_range, SeqRange { start: 5, end: 5 });
+  assert!(
+    !metadata_store
+      .scans
+      .lock()
+      .await
+      .iter()
+      .any(|(window_start, _)| *window_start == 90_000)
+  );
+
+  let PartitionReadState::Recovering(recovery_state) =
+    reader.partition_read_states.get(&7).unwrap()
+  else {
+    panic!("partition must remain in recovery before the cutover is scanned");
+  };
+  assert_eq!(recovery_state.cutover_window_start_unix_seconds, 90_000);
+  assert_eq!(recovery_state.next_window_start_unix_seconds, 24_600);
+}
+
+#[tokio::test]
+async fn retention_recovery_clamps_legacy_cursor_to_retention_floor() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    blob_store,
+    metadata_store_dyn,
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  )
+  .unwrap();
+  reader.hydrate_cursor_with_source(
+    7,
+    &CommittedCursor {
+      virtual_partition_id: 7,
+      seq_end: 4,
+      source_checkpoint: None,
+    },
+    Some(1_000),
+    90_000,
+  );
+  reader
+    .set_assigned_virtual_partitions(vec![7], 90_000)
+    .unwrap();
+
+  assert!(reader.read_available(90_000).await.unwrap().is_empty());
+  let scans = metadata_store.scans.lock().await;
+  assert_eq!(scans.first(), Some(&(3_600, None)));
+  assert_eq!(scans.len(), 32);
+}
+
+#[tokio::test]
+async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let window_size_seconds = 300;
+  let cutover_window_start = 24_000;
+
+  for (window_offset, snowflake_id, sequence) in [(31, 2, 1), (32, 3, 2), (64, 4, 3), (80, 5, 4)] {
+    let window_start = i64::from(window_offset) * window_size_seconds;
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      window_start,
+      snowflake_id,
+      7,
+      SeqRange {
+        start: sequence,
+        end: sequence,
+      },
+      vec![new_record(
+        vec![u8::try_from(sequence).unwrap()],
+        window_start * 1_000,
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(window_size_seconds),
+      metadata_visibility_delay_ms: Some(0),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    Arc::clone(&blob_store),
+    Arc::clone(&metadata_store),
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  )
+  .unwrap();
+  reader.hydrate_cursor_with_source(
+    7,
+    &CommittedCursor {
+      virtual_partition_id: 7,
+      seq_end: 0,
+      source_checkpoint: Some(CommittedSourceCheckpoint {
+        window_start_unix_seconds: 0,
+        snowflake_id: 1,
+      }),
+    },
+    Some(0),
+    cutover_window_start,
+  );
+  reader
+    .set_assigned_virtual_partitions(vec![7], cutover_window_start)
+    .unwrap();
+
+  let first_slice = reader.read_available(cutover_window_start).await.unwrap();
+  assert_eq!(first_slice.len(), 1);
+  assert_eq!(first_slice[0].seq_range.end, 1);
+  let second_slice = reader.read_available(cutover_window_start).await.unwrap();
+  assert_eq!(second_slice.len(), 1);
+  assert_eq!(second_slice[0].seq_range.end, 2);
+  let final_slice = reader.read_available(cutover_window_start).await.unwrap();
+  let recovered_sequences = first_slice
+    .into_iter()
+    .chain(second_slice)
+    .chain(final_slice)
+    .map(|batch| batch.seq_range.end)
+    .collect::<Vec<_>>();
+  assert_eq!(recovered_sequences, vec![1, 2, 3, 4]);
+  assert!(matches!(
+    reader.partition_read_states.get(&7),
+    Some(PartitionReadState::Fast)
+  ));
+}
+
+#[tokio::test]
+async fn recovery_waits_for_visibility_deferred_window_before_advancing() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let window_size_seconds = 300;
+  let cutover_window_start = 12_000;
+  let deferred_window_start = 9_600;
+
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    9_300,
+    2,
+    7,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![1], 9_300_000)],
+    Compression::none(),
+  )
+  .await;
+  write_segment_with_publication_time(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    deferred_window_start,
+    3,
+    7,
+    SeqRange { start: 2, end: 2 },
+    vec![new_record(vec![2], 9_600_000)],
+    Compression::none(),
+    cutover_window_start * 1_000,
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(window_size_seconds),
+      metadata_visibility_delay_ms: Some(1_000),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    Arc::clone(&blob_store),
+    Arc::clone(&metadata_store),
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  )
+  .unwrap();
+  reader.hydrate_cursor_with_source(
+    7,
+    &CommittedCursor {
+      virtual_partition_id: 7,
+      seq_end: 0,
+      source_checkpoint: Some(CommittedSourceCheckpoint {
+        window_start_unix_seconds: 0,
+        snowflake_id: 1,
+      }),
+    },
+    Some(0),
+    cutover_window_start,
+  );
+  reader
+    .set_assigned_virtual_partitions(vec![7], cutover_window_start)
+    .unwrap();
+
+  assert_eq!(
+    reader
+      .read_available(cutover_window_start)
+      .await
+      .unwrap()
+      .len(),
+    1
+  );
+  assert!(
+    reader
+      .read_available(cutover_window_start)
+      .await
+      .unwrap()
+      .is_empty()
+  );
+  let PartitionReadState::Recovering(recovery_state) =
+    reader.partition_read_states.get(&7).unwrap()
+  else {
+    panic!("visibility-deferred recovery window must remain pending");
+  };
+  assert_eq!(
+    recovery_state.next_window_start_unix_seconds,
+    deferred_window_start
+  );
+
+  let batches = reader
+    .read_available(cutover_window_start + 1)
+    .await
+    .unwrap();
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].seq_range, SeqRange { start: 2, end: 2 });
 }
 
 #[tokio::test]
@@ -156,11 +572,10 @@ async fn advances_cursor_and_dedupes_on_rescan() {
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
-      lookback_windows: Some(2),
       ..Default::default()
     },
     vec![7],
@@ -168,6 +583,8 @@ async fn advances_cursor_and_dedupes_on_rescan() {
     blob_store,
     metadata_store,
     &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )
   .unwrap();
 
@@ -182,7 +599,7 @@ async fn advances_cursor_and_dedupes_on_rescan() {
 }
 
 #[tokio::test]
-async fn catches_late_metadata_with_lookback_window() {
+async fn catches_late_metadata_with_derived_candidate_horizon() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
 
@@ -199,11 +616,10 @@ async fn catches_late_metadata_with_lookback_window() {
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
-      lookback_windows: Some(3),
       ..Default::default()
     },
     vec![11],
@@ -211,6 +627,8 @@ async fn catches_late_metadata_with_lookback_window() {
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
     &metrics_scope(),
+    1,
+    600_000,
   )
   .unwrap();
 
@@ -255,11 +673,10 @@ async fn decodes_zstd_compressed_batches() {
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
-      lookback_windows: Some(2),
       ..Default::default()
     },
     vec![3],
@@ -267,6 +684,8 @@ async fn decodes_zstd_compressed_batches() {
     blob_store,
     metadata_store,
     &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )
   .unwrap();
 
@@ -278,70 +697,7 @@ async fn decodes_zstd_compressed_batches() {
 }
 
 #[tokio::test]
-async fn recovery_scan_catches_late_lower_snowflake_metadata() {
-  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
-  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
-
-  write_segment(
-    blob_store.as_ref(),
-    metadata_store.as_ref(),
-    "telemetry",
-    900,
-    2,
-    7,
-    SeqRange { start: 1, end: 2 },
-    vec![new_record(vec![1], 901), new_record(vec![2], 902)],
-    Compression::none(),
-  )
-  .await;
-
-  let mut reader = ConsumerReaderImpl::new(
-    ConsumerReadConfig {
-      topic: "telemetry".to_string().into(),
-      window_size_seconds: Some(300),
-      lookback_windows: Some(2),
-      metadata_recovery_scan_interval_seconds: Some(60),
-      ..Default::default()
-    },
-    vec![7],
-    HashMap::new(),
-    Arc::clone(&blob_store),
-    Arc::clone(&metadata_store),
-    &metrics_scope(),
-  )
-  .unwrap();
-
-  let initial = reader.read_available(901).await.unwrap();
-  assert_eq!(initial.len(), 1);
-  assert_eq!(reader.metrics.metadata_recovery_scan_hits.get(), 1);
-  assert_eq!(reader.metrics.metadata_recovery_scan_batches_read.get(), 1);
-
-  write_segment(
-    blob_store.as_ref(),
-    metadata_store.as_ref(),
-    "telemetry",
-    900,
-    1,
-    7,
-    SeqRange { start: 3, end: 4 },
-    vec![new_record(vec![3], 903), new_record(vec![4], 904)],
-    Compression::none(),
-  )
-  .await;
-
-  let fast_scan = reader.read_available(902).await.unwrap();
-  assert!(fast_scan.is_empty());
-  assert_eq!(reader.metrics.metadata_recovery_scan_hits.get(), 1);
-
-  let recovery_scan = reader.read_available(961).await.unwrap();
-  assert_eq!(recovery_scan.len(), 1);
-  assert_eq!(recovery_scan[0].seq_range, SeqRange { start: 3, end: 4 });
-  assert_eq!(reader.metrics.metadata_recovery_scan_hits.get(), 2);
-  assert_eq!(reader.metrics.metadata_recovery_scan_batches_read.get(), 2);
-}
-
-#[tokio::test]
-async fn fast_scan_uses_current_window_inclusive_watermark() {
+async fn fast_scan_uses_per_partition_inclusive_frontier() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let recording_metadata_store = Arc::new(RecordingMetadataStore::new());
   let metadata_store: Arc<dyn MetadataStore> = recording_metadata_store.clone();
@@ -359,12 +715,11 @@ async fn fast_scan_uses_current_window_inclusive_watermark() {
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new(
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
-      lookback_windows: Some(2),
-      metadata_recovery_scan_interval_seconds: Some(60),
+      metadata_visibility_delay_ms: Some(0),
       ..Default::default()
     },
     vec![7],
@@ -372,6 +727,8 @@ async fn fast_scan_uses_current_window_inclusive_watermark() {
     blob_store,
     metadata_store,
     &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )
   .unwrap();
 
@@ -382,6 +739,170 @@ async fn fast_scan_uses_current_window_inclusive_watermark() {
   assert!(batches.is_empty());
   assert_eq!(
     *recording_metadata_store.scans.lock().await,
-    vec![(900, Some(SnowflakeId(2)))]
+    vec![(600, None), (900, Some(SnowflakeId(2)))]
+  );
+}
+
+#[tokio::test]
+async fn fast_scan_uses_lowest_partition_frontier_for_cross_partition_ordering() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let recording_metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = recording_metadata_store.clone();
+
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    100,
+    7,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![7], 901_000)],
+    Compression::none(),
+  )
+  .await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    8,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![8], 901_000)],
+    Compression::none(),
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      metadata_visibility_delay_ms: Some(0),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    Arc::clone(&blob_store),
+    Arc::clone(&metadata_store),
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  )
+  .unwrap();
+
+  assert_eq!(reader.read_available(901).await.unwrap().len(), 2);
+  recording_metadata_store.scans.lock().await.clear();
+
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    2,
+    8,
+    SeqRange { start: 2, end: 2 },
+    vec![new_record(vec![9], 902_000)],
+    Compression::none(),
+  )
+  .await;
+
+  let batches = reader.read_available(902).await.unwrap();
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].virtual_partition_id, 8);
+  assert!(
+    recording_metadata_store
+      .scans
+      .lock()
+      .await
+      .contains(&(900, Some(SnowflakeId(1))))
+  );
+}
+
+#[tokio::test]
+async fn fast_scan_uses_per_window_frontiers_across_candidate_window_boundary() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let recording_metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = recording_metadata_store.clone();
+
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    100,
+    7,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![7], 900_000)],
+    Compression::none(),
+  )
+  .await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    10,
+    8,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![8], 900_000)],
+    Compression::none(),
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      metadata_visibility_delay_ms: Some(0),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    Arc::clone(&blob_store),
+    Arc::clone(&metadata_store),
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  )
+  .unwrap();
+  assert_eq!(reader.read_available(900).await.unwrap().len(), 2);
+  recording_metadata_store.scans.lock().await.clear();
+
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    600,
+    1,
+    7,
+    SeqRange { start: 2, end: 2 },
+    vec![new_record(vec![9], 600_000)],
+    Compression::none(),
+  )
+  .await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    11,
+    8,
+    SeqRange { start: 2, end: 2 },
+    vec![new_record(vec![10], 900_000)],
+    Compression::none(),
+  )
+  .await;
+
+  let batches = reader.read_available(901).await.unwrap();
+  let mut sequences = batches
+    .into_iter()
+    .map(|batch| batch.seq_range.end)
+    .collect::<Vec<_>>();
+  sequences.sort_unstable();
+  assert_eq!(sequences, vec![2, 2]);
+  assert_eq!(
+    *recording_metadata_store.scans.lock().await,
+    vec![(600, None), (900, Some(SnowflakeId(10)))]
   );
 }

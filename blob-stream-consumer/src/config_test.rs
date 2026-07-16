@@ -1,10 +1,10 @@
 use super::{
   ConsumerReadConfig,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  consumer_candidate_window_count,
   consumer_idle_poll_delay_ms,
-  consumer_lookback_windows,
   consumer_max_idle_poll_delay_ms,
-  consumer_metadata_fast_scan_enabled,
-  consumer_metadata_recovery_scan_interval_seconds,
+  consumer_metadata_visibility_delay_ms,
   consumer_prefetch_max_bytes,
   validate_read_config,
 };
@@ -16,30 +16,47 @@ fn read_config() -> ConsumerReadConfig {
 }
 
 #[test]
-fn read_defaults_use_two_windows_and_two_second_idle_cap() {
+fn read_defaults_derive_two_candidate_windows_and_two_second_idle_cap() {
   let read = read_config();
-  assert_eq!(consumer_lookback_windows(&read), 2);
+  assert_eq!(
+    consumer_candidate_window_count(&read, DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS).unwrap(),
+    2
+  );
   assert_eq!(consumer_idle_poll_delay_ms(&read), 250);
   assert_eq!(consumer_max_idle_poll_delay_ms(&read), 2_000);
   assert_eq!(consumer_prefetch_max_bytes(&read), 64 * 1024 * 1024);
-  assert_eq!(consumer_metadata_recovery_scan_interval_seconds(&read), 60);
-  assert!(consumer_metadata_fast_scan_enabled(&read));
+  assert_eq!(consumer_metadata_visibility_delay_ms(&read), 2_000);
 }
 
 #[test]
-fn metadata_fast_scan_can_be_disabled() {
+fn candidate_windows_cover_publication_and_visibility_delay() {
   let mut read = read_config();
-  read.metadata_fast_scan_enabled = Some(false);
+  read.window_size_seconds = Some(300);
+  read.metadata_visibility_delay_ms = Some(300_000);
 
-  assert!(!consumer_metadata_fast_scan_enabled(&read));
+  assert_eq!(consumer_candidate_window_count(&read, 30_000).unwrap(), 3);
 }
 
 #[test]
-fn metadata_recovery_scan_interval_uses_explicit_value() {
+fn candidate_windows_rejects_unbounded_scan_horizon() {
   let mut read = read_config();
-  read.metadata_recovery_scan_interval_seconds = Some(30);
+  read.window_size_seconds = Some(300);
+  read.metadata_visibility_delay_ms = Some(9_600_000);
 
-  assert_eq!(consumer_metadata_recovery_scan_interval_seconds(&read), 30);
+  let error = consumer_candidate_window_count(&read, 300_000).unwrap_err();
+  assert!(
+    error
+      .to_string()
+      .contains("metadata availability horizon exceeds")
+  );
+}
+
+#[test]
+fn metadata_visibility_delay_uses_explicit_value() {
+  let mut read = read_config();
+  read.metadata_visibility_delay_ms = Some(1_500);
+
+  assert_eq!(consumer_metadata_visibility_delay_ms(&read), 1_500);
 }
 
 #[test]

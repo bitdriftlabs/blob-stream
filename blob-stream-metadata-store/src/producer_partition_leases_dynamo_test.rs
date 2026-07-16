@@ -262,6 +262,12 @@ async fn writes_ttl_attribute_for_lease_rows() -> Result<()> {
     .parse::<i64>()?;
 
   assert_eq!(ttl, 123);
+  for attribute in ["topic", "virtual_partition_id"] {
+    assert!(
+      !item.contains_key(attribute),
+      "producer lease item unexpectedly contains {attribute}"
+    );
+  }
 
   client.delete_table().table_name(table_name).send().await?;
   Ok(())

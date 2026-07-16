@@ -117,6 +117,11 @@ message TopicConfig {
   // Retention window in days (used to drive storage TTL and lifecycle policies).
   // Default when unset: 0 days.
   uint32 retention_days = 4;
+
+  // Maximum time from assigning a segment to its window until its metadata is durably written.
+  // Default when unset: 30,000 ms. Brokers enforce this deadline and consumers use it to derive
+  // the finite steady-state metadata scan horizon.
+  optional uint64 max_metadata_publication_lag_ms = 5 [(validate.rules).uint64.gt = 0];
 }
 
 // In-memory blob store configuration (used for tests/local runs).
@@ -290,27 +295,7 @@ message ConsumerReadConfig {
   //   partition-key scans, accepting coarser scan buckets.
   optional int64 window_size_seconds = 2 [(validate.rules).int64.gt = 0];
 
-  // Number of trailing windows to scan on each read.
-  // Default when unset: 2 windows.
-  //
-  // Effective late-arrival coverage is:
-  //   coverage_seconds = window_size_seconds * lookback_windows
-  //
-  // With defaults, coverage is 300 * 2 = 600 seconds (10 minutes). This scans the current
-  // window and its immediate predecessor, allowing metadata to arrive for up to one full window
-  // after the original window closes.
-  //
-  // Why values > 1 are useful even with a 5-minute window:
-  // - Metadata visibility can be delayed by retries/backoff, transient store slowness,
-  //   or temporary outages.
-  // - Consumers can miss scans during rebalance pauses or process restarts.
-  // - Segments near window boundaries can be observed on a later scan cycle.
-  //
-  // Practical sizing rule:
-  // - Choose lookback_windows >= ceil(max_expected_metadata_delay / window_size_seconds) + 1.
-  // - Increase this value when metadata can arrive later than one window after its original
-  //   window closes.
-  optional uint32 lookback_windows = 3 [(validate.rules).uint32.gt = 0];
+  reserved 3;
 
   // Base idle poll delay in milliseconds when no batches are available.
   // Default when unset: 250 ms.
@@ -334,21 +319,12 @@ message ConsumerReadConfig {
   // - Decrease to reduce process memory footprint when running many consumers per host.
   optional uint64 prefetch_max_bytes = 6 [(validate.rules).uint64.gt = 0];
 
-  // Interval between unbounded metadata recovery scans.
-  // Default when unset: 60 seconds.
-  //
-  // Between recovery scans, consumers query only the active window from their observed
-  // snowflake watermark. Recovery scans query all configured lookback windows without a
-  // snowflake bound so they discover metadata that becomes visible late with an earlier
-  // snowflake id.
-  optional uint64 metadata_recovery_scan_interval_seconds = 7 [(validate.rules).uint64.gt = 0];
+  reserved 7, 8;
 
-  // Enable bounded current-window metadata scans between recovery scans.
-  // Default when unset: true.
-  //
-  // Set to false to scan every configured lookback window without a snowflake bound on each
-  // read, preserving the legacy behavior while investigating a rollout issue.
-  optional bool metadata_fast_scan_enabled = 8;
+  // Delay accepting recently published metadata rows while using eventually consistent reads.
+  // Default when unset: 2,000 ms. This is a best-effort staleness margin, not a
+  // consistency guarantee because the metadata store has no bounded replication delay.
+  optional uint64 metadata_visibility_delay_ms = 9;
 }
 
 // Consumer group lease and heartbeat settings.

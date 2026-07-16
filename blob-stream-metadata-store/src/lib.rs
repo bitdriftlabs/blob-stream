@@ -10,7 +10,6 @@ use blob_stream_blob_store::BlobKey;
 use blob_stream_types::{
   BatchMetadata,
   CommittedCursor,
-  Compression,
   SeqRange,
   SnowflakeId,
   TopicWindowKey,
@@ -51,18 +50,10 @@ pub struct SegmentMetadata {
   pub blob_key: BlobKey,
   /// Per-partition batch index for byte-range and sequence lookups.
   pub segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
-  /// Segment compression settings.
-  pub compression: Compression,
-  /// Total record count in this segment.
-  pub record_count: u64,
-  /// Minimum event timestamp in milliseconds.
-  pub min_event_ts_ms: i64,
-  /// Maximum event timestamp in milliseconds.
-  pub max_event_ts_ms: i64,
-  /// Optional integrity checksum.
-  pub checksum: Option<String>,
   /// Creation timestamp in milliseconds.
   pub created_ts_ms: i64,
+  /// Timestamp immediately before the metadata row was written, in milliseconds.
+  pub metadata_published_ts_ms: i64,
 }
 
 impl SegmentMetadata {
@@ -73,24 +64,16 @@ impl SegmentMetadata {
     snowflake_id: SnowflakeId,
     blob_key: BlobKey,
     segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
-    compression: Compression,
-    record_count: u64,
-    min_event_ts_ms: i64,
-    max_event_ts_ms: i64,
-    checksum: Option<String>,
     created_ts_ms: i64,
+    metadata_published_ts_ms: i64,
   ) -> Self {
     Self {
       window,
       snowflake_id,
       blob_key,
       segment_index,
-      compression,
-      record_count,
-      min_event_ts_ms,
-      max_event_ts_ms,
-      checksum,
       created_ts_ms,
+      metadata_published_ts_ms,
     }
   }
 

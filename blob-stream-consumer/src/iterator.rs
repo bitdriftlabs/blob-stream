@@ -19,6 +19,7 @@ use crate::coordination::{
   ConsumerGroupCoordinatorImpl,
   HeartbeatReport,
   RebalanceReport,
+  RecoveredCursor,
 };
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
@@ -31,6 +32,8 @@ use blob_stream_metadata_store::{
   MetadataStore,
 };
 use blob_stream_types::{
+  CommittedCursor,
+  CommittedSourceCheckpoint,
   Record,
   VirtualPartitionId,
   format_unix_timestamp_ms,
@@ -163,7 +166,29 @@ impl HeartbeatTrigger {
 struct BufferedBatch {
   virtual_partition_id: VirtualPartitionId,
   next_offset: u64,
+  source_checkpoint: CommittedSourceCheckpoint,
   records: std::vec::IntoIter<Record>,
+}
+
+//
+// PendingCommit
+//
+
+#[derive(Clone, Debug)]
+struct PendingCommit {
+  offset: u64,
+  source_checkpoint: CommittedSourceCheckpoint,
+}
+
+//
+// DeliveredSourceRange
+//
+
+#[derive(Clone)]
+struct DeliveredSourceRange {
+  start_offset: u64,
+  end_offset: u64,
+  source_checkpoint: CommittedSourceCheckpoint,
 }
 
 //
@@ -182,6 +207,7 @@ impl DeliveryState {
   fn try_take_next(
     &mut self,
     active_assignment: &HashSet<VirtualPartitionId>,
+    delivered_source_ranges: &mut HashMap<VirtualPartitionId, Vec<DeliveredSourceRange>>,
     metrics: &ConsumerIteratorMetrics,
   ) -> Option<NextResult> {
     if let Some(revocation) = self.pending_revocation.take() {
@@ -202,6 +228,12 @@ impl DeliveryState {
         if let Some(record) = current_batch.records.next() {
           let offset = current_batch.next_offset;
           current_batch.next_offset = current_batch.next_offset.saturating_add(1);
+          record_delivered_source(
+            delivered_source_ranges,
+            current_batch.virtual_partition_id,
+            offset,
+            current_batch.source_checkpoint.clone(),
+          );
           metrics.records_delivered.inc();
           return Some(NextResult::Record(ConsumerRecord {
             virtual_partition_id: current_batch.virtual_partition_id,
@@ -225,6 +257,7 @@ impl DeliveryState {
       self.current_batch = Some(BufferedBatch {
         virtual_partition_id: batch.virtual_partition_id,
         next_offset: batch.seq_range.start,
+        source_checkpoint: batch.source_checkpoint,
         records: batch.records.into_iter(),
       });
     }
@@ -244,6 +277,29 @@ impl DeliveryState {
       .retain(|batch| !revoked.contains(&batch.virtual_partition_id));
     self.buffered_bytes = self.batches.iter().map(prefetched_batch_bytes).sum();
   }
+}
+
+fn record_delivered_source(
+  delivered_source_ranges: &mut HashMap<VirtualPartitionId, Vec<DeliveredSourceRange>>,
+  virtual_partition_id: VirtualPartitionId,
+  offset: u64,
+  source_checkpoint: CommittedSourceCheckpoint,
+) {
+  let ranges = delivered_source_ranges
+    .entry(virtual_partition_id)
+    .or_default();
+  if let Some(last) = ranges.last_mut()
+    && last.end_offset.saturating_add(1) == offset
+    && last.source_checkpoint == source_checkpoint
+  {
+    last.end_offset = offset;
+    return;
+  }
+  ranges.push(DeliveredSourceRange {
+    start_offset: offset,
+    end_offset: offset,
+    source_checkpoint,
+  });
 }
 
 //
@@ -409,7 +465,8 @@ struct ConsumerDiagnosticsRuntimeState {
 #[derive(Default)]
 struct ConsumerSharedState {
   active_assignment: HashSet<VirtualPartitionId>,
-  pending_commits: HashMap<VirtualPartitionId, u64>,
+  pending_commits: HashMap<VirtualPartitionId, PendingCommit>,
+  delivered_source_ranges: HashMap<VirtualPartitionId, Vec<DeliveredSourceRange>>,
   delivery_state: DeliveryState,
   terminal_error: Option<String>,
   diagnostics: ConsumerDiagnosticsRuntimeState,
@@ -464,7 +521,7 @@ impl ConsumerDiagnostics {
         runtime_state.active_assignment.clone(),
         runtime_state.pending_assignment.clone(),
         runtime_state.pending_revocation,
-        offsets_from_map(&shared_state.pending_commits),
+        offsets_from_pending_commits(&shared_state.pending_commits),
         offsets_from_map(&runtime_state.last_committed_offsets),
         runtime_state.last_successful_heartbeat_at_ms,
         runtime_state.coordinator_generation,
@@ -536,6 +593,16 @@ fn offsets_from_map(offsets: &HashMap<VirtualPartitionId, u64>) -> Vec<ConsumerO
     .collect::<Vec<_>>();
   snapshots.sort_by_key(|snapshot| snapshot.virtual_partition_id);
   snapshots
+}
+
+fn offsets_from_pending_commits(
+  commits: &HashMap<VirtualPartitionId, PendingCommit>,
+) -> Vec<ConsumerOffsetSnapshot> {
+  let offsets = commits
+    .iter()
+    .map(|(partition_id, commit)| (*partition_id, commit.offset))
+    .collect();
+  offsets_from_map(&offsets)
 }
 
 //
@@ -630,8 +697,8 @@ pub struct ConsumerIteratorImpl {
 }
 
 impl ConsumerIteratorImpl {
-  /// Build an iterator from explicit runtime config and backend dependencies.
-  pub async fn from_runtime_config(
+  /// Build an iterator with recovery retention and an explicit metadata publication bound.
+  pub async fn from_runtime_config_with_retention_and_publication_lag(
     runtime: &ConsumerRuntimeConfig,
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
@@ -639,8 +706,14 @@ impl ConsumerIteratorImpl {
     membership_store: Arc<dyn ConsumerGroupMembershipStore>,
     coordination_source: Arc<dyn ConsumerCoordinationSource>,
     metrics_scope: Scope,
+    retention_days: u32,
+    maximum_metadata_publication_lag_ms: u64,
   ) -> Result<Self> {
     validate_runtime_config(runtime)?;
+    ensure!(
+      retention_days > 0,
+      "consumer retention recovery requires topic retention_days greater than zero"
+    );
     let read_config = runtime
       .read
       .as_ref()
@@ -657,14 +730,18 @@ impl ConsumerIteratorImpl {
 
     let active_assignment = HashSet::new();
     let shared_state = Arc::new(ParkingLotMutex::new(ConsumerSharedState::default()));
-    let reader = Arc::new(Mutex::new(ConsumerReaderImpl::new(
-      read_config,
-      Vec::new(),
-      HashMap::new(),
-      blob_store,
-      metadata_store,
-      &metrics_scope.scope("consumer"),
-    )?));
+    let reader = Arc::new(Mutex::new(
+      ConsumerReaderImpl::new_with_retention_and_publication_lag(
+        read_config,
+        Vec::new(),
+        HashMap::new(),
+        blob_store,
+        metadata_store,
+        &metrics_scope.scope("consumer"),
+        retention_days,
+        maximum_metadata_publication_lag_ms,
+      )?,
+    ));
     let coordinator = ConsumerGroupCoordinatorImpl::new(group_config.clone(), lease_store)?;
     let now_ts_ms = now_unix_millis();
     let delivery_notify = Arc::new(Notify::new());
@@ -758,22 +835,33 @@ impl ConsumerDriver {
   ) -> Result<Vec<VirtualPartitionId>> {
     let RebalanceReport {
       owned_partitions,
-      committed_cursors,
+      recovered_cursors,
     } = report;
-    self.hydrate_cursors(committed_cursors).await;
+    self
+      .hydrate_cursors(recovered_cursors, now_unix_millis() / 1_000)
+      .await;
 
     self.apply_assignment(&owned_partitions).await?;
     Ok(owned_partitions)
   }
 
-  async fn hydrate_cursors(&self, committed_cursors: HashMap<VirtualPartitionId, u64>) {
-    if committed_cursors.is_empty() {
+  async fn hydrate_cursors(
+    &self,
+    recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
+    now_unix_seconds: i64,
+  ) {
+    if recovered_cursors.is_empty() {
       return;
     }
 
     let mut reader = self.reader.lock().await;
-    for (partition_id, seq_end) in committed_cursors {
-      reader.hydrate_cursor(partition_id, seq_end);
+    for (partition_id, recovered_cursor) in recovered_cursors {
+      reader.hydrate_cursor_with_source(
+        partition_id,
+        &recovered_cursor.committed_cursor,
+        recovered_cursor.committed_ts_ms,
+        now_unix_seconds,
+      );
     }
   }
 
@@ -840,12 +928,15 @@ impl ConsumerDriver {
       .reader
       .lock()
       .await
-      .set_assigned_virtual_partitions(assignment.to_owned())?;
+      .set_assigned_virtual_partitions(assignment.to_owned(), now_unix_millis() / 1_000)?;
     self.active_assignment = active_assignment;
     {
       let mut shared_state = self.shared_state.lock();
       shared_state
         .pending_commits
+        .retain(|partition_id, _| self.active_assignment.contains(partition_id));
+      shared_state
+        .delivered_source_ranges
         .retain(|partition_id, _| self.active_assignment.contains(partition_id));
       shared_state
         .active_assignment
@@ -914,7 +1005,7 @@ impl ConsumerDriver {
     self.record_coordination_snapshot(&snapshot);
     let RebalanceReport {
       owned_partitions: next_assignment,
-      committed_cursors,
+      recovered_cursors,
     } = self
       .coordinator
       .rebalance(snapshot.members, snapshot.virtual_partitions, now_ts_ms)
@@ -924,7 +1015,9 @@ impl ConsumerDriver {
 
     let next_assignment_set = next_assignment.iter().copied().collect::<HashSet<_>>();
     let assignment_changed = self.active_assignment != next_assignment_set;
-    self.hydrate_cursors(committed_cursors).await;
+    self
+      .hydrate_cursors(recovered_cursors, now_ts_ms / 1_000)
+      .await;
 
     if !assignment_changed {
       self.refresh_rebalance_diagnostics();
@@ -1029,7 +1122,7 @@ impl ConsumerDriver {
     &self,
     now_ts_ms: i64,
     report: &HeartbeatReport,
-    pending_commits: &HashMap<VirtualPartitionId, u64>,
+    pending_commits: &HashMap<VirtualPartitionId, PendingCommit>,
     started_at: Instant,
   ) {
     self
@@ -1047,7 +1140,7 @@ impl ConsumerDriver {
       .filter_map(|partition_id| {
         pending_commits
           .get(partition_id)
-          .map(|offset| (*partition_id, *offset))
+          .map(|commit| (*partition_id, commit.offset))
       })
       .collect::<Vec<_>>();
     self
@@ -1060,13 +1153,16 @@ impl ConsumerDriver {
       .observe(started_at.elapsed().as_secs_f64());
 
     let mut shared_state = self.shared_state.lock();
-    let diagnostics = &mut shared_state.diagnostics;
     for (partition_id, offset) in committed_offsets {
-      diagnostics
+      shared_state
+        .diagnostics
         .last_committed_offsets
         .insert(partition_id, offset);
+      if let Some(ranges) = shared_state.delivered_source_ranges.get_mut(&partition_id) {
+        ranges.retain(|range| range.end_offset > offset);
+      }
     }
-    diagnostics.last_successful_heartbeat_at_ms = Some(now_ts_ms);
+    shared_state.diagnostics.last_successful_heartbeat_at_ms = Some(now_ts_ms);
   }
 
   async fn heartbeat(
@@ -1118,9 +1214,22 @@ impl ConsumerDriver {
       return Err(error);
     }
 
+    let committed_cursors = pending_commits
+      .iter()
+      .map(|(partition_id, commit)| {
+        (
+          *partition_id,
+          CommittedCursor {
+            virtual_partition_id: *partition_id,
+            seq_end: commit.offset,
+            source_checkpoint: Some(commit.source_checkpoint.clone()),
+          },
+        )
+      })
+      .collect();
     let report = match self
       .coordinator
-      .heartbeat_and_commit(now_ts_ms, &pending_commits)
+      .heartbeat_and_commit(now_ts_ms, &committed_cursors)
       .await
     {
       Ok(report) => report,
@@ -1150,17 +1259,17 @@ impl ConsumerDriver {
         let mut shared_state = self.shared_state.lock();
         for partition_id in &report.fenced_partitions {
           shared_state.pending_commits.remove(partition_id);
+          shared_state.delivered_source_ranges.remove(partition_id);
         }
         shared_state
           .active_assignment
           .clone_from(&self.active_assignment);
         self.refresh_diagnostics_locked(&mut shared_state);
       }
-      self
-        .reader
-        .lock()
-        .await
-        .set_assigned_virtual_partitions(self.active_assignment.iter().copied().collect())?;
+      self.reader.lock().await.set_assigned_virtual_partitions(
+        self.active_assignment.iter().copied().collect(),
+        now_ts_ms / 1_000,
+      )?;
       info!(
         "consumer heartbeat fenced partitions: topic={}, group_id={}, member_id={}, fenced={:?}",
         self.group_config.topic,
@@ -1490,6 +1599,14 @@ impl ConsumerDriver {
       .lock()
       .await
       .set_cursor(virtual_partition_id, offset);
+    {
+      let mut shared_state = self.shared_state.lock();
+      shared_state.pending_commits.remove(&virtual_partition_id);
+      shared_state
+        .delivered_source_ranges
+        .remove(&virtual_partition_id);
+    }
+    self.refresh_diagnostics();
     trace!(
       "consumer seek: topic={}, partition={}, offset={}",
       self.group_config.topic, virtual_partition_id, offset
@@ -1530,12 +1647,13 @@ impl ConsumerIterator for ConsumerIteratorImpl {
         let mut shared_state = self.shared_state.lock();
         let ConsumerSharedState {
           active_assignment,
+          delivered_source_ranges,
           delivery_state,
           terminal_error,
           ..
         } = &mut *shared_state;
         (
-          delivery_state.try_take_next(active_assignment, &self.metrics),
+          delivery_state.try_take_next(active_assignment, delivered_source_ranges, &self.metrics),
           terminal_error.clone(),
         )
       };
@@ -1560,9 +1678,35 @@ impl ConsumerIterator for ConsumerIteratorImpl {
         .contains(&virtual_partition_id),
       "cannot store cursor for unassigned virtual partition {virtual_partition_id}"
     );
-    shared_state
-      .pending_commits
-      .insert(virtual_partition_id, offset);
+    let source_checkpoint = shared_state
+      .delivered_source_ranges
+      .get(&virtual_partition_id)
+      .and_then(|ranges| {
+        ranges.iter().find_map(|range| {
+          (range.start_offset <= offset && offset <= range.end_offset)
+            .then(|| range.source_checkpoint.clone())
+        })
+      })
+      .ok_or_else(|| {
+        anyhow!(
+          "cannot store offset {offset} for partition {virtual_partition_id}: offset was not \
+           delivered"
+        )
+      })?;
+    if let Some(staged) = shared_state.pending_commits.get(&virtual_partition_id) {
+      ensure!(
+        offset >= staged.offset,
+        "cannot store offset {offset} below staged offset {} for partition {virtual_partition_id}",
+        staged.offset
+      );
+    }
+    shared_state.pending_commits.insert(
+      virtual_partition_id,
+      PendingCommit {
+        offset,
+        source_checkpoint,
+      },
+    );
     trace!("consumer stored offset: partition={virtual_partition_id}, offset={offset}");
     Ok(())
   }

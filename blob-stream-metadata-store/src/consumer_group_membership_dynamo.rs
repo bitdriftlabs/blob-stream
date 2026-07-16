@@ -12,9 +12,6 @@ use std::collections::{HashMap, HashSet};
 
 const ATTR_PK: &str = "pk";
 const ATTR_SK: &str = "sk";
-const ATTR_TOPIC: &str = "topic";
-const ATTR_GROUP_ID: &str = "group_id";
-const ATTR_MEMBER_ID: &str = "member_id";
 const ATTR_LEASE_EXPIRES: &str = "lease_expiry_ts";
 const ATTR_LAST_HEARTBEAT: &str = "last_heartbeat_ts";
 const ATTR_TTL: &str = "ttl_epoch_seconds";
@@ -77,15 +74,6 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
 
     let mut values = HashMap::new();
-    values.insert(":topic".to_string(), AttributeValue::S(topic.to_string()));
-    values.insert(
-      ":group_id".to_string(),
-      AttributeValue::S(group_id.to_string()),
-    );
-    values.insert(
-      ":member_id".to_string(),
-      AttributeValue::S(member_id.to_string()),
-    );
     values.insert(
       ":expires".to_string(),
       AttributeValue::N(expires_at.to_string()),
@@ -103,10 +91,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       .key(ATTR_PK, AttributeValue::S(Self::pk(topic, group_id)))
       .key(ATTR_SK, AttributeValue::S(Self::sk(member_id)))
       .update_expression(format!(
-        "SET {ATTR_TOPIC} = if_not_exists({ATTR_TOPIC}, :topic), {ATTR_GROUP_ID} = \
-         if_not_exists({ATTR_GROUP_ID}, :group_id), {ATTR_MEMBER_ID} = \
-         if_not_exists({ATTR_MEMBER_ID}, :member_id), {ATTR_LEASE_EXPIRES} = :expires, {ATTR_TTL} \
-         = :ttl, {ATTR_LAST_HEARTBEAT} = :now"
+        "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_TTL} = :ttl, {ATTR_LAST_HEARTBEAT} = :now"
       ))
       .set_expression_attribute_values(Some(values))
       .send()
@@ -178,7 +163,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
         .table_name(&self.table_name)
         .key_condition_expression(format!("{ATTR_PK} = :pk"))
         .filter_expression(format!("{ATTR_LEASE_EXPIRES} > :now"))
-        .projection_expression(ATTR_MEMBER_ID)
+        .projection_expression(ATTR_SK)
         .set_expression_attribute_values(Some(values));
 
       if let Some(key) = start_key.take() {
@@ -187,7 +172,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
 
       let response = query.send().await?;
       for item in response.items() {
-        if let Some(AttributeValue::S(member_id)) = item.get(ATTR_MEMBER_ID) {
+        if let Some(AttributeValue::S(member_id)) = item.get(ATTR_SK) {
           members.insert(member_id.clone());
         }
       }

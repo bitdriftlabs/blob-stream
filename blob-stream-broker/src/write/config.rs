@@ -41,6 +41,7 @@ const DEFAULT_WINDOW_SIZE_SECONDS: i64 = 300;
 const DEFAULT_SEGMENT_TTL_BUFFER_SECONDS: u32 = 3_600;
 const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
+const DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS: u64 = 30_000;
 
 #[cfg(test)]
 #[path = "./config_test.rs"]
@@ -128,6 +129,7 @@ pub struct TopicInfo {
   pub partition_count: u32,
   pub num_writers: u32,
   pub retention_days: u32,
+  pub max_metadata_publication_lag_ms: u64,
 }
 
 impl TopicInfo {
@@ -139,6 +141,9 @@ impl TopicInfo {
       partition_count: proto.partition_count,
       num_writers: proto.num_writers,
       retention_days: proto.retention_days,
+      max_metadata_publication_lag_ms: proto
+        .max_metadata_publication_lag_ms
+        .unwrap_or(DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS),
     })
   }
 

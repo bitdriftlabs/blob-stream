@@ -4,6 +4,7 @@ use crate::config::ConsumerGroupConfig;
 use crate::coordination::{
   ConsumerGroupCoordinator,
   ConsumerGroupCoordinatorImpl,
+  RecoveredCursor,
   cooperative_sticky_assignment,
 };
 use blob_stream_metadata_store::{
@@ -12,8 +13,17 @@ use blob_stream_metadata_store::{
   ConsumerGroupLeaseStore,
   InMemoryConsumerGroupLeaseStore,
 };
+use blob_stream_types::CommittedCursor;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+fn committed_cursor(virtual_partition_id: u32, seq_end: u64) -> CommittedCursor {
+  CommittedCursor {
+    virtual_partition_id,
+    seq_end,
+    source_checkpoint: None,
+  }
+}
 
 #[test]
 fn sticky_assignment_stable_for_same_membership() {
@@ -147,10 +157,10 @@ async fn heartbeat_commit_renews_and_commits_cursor() {
     .await
     .unwrap();
   assert_eq!(owned.owned_partitions, vec![7]);
-  assert!(owned.committed_cursors.is_empty());
+  assert!(owned.recovered_cursors.is_empty());
 
   let report = coordinator
-    .heartbeat_and_commit(1_010, &HashMap::from([(7_u32, 10_u64)]))
+    .heartbeat_and_commit(1_010, &HashMap::from([(7_u32, committed_cursor(7, 10))]))
     .await
     .unwrap();
   assert_eq!(report.renewed_partitions, vec![7]);
@@ -179,7 +189,7 @@ async fn stable_rebalance_preserves_owned_partitions_and_committed_cursor() {
     .await
     .unwrap();
   coordinator
-    .heartbeat_and_commit(1_010, &HashMap::from([(7_u32, 10_u64)]))
+    .heartbeat_and_commit(1_010, &HashMap::from([(7_u32, committed_cursor(7, 10))]))
     .await
     .unwrap();
 
@@ -189,7 +199,16 @@ async fn stable_rebalance_preserves_owned_partitions_and_committed_cursor() {
     .unwrap();
 
   assert_eq!(report.owned_partitions, vec![7]);
-  assert_eq!(report.committed_cursors, HashMap::from([(7_u32, 10_u64)]));
+  assert_eq!(
+    report.recovered_cursors,
+    HashMap::from([(
+      7_u32,
+      RecoveredCursor {
+        committed_cursor: committed_cursor(7, 10),
+        committed_ts_ms: Some(1_010),
+      },
+    )])
+  );
 }
 
 #[tokio::test]
@@ -232,7 +251,7 @@ async fn heartbeat_detects_fencing_by_new_generation() {
     .unwrap();
 
   let report = coordinator
-    .heartbeat_and_commit(1_130, &HashMap::from([(7_u32, 12_u64)]))
+    .heartbeat_and_commit(1_130, &HashMap::from([(7_u32, committed_cursor(7, 12))]))
     .await
     .unwrap();
 

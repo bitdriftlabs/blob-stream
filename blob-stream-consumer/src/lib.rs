@@ -27,7 +27,6 @@
 //!   let mut read = ConsumerReadConfig::new();
 //!   read.topic = "telemetry".into();
 //!   read.window_size_seconds = Some(300);
-//!   read.lookback_windows = Some(3);
 //!
 //!   let mut group = ConsumerGroupConfig::new();
 //!   group.topic = "telemetry".into();
@@ -45,6 +44,7 @@
 //!   topic.partition_count = 128;
 //!   topic.num_writers = 1;
 //!   topic.retention_days = 7;
+//!   topic.max_metadata_publication_lag_ms = Some(30_000);
 //!
 //!   let mut in_memory_blob = BlobStoreConfig::new();
 //!   in_memory_blob.backend = Some(blob_store_config::Backend::InMemory(Default::default()));
@@ -85,13 +85,19 @@ mod coordination;
 mod iterator;
 
 pub use bootstrap::{ConsumerBootstrapConfig, ConsumerConfigFactory, MembershipCoordinationSource};
-pub use config::{ConsumerGroupConfig, ConsumerReadConfig, ConsumerRuntimeConfig};
+pub use config::{
+  ConsumerGroupConfig,
+  ConsumerReadConfig,
+  ConsumerRuntimeConfig,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+};
 pub use consumer::{ConsumerBatch, ConsumerReader, ConsumerReaderImpl};
 pub use coordination::{
   ConsumerGroupCoordinator,
   ConsumerGroupCoordinatorImpl,
   HeartbeatReport,
   RebalanceReport,
+  RecoveredCursor,
   cooperative_sticky_assignment,
 };
 pub use iterator::{

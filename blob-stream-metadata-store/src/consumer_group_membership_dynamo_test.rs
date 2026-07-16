@@ -186,6 +186,12 @@ async fn writes_ttl_attribute_for_membership_rows() -> Result<()> {
     .parse::<i64>()?;
 
   assert_eq!(ttl, 122);
+  for attribute in ["topic", "group_id", "member_id"] {
+    assert!(
+      !item.contains_key(attribute),
+      "membership item unexpectedly contains {attribute}"
+    );
+  }
 
   client.delete_table().table_name(table_name).send().await?;
   Ok(())

@@ -12,7 +12,12 @@ use super::{
   IdlePollBackoff,
   NextResult,
 };
-use crate::config::{ConsumerGroupConfig, ConsumerReadConfig, ConsumerRuntimeConfig};
+use crate::config::{
+  ConsumerGroupConfig,
+  ConsumerReadConfig,
+  ConsumerRuntimeConfig,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+};
 use bd_server_stats::stats::Collector;
 use blob_stream_blob_store::{BlobKey, BlobStore, InMemoryBlobStore};
 use blob_stream_metadata_store::{
@@ -29,6 +34,7 @@ use blob_stream_metadata_store::{
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
   BatchMetadata,
+  CommittedSourceCheckpoint,
   Compression,
   Record,
   RecordBatch,
@@ -188,6 +194,10 @@ fn current_batch_for_fenced_partition_is_not_delivered() {
     current_batch: Some(BufferedBatch {
       virtual_partition_id: 7,
       next_offset: 1,
+      source_checkpoint: CommittedSourceCheckpoint {
+        window_start_unix_seconds: 0,
+        snowflake_id: 1,
+      },
       records: vec![new_record(vec![1], 0)].into_iter(),
     }),
     ..Default::default()
@@ -197,6 +207,7 @@ fn current_batch_for_fenced_partition_is_not_delivered() {
     delivery_state
       .try_take_next(
         &HashSet::new(),
+        &mut HashMap::new(),
         &ConsumerIteratorMetrics::new(&metrics_scope())
       )
       .is_none()
@@ -250,11 +261,7 @@ async fn write_segment(
         compression: Compression::none(),
       }],
     )]),
-    Compression::none(),
-    records.len() as u64,
-    records.first().map_or(0, |record| record.event_ts_ms),
-    records.last().map_or(0, |record| record.event_ts_ms),
-    None,
+    window_start * 1_000,
     window_start * 1_000,
   );
 
@@ -271,7 +278,6 @@ fn runtime_config_with_prefetch_max_bytes(
   let mut read = ConsumerReadConfig::new();
   read.topic = "telemetry".to_string().into();
   read.window_size_seconds = Some(300);
-  read.lookback_windows = Some(2);
   read.prefetch_max_bytes = prefetch_max_bytes;
 
   let mut group = ConsumerGroupConfig::new();
@@ -357,7 +363,7 @@ async fn diagnostics_report_assignment_and_start_state() {
     virtual_partitions: vec![0, 1],
   }));
 
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
     &runtime_config(),
     blob_store,
     metadata_store,
@@ -365,6 +371,8 @@ async fn diagnostics_report_assignment_and_start_state() {
     membership_store,
     source,
     metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )
   .await
   .unwrap();
@@ -430,7 +438,7 @@ async fn next_returns_revocation_until_completed() {
     virtual_partitions: vec![0, 1],
   }));
 
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
     &runtime,
     blob_store,
     metadata_store,
@@ -438,6 +446,8 @@ async fn next_returns_revocation_until_completed() {
     membership_store,
     source.clone(),
     metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )
   .await
   .unwrap();
@@ -531,7 +541,7 @@ async fn next_delivers_records_and_commit_renews() {
       members: vec!["member-a".to_string()],
       virtual_partitions: vec![3],
     }));
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
     &runtime,
     blob_store,
     metadata_store,
@@ -539,6 +549,8 @@ async fn next_delivers_records_and_commit_renews() {
     membership_store,
     source,
     metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )
   .await
   .unwrap();
@@ -593,7 +605,7 @@ async fn shutdown_releases_owned_partitions() {
       members: vec!["member-a".to_string()],
       virtual_partitions: vec![3],
     }));
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
     &runtime,
     blob_store,
     metadata_store,
@@ -601,6 +613,8 @@ async fn shutdown_releases_owned_partitions() {
     membership_store,
     source,
     metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )
   .await
   .unwrap();
@@ -677,7 +691,7 @@ async fn prefetch_soft_budget_pauses_and_resumes_after_drain() {
       virtual_partitions: vec![7],
     }));
 
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
     &runtime,
     blob_store,
     metadata_store,
@@ -685,6 +699,8 @@ async fn prefetch_soft_budget_pauses_and_resumes_after_drain() {
     membership_store,
     source,
     metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )
   .await
   .unwrap();
@@ -770,7 +786,7 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
     virtual_partitions: vec![0, 1],
   }));
 
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
     &runtime,
     blob_store,
     metadata_store,
@@ -778,6 +794,8 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
     membership_store,
     source.clone(),
     metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )
   .await
   .unwrap();
@@ -860,7 +878,7 @@ async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
       members: vec!["member-a".to_string()],
       virtual_partitions: vec![0],
     }));
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
     &runtime,
     blob_store,
     metadata_store,
@@ -868,6 +886,8 @@ async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
     membership_store.clone(),
     source,
     metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )
   .await
   .unwrap();
@@ -928,7 +948,7 @@ async fn cancelled_next_does_not_restart_rebalance() {
   let mut runtime = runtime_config();
   runtime.group.as_mut().unwrap().heartbeat_interval_ms = Some(60_000);
   runtime.group.as_mut().unwrap().rebalance_interval_ms = Some(60_000);
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
     &runtime,
     blob_store,
     metadata_store,
@@ -936,6 +956,8 @@ async fn cancelled_next_does_not_restart_rebalance() {
     membership_store,
     source.clone(),
     metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )
   .await
   .unwrap();
@@ -995,7 +1017,7 @@ async fn cancelled_next_preserves_prefetched_record() {
       members: vec!["member-a".to_string()],
       virtual_partitions: vec![3],
     }));
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
     &runtime_config(),
     blob_store,
     metadata_store,
@@ -1003,6 +1025,8 @@ async fn cancelled_next_preserves_prefetched_record() {
     membership_store,
     source,
     metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   )
   .await
   .unwrap();

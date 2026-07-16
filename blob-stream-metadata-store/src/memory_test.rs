@@ -38,11 +38,7 @@ fn build_segment(
     SnowflakeId(snowflake_id),
     BlobKey::from("topic/1/segment"),
     segment_index,
-    Compression::none(),
-    10,
-    1000,
-    2000,
-    None,
+    3000,
     3000,
   )
 }

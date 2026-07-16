@@ -17,8 +17,8 @@ observability. See [DEVELOPMENT.md](DEVELOPMENT.md) for contributor workflows.
   produce duplicates. Consumers must tolerate or deduplicate them as required by their domain.
 - Records have no global ordering and no cross-partition ordering guarantee. Sequence numbers
   provide monotonic progress only within a virtual partition.
-- Consumers use cursors, not timestamp seeks. A new consumer group starts from the oldest data
-  still discoverable within its configured metadata scan horizon and storage retention.
+- Consumers use cursors, not timestamp seeks. A new consumer group starts at its current aligned
+  metadata window; a resumed group recovers from its committed metadata source through retention.
 - There is no broker read path, compaction, built-in authorization, or idempotent producer
   protocol.
 - DynamoDB TTL is written by the service. S3 lifecycle expiration is configured by operators and
@@ -201,9 +201,10 @@ pk = "<topic>#<window_start_unix_seconds>"
 ```
 
 Its sort key is a fixed-width, lexicographically sortable snowflake ID. The row includes the
-blob key, segment compression, aggregate record and event-time statistics, creation time, and a
-per-virtual-partition index. Each index entry identifies a byte range, sequence range, batch
-summary, and compression setting.
+blob key, segment compression, aggregate record and event-time statistics, creation time,
+metadata publication time, and a per-virtual-partition index. Each index entry identifies a byte
+range, sequence range, batch summary, and compression setting. Publication time is captured after
+the blob upload and immediately before the metadata write.
 
 Metadata is written only after the blob upload succeeds. Segment metadata TTL is derived from the
 topic retention setting plus the configured DynamoDB TTL buffer. S3 lifecycle expiration is not
@@ -228,33 +229,33 @@ stored lease timestamp.
 ## Read Path
 
 Consumers read DynamoDB metadata and blob storage directly. The broker is not in the read path.
-For every `read_available()` call, a consumer:
+For every `read_available()` call, a consumer plans work independently for each owned partition:
 
-1. Computes the current aligned time window plus the configured trailing
-   `lookback_windows`.
-2. Selects a scan mode:
-   - At startup, after an assignment change, and at each
-     `metadata_recovery_scan_interval_seconds`, performs an unbounded recovery scan of every
-     window in that lookback set. The default interval is one minute.
-   - Between recovery scans, queries only the current window with an inclusive lower bound equal
-     to the largest snowflake previously observed for that window.
-   - When `metadata_fast_scan_enabled` is `false`, performs the unbounded lookback scan on every
-     read, preserving the legacy behavior for rollback.
-3. Queries the selected metadata windows concurrently. DynamoDB applies the optional snowflake
-   lower bound to its sort key and follows all result pages. Metadata-store results remain
-   intentionally unordered by contract.
-4. Sorts segments by snowflake ID, filters their indexes to assigned virtual partitions, and sorts
-   batches within each partition by `seq_start`.
-5. Skips ranges already covered by the in-memory cursor.
-6. Fetches only the indexed blob byte range, decompresses it, decodes `StoredRecordBatch`, and
-   verifies its virtual partition matches the metadata entry.
-7. Emits the records and advances the cursor to the greater of its existing value and the batch
-   `seq_end`.
+1. A fresh group scans only its current aligned metadata window.
+2. A resumed partition reads its committed cursor and source checkpoint from the lease. It scans
+  full metadata windows from that source through a fixed current-window cutover, clamped to the
+  configured finite topic retention. Legacy rows without a source checkpoint fall back to their
+  committed timestamp; if that timestamp is absent, recovery starts at the retention floor.
+3. Recovery proceeds in chronological bounded slices. A recovering partition does not use the
+  live fast path until it reaches its captured cutover. Recovery scans do not use the checkpoint
+  snowflake as a DynamoDB lower bound, so late lower-snowflake metadata remains discoverable.
+4. Fast partitions scan a trailing horizon derived from the topic's enforced metadata-publication
+  deadline plus `metadata_visibility_delay_ms`. Each aggregate window query starts at the lowest
+  established inclusive frontier across assigned partitions; frontiers remain per partition and
+  window because snowflake ordering is not shared across concurrently flushed partitions.
+5. The reader sorts segments by snowflake ID, filters their indexes to eligible assigned
+  partitions, sorts batches by `seq_start`, skips ranges covered by the in-memory cursor, and
+  decodes only the required blob byte ranges.
 
-The reader advances an in-memory per-window snowflake watermark only after the full scan and
-batch-processing cycle succeeds. It retains the bound inclusively, so the boundary row is replayed
-and removed by cursor deduplication. Watermarks are discarded after an assignment change and
-pruned once their windows leave the lookback horizon.
+Every committed cursor includes the source window and snowflake of the record batch that produced
+it. The iterator carries that provenance from decoded batches through `store_offset()` to the
+lease heartbeat, so a replacement owner can resume the correct finite-retention recovery range.
+
+The reader advances an in-memory `(virtual_partition_id, window)` snowflake frontier only after
+the source is visibility-eligible and its batches are successfully processed. It retains the bound
+inclusively, so the boundary row is replayed and removed by cursor deduplication. Assignment loss
+clears only the affected partition's frontiers, which are pruned once their windows leave the
+derived horizon.
 
 Consumer metrics distinguish fast and recovery query volume. `metadata_recovery_scan_hits`
 counts successful recovery passes that emit one or more new batches, and
@@ -268,34 +269,26 @@ revocation removes buffered data for that partition before the new assignment be
 
 ### Delayed Metadata Bound
 
-The fast path discovers newly written current-window metadata immediately when its snowflake is
-at or above the observed watermark. A metadata row that becomes visible late with an earlier
-snowflake is discovered on the next unbounded recovery scan. With the default one-minute interval,
-the additional detection delay is approximately one minute plus the next poll.
-
-Recovery scans only cover the configured recent windows, so this protection remains bounded:
-
-```
-late-metadata coverage = window_size_seconds * lookback_windows
-```
-
-Metadata that becomes visible after its window has left that horizon is not automatically
-rediscovered. The default five-minute window and two lookback windows provide ten minutes of
-recovery coverage. Event timestamps do not affect metadata selection; the bound is based on
-segment snowflakes. Operators must size the horizon and recovery interval for expected metadata
 delays, retries, outages, and clock skew.
-
-The recovery interval and horizon are rediscovery controls, not a DynamoDB replication-lag
 guarantee. DynamoDB does not provide a maximum convergence delay for eventually consistent
-metadata queries.
+The fast path considers metadata only after the configured visibility delay. Its candidate horizon
+covers the broker's metadata-publication deadline plus that delay, so a metadata row that meets the
+publication contract remains in a scanned window when it becomes eligible. Event timestamps do not
+affect metadata selection; the bound is based on segment windows and snowflakes.
+
+The default visibility delay is two seconds. It is a best-effort staleness margin, not a DynamoDB
+replication-delay guarantee: eventually consistent reads have no bounded convergence time. A row
+that becomes visible after its derived candidate window leaves the horizon is not automatically
+rediscovered by the fast path; a resumed consumer instead performs retention-bounded recovery.
 
 ### Read Consistency and Delivery Tradeoffs
 
-The current implementation uses eventually consistent DynamoDB metadata queries. A broker returns
-`OK` only after it uploads the segment blob and writes its metadata row, but this does not mean an
-eventually consistent reader replica can observe the row immediately. The current-window fast
-path and periodic lookback recovery reduce ordinary discovery delay; they do not create a strict
-visibility bound or recover metadata after it leaves the configured lookback horizon.
+The implementation uses eventually consistent DynamoDB metadata queries. A broker returns `OK`
+only after it uploads the segment blob and writes its metadata row, but an eventually consistent
+reader replica may not observe that row immediately. `metadata_visibility_delay_ms` can defer
+accepting metadata whose publication timestamp is too recent. It defaults to two seconds and is a
+best-effort staleness margin, not a correctness guarantee: DynamoDB supplies no bounded
+replication-delay contract, and the delay does not solve stale-writer publication.
 
 The reader's cursor filtering relies on metadata becoming visible in compatible sequence order.
 Graceful broker handoff drains locally accepted work before lease release, but the expiry/stale
@@ -309,17 +302,9 @@ Future reader modes may offer the following cost/correctness tradeoffs:
   consistency removes read-replica staleness at approximately twice the metadata-query RRU
   component. It does not by itself prevent a stale former producer from publishing metadata after
   lease expiry, so it must be paired with a publication fence for a complete ordering guarantee.
-- **Delayed eventual visibility:** An eventual-read mode could defer processing metadata until it
-  is older than a configured delay. This may absorb typical replication lag at lower cost, but is
-  probabilistic because DynamoDB supplies no maximum eventual-consistency delay. It must not be
-  documented as a correctness guarantee.
-
-A future delayed-visibility mode needs an immutable publication timestamp written when metadata
-is committed. The current `created_ts_ms` is generated while building a segment, before blob
-upload and metadata publication, and therefore cannot safely define metadata visibility age.
 Use `cost_analysis.py` with real page sizes, poll rates, consumer counts, and regional pricing
-before selecting a future mode: strong reads approximately double metadata scan RRUs, while
-shorter recovery intervals or delayed-visibility horizons add rescans.
+before selecting strong reads: they approximately double metadata scan RRUs, while shorter
+recovery intervals or delayed-visibility horizons add rescans.
 
 ## Consumer Group Coordination
 
@@ -338,8 +323,8 @@ handoff time.
 During rebalance, an iterator stops delivering revoked partitions, discards their prefetched
 records, invokes the configured revocation callback, and waits for callback completion before
 activating the replacement assignment. A replacement owner hydrates its reader from the committed
-cursor, clears scan watermarks, and performs an unbounded lookback recovery scan before resuming
-the bounded fast path.
+cursor, source checkpoint, and legacy commit timestamp. It recovers through the fixed cutover
+within retention before enabling that partition's bounded fast path.
 
 ## Correctness and Failure Behavior
 
@@ -356,8 +341,8 @@ The design relies on these invariants:
 - Valid later batches for a virtual partition have `seq_end` greater than already processed
   batches, so cursors never regress.
 - A consumer lease generation fences stale ownership and stale cursor commits.
-- Recovery scans find late lower-snowflake metadata only while it remains inside the configured
-  scan horizon.
+- Resumed-partition recovery scans find late lower-snowflake metadata throughout the topic
+  retention horizon; fast-path rediscovery covers the derived publication and visibility horizon.
 
 These invariants prevent a consumer from treating an already committed cursor as unprocessed
 work, but they do not provide exactly-once delivery. Applications needing exactly-once effects

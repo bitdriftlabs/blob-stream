@@ -27,7 +27,9 @@ use sonyflake::Sonyflake;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Instant;
 use time::OffsetDateTime;
+use tokio::time::{Duration, timeout};
 
 //
 // SnowflakeGenerator
@@ -37,6 +39,7 @@ pub(super) struct SnowflakeGenerator {
   generator: Sonyflake,
 }
 
+use bd_time::TimeProvider;
 impl SnowflakeGenerator {
   pub(super) fn new() -> Result<Self> {
     let generator = Sonyflake::new().context("initialize sonyflake generator")?;
@@ -62,6 +65,7 @@ pub struct FlushContext {
   blob_store: Arc<dyn BlobStore>,
   metadata_store: Arc<dyn MetadataStore>,
   snowflake: Arc<SnowflakeGenerator>,
+  time_provider: Arc<dyn TimeProvider>,
 }
 
 impl FlushContext {
@@ -70,12 +74,14 @@ impl FlushContext {
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
     snowflake: SnowflakeGenerator,
+    time_provider: Arc<dyn TimeProvider>,
   ) -> Self {
     Self {
       config,
       blob_store,
       metadata_store,
       snowflake: Arc::new(snowflake),
+      time_provider,
     }
   }
 
@@ -145,8 +151,6 @@ impl FlushContext {
     let mut payload = BytesMut::new();
     let mut segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>> = HashMap::new();
     let mut record_count = 0_u64;
-    let mut min_event_ts_ms: Option<i64> = None;
-    let mut max_event_ts_ms: Option<i64> = None;
 
     for partition in partitions {
       trace!(
@@ -169,12 +173,6 @@ impl FlushContext {
         let end = payload.len() as u64;
 
         record_count = record_count.saturating_add(u64::from(summary.record_count));
-        min_event_ts_ms = min_event_ts_ms.map_or(Some(summary.min_event_ts_ms), |current| {
-          Some(current.min(summary.min_event_ts_ms))
-        });
-        max_event_ts_ms = max_event_ts_ms.map_or(Some(summary.max_event_ts_ms), |current| {
-          Some(current.max(summary.max_event_ts_ms))
-        });
 
         let metadata = BatchMetadata {
           seq_range,
@@ -190,18 +188,12 @@ impl FlushContext {
       }
     }
 
-    let min_event_ts_ms = min_event_ts_ms.unwrap_or(now_ts_ms);
-    let max_event_ts_ms = max_event_ts_ms.unwrap_or(now_ts_ms);
-
     let envelope = SegmentEnvelope {
       window: window.key(topic),
       snowflake_id,
       blob_key,
       segment_index,
-      compression,
       record_count,
-      min_event_ts_ms,
-      max_event_ts_ms,
       created_ts_ms: now_ts_ms,
     };
 
@@ -221,23 +213,42 @@ impl FlushContext {
     plan: &mut FlushPlan,
     now: OffsetDateTime,
   ) -> Result<(), WriteError> {
+    let publication_started_at = Instant::now();
     let partitions = std::mem::take(&mut plan.partitions);
     let (payload, envelope) = self.build_segment(&plan.topic, partitions, now)?;
-    let metadata = envelope.into_metadata();
     let payload_bytes = payload.len();
-    let record_count = metadata.record_count;
-    let partition_count = metadata.segment_index.len();
+    let record_count = envelope.record_count;
+    let partition_count = envelope.segment_index.len();
 
-    self
-      .blob_store
-      .put(&metadata.blob_key, payload)
-      .await
-      .context("write segment blob")?;
-    self
-      .metadata_store
-      .write_segment(metadata)
-      .await
-      .context("write segment metadata")?;
+    let publication_budget = Duration::from_millis(plan.max_metadata_publication_lag_ms);
+    let remaining_budget = publication_budget
+      .checked_sub(publication_started_at.elapsed())
+      .ok_or_else(|| {
+        anyhow::anyhow!(
+          "metadata publication exceeded {} ms before segment persistence",
+          plan.max_metadata_publication_lag_ms
+        )
+      })?;
+    timeout(remaining_budget, async {
+      self
+        .blob_store
+        .put(&envelope.blob_key, payload)
+        .await
+        .context("write segment blob")?;
+      let metadata = envelope.into_metadata(self.time_provider.now().unix_timestamp_ms());
+      self
+        .metadata_store
+        .write_segment(metadata)
+        .await
+        .context("write segment metadata")
+    })
+    .await
+    .map_err(|_| {
+      anyhow::anyhow!(
+        "metadata publication exceeded {} ms while persisting segment",
+        plan.max_metadata_publication_lag_ms
+      )
+    })??;
 
     debug!(
       "flush persisted segment: topic={}, partitions={partition_count}, records={record_count}, \

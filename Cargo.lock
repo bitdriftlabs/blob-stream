@@ -1539,6 +1539,7 @@ dependencies = [
  "blob-stream-types",
  "bytes",
  "ctor",
+ "protobuf 4.0.0-alpha.0",
  "serde_json",
  "tokio",
  "uuid",

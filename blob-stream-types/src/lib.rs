@@ -182,6 +182,19 @@ impl SeqRange {
 }
 
 //
+// CommittedSourceCheckpoint
+//
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Metadata source that produced a committed consumer cursor.
+pub struct CommittedSourceCheckpoint {
+  /// Window containing the segment metadata row.
+  pub window_start_unix_seconds: i64,
+  /// Segment metadata row identifier within the window.
+  pub snowflake_id: u64,
+}
+
+//
 // CommittedCursor
 //
 
@@ -192,6 +205,9 @@ pub struct CommittedCursor {
   pub virtual_partition_id: VirtualPartitionId,
   /// Highest fully processed sequence.
   pub seq_end: u64,
+  /// Metadata source checkpoint for retention-wide recovery.
+  #[serde(default)]
+  pub source_checkpoint: Option<CommittedSourceCheckpoint>,
 }
 
 //
