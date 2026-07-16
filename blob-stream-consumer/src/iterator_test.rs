@@ -2,6 +2,7 @@
 
 use super::{
   ConsumerCoordinationSource,
+  ConsumerDeliveryState,
   ConsumerIterator,
   ConsumerIteratorImpl,
   CoordinationSnapshot,
@@ -38,12 +39,125 @@ use bytes::Bytes;
 use protobuf::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep, timeout};
 
 struct MutableCoordinationSource {
   snapshot: Arc<Mutex<CoordinationSnapshot>>,
+}
+
+struct BlockingCoordinationSource {
+  snapshot: Arc<Mutex<CoordinationSnapshot>>,
+  block_snapshots: AtomicBool,
+  snapshot_calls: AtomicUsize,
+  snapshot_started: Arc<tokio::sync::Notify>,
+  snapshot_release: Arc<tokio::sync::Notify>,
+}
+
+impl BlockingCoordinationSource {
+  fn new(snapshot: CoordinationSnapshot) -> Self {
+    Self {
+      snapshot: Arc::new(Mutex::new(snapshot)),
+      block_snapshots: AtomicBool::new(false),
+      snapshot_calls: AtomicUsize::new(0),
+      snapshot_started: Arc::new(tokio::sync::Notify::new()),
+      snapshot_release: Arc::new(tokio::sync::Notify::new()),
+    }
+  }
+}
+
+#[async_trait::async_trait]
+impl ConsumerCoordinationSource for BlockingCoordinationSource {
+  async fn snapshot(&self) -> anyhow::Result<CoordinationSnapshot> {
+    self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+    if self.block_snapshots.load(Ordering::SeqCst) {
+      self.snapshot_started.notify_waiters();
+      self.snapshot_release.notified().await;
+    }
+    Ok(self.snapshot.lock().await.clone())
+  }
+}
+
+struct BlockingMembershipStore {
+  inner: InMemoryConsumerGroupMembershipStore,
+  block_heartbeats: AtomicBool,
+  heartbeat_calls: AtomicUsize,
+  heartbeat_started: Arc<tokio::sync::Notify>,
+  heartbeat_release: Arc<tokio::sync::Notify>,
+}
+
+impl BlockingMembershipStore {
+  fn new() -> Self {
+    Self {
+      inner: InMemoryConsumerGroupMembershipStore::new(),
+      block_heartbeats: AtomicBool::new(false),
+      heartbeat_calls: AtomicUsize::new(0),
+      heartbeat_started: Arc::new(tokio::sync::Notify::new()),
+      heartbeat_release: Arc::new(tokio::sync::Notify::new()),
+    }
+  }
+}
+
+#[async_trait::async_trait]
+impl ConsumerGroupMembershipStore for BlockingMembershipStore {
+  async fn register_member(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    now_ts_ms: i64,
+    ttl_ms: i64,
+  ) -> anyhow::Result<()> {
+    self
+      .inner
+      .register_member(topic, group_id, member_id, now_ts_ms, ttl_ms)
+      .await
+  }
+
+  async fn heartbeat_member(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+    now_ts_ms: i64,
+    ttl_ms: i64,
+  ) -> anyhow::Result<()> {
+    self.heartbeat_calls.fetch_add(1, Ordering::SeqCst);
+    if self.block_heartbeats.load(Ordering::SeqCst) {
+      self.heartbeat_started.notify_waiters();
+      self.heartbeat_release.notified().await;
+    }
+    self
+      .inner
+      .heartbeat_member(topic, group_id, member_id, now_ts_ms, ttl_ms)
+      .await
+  }
+
+  async fn deregister_member(
+    &self,
+    topic: &str,
+    group_id: &str,
+    member_id: &str,
+  ) -> anyhow::Result<()> {
+    self
+      .inner
+      .deregister_member(topic, group_id, member_id)
+      .await
+  }
+
+  async fn list_active_members(
+    &self,
+    topic: &str,
+    group_id: &str,
+    now_ts_ms: i64,
+  ) -> anyhow::Result<Vec<String>> {
+    self
+      .inner
+      .list_active_members(topic, group_id, now_ts_ms)
+      .await
+  }
 }
 
 impl MutableCoordinationSource {
@@ -151,17 +265,53 @@ fn runtime_config_with_prefetch_max_bytes(
 
 async fn wait_for_prefetch_buffer_len(iterator: &ConsumerIteratorImpl, expected_min: usize) {
   for _ in 0 .. 40 {
-    let len = iterator.prefetch_buffer.lock().await.batches.len();
+    let len = iterator
+      .diagnostics()
+      .expect("consumer implementation provides diagnostics")
+      .state_snapshot()
+      .await
+      .prefetch_buffered_batch_count;
     if len >= expected_min {
       return;
     }
     sleep(Duration::from_millis(25)).await;
   }
 
-  let len = iterator.prefetch_buffer.lock().await.batches.len();
+  let len = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_snapshot()
+    .await
+    .prefetch_buffered_batch_count;
   assert!(
     len >= expected_min,
     "prefetch buffer length {len} did not reach expected minimum {expected_min}"
+  );
+}
+
+async fn wait_for_active_assignment(iterator: &ConsumerIteratorImpl, expected_partitions: &[u32]) {
+  for _ in 0 .. 40 {
+    let mut active_assignment = iterator
+      .diagnostics()
+      .expect("consumer implementation provides diagnostics")
+      .state_snapshot()
+      .await
+      .active_assignment;
+    active_assignment.sort_unstable();
+    if active_assignment == expected_partitions {
+      return;
+    }
+    sleep(Duration::from_millis(25)).await;
+  }
+
+  let snapshot = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_snapshot()
+    .await;
+  panic!(
+    "active assignment {:?} did not reach expected assignment {expected_partitions:?}",
+    snapshot.active_assignment
   );
 }
 
@@ -198,7 +348,7 @@ async fn diagnostics_report_assignment_and_start_state() {
     .diagnostics()
     .expect("consumer implementation provides diagnostics");
   let snapshot = diagnostics.state_snapshot().await;
-  assert_eq!(snapshot.schema_version, 3);
+  assert_eq!(snapshot.schema_version, 6);
   assert!(snapshot.generated_at.ends_with('Z'));
   assert_eq!(snapshot.topic, "telemetry");
   assert_eq!(snapshot.group_id, "group-a");
@@ -209,6 +359,7 @@ async fn diagnostics_report_assignment_and_start_state() {
   assert_eq!(snapshot.prefetch_buffered_batch_count, 0);
 
   iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[0, 1]).await;
   let started_snapshot = diagnostics.state_snapshot().await;
   assert!(started_snapshot.started);
   assert!(started_snapshot.prefetch_worker_running);
@@ -267,6 +418,7 @@ async fn next_returns_revocation_until_completed() {
   .unwrap();
 
   iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[0, 1]).await;
 
   source
     .update(CoordinationSnapshot {
@@ -274,6 +426,28 @@ async fn next_returns_revocation_until_completed() {
       virtual_partitions: vec![0, 1],
     })
     .await;
+
+  for _ in 0 .. 40 {
+    if iterator
+      .diagnostics()
+      .expect("consumer implementation provides diagnostics")
+      .state_snapshot()
+      .await
+      .pending_revocation
+    {
+      break;
+    }
+    sleep(Duration::from_millis(25)).await;
+  }
+  assert!(
+    iterator
+      .diagnostics()
+      .expect("consumer implementation provides diagnostics")
+      .state_snapshot()
+      .await
+      .pending_revocation,
+    "expected autonomous rebalance to request revocation"
+  );
 
   let revoked = iterator.next().await.unwrap();
   let revoked = match revoked {
@@ -284,16 +458,14 @@ async fn next_returns_revocation_until_completed() {
   let revoked_partitions = revoked.partitions();
   assert_eq!(revoked_partitions.len(), 1);
 
-  let result = iterator.next().await;
-  assert!(result.is_err());
-  let error = result.err().unwrap();
   assert!(
-    error
-      .to_string()
-      .contains("revocation callback must be completed")
+    timeout(Duration::from_millis(50), iterator.next())
+      .await
+      .is_err()
   );
 
   revoked.complete().await;
+  Box::new(iterator).shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -494,7 +666,12 @@ async fn prefetch_soft_budget_pauses_and_resumes_after_drain() {
   iterator.start().unwrap();
 
   wait_for_prefetch_buffer_len(&iterator, 1).await;
-  let buffered_before = iterator.prefetch_buffer.lock().await.batches.len();
+  let buffered_before = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_snapshot()
+    .await
+    .prefetch_buffered_batch_count;
   assert_eq!(buffered_before, 1);
 
   let first = timeout(Duration::from_secs(2), iterator.next())
@@ -510,7 +687,12 @@ async fn prefetch_soft_budget_pauses_and_resumes_after_drain() {
 
   // Drain should allow worker to admit another pending batch.
   wait_for_prefetch_buffer_len(&iterator, 1).await;
-  let buffered_after = iterator.prefetch_buffer.lock().await.batches.len();
+  let buffered_after = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_snapshot()
+    .await
+    .prefetch_buffered_batch_count;
   assert_eq!(buffered_after, 1);
 
   Box::new(iterator).shutdown().await.unwrap();
@@ -585,6 +767,28 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
     })
     .await;
 
+  for _ in 0 .. 40 {
+    if iterator
+      .diagnostics()
+      .expect("consumer implementation provides diagnostics")
+      .state_snapshot()
+      .await
+      .pending_revocation
+    {
+      break;
+    }
+    sleep(Duration::from_millis(25)).await;
+  }
+  assert!(
+    iterator
+      .diagnostics()
+      .expect("consumer implementation provides diagnostics")
+      .state_snapshot()
+      .await
+      .pending_revocation,
+    "expected autonomous rebalance to request revocation"
+  );
+
   let revoked = iterator.next().await.unwrap();
   let revoked = match revoked {
     NextResult::Revoked(revoked) => revoked,
@@ -594,17 +798,231 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
   assert_eq!(revoked_partitions.len(), 1);
   let revoked_partition = revoked_partitions[0];
 
-  {
-    let buffer = iterator.prefetch_buffer.lock().await;
-    assert!(
-      buffer
-        .batches
-        .iter()
-        .all(|batch| batch.virtual_partition_id != revoked_partition),
-      "revoked partition batch was not removed from prefetch buffer"
-    );
-  }
+  let snapshot = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_snapshot()
+    .await;
+  assert!(
+    snapshot
+      .prefetch_buffered_partitions
+      .iter()
+      .all(|partition| *partition != revoked_partition),
+    "revoked partition batch was not removed from prefetch buffer"
+  );
 
   revoked.complete().await;
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store = Arc::new(BlockingMembershipStore::new());
+  membership_store
+    .block_heartbeats
+    .store(true, Ordering::SeqCst);
+  let heartbeat_started = membership_store.heartbeat_started.clone();
+
+  let mut runtime = runtime_config();
+  runtime.group.as_mut().unwrap().heartbeat_interval_ms = Some(60_000);
+  runtime.group.as_mut().unwrap().rebalance_interval_ms = Some(60_000);
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![0],
+    }));
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+    &runtime,
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store.clone(),
+    source,
+    metrics_scope(),
+  )
+  .await
+  .unwrap();
+
+  let heartbeat_wait = heartbeat_started.notified();
+  iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[0]).await;
+  timeout(Duration::from_secs(1), heartbeat_wait)
+    .await
+    .unwrap();
+
+  for _ in 0 .. 8 {
+    tokio::select! {
+      () = tokio::task::yield_now() => {},
+      _ = iterator.next() => panic!("cancelled poll unexpectedly completed"),
+    }
+  }
+
+  membership_store
+    .block_heartbeats
+    .store(false, Ordering::SeqCst);
+  membership_store.heartbeat_release.notify_waiters();
+  for _ in 0 .. 40 {
+    let snapshot = iterator
+      .diagnostics()
+      .expect("consumer implementation provides diagnostics")
+      .state_snapshot()
+      .await;
+    if snapshot.last_successful_heartbeat_at.is_some() {
+      break;
+    }
+    sleep(Duration::from_millis(25)).await;
+  }
+
+  assert_eq!(membership_store.heartbeat_calls.load(Ordering::SeqCst), 1);
+  let snapshot = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_snapshot()
+    .await;
+  assert!(snapshot.last_successful_heartbeat_at.is_some());
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_next_does_not_restart_rebalance() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source = Arc::new(BlockingCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![0],
+  }));
+
+  let mut runtime = runtime_config();
+  runtime.group.as_mut().unwrap().heartbeat_interval_ms = Some(60_000);
+  runtime.group.as_mut().unwrap().rebalance_interval_ms = Some(60_000);
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+    &runtime,
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source.clone(),
+    metrics_scope(),
+  )
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[0]).await;
+  source.block_snapshots.store(true, Ordering::SeqCst);
+  let rebalance_started = source.snapshot_started.notified();
+
+  tokio::select! {
+    () = rebalance_started => {},
+    _ = iterator.next() => panic!("cancelled poll unexpectedly completed"),
+  }
+
+  source.snapshot_release.notify_waiters();
+  for _ in 0 .. 40 {
+    if source.snapshot_calls.load(Ordering::SeqCst) == 2 {
+      break;
+    }
+    sleep(Duration::from_millis(25)).await;
+  }
+
+  assert_eq!(source.snapshot_calls.load(Ordering::SeqCst), 2);
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_next_preserves_prefetched_record() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let now_window = (SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap()
+    .as_secs()
+    .try_into()
+    .unwrap_or(i64::MAX)
+    / 300)
+    * 300;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    now_window,
+    1,
+    3,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![1, 2, 3], now_window * 1_000)],
+  )
+  .await;
+
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![3],
+    }));
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+  )
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  wait_for_prefetch_buffer_len(&iterator, 1).await;
+  for _ in 0 .. 40 {
+    if iterator
+      .diagnostics()
+      .expect("consumer implementation provides diagnostics")
+      .state_snapshot()
+      .await
+      .delivery_state
+      == ConsumerDeliveryState::Pending
+    {
+      break;
+    }
+    sleep(Duration::from_millis(25)).await;
+  }
+  assert_eq!(
+    iterator
+      .diagnostics()
+      .expect("consumer implementation provides diagnostics")
+      .state_snapshot()
+      .await
+      .delivery_state,
+    ConsumerDeliveryState::Pending
+  );
+
+  tokio::select! {
+    biased;
+    () = async {} => {},
+    _ = iterator.next() => panic!("cancelled poll unexpectedly received the ready record"),
+  }
+
+  let next = timeout(Duration::from_secs(1), iterator.next())
+    .await
+    .unwrap()
+    .unwrap();
+  let record = match next {
+    NextResult::Record(record) => record,
+    NextResult::Revoked(_) => panic!("expected record"),
+  };
+  assert_eq!(record.virtual_partition_id, 3);
+  assert_eq!(record.offset, 1);
+  assert_eq!(record.record.payload.to_vec(), vec![1, 2, 3]);
   Box::new(iterator).shutdown().await.unwrap();
 }
