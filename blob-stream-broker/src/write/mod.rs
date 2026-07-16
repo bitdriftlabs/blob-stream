@@ -42,6 +42,7 @@ pub use config::{TopicInfo, WriteConfig, build_write_engine};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use log::{error, trace};
+use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,12 +50,12 @@ use std::time::{Duration as StdDuration, Instant};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::ext::NumericalDuration;
-use tokio::sync::{Mutex, Notify, oneshot, watch};
+use tokio::sync::futures::OwnedNotified;
+use tokio::sync::{Notify, oneshot, watch};
 
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
 const MAX_IN_FLIGHT_FLUSH_PLANS: usize = 4;
 type FlushCompletion = oneshot::Sender<Result<(), String>>;
-type PartitionStateHandle = Arc<Mutex<PartitionState>>;
 
 //
 // WriteRequest
@@ -167,6 +168,8 @@ pub struct BrokerTopicStateSnapshot {
 pub struct BrokerPartitionStateSnapshot {
   pub virtual_partition_id: VirtualPartitionId,
   pub lease_expires_at: Option<String>,
+  pub allocation_in_flight: bool,
+  pub allocation_started_at: Option<String>,
   pub buffered_batch_count: usize,
   pub buffered_record_count: usize,
   pub buffered_bytes: u64,
@@ -231,6 +234,9 @@ impl WriteError {
 pub trait WriteEngine: Send + Sync {
   /// Ingest a single batch into the broker write path.
   async fn produce_batch(&self, request: WriteRequest) -> Result<WriteResponse, WriteError>;
+
+  /// Returns the maximum time an incoming produce RPC may wait for this engine.
+  fn produce_request_timeout(&self) -> StdDuration;
 
   /// Returns a best-effort snapshot of state held by this broker process.
   async fn state_snapshot(&self) -> BrokerStateSnapshot;
@@ -534,8 +540,7 @@ impl WriteEngineImpl {
           flush_context.config(),
           &topics,
           available_slots,
-        )
-        .await;
+        );
 
         if !plans.is_empty() {
           metrics.record_flush_plan_summary(&plans);
@@ -612,64 +617,109 @@ impl WriteEngine for WriteEngineImpl {
 
     let summary = RecordBatch::summary_from_records(&request.records)
       .ok_or_else(|| anyhow!("failed to summarize record batch"))?;
+    let topic = request.topic;
+    let virtual_partition_id = request.virtual_partition_id;
+    let mut records = Some(request.records);
+    let mut summary = Some(summary);
+    let record_count = records
+      .as_ref()
+      .map(|records| records.len() as u64)
+      .unwrap_or_default();
 
-    let now = self.time_provider.now();
-    let now_ts_ms = now.unix_timestamp_ms();
-    let partition_state = {
-      let mut state = self.state.lock().await;
-      state.partition_state(&request.topic, request.virtual_partition_id)
+    let (completion_rx, seq_range) = loop {
+      let now_ts_ms = self.time_provider.now().unix_timestamp_ms();
+      let buffered = {
+        let mut state = self.state.lock();
+        let partition_state = state.partition_state_mut(&topic, virtual_partition_id);
+        if partition_state.draining {
+          return Err(WriteError::NotLeaseHolder {
+            topic,
+            virtual_partition_id,
+          });
+        }
+
+        if partition_state.allocation_in_flight
+          || partition_state.needs_lease(now_ts_ms)
+          || !partition_state.seq_allocator.can_allocate(record_count)
+        {
+          None
+        } else {
+          let (completion_tx, completion_rx) = oneshot::channel();
+          let seq_range = partition_state
+            .seq_allocator
+            .allocate(record_count)
+            .ok_or_else(|| WriteError::Overloaded("sequence reservation exhausted".to_string()))?;
+          partition_state.buffer.push(
+            BufferedBatch {
+              records: records.take().expect("records are buffered only once"),
+              summary: summary.take().expect("summary is buffered only once"),
+              seq_range: seq_range.clone(),
+              completion: Some(completion_tx),
+            },
+            now_ts_ms,
+          );
+          Some((completion_rx, seq_range))
+        }
+      };
+      if let Some(buffered) = buffered {
+        break buffered;
+      }
+
+      let decision = begin_allocation_transition(
+        &self.state,
+        &topic,
+        virtual_partition_id,
+        record_count,
+        now_ts_ms,
+        false,
+      );
+      match decision {
+        AllocationTransitionDecision::Draining => {
+          return Err(WriteError::NotLeaseHolder {
+            topic,
+            virtual_partition_id,
+          });
+        },
+        AllocationTransitionDecision::Ready => {},
+        AllocationTransitionDecision::Waiting(notified) => notified.await,
+        AllocationTransitionDecision::Claimed(work) => {
+          let mut lease_expiration = LeaseExpirationUpdate::Preserve;
+          // Sequence reservation is conditionally accepted only for the current active lease
+          // holder. When acquisition is required, the lease may be absent or expired, so it must
+          // complete before reserving sequences; these calls cannot be run in parallel.
+          if work.needs_lease {
+            match self
+              .ensure_lease(&topic, virtual_partition_id, now_ts_ms)
+              .await
+            {
+              Ok(expires_at) => lease_expiration = LeaseExpirationUpdate::Set(Some(expires_at)),
+              Err(error) => {
+                work
+                  .transition
+                  .finish(LeaseExpirationUpdate::Preserve, None);
+                return Err(error);
+              },
+            }
+          }
+
+          let mut reservation = None;
+          if work.needs_reservation {
+            match self
+              .reserve_sequences(&topic, virtual_partition_id, now_ts_ms)
+              .await
+            {
+              Ok(range) => reservation = Some(range),
+              Err(error) => {
+                work.transition.finish(lease_expiration, None);
+                return Err(error);
+              },
+            }
+          }
+          work.transition.finish(lease_expiration, reservation);
+        },
+      }
     };
-    let mut partition_state = partition_state.lock().await;
 
-    if partition_state.draining {
-      return Err(WriteError::NotLeaseHolder {
-        topic: request.topic,
-        virtual_partition_id: request.virtual_partition_id,
-      });
-    }
-
-    let needs_lease = partition_state.needs_lease(now_ts_ms);
-
-    if needs_lease {
-      let expires_at = self
-        .ensure_lease(&request.topic, request.virtual_partition_id, now_ts_ms)
-        .await?;
-      partition_state.lease_expiration_ts_ms = Some(expires_at);
-    }
-
-    let record_count = request.records.len() as u64;
-    let needs_reservation = !partition_state.seq_allocator.can_allocate(record_count);
-
-    if needs_reservation {
-      let range = self
-        .reserve_sequences(&request.topic, request.virtual_partition_id, now_ts_ms)
-        .await?;
-      partition_state.seq_allocator.set_reservation(range);
-    }
-
-    let (completion_tx, completion_rx) = oneshot::channel();
-
-    // We should normally have capacity because we reserve when `can_allocate(record_count)` is
-    // false above, and the lease-assignment loop also proactively tops up. This can still fail
-    // if ownership changed or local reservation state was invalidated concurrently.
-    let seq_range = partition_state
-      .seq_allocator
-      .allocate(record_count)
-      // TODO(mattklein123): Consider a single inline re-reserve + allocate retry here before
-      // returning OVERLOADED. That would reduce transient write failures during rapid
-      // reservation turnover while preserving lease fencing.
-      .ok_or_else(|| WriteError::Overloaded("sequence reservation exhausted".to_string()))?;
-
-    partition_state.buffer.push(
-      BufferedBatch {
-        records: request.records,
-        summary,
-        seq_range: seq_range.clone(),
-        completion: Some(completion_tx),
-      },
-      now_ts_ms,
-    );
-    drop(partition_state);
     self.flush_notifier.notify_one();
 
     match completion_rx.await {
@@ -705,15 +755,53 @@ impl WriteEngine for WriteEngineImpl {
     Ok(WriteResponse { seq_range })
   }
 
+  fn produce_request_timeout(&self) -> StdDuration {
+    self.config.produce_request_timeout()
+  }
+
   async fn state_snapshot(&self) -> BrokerStateSnapshot {
     let generated_at_ts_ms = self.time_provider.now().unix_timestamp_ms();
     let generated_at = format_unix_timestamp_ms(generated_at_ts_ms);
-    let (membership, partition_states) = {
-      let state = self.state.lock().await;
-      (
-        state.membership.clone(),
-        state.partition_states_for_all_topics(),
-      )
+    let (membership, mut local_partitions_by_topic) = {
+      let state = self.state.lock();
+      let mut local_partitions_by_topic = HashMap::new();
+      for (topic, topic_state) in &state.topics {
+        for (virtual_partition_id, partition_state) in &topic_state.partitions {
+          local_partitions_by_topic
+            .entry(topic.clone())
+            .or_insert_with(Vec::new)
+            .push(BrokerPartitionStateSnapshot {
+              virtual_partition_id: *virtual_partition_id,
+              lease_expires_at: partition_state
+                .lease_expiration_ts_ms
+                .map(format_unix_timestamp_ms),
+              allocation_in_flight: partition_state.allocation_in_flight,
+              allocation_started_at: partition_state
+                .allocation_started_ts_ms
+                .map(format_unix_timestamp_ms),
+              buffered_batch_count: partition_state.buffer.batches.len(),
+              buffered_record_count: partition_state
+                .buffer
+                .batches
+                .iter()
+                .map(|batch| batch.records.len())
+                .sum(),
+              buffered_bytes: partition_state.buffer.buffered_bytes,
+              first_buffered_at: partition_state
+                .buffer
+                .first_buffered_ts_ms
+                .map(format_unix_timestamp_ms),
+              sequence_reservation: partition_state.seq_allocator.reservation.as_ref().map(
+                |reservation| SequenceReservationSnapshot {
+                  start: reservation.start,
+                  end: reservation.end,
+                },
+              ),
+              next_sequence: partition_state.seq_allocator.next_seq,
+            });
+        }
+      }
+      (state.membership.clone(), local_partitions_by_topic)
     };
     let mut membership_snapshot = membership
       .nodes
@@ -729,39 +817,6 @@ impl WriteEngine for WriteEngineImpl {
         .cmp(&right.node_id)
         .then_with(|| left.address.cmp(&right.address))
     });
-
-    let mut local_partitions_by_topic = HashMap::new();
-    for (topic, virtual_partition_id, partition_state) in partition_states {
-      let partition_state = partition_state.lock().await;
-      local_partitions_by_topic
-        .entry(topic)
-        .or_insert_with(Vec::new)
-        .push(BrokerPartitionStateSnapshot {
-          virtual_partition_id,
-          lease_expires_at: partition_state
-            .lease_expiration_ts_ms
-            .map(format_unix_timestamp_ms),
-          buffered_batch_count: partition_state.buffer.batches.len(),
-          buffered_record_count: partition_state
-            .buffer
-            .batches
-            .iter()
-            .map(|batch| batch.records.len())
-            .sum(),
-          buffered_bytes: partition_state.buffer.buffered_bytes,
-          first_buffered_at: partition_state
-            .buffer
-            .first_buffered_ts_ms
-            .map(format_unix_timestamp_ms),
-          sequence_reservation: partition_state.seq_allocator.reservation.as_ref().map(
-            |reservation| SequenceReservationSnapshot {
-              start: reservation.start,
-              end: reservation.end,
-            },
-          ),
-          next_sequence: partition_state.seq_allocator.next_seq,
-        });
-    }
 
     let mut topics = self
       .topics
@@ -869,7 +924,7 @@ impl WriteEngine for WriteEngineImpl {
     });
 
     BrokerStateSnapshot {
-      schema_version: 3,
+      schema_version: 4,
       generated_at,
       holder_id: self.holder_id.clone(),
       writer_id: self.config.writer_id,
@@ -912,7 +967,7 @@ async fn flush_plan_and_notify(
   metrics
     .flush_latency_seconds
     .observe(flush_started.elapsed().as_secs_f64());
-  mark_flush_complete(state, &topic, &flushed_partitions).await;
+  mark_flush_complete(state, &topic, &flushed_partitions);
   let completion_result = result
     .as_ref()
     .map_or_else(|error| Err(error.to_string()), |_ok| Ok(()));
@@ -921,23 +976,30 @@ async fn flush_plan_and_notify(
   }
 }
 
-async fn mark_flush_complete(
+fn mark_flush_complete(
   state: &Arc<Mutex<WriteState>>,
   topic: &str,
   virtual_partition_ids: &[VirtualPartitionId],
 ) {
-  let partition_states = {
-    let state = state.lock().await;
-    state.partition_states(topic, virtual_partition_ids)
-  };
-  for partition_state in partition_states {
-    let mut partition_state = partition_state.lock().await;
-    partition_state.flush_in_flight = false;
-    partition_state.drain_notify.notify_waiters();
+  let mut drain_notifiers = Vec::new();
+  {
+    let mut state = state.lock();
+    for virtual_partition_id in virtual_partition_ids {
+      let Some(partition_state) =
+        state.partition_state_mut_if_present(topic, *virtual_partition_id)
+      else {
+        continue;
+      };
+      partition_state.flush_in_flight = false;
+      drain_notifiers.push(Arc::clone(&partition_state.drain_notify));
+    }
+  }
+  for drain_notify in drain_notifiers {
+    drain_notify.notify_waiters();
   }
 }
 
-async fn collect_flush_plans(
+fn collect_flush_plans(
   state: &Arc<Mutex<WriteState>>,
   now_ts_ms: i64,
   config: &WriteConfig,
@@ -947,25 +1009,21 @@ async fn collect_flush_plans(
   if max_plans == 0 {
     return Vec::new();
   }
-  let (mut partition_states, last_flush_topic) = {
-    let state = state.lock().await;
-    (
-      state.partition_states_for_all_topics(),
-      state.last_flush_topic.clone(),
-    )
-  };
-  partition_states.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+  let mut state = state.lock();
+  let mut partition_keys = state.partition_keys();
+  partition_keys.sort_unstable();
+  let last_flush_topic = state.last_flush_topic.clone();
   let start = last_flush_topic.as_ref().map_or(0, |last_topic| {
-    partition_states
+    partition_keys
       .iter()
-      .position(|(topic, ..)| topic > last_topic)
+      .position(|(topic, _)| topic > last_topic)
       .unwrap_or(0)
   });
-  let partition_state_count = partition_states.len();
+  let partition_state_count = partition_keys.len();
   let mut plans_by_topic: HashMap<String, Vec<FlushPartition>> = HashMap::new();
   let mut last_planned_topic = None;
 
-  for (topic, virtual_partition_id, partition_state) in partition_states
+  for (topic, virtual_partition_id) in partition_keys
     .iter()
     .cycle()
     .skip(start)
@@ -982,7 +1040,10 @@ async fn collect_flush_plans(
     if is_new_topic && plans_by_topic.len() == max_plans {
       continue;
     }
-    let mut partition_state = partition_state.lock().await;
+    let Some(partition_state) = state.partition_state_mut_if_present(topic, *virtual_partition_id)
+    else {
+      continue;
+    };
     if partition_state.flush_in_flight
       || (!partition_state.draining && !partition_state.buffer.should_flush(now_ts_ms, config))
     {
@@ -1012,7 +1073,7 @@ async fn collect_flush_plans(
   }
 
   if let Some(last_planned_topic) = last_planned_topic {
-    state.lock().await.last_flush_topic = Some(last_planned_topic);
+    state.last_flush_topic = Some(last_planned_topic);
   }
 
   plans_by_topic
@@ -1040,54 +1101,51 @@ struct WriteState {
 }
 
 impl WriteState {
-  fn partition_state(
+  fn partition_state_mut(
     &mut self,
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
-  ) -> PartitionStateHandle {
-    Arc::clone(
-      self
-        .topics
-        .entry(topic.to_string())
-        .or_default()
-        .partitions
-        .entry(virtual_partition_id)
-        .or_insert_with(|| Arc::new(Mutex::new(PartitionState::default()))),
-    )
+  ) -> &mut PartitionState {
+    self
+      .topics
+      .entry(topic.to_string())
+      .or_default()
+      .partitions
+      .entry(virtual_partition_id)
+      .or_default()
   }
 
-  fn partition_states(
+  fn partition_state(
     &self,
     topic: &str,
-    virtual_partition_ids: &[VirtualPartitionId],
-  ) -> Vec<PartitionStateHandle> {
-    let Some(topic_state) = self.topics.get(topic) else {
-      return Vec::new();
-    };
-    virtual_partition_ids
-      .iter()
-      .filter_map(|virtual_partition_id| topic_state.partitions.get(virtual_partition_id))
-      .cloned()
-      .collect()
+    virtual_partition_id: VirtualPartitionId,
+  ) -> Option<&PartitionState> {
+    self
+      .topics
+      .get(topic)
+      .and_then(|topic_state| topic_state.partitions.get(&virtual_partition_id))
   }
 
-  fn partition_states_for_all_topics(
-    &self,
-  ) -> Vec<(String, VirtualPartitionId, PartitionStateHandle)> {
+  fn partition_state_mut_if_present(
+    &mut self,
+    topic: &str,
+    virtual_partition_id: VirtualPartitionId,
+  ) -> Option<&mut PartitionState> {
+    self
+      .topics
+      .get_mut(topic)
+      .and_then(|topic_state| topic_state.partitions.get_mut(&virtual_partition_id))
+  }
+
+  fn partition_keys(&self) -> Vec<(String, VirtualPartitionId)> {
     self
       .topics
       .iter()
       .flat_map(|(topic, topic_state)| {
         topic_state
           .partitions
-          .iter()
-          .map(|(virtual_partition_id, partition_state)| {
-            (
-              topic.clone(),
-              *virtual_partition_id,
-              Arc::clone(partition_state),
-            )
-          })
+          .keys()
+          .map(|virtual_partition_id| (topic.clone(), *virtual_partition_id))
       })
       .collect()
   }
@@ -1099,7 +1157,7 @@ impl WriteState {
 
 #[derive(Debug, Default)]
 struct TopicState {
-  partitions: HashMap<VirtualPartitionId, PartitionStateHandle>,
+  partitions: HashMap<VirtualPartitionId, PartitionState>,
 }
 
 //
@@ -1112,6 +1170,9 @@ struct PartitionState {
   seq_allocator: SeqAllocator,
   lease_expiration_ts_ms: Option<i64>,
   flush_in_flight: bool,
+  allocation_in_flight: bool,
+  allocation_started_ts_ms: Option<i64>,
+  allocation_notify: Arc<Notify>,
   draining: bool,
   drain_notify: Arc<Notify>,
 }
@@ -1124,8 +1185,135 @@ impl PartitionState {
   }
 
   fn is_drained(&self) -> bool {
-    !self.flush_in_flight && self.buffer.batches.is_empty()
+    !self.flush_in_flight && !self.allocation_in_flight && self.buffer.batches.is_empty()
   }
+}
+
+//
+// AllocationTransition
+//
+
+struct AllocationTransition {
+  state: Arc<Mutex<WriteState>>,
+  topic: String,
+  virtual_partition_id: VirtualPartitionId,
+  finished: bool,
+}
+
+impl AllocationTransition {
+  fn finish(
+    mut self,
+    lease_expiration_update: LeaseExpirationUpdate,
+    reservation: Option<SeqRange>,
+  ) {
+    self.finish_inner(lease_expiration_update, reservation);
+  }
+
+  fn finish_inner(
+    &mut self,
+    lease_expiration_update: LeaseExpirationUpdate,
+    reservation: Option<SeqRange>,
+  ) {
+    if self.finished {
+      return;
+    }
+
+    let (allocation_notify, drain_notify) = {
+      let mut state = self.state.lock();
+      let partition_state = state.partition_state_mut(&self.topic, self.virtual_partition_id);
+      if let LeaseExpirationUpdate::Set(lease_expiration_ts_ms) = lease_expiration_update {
+        partition_state.lease_expiration_ts_ms = lease_expiration_ts_ms;
+      }
+      if let Some(reservation) = reservation {
+        partition_state.seq_allocator.set_reservation(reservation);
+      }
+      partition_state.allocation_in_flight = false;
+      partition_state.allocation_started_ts_ms = None;
+      (
+        Arc::clone(&partition_state.allocation_notify),
+        Arc::clone(&partition_state.drain_notify),
+      )
+    };
+    self.finished = true;
+    allocation_notify.notify_waiters();
+    drain_notify.notify_waiters();
+  }
+}
+
+impl Drop for AllocationTransition {
+  fn drop(&mut self) {
+    self.finish_inner(LeaseExpirationUpdate::Preserve, None);
+  }
+}
+
+//
+// LeaseExpirationUpdate
+//
+
+#[derive(Clone, Copy)]
+enum LeaseExpirationUpdate {
+  Preserve,
+  Set(Option<i64>),
+}
+
+//
+// AllocationTransitionWork
+//
+
+struct AllocationTransitionWork {
+  transition: AllocationTransition,
+  needs_lease: bool,
+  needs_reservation: bool,
+}
+
+//
+// AllocationTransitionDecision
+//
+
+enum AllocationTransitionDecision {
+  Draining,
+  Ready,
+  Waiting(OwnedNotified),
+  Claimed(AllocationTransitionWork),
+}
+
+fn begin_allocation_transition(
+  state: &Arc<Mutex<WriteState>>,
+  topic: &str,
+  virtual_partition_id: VirtualPartitionId,
+  record_count: u64,
+  now_ts_ms: i64,
+  renew_lease: bool,
+) -> AllocationTransitionDecision {
+  let mut state_guard = state.lock();
+  let partition_state = state_guard.partition_state_mut(topic, virtual_partition_id);
+  if partition_state.draining {
+    return AllocationTransitionDecision::Draining;
+  }
+  if partition_state.allocation_in_flight {
+    return AllocationTransitionDecision::Waiting(
+      Arc::clone(&partition_state.allocation_notify).notified_owned(),
+    );
+  }
+
+  let needs_lease = renew_lease || partition_state.needs_lease(now_ts_ms);
+  let needs_reservation = !partition_state.seq_allocator.can_allocate(record_count);
+  if !needs_lease && !needs_reservation {
+    return AllocationTransitionDecision::Ready;
+  }
+
+  partition_state.allocation_in_flight = true;
+  partition_state.allocation_started_ts_ms = Some(now_ts_ms);
+  AllocationTransitionDecision::Claimed(AllocationTransitionWork {
+    transition: AllocationTransition {
+      state: Arc::clone(state),
+      topic: topic.to_string(),
+      virtual_partition_id,
+      finished: false,
+    },
+    needs_lease,
+    needs_reservation,
+  })
 }
 
 //

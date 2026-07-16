@@ -1453,6 +1453,7 @@ dependencies = [
  "http 1.4.2",
  "log",
  "mockall",
+ "parking_lot",
  "prometheus",
  "protobuf 4.0.0-alpha.0",
  "protobuf-json-mapping",

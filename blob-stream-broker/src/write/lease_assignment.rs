@@ -107,7 +107,7 @@ impl WriteEngineImpl {
 
         let membership = membership_rx.borrow().clone();
         {
-          let mut guard = state.lock().await;
+          let mut guard = state.lock();
           guard.membership = membership.clone();
         }
         let owned = Self::owned_virtual_partitions(&topics, writer_id, &holder_id, &membership);
@@ -170,11 +170,6 @@ impl WriteEngineImpl {
         previously_assigned = currently_owned;
 
         for (topic, virtual_partition_id) in owned {
-          let partition_state = {
-            let mut state = state.lock().await;
-            state.partition_state(&topic, virtual_partition_id)
-          };
-          let mut partition_state = partition_state.lock().await;
           let key = ProducerPartitionLeaseKey {
             topic: topic.clone(),
             virtual_partition_id,
@@ -182,72 +177,89 @@ impl WriteEngineImpl {
 
           let now = time_provider.now();
           let now_ts_ms = now.unix_timestamp_ms();
+          let transition = loop {
+            match super::begin_allocation_transition(
+              &state,
+              &topic,
+              virtual_partition_id,
+              1,
+              now_ts_ms,
+              true,
+            ) {
+              super::AllocationTransitionDecision::Draining => break None,
+              super::AllocationTransitionDecision::Ready => {
+                unreachable!("lease renewal always needs an allocation transition")
+              },
+              super::AllocationTransitionDecision::Waiting(notified) => notified.await,
+              super::AllocationTransitionDecision::Claimed(transition) => break Some(transition),
+            }
+          };
+          let Some(transition) = transition else {
+            continue;
+          };
 
-          let acquired = match lease_store
+          match lease_store
             .acquire_lease(key.clone(), holder_id.clone(), now_ts_ms, lease_duration_ms)
             .await
           {
             Ok(LeaseAcquireOutcome::Acquired(lease)) => {
-              partition_state.lease_expiration_ts_ms = Some(lease.lease_expiration_ts_ms);
-              partition_state.draining = false;
-              true
+              let mut reservation = None;
+              if transition.needs_reservation {
+                let reservation_started = std::time::Instant::now();
+                let reservation_outcome = lease_store
+                  .reserve_sequences(&key, &holder_id, now_ts_ms, reservation_size)
+                  .await;
+                metrics
+                  .sequence_reservation_latency_seconds
+                  .observe(reservation_started.elapsed().as_secs_f64());
+                match reservation_outcome {
+                  Ok(SequenceReservationOutcome::Reserved(reserved)) => {
+                    metrics.record_sequence_reservation(&reserved.range);
+                    reservation = Some(reserved.range);
+                  },
+                  Ok(
+                    SequenceReservationOutcome::HeldByOther(_)
+                    | SequenceReservationOutcome::Expired,
+                  ) => {
+                    metrics.sequence_reservation_failures_total.inc();
+                    // Foreground writes will re-attempt allocation and return NOT_LEASE_HOLDER if
+                    // ownership has moved before the next maintenance pass.
+                  },
+                  Err(error) => {
+                    metrics.sequence_reservation_failures_total.inc();
+                    warn_every!(
+                      15.seconds(),
+                      "lease self-assignment reserve failed: {error}"
+                    );
+                  },
+                }
+              }
+              transition.transition.finish(
+                super::LeaseExpirationUpdate::Set(Some(lease.lease_expiration_ts_ms)),
+                reservation,
+              );
+              {
+                let mut state = state.lock();
+                if let Some(partition_state) =
+                  state.partition_state_mut_if_present(&topic, virtual_partition_id)
+                {
+                  partition_state.draining = false;
+                }
+              }
             },
             Ok(LeaseAcquireOutcome::HeldByOther(_)) => {
-              partition_state.lease_expiration_ts_ms = None;
-              false
+              transition
+                .transition
+                .finish(super::LeaseExpirationUpdate::Set(None), None);
             },
             Err(error) => {
               warn_every!(
                 15.seconds(),
                 "lease self-assignment acquire failed: {error}"
               );
-              false
-            },
-          };
-
-          if !acquired {
-            continue;
-          }
-
-          let needs_reservation = {
-            // Background maintenance only tops up when we cannot allocate even a single record.
-            // This keeps steady-state churn low while ensuring foreground writes usually find
-            // capacity already available.
-            !partition_state.seq_allocator.can_allocate(1)
-          };
-
-          if !needs_reservation {
-            continue;
-          }
-
-          let reservation_started = std::time::Instant::now();
-          let reservation_outcome = lease_store
-            .reserve_sequences(&key, &holder_id, now_ts_ms, reservation_size)
-            .await;
-          metrics
-            .sequence_reservation_latency_seconds
-            .observe(reservation_started.elapsed().as_secs_f64());
-          match reservation_outcome {
-            Ok(SequenceReservationOutcome::Reserved(reservation)) => {
-              metrics.record_sequence_reservation(&reservation.range);
-              partition_state
-                .seq_allocator
-                .set_reservation(reservation.range);
-            },
-            Ok(
-              SequenceReservationOutcome::HeldByOther(_) | SequenceReservationOutcome::Expired,
-            ) => {
-              metrics.sequence_reservation_failures_total.inc();
-              // If reservation cannot be extended here, we do not fail the loop. Foreground
-              // writes will attempt lease+reservation again in `produce_batch`; if ownership has
-              // moved, those writes return NOT_LEASE_HOLDER and producers re-route.
-            },
-            Err(error) => {
-              metrics.sequence_reservation_failures_total.inc();
-              warn_every!(
-                15.seconds(),
-                "lease self-assignment reserve failed: {error}"
-              );
+              transition
+                .transition
+                .finish(super::LeaseExpirationUpdate::Preserve, None);
             },
           }
         }
@@ -259,7 +271,7 @@ impl WriteEngineImpl {
 
   async fn release_partition_lease(
     lease_store: &Arc<dyn blob_stream_metadata_store::ProducerPartitionLeaseStore>,
-    state: &Arc<tokio::sync::Mutex<super::WriteState>>,
+    state: &Arc<parking_lot::Mutex<super::WriteState>>,
     flush_notifier: &Arc<tokio::sync::Notify>,
     metrics: &super::WriteMetrics,
     holder_id: &str,
@@ -267,17 +279,14 @@ impl WriteEngineImpl {
     virtual_partition_id: VirtualPartitionId,
     now_ts_ms: i64,
   ) {
-    let partition_state = {
-      let mut state = state.lock().await;
-      state.partition_state(topic, virtual_partition_id)
-    };
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string(),
       virtual_partition_id,
     };
 
     {
-      let mut partition_state = partition_state.lock().await;
+      let mut state = state.lock();
+      let partition_state = state.partition_state_mut(topic, virtual_partition_id);
       partition_state.draining = true;
     }
     metrics.lease_drain_starts_total.inc();
@@ -290,7 +299,7 @@ impl WriteEngineImpl {
     // TODO(mattklein123): Renew the producer lease while waiting for a drain that can approach
     // the lease duration. The default 30-second lease makes this unlikely in normal operation,
     // but a slow blob upload can otherwise let a successor acquire before this drain completes.
-    Self::wait_for_partition_drain(&partition_state).await;
+    Self::wait_for_partition_drain(state, topic, virtual_partition_id).await;
     metrics.lease_drain_completions_total.inc();
     info!(
       "broker partition drain complete: holder_id={holder_id}, topic={topic}, \
@@ -301,14 +310,22 @@ impl WriteEngineImpl {
       Ok(LeaseReleaseOutcome::Released | LeaseReleaseOutcome::Expired) => {
         // Clear local lease/allocator state immediately to avoid accepting writes based on stale
         // in-memory lease data after ownership moved away.
-        let mut partition_state = partition_state.lock().await;
-        partition_state.lease_expiration_ts_ms = None;
-        partition_state.seq_allocator = super::SeqAllocator::default();
+        let mut state = state.lock();
+        if let Some(partition_state) =
+          state.partition_state_mut_if_present(topic, virtual_partition_id)
+        {
+          partition_state.lease_expiration_ts_ms = None;
+          partition_state.seq_allocator = super::SeqAllocator::default();
+        }
       },
       Ok(LeaseReleaseOutcome::HeldByOther(_)) => {
-        let mut partition_state = partition_state.lock().await;
-        partition_state.lease_expiration_ts_ms = None;
-        partition_state.seq_allocator = super::SeqAllocator::default();
+        let mut state = state.lock();
+        if let Some(partition_state) =
+          state.partition_state_mut_if_present(topic, virtual_partition_id)
+        {
+          partition_state.lease_expiration_ts_ms = None;
+          partition_state.seq_allocator = super::SeqAllocator::default();
+        }
       },
       Err(error) => {
         warn_every!(
@@ -319,10 +336,17 @@ impl WriteEngineImpl {
     }
   }
 
-  async fn wait_for_partition_drain(partition_state: &super::PartitionStateHandle) {
+  async fn wait_for_partition_drain(
+    state: &Arc<parking_lot::Mutex<super::WriteState>>,
+    topic: &str,
+    virtual_partition_id: VirtualPartitionId,
+  ) {
     loop {
       let notified = {
-        let partition_state = partition_state.lock().await;
+        let state = state.lock();
+        let Some(partition_state) = state.partition_state(topic, virtual_partition_id) else {
+          return;
+        };
         if partition_state.is_drained() {
           return;
         }

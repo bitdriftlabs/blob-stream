@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "./grpc_test.rs"]
+mod tests;
+
 use crate::metrics::BrokerMetrics;
 use crate::write::{WriteEngine, WriteError, WriteRequest};
 use axum::extract::Query;
@@ -17,7 +21,7 @@ use http::{Extensions, HeaderMap};
 use log::trace;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use time::ext::NumericalDuration;
 
 //
@@ -31,6 +35,7 @@ struct BrokerGrpcMetrics {
   responses_not_lease_holder_total: prometheus::IntCounter,
   responses_unknown_topic_total: prometheus::IntCounter,
   responses_overloaded_total: prometheus::IntCounter,
+  request_timeouts_total: prometheus::IntCounter,
   request_latency_seconds: prometheus::Histogram,
 }
 
@@ -44,6 +49,7 @@ impl BrokerGrpcMetrics {
       responses_not_lease_holder_total: scope.counter("responses_not_lease_holder_total"),
       responses_unknown_topic_total: scope.counter("responses_unknown_topic_total"),
       responses_overloaded_total: scope.counter("responses_overloaded_total"),
+      request_timeouts_total: scope.counter("request_timeouts_total"),
       request_latency_seconds: scope.histogram("request_latency_seconds"),
     }
   }
@@ -62,18 +68,25 @@ impl BrokerGrpcMetrics {
       },
     }
   }
+
+  fn record_timeout(&self) {
+    self.request_timeouts_total.inc();
+  }
 }
 
 pub struct BrokerGrpc {
   write_engine: Arc<dyn WriteEngine>,
+  produce_request_timeout: Duration,
   metrics: BrokerGrpcMetrics,
 }
 
 impl BrokerGrpc {
   #[must_use]
   pub fn new(write_engine: Arc<dyn WriteEngine>, metrics_scope: &Scope) -> Self {
+    let produce_request_timeout = write_engine.produce_request_timeout();
     Self {
       write_engine,
+      produce_request_timeout,
       metrics: BrokerGrpcMetrics::new(metrics_scope),
     }
   }
@@ -97,13 +110,37 @@ impl Handler<ProduceBatchRequest, ProduceBatchResponse> for BrokerGrpc {
       request.topic, request.virtual_partition_id, record_count
     );
 
+    let topic = request.topic.to_string();
+    let virtual_partition_id = request.virtual_partition_id;
     let write_request = WriteRequest {
-      topic: request.topic.to_string(),
-      virtual_partition_id: request.virtual_partition_id,
+      topic: topic.clone(),
+      virtual_partition_id,
       records: request.records,
     };
 
-    let result = self.write_engine.produce_batch(write_request).await;
+    // A stalled backend must not keep an incoming RPC (and its allocation transition) alive
+    // indefinitely. Dropping this future releases the transition through its cancellation cleanup.
+    let result = match tokio::time::timeout(
+      self.produce_request_timeout,
+      self.write_engine.produce_batch(write_request),
+    )
+    .await
+    {
+      Ok(result) => result,
+      Err(_elapsed) => {
+        self.metrics.record_timeout();
+        warn_every!(
+          15.seconds(),
+          "broker produce request timed out: topic={topic}, \
+           virtual_partition_id={virtual_partition_id}, records={record_count}, timeout_ms={}",
+          self.produce_request_timeout.as_millis(),
+        );
+        Err(WriteError::Overloaded(format!(
+          "produce request timed out after {} ms",
+          self.produce_request_timeout.as_millis()
+        )))
+      },
+    };
 
     let status = match &result {
       Ok(_) => ProduceStatus::PRODUCE_STATUS_OK,
