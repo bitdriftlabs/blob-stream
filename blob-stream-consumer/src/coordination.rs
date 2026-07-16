@@ -228,7 +228,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
         },
         ConsumerGroupAssignmentOutcome::HeldByOther(lease) => {
           assignment_changed |= self.owned.remove(&partition_id);
-          info!(
+          debug!(
             "consumer assignment held by another member: topic={}, group_id={}, partition={}, \
              member_id={}, generation={}, owner_id={}, owner_generation={}, \
              lease_expires_at_ms={}, last_heartbeat_at_ms={}",

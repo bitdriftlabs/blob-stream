@@ -607,7 +607,7 @@ impl ConsumerIteratorImpl {
   }
 
   fn record_coordination_snapshot(&mut self, snapshot: &CoordinationSnapshot) {
-    let Some(previous) = self.last_coordination_snapshot.replace(snapshot.clone()) else {
+    let Some(previous) = self.last_coordination_snapshot.as_ref() else {
       info!(
         "consumer membership snapshot initialized: topic={}, group_id={}, member_id={}, \
          members={:?}, partitions={:?}",
@@ -617,8 +617,13 @@ impl ConsumerIteratorImpl {
         snapshot.members,
         snapshot.virtual_partitions
       );
+      self.last_coordination_snapshot = Some(snapshot.clone());
       return;
     };
+
+    if previous == snapshot {
+      return;
+    }
 
     if previous.members != snapshot.members {
       info!(
@@ -643,6 +648,8 @@ impl ConsumerIteratorImpl {
         snapshot.virtual_partitions
       );
     }
+
+    self.last_coordination_snapshot = Some(snapshot.clone());
   }
 
   async fn apply_assignment(&mut self, assignment: &[VirtualPartitionId]) -> Result<()> {
