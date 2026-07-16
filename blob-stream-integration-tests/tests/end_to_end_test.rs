@@ -50,6 +50,7 @@ use framework::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep, timeout};
@@ -62,6 +63,7 @@ struct DelayedVisibilityMetadataStore {
   inner: Arc<dyn MetadataStore>,
   delay: Duration,
   pending: Mutex<Vec<(Instant, SegmentMetadata)>>,
+  visibility_held: AtomicBool,
 }
 
 impl DelayedVisibilityMetadataStore {
@@ -70,10 +72,23 @@ impl DelayedVisibilityMetadataStore {
       inner,
       delay,
       pending: Mutex::new(Vec::new()),
+      visibility_held: AtomicBool::new(false),
     }
   }
 
+  fn hold_visibility(&self) {
+    self.visibility_held.store(true, Ordering::Release);
+  }
+
+  fn release_visibility(&self) {
+    self.visibility_held.store(false, Ordering::Release);
+  }
+
   async fn flush_visible_segments(&self) -> Result<()> {
+    if self.visibility_held.load(Ordering::Acquire) {
+      return Ok(());
+    }
+
     let now = Instant::now();
     let mut pending = self.pending.lock().await;
     let mut ready = Vec::new();
@@ -1730,11 +1745,15 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
 async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
   // Step 1: Start isolated infrastructure with a metadata store that delays visibility.
   let resources = IntegrationResources::create().await?;
-  let delayed_metadata_store: Arc<dyn MetadataStore> = Arc::new(
-    DelayedVisibilityMetadataStore::new(resources.metadata_store(), Duration::from_secs(2)),
-  );
+  let delayed_metadata_store = Arc::new(DelayedVisibilityMetadataStore::new(
+    resources.metadata_store(),
+    Duration::from_secs(2),
+  ));
+  // Hold visibility before producers start so the initial reader scans cannot race metadata writes.
+  delayed_metadata_store.hold_visibility();
+  let metadata_store: Arc<dyn MetadataStore> = delayed_metadata_store.clone();
   let mut cluster = ClusterHarness::builder(&resources, 1)
-    .metadata_store(Arc::clone(&delayed_metadata_store))
+    .metadata_store(Arc::clone(&metadata_store))
     .start()
     .await?;
 
@@ -1752,12 +1771,13 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
       lookback_windows: Some(10),
+      metadata_recovery_scan_interval_seconds: Some(1),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
     HashMap::new(),
     resources.blob_store(),
-    Arc::clone(&delayed_metadata_store),
+    metadata_store,
     &metrics_scope("blob_stream_consumer_it"),
   )?;
 
@@ -1785,7 +1805,8 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
     sleep(Duration::from_millis(100)).await;
   }
 
-  // Step 3: Re-scans should eventually discover all delayed metadata with no loss.
+  // Step 3: Make the delayed metadata visible so re-scans can recover it without loss.
+  delayed_metadata_store.release_visibility();
   let mut consumed_ids = HashSet::new();
   let deadline = Instant::now() + Duration::from_secs(20);
   drain_reader_until(&mut reader, &mut consumed_ids, expected_ids.len(), deadline).await?;

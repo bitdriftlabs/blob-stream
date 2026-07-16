@@ -96,6 +96,7 @@ pub use coordination::{
 };
 pub use iterator::{
   ConsumerCoordinationSource,
+  ConsumerDeliveryState,
   ConsumerDiagnostics,
   ConsumerIterator,
   ConsumerIteratorImpl,
