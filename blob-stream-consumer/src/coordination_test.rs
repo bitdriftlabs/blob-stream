@@ -2,13 +2,17 @@
 
 use crate::config::ConsumerGroupConfig;
 use crate::coordination::{
+  AssignmentPlanValidationError,
   ConsumerGroupCoordinator,
   ConsumerGroupCoordinatorImpl,
   RecoveredCursor,
+  assignment_plan_validation_error,
   cooperative_sticky_assignment,
 };
 use blob_stream_metadata_store::{
+  ConsumerGroupAssignment,
   ConsumerGroupAssignmentOutcome,
+  ConsumerGroupAssignmentPlan,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
   ConsumerGroupMembershipStore,
@@ -62,6 +66,75 @@ fn sticky_assignment_moves_minimal_partitions_on_scale_out() {
     .count();
 
   assert_eq!(moved, 2);
+}
+
+#[test]
+fn sticky_assignment_repairs_zero_owner_when_other_members_are_at_ceiling() {
+  let members = vec![
+    "member-a".to_string(),
+    "member-b".to_string(),
+    "member-c".to_string(),
+    "member-d".to_string(),
+  ];
+  let partitions = vec![0, 1, 2, 3, 4, 5];
+  let previous = HashMap::from([
+    (0, "member-a".to_string()),
+    (1, "member-a".to_string()),
+    (2, "member-b".to_string()),
+    (3, "member-b".to_string()),
+    (4, "member-c".to_string()),
+    (5, "member-c".to_string()),
+  ]);
+
+  let assignment = cooperative_sticky_assignment(&members, &partitions, &previous, "member-a");
+  let loads = members
+    .iter()
+    .map(|member| assignment.values().filter(|owner| *owner == member).count())
+    .collect::<Vec<_>>();
+  let moved = partitions
+    .iter()
+    .filter(|partition_id| assignment.get(partition_id) != previous.get(partition_id))
+    .count();
+
+  assert_eq!(loads.iter().min(), Some(&1));
+  assert_eq!(loads.iter().max(), Some(&2));
+  assert_eq!(loads[3], 1);
+  assert_eq!(moved, 1);
+}
+
+#[test]
+fn assignment_plan_validation_reports_imbalanced_load() {
+  let members = vec![
+    "member-a".to_string(),
+    "member-b".to_string(),
+    "member-c".to_string(),
+    "member-d".to_string(),
+  ];
+  let plan = ConsumerGroupAssignmentPlan {
+    version: 73,
+    planner_member_id: "member-a".to_string(),
+    members,
+    assignments: (0 .. 6)
+      .map(|virtual_partition_id| ConsumerGroupAssignment {
+        virtual_partition_id,
+        member_id: match virtual_partition_id {
+          0 | 1 => "member-a",
+          2 | 3 => "member-b",
+          _ => "member-c",
+        }
+        .to_string(),
+      })
+      .collect(),
+    published_ts_ms: 1_000,
+  };
+
+  assert_eq!(
+    assignment_plan_validation_error(&plan, &[0, 1, 2, 3, 4, 5]),
+    Some(AssignmentPlanValidationError::ImbalancedLoad {
+      min_load: 0,
+      max_load: 2,
+    })
+  );
 }
 
 #[tokio::test]
