@@ -7,8 +7,8 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 use log::trace;
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use tokio::sync::RwLock;
 
 //
 // InMemoryBlobStore
@@ -34,7 +34,7 @@ impl BlobStore for InMemoryBlobStore {
       key.as_str(),
       payload.len()
     );
-    let mut guard = self.blobs.write().await;
+    let mut guard = self.blobs.write();
     guard.insert(key.clone(), payload);
     Ok(())
   }
@@ -50,7 +50,7 @@ impl BlobStore for InMemoryBlobStore {
       return Ok(Bytes::new());
     }
 
-    let guard = self.blobs.read().await;
+    let guard = self.blobs.read();
     let blob = guard
       .get(key)
       .ok_or_else(|| anyhow::anyhow!("blob not found: {}", key.as_str()))?;

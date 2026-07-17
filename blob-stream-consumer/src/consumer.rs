@@ -26,9 +26,10 @@ use blob_stream_types::{
   TopicWindowKey,
   VirtualPartitionId,
   Window,
+  format_unix_timestamp_ms,
 };
 use futures::future::try_join_all;
-use log::trace;
+use log::{info, trace};
 use prometheus::{Histogram, IntCounter, IntGauge};
 use protobuf::Message;
 use std::borrow::Cow;
@@ -38,6 +39,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const MAX_RECOVERY_WINDOWS_PER_SCAN: usize = 32;
+
+fn format_unix_timestamp_seconds(timestamp_seconds: i64) -> String {
+  format_unix_timestamp_ms(timestamp_seconds.saturating_mul(1_000))
+}
 
 //
 // Scanning algorithm overview
@@ -292,6 +297,32 @@ struct RecoveryState {
   cutover_window_start_unix_seconds: i64,
 }
 
+//
+// ConsumerReaderPartitionMode
+//
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsumerReaderPartitionMode {
+  Fresh {
+    initial_window_start_unix_seconds: i64,
+  },
+  Recovering {
+    next_window_start_unix_seconds: i64,
+    cutover_window_start_unix_seconds: i64,
+  },
+  Fast,
+}
+
+//
+// ConsumerReaderPartitionState
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerReaderPartitionState {
+  pub(super) virtual_partition_id: VirtualPartitionId,
+  pub(super) mode: ConsumerReaderPartitionMode,
+}
+
 #[derive(Clone)]
 struct ScanRequest {
   window: TopicWindowKey,
@@ -342,9 +373,12 @@ impl ConsumerReaderImpl {
       retention_days > 0,
       "consumer retention recovery requires topic retention_days greater than zero"
     );
-    trace!(
-      "consumer reader init: topic={}, assigned_partitions={}, initial_cursors={}",
+    info!(
+      "consumer reader initialized: topic={}, retention_days={}, \
+       maximum_metadata_publication_lag_ms={}, assigned_partitions={}, initial_cursors={}",
       config.topic,
+      retention_days,
+      maximum_metadata_publication_lag_ms,
       assigned_virtual_partitions.len(),
       initial_cursors.len()
     );
@@ -392,10 +426,10 @@ impl ConsumerReaderImpl {
     }
 
     trace!(
-      "consumer scan windows computed: topic={}, count={}, now_unix_seconds={}",
+      "consumer scan windows computed: topic={}, count={}, now={}",
       self.config.topic,
       windows.len(),
-      now_unix_seconds
+      format_unix_timestamp_seconds(now_unix_seconds)
     );
 
     Ok(windows)
@@ -648,6 +682,7 @@ impl ConsumerReaderImpl {
     assigned_virtual_partitions: Vec<VirtualPartitionId>,
     now_unix_seconds: i64,
   ) -> Result<()> {
+    let previous_assignment = self.assigned_virtual_partitions.clone();
     if self.assigned_virtual_partitions != assigned_virtual_partitions {
       let assigned = assigned_virtual_partitions
         .iter()
@@ -674,6 +709,27 @@ impl ConsumerReaderImpl {
         });
     }
     self.assigned_virtual_partitions = assigned_virtual_partitions;
+    if self.assigned_virtual_partitions != previous_assignment {
+      let previous = previous_assignment.into_iter().collect::<HashSet<_>>();
+      let current = self
+        .assigned_virtual_partitions
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+      let mut added = current.difference(&previous).copied().collect::<Vec<_>>();
+      let mut removed = previous.difference(&current).copied().collect::<Vec<_>>();
+      added.sort_unstable();
+      removed.sort_unstable();
+      let mut assigned = self.assigned_virtual_partitions.clone();
+      assigned.sort_unstable();
+      let (fresh, recovering, fast) = self.partition_read_mode_counts();
+      info!(
+        "consumer reader assignment updated: topic={}, assigned={assigned:?}, added={added:?}, \
+         removed={removed:?}, fresh_partitions={fresh}, recovering_partitions={recovering}, \
+         fast_partitions={fast}",
+        self.config.topic
+      );
+    }
     Ok(())
   }
 
@@ -722,11 +778,68 @@ impl ConsumerReaderImpl {
           cutover_window_start_unix_seconds,
         }),
       );
+      info!(
+        "consumer partition recovery started: topic={}, partition={}, committed_offset={}, \
+         recovery_start_window={}, cutover_window={}",
+        self.config.topic,
+        virtual_partition_id,
+        committed_cursor.seq_end,
+        format_unix_timestamp_seconds(source_window_start_unix_seconds),
+        format_unix_timestamp_seconds(cutover_window_start_unix_seconds)
+      );
     } else {
       self
         .partition_read_states
         .insert(virtual_partition_id, PartitionReadState::Fast);
+      info!(
+        "consumer partition resumed on fast path: topic={}, partition={}, committed_offset={}, \
+         source_window={}, cutover_window={}",
+        self.config.topic,
+        virtual_partition_id,
+        committed_cursor.seq_end,
+        format_unix_timestamp_seconds(source_window_start_unix_seconds),
+        format_unix_timestamp_seconds(cutover_window_start_unix_seconds)
+      );
     }
+  }
+
+  pub(super) fn partition_read_states(&self) -> Vec<ConsumerReaderPartitionState> {
+    let mut states = self
+      .partition_read_states
+      .iter()
+      .map(
+        |(virtual_partition_id, state)| ConsumerReaderPartitionState {
+          virtual_partition_id: *virtual_partition_id,
+          mode: match state {
+            PartitionReadState::Fresh {
+              initial_window_start_unix_seconds,
+            } => ConsumerReaderPartitionMode::Fresh {
+              initial_window_start_unix_seconds: *initial_window_start_unix_seconds,
+            },
+            PartitionReadState::Recovering(recovery_state) => {
+              ConsumerReaderPartitionMode::Recovering {
+                next_window_start_unix_seconds: recovery_state.next_window_start_unix_seconds,
+                cutover_window_start_unix_seconds: recovery_state.cutover_window_start_unix_seconds,
+              }
+            },
+            PartitionReadState::Fast => ConsumerReaderPartitionMode::Fast,
+          },
+        },
+      )
+      .collect::<Vec<_>>();
+    states.sort_by_key(|state| state.virtual_partition_id);
+    states
+  }
+
+  fn partition_read_mode_counts(&self) -> (usize, usize, usize) {
+    self.partition_read_states.values().fold(
+      (0_usize, 0_usize, 0_usize),
+      |(fresh, recovering, fast), state| match state {
+        PartitionReadState::Fresh { .. } => (fresh.saturating_add(1), recovering, fast),
+        PartitionReadState::Recovering(_) => (fresh, recovering.saturating_add(1), fast),
+        PartitionReadState::Fast => (fresh, recovering, fast.saturating_add(1)),
+      },
+    )
   }
 }
 
@@ -795,7 +908,7 @@ impl ConsumerReader for ConsumerReaderImpl {
       trace!(
         "consumer scanned window: topic={}, window_start={}, segments={}",
         window.topic,
-        window.window_start_unix_seconds,
+        format_unix_timestamp_seconds(window.window_start_unix_seconds),
         segments.len()
       );
 
@@ -854,13 +967,13 @@ impl ConsumerReader for ConsumerReaderImpl {
               .inc();
             trace!(
               "consumer deferred metadata by visibility delay: topic={}, partition={}, \
-               window_start={}, snowflake_id={}, published_ts_ms={}, visibility_cutoff_ts_ms={}",
+               window_start={}, snowflake_id={}, published_at={}, visibility_cutoff={}",
               self.config.topic,
               partition_id,
-              window.window_start_unix_seconds,
+              format_unix_timestamp_seconds(window.window_start_unix_seconds),
               segment.snowflake_id.as_u64(),
-              segment.metadata_published_ts_ms,
-              visibility_cutoff_ts_ms
+              format_unix_timestamp_ms(segment.metadata_published_ts_ms),
+              format_unix_timestamp_ms(visibility_cutoff_ts_ms)
             );
             if fast_partition {
               blocked_fast_sources.insert(frontier_key);
@@ -947,6 +1060,8 @@ impl ConsumerReader for ConsumerReaderImpl {
     }
 
     let window_size_seconds = consumer_window_size_seconds(&self.config);
+    let mut initial_scans_completed = Vec::new();
+    let mut recoveries_completed = Vec::new();
     for (partition_id, state) in &mut self.partition_read_states {
       match state {
         PartitionReadState::Fresh {
@@ -954,6 +1069,7 @@ impl ConsumerReader for ConsumerReaderImpl {
         } if scanned_fresh_window_starts.contains(initial_window_start_unix_seconds)
           && !deferred_fresh_partitions.contains(partition_id) =>
         {
+          initial_scans_completed.push((*partition_id, *initial_window_start_unix_seconds));
           *state = PartitionReadState::Fast;
         },
         PartitionReadState::Recovering(recovery_state) => {
@@ -976,11 +1092,33 @@ impl ConsumerReader for ConsumerReaderImpl {
           if recovery_state.next_window_start_unix_seconds
             > recovery_state.cutover_window_start_unix_seconds
           {
+            recoveries_completed.push((
+              *partition_id,
+              recovery_state.cutover_window_start_unix_seconds,
+            ));
             *state = PartitionReadState::Fast;
           }
         },
         PartitionReadState::Fresh { .. } | PartitionReadState::Fast => {},
       }
+    }
+    for (partition_id, initial_window_start_unix_seconds) in initial_scans_completed {
+      info!(
+        "consumer partition initial scan completed; fast path active: topic={}, partition={}, \
+         initial_window={}",
+        self.config.topic,
+        partition_id,
+        format_unix_timestamp_seconds(initial_window_start_unix_seconds)
+      );
+    }
+    for (partition_id, cutover_window_start_unix_seconds) in recoveries_completed {
+      info!(
+        "consumer partition recovery completed; fast path active: topic={}, partition={}, \
+         cutover_window={}",
+        self.config.topic,
+        partition_id,
+        format_unix_timestamp_seconds(cutover_window_start_unix_seconds)
+      );
     }
 
     trace!(

@@ -5,10 +5,10 @@ mod tests;
 use crate::{MetadataStore, SegmentMetadata};
 use anyhow::Result;
 use async_trait::async_trait;
-use blob_stream_types::{SnowflakeId, TopicWindowKey};
+use blob_stream_types::{SnowflakeId, TopicWindowKey, format_unix_timestamp_ms};
 use log::trace;
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use tokio::sync::RwLock;
 
 //
 // InMemoryMetadataStore
@@ -32,10 +32,15 @@ impl MetadataStore for InMemoryMetadataStore {
     trace!(
       "metadata(memory) write_segment: topic={}, window_start={}, snowflake_id={}",
       metadata.window.topic,
-      metadata.window.window_start_unix_seconds,
+      format_unix_timestamp_ms(
+        metadata
+          .window
+          .window_start_unix_seconds
+          .saturating_mul(1_000)
+      ),
       metadata.snowflake_id.as_u64()
     );
-    let mut guard = self.windows.write().await;
+    let mut guard = self.windows.write();
     let key = metadata.partition_key();
     guard.entry(key).or_default().push(metadata);
     Ok(())
@@ -49,10 +54,10 @@ impl MetadataStore for InMemoryMetadataStore {
     trace!(
       "metadata(memory) scan_window: topic={}, window_start={}, min_snowflake={:?}",
       window.topic,
-      window.window_start_unix_seconds,
+      format_unix_timestamp_ms(window.window_start_unix_seconds.saturating_mul(1_000)),
       min_snowflake.map(SnowflakeId::as_u64)
     );
-    let guard = self.windows.read().await;
+    let guard = self.windows.read();
     let Some(segments) = guard.get(&window.format()) else {
       return Ok(Vec::new());
     };

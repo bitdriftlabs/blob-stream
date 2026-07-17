@@ -23,11 +23,11 @@ use blob_stream_types::{
   new_record,
 };
 use bytes::Bytes;
+use parking_lot::Mutex;
 use protobuf::Message;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 struct RecordingMetadataStore {
   inner: InMemoryMetadataStore,
@@ -57,7 +57,6 @@ impl MetadataStore for RecordingMetadataStore {
     self
       .scans
       .lock()
-      .await
       .push((window.window_start_unix_seconds, min_snowflake));
     self
       .inner
@@ -318,7 +317,6 @@ async fn retention_recovery_scans_from_checkpoint_before_fast_path() {
     !metadata_store
       .scans
       .lock()
-      .await
       .iter()
       .any(|(window_start, _)| *window_start == 90_000)
   );
@@ -367,7 +365,7 @@ async fn retention_recovery_clamps_legacy_cursor_to_retention_floor() {
     .unwrap();
 
   assert!(reader.read_available(90_000).await.unwrap().is_empty());
-  let scans = metadata_store.scans.lock().await;
+  let scans = metadata_store.scans.lock();
   assert_eq!(scans.first(), Some(&(3_600, None)));
   assert_eq!(scans.len(), 32);
 }
@@ -733,12 +731,12 @@ async fn fast_scan_uses_per_partition_inclusive_frontier() {
   .unwrap();
 
   reader.read_available(901).await.unwrap();
-  recording_metadata_store.scans.lock().await.clear();
+  recording_metadata_store.scans.lock().clear();
 
   let batches = reader.read_available(902).await.unwrap();
   assert!(batches.is_empty());
   assert_eq!(
-    *recording_metadata_store.scans.lock().await,
+    *recording_metadata_store.scans.lock(),
     vec![(600, None), (900, Some(SnowflakeId(2)))]
   );
 }
@@ -792,7 +790,7 @@ async fn fast_scan_uses_lowest_partition_frontier_for_cross_partition_ordering()
   .unwrap();
 
   assert_eq!(reader.read_available(901).await.unwrap().len(), 2);
-  recording_metadata_store.scans.lock().await.clear();
+  recording_metadata_store.scans.lock().clear();
 
   write_segment(
     blob_store.as_ref(),
@@ -814,7 +812,6 @@ async fn fast_scan_uses_lowest_partition_frontier_for_cross_partition_ordering()
     recording_metadata_store
       .scans
       .lock()
-      .await
       .contains(&(900, Some(SnowflakeId(1))))
   );
 }
@@ -867,7 +864,7 @@ async fn fast_scan_uses_per_window_frontiers_across_candidate_window_boundary() 
   )
   .unwrap();
   assert_eq!(reader.read_available(900).await.unwrap().len(), 2);
-  recording_metadata_store.scans.lock().await.clear();
+  recording_metadata_store.scans.lock().clear();
 
   write_segment(
     blob_store.as_ref(),
@@ -902,7 +899,7 @@ async fn fast_scan_uses_per_window_frontiers_across_candidate_window_boundary() 
   sequences.sort_unstable();
   assert_eq!(sequences, vec![2, 2]);
   assert_eq!(
-    *recording_metadata_store.scans.lock().await,
+    *recording_metadata_store.scans.lock(),
     vec![(600, None), (900, Some(SnowflakeId(10)))]
   );
 }

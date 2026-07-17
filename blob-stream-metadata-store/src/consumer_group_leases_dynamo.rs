@@ -97,6 +97,63 @@ impl DynamoConsumerGroupLeaseStore {
 
 #[async_trait]
 impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
+  async fn list_group_leases(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> Result<Vec<ConsumerGroupLease>> {
+    trace!(
+      "consumer lease(dynamo) list group: table={}, topic={}, group_id={}",
+      self.table_name, topic, group_id
+    );
+    let partition_key = format!("{topic}#{group_id}");
+    let mut leases = Vec::new();
+    let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+
+    loop {
+      let mut values = HashMap::new();
+      values.insert(":pk".to_string(), AttributeValue::S(partition_key.clone()));
+      let mut query = self
+        .client
+        .query()
+        .table_name(&self.table_name)
+        .key_condition_expression(format!("{ATTR_PK} = :pk"))
+        .consistent_read(true)
+        .set_expression_attribute_values(Some(values));
+      if let Some(key) = start_key.take() {
+        query = query.set_exclusive_start_key(Some(key));
+      }
+
+      let response = query.send().await?;
+      for item in response.items() {
+        let partition_id = item
+          .get(ATTR_SK)
+          .ok_or_else(|| anyhow!("consumer lease query returned row without string sort key"))?
+          .as_s()
+          .map_err(|_| anyhow!("consumer lease query returned row without string sort key"))?
+          .parse()
+          .map_err(|error| {
+            anyhow!("consumer lease query returned invalid partition id: {error}")
+          })?;
+        let key = ConsumerGroupLeaseKey {
+          topic: topic.to_string(),
+          group_id: group_id.to_string(),
+          virtual_partition_id: partition_id,
+        };
+        leases.push(Self::lease_from_item(item.clone(), key)?);
+      }
+
+      if let Some(key) = response.last_evaluated_key {
+        start_key = Some(key);
+      } else {
+        break;
+      }
+    }
+
+    leases.sort_by_key(|lease| lease.key.virtual_partition_id);
+    Ok(leases)
+  }
+
   async fn assign_partition(
     &self,
     key: ConsumerGroupLeaseKey,

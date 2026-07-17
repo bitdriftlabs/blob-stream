@@ -40,7 +40,6 @@ const S3_ENDPOINT: &str = "http://localhost:4566";
 const AWS_REGION: &str = "us-east-1";
 const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
 
-#[cfg(test)]
 #[ctor::ctor(unsafe)]
 fn global_init() {
   bd_test_helpers::test_global_init();

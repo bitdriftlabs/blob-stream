@@ -364,6 +364,22 @@ activating the replacement assignment. A replacement owner hydrates its reader f
 cursor, source checkpoint, and legacy commit timestamp. It recovers through the fixed cutover
 within retention before enabling that partition's bounded fast path.
 
+### Consumer State Snapshot
+
+The consumer keeps its most recently published immutable local snapshot in memory. Reading this
+snapshot does not wait for metadata, blob, lease, or membership-store operations, so the driver and
+local diagnostics remain available while a reader scan is stalled on an external dependency.
+Snapshots are republished after completed local state transitions; their timestamp therefore
+reflects publication time and fields may lag an in-flight read or rebalance.
+
+The always-available `/state` endpoint returns that local state plus a fresh, strongly consistent
+lease-table query for the consumer group. The response joins retained lease rows with the last
+structurally valid assignment plan accepted by the local coordinator, so it includes planned but
+currently unleased partitions as well as other consumers' owner, generation, heartbeat, and
+committed cursor information. The inline query never enters the driver control flow and is bounded
+to one second. A query error or timeout is represented as `lookup_failed`; the local state remains
+available in that response.
+
 ## Correctness and Failure Behavior
 
 The design relies on these invariants:

@@ -7,6 +7,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupAssignmentPlan,
   ConsumerGroupCommitOutcome,
   ConsumerGroupHeartbeatOutcome,
+  ConsumerGroupLease,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
   ConsumerGroupMembershipStore,
@@ -59,6 +60,7 @@ pub enum StoreFaultOperation {
   ConsumerHeartbeatPartition,
   ConsumerCommitCursor,
   ConsumerReleasePartition,
+  ConsumerListGroupLeases,
   ConsumerMembershipHeartbeat,
   ConsumerGetAssignmentPlan,
   ConsumerGetPlannerLease,
@@ -425,6 +427,7 @@ fn describe_store_operation(operation: StoreFaultOperation) -> &'static str {
     StoreFaultOperation::ConsumerHeartbeatPartition => "consumer_heartbeat_partition",
     StoreFaultOperation::ConsumerCommitCursor => "consumer_commit_cursor",
     StoreFaultOperation::ConsumerReleasePartition => "consumer_release_partition",
+    StoreFaultOperation::ConsumerListGroupLeases => "consumer_list_group_leases",
     StoreFaultOperation::ConsumerMembershipHeartbeat => "consumer_membership_heartbeat",
     StoreFaultOperation::ConsumerGetAssignmentPlan => "consumer_get_assignment_plan",
     StoreFaultOperation::ConsumerGetPlannerLease => "consumer_get_planner_lease",
@@ -1185,6 +1188,47 @@ impl FaultInjectedConsumerGroupLeaseStore {
 
 #[async_trait]
 impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
+  async fn list_group_leases(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> Result<Vec<ConsumerGroupLease>> {
+    let key = format!("{topic}#{group_id}");
+    let effects = self
+      .controller
+      .effects_for_call(
+        StoreFaultDomain::ConsumerLease,
+        StoreFaultOperation::ConsumerListGroupLeases,
+        &key,
+      )
+      .await;
+    if let Some(delay) = effects.delay {
+      sleep(delay).await;
+    }
+    if let Some(timeout) = effects.timeout {
+      sleep(timeout).await;
+      return Err(anyhow!(
+        "consumer list_group_leases timed out for key {key}"
+      ));
+    }
+    if let Some(message) = effects.fail_message {
+      return Err(anyhow!(
+        "consumer list_group_leases fault for key {key}: {message}"
+      ));
+    }
+    let result = self.inner.list_group_leases(topic, group_id).await;
+    self
+      .controller
+      .record_operation_outcome(
+        StoreFaultOperation::ConsumerListGroupLeases,
+        key,
+        if result.is_ok() { "ok" } else { "error" },
+        result.as_ref().ok().map(|leases| leases.len().to_string()),
+      )
+      .await;
+    result
+  }
+
   async fn assign_partition(
     &self,
     key: ConsumerGroupLeaseKey,

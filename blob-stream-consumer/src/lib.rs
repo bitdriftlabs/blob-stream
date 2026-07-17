@@ -76,7 +76,6 @@
 //! }
 //! ```
 
-#[cfg(feature = "admin")]
 mod admin;
 mod bootstrap;
 mod config;
@@ -106,11 +105,16 @@ pub use iterator::{
   ConsumerCoordinationSource,
   ConsumerDeliveryState,
   ConsumerDiagnostics,
+  ConsumerGroupLeaseObservation,
+  ConsumerGroupPartitionLeaseSnapshot,
   ConsumerIterator,
   ConsumerIteratorImpl,
   ConsumerOffsetSnapshot,
   ConsumerPartitionAssignmentSnapshot,
+  ConsumerPartitionReadMode,
+  ConsumerReaderPartitionSnapshot,
   ConsumerRecord,
+  ConsumerStateResponse,
   ConsumerStateSnapshot,
   CoordinationSnapshot,
   NextResult,

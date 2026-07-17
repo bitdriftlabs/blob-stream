@@ -25,6 +25,57 @@ fn cursor(virtual_partition_id: u32, seq_end: u64) -> CommittedCursor {
   }
 }
 
+fn lease_key_for(topic: &str, group_id: &str, virtual_partition_id: u32) -> ConsumerGroupLeaseKey {
+  ConsumerGroupLeaseKey {
+    topic: topic.to_string(),
+    group_id: group_id.to_string(),
+    virtual_partition_id,
+  }
+}
+
+#[tokio::test]
+async fn list_group_leases_returns_retained_rows_in_partition_order() {
+  let store = InMemoryConsumerGroupLeaseStore::new();
+  let key_two = lease_key_for("topic-a", "group-a", 2);
+  let key_ten = lease_key_for("topic-a", "group-a", 10);
+  let other_group_key = lease_key_for("topic-a", "group-b", 4);
+
+  store
+    .assign_partition(key_ten.clone(), "member-b".to_string(), 3, 1_000, 100)
+    .await
+    .unwrap();
+  store
+    .heartbeat_partition(&key_ten, "member-b", 3, 1_010, 100, Some(cursor(10, 42)))
+    .await
+    .unwrap();
+  store
+    .assign_partition(key_two.clone(), "member-a".to_string(), 2, 1_000, 100)
+    .await
+    .unwrap();
+  store
+    .release_partition(&key_two, "member-a", 2, 1_020)
+    .await
+    .unwrap();
+  store
+    .assign_partition(other_group_key, "member-c".to_string(), 1, 1_000, 100)
+    .await
+    .unwrap();
+
+  let leases = store.list_group_leases("topic-a", "group-a").await.unwrap();
+  assert_eq!(
+    leases
+      .iter()
+      .map(|lease| lease.key.virtual_partition_id)
+      .collect::<Vec<_>>(),
+    vec![2, 10]
+  );
+  assert_eq!(leases[0].owner_id, "member-a");
+  assert_eq!(leases[0].lease_expiration_ts_ms, 1_020);
+  assert_eq!(leases[1].owner_id, "member-b");
+  assert_eq!(leases[1].committed_cursor, Some(cursor(10, 42)));
+  assert_eq!(leases[1].committed_ts_ms, Some(1_010));
+}
+
 #[tokio::test]
 async fn fences_assignment() {
   let store = InMemoryConsumerGroupLeaseStore::new();

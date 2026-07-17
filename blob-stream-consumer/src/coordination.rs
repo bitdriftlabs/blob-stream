@@ -3,7 +3,7 @@
 mod tests;
 
 use crate::config::{ConsumerGroupConfig, consumer_lease_duration_ms, validate_group_config};
-use anyhow::Result;
+use anyhow::{Error, Result};
 use async_trait::async_trait;
 use bd_log::warn_every;
 use blob_stream_metadata_store::{
@@ -17,7 +17,8 @@ use blob_stream_metadata_store::{
   ConsumerGroupPlannerLeaseOutcome,
   ConsumerGroupReleaseOutcome,
 };
-use blob_stream_types::{CommittedCursor, VirtualPartitionId};
+use blob_stream_types::{CommittedCursor, VirtualPartitionId, format_unix_timestamp_ms};
+use futures::future::try_join_all;
 use log::{debug, info, trace};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -106,6 +107,8 @@ pub struct RebalanceReport {
   pub owned_partitions: Vec<VirtualPartitionId>,
   /// Last committed cursor state per owned partition, when present in lease store.
   pub recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
+  /// Valid persisted assignment plan accepted during this rebalance.
+  pub accepted_assignment_plan: Option<ConsumerGroupAssignmentPlan>,
   /// Version of the valid persisted assignment plan accepted during this rebalance.
   pub accepted_assignment_plan_version: Option<u64>,
   /// Invalid persisted plan version rejected during this rebalance, when one was observed.
@@ -521,8 +524,8 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
           assignment_changed |= self.owned.remove(&partition_id);
           debug!(
             "consumer assignment held by another member: topic={}, group_id={}, partition={}, \
-             member_id={}, generation={}, owner_id={}, owner_generation={}, \
-             lease_expires_at_ms={}, last_heartbeat_at_ms={}",
+             member_id={}, generation={}, owner_id={}, owner_generation={}, lease_expires_at={}, \
+             last_heartbeat_at={}",
             self.config.topic,
             self.config.group_id,
             partition_id,
@@ -530,8 +533,8 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
             self.generation,
             lease.owner_id,
             lease.generation,
-            lease.lease_expiration_ts_ms,
-            lease.last_heartbeat_ts_ms
+            format_unix_timestamp_ms(lease.lease_expiration_ts_ms),
+            format_unix_timestamp_ms(lease.last_heartbeat_ts_ms)
           );
         },
       }
@@ -565,6 +568,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     Ok(RebalanceReport {
       owned_partitions: owned,
       recovered_cursors,
+      accepted_assignment_plan: shared_plan,
       accepted_assignment_plan_version,
       rejected_assignment_plan_version,
       assignment_plan_applied,
@@ -580,31 +584,41 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     let mut renewed = Vec::new();
     let mut fenced = Vec::new();
 
-    // Snapshot owned partitions so we can mutate self.owned while iterating outcomes.
+    // Snapshot owned partitions, issue independent lease updates concurrently, then reconcile
+    // local ownership after every outcome completes.
     let owned = self.owned.iter().copied().collect::<Vec<_>>();
     let owned_count = owned.len();
-    for partition_id in owned {
-      // Commit-on-heartbeat: include cursor when present, avoiding an additional write path.
-      let committed_cursor = cursors.get(&partition_id).cloned();
-
+    let topic = self.config.topic.to_string();
+    let group_id = self.config.group_id.to_string();
+    let member_id = self.config.member_id.to_string();
+    let generation = self.generation;
+    let lease_duration_ms = consumer_lease_duration_ms(&self.config);
+    let outcomes = try_join_all(owned.into_iter().map(|partition_id| {
+      let lease_store = Arc::clone(&self.lease_store);
       let key = ConsumerGroupLeaseKey {
-        topic: self.config.topic.to_string(),
-        group_id: self.config.group_id.to_string(),
+        topic: topic.clone(),
+        group_id: group_id.clone(),
         virtual_partition_id: partition_id,
       };
+      let member_id = member_id.clone();
+      let committed_cursor = cursors.get(&partition_id).cloned();
+      async move {
+        let outcome = lease_store
+          .heartbeat_partition(
+            &key,
+            &member_id,
+            generation,
+            now_ts_ms,
+            lease_duration_ms,
+            committed_cursor,
+          )
+          .await?;
+        Ok::<_, Error>((partition_id, outcome))
+      }
+    }))
+    .await?;
 
-      let outcome = self
-        .lease_store
-        .heartbeat_partition(
-          &key,
-          &self.config.member_id,
-          self.generation,
-          now_ts_ms,
-          consumer_lease_duration_ms(&self.config),
-          committed_cursor,
-        )
-        .await?;
-
+    for (partition_id, outcome) in outcomes {
       match outcome {
         // Lease still valid for this member+generation.
         ConsumerGroupHeartbeatOutcome::Renewed(_) => renewed.push(partition_id),
@@ -614,8 +628,8 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
           fenced.push(partition_id);
           info!(
             "consumer lease fenced by another member: topic={}, group_id={}, partition={}, \
-             member_id={}, generation={}, owner_id={}, owner_generation={}, \
-             lease_expires_at_ms={}, last_heartbeat_at_ms={}",
+             member_id={}, generation={}, owner_id={}, owner_generation={}, lease_expires_at={}, \
+             last_heartbeat_at={}",
             self.config.topic,
             self.config.group_id,
             partition_id,
@@ -623,8 +637,8 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
             self.generation,
             lease.owner_id,
             lease.generation,
-            lease.lease_expiration_ts_ms,
-            lease.last_heartbeat_ts_ms
+            format_unix_timestamp_ms(lease.lease_expiration_ts_ms),
+            format_unix_timestamp_ms(lease.last_heartbeat_ts_ms)
           );
         },
         ConsumerGroupHeartbeatOutcome::Expired => {
@@ -632,13 +646,13 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
           fenced.push(partition_id);
           info!(
             "consumer lease expired before heartbeat: topic={}, group_id={}, partition={}, \
-             member_id={}, generation={}, now_ts_ms={}",
+             member_id={}, generation={}, now={}",
             self.config.topic,
             self.config.group_id,
             partition_id,
             self.config.member_id,
             self.generation,
-            now_ts_ms
+            format_unix_timestamp_ms(now_ts_ms)
           );
         },
       }

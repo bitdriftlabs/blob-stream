@@ -7,7 +7,7 @@ pub fn router(diagnostics: ProducerDiagnostics) -> Router {
     "/state",
     get(move || {
       let diagnostics = diagnostics.clone();
-      async move { Json(diagnostics.state_snapshot().await) }
+      async move { Json(diagnostics.state_snapshot()) }
     }),
   )
 }
