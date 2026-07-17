@@ -73,6 +73,14 @@ that broker returns `NOT_LEASE_HOLDER`, and the producer retries with exponentia
 its current membership view. An empty local membership has no producer route; it never falls back
 to a different writer/AZ.
 
+Broker discovery distinguishes a pending initial watch value from an initialized membership
+snapshot. A broker starts its listener while discovery is pending so Kubernetes can mark the pod
+ready and include it in Endpoints, but it performs no lease acquisition, renewal, release, or
+assignment reconciliation until an initialized membership contains its own node ID. An initialized
+membership without the local node after that activation is a real ownership loss; an initialized
+empty membership owns no partitions. This prevents a pod from temporarily claiming every
+partition while Kubernetes publishes its initial Endpoint set.
+
 Each broker fences writes through a producer-partition lease. A lease key contains topic, the
 virtual partition ID. The virtual partition calculation already includes writer identity, so the
 broker writer ID is not duplicated in the key. Only the active lease holder can reserve sequences

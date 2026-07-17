@@ -59,7 +59,7 @@ impl BrokerDiscovery for K8sServiceBrokerDiscovery {
           Ok(event) => {
             let membership = match event {
               Event::Apply(endpoints) => membership_from_endpoints(&endpoints),
-              Event::Delete(_) => BrokerMembership::default(),
+              Event::Delete(_) => BrokerMembership::new(Vec::new()),
               Event::Init => {
                 init_buffer.clear();
                 init_pending = true;
@@ -103,7 +103,10 @@ fn membership_from_items(service_name: &str, items: &[Endpoints]) -> BrokerMembe
     .iter()
     .find(|item| item.metadata.name.as_deref() == Some(service_name));
 
-  endpoints.map(membership_from_endpoints).unwrap_or_default()
+  endpoints.map_or_else(
+    || BrokerMembership::new(Vec::new()),
+    membership_from_endpoints,
+  )
 }
 
 fn membership_from_endpoints(endpoints: &Endpoints) -> BrokerMembership {
@@ -111,7 +114,7 @@ fn membership_from_endpoints(endpoints: &Endpoints) -> BrokerMembership {
   let mut seen = HashSet::new();
 
   let Some(subsets) = endpoints.subsets.as_ref() else {
-    return BrokerMembership::default();
+    return BrokerMembership::new(Vec::new());
   };
 
   for subset in subsets {
