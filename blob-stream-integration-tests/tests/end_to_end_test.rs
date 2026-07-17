@@ -65,7 +65,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{Barrier, Mutex, mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep, timeout};
 
 fn metrics_scope(component: &str) -> bd_server_stats::stats::Scope {
@@ -1892,9 +1892,22 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
   config.max_batch_bytes = Some(4_096);
   config.flush_max_delay_ms = Some(50);
 
-  let producer = Arc::new(
+  let boundary_producer = Arc::new(
     blob_stream_producer::ProducerClientImpl::new(
       config,
+      vec![producer_topic()],
+      Arc::clone(&discovery),
+      metrics_scope("blob_stream_producer_it"),
+    )
+    .await?,
+  );
+  let mut batching_config = producer_config(8);
+  batching_config.max_batch_records = Some(8);
+  batching_config.max_batch_bytes = Some(4_096);
+  batching_config.flush_max_delay_ms = Some(1_000);
+  let batching_producer = Arc::new(
+    blob_stream_producer::ProducerClientImpl::new(
+      batching_config,
       vec![producer_topic()],
       Arc::clone(&discovery),
       metrics_scope("blob_stream_producer_it"),
@@ -1929,7 +1942,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
         .as_millis(),
     )
     .expect("unix millis exceeds i64");
-    let ack = producer
+    let ack = boundary_producer
       .produce(ProducerRecord::new(
         TOPIC,
         format!("boundary-key-{index}").into_bytes(),
@@ -1943,12 +1956,15 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
 
   // Step 3: Produce concurrent small records on one key to force in-producer batching.
   let mut produce_tasks = Vec::new();
+  let batching_barrier = Arc::new(Barrier::new(25));
   for message_id in 0 .. 24 {
-    let producer = Arc::clone(&producer);
+    let producer = Arc::clone(&batching_producer);
+    let barrier = Arc::clone(&batching_barrier);
     let payload = format!("batching-{message_id}").into_bytes();
     *expected_payload_counts.entry(payload.clone()).or_insert(0) += 1;
 
     produce_tasks.push(tokio::spawn(async move {
+      barrier.wait().await;
       let event_ts_ms = i64::try_from(
         std::time::SystemTime::now()
           .duration_since(std::time::UNIX_EPOCH)
@@ -1966,12 +1982,13 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
         .await
     }));
   }
+  batching_barrier.wait().await;
 
   for task in produce_tasks {
     let ack = task.await??;
     assert!(ack.attempts >= 1);
   }
-  producer.flush().await?;
+  batching_producer.flush().await?;
 
   // Step 4: Drain and assert exact payload recovery plus at least one multi-record batch.
   let expected_total = expected_payload_counts.values().sum::<usize>();

@@ -16,6 +16,7 @@ use blob_stream_blob_store::BlobStore;
 use blob_stream_broker::grpc::make_broker_router;
 use blob_stream_broker::metrics::BrokerMetrics;
 use blob_stream_broker::write::{
+  BrokerLeaseStatus,
   BrokerStateSnapshot,
   TopicInfo,
   WriteConfig,
@@ -30,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, sleep, timeout};
 
 //
 // BrokerHandle
@@ -217,7 +218,40 @@ impl ClusterHarness {
       harness.brokers.push(broker);
     }
 
+    harness.wait_for_initial_lease_assignment().await?;
     Ok(harness)
+  }
+
+  async fn wait_for_initial_lease_assignment(&self) -> Result<()> {
+    let initial_broker = self
+      .brokers
+      .first()
+      .ok_or_else(|| anyhow!("broker list cannot be empty"))?;
+    let expected_partition_count = self.partition_count as usize * 2;
+    let deadline = Instant::now() + Duration::from_secs(15);
+
+    loop {
+      let snapshots = self.broker_state_snapshots().await;
+      let initial_broker_ready = snapshots
+        .iter()
+        .find(|snapshot| snapshot.holder_id == initial_broker.node.node_id)
+        .is_some_and(|snapshot| {
+          snapshot.ownership.len() == expected_partition_count
+            && snapshot.ownership.iter().all(|ownership| {
+              ownership.assignment_is_local
+                && ownership.lease_status == BrokerLeaseStatus::LocalActive
+            })
+        });
+      if initial_broker_ready {
+        return Ok(());
+      }
+      if Instant::now() >= deadline {
+        return Err(anyhow!(
+          "initial broker lease assignment did not converge: {snapshots:#?}"
+        ));
+      }
+      sleep(Duration::from_millis(10)).await;
+    }
   }
 
   pub fn producer_discovery(&self) -> DynamicBrokerDiscovery {
