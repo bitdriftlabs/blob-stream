@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const MAX_RECOVERY_WINDOWS_PER_SCAN: usize = 32;
+const HISTORICAL_SEEK_RECOVERY_SECONDS: i64 = 10 * 60;
 
 fn format_unix_timestamp_seconds(timestamp_seconds: i64) -> String {
   format_unix_timestamp_ms(timestamp_seconds.saturating_mul(1_000))
@@ -733,9 +734,42 @@ impl ConsumerReaderImpl {
     Ok(())
   }
 
-  /// Set the in-memory cursor for a virtual partition.
+  /// Set the in-memory cursor for a virtual partition and reset its fast scan frontier.
   pub fn set_cursor(&mut self, virtual_partition_id: VirtualPartitionId, seq_end: u64) {
     self.cursors.insert(virtual_partition_id, seq_end);
+    self
+      .fast_frontiers
+      .retain(|(partition_id, _), _| *partition_id != virtual_partition_id);
+  }
+
+  /// Reposition a partition cursor and recover recent windows before returning to the fast path.
+  pub fn seek(
+    &mut self,
+    virtual_partition_id: VirtualPartitionId,
+    seq_end: u64,
+    now_unix_seconds: i64,
+  ) {
+    self.set_cursor(virtual_partition_id, seq_end);
+    let cutover_window_start_unix_seconds = self.window_start(now_unix_seconds);
+    let recovery_start_window_unix_seconds = self
+      .window_start(now_unix_seconds.saturating_sub(HISTORICAL_SEEK_RECOVERY_SECONDS))
+      .max(self.retention_floor_window_start(cutover_window_start_unix_seconds));
+    self.partition_read_states.insert(
+      virtual_partition_id,
+      PartitionReadState::Recovering(RecoveryState {
+        next_window_start_unix_seconds: recovery_start_window_unix_seconds,
+        cutover_window_start_unix_seconds,
+      }),
+    );
+    info!(
+      "consumer historical seek recovery started: topic={}, partition={}, offset={}, \
+       recovery_start_window={}, cutover_window={}",
+      self.config.topic,
+      virtual_partition_id,
+      seq_end,
+      format_unix_timestamp_seconds(recovery_start_window_unix_seconds),
+      format_unix_timestamp_seconds(cutover_window_start_unix_seconds)
+    );
   }
 
   /// Update cursor and plan finite-retention recovery from externally committed state.

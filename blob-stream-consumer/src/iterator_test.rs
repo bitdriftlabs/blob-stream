@@ -1065,13 +1065,13 @@ async fn next_delivers_records_and_commit_renews() {
 }
 
 #[tokio::test]
-async fn reader_control_and_shutdown_remain_available_while_prefetch_blob_read_is_blocked() {
+async fn seek_waits_for_prefetch_scan_without_stalling_heartbeats() {
   let blob_store = Arc::new(BlockingBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
     Arc::new(InMemoryConsumerGroupLeaseStore::new());
-  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
-    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let concrete_membership_store = Arc::new(BlockingMembershipStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> = concrete_membership_store.clone();
   let now_window = (SystemTime::now()
     .duration_since(UNIX_EPOCH)
     .unwrap()
@@ -1122,14 +1122,37 @@ async fn reader_control_and_shutdown_remain_available_while_prefetch_blob_read_i
   assert!(snapshot.started);
   assert_eq!(snapshot.active_assignment, vec![3]);
 
-  timeout(Duration::from_secs(1), iterator.seek(3, 0))
+  let heartbeat_calls_before = concrete_membership_store
+    .heartbeat_calls
+    .load(Ordering::SeqCst);
+  let mut seek = Box::pin(iterator.seek(3, 0));
+  assert!(
+    timeout(Duration::from_millis(50), seek.as_mut())
+      .await
+      .is_err(),
+    "seek completed before the blocked prefetch scan reached its command boundary"
+  );
+  timeout(Duration::from_secs(1), async {
+    loop {
+      if concrete_membership_store
+        .heartbeat_calls
+        .load(Ordering::SeqCst)
+        > heartbeat_calls_before
+      {
+        return;
+      }
+      sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .unwrap();
+
+  blob_store.read_release.notify_waiters();
+  timeout(Duration::from_secs(1), seek)
     .await
     .unwrap()
     .unwrap();
-  timeout(Duration::from_secs(1), Box::new(iterator).shutdown())
-    .await
-    .unwrap()
-    .unwrap();
+  Box::new(iterator).shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1223,7 +1246,7 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
 }
 
 #[tokio::test]
-async fn prefetch_soft_budget_pauses_and_resumes_after_drain() {
+async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
@@ -1306,14 +1329,28 @@ async fn prefetch_soft_budget_pauses_and_resumes_after_drain() {
   assert_eq!(first_record.virtual_partition_id, 7);
   assert_eq!(first_record.offset, 1);
 
-  // Drain should allow worker to admit another pending batch.
-  wait_for_prefetch_buffer_len(&iterator, 1).await;
-  let buffered_after = iterator
+  timeout(Duration::from_secs(2), iterator.seek(7, 0))
+    .await
+    .unwrap()
+    .unwrap();
+  let rewound = timeout(Duration::from_secs(2), iterator.next())
+    .await
+    .unwrap()
+    .unwrap();
+  let rewound_record = match rewound {
+    NextResult::Record(record) => record,
+    NextResult::Revoked(_) => panic!("expected rewound record"),
+  };
+  assert_eq!(rewound_record.virtual_partition_id, 7);
+  assert_eq!(rewound_record.offset, 1);
+  let recovered_snapshot = iterator
     .diagnostics()
     .expect("consumer implementation provides diagnostics")
-    .state_snapshot()
-    .prefetch_buffered_batch_count;
-  assert_eq!(buffered_after, 1);
+    .state_snapshot();
+  assert_eq!(
+    recovered_snapshot.reader_partitions[0].mode,
+    ConsumerPartitionReadMode::Fast
+  );
 
   Box::new(iterator).shutdown().await.unwrap();
 }
