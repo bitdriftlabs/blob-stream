@@ -944,7 +944,7 @@ fn assignment_plan_validation_error(
       .iter()
       .find(|partition| !assignment_partitions.contains(partition))
       .copied()
-      .unwrap_or_default();
+      .expect("assignment completeness check found no missing partition");
     return Some(AssignmentPlanValidationError::MissingExpectedPartition {
       virtual_partition_id,
     });
