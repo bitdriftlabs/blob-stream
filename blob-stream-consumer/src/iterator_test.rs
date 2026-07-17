@@ -617,7 +617,7 @@ async fn diagnostics_report_assignment_and_start_state() {
     .diagnostics()
     .expect("consumer implementation provides diagnostics");
   let snapshot = diagnostics.state_snapshot();
-  assert_eq!(snapshot.schema_version, 9);
+  assert_eq!(snapshot.schema_version, 10);
   assert!(snapshot.generated_at.ends_with('Z'));
   assert_eq!(snapshot.topic, "telemetry");
   assert_eq!(snapshot.group_id, "group-a");
@@ -718,7 +718,7 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
     .expect("consumer implementation provides diagnostics")
     .state_response()
     .await;
-  assert_eq!(response.state.schema_version, 10);
+  assert_eq!(response.state.schema_version, 11);
   assert_eq!(
     response
       .state
@@ -790,8 +790,8 @@ async fn state_response_reports_lease_lookup_failure_without_blocking_local_diag
   let local_snapshot = diagnostics.state_snapshot();
   let response = diagnostics.state_response().await;
 
-  assert_eq!(local_snapshot.schema_version, 9);
-  assert_eq!(response.state.schema_version, 10);
+  assert_eq!(local_snapshot.schema_version, 10);
+  assert_eq!(response.state.schema_version, 11);
   assert!(matches!(
     response.group_lease_observation,
     ConsumerGroupLeaseObservation::LookupFailed { .. }
@@ -1057,10 +1057,10 @@ async fn next_delivers_records_and_commit_renews() {
   assert!(report.fenced_partitions.is_empty());
 
   let state = iterator.diagnostics.state_snapshot();
-  assert_eq!(state.staged_offsets.len(), 1);
-  assert_eq!(state.staged_offsets[0].virtual_partition_id, 3);
-  assert_eq!(state.staged_offsets[0].offset, 2);
-  assert_eq!(state.last_committed_offsets, state.staged_offsets);
+  assert_eq!(state.pending_commits.len(), 1);
+  assert_eq!(state.pending_commits[0].virtual_partition_id, 3);
+  assert_eq!(state.pending_commits[0].offset, 2);
+  assert_eq!(state.last_committed_offsets, state.pending_commits);
   assert!(state.last_successful_heartbeat_at.is_some());
 }
 

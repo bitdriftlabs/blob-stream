@@ -454,7 +454,6 @@ pub struct ConsumerStateSnapshot {
   pub pending_revocation: bool,
   pub delivery_state: ConsumerDeliveryState,
   pub pending_commits: Vec<ConsumerOffsetSnapshot>,
-  pub staged_offsets: Vec<ConsumerOffsetSnapshot>,
   pub last_committed_offsets: Vec<ConsumerOffsetSnapshot>,
   pub last_successful_heartbeat_at: Option<String>,
   pub cursors: Vec<ConsumerOffsetSnapshot>,
@@ -569,7 +568,7 @@ pub struct ConsumerReaderPartitionSnapshot {
 // ConsumerDiagnosticsRuntimeState
 //
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ConsumerDiagnosticsRuntimeState {
   started: bool,
   prefetch_worker_running: bool,
@@ -624,16 +623,41 @@ impl ConsumerDiagnostics {
   }
 
   fn build_state_snapshot(&self) -> ConsumerStateSnapshot {
-    let shared_state = self.shared_state.lock();
-    let runtime_state = &shared_state.diagnostics;
-    let mut owned_partitions = runtime_state.owned_partitions.clone();
-    let mut active_assignment = runtime_state.active_assignment.clone();
-    let mut pending_assignment = runtime_state.pending_assignment.clone();
-    let mut prefetch_buffered_partitions = shared_state
-      .delivery_state
-      .batches
+    let (
+      runtime_state,
+      pending_commit_state,
+      buffered_batches,
+      current_batch_record_count,
+      prefetch_buffered_bytes,
+      delivery_pending,
+    ) = {
+      let shared_state = self.shared_state.lock();
+      (
+        shared_state.diagnostics.clone(),
+        shared_state.pending_commits.clone(),
+        shared_state
+          .delivery_state
+          .batches
+          .iter()
+          .map(|batch| (batch.virtual_partition_id, batch.records.len()))
+          .collect::<Vec<_>>(),
+        shared_state
+          .delivery_state
+          .current_batch
+          .as_ref()
+          .map_or(0, |batch| batch.records.len()),
+        shared_state.delivery_state.buffered_bytes,
+        shared_state.delivery_state.pending_revocation.is_some()
+          || shared_state.delivery_state.current_batch.is_some()
+          || !shared_state.delivery_state.batches.is_empty(),
+      )
+    };
+    let mut owned_partitions = runtime_state.owned_partitions;
+    let mut active_assignment = runtime_state.active_assignment;
+    let mut pending_assignment = runtime_state.pending_assignment;
+    let mut prefetch_buffered_partitions = buffered_batches
       .iter()
-      .map(|batch| batch.virtual_partition_id)
+      .map(|(partition_id, _)| *partition_id)
       .collect::<Vec<_>>();
     owned_partitions.sort_unstable();
     active_assignment.sort_unstable();
@@ -641,42 +665,43 @@ impl ConsumerDiagnostics {
       assignment.sort_unstable();
     }
     prefetch_buffered_partitions.sort_unstable();
-    let pending_commits = offsets_from_pending_commits(&shared_state.pending_commits);
+    let pending_commits = offsets_from_pending_commits(&pending_commit_state);
+    let prefetch_buffered_record_count = buffered_batches
+      .iter()
+      .map(|(_, record_count)| *record_count)
+      .sum::<usize>()
+      .saturating_add(current_batch_record_count);
 
     ConsumerStateSnapshot {
-      schema_version: 9,
+      schema_version: 10,
       generated_at: format_unix_timestamp_ms(now_unix_millis()),
       topic: self.group_config.topic.to_string(),
       group_id: self.group_config.group_id.to_string(),
       member_id: self.group_config.member_id.to_string(),
       started: runtime_state.started,
       accepted_assignment_plan_version: runtime_state.accepted_assignment_plan_version,
-      assignment_plan: runtime_state.assignment_plan.clone(),
+      assignment_plan: runtime_state.assignment_plan,
       owned_partitions,
       active_assignment,
       pending_assignment,
       pending_revocation: runtime_state.pending_revocation,
-      delivery_state: if shared_state.delivery_state.pending_revocation.is_some()
-        || shared_state.delivery_state.current_batch.is_some()
-        || !shared_state.delivery_state.batches.is_empty()
-      {
+      delivery_state: if delivery_pending {
         ConsumerDeliveryState::Pending
       } else {
         ConsumerDeliveryState::Idle
       },
-      staged_offsets: pending_commits.clone(),
       pending_commits,
       last_committed_offsets: offsets_from_map(&runtime_state.last_committed_offsets),
       last_successful_heartbeat_at: runtime_state
         .last_successful_heartbeat_at_ms
         .map(format_unix_timestamp_ms),
-      cursors: runtime_state.cursors.clone(),
-      reader_partitions: runtime_state.reader_partitions.clone(),
+      cursors: runtime_state.cursors,
+      reader_partitions: runtime_state.reader_partitions,
       next_heartbeat_at: format_unix_timestamp_ms(runtime_state.next_heartbeat_at_ms),
       next_rebalance_at: format_unix_timestamp_ms(runtime_state.next_rebalance_at_ms),
-      prefetch_buffered_batch_count: shared_state.delivery_state.batches.len(),
-      prefetch_buffered_record_count: buffered_record_count(&shared_state.delivery_state),
-      prefetch_buffered_bytes: shared_state.delivery_state.buffered_bytes,
+      prefetch_buffered_batch_count: buffered_batches.len(),
+      prefetch_buffered_record_count,
+      prefetch_buffered_bytes,
       prefetch_buffered_partitions,
       prefetch_pending_batch_count: runtime_state.prefetch_pending_batch_count,
       prefetch_pending_record_count: runtime_state.prefetch_pending_record_count,
@@ -717,7 +742,7 @@ impl ConsumerDiagnostics {
       },
     };
 
-    state.schema_version = 10;
+    state.schema_version = 11;
     state.generated_at = format_unix_timestamp_ms(now_unix_millis());
     ConsumerStateResponse {
       state,
@@ -955,6 +980,7 @@ enum ConsumerReaderCommand {
   Seek {
     virtual_partition_id: VirtualPartitionId,
     offset: u64,
+    now_unix_seconds: i64,
     response: oneshot::Sender<Result<()>>,
   },
 }
@@ -1237,6 +1263,7 @@ impl ConsumerDriver {
     let command = ConsumerReaderCommand::Seek {
       virtual_partition_id,
       offset,
+      now_unix_seconds,
       response,
     };
     if let Err(error) = reader_command_tx.send(command) {
@@ -1723,19 +1750,6 @@ fn prefetched_batch_bytes(batch: &ConsumerBatch) -> u64 {
   })
 }
 
-fn buffered_record_count(buffer: &DeliveryState) -> usize {
-  let queued_records = buffer
-    .batches
-    .iter()
-    .map(|batch| batch.records.len())
-    .sum::<usize>();
-  let current_records = buffer
-    .current_batch
-    .as_ref()
-    .map_or(0, |batch| batch.records.len());
-  queued_records.saturating_add(current_records)
-}
-
 fn update_worker_prefetch_metrics(metrics: &ConsumerIteratorMetrics, buffer: &DeliveryState) {
   metrics
     .prefetch_buffered_batches
@@ -1837,9 +1851,10 @@ fn process_reader_commands(
       ConsumerReaderCommand::Seek {
         virtual_partition_id,
         offset,
+        now_unix_seconds,
         response,
       } => {
-        reader.seek(virtual_partition_id, offset, now_unix_seconds());
+        reader.seek(virtual_partition_id, offset, now_unix_seconds);
         pending.retain(|batch| {
           if batch.virtual_partition_id != virtual_partition_id {
             return true;

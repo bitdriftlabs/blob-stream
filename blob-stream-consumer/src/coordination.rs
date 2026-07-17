@@ -25,7 +25,7 @@ use std::sync::Arc;
 use time::ext::NumericalDuration;
 use uuid::Uuid;
 
-const MAX_CONCURRENT_PARTITION_HEARTBEATS: usize = 16;
+const MAX_CONCURRENT_PARTITION_LEASE_OPERATIONS: usize = 16;
 
 //
 // Coordination algorithm overview
@@ -481,33 +481,46 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       assignment_changed |= !retain;
       retain
     });
-    let mut recovered_cursors = HashMap::new();
-    for partition_id in partitions {
-      let Some(owner_id) = desired_assignment.get(&partition_id) else {
-        continue;
-      };
-      // Skip partitions assigned to other members.
-      if owner_id != &member_id {
-        continue;
-      }
-
+    let topic = self.config.topic.to_string();
+    let group_id = self.config.group_id.to_string();
+    let generation = self.generation;
+    let lease_duration_ms = consumer_lease_duration_ms(&self.config);
+    let outcomes = stream::iter(partitions.into_iter().filter(|partition_id| {
+      desired_assignment
+        .get(partition_id)
+        .is_some_and(|owner_id| owner_id == &member_id)
+    }))
+    .map(|partition_id| {
+      let lease_store = Arc::clone(&self.lease_store);
       let key = ConsumerGroupLeaseKey {
-        topic: self.config.topic.to_string(),
-        group_id: self.config.group_id.to_string(),
+        topic: topic.clone(),
+        group_id: group_id.clone(),
         virtual_partition_id: partition_id,
       };
+      let member_id = member_id.clone();
+      async move {
+        let outcome = lease_store
+          .assign_partition(key, member_id, generation, now_ts_ms, lease_duration_ms)
+          .await?;
+        Ok::<_, Error>((partition_id, outcome))
+      }
+    })
+    .buffer_unordered(MAX_CONCURRENT_PARTITION_LEASE_OPERATIONS)
+    .collect::<Vec<_>>()
+    .await;
 
-      let outcome = self
-        .lease_store
-        .assign_partition(
-          key,
-          member_id.clone(),
-          self.generation,
-          now_ts_ms,
-          consumer_lease_duration_ms(&self.config),
-        )
-        .await?;
-
+    let mut recovered_cursors = HashMap::new();
+    let mut assignment_error = None;
+    for result in outcomes {
+      let (partition_id, outcome) = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+          if assignment_error.is_none() {
+            assignment_error = Some(error);
+          }
+          continue;
+        },
+      };
       // Track only partitions that the lease store actually granted to this member.
       match outcome {
         ConsumerGroupAssignmentOutcome::Assigned(lease) => {
@@ -540,6 +553,10 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
           );
         },
       }
+    }
+
+    if let Some(error) = assignment_error {
+      return Err(error);
     }
 
     // Stable ordering helps deterministic tests and predictable downstream behavior.
@@ -618,7 +635,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
         Ok::<_, Error>((partition_id, outcome))
       }
     }))
-    .buffer_unordered(MAX_CONCURRENT_PARTITION_HEARTBEATS)
+    .buffer_unordered(MAX_CONCURRENT_PARTITION_LEASE_OPERATIONS)
     .collect::<Vec<_>>()
     .await;
 
