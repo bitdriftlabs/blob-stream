@@ -1419,6 +1419,7 @@ dependencies = [
  "bytes",
  "log",
  "mockall",
+ "parking_lot",
  "serde",
  "tokio",
 ]
@@ -1559,6 +1560,7 @@ dependencies = [
  "blob-stream-types",
  "log",
  "mockall",
+ "parking_lot",
  "serde",
  "serde_dynamo",
  "tokio",
@@ -1581,6 +1583,7 @@ dependencies = [
  "blob-stream-types",
  "futures",
  "log",
+ "parking_lot",
  "prometheus",
  "serde",
  "thiserror 2.0.18",

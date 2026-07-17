@@ -177,8 +177,7 @@ async fn wait_for_buffered_partitions(producer: &ProducerClientImpl, expected: u
     let snapshot = producer
       .diagnostics()
       .expect("producer implementation provides diagnostics")
-      .state_snapshot()
-      .await;
+      .state_snapshot();
     let buffered_partitions = snapshot
       .partition_buffers
       .iter()
@@ -245,8 +244,7 @@ async fn diagnostics_report_buffered_partition_state() {
   let snapshot = producer
     .diagnostics()
     .expect("producer implementation provides diagnostics")
-    .state_snapshot()
-    .await;
+    .state_snapshot();
   assert_eq!(snapshot.schema_version, 3);
   assert!(snapshot.generated_at.ends_with('Z'));
   assert_eq!(snapshot.writer_id, 1);

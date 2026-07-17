@@ -15,8 +15,8 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use blob_stream_types::CommittedCursor;
 use log::trace;
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use tokio::sync::RwLock;
 
 //
 // InMemoryConsumerGroupLeaseStore
@@ -36,6 +36,21 @@ impl InMemoryConsumerGroupLeaseStore {
 
 #[async_trait]
 impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
+  async fn list_group_leases(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> Result<Vec<ConsumerGroupLease>> {
+    let guard = self.leases.read();
+    let mut leases = guard
+      .iter()
+      .filter(|(key, _)| key.topic == topic && key.group_id == group_id)
+      .map(|(key, state)| state.to_lease(key.clone()))
+      .collect::<Vec<_>>();
+    leases.sort_by_key(|lease| lease.key.virtual_partition_id);
+    Ok(leases)
+  }
+
   async fn assign_partition(
     &self,
     key: ConsumerGroupLeaseKey,
@@ -49,7 +64,7 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
        generation={}",
       key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
     );
-    let mut guard = self.leases.write().await;
+    let mut guard = self.leases.write();
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
 
     match guard.get_mut(&key) {
@@ -118,7 +133,7 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
       validate_cursor(key, cursor)?;
     }
 
-    let mut guard = self.leases.write().await;
+    let mut guard = self.leases.write();
     let Some(state) = guard.get_mut(key) else {
       return Ok(ConsumerGroupHeartbeatOutcome::Expired);
     };
@@ -166,7 +181,7 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     );
     validate_cursor(key, &committed_cursor)?;
 
-    let mut guard = self.leases.write().await;
+    let mut guard = self.leases.write();
     let Some(state) = guard.get_mut(key) else {
       return Ok(ConsumerGroupCommitOutcome::Expired);
     };
@@ -202,7 +217,7 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
       key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
     );
 
-    let mut guard = self.leases.write().await;
+    let mut guard = self.leases.write();
     let Some(state) = guard.get_mut(key) else {
       return Ok(ConsumerGroupReleaseOutcome::Expired);
     };

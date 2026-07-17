@@ -101,6 +101,14 @@ fn lease_key() -> ConsumerGroupLeaseKey {
   }
 }
 
+fn lease_key_for(topic: &str, group_id: &str, virtual_partition_id: u32) -> ConsumerGroupLeaseKey {
+  ConsumerGroupLeaseKey {
+    topic: topic.to_string(),
+    group_id: group_id.to_string(),
+    virtual_partition_id,
+  }
+}
+
 fn cursor_with_source(virtual_partition_id: u32, seq_end: u64) -> CommittedCursor {
   CommittedCursor {
     virtual_partition_id,
@@ -110,6 +118,60 @@ fn cursor_with_source(virtual_partition_id: u32, seq_end: u64) -> CommittedCurso
       snowflake_id: 42,
     }),
   }
+}
+
+#[tokio::test]
+async fn list_group_leases_returns_retained_rows_in_partition_order() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
+  create_leases_table(&client, &table_name).await?;
+
+  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone());
+  let key_two = lease_key_for("topic-a", "group-a", 2);
+  let key_ten = lease_key_for("topic-a", "group-a", 10);
+  let other_group_key = lease_key_for("topic-a", "group-b", 4);
+  store
+    .assign_partition(key_ten.clone(), "member-b".to_string(), 3, 1_000, 100)
+    .await?;
+  store
+    .heartbeat_partition(
+      &key_ten,
+      "member-b",
+      3,
+      1_010,
+      100,
+      Some(cursor_with_source(10, 42)),
+    )
+    .await?;
+  store
+    .assign_partition(key_two.clone(), "member-a".to_string(), 2, 1_000, 100)
+    .await?;
+  assert_eq!(
+    store
+      .release_partition(&key_two, "member-a", 2, 1_020)
+      .await?,
+    ConsumerGroupReleaseOutcome::Released
+  );
+  store
+    .assign_partition(other_group_key, "member-c".to_string(), 1, 1_000, 100)
+    .await?;
+
+  let leases = store.list_group_leases("topic-a", "group-a").await?;
+  assert_eq!(
+    leases
+      .iter()
+      .map(|lease| lease.key.virtual_partition_id)
+      .collect::<Vec<_>>(),
+    vec![2, 10]
+  );
+  assert_eq!(leases[0].owner_id, "member-a");
+  assert_eq!(leases[0].lease_expiration_ts_ms, 1_020);
+  assert_eq!(leases[1].owner_id, "member-b");
+  assert_eq!(leases[1].committed_cursor, Some(cursor_with_source(10, 42)));
+  assert_eq!(leases[1].committed_ts_ms, Some(1_010));
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
 }
 
 #[tokio::test]

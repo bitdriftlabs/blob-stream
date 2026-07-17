@@ -2,11 +2,15 @@
 
 use super::{
   BufferedBatch,
+  ConsumerAssignmentPlanSnapshot,
   ConsumerCoordinationSource,
   ConsumerDeliveryState,
+  ConsumerGroupLeaseObservation,
   ConsumerIterator,
   ConsumerIteratorImpl,
   ConsumerIteratorMetrics,
+  ConsumerPartitionAssignmentSnapshot,
+  ConsumerPartitionReadMode,
   CoordinationSnapshot,
   DeliveryState,
   IdlePollBackoff,
@@ -19,15 +23,19 @@ use crate::config::{
   DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
 };
 use bd_server_stats::stats::Collector;
-use blob_stream_blob_store::{BlobKey, BlobStore, InMemoryBlobStore};
+use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupAssignmentPlan,
+  ConsumerGroupCommitOutcome,
+  ConsumerGroupHeartbeatOutcome,
+  ConsumerGroupLease,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
   ConsumerGroupMembershipStore,
   ConsumerGroupPlannerLease,
   ConsumerGroupPlannerLeaseOutcome,
+  ConsumerGroupReleaseOutcome,
   InMemoryConsumerGroupLeaseStore,
   InMemoryConsumerGroupMembershipStore,
   InMemoryMetadataStore,
@@ -37,6 +45,7 @@ use blob_stream_metadata_store::{
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
   BatchMetadata,
+  CommittedCursor,
   CommittedSourceCheckpoint,
   Compression,
   Record,
@@ -49,12 +58,12 @@ use blob_stream_types::{
   now_unix_millis,
 };
 use bytes::Bytes;
+use parking_lot::Mutex;
 use protobuf::Message;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep, timeout};
 
 struct MutableCoordinationSource {
@@ -89,7 +98,7 @@ impl ConsumerCoordinationSource for BlockingCoordinationSource {
       self.snapshot_started.notify_waiters();
       self.snapshot_release.notified().await;
     }
-    Ok(self.snapshot.lock().await.clone())
+    Ok(self.snapshot.lock().clone())
   }
 }
 
@@ -100,6 +109,127 @@ struct BlockingMembershipStore {
   heartbeat_calls: AtomicUsize,
   heartbeat_started: Arc<tokio::sync::Notify>,
   heartbeat_release: Arc<tokio::sync::Notify>,
+}
+
+struct BlockingBlobStore {
+  inner: InMemoryBlobStore,
+  block_reads: AtomicBool,
+  read_started: tokio::sync::Notify,
+  read_release: tokio::sync::Notify,
+}
+
+struct FailingLeaseStore {
+  inner: InMemoryConsumerGroupLeaseStore,
+}
+
+impl FailingLeaseStore {
+  fn new() -> Self {
+    Self {
+      inner: InMemoryConsumerGroupLeaseStore::new(),
+    }
+  }
+}
+
+#[async_trait::async_trait]
+impl ConsumerGroupLeaseStore for FailingLeaseStore {
+  async fn list_group_leases(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> anyhow::Result<Vec<ConsumerGroupLease>> {
+    Err(anyhow::anyhow!(
+      "injected lease lookup failure for {topic}/{group_id}"
+    ))
+  }
+
+  async fn assign_partition(
+    &self,
+    key: ConsumerGroupLeaseKey,
+    owner_id: String,
+    generation: u64,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+  ) -> anyhow::Result<ConsumerGroupAssignmentOutcome> {
+    self
+      .inner
+      .assign_partition(key, owner_id, generation, now_ts_ms, lease_duration_ms)
+      .await
+  }
+
+  async fn heartbeat_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+    committed_cursor: Option<CommittedCursor>,
+  ) -> anyhow::Result<ConsumerGroupHeartbeatOutcome> {
+    self
+      .inner
+      .heartbeat_partition(
+        key,
+        owner_id,
+        generation,
+        now_ts_ms,
+        lease_duration_ms,
+        committed_cursor,
+      )
+      .await
+  }
+
+  async fn commit_cursor(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+    committed_cursor: CommittedCursor,
+  ) -> anyhow::Result<ConsumerGroupCommitOutcome> {
+    self
+      .inner
+      .commit_cursor(key, owner_id, generation, now_ts_ms, committed_cursor)
+      .await
+  }
+
+  async fn release_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+  ) -> anyhow::Result<ConsumerGroupReleaseOutcome> {
+    self
+      .inner
+      .release_partition(key, owner_id, generation, now_ts_ms)
+      .await
+  }
+}
+
+impl BlockingBlobStore {
+  fn new() -> Self {
+    Self {
+      inner: InMemoryBlobStore::new(),
+      block_reads: AtomicBool::new(false),
+      read_started: tokio::sync::Notify::new(),
+      read_release: tokio::sync::Notify::new(),
+    }
+  }
+}
+
+#[async_trait::async_trait]
+impl BlobStore for BlockingBlobStore {
+  async fn put(&self, key: &BlobKey, payload: Bytes) -> anyhow::Result<()> {
+    self.inner.put(key, payload).await
+  }
+
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> anyhow::Result<Bytes> {
+    if self.block_reads.load(Ordering::SeqCst) {
+      self.read_started.notify_waiters();
+      self.read_release.notified().await;
+    }
+    self.inner.get_range(key, range).await
+  }
 }
 
 impl BlockingMembershipStore {
@@ -258,15 +388,15 @@ impl MutableCoordinationSource {
     }
   }
 
-  async fn update(&self, snapshot: CoordinationSnapshot) {
-    *self.snapshot.lock().await = snapshot;
+  fn update(&self, snapshot: CoordinationSnapshot) {
+    *self.snapshot.lock() = snapshot;
   }
 }
 
 #[async_trait::async_trait]
 impl ConsumerCoordinationSource for MutableCoordinationSource {
   async fn snapshot(&self) -> anyhow::Result<CoordinationSnapshot> {
-    Ok(self.snapshot.lock().await.clone())
+    Ok(self.snapshot.lock().clone())
   }
 }
 
@@ -382,7 +512,6 @@ async fn wait_for_prefetch_buffer_len(iterator: &ConsumerIteratorImpl, expected_
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
-      .await
       .prefetch_buffered_batch_count;
     if len >= expected_min {
       return;
@@ -394,11 +523,37 @@ async fn wait_for_prefetch_buffer_len(iterator: &ConsumerIteratorImpl, expected_
     .diagnostics()
     .expect("consumer implementation provides diagnostics")
     .state_snapshot()
-    .await
     .prefetch_buffered_batch_count;
   assert!(
     len >= expected_min,
     "prefetch buffer length {len} did not reach expected minimum {expected_min}"
+  );
+}
+
+async fn wait_for_prefetch_pending_record_count(
+  iterator: &ConsumerIteratorImpl,
+  expected_min: usize,
+) {
+  for _ in 0 .. 40 {
+    let count = iterator
+      .diagnostics()
+      .expect("consumer implementation provides diagnostics")
+      .state_snapshot()
+      .prefetch_pending_record_count;
+    if count >= expected_min {
+      return;
+    }
+    sleep(Duration::from_millis(25)).await;
+  }
+
+  let count = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_snapshot()
+    .prefetch_pending_record_count;
+  assert!(
+    count >= expected_min,
+    "prefetch pending record count {count} did not reach expected minimum {expected_min}"
   );
 }
 
@@ -408,8 +563,8 @@ async fn wait_for_active_assignment(iterator: &ConsumerIteratorImpl, expected_pa
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
-      .await
-      .active_assignment;
+      .active_assignment
+      .clone();
     active_assignment.sort_unstable();
     if active_assignment == expected_partitions {
       return;
@@ -420,8 +575,7 @@ async fn wait_for_active_assignment(iterator: &ConsumerIteratorImpl, expected_pa
   let snapshot = iterator
     .diagnostics()
     .expect("consumer implementation provides diagnostics")
-    .state_snapshot()
-    .await;
+    .state_snapshot();
   panic!(
     "active assignment {:?} did not reach expected assignment {expected_partitions:?}",
     snapshot.active_assignment
@@ -462,8 +616,8 @@ async fn diagnostics_report_assignment_and_start_state() {
   let diagnostics = iterator
     .diagnostics()
     .expect("consumer implementation provides diagnostics");
-  let snapshot = diagnostics.state_snapshot().await;
-  assert_eq!(snapshot.schema_version, 8);
+  let snapshot = diagnostics.state_snapshot();
+  assert_eq!(snapshot.schema_version, 10);
   assert!(snapshot.generated_at.ends_with('Z'));
   assert_eq!(snapshot.topic, "telemetry");
   assert_eq!(snapshot.group_id, "group-a");
@@ -479,14 +633,212 @@ async fn diagnostics_report_assignment_and_start_state() {
     Some((1, 2))
   );
   assert_eq!(snapshot.prefetch_buffered_batch_count, 0);
+  assert_eq!(snapshot.prefetch_buffered_record_count, 0);
+  assert_eq!(snapshot.prefetch_pending_batch_count, 0);
+  assert_eq!(snapshot.prefetch_pending_record_count, 0);
+  assert_eq!(snapshot.prefetch_pending_bytes, 0);
+  assert_eq!(snapshot.reader_partitions.len(), 2);
+  assert!(snapshot.reader_partitions.iter().all(|partition| {
+    partition.mode == ConsumerPartitionReadMode::Fresh
+      && partition.recovery_next_window_start.is_some()
+      && partition.recovery_cutover_window_start.is_none()
+  }));
 
   iterator.start().unwrap();
   wait_for_active_assignment(&iterator, &[0, 1]).await;
-  let started_snapshot = diagnostics.state_snapshot().await;
+  let started_snapshot = diagnostics.state_snapshot();
   assert!(started_snapshot.started);
   assert!(started_snapshot.prefetch_worker_running);
 
   Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let concrete_lease_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> = concrete_lease_store.clone();
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string(), "member-b".to_string()],
+    virtual_partitions: vec![0, 1],
+  }));
+  let iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  )
+  .await
+  .unwrap();
+  let now_ts_ms = now_unix_millis();
+  let member_b_key = ConsumerGroupLeaseKey {
+    topic: "telemetry".to_string(),
+    group_id: "group-a".to_string(),
+    virtual_partition_id: 1,
+  };
+  concrete_lease_store
+    .assign_partition(
+      member_b_key.clone(),
+      "member-b".to_string(),
+      7,
+      now_ts_ms,
+      10_000,
+    )
+    .await
+    .unwrap();
+  concrete_lease_store
+    .heartbeat_partition(
+      &member_b_key,
+      "member-b",
+      7,
+      now_ts_ms + 1,
+      10_000,
+      Some(CommittedCursor {
+        virtual_partition_id: 1,
+        seq_end: 42,
+        source_checkpoint: Some(CommittedSourceCheckpoint {
+          window_start_unix_seconds: 1_000,
+          snowflake_id: 99,
+        }),
+      }),
+    )
+    .await
+    .unwrap();
+
+  let response = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_response()
+    .await;
+  assert_eq!(response.state.schema_version, 11);
+  assert_eq!(
+    response
+      .state
+      .assignment_plan
+      .as_ref()
+      .map(|plan| plan.version),
+    Some(1)
+  );
+  let ConsumerGroupLeaseObservation::Fresh { partitions } = response.group_lease_observation else {
+    panic!("expected fresh group lease observation");
+  };
+  assert_eq!(partitions.len(), 2);
+  let member_b_partition = partitions
+    .iter()
+    .find(|partition| partition.virtual_partition_id == 1)
+    .unwrap();
+  assert_eq!(
+    member_b_partition.desired_owner_id.as_deref(),
+    Some("member-b")
+  );
+  assert_eq!(member_b_partition.owner_id.as_deref(), Some("member-b"));
+  assert_eq!(member_b_partition.generation, Some(7));
+  assert_eq!(member_b_partition.committed_offset, Some(42));
+  assert_eq!(
+    member_b_partition.committed_source_checkpoint,
+    Some(CommittedSourceCheckpoint {
+      window_start_unix_seconds: 1_000,
+      snowflake_id: 99,
+    })
+  );
+  let member_a_partition = partitions
+    .iter()
+    .find(|partition| partition.virtual_partition_id == 0)
+    .unwrap();
+  assert_eq!(
+    member_a_partition.desired_owner_id.as_deref(),
+    Some("member-a")
+  );
+  assert_eq!(member_a_partition.owner_id.as_deref(), Some("member-a"));
+}
+
+#[tokio::test]
+async fn state_response_reports_lease_lookup_failure_without_blocking_local_diagnostics() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> = Arc::new(FailingLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![0],
+  }));
+  let iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  )
+  .await
+  .unwrap();
+  let diagnostics = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics");
+  let local_snapshot = diagnostics.state_snapshot();
+  let response = diagnostics.state_response().await;
+
+  assert_eq!(local_snapshot.schema_version, 10);
+  assert_eq!(response.state.schema_version, 11);
+  assert!(matches!(
+    response.group_lease_observation,
+    ConsumerGroupLeaseObservation::LookupFailed { .. }
+  ));
+}
+
+#[test]
+fn group_lease_observation_includes_unleased_plan_partitions() {
+  let plan = ConsumerAssignmentPlanSnapshot {
+    version: 1,
+    planner_member_id: "member-a".to_string(),
+    members: vec!["member-a".to_string(), "member-b".to_string()],
+    assignments: vec![
+      ConsumerPartitionAssignmentSnapshot {
+        virtual_partition_id: 0,
+        member_id: "member-a".to_string(),
+      },
+      ConsumerPartitionAssignmentSnapshot {
+        virtual_partition_id: 1,
+        member_id: "member-b".to_string(),
+      },
+    ],
+    published_at: "2026-07-17T00:00:00Z".to_string(),
+  };
+  let observation = super::group_lease_observation(
+    Some(&plan),
+    vec![ConsumerGroupLease {
+      key: ConsumerGroupLeaseKey {
+        topic: "telemetry".to_string(),
+        group_id: "group-a".to_string(),
+        virtual_partition_id: 1,
+      },
+      owner_id: "member-b".to_string(),
+      generation: 7,
+      lease_expiration_ts_ms: 20_000,
+      last_heartbeat_ts_ms: 10_000,
+      committed_cursor: None,
+      committed_ts_ms: None,
+    }],
+  );
+  let ConsumerGroupLeaseObservation::Fresh { partitions } = observation else {
+    panic!("expected fresh group lease observation");
+  };
+  assert_eq!(partitions.len(), 2);
+  assert_eq!(partitions[0].virtual_partition_id, 0);
+  assert_eq!(partitions[0].desired_owner_id.as_deref(), Some("member-a"));
+  assert!(partitions[0].owner_id.is_none());
 }
 
 #[tokio::test]
@@ -581,19 +933,16 @@ async fn next_returns_revocation_until_completed() {
   iterator.start().unwrap();
   wait_for_active_assignment(&iterator, &[0, 1]).await;
 
-  source
-    .update(CoordinationSnapshot {
-      members: vec!["member-a".to_string(), "member-b".to_string()],
-      virtual_partitions: vec![0, 1],
-    })
-    .await;
+  source.update(CoordinationSnapshot {
+    members: vec!["member-a".to_string(), "member-b".to_string()],
+    virtual_partitions: vec![0, 1],
+  });
 
   for _ in 0 .. 40 {
     if iterator
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
-      .await
       .pending_revocation
     {
       break;
@@ -605,7 +954,6 @@ async fn next_returns_revocation_until_completed() {
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
-      .await
       .pending_revocation,
     "expected autonomous rebalance to request revocation"
   );
@@ -708,12 +1056,103 @@ async fn next_delivers_records_and_commit_renews() {
   assert_eq!(report.renewed_partitions, vec![3]);
   assert!(report.fenced_partitions.is_empty());
 
-  let state = iterator.diagnostics.state_snapshot().await;
-  assert_eq!(state.staged_offsets.len(), 1);
-  assert_eq!(state.staged_offsets[0].virtual_partition_id, 3);
-  assert_eq!(state.staged_offsets[0].offset, 2);
-  assert_eq!(state.last_committed_offsets, state.staged_offsets);
+  let state = iterator.diagnostics.state_snapshot();
+  assert_eq!(state.pending_commits.len(), 1);
+  assert_eq!(state.pending_commits[0].virtual_partition_id, 3);
+  assert_eq!(state.pending_commits[0].offset, 2);
+  assert_eq!(state.last_committed_offsets, state.pending_commits);
   assert!(state.last_successful_heartbeat_at.is_some());
+}
+
+#[tokio::test]
+async fn seek_waits_for_prefetch_scan_without_stalling_heartbeats() {
+  let blob_store = Arc::new(BlockingBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let concrete_membership_store = Arc::new(BlockingMembershipStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> = concrete_membership_store.clone();
+  let now_window = (SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap()
+    .as_secs()
+    .try_into()
+    .unwrap_or(i64::MAX)
+    / 300)
+    * 300;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    now_window,
+    1,
+    3,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![1], now_window * 1_000)],
+  )
+  .await;
+  blob_store.block_reads.store(true, Ordering::SeqCst);
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![3],
+    }));
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+    &runtime_config(),
+    blob_store.clone(),
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  )
+  .await
+  .unwrap();
+
+  let read_started = blob_store.read_started.notified();
+  iterator.start().unwrap();
+  timeout(Duration::from_secs(1), read_started).await.unwrap();
+
+  let snapshot = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_snapshot();
+  assert!(snapshot.started);
+  assert_eq!(snapshot.active_assignment, vec![3]);
+
+  let heartbeat_calls_before = concrete_membership_store
+    .heartbeat_calls
+    .load(Ordering::SeqCst);
+  let mut seek = Box::pin(iterator.seek(3, 0));
+  assert!(
+    timeout(Duration::from_millis(50), seek.as_mut())
+      .await
+      .is_err(),
+    "seek completed before the blocked prefetch scan reached its command boundary"
+  );
+  timeout(Duration::from_secs(1), async {
+    loop {
+      if concrete_membership_store
+        .heartbeat_calls
+        .load(Ordering::SeqCst)
+        > heartbeat_calls_before
+      {
+        return;
+      }
+      sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .unwrap();
+
+  blob_store.read_release.notify_waiters();
+  timeout(Duration::from_secs(1), seek)
+    .await
+    .unwrap()
+    .unwrap();
+  Box::new(iterator).shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -807,7 +1246,7 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
 }
 
 #[tokio::test]
-async fn prefetch_soft_budget_pauses_and_resumes_after_drain() {
+async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
@@ -869,13 +1308,15 @@ async fn prefetch_soft_budget_pauses_and_resumes_after_drain() {
   iterator.start().unwrap();
 
   wait_for_prefetch_buffer_len(&iterator, 1).await;
+  wait_for_prefetch_pending_record_count(&iterator, 4).await;
   let buffered_before = iterator
     .diagnostics()
     .expect("consumer implementation provides diagnostics")
-    .state_snapshot()
-    .await
-    .prefetch_buffered_batch_count;
-  assert_eq!(buffered_before, 1);
+    .state_snapshot();
+  assert_eq!(buffered_before.prefetch_buffered_batch_count, 1);
+  assert_eq!(buffered_before.prefetch_buffered_record_count, 2);
+  assert_eq!(buffered_before.prefetch_pending_batch_count, 2);
+  assert_eq!(buffered_before.prefetch_pending_record_count, 4);
 
   let first = timeout(Duration::from_secs(2), iterator.next())
     .await
@@ -888,15 +1329,28 @@ async fn prefetch_soft_budget_pauses_and_resumes_after_drain() {
   assert_eq!(first_record.virtual_partition_id, 7);
   assert_eq!(first_record.offset, 1);
 
-  // Drain should allow worker to admit another pending batch.
-  wait_for_prefetch_buffer_len(&iterator, 1).await;
-  let buffered_after = iterator
+  timeout(Duration::from_secs(2), iterator.seek(7, 0))
+    .await
+    .unwrap()
+    .unwrap();
+  let rewound = timeout(Duration::from_secs(2), iterator.next())
+    .await
+    .unwrap()
+    .unwrap();
+  let rewound_record = match rewound {
+    NextResult::Record(record) => record,
+    NextResult::Revoked(_) => panic!("expected rewound record"),
+  };
+  assert_eq!(rewound_record.virtual_partition_id, 7);
+  assert_eq!(rewound_record.offset, 1);
+  let recovered_snapshot = iterator
     .diagnostics()
     .expect("consumer implementation provides diagnostics")
-    .state_snapshot()
-    .await
-    .prefetch_buffered_batch_count;
-  assert_eq!(buffered_after, 1);
+    .state_snapshot();
+  assert_eq!(
+    recovered_snapshot.reader_partitions[0].mode,
+    ConsumerPartitionReadMode::Fast
+  );
 
   Box::new(iterator).shutdown().await.unwrap();
 }
@@ -965,19 +1419,16 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
   iterator.start().unwrap();
   wait_for_prefetch_buffer_len(&iterator, 2).await;
 
-  source
-    .update(CoordinationSnapshot {
-      members: vec!["member-a".to_string(), "member-b".to_string()],
-      virtual_partitions: vec![0, 1],
-    })
-    .await;
+  source.update(CoordinationSnapshot {
+    members: vec!["member-a".to_string(), "member-b".to_string()],
+    virtual_partitions: vec![0, 1],
+  });
 
   for _ in 0 .. 40 {
     if iterator
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
-      .await
       .pending_revocation
     {
       break;
@@ -989,7 +1440,6 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
-      .await
       .pending_revocation,
     "expected autonomous rebalance to request revocation"
   );
@@ -1006,8 +1456,7 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
   let snapshot = iterator
     .diagnostics()
     .expect("consumer implementation provides diagnostics")
-    .state_snapshot()
-    .await;
+    .state_snapshot();
   assert!(
     snapshot
       .prefetch_buffered_partitions
@@ -1076,8 +1525,7 @@ async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
     let snapshot = iterator
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
-      .state_snapshot()
-      .await;
+      .state_snapshot();
     if snapshot.last_successful_heartbeat_at.is_some() {
       break;
     }
@@ -1088,8 +1536,7 @@ async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
   let snapshot = iterator
     .diagnostics()
     .expect("consumer implementation provides diagnostics")
-    .state_snapshot()
-    .await;
+    .state_snapshot();
   assert!(snapshot.last_successful_heartbeat_at.is_some());
   Box::new(iterator).shutdown().await.unwrap();
 }
@@ -1200,7 +1647,6 @@ async fn cancelled_next_preserves_prefetched_record() {
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
-      .await
       .delivery_state
       == ConsumerDeliveryState::Pending
     {
@@ -1213,7 +1659,6 @@ async fn cancelled_next_preserves_prefetched_record() {
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
-      .await
       .delivery_state,
     ConsumerDeliveryState::Pending
   );

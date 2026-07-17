@@ -15,6 +15,7 @@ aws-sdk-dynamodb.workspace  = true
 blob-stream-blob-store.path = "../blob-stream-blob-store"
 blob-stream-types.path      = "../blob-stream-types"
 log.workspace               = true
+parking_lot.workspace       = true
 serde.workspace             = true
 serde_dynamo                = { workspace = true, features = ["aws-sdk-dynamodb+1"] }
 tokio.workspace             = true

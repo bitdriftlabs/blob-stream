@@ -4,7 +4,13 @@ use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use blob_stream_blob_store::BlobKey;
-use blob_stream_types::{BatchMetadata, SnowflakeId, TopicWindowKey, VirtualPartitionId};
+use blob_stream_types::{
+  BatchMetadata,
+  SnowflakeId,
+  TopicWindowKey,
+  VirtualPartitionId,
+  format_unix_timestamp_ms,
+};
 use log::{debug, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -78,7 +84,12 @@ impl MetadataStore for DynamoMetadataStore {
       "metadata(dynamo) write_segment start: table={}, topic={}, window_start={}, snowflake_id={}",
       self.table_name,
       metadata.window.topic,
-      metadata.window.window_start_unix_seconds,
+      format_unix_timestamp_ms(
+        metadata
+          .window
+          .window_start_unix_seconds
+          .saturating_mul(1_000)
+      ),
       metadata.snowflake_id.as_u64()
     );
     let ttl_epoch_seconds = self.metadata_ttl_epoch_seconds(&metadata);
@@ -110,7 +121,7 @@ impl MetadataStore for DynamoMetadataStore {
       "metadata(dynamo) scan_window start: table={}, topic={}, window_start={}, min_snowflake={:?}",
       self.table_name,
       window.topic,
-      window.window_start_unix_seconds,
+      format_unix_timestamp_ms(window.window_start_unix_seconds.saturating_mul(1_000)),
       min_snowflake.map(SnowflakeId::as_u64)
     );
 

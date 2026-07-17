@@ -76,7 +76,6 @@
 //! }
 //! ```
 
-#[cfg(feature = "admin")]
 mod admin;
 mod config;
 mod producer;

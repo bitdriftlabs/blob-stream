@@ -47,6 +47,7 @@ use blob_stream_types::{VirtualPartitionId, format_unix_timestamp_ms, virtual_pa
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use log::{debug, trace};
+use parking_lot::Mutex;
 use prometheus::{Histogram, IntCounter};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -55,7 +56,7 @@ use std::time::Duration;
 use thiserror::Error;
 use time::Duration as TimeDuration;
 use time::ext::NumericalDuration;
-use tokio::sync::{Mutex, Semaphore, oneshot, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval};
 
@@ -222,7 +223,7 @@ pub struct ProducerDiagnostics {
 
 impl ProducerDiagnostics {
   #[must_use]
-  pub async fn state_snapshot(&self) -> ProducerStateSnapshot {
+  pub fn state_snapshot(&self) -> ProducerStateSnapshot {
     let generated_at_ts_ms = time::OffsetDateTime::now_utc().unix_timestamp() * 1_000;
     let generated_at = format_unix_timestamp_ms(generated_at_ts_ms);
     let writer_id = producer_writer_id(&self.config);
@@ -291,7 +292,7 @@ impl ProducerDiagnostics {
       (&left.topic, left.virtual_partition_id).cmp(&(&right.topic, right.virtual_partition_id))
     });
 
-    let state = self.state.lock().await;
+    let state = self.state.lock();
     let mut partition_buffers = state
       .buffers
       .iter()
@@ -326,7 +327,6 @@ impl ProducerDiagnostics {
     }
   }
 
-  #[cfg(feature = "admin")]
   pub fn admin_router(self) -> axum::Router {
     crate::admin::router(self)
   }
@@ -591,7 +591,7 @@ impl ProducerClientImpl {
               .unwrap_or(usize::MAX);
             let dispatch_capacity = max_dispatches.saturating_sub(dispatches.len());
             let batches = {
-              let mut guard = state.lock().await;
+              let mut guard = state.lock();
               guard.collect_ready_batches(
                 producer_flush_max_delay_ms(&config),
                 dispatch_capacity,
@@ -660,7 +660,7 @@ impl ProducerClient for ProducerClientImpl {
     );
 
     let maybe_batch = {
-      let mut guard = self.state.lock().await;
+      let mut guard = self.state.lock();
       guard.push_record(
         BufferedRecord {
           topic,
@@ -704,7 +704,7 @@ impl ProducerClient for ProducerClientImpl {
 
   async fn flush(&self) -> Result<(), ProducerError> {
     let batches = {
-      let mut guard = self.state.lock().await;
+      let mut guard = self.state.lock();
       guard.drain_all_batches()
     };
 

@@ -11,8 +11,8 @@ use crate::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use log::trace;
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
-use tokio::sync::RwLock;
 
 //
 // InMemoryConsumerGroupMembershipStore
@@ -49,7 +49,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     let state = MemberState {
       lease_expiration_ts_ms: expires_at,
     };
-    self.state.write().await.members.insert(key, state);
+    self.state.write().members.insert(key, state);
     Ok(())
   }
 
@@ -76,7 +76,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
        member_id={member_id}"
     );
     let key = MemberKey::new(topic, group_id, member_id);
-    self.state.write().await.members.remove(&key);
+    self.state.write().members.remove(&key);
     Ok(())
   }
 
@@ -87,7 +87,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     now_ts_ms: i64,
   ) -> Result<Vec<String>> {
     trace!("consumer membership(memory) list_active_members: topic={topic}, group_id={group_id}");
-    let guard = self.state.read().await;
+    let guard = self.state.read();
     let mut members = HashSet::new();
     for (key, state) in &guard.members {
       if key.topic == topic && key.group_id == group_id && state.lease_expiration_ts_ms > now_ts_ms
@@ -110,7 +110,6 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
       self
         .state
         .read()
-        .await
         .plans
         .get(&GroupKey::new(topic, group_id))
         .cloned(),
@@ -126,7 +125,6 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
       self
         .state
         .read()
-        .await
         .planners
         .get(&GroupKey::new(topic, group_id))
         .map(|planner| ConsumerGroupPlannerLease {
@@ -148,7 +146,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
   ) -> Result<ConsumerGroupPlannerLeaseOutcome> {
     let expires_at = expires_at(now_ts_ms, ttl_ms)?;
     let group_key = GroupKey::new(topic, group_id);
-    let mut state = self.state.write().await;
+    let mut state = self.state.write();
 
     match state.planners.get(&group_key) {
       Some(planner)
@@ -180,7 +178,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     planner_session_id: &str,
   ) -> Result<bool> {
     let group_key = GroupKey::new(topic, group_id);
-    let mut state = self.state.write().await;
+    let mut state = self.state.write();
     if state.planners.get(&group_key).is_none_or(|planner| {
       planner.member_id != member_id || planner.planner_session_id != planner_session_id
     }) {
@@ -201,7 +199,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     plan: ConsumerGroupAssignmentPlan,
   ) -> Result<bool> {
     let group_key = GroupKey::new(topic, group_id);
-    let mut state = self.state.write().await;
+    let mut state = self.state.write();
     let Some(planner) = state.planners.get(&group_key) else {
       return Ok(false);
     };

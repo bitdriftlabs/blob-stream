@@ -7,15 +7,12 @@ version = "0.1.0"
 [lib]
 doctest = true
 
-[features]
-admin = ["dep:axum"]
-
 [dependencies]
 anyhow.workspace                  = true
 async-trait.workspace             = true
-axum                              = { workspace = true, optional = true }
-bd-log.workspace                  = true
+axum.workspace                    = true
 bd-grpc.workspace                 = true
+bd-log.workspace                  = true
 bd-pgv.workspace                  = true
 bd-server-stats.workspace         = true
 blob-stream-broker-discovery.path = "../blob-stream-broker-discovery"
@@ -23,6 +20,7 @@ blob-stream-proto.path            = "../blob-stream-proto"
 blob-stream-types.path            = "../blob-stream-types"
 futures.workspace                 = true
 log.workspace                     = true
+parking_lot.workspace             = true
 prometheus.workspace              = true
 serde.workspace                   = true
 thiserror.workspace               = true

@@ -3,7 +3,7 @@
 mod tests;
 
 use crate::config::{ConsumerGroupConfig, consumer_lease_duration_ms, validate_group_config};
-use anyhow::Result;
+use anyhow::{Error, Result};
 use async_trait::async_trait;
 use bd_log::warn_every;
 use blob_stream_metadata_store::{
@@ -17,12 +17,15 @@ use blob_stream_metadata_store::{
   ConsumerGroupPlannerLeaseOutcome,
   ConsumerGroupReleaseOutcome,
 };
-use blob_stream_types::{CommittedCursor, VirtualPartitionId};
+use blob_stream_types::{CommittedCursor, VirtualPartitionId, format_unix_timestamp_ms};
+use futures::{StreamExt, stream};
 use log::{debug, info, trace};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use time::ext::NumericalDuration;
 use uuid::Uuid;
+
+const MAX_CONCURRENT_PARTITION_LEASE_OPERATIONS: usize = 16;
 
 //
 // Coordination algorithm overview
@@ -106,6 +109,8 @@ pub struct RebalanceReport {
   pub owned_partitions: Vec<VirtualPartitionId>,
   /// Last committed cursor state per owned partition, when present in lease store.
   pub recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
+  /// Valid persisted assignment plan accepted during this rebalance.
+  pub accepted_assignment_plan: Option<ConsumerGroupAssignmentPlan>,
   /// Version of the valid persisted assignment plan accepted during this rebalance.
   pub accepted_assignment_plan_version: Option<u64>,
   /// Invalid persisted plan version rejected during this rebalance, when one was observed.
@@ -476,33 +481,46 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       assignment_changed |= !retain;
       retain
     });
-    let mut recovered_cursors = HashMap::new();
-    for partition_id in partitions {
-      let Some(owner_id) = desired_assignment.get(&partition_id) else {
-        continue;
-      };
-      // Skip partitions assigned to other members.
-      if owner_id != &member_id {
-        continue;
-      }
-
+    let topic = self.config.topic.to_string();
+    let group_id = self.config.group_id.to_string();
+    let generation = self.generation;
+    let lease_duration_ms = consumer_lease_duration_ms(&self.config);
+    let outcomes = stream::iter(partitions.into_iter().filter(|partition_id| {
+      desired_assignment
+        .get(partition_id)
+        .is_some_and(|owner_id| owner_id == &member_id)
+    }))
+    .map(|partition_id| {
+      let lease_store = Arc::clone(&self.lease_store);
       let key = ConsumerGroupLeaseKey {
-        topic: self.config.topic.to_string(),
-        group_id: self.config.group_id.to_string(),
+        topic: topic.clone(),
+        group_id: group_id.clone(),
         virtual_partition_id: partition_id,
       };
+      let member_id = member_id.clone();
+      async move {
+        let outcome = lease_store
+          .assign_partition(key, member_id, generation, now_ts_ms, lease_duration_ms)
+          .await?;
+        Ok::<_, Error>((partition_id, outcome))
+      }
+    })
+    .buffer_unordered(MAX_CONCURRENT_PARTITION_LEASE_OPERATIONS)
+    .collect::<Vec<_>>()
+    .await;
 
-      let outcome = self
-        .lease_store
-        .assign_partition(
-          key,
-          member_id.clone(),
-          self.generation,
-          now_ts_ms,
-          consumer_lease_duration_ms(&self.config),
-        )
-        .await?;
-
+    let mut recovered_cursors = HashMap::new();
+    let mut assignment_error = None;
+    for result in outcomes {
+      let (partition_id, outcome) = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+          if assignment_error.is_none() {
+            assignment_error = Some(error);
+          }
+          continue;
+        },
+      };
       // Track only partitions that the lease store actually granted to this member.
       match outcome {
         ConsumerGroupAssignmentOutcome::Assigned(lease) => {
@@ -521,8 +539,8 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
           assignment_changed |= self.owned.remove(&partition_id);
           debug!(
             "consumer assignment held by another member: topic={}, group_id={}, partition={}, \
-             member_id={}, generation={}, owner_id={}, owner_generation={}, \
-             lease_expires_at_ms={}, last_heartbeat_at_ms={}",
+             member_id={}, generation={}, owner_id={}, owner_generation={}, lease_expires_at={}, \
+             last_heartbeat_at={}",
             self.config.topic,
             self.config.group_id,
             partition_id,
@@ -530,11 +548,15 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
             self.generation,
             lease.owner_id,
             lease.generation,
-            lease.lease_expiration_ts_ms,
-            lease.last_heartbeat_ts_ms
+            format_unix_timestamp_ms(lease.lease_expiration_ts_ms),
+            format_unix_timestamp_ms(lease.last_heartbeat_ts_ms)
           );
         },
       }
+    }
+
+    if let Some(error) = assignment_error {
+      return Err(error);
     }
 
     // Stable ordering helps deterministic tests and predictable downstream behavior.
@@ -565,6 +587,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     Ok(RebalanceReport {
       owned_partitions: owned,
       recovered_cursors,
+      accepted_assignment_plan: shared_plan,
       accepted_assignment_plan_version,
       rejected_assignment_plan_version,
       assignment_plan_applied,
@@ -580,31 +603,53 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     let mut renewed = Vec::new();
     let mut fenced = Vec::new();
 
-    // Snapshot owned partitions so we can mutate self.owned while iterating outcomes.
+    // Bound independent lease writes so a large assignment cannot overwhelm the lease store.
+    // Reconcile every completed outcome before returning an error from another partition.
     let owned = self.owned.iter().copied().collect::<Vec<_>>();
     let owned_count = owned.len();
-    for partition_id in owned {
-      // Commit-on-heartbeat: include cursor when present, avoiding an additional write path.
-      let committed_cursor = cursors.get(&partition_id).cloned();
-
+    let topic = self.config.topic.to_string();
+    let group_id = self.config.group_id.to_string();
+    let member_id = self.config.member_id.to_string();
+    let generation = self.generation;
+    let lease_duration_ms = consumer_lease_duration_ms(&self.config);
+    let outcomes = stream::iter(owned.into_iter().map(|partition_id| {
+      let lease_store = Arc::clone(&self.lease_store);
       let key = ConsumerGroupLeaseKey {
-        topic: self.config.topic.to_string(),
-        group_id: self.config.group_id.to_string(),
+        topic: topic.clone(),
+        group_id: group_id.clone(),
         virtual_partition_id: partition_id,
       };
+      let member_id = member_id.clone();
+      let committed_cursor = cursors.get(&partition_id).cloned();
+      async move {
+        let outcome = lease_store
+          .heartbeat_partition(
+            &key,
+            &member_id,
+            generation,
+            now_ts_ms,
+            lease_duration_ms,
+            committed_cursor,
+          )
+          .await?;
+        Ok::<_, Error>((partition_id, outcome))
+      }
+    }))
+    .buffer_unordered(MAX_CONCURRENT_PARTITION_LEASE_OPERATIONS)
+    .collect::<Vec<_>>()
+    .await;
 
-      let outcome = self
-        .lease_store
-        .heartbeat_partition(
-          &key,
-          &self.config.member_id,
-          self.generation,
-          now_ts_ms,
-          consumer_lease_duration_ms(&self.config),
-          committed_cursor,
-        )
-        .await?;
-
+    let mut heartbeat_error = None;
+    for result in outcomes {
+      let (partition_id, outcome) = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+          if heartbeat_error.is_none() {
+            heartbeat_error = Some(error);
+          }
+          continue;
+        },
+      };
       match outcome {
         // Lease still valid for this member+generation.
         ConsumerGroupHeartbeatOutcome::Renewed(_) => renewed.push(partition_id),
@@ -614,8 +659,8 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
           fenced.push(partition_id);
           info!(
             "consumer lease fenced by another member: topic={}, group_id={}, partition={}, \
-             member_id={}, generation={}, owner_id={}, owner_generation={}, \
-             lease_expires_at_ms={}, last_heartbeat_at_ms={}",
+             member_id={}, generation={}, owner_id={}, owner_generation={}, lease_expires_at={}, \
+             last_heartbeat_at={}",
             self.config.topic,
             self.config.group_id,
             partition_id,
@@ -623,8 +668,8 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
             self.generation,
             lease.owner_id,
             lease.generation,
-            lease.lease_expiration_ts_ms,
-            lease.last_heartbeat_ts_ms
+            format_unix_timestamp_ms(lease.lease_expiration_ts_ms),
+            format_unix_timestamp_ms(lease.last_heartbeat_ts_ms)
           );
         },
         ConsumerGroupHeartbeatOutcome::Expired => {
@@ -632,13 +677,13 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
           fenced.push(partition_id);
           info!(
             "consumer lease expired before heartbeat: topic={}, group_id={}, partition={}, \
-             member_id={}, generation={}, now_ts_ms={}",
+             member_id={}, generation={}, now={}",
             self.config.topic,
             self.config.group_id,
             partition_id,
             self.config.member_id,
             self.generation,
-            now_ts_ms
+            format_unix_timestamp_ms(now_ts_ms)
           );
         },
       }
@@ -666,6 +711,9 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       fenced.len(),
       cursors.len()
     );
+    if let Some(error) = heartbeat_error {
+      return Err(error);
+    }
     Ok(HeartbeatReport {
       renewed_partitions: renewed,
       fenced_partitions: fenced,

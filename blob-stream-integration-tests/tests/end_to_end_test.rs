@@ -808,11 +808,11 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
         phase1_consumed.insert(id);
 
         consumer.store_offset(record.virtual_partition_id, record.offset)?;
-        let _ = consumer.commit().await?;
       },
     }
   }
   assert_eq!(phase1_consumed, phase1_expected);
+  let _ = consumer.commit().await?;
 
   // Step 4: Restart the consumer and produce phase 2 records after the restart boundary.
   let _ = consumer.shutdown().await;
@@ -882,7 +882,6 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
         }
 
         resumed_consumer.store_offset(record.virtual_partition_id, record.offset)?;
-        let _ = resumed_consumer.commit().await?;
       },
     }
   }
@@ -1417,8 +1416,7 @@ async fn wait_for_producer_route(
     let snapshot = producer
       .diagnostics()
       .expect("producer diagnostics must be available")
-      .state_snapshot()
-      .await;
+      .state_snapshot();
     let routes_converged = !snapshot.route_map.is_empty()
       && snapshot.route_map.iter().all(|route| {
         route
@@ -2858,7 +2856,6 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
         consumed_ids.insert(id);
 
         consumer.store_offset(record.virtual_partition_id, record.offset)?;
-        let _ = consumer.commit().await?;
       },
     }
   }

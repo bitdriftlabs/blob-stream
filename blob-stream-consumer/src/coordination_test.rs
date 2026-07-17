@@ -13,15 +13,22 @@ use blob_stream_metadata_store::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupAssignmentPlan,
+  ConsumerGroupCommitOutcome,
+  ConsumerGroupHeartbeatOutcome,
+  ConsumerGroupLease,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
   ConsumerGroupMembershipStore,
+  ConsumerGroupReleaseOutcome,
   InMemoryConsumerGroupLeaseStore,
   InMemoryConsumerGroupMembershipStore,
 };
 use blob_stream_types::CommittedCursor;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::sync::Notify;
+use tokio::time::{Duration, timeout};
 
 fn membership_store() -> Arc<dyn ConsumerGroupMembershipStore> {
   Arc::new(InMemoryConsumerGroupMembershipStore::new())
@@ -32,6 +39,178 @@ fn committed_cursor(virtual_partition_id: u32, seq_end: u64) -> CommittedCursor 
     virtual_partition_id,
     seq_end,
     source_checkpoint: None,
+  }
+}
+
+struct PartialHeartbeatFailureLeaseStore {
+  inner: InMemoryConsumerGroupLeaseStore,
+  failing_partition: u32,
+}
+
+struct BlockingAssignmentLeaseStore {
+  inner: InMemoryConsumerGroupLeaseStore,
+  assignment_started: AtomicUsize,
+  assignment_started_notify: Notify,
+  assignment_released: AtomicBool,
+  assignment_release_notify: Notify,
+}
+
+#[async_trait::async_trait]
+impl ConsumerGroupLeaseStore for PartialHeartbeatFailureLeaseStore {
+  async fn list_group_leases(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> anyhow::Result<Vec<ConsumerGroupLease>> {
+    self.inner.list_group_leases(topic, group_id).await
+  }
+
+  async fn assign_partition(
+    &self,
+    key: ConsumerGroupLeaseKey,
+    owner_id: String,
+    generation: u64,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+  ) -> anyhow::Result<ConsumerGroupAssignmentOutcome> {
+    self
+      .inner
+      .assign_partition(key, owner_id, generation, now_ts_ms, lease_duration_ms)
+      .await
+  }
+
+  async fn heartbeat_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+    committed_cursor: Option<CommittedCursor>,
+  ) -> anyhow::Result<ConsumerGroupHeartbeatOutcome> {
+    if key.virtual_partition_id == self.failing_partition {
+      return Err(anyhow::anyhow!("injected heartbeat failure"));
+    }
+    self
+      .inner
+      .heartbeat_partition(
+        key,
+        owner_id,
+        generation,
+        now_ts_ms,
+        lease_duration_ms,
+        committed_cursor,
+      )
+      .await
+  }
+
+  async fn commit_cursor(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+    committed_cursor: CommittedCursor,
+  ) -> anyhow::Result<ConsumerGroupCommitOutcome> {
+    self
+      .inner
+      .commit_cursor(key, owner_id, generation, now_ts_ms, committed_cursor)
+      .await
+  }
+
+  async fn release_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+  ) -> anyhow::Result<ConsumerGroupReleaseOutcome> {
+    self
+      .inner
+      .release_partition(key, owner_id, generation, now_ts_ms)
+      .await
+  }
+}
+
+#[async_trait::async_trait]
+impl ConsumerGroupLeaseStore for BlockingAssignmentLeaseStore {
+  async fn list_group_leases(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> anyhow::Result<Vec<ConsumerGroupLease>> {
+    self.inner.list_group_leases(topic, group_id).await
+  }
+
+  async fn assign_partition(
+    &self,
+    key: ConsumerGroupLeaseKey,
+    owner_id: String,
+    generation: u64,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+  ) -> anyhow::Result<ConsumerGroupAssignmentOutcome> {
+    self.assignment_started.fetch_add(1, Ordering::SeqCst);
+    self.assignment_started_notify.notify_waiters();
+    while !self.assignment_released.load(Ordering::SeqCst) {
+      let release_notified = self.assignment_release_notify.notified();
+      if !self.assignment_released.load(Ordering::SeqCst) {
+        release_notified.await;
+      }
+    }
+    self
+      .inner
+      .assign_partition(key, owner_id, generation, now_ts_ms, lease_duration_ms)
+      .await
+  }
+
+  async fn heartbeat_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+    committed_cursor: Option<CommittedCursor>,
+  ) -> anyhow::Result<ConsumerGroupHeartbeatOutcome> {
+    self
+      .inner
+      .heartbeat_partition(
+        key,
+        owner_id,
+        generation,
+        now_ts_ms,
+        lease_duration_ms,
+        committed_cursor,
+      )
+      .await
+  }
+
+  async fn commit_cursor(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+    committed_cursor: CommittedCursor,
+  ) -> anyhow::Result<ConsumerGroupCommitOutcome> {
+    self
+      .inner
+      .commit_cursor(key, owner_id, generation, now_ts_ms, committed_cursor)
+      .await
+  }
+
+  async fn release_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+  ) -> anyhow::Result<ConsumerGroupReleaseOutcome> {
+    self
+      .inner
+      .release_partition(key, owner_id, generation, now_ts_ms)
+      .await
   }
 }
 
@@ -356,6 +535,53 @@ async fn heartbeat_commit_renews_and_commits_cursor() {
 }
 
 #[tokio::test]
+async fn rebalance_acquires_partition_leases_concurrently() {
+  let concrete_store = Arc::new(BlockingAssignmentLeaseStore {
+    inner: InMemoryConsumerGroupLeaseStore::new(),
+    assignment_started: AtomicUsize::new(0),
+    assignment_started_notify: Notify::new(),
+    assignment_released: AtomicBool::new(false),
+    assignment_release_notify: Notify::new(),
+  });
+  let store: Arc<dyn ConsumerGroupLeaseStore> = concrete_store.clone();
+  let mut coordinator = ConsumerGroupCoordinatorImpl::new(
+    ConsumerGroupConfig {
+      topic: "topic-a".to_string().into(),
+      group_id: "group-a".to_string().into(),
+      member_id: "member-a".to_string().into(),
+      lease_duration_ms: Some(1_000),
+      heartbeat_interval_ms: Some(50),
+      rebalance_interval_ms: Some(50),
+      ..Default::default()
+    },
+    store,
+    membership_store(),
+  )
+  .unwrap();
+
+  let rebalance = tokio::spawn(async move {
+    coordinator
+      .rebalance(vec!["member-a".to_string()], vec![0, 1, 2], 1_000)
+      .await
+  });
+
+  timeout(Duration::from_secs(1), async {
+    while concrete_store.assignment_started.load(Ordering::SeqCst) < 2 {
+      concrete_store.assignment_started_notify.notified().await;
+    }
+  })
+  .await
+  .expect("rebalance should start multiple assignments before one completes");
+  concrete_store
+    .assignment_released
+    .store(true, Ordering::SeqCst);
+  concrete_store.assignment_release_notify.notify_waiters();
+
+  let report = rebalance.await.unwrap().unwrap();
+  assert_eq!(report.owned_partitions, vec![0, 1, 2]);
+}
+
+#[tokio::test]
 async fn stable_rebalance_preserves_owned_partitions_and_committed_cursor() {
   let store: Arc<dyn ConsumerGroupLeaseStore> = Arc::new(InMemoryConsumerGroupLeaseStore::new());
   let membership_store = membership_store();
@@ -450,6 +676,60 @@ async fn heartbeat_detects_fencing_by_new_generation() {
   assert!(report.renewed_partitions.is_empty());
   assert_eq!(report.fenced_partitions, vec![7]);
   assert!(coordinator.owned_partitions().is_empty());
+}
+
+#[tokio::test]
+async fn heartbeat_reconciles_fencing_when_another_partition_errors() {
+  let concrete_store = Arc::new(PartialHeartbeatFailureLeaseStore {
+    inner: InMemoryConsumerGroupLeaseStore::new(),
+    failing_partition: 8,
+  });
+  let store: Arc<dyn ConsumerGroupLeaseStore> = concrete_store.clone();
+  let membership_store = membership_store();
+  let mut coordinator = ConsumerGroupCoordinatorImpl::new(
+    ConsumerGroupConfig {
+      topic: "topic-a".to_string().into(),
+      group_id: "group-a".to_string().into(),
+      member_id: "member-a".to_string().into(),
+      lease_duration_ms: Some(100),
+      heartbeat_interval_ms: Some(50),
+      rebalance_interval_ms: Some(50),
+      ..Default::default()
+    },
+    store,
+    membership_store,
+  )
+  .unwrap();
+
+  coordinator
+    .rebalance(vec!["member-a".to_string()], vec![7, 8], 1_000)
+    .await
+    .unwrap();
+  assert_eq!(coordinator.owned_partitions(), vec![7, 8]);
+
+  concrete_store
+    .inner
+    .assign_partition(
+      ConsumerGroupLeaseKey {
+        topic: "topic-a".to_string(),
+        group_id: "group-a".to_string(),
+        virtual_partition_id: 7,
+      },
+      "member-b".to_string(),
+      2,
+      1_120,
+      100,
+    )
+    .await
+    .unwrap();
+
+  assert!(
+    coordinator
+      .heartbeat_and_commit(1_130, &HashMap::new())
+      .await
+      .is_err()
+  );
+  assert_eq!(coordinator.owned_partitions(), vec![8]);
 }
 
 #[tokio::test]

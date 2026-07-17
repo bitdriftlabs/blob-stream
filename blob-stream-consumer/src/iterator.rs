@@ -13,7 +13,12 @@ use crate::config::{
   consumer_rebalance_interval_ms,
   validate_runtime_config,
 };
-use crate::consumer::{ConsumerBatch, ConsumerReader, ConsumerReaderImpl};
+use crate::consumer::{
+  ConsumerBatch,
+  ConsumerReader,
+  ConsumerReaderImpl,
+  ConsumerReaderPartitionMode,
+};
 use crate::coordination::{
   ConsumerGroupCoordinator,
   ConsumerGroupCoordinatorImpl,
@@ -28,6 +33,7 @@ use bd_server_stats::stats::Scope;
 use blob_stream_blob_store::BlobStore;
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentPlan,
+  ConsumerGroupLease,
   ConsumerGroupLeaseStore,
   ConsumerGroupMembershipStore,
   MetadataStore,
@@ -42,16 +48,16 @@ use blob_stream_types::{
   now_unix_seconds,
 };
 use log::{debug, info, trace};
-use parking_lot::Mutex as ParkingLotMutex;
+use parking_lot::Mutex;
 use prometheus::{Histogram, IntCounter, IntGauge};
 use serde::Serialize;
 use std::cmp::max;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use time::ext::NumericalDuration;
-use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 //
@@ -280,18 +286,18 @@ impl DeliveryState {
     }
   }
 
-  fn drop_revoked_partitions(&mut self, revoked: &HashSet<VirtualPartitionId>) {
+  fn drop_partitions(&mut self, partitions: &HashSet<VirtualPartitionId>) {
     if self
       .current_batch
       .as_ref()
-      .is_some_and(|batch| revoked.contains(&batch.virtual_partition_id))
+      .is_some_and(|batch| partitions.contains(&batch.virtual_partition_id))
     {
       self.current_batch = None;
     }
 
     self
       .batches
-      .retain(|batch| !revoked.contains(&batch.virtual_partition_id));
+      .retain(|batch| !partitions.contains(&batch.virtual_partition_id));
     self.buffered_bytes = self.batches.iter().map(prefetched_batch_bytes).sum();
   }
 }
@@ -406,7 +412,7 @@ pub enum NextResult {
   Revoked(Box<dyn RevokedPartitions>),
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 /// Delivery state shared by the consumer facade and driver.
 pub enum ConsumerDeliveryState {
   /// No record or revocation event is currently available to a caller.
@@ -416,10 +422,22 @@ pub enum ConsumerDeliveryState {
 }
 
 //
-// ConsumerStateSnapshot
+// ConsumerStateResponse
 //
 
 #[derive(Debug, Serialize)]
+pub struct ConsumerStateResponse {
+  #[serde(flatten)]
+  pub state: ConsumerStateSnapshot,
+  pub group_lease_observation: ConsumerGroupLeaseObservation,
+}
+
+//
+// ConsumerStateSnapshot
+//
+
+#[derive(Clone, Debug, Serialize)]
+/// Immutable local state that is available without awaiting external work.
 pub struct ConsumerStateSnapshot {
   pub schema_version: u32,
   pub generated_at: String,
@@ -436,17 +454,55 @@ pub struct ConsumerStateSnapshot {
   pub pending_revocation: bool,
   pub delivery_state: ConsumerDeliveryState,
   pub pending_commits: Vec<ConsumerOffsetSnapshot>,
-  pub staged_offsets: Vec<ConsumerOffsetSnapshot>,
   pub last_committed_offsets: Vec<ConsumerOffsetSnapshot>,
   pub last_successful_heartbeat_at: Option<String>,
   pub cursors: Vec<ConsumerOffsetSnapshot>,
+  pub reader_partitions: Vec<ConsumerReaderPartitionSnapshot>,
   pub next_heartbeat_at: String,
   pub next_rebalance_at: String,
   pub prefetch_buffered_batch_count: usize,
+  pub prefetch_buffered_record_count: usize,
   pub prefetch_buffered_bytes: u64,
   pub prefetch_buffered_partitions: Vec<VirtualPartitionId>,
+  pub prefetch_pending_batch_count: usize,
+  pub prefetch_pending_record_count: usize,
+  pub prefetch_pending_bytes: u64,
   pub prefetch_max_bytes: u64,
   pub prefetch_worker_running: bool,
+}
+
+//
+// ConsumerGroupLeaseObservation
+//
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+/// Fresh group-wide lease observation for a state request, or its lookup failure.
+pub enum ConsumerGroupLeaseObservation {
+  Fresh {
+    partitions: Vec<ConsumerGroupPartitionLeaseSnapshot>,
+  },
+  LookupFailed {
+    error: String,
+  },
+}
+
+//
+// ConsumerGroupPartitionLeaseSnapshot
+//
+
+#[derive(Debug, Serialize)]
+/// Desired and observed lease state for one consumer-group virtual partition.
+pub struct ConsumerGroupPartitionLeaseSnapshot {
+  pub virtual_partition_id: VirtualPartitionId,
+  pub desired_owner_id: Option<String>,
+  pub owner_id: Option<String>,
+  pub generation: Option<u64>,
+  pub lease_expiration_at: Option<String>,
+  pub last_heartbeat_at: Option<String>,
+  pub committed_offset: Option<u64>,
+  pub committed_source_checkpoint: Option<CommittedSourceCheckpoint>,
+  pub committed_at: Option<String>,
 }
 
 //
@@ -485,20 +541,52 @@ pub struct ConsumerOffsetSnapshot {
 }
 
 //
+// ConsumerPartitionReadMode
+//
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerPartitionReadMode {
+  Fresh,
+  Recovering,
+  Fast,
+}
+
+//
+// ConsumerReaderPartitionSnapshot
+//
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ConsumerReaderPartitionSnapshot {
+  pub virtual_partition_id: VirtualPartitionId,
+  pub mode: ConsumerPartitionReadMode,
+  pub recovery_next_window_start: Option<String>,
+  pub recovery_cutover_window_start: Option<String>,
+}
+
+//
 // ConsumerDiagnosticsRuntimeState
 //
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ConsumerDiagnosticsRuntimeState {
+  started: bool,
+  prefetch_worker_running: bool,
   accepted_assignment_plan_version: u64,
+  assignment_plan: Option<ConsumerAssignmentPlanSnapshot>,
   owned_partitions: Vec<VirtualPartitionId>,
   active_assignment: Vec<VirtualPartitionId>,
   pending_assignment: Option<Vec<VirtualPartitionId>>,
   pending_revocation: bool,
   last_committed_offsets: HashMap<VirtualPartitionId, u64>,
+  cursors: Vec<ConsumerOffsetSnapshot>,
+  reader_partitions: Vec<ConsumerReaderPartitionSnapshot>,
   last_successful_heartbeat_at_ms: Option<i64>,
   next_heartbeat_at_ms: i64,
   next_rebalance_at_ms: i64,
+  prefetch_pending_batch_count: usize,
+  prefetch_pending_record_count: usize,
+  prefetch_pending_bytes: u64,
 }
 
 //
@@ -523,117 +611,227 @@ struct ConsumerSharedState {
 #[derive(Clone)]
 pub struct ConsumerDiagnostics {
   group_config: ConsumerGroupConfig,
-  membership_store: Arc<dyn ConsumerGroupMembershipStore>,
-  reader: Arc<Mutex<ConsumerReaderImpl>>,
-  shared_state: Arc<ParkingLotMutex<ConsumerSharedState>>,
+  shared_state: Arc<Mutex<ConsumerSharedState>>,
   prefetch_max_bytes: u64,
-  started: Arc<AtomicBool>,
-  prefetch_shutdown: Arc<AtomicBool>,
+  lease_store: Arc<dyn ConsumerGroupLeaseStore>,
 }
 
 impl ConsumerDiagnostics {
   #[must_use]
-  pub async fn state_snapshot(&self) -> ConsumerStateSnapshot {
-    let generated_at_ts_ms = now_unix_millis();
-    let generated_at = format_unix_timestamp_ms(generated_at_ts_ms);
+  pub fn state_snapshot(&self) -> ConsumerStateSnapshot {
+    self.build_state_snapshot()
+  }
+
+  fn build_state_snapshot(&self) -> ConsumerStateSnapshot {
     let (
-      mut owned_partitions,
-      mut active_assignment,
-      mut pending_assignment,
-      pending_revocation,
-      pending_commits,
-      last_committed_offsets,
-      last_successful_heartbeat_at_ms,
-      accepted_assignment_plan_version,
-      next_heartbeat_at_ms,
-      next_rebalance_at_ms,
-      delivery_state,
-      prefetch_buffered_batch_count,
+      runtime_state,
+      pending_commit_state,
+      buffered_batches,
+      current_batch_record_count,
       prefetch_buffered_bytes,
-      prefetch_buffered_partitions,
+      delivery_pending,
     ) = {
       let shared_state = self.shared_state.lock();
-      let runtime_state = &shared_state.diagnostics;
-      let mut prefetch_buffered_partitions = shared_state
-        .delivery_state
-        .batches
-        .iter()
-        .map(|batch| batch.virtual_partition_id)
-        .collect::<Vec<_>>();
-      prefetch_buffered_partitions.sort_unstable();
       (
-        runtime_state.owned_partitions.clone(),
-        runtime_state.active_assignment.clone(),
-        runtime_state.pending_assignment.clone(),
-        runtime_state.pending_revocation,
-        offsets_from_pending_commits(&shared_state.pending_commits),
-        offsets_from_map(&runtime_state.last_committed_offsets),
-        runtime_state.last_successful_heartbeat_at_ms,
-        runtime_state.accepted_assignment_plan_version,
-        runtime_state.next_heartbeat_at_ms,
-        runtime_state.next_rebalance_at_ms,
-        if shared_state.delivery_state.pending_revocation.is_some()
-          || shared_state.delivery_state.current_batch.is_some()
-          || !shared_state.delivery_state.batches.is_empty()
-        {
-          ConsumerDeliveryState::Pending
-        } else {
-          ConsumerDeliveryState::Idle
-        },
-        shared_state.delivery_state.batches.len(),
+        shared_state.diagnostics.clone(),
+        shared_state.pending_commits.clone(),
+        shared_state
+          .delivery_state
+          .batches
+          .iter()
+          .map(|batch| (batch.virtual_partition_id, batch.records.len()))
+          .collect::<Vec<_>>(),
+        shared_state
+          .delivery_state
+          .current_batch
+          .as_ref()
+          .map_or(0, |batch| batch.records.len()),
         shared_state.delivery_state.buffered_bytes,
-        prefetch_buffered_partitions,
+        shared_state.delivery_state.pending_revocation.is_some()
+          || shared_state.delivery_state.current_batch.is_some()
+          || !shared_state.delivery_state.batches.is_empty(),
       )
     };
+    let mut owned_partitions = runtime_state.owned_partitions;
+    let mut active_assignment = runtime_state.active_assignment;
+    let mut pending_assignment = runtime_state.pending_assignment;
+    let mut prefetch_buffered_partitions = buffered_batches
+      .iter()
+      .map(|(partition_id, _)| *partition_id)
+      .collect::<Vec<_>>();
     owned_partitions.sort_unstable();
     active_assignment.sort_unstable();
     if let Some(assignment) = &mut pending_assignment {
       assignment.sort_unstable();
     }
-
-    let mut cursors = offsets_from_map(&self.reader.lock().await.cursors());
-
-    let assignment_plan = self
-      .membership_store
-      .get_assignment_plan(&self.group_config.topic, &self.group_config.group_id)
-      .await
-      .ok()
-      .flatten()
-      .map(assignment_plan_snapshot);
+    prefetch_buffered_partitions.sort_unstable();
+    let pending_commits = offsets_from_pending_commits(&pending_commit_state);
+    let prefetch_buffered_record_count = buffered_batches
+      .iter()
+      .map(|(_, record_count)| *record_count)
+      .sum::<usize>()
+      .saturating_add(current_batch_record_count);
 
     ConsumerStateSnapshot {
-      schema_version: 8,
-      generated_at,
+      schema_version: 10,
+      generated_at: format_unix_timestamp_ms(now_unix_millis()),
       topic: self.group_config.topic.to_string(),
       group_id: self.group_config.group_id.to_string(),
       member_id: self.group_config.member_id.to_string(),
-      started: self.started.load(Ordering::Acquire),
-      accepted_assignment_plan_version,
-      assignment_plan,
+      started: runtime_state.started,
+      accepted_assignment_plan_version: runtime_state.accepted_assignment_plan_version,
+      assignment_plan: runtime_state.assignment_plan,
       owned_partitions,
       active_assignment,
       pending_assignment,
-      pending_revocation,
-      delivery_state,
-      pending_commits: pending_commits.clone(),
-      staged_offsets: pending_commits,
-      last_committed_offsets,
-      last_successful_heartbeat_at: last_successful_heartbeat_at_ms.map(format_unix_timestamp_ms),
-      cursors: std::mem::take(&mut cursors),
-      next_heartbeat_at: format_unix_timestamp_ms(next_heartbeat_at_ms),
-      next_rebalance_at: format_unix_timestamp_ms(next_rebalance_at_ms),
-      prefetch_buffered_batch_count,
+      pending_revocation: runtime_state.pending_revocation,
+      delivery_state: if delivery_pending {
+        ConsumerDeliveryState::Pending
+      } else {
+        ConsumerDeliveryState::Idle
+      },
+      pending_commits,
+      last_committed_offsets: offsets_from_map(&runtime_state.last_committed_offsets),
+      last_successful_heartbeat_at: runtime_state
+        .last_successful_heartbeat_at_ms
+        .map(format_unix_timestamp_ms),
+      cursors: runtime_state.cursors,
+      reader_partitions: runtime_state.reader_partitions,
+      next_heartbeat_at: format_unix_timestamp_ms(runtime_state.next_heartbeat_at_ms),
+      next_rebalance_at: format_unix_timestamp_ms(runtime_state.next_rebalance_at_ms),
+      prefetch_buffered_batch_count: buffered_batches.len(),
+      prefetch_buffered_record_count,
       prefetch_buffered_bytes,
       prefetch_buffered_partitions,
+      prefetch_pending_batch_count: runtime_state.prefetch_pending_batch_count,
+      prefetch_pending_record_count: runtime_state.prefetch_pending_record_count,
+      prefetch_pending_bytes: runtime_state.prefetch_pending_bytes,
       prefetch_max_bytes: self.prefetch_max_bytes,
-      prefetch_worker_running: self.started.load(Ordering::Acquire)
-        && !self.prefetch_shutdown.load(Ordering::Acquire),
+      prefetch_worker_running: runtime_state.prefetch_worker_running,
     }
   }
 
-  #[cfg(feature = "admin")]
+  pub async fn state_response(&self) -> ConsumerStateResponse {
+    let mut state = self.build_state_snapshot();
+    let group_lease_observation = match tokio::time::timeout(
+      Duration::from_secs(1),
+      self
+        .lease_store
+        .list_group_leases(&state.topic, &state.group_id),
+    )
+    .await
+    {
+      Ok(Ok(leases)) => group_lease_observation(state.assignment_plan.as_ref(), leases),
+      Ok(Err(error)) => {
+        debug!(
+          "consumer state lease lookup failed: topic={}, group_id={}, error={error:#}",
+          state.topic, state.group_id
+        );
+        ConsumerGroupLeaseObservation::LookupFailed {
+          error: error.to_string(),
+        }
+      },
+      Err(_) => {
+        debug!(
+          "consumer state lease lookup timed out: topic={}, group_id={}",
+          state.topic, state.group_id
+        );
+        ConsumerGroupLeaseObservation::LookupFailed {
+          error: "consumer lease lookup timed out after 1 second".to_string(),
+        }
+      },
+    };
+
+    state.schema_version = 11;
+    state.generated_at = format_unix_timestamp_ms(now_unix_millis());
+    ConsumerStateResponse {
+      state,
+      group_lease_observation,
+    }
+  }
+
   pub fn admin_router(self) -> axum::Router {
     crate::admin::router(self)
+  }
+}
+
+fn group_lease_observation(
+  assignment_plan: Option<&ConsumerAssignmentPlanSnapshot>,
+  leases: Vec<ConsumerGroupLease>,
+) -> ConsumerGroupLeaseObservation {
+  let desired_owners = assignment_plan
+    .map(|plan| {
+      plan
+        .assignments
+        .iter()
+        .map(|assignment| {
+          (
+            assignment.virtual_partition_id,
+            assignment.member_id.clone(),
+          )
+        })
+        .collect::<HashMap<_, _>>()
+    })
+    .unwrap_or_default();
+  let mut partitions = leases
+    .into_iter()
+    .map(|lease| {
+      let virtual_partition_id = lease.key.virtual_partition_id;
+      group_partition_lease_snapshot(
+        virtual_partition_id,
+        desired_owners.get(&virtual_partition_id).cloned(),
+        Some(lease),
+      )
+    })
+    .collect::<Vec<_>>();
+
+  for (virtual_partition_id, desired_owner_id) in desired_owners {
+    if !partitions
+      .iter()
+      .any(|partition| partition.virtual_partition_id == virtual_partition_id)
+    {
+      partitions.push(group_partition_lease_snapshot(
+        virtual_partition_id,
+        Some(desired_owner_id),
+        None,
+      ));
+    }
+  }
+  partitions.sort_by_key(|partition| partition.virtual_partition_id);
+  ConsumerGroupLeaseObservation::Fresh { partitions }
+}
+
+fn group_partition_lease_snapshot(
+  virtual_partition_id: VirtualPartitionId,
+  desired_owner_id: Option<String>,
+  lease: Option<ConsumerGroupLease>,
+) -> ConsumerGroupPartitionLeaseSnapshot {
+  let Some(lease) = lease else {
+    return ConsumerGroupPartitionLeaseSnapshot {
+      virtual_partition_id,
+      desired_owner_id,
+      owner_id: None,
+      generation: None,
+      lease_expiration_at: None,
+      last_heartbeat_at: None,
+      committed_offset: None,
+      committed_source_checkpoint: None,
+      committed_at: None,
+    };
+  };
+
+  ConsumerGroupPartitionLeaseSnapshot {
+    virtual_partition_id,
+    desired_owner_id,
+    owner_id: Some(lease.owner_id),
+    generation: Some(lease.generation),
+    lease_expiration_at: Some(format_unix_timestamp_ms(lease.lease_expiration_ts_ms)),
+    last_heartbeat_at: Some(format_unix_timestamp_ms(lease.last_heartbeat_ts_ms)),
+    committed_offset: lease.committed_cursor.as_ref().map(|cursor| cursor.seq_end),
+    committed_source_checkpoint: lease
+      .committed_cursor
+      .and_then(|cursor| cursor.source_checkpoint),
+    committed_at: lease.committed_ts_ms.map(format_unix_timestamp_ms),
   }
 }
 
@@ -696,7 +894,10 @@ pub trait ConsumerIterator: Send + Sync {
   async fn commit(&mut self) -> Result<HeartbeatReport>;
   /// Shutdown iterator and release owned partitions.
   async fn shutdown(self: Box<Self>) -> Result<()>;
-  /// Reposition read cursor for a partition.
+  /// Reposition a partition cursor after discarding buffered records read under the prior cursor.
+  ///
+  /// TODO: Accept a source checkpoint so historical seeks can target the exact source window.
+  /// TODO: Slice a batch at the requested offset rather than redelivering its earlier records.
   async fn seek(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()>;
   /// Register a callback for active partition assignments.
   ///
@@ -718,14 +919,15 @@ pub trait ConsumerIterator: Send + Sync {
 /// Long-lived owner of consumer coordination and prefetch lifecycle state.
 struct ConsumerDriver {
   group_config: ConsumerGroupConfig,
-  reader: Arc<Mutex<ConsumerReaderImpl>>,
+  reader: Option<ConsumerReaderImpl>,
+  reader_command_tx: Option<mpsc::UnboundedSender<ConsumerReaderCommand>>,
   coordinator: Box<dyn ConsumerGroupCoordinator>,
   membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   coordination_source: Arc<dyn ConsumerCoordinationSource>,
   last_coordination_snapshot: Option<CoordinationSnapshot>,
   metrics: ConsumerIteratorMetrics,
   started: bool,
-  shared_state: Arc<ParkingLotMutex<ConsumerSharedState>>,
+  shared_state: Arc<Mutex<ConsumerSharedState>>,
   prefetch_max_bytes: u64,
   delivery_notify: Arc<Notify>,
   prefetch_space_notify: Arc<Notify>,
@@ -734,7 +936,7 @@ struct ConsumerDriver {
   prefetch_idle_base_delay_ms: u64,
   prefetch_idle_max_delay_ms: Option<u64>,
   active_assignment: HashSet<VirtualPartitionId>,
-  assignment_callback: Arc<ParkingLotMutex<Option<AssignmentCallback>>>,
+  assignment_callback: Arc<Mutex<Option<AssignmentCallback>>>,
   pending_assignment: Option<Vec<VirtualPartitionId>>,
   pending_revocation_completion: Option<oneshot::Receiver<()>>,
   revocation_notify: Arc<Notify>,
@@ -762,6 +964,28 @@ enum ConsumerDriverCommand {
 }
 
 //
+// ConsumerReaderCommand
+//
+
+/// Commands that mutate the reader at a safe boundary between asynchronous scans.
+enum ConsumerReaderCommand {
+  HydrateCursors {
+    recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
+    now_unix_seconds: i64,
+  },
+  SetAssignment {
+    assignment: Vec<VirtualPartitionId>,
+    now_unix_seconds: i64,
+  },
+  Seek {
+    virtual_partition_id: VirtualPartitionId,
+    offset: u64,
+    now_unix_seconds: i64,
+    response: oneshot::Sender<Result<()>>,
+  },
+}
+
+//
 // ConsumerIteratorImpl
 //
 
@@ -769,11 +993,11 @@ enum ConsumerDriverCommand {
 pub struct ConsumerIteratorImpl {
   started: bool,
   diagnostics: ConsumerDiagnostics,
-  shared_state: Arc<ParkingLotMutex<ConsumerSharedState>>,
+  shared_state: Arc<Mutex<ConsumerSharedState>>,
   delivery_notify: Arc<Notify>,
   prefetch_space_notify: Arc<Notify>,
   metrics: ConsumerIteratorMetrics,
-  assignment_callback: Arc<ParkingLotMutex<Option<AssignmentCallback>>>,
+  assignment_callback: Arc<Mutex<Option<AssignmentCallback>>>,
   command_tx: Option<mpsc::UnboundedSender<ConsumerDriverCommand>>,
   driver: Option<ConsumerDriver>,
   driver_task: Option<JoinHandle<()>>,
@@ -812,49 +1036,43 @@ impl ConsumerIteratorImpl {
     let prefetch_max_bytes = consumer_prefetch_max_bytes(&read_config);
 
     let active_assignment = HashSet::new();
-    let assignment_callback = Arc::new(ParkingLotMutex::new(None));
-    let shared_state = Arc::new(ParkingLotMutex::new(ConsumerSharedState::default()));
-    let reader = Arc::new(Mutex::new(
-      ConsumerReaderImpl::new_with_retention_and_publication_lag(
-        read_config,
-        Vec::new(),
-        HashMap::new(),
-        blob_store,
-        metadata_store,
-        &metrics_scope.scope("consumer"),
-        retention_days,
-        maximum_metadata_publication_lag_ms,
-      )?,
-    ));
+    let assignment_callback = Arc::new(Mutex::new(None));
+    let shared_state = Arc::new(Mutex::new(ConsumerSharedState::default()));
+    let reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+      read_config,
+      Vec::new(),
+      HashMap::new(),
+      blob_store,
+      metadata_store,
+      &metrics_scope.scope("consumer"),
+      retention_days,
+      maximum_metadata_publication_lag_ms,
+    )?;
     let coordinator = ConsumerGroupCoordinatorImpl::new(
       group_config.clone(),
-      lease_store,
+      Arc::clone(&lease_store),
       Arc::clone(&membership_store),
     )?;
     let now_ts_ms = now_unix_millis();
     let delivery_notify = Arc::new(Notify::new());
     let prefetch_space_notify = Arc::new(Notify::new());
     let revocation_notify = Arc::new(Notify::new());
-    let started = Arc::new(AtomicBool::new(false));
     let prefetch_shutdown = Arc::new(AtomicBool::new(false));
     let diagnostics = ConsumerDiagnostics {
       group_config: group_config.clone(),
-      membership_store: Arc::clone(&membership_store),
-      reader: Arc::clone(&reader),
       shared_state: Arc::clone(&shared_state),
       prefetch_max_bytes,
-      started: Arc::clone(&started),
-      prefetch_shutdown: Arc::clone(&prefetch_shutdown),
+      lease_store: Arc::clone(&lease_store),
     };
     {
       let mut state = shared_state.lock();
       state.diagnostics.next_heartbeat_at_ms = now_ts_ms;
       state.diagnostics.next_rebalance_at_ms = now_ts_ms;
     }
-
     let mut driver = ConsumerDriver {
       group_config,
-      reader,
+      reader: Some(reader),
+      reader_command_tx: None,
       coordinator: Box::new(coordinator),
       membership_store,
       coordination_source,
@@ -904,7 +1122,7 @@ impl ConsumerIteratorImpl {
       },
     };
     driver.record_rebalance_metrics(&report);
-    let owned = driver.apply_rebalance_report(report).await?;
+    let owned = driver.apply_rebalance_report(report)?;
     info!(
       "consumer iterator bootstrapped: topic={}, group_id={}, member_id={}, owned={}",
       driver.group_config.topic,
@@ -929,6 +1147,15 @@ impl ConsumerIteratorImpl {
 }
 
 impl ConsumerDriver {
+  fn record_accepted_assignment_plan(&self, plan: Option<ConsumerGroupAssignmentPlan>) {
+    {
+      let mut shared_state = self.shared_state.lock();
+      if let Some(plan) = plan {
+        shared_state.diagnostics.assignment_plan = Some(assignment_plan_snapshot(plan));
+      }
+    }
+  }
+
   fn record_rebalance_metrics(&self, report: &RebalanceReport) {
     if report.assignment_plan_applied {
       self.metrics.assignment_plans_applied_total.inc();
@@ -946,40 +1173,104 @@ impl ConsumerDriver {
       .set(i64::try_from(report.owned_partitions.len()).unwrap_or(i64::MAX));
   }
 
-  async fn apply_rebalance_report(
-    &mut self,
-    report: RebalanceReport,
-  ) -> Result<Vec<VirtualPartitionId>> {
+  fn apply_rebalance_report(&mut self, report: RebalanceReport) -> Result<Vec<VirtualPartitionId>> {
     let RebalanceReport {
       owned_partitions,
       recovered_cursors,
+      accepted_assignment_plan,
       ..
     } = report;
-    self
-      .hydrate_cursors(recovered_cursors, now_unix_millis() / 1_000)
-      .await;
+    self.record_accepted_assignment_plan(accepted_assignment_plan);
+    self.hydrate_cursors(recovered_cursors, now_unix_millis() / 1_000)?;
 
-    self.apply_assignment(&owned_partitions).await?;
+    self.apply_assignment(&owned_partitions)?;
     Ok(owned_partitions)
   }
 
-  async fn hydrate_cursors(
-    &self,
+  fn hydrate_cursors(
+    &mut self,
     recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
     now_unix_seconds: i64,
-  ) {
+  ) -> Result<()> {
     if recovered_cursors.is_empty() {
+      return Ok(());
+    }
+
+    if let Some(reader) = &mut self.reader {
+      for (partition_id, recovered_cursor) in recovered_cursors {
+        reader.hydrate_cursor_with_source(
+          partition_id,
+          &recovered_cursor.committed_cursor,
+          recovered_cursor.committed_ts_ms,
+          now_unix_seconds,
+        );
+      }
+      record_reader_diagnostics(reader, &self.shared_state);
+      return Ok(());
+    }
+
+    self
+      .reader_command_tx
+      .as_ref()
+      .ok_or_else(|| anyhow!("consumer reader is unavailable"))?
+      .send(ConsumerReaderCommand::HydrateCursors {
+        recovered_cursors,
+        now_unix_seconds,
+      })
+      .map_err(|_| anyhow!("consumer reader worker stopped"))
+  }
+
+  fn set_reader_assignment(
+    &mut self,
+    assignment: Vec<VirtualPartitionId>,
+    now_unix_seconds: i64,
+  ) -> Result<()> {
+    if let Some(reader) = &mut self.reader {
+      reader.set_assigned_virtual_partitions(assignment, now_unix_seconds)?;
+      record_reader_diagnostics(reader, &self.shared_state);
+      return Ok(());
+    }
+
+    self
+      .reader_command_tx
+      .as_ref()
+      .ok_or_else(|| anyhow!("consumer reader is unavailable"))?
+      .send(ConsumerReaderCommand::SetAssignment {
+        assignment,
+        now_unix_seconds,
+      })
+      .map_err(|_| anyhow!("consumer reader worker stopped"))
+  }
+
+  fn seek_reader(
+    &mut self,
+    virtual_partition_id: VirtualPartitionId,
+    offset: u64,
+    now_unix_seconds: i64,
+    response: oneshot::Sender<Result<()>>,
+  ) {
+    if let Some(reader) = &mut self.reader {
+      reader.seek(virtual_partition_id, offset, now_unix_seconds);
+      record_reader_diagnostics(reader, &self.shared_state);
+      let _ = response.send(Ok(()));
       return;
     }
 
-    let mut reader = self.reader.lock().await;
-    for (partition_id, recovered_cursor) in recovered_cursors {
-      reader.hydrate_cursor_with_source(
-        partition_id,
-        &recovered_cursor.committed_cursor,
-        recovered_cursor.committed_ts_ms,
-        now_unix_seconds,
-      );
+    let Some(reader_command_tx) = self.reader_command_tx.as_ref() else {
+      let _ = response.send(Err(anyhow!("consumer reader is unavailable")));
+      return;
+    };
+    let command = ConsumerReaderCommand::Seek {
+      virtual_partition_id,
+      offset,
+      now_unix_seconds,
+      response,
+    };
+    if let Err(error) = reader_command_tx.send(command) {
+      let ConsumerReaderCommand::Seek { response, .. } = error.0 else {
+        unreachable!("only seek commands are sent through this path");
+      };
+      let _ = response.send(Err(anyhow!("consumer reader worker stopped")));
     }
   }
 
@@ -1029,14 +1320,12 @@ impl ConsumerDriver {
     self.last_coordination_snapshot = Some(snapshot.clone());
   }
 
-  async fn apply_assignment(&mut self, assignment: &[VirtualPartitionId]) -> Result<()> {
+  fn apply_assignment(&mut self, assignment: &[VirtualPartitionId]) -> Result<()> {
     let active_assignment = assignment.iter().copied().collect();
-    self
-      .apply_assignment_with_active_set(assignment, active_assignment)
-      .await
+    self.apply_assignment_with_active_set(assignment, active_assignment)
   }
 
-  async fn apply_assignment_with_active_set(
+  fn apply_assignment_with_active_set(
     &mut self,
     assignment: &[VirtualPartitionId],
     active_assignment: HashSet<VirtualPartitionId>,
@@ -1047,11 +1336,7 @@ impl ConsumerDriver {
       .copied()
       .collect::<Vec<_>>();
     newly_assigned.sort_unstable();
-    self
-      .reader
-      .lock()
-      .await
-      .set_assigned_virtual_partitions(assignment.to_owned(), now_unix_millis() / 1_000)?;
+    self.set_reader_assignment(assignment.to_owned(), now_unix_millis() / 1_000)?;
     self.active_assignment = active_assignment;
     self
       .metrics
@@ -1104,6 +1389,8 @@ impl ConsumerDriver {
     diagnostics.pending_revocation = self.pending_revocation_completion.is_some();
     diagnostics.next_heartbeat_at_ms = self.next_heartbeat_at_ms;
     diagnostics.next_rebalance_at_ms = self.next_rebalance_at_ms;
+    diagnostics.started = self.started;
+    diagnostics.prefetch_worker_running = self.prefetch_task.is_some();
   }
 
   fn refresh_rebalance_diagnostics(&self) {
@@ -1111,9 +1398,11 @@ impl ConsumerDriver {
     let diagnostics = &mut shared_state.diagnostics;
     diagnostics.accepted_assignment_plan_version = self.coordinator.generation();
     diagnostics.next_rebalance_at_ms = self.next_rebalance_at_ms;
+    diagnostics.started = self.started;
+    diagnostics.prefetch_worker_running = self.prefetch_task.is_some();
   }
 
-  async fn finish_pending_revocation_if_completed(&mut self) -> Result<bool> {
+  fn finish_pending_revocation_if_completed(&mut self) -> Result<bool> {
     let Some(recv) = self.pending_revocation_completion.as_mut() else {
       return Ok(true);
     };
@@ -1122,7 +1411,7 @@ impl ConsumerDriver {
       Ok(()) | Err(oneshot::error::TryRecvError::Closed) => {
         let assignment = self.pending_assignment.take().unwrap_or_default();
         self.pending_revocation_completion = None;
-        self.apply_assignment(&assignment).await?;
+        self.apply_assignment(&assignment)?;
         Ok(true)
       },
       Err(oneshot::error::TryRecvError::Empty) => Ok(false),
@@ -1152,16 +1441,16 @@ impl ConsumerDriver {
     let RebalanceReport {
       owned_partitions: next_assignment,
       recovered_cursors,
+      accepted_assignment_plan,
       ..
     } = report;
+    self.record_accepted_assignment_plan(accepted_assignment_plan);
 
     self.next_rebalance_at_ms = now_ts_ms + consumer_rebalance_interval_ms(&self.group_config);
 
     let next_assignment_set = next_assignment.iter().copied().collect::<HashSet<_>>();
     let assignment_changed = self.active_assignment != next_assignment_set;
-    self
-      .hydrate_cursors(recovered_cursors, now_ts_ms / 1_000)
-      .await;
+    self.hydrate_cursors(recovered_cursors, now_ts_ms / 1_000)?;
 
     if !assignment_changed {
       self.refresh_rebalance_diagnostics();
@@ -1175,9 +1464,7 @@ impl ConsumerDriver {
       .collect::<Vec<_>>();
 
     if revoked.is_empty() {
-      self
-        .apply_assignment_with_active_set(&next_assignment, next_assignment_set)
-        .await?;
+      self.apply_assignment_with_active_set(&next_assignment, next_assignment_set)?;
       return Ok(());
     }
 
@@ -1187,7 +1474,7 @@ impl ConsumerDriver {
     {
       let mut shared_state = self.shared_state.lock();
       let delivery_state = &mut shared_state.delivery_state;
-      delivery_state.drop_revoked_partitions(&revoked_set);
+      delivery_state.drop_partitions(&revoked_set);
       delivery_state.pending_revocation =
         Some(NextResult::Revoked(Box::new(RevokedPartitionsImpl {
           revoked: revoked.clone(),
@@ -1218,7 +1505,12 @@ impl ConsumerDriver {
 
     self.prefetch_shutdown.store(false, Ordering::Release);
 
-    let reader = Arc::clone(&self.reader);
+    let reader = self
+      .reader
+      .take()
+      .expect("consumer reader must be available before prefetch starts");
+    let (reader_command_tx, reader_command_rx) = mpsc::unbounded_channel();
+    self.reader_command_tx = Some(reader_command_tx);
     let shared_state = Arc::clone(&self.shared_state);
     let delivery_notify = Arc::clone(&self.delivery_notify);
     let space_notify = Arc::clone(&self.prefetch_space_notify);
@@ -1231,6 +1523,7 @@ impl ConsumerDriver {
     self.prefetch_task = Some(tokio::spawn(async move {
       run_prefetch_worker(
         reader,
+        reader_command_rx,
         shared_state,
         delivery_notify,
         space_notify,
@@ -1246,10 +1539,12 @@ impl ConsumerDriver {
 
   async fn stop_prefetch_task(&mut self) {
     self.prefetch_shutdown.store(true, Ordering::Release);
+    self.reader_command_tx = None;
     self.delivery_notify.notify_waiters();
     self.prefetch_space_notify.notify_waiters();
 
     if let Some(handle) = self.prefetch_task.take() {
+      handle.abort();
       let _ = handle.await;
     }
   }
@@ -1410,7 +1705,7 @@ impl ConsumerDriver {
           .clone_from(&self.active_assignment);
         self.refresh_diagnostics_locked(&mut shared_state);
       }
-      self.reader.lock().await.set_assigned_virtual_partitions(
+      self.set_reader_assignment(
         self.active_assignment.iter().copied().collect(),
         now_ts_ms / 1_000,
       )?;
@@ -1433,7 +1728,7 @@ impl ConsumerDriver {
     trace!(
       "consumer heartbeat completed: topic={}, group_id={}, member_id={}, trigger={}, \
        generation={}, renewed={:?}, fenced={:?}, committed_offsets={}, elapsed_ms={}, \
-       next_heartbeat_at_ms={}",
+       next_heartbeat_at={}",
       self.group_config.topic,
       self.group_config.group_id,
       self.group_config.member_id,
@@ -1443,7 +1738,7 @@ impl ConsumerDriver {
       report.fenced_partitions,
       committed_offsets,
       started_at.elapsed().as_millis(),
-      self.next_heartbeat_at_ms
+      format_unix_timestamp_ms(self.next_heartbeat_at_ms)
     );
     Ok(report)
   }
@@ -1464,9 +1759,124 @@ fn update_worker_prefetch_metrics(metrics: &ConsumerIteratorMetrics, buffer: &De
     .set(i64::try_from(buffer.buffered_bytes).unwrap_or(i64::MAX));
 }
 
+fn reader_partition_snapshot(
+  virtual_partition_id: VirtualPartitionId,
+  mode: ConsumerReaderPartitionMode,
+) -> ConsumerReaderPartitionSnapshot {
+  match mode {
+    ConsumerReaderPartitionMode::Fresh {
+      initial_window_start_unix_seconds,
+    } => ConsumerReaderPartitionSnapshot {
+      virtual_partition_id,
+      mode: ConsumerPartitionReadMode::Fresh,
+      recovery_next_window_start: Some(format_unix_timestamp_ms(
+        initial_window_start_unix_seconds.saturating_mul(1_000),
+      )),
+      recovery_cutover_window_start: None,
+    },
+    ConsumerReaderPartitionMode::Recovering {
+      next_window_start_unix_seconds,
+      cutover_window_start_unix_seconds,
+    } => ConsumerReaderPartitionSnapshot {
+      virtual_partition_id,
+      mode: ConsumerPartitionReadMode::Recovering,
+      recovery_next_window_start: Some(format_unix_timestamp_ms(
+        next_window_start_unix_seconds.saturating_mul(1_000),
+      )),
+      recovery_cutover_window_start: Some(format_unix_timestamp_ms(
+        cutover_window_start_unix_seconds.saturating_mul(1_000),
+      )),
+    },
+    ConsumerReaderPartitionMode::Fast => ConsumerReaderPartitionSnapshot {
+      virtual_partition_id,
+      mode: ConsumerPartitionReadMode::Fast,
+      recovery_next_window_start: None,
+      recovery_cutover_window_start: None,
+    },
+  }
+}
+
+fn record_reader_diagnostics(
+  reader: &ConsumerReaderImpl,
+  shared_state: &Arc<Mutex<ConsumerSharedState>>,
+) {
+  let mut shared_state = shared_state.lock();
+  shared_state.diagnostics.cursors = offsets_from_map(&reader.cursors());
+  shared_state.diagnostics.reader_partitions = reader
+    .partition_read_states()
+    .into_iter()
+    .map(|state| reader_partition_snapshot(state.virtual_partition_id, state.mode))
+    .collect();
+}
+
+fn process_reader_commands(
+  reader: &mut ConsumerReaderImpl,
+  reader_command_rx: &mut mpsc::UnboundedReceiver<ConsumerReaderCommand>,
+  shared_state: &Arc<Mutex<ConsumerSharedState>>,
+  pending: &mut VecDeque<ConsumerBatch>,
+  pending_record_count: &mut usize,
+  pending_bytes: &mut u64,
+) -> bool {
+  loop {
+    let command = match reader_command_rx.try_recv() {
+      Ok(command) => command,
+      Err(mpsc::error::TryRecvError::Empty) => return true,
+      Err(mpsc::error::TryRecvError::Disconnected) => return false,
+    };
+    let seek_response = match command {
+      ConsumerReaderCommand::HydrateCursors {
+        recovered_cursors,
+        now_unix_seconds,
+      } => {
+        for (partition_id, recovered_cursor) in recovered_cursors {
+          reader.hydrate_cursor_with_source(
+            partition_id,
+            &recovered_cursor.committed_cursor,
+            recovered_cursor.committed_ts_ms,
+            now_unix_seconds,
+          );
+        }
+        None
+      },
+      ConsumerReaderCommand::SetAssignment {
+        assignment,
+        now_unix_seconds,
+      } => {
+        if let Err(error) = reader.set_assigned_virtual_partitions(assignment, now_unix_seconds) {
+          shared_state.lock().terminal_error = Some(error.to_string());
+          return false;
+        }
+        None
+      },
+      ConsumerReaderCommand::Seek {
+        virtual_partition_id,
+        offset,
+        now_unix_seconds,
+        response,
+      } => {
+        reader.seek(virtual_partition_id, offset, now_unix_seconds);
+        pending.retain(|batch| {
+          if batch.virtual_partition_id != virtual_partition_id {
+            return true;
+          }
+          *pending_record_count = pending_record_count.saturating_sub(batch.records.len());
+          *pending_bytes = pending_bytes.saturating_sub(prefetched_batch_bytes(batch));
+          false
+        });
+        Some(response)
+      },
+    };
+    record_reader_diagnostics(reader, shared_state);
+    if let Some(response) = seek_response {
+      let _ = response.send(Ok(()));
+    }
+  }
+}
+
 async fn run_prefetch_worker(
-  reader: Arc<Mutex<ConsumerReaderImpl>>,
-  shared_state: Arc<ParkingLotMutex<ConsumerSharedState>>,
+  mut reader: ConsumerReaderImpl,
+  mut reader_command_rx: mpsc::UnboundedReceiver<ConsumerReaderCommand>,
+  shared_state: Arc<Mutex<ConsumerSharedState>>,
   delivery_notify: Arc<Notify>,
   prefetch_space_notify: Arc<Notify>,
   prefetch_shutdown: Arc<AtomicBool>,
@@ -1476,20 +1886,42 @@ async fn run_prefetch_worker(
   max_idle_delay_ms: Option<u64>,
 ) {
   let mut idle_poll_backoff = IdlePollBackoff::new(base_idle_delay_ms, max_idle_delay_ms);
-  let mut pending = VecDeque::new();
+  let mut pending = VecDeque::<ConsumerBatch>::new();
+  let mut pending_record_count = 0_usize;
+  let mut pending_bytes = 0_u64;
 
   loop {
     if prefetch_shutdown.load(Ordering::Acquire) {
+      return;
+    }
+    if !process_reader_commands(
+      &mut reader,
+      &mut reader_command_rx,
+      &shared_state,
+      &mut pending,
+      &mut pending_record_count,
+      &mut pending_bytes,
+    ) {
       return;
     }
 
     {
       let pending_remains = {
         let mut shared_state = shared_state.lock();
-        let buffer = &mut shared_state.delivery_state;
 
         while let Some(batch) = pending.front() {
+          let batch_record_count = batch.records.len();
           let batch_bytes = prefetched_batch_bytes(batch);
+          if !shared_state
+            .active_assignment
+            .contains(&batch.virtual_partition_id)
+          {
+            pending.pop_front();
+            pending_record_count = pending_record_count.saturating_sub(batch_record_count);
+            pending_bytes = pending_bytes.saturating_sub(batch_bytes);
+            continue;
+          }
+          let buffer = &mut shared_state.delivery_state;
           let would_cross = buffer
             .buffered_bytes
             .saturating_add(batch_bytes)
@@ -1504,18 +1936,23 @@ async fn run_prefetch_worker(
           let Some(batch) = pending.pop_front() else {
             break;
           };
+          pending_record_count = pending_record_count.saturating_sub(batch_record_count);
+          pending_bytes = pending_bytes.saturating_sub(batch_bytes);
           buffer.buffered_bytes = buffer.buffered_bytes.saturating_add(batch_bytes);
           buffer.batches.push_back(batch);
         }
 
+        let buffer = &mut shared_state.delivery_state;
         if !buffer.batches.is_empty() {
           update_worker_prefetch_metrics(&metrics, buffer);
           delivery_notify.notify_waiters();
         }
+        shared_state.diagnostics.prefetch_pending_batch_count = pending.len();
+        shared_state.diagnostics.prefetch_pending_record_count = pending_record_count;
+        shared_state.diagnostics.prefetch_pending_bytes = pending_bytes;
 
         !pending.is_empty()
       };
-
       if pending_remains {
         let _ = tokio::time::timeout(
           std::time::Duration::from_millis(250),
@@ -1530,7 +1967,7 @@ async fn run_prefetch_worker(
     let mut read_attempt: u8 = 0;
     let batches = loop {
       let now_s = now_unix_seconds();
-      let read_result = reader.lock().await.read_available(now_s).await;
+      let read_result = reader.read_available(now_s).await;
       match read_result {
         Ok(batches) => break batches,
         Err(read_error) => {
@@ -1553,6 +1990,7 @@ async fn run_prefetch_worker(
         },
       }
     };
+    record_reader_diagnostics(&reader, &shared_state);
 
     metrics
       .next_latency_seconds
@@ -1566,6 +2004,14 @@ async fn run_prefetch_worker(
 
     idle_poll_backoff.reset();
     metrics.prefetch_refill_cycles.inc();
+    pending_record_count = pending_record_count.saturating_add(
+      batches
+        .iter()
+        .map(|batch| batch.records.len())
+        .sum::<usize>(),
+    );
+    pending_bytes =
+      pending_bytes.saturating_add(batches.iter().map(prefetched_batch_bytes).sum::<u64>());
     pending.extend(batches);
   }
 }
@@ -1574,7 +2020,6 @@ impl ConsumerDriver {
   fn start(&mut self) -> Result<()> {
     ensure!(!self.started, "consumer iterator already started");
     self.started = true;
-    self.diagnostics.started.store(true, Ordering::Release);
     self.spawn_prefetch_task();
     self.refresh_diagnostics();
     info!(
@@ -1586,14 +2031,18 @@ impl ConsumerDriver {
 
   async fn run(mut self, mut command_rx: mpsc::UnboundedReceiver<ConsumerDriverCommand>) {
     if let Err(error) = self.start() {
-      self.shared_state.lock().terminal_error = Some(error.to_string());
-      self.diagnostics.started.store(false, Ordering::Release);
+      {
+        let mut shared_state = self.shared_state.lock();
+        shared_state.terminal_error = Some(error.to_string());
+        shared_state.diagnostics.started = false;
+        shared_state.diagnostics.prefetch_worker_running = false;
+      }
       self.delivery_notify.notify_waiters();
       return;
     }
 
     loop {
-      let revocation_completed = match self.finish_pending_revocation_if_completed().await {
+      let revocation_completed = match self.finish_pending_revocation_if_completed() {
         Ok(completed) => completed,
         Err(error) => {
           self.shared_state.lock().terminal_error = Some(error.to_string());
@@ -1621,13 +2070,13 @@ impl ConsumerDriver {
       if now_ts_ms >= self.next_heartbeat_at_ms {
         trace!(
           "consumer scheduled heartbeat due: topic={}, group_id={}, member_id={}, generation={}, \
-           now_ts_ms={}, due_at_ms={}, overdue_ms={}, active_partitions={:?}, pending_commits={}",
+           now={}, due_at={}, overdue_ms={}, active_partitions={:?}, pending_commits={}",
           self.group_config.topic,
           self.group_config.group_id,
           self.group_config.member_id,
           self.coordinator.generation(),
-          now_ts_ms,
-          self.next_heartbeat_at_ms,
+          format_unix_timestamp_ms(now_ts_ms),
+          format_unix_timestamp_ms(self.next_heartbeat_at_ms),
           now_ts_ms.saturating_sub(self.next_heartbeat_at_ms),
           self.active_assignment,
           self.shared_state.lock().pending_commits.len()
@@ -1668,7 +2117,7 @@ impl ConsumerDriver {
               offset,
               response,
             } => {
-              let _ = response.send(self.seek(virtual_partition_id, offset).await);
+              self.seek(virtual_partition_id, offset, response);
             },
             ConsumerDriverCommand::Shutdown { response } => {
               let _ = response.send(self.shutdown().await);
@@ -1742,7 +2191,6 @@ impl ConsumerDriver {
       }
       self.stop_prefetch_task().await;
       self.started = false;
-      self.diagnostics.started.store(false, Ordering::Release);
       self.refresh_diagnostics();
       info!(
         "consumer iterator shutdown: topic={}, group_id={}, member_id={}",
@@ -1756,29 +2204,36 @@ impl ConsumerDriver {
   }
 
   #[allow(clippy::needless_pass_by_ref_mut)]
-  async fn seek(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()> {
-    ensure!(
-      self.active_assignment.contains(&virtual_partition_id),
-      "cannot seek unassigned virtual partition {virtual_partition_id}"
-    );
-    self
-      .reader
-      .lock()
-      .await
-      .set_cursor(virtual_partition_id, offset);
+  fn seek(
+    &mut self,
+    virtual_partition_id: VirtualPartitionId,
+    offset: u64,
+    response: oneshot::Sender<Result<()>>,
+  ) {
+    if !self.active_assignment.contains(&virtual_partition_id) {
+      let _ = response.send(Err(anyhow!(
+        "cannot seek unassigned virtual partition {virtual_partition_id}"
+      )));
+      return;
+    }
     {
       let mut shared_state = self.shared_state.lock();
+      shared_state
+        .delivery_state
+        .drop_partitions(&HashSet::from([virtual_partition_id]));
       shared_state.pending_commits.remove(&virtual_partition_id);
       shared_state
         .delivered_source_ranges
         .remove(&virtual_partition_id);
+      update_worker_prefetch_metrics(&self.metrics, &shared_state.delivery_state);
     }
+    self.prefetch_space_notify.notify_waiters();
     self.refresh_diagnostics();
+    self.seek_reader(virtual_partition_id, offset, now_unix_seconds(), response);
     trace!(
       "consumer seek: topic={}, partition={}, offset={}",
       self.group_config.topic, virtual_partition_id, offset
     );
-    Ok(())
   }
 }
 
@@ -1795,7 +2250,11 @@ impl ConsumerIterator for ConsumerIteratorImpl {
 
     self.command_tx = Some(command_tx);
     self.started = true;
-    self.diagnostics.started.store(true, Ordering::Release);
+    {
+      let mut shared_state = self.shared_state.lock();
+      shared_state.diagnostics.started = true;
+      shared_state.diagnostics.prefetch_worker_running = true;
+    }
     self.driver_task = Some(tokio::spawn(async move {
       driver.run(command_rx).await;
     }));

@@ -365,6 +365,11 @@ pub enum ConsumerGroupReleaseOutcome {
 #[async_trait]
 /// Lease store used by consumer-group coordination and commits.
 pub trait ConsumerGroupLeaseStore: Send + Sync {
+  /// List all retained lease rows for one consumer group, including expired rows awaiting TTL
+  /// cleanup.
+  async fn list_group_leases(&self, topic: &str, group_id: &str)
+  -> Result<Vec<ConsumerGroupLease>>;
+
   /// Assign ownership of a virtual partition lease.
   async fn assign_partition(
     &self,
