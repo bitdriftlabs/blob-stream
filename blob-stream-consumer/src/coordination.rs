@@ -18,12 +18,14 @@ use blob_stream_metadata_store::{
   ConsumerGroupReleaseOutcome,
 };
 use blob_stream_types::{CommittedCursor, VirtualPartitionId, format_unix_timestamp_ms};
-use futures::future::try_join_all;
+use futures::{StreamExt, stream};
 use log::{debug, info, trace};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use time::ext::NumericalDuration;
 use uuid::Uuid;
+
+const MAX_CONCURRENT_PARTITION_HEARTBEATS: usize = 16;
 
 //
 // Coordination algorithm overview
@@ -584,8 +586,8 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     let mut renewed = Vec::new();
     let mut fenced = Vec::new();
 
-    // Snapshot owned partitions, issue independent lease updates concurrently, then reconcile
-    // local ownership after every outcome completes.
+    // Bound independent lease writes so a large assignment cannot overwhelm the lease store.
+    // Reconcile every completed outcome before returning an error from another partition.
     let owned = self.owned.iter().copied().collect::<Vec<_>>();
     let owned_count = owned.len();
     let topic = self.config.topic.to_string();
@@ -593,7 +595,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     let member_id = self.config.member_id.to_string();
     let generation = self.generation;
     let lease_duration_ms = consumer_lease_duration_ms(&self.config);
-    let outcomes = try_join_all(owned.into_iter().map(|partition_id| {
+    let outcomes = stream::iter(owned.into_iter().map(|partition_id| {
       let lease_store = Arc::clone(&self.lease_store);
       let key = ConsumerGroupLeaseKey {
         topic: topic.clone(),
@@ -616,9 +618,21 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
         Ok::<_, Error>((partition_id, outcome))
       }
     }))
-    .await?;
+    .buffer_unordered(MAX_CONCURRENT_PARTITION_HEARTBEATS)
+    .collect::<Vec<_>>()
+    .await;
 
-    for (partition_id, outcome) in outcomes {
+    let mut heartbeat_error = None;
+    for result in outcomes {
+      let (partition_id, outcome) = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+          if heartbeat_error.is_none() {
+            heartbeat_error = Some(error);
+          }
+          continue;
+        },
+      };
       match outcome {
         // Lease still valid for this member+generation.
         ConsumerGroupHeartbeatOutcome::Renewed(_) => renewed.push(partition_id),
@@ -680,6 +694,9 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       fenced.len(),
       cursors.len()
     );
+    if let Some(error) = heartbeat_error {
+      return Err(error);
+    }
     Ok(HeartbeatReport {
       renewed_partitions: renewed,
       fenced_partitions: fenced,

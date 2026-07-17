@@ -1065,7 +1065,7 @@ async fn next_delivers_records_and_commit_renews() {
 }
 
 #[tokio::test]
-async fn diagnostics_remain_available_while_prefetch_blob_read_is_blocked() {
+async fn reader_control_and_shutdown_remain_available_while_prefetch_blob_read_is_blocked() {
   let blob_store = Arc::new(BlockingBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
@@ -1122,13 +1122,14 @@ async fn diagnostics_remain_available_while_prefetch_blob_read_is_blocked() {
   assert!(snapshot.started);
   assert_eq!(snapshot.active_assignment, vec![3]);
 
-  blob_store.read_release.notify_waiters();
-  let next = timeout(Duration::from_secs(1), iterator.next())
+  timeout(Duration::from_secs(1), iterator.seek(3, 0))
     .await
     .unwrap()
     .unwrap();
-  assert!(matches!(next, NextResult::Record(_)));
-  Box::new(iterator).shutdown().await.unwrap();
+  timeout(Duration::from_secs(1), Box::new(iterator).shutdown())
+    .await
+    .unwrap()
+    .unwrap();
 }
 
 #[tokio::test]

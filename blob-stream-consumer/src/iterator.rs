@@ -619,8 +619,8 @@ pub struct ConsumerDiagnostics {
 
 impl ConsumerDiagnostics {
   #[must_use]
-  pub fn state_snapshot(&self) -> Arc<ConsumerStateSnapshot> {
-    Arc::new(self.build_state_snapshot())
+  pub fn state_snapshot(&self) -> ConsumerStateSnapshot {
+    self.build_state_snapshot()
   }
 
   fn build_state_snapshot(&self) -> ConsumerStateSnapshot {
@@ -869,7 +869,7 @@ pub trait ConsumerIterator: Send + Sync {
   async fn commit(&mut self) -> Result<HeartbeatReport>;
   /// Shutdown iterator and release owned partitions.
   async fn shutdown(self: Box<Self>) -> Result<()>;
-  /// Reposition read cursor for a partition.
+  /// Queue a read-cursor reposition for a partition at the next safe scan boundary.
   async fn seek(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()>;
   /// Register a callback for active partition assignments.
   ///
@@ -944,17 +944,14 @@ enum ConsumerReaderCommand {
   HydrateCursors {
     recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
     now_unix_seconds: i64,
-    response: oneshot::Sender<Result<()>>,
   },
   SetAssignment {
     assignment: Vec<VirtualPartitionId>,
     now_unix_seconds: i64,
-    response: oneshot::Sender<Result<()>>,
   },
   Seek {
     virtual_partition_id: VirtualPartitionId,
     offset: u64,
-    response: oneshot::Sender<Result<()>>,
   },
 }
 
@@ -1095,7 +1092,7 @@ impl ConsumerIteratorImpl {
       },
     };
     driver.record_rebalance_metrics(&report);
-    let owned = driver.apply_rebalance_report(report).await?;
+    let owned = driver.apply_rebalance_report(report)?;
     info!(
       "consumer iterator bootstrapped: topic={}, group_id={}, member_id={}, owned={}",
       driver.group_config.topic,
@@ -1146,10 +1143,7 @@ impl ConsumerDriver {
       .set(i64::try_from(report.owned_partitions.len()).unwrap_or(i64::MAX));
   }
 
-  async fn apply_rebalance_report(
-    &mut self,
-    report: RebalanceReport,
-  ) -> Result<Vec<VirtualPartitionId>> {
+  fn apply_rebalance_report(&mut self, report: RebalanceReport) -> Result<Vec<VirtualPartitionId>> {
     let RebalanceReport {
       owned_partitions,
       recovered_cursors,
@@ -1157,15 +1151,13 @@ impl ConsumerDriver {
       ..
     } = report;
     self.record_accepted_assignment_plan(accepted_assignment_plan);
-    self
-      .hydrate_cursors(recovered_cursors, now_unix_millis() / 1_000)
-      .await?;
+    self.hydrate_cursors(recovered_cursors, now_unix_millis() / 1_000)?;
 
-    self.apply_assignment(&owned_partitions).await?;
+    self.apply_assignment(&owned_partitions)?;
     Ok(owned_partitions)
   }
 
-  async fn hydrate_cursors(
+  fn hydrate_cursors(
     &mut self,
     recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
     now_unix_seconds: i64,
@@ -1187,7 +1179,6 @@ impl ConsumerDriver {
       return Ok(());
     }
 
-    let (response_tx, response_rx) = oneshot::channel();
     self
       .reader_command_tx
       .as_ref()
@@ -1195,15 +1186,11 @@ impl ConsumerDriver {
       .send(ConsumerReaderCommand::HydrateCursors {
         recovered_cursors,
         now_unix_seconds,
-        response: response_tx,
       })
-      .map_err(|_| anyhow!("consumer reader worker stopped"))?;
-    response_rx
-      .await
-      .map_err(|_| anyhow!("consumer reader worker stopped"))?
+      .map_err(|_| anyhow!("consumer reader worker stopped"))
   }
 
-  async fn set_reader_assignment(
+  fn set_reader_assignment(
     &mut self,
     assignment: Vec<VirtualPartitionId>,
     now_unix_seconds: i64,
@@ -1214,7 +1201,6 @@ impl ConsumerDriver {
       return Ok(());
     }
 
-    let (response_tx, response_rx) = oneshot::channel();
     self
       .reader_command_tx
       .as_ref()
@@ -1222,26 +1208,17 @@ impl ConsumerDriver {
       .send(ConsumerReaderCommand::SetAssignment {
         assignment,
         now_unix_seconds,
-        response: response_tx,
       })
-      .map_err(|_| anyhow!("consumer reader worker stopped"))?;
-    response_rx
-      .await
-      .map_err(|_| anyhow!("consumer reader worker stopped"))?
+      .map_err(|_| anyhow!("consumer reader worker stopped"))
   }
 
-  async fn seek_reader(
-    &mut self,
-    virtual_partition_id: VirtualPartitionId,
-    offset: u64,
-  ) -> Result<()> {
+  fn seek_reader(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()> {
     if let Some(reader) = &mut self.reader {
       reader.set_cursor(virtual_partition_id, offset);
       record_reader_diagnostics(reader, &self.shared_state);
       return Ok(());
     }
 
-    let (response_tx, response_rx) = oneshot::channel();
     self
       .reader_command_tx
       .as_ref()
@@ -1249,12 +1226,8 @@ impl ConsumerDriver {
       .send(ConsumerReaderCommand::Seek {
         virtual_partition_id,
         offset,
-        response: response_tx,
       })
-      .map_err(|_| anyhow!("consumer reader worker stopped"))?;
-    response_rx
-      .await
-      .map_err(|_| anyhow!("consumer reader worker stopped"))?
+      .map_err(|_| anyhow!("consumer reader worker stopped"))
   }
 
   fn record_coordination_snapshot(&mut self, snapshot: &CoordinationSnapshot) {
@@ -1303,14 +1276,12 @@ impl ConsumerDriver {
     self.last_coordination_snapshot = Some(snapshot.clone());
   }
 
-  async fn apply_assignment(&mut self, assignment: &[VirtualPartitionId]) -> Result<()> {
+  fn apply_assignment(&mut self, assignment: &[VirtualPartitionId]) -> Result<()> {
     let active_assignment = assignment.iter().copied().collect();
-    self
-      .apply_assignment_with_active_set(assignment, active_assignment)
-      .await
+    self.apply_assignment_with_active_set(assignment, active_assignment)
   }
 
-  async fn apply_assignment_with_active_set(
+  fn apply_assignment_with_active_set(
     &mut self,
     assignment: &[VirtualPartitionId],
     active_assignment: HashSet<VirtualPartitionId>,
@@ -1321,9 +1292,7 @@ impl ConsumerDriver {
       .copied()
       .collect::<Vec<_>>();
     newly_assigned.sort_unstable();
-    self
-      .set_reader_assignment(assignment.to_owned(), now_unix_millis() / 1_000)
-      .await?;
+    self.set_reader_assignment(assignment.to_owned(), now_unix_millis() / 1_000)?;
     self.active_assignment = active_assignment;
     self
       .metrics
@@ -1389,7 +1358,7 @@ impl ConsumerDriver {
     diagnostics.prefetch_worker_running = self.prefetch_task.is_some();
   }
 
-  async fn finish_pending_revocation_if_completed(&mut self) -> Result<bool> {
+  fn finish_pending_revocation_if_completed(&mut self) -> Result<bool> {
     let Some(recv) = self.pending_revocation_completion.as_mut() else {
       return Ok(true);
     };
@@ -1398,7 +1367,7 @@ impl ConsumerDriver {
       Ok(()) | Err(oneshot::error::TryRecvError::Closed) => {
         let assignment = self.pending_assignment.take().unwrap_or_default();
         self.pending_revocation_completion = None;
-        self.apply_assignment(&assignment).await?;
+        self.apply_assignment(&assignment)?;
         Ok(true)
       },
       Err(oneshot::error::TryRecvError::Empty) => Ok(false),
@@ -1437,9 +1406,7 @@ impl ConsumerDriver {
 
     let next_assignment_set = next_assignment.iter().copied().collect::<HashSet<_>>();
     let assignment_changed = self.active_assignment != next_assignment_set;
-    self
-      .hydrate_cursors(recovered_cursors, now_ts_ms / 1_000)
-      .await?;
+    self.hydrate_cursors(recovered_cursors, now_ts_ms / 1_000)?;
 
     if !assignment_changed {
       self.refresh_rebalance_diagnostics();
@@ -1453,9 +1420,7 @@ impl ConsumerDriver {
       .collect::<Vec<_>>();
 
     if revoked.is_empty() {
-      self
-        .apply_assignment_with_active_set(&next_assignment, next_assignment_set)
-        .await?;
+      self.apply_assignment_with_active_set(&next_assignment, next_assignment_set)?;
       return Ok(());
     }
 
@@ -1535,6 +1500,7 @@ impl ConsumerDriver {
     self.prefetch_space_notify.notify_waiters();
 
     if let Some(handle) = self.prefetch_task.take() {
+      handle.abort();
       let _ = handle.await;
     }
   }
@@ -1695,12 +1661,10 @@ impl ConsumerDriver {
           .clone_from(&self.active_assignment);
         self.refresh_diagnostics_locked(&mut shared_state);
       }
-      self
-        .set_reader_assignment(
-          self.active_assignment.iter().copied().collect(),
-          now_ts_ms / 1_000,
-        )
-        .await?;
+      self.set_reader_assignment(
+        self.active_assignment.iter().copied().collect(),
+        now_ts_ms / 1_000,
+      )?;
       info!(
         "consumer heartbeat fenced partitions: topic={}, group_id={}, member_id={}, fenced={:?}",
         self.group_config.topic,
@@ -1825,11 +1789,10 @@ fn process_reader_commands(
       Err(mpsc::error::TryRecvError::Empty) => return true,
       Err(mpsc::error::TryRecvError::Disconnected) => return false,
     };
-    let response = match command {
+    match command {
       ConsumerReaderCommand::HydrateCursors {
         recovered_cursors,
         now_unix_seconds,
-        response,
       } => {
         for (partition_id, recovered_cursor) in recovered_cursors {
           reader.hydrate_cursor_with_source(
@@ -1839,30 +1802,24 @@ fn process_reader_commands(
             now_unix_seconds,
           );
         }
-        response
       },
       ConsumerReaderCommand::SetAssignment {
         assignment,
         now_unix_seconds,
-        response,
       } => {
         if let Err(error) = reader.set_assigned_virtual_partitions(assignment, now_unix_seconds) {
-          let _ = response.send(Err(error));
-          continue;
+          shared_state.lock().terminal_error = Some(error.to_string());
+          return false;
         }
-        response
       },
       ConsumerReaderCommand::Seek {
         virtual_partition_id,
         offset,
-        response,
       } => {
         reader.set_cursor(virtual_partition_id, offset);
-        response
       },
-    };
+    }
     record_reader_diagnostics(reader, shared_state);
-    let _ = response.send(Ok(()));
   }
 }
 
@@ -2028,7 +1985,7 @@ impl ConsumerDriver {
     }
 
     loop {
-      let revocation_completed = match self.finish_pending_revocation_if_completed().await {
+      let revocation_completed = match self.finish_pending_revocation_if_completed() {
         Ok(completed) => completed,
         Err(error) => {
           self.shared_state.lock().terminal_error = Some(error.to_string());
@@ -2103,7 +2060,7 @@ impl ConsumerDriver {
               offset,
               response,
             } => {
-              let _ = response.send(self.seek(virtual_partition_id, offset).await);
+              let _ = response.send(self.seek(virtual_partition_id, offset));
             },
             ConsumerDriverCommand::Shutdown { response } => {
               let _ = response.send(self.shutdown().await);
@@ -2190,12 +2147,12 @@ impl ConsumerDriver {
   }
 
   #[allow(clippy::needless_pass_by_ref_mut)]
-  async fn seek(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()> {
+  fn seek(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()> {
     ensure!(
       self.active_assignment.contains(&virtual_partition_id),
       "cannot seek unassigned virtual partition {virtual_partition_id}"
     );
-    self.seek_reader(virtual_partition_id, offset).await?;
+    self.seek_reader(virtual_partition_id, offset)?;
     {
       let mut shared_state = self.shared_state.lock();
       shared_state.pending_commits.remove(&virtual_partition_id);

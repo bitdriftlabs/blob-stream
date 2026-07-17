@@ -47,7 +47,7 @@ protobuf = { git = "https://github.com/bitdriftlabs/rust-protobuf.git", branch =
 protobuf-codegen = { git = "https://github.com/bitdriftlabs/rust-protobuf.git", branch = "patch-stack" }
 protobuf-json-mapping = { git = "https://github.com/bitdriftlabs/rust-protobuf.git", branch = "patch-stack" }
 
-serde             = { version = "1.0.228", features = ["derive", "rc"] }
+serde             = { version = "1.0.228", features = ["derive"] }
 serde_dynamo      = "4.3.0"
 serde_json        = { version = "1.0.150" }
 serde_yaml        = "0.9.34"
