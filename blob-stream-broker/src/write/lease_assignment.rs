@@ -31,9 +31,6 @@ impl WriteEngineImpl {
     holder_id: &str,
     membership: &BrokerMembership,
   ) -> Vec<(String, VirtualPartitionId)> {
-    // Empty membership means discovery is unavailable or intentionally static; in that case we
-    // self-assign all partitions so writes can continue behind lease fencing.
-    let static_self = membership.nodes.is_empty();
     let partitions = writer_virtual_partitions(
       topics
         .values()
@@ -41,19 +38,12 @@ impl WriteEngineImpl {
       writer_id,
     );
 
-    let mut owned: Vec<(String, VirtualPartitionId)> = if static_self {
-      partitions
-        .into_iter()
-        .map(|partition| (partition.topic, partition.virtual_partition_id))
-        .collect()
-    } else {
-      balanced_assignment(partitions, membership)
-        .into_iter()
-        .filter_map(|(partition, owner)| {
-          (owner.node_id == holder_id).then_some((partition.topic, partition.virtual_partition_id))
-        })
-        .collect()
-    };
+    let mut owned: Vec<(String, VirtualPartitionId)> = balanced_assignment(partitions, membership)
+      .into_iter()
+      .filter_map(|(partition, owner)| {
+        (owner.node_id == holder_id).then_some((partition.topic, partition.virtual_partition_id))
+      })
+      .collect();
 
     owned.sort_unstable();
     owned
@@ -84,6 +74,7 @@ impl WriteEngineImpl {
       // If the watch sender closes, we continue on ticker-only cadence so lease maintenance keeps
       // running instead of silently stalling.
       let mut membership_updates_open = true;
+      let mut assignment_activated = false;
       let mut previously_assigned: HashSet<(String, VirtualPartitionId)> = HashSet::new();
 
       loop {
@@ -110,6 +101,29 @@ impl WriteEngineImpl {
           let mut guard = state.lock();
           guard.membership = membership.clone();
         }
+        // Kubernetes does not publish this pod to Endpoints until it is ready. Waiting here keeps
+        // the server available for readiness checks without treating an incomplete snapshot as
+        // authoritative ownership.
+        if !assignment_activated {
+          let Some(nodes) = membership.nodes() else {
+            if shutting_down {
+              break;
+            }
+            continue;
+          };
+          let self_is_member = nodes.iter().any(|node| node.node_id == holder_id);
+          if !self_is_member {
+            if shutting_down {
+              break;
+            }
+            continue;
+          }
+          assignment_activated = true;
+          info!(
+            "broker lease assignment activated: holder_id={holder_id}, membership_nodes={nodes:?}"
+          );
+        }
+
         let owned = Self::owned_virtual_partitions(&topics, writer_id, &holder_id, &membership);
         let currently_owned: HashSet<(String, VirtualPartitionId)> =
           owned.iter().cloned().collect();
@@ -121,7 +135,7 @@ impl WriteEngineImpl {
             "broker partition assignment changed: holder_id={holder_id}, membership_nodes={:?}, \
              assigned_partitions={}, gained_partitions={gained_partitions:?}, \
              lost_partitions={lost_partitions:?}",
-            membership.nodes,
+            membership.nodes().unwrap_or_default(),
             currently_owned.len(),
           );
         }

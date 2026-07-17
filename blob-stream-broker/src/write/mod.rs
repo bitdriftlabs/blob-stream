@@ -804,7 +804,8 @@ impl WriteEngine for WriteEngineImpl {
       (state.membership.clone(), local_partitions_by_topic)
     };
     let mut membership_snapshot = membership
-      .nodes
+      .nodes()
+      .unwrap_or_default()
       .iter()
       .map(|node| BrokerNodeSnapshot {
         node_id: node.node_id.clone(),
@@ -868,7 +869,8 @@ impl WriteEngine for WriteEngineImpl {
         Ok(Some(lease)) => {
           let is_active = lease.lease_expiration_ts_ms > generated_at_ts_ms;
           let holder_address = membership
-            .nodes
+            .nodes()
+            .unwrap_or_default()
             .iter()
             .find(|node| node.node_id == lease.holder_id)
             .map(|node| node.address.clone());
@@ -1287,7 +1289,7 @@ fn begin_allocation_transition(
 ) -> AllocationTransitionDecision {
   let mut state_guard = state.lock();
   let partition_state = state_guard.partition_state_mut(topic, virtual_partition_id);
-  if partition_state.draining {
+  if partition_state.draining && !renew_lease {
     return AllocationTransitionDecision::Draining;
   }
   if partition_state.allocation_in_flight {

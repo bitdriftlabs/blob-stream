@@ -12,6 +12,15 @@ use super::{
 use anyhow::Result;
 use std::collections::HashMap;
 
+#[test]
+fn membership_distinguishes_pending_from_known_empty() {
+  assert!(BrokerMembership::default().nodes().is_none());
+  assert_eq!(
+    BrokerMembership::new(Vec::new()).nodes(),
+    Some([].as_slice())
+  );
+}
+
 #[tokio::test]
 async fn static_discovery_emits_membership() -> Result<()> {
   let nodes = vec![
@@ -30,6 +39,10 @@ async fn static_discovery_emits_membership() -> Result<()> {
 
   let expected = BrokerMembership::new(nodes);
   assert_eq!(*receiver.borrow(), expected);
+  assert_eq!(
+    receiver.borrow().nodes(),
+    Some(expected.nodes().unwrap_or_default())
+  );
   Ok(())
 }
 

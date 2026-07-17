@@ -36,16 +36,28 @@ pub struct BrokerNode {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 /// Current broker membership view.
-pub struct BrokerMembership {
-  /// Known broker nodes.
-  pub nodes: Vec<BrokerNode>,
+pub enum BrokerMembership {
+  /// Discovery has not delivered its initial membership snapshot.
+  #[default]
+  Pending,
+  /// An authoritative membership snapshot, which may contain no nodes.
+  Initialized(Vec<BrokerNode>),
 }
 
 impl BrokerMembership {
-  /// Build a membership set from nodes.
+  /// Build an initialized membership snapshot from nodes.
   #[must_use]
   pub fn new(nodes: Vec<BrokerNode>) -> Self {
-    Self { nodes }
+    Self::Initialized(nodes)
+  }
+
+  #[must_use]
+  /// Return nodes from an initialized snapshot, or `None` while discovery is pending.
+  pub fn nodes(&self) -> Option<&[BrokerNode]> {
+    match self {
+      Self::Pending => None,
+      Self::Initialized(nodes) => Some(nodes),
+    }
   }
 }
 
@@ -136,7 +148,7 @@ pub fn balanced_assignment(
 }
 
 fn canonical_nodes(membership: &BrokerMembership) -> Vec<BrokerNode> {
-  let mut nodes = membership.nodes.clone();
+  let mut nodes = membership.nodes().unwrap_or_default().to_vec();
   nodes.sort_unstable_by(|left, right| {
     left
       .node_id
@@ -162,6 +174,9 @@ fn rendezvous_score(partition: &BrokerPartition, node_id: &str) -> u64 {
 #[async_trait]
 /// Discovery source that provides watchable membership updates.
 pub trait BrokerDiscovery: Send + Sync {
-  /// Return a watch receiver seeded with current membership and updated on membership changes.
+  /// Return a watch receiver updated with membership changes.
+  ///
+  /// A receiver may initially contain [`BrokerMembership::Pending`]. Callers must wait for an
+  /// [`BrokerMembership::Initialized`] snapshot before treating membership as authoritative.
   async fn watch_membership(&self) -> Result<watch::Receiver<BrokerMembership>>;
 }

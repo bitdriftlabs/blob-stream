@@ -79,6 +79,14 @@ fn ownership_changes_with_membership() {
   }]);
   let owned_after_move = WriteEngineImpl::owned_virtual_partitions(&topics, 0, "node-a", &solo_b);
   assert!(owned_after_move.is_empty());
+
+  let owned_empty = WriteEngineImpl::owned_virtual_partitions(
+    &topics,
+    0,
+    "node-a",
+    &BrokerMembership::new(Vec::new()),
+  );
+  assert!(owned_empty.is_empty());
 }
 
 #[test]
@@ -177,6 +185,173 @@ async fn all_partitions_acquired(
   }
 
   true
+}
+
+async fn all_partitions_held_by(
+  store: &InMemoryProducerPartitionLeaseStore,
+  holder_id: &str,
+  partition_count: u32,
+  now_ts_ms: i64,
+) -> bool {
+  for logical_partition_id in 0 .. partition_count {
+    let virtual_partition_id =
+      virtual_partition_for_logical(logical_partition_id, partition_count, 0);
+    let key = ProducerPartitionLeaseKey {
+      topic: "telemetry".to_string(),
+      virtual_partition_id,
+    };
+    let Ok(Some(lease)) = store.get_lease(&key).await else {
+      return false;
+    };
+    if lease.holder_id != holder_id || lease.lease_expiration_ts_ms <= now_ts_ms {
+      return false;
+    }
+  }
+
+  true
+}
+
+async fn all_partitions_expired(
+  store: &InMemoryProducerPartitionLeaseStore,
+  partition_count: u32,
+  now_ts_ms: i64,
+) -> bool {
+  for logical_partition_id in 0 .. partition_count {
+    let virtual_partition_id =
+      virtual_partition_for_logical(logical_partition_id, partition_count, 0);
+    let key = ProducerPartitionLeaseKey {
+      topic: "telemetry".to_string(),
+      virtual_partition_id,
+    };
+    let Ok(Some(lease)) = store.get_lease(&key).await else {
+      return false;
+    };
+    if lease.lease_expiration_ts_ms > now_ts_ms {
+      return false;
+    }
+  }
+
+  true
+}
+
+async fn wait_for_all_partitions(mut predicate: impl AsyncFnMut() -> bool) -> bool {
+  for _ in 0 .. 300 {
+    if predicate().await {
+      return true;
+    }
+    tokio::time::sleep(StdDuration::from_millis(20)).await;
+  }
+
+  false
+}
+
+#[tokio::test]
+async fn lease_assignment_waits_for_initialized_self_membership() -> Result<()> {
+  let partition_count = 4;
+  let topics = make_topic(partition_count);
+  let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
+  let now_ts_ms = 1_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ts_ms)));
+  let mut config = WriteConfig::with_defaults();
+  config.lease_duration_ms = 60_000;
+  let (membership_tx, membership_rx) = watch::channel(BrokerMembership::default());
+
+  let engine = WriteEngineImpl::new_with_time_provider(
+    config,
+    topics,
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    lease_store.clone(),
+    "node-a".to_string(),
+    Some(membership_rx),
+    time_provider,
+    &metrics_scope(),
+  )?;
+
+  tokio::time::sleep(StdDuration::from_millis(50)).await;
+  assert!(!all_partitions_held_by(&lease_store, "node-a", partition_count, now_ts_ms).await);
+
+  membership_tx.send(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-b".to_string(),
+    address: "10.0.0.2:8080".to_string(),
+  }]))?;
+  tokio::time::sleep(StdDuration::from_millis(50)).await;
+  assert!(!all_partitions_held_by(&lease_store, "node-a", partition_count, now_ts_ms).await);
+
+  membership_tx.send(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-a".to_string(),
+    address: "10.0.0.1:8080".to_string(),
+  }]))?;
+  assert!(
+    wait_for_all_partitions(|| {
+      all_partitions_held_by(&lease_store, "node-a", partition_count, now_ts_ms)
+    })
+    .await,
+    "leases were not acquired after node-a appeared in membership"
+  );
+
+  drop(engine);
+  Ok(())
+}
+
+#[tokio::test]
+async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Result<()> {
+  let partition_count = 4;
+  let topics = make_topic(partition_count);
+  let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
+  let now_ts_ms = 1_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ts_ms)));
+  let mut config = WriteConfig::with_defaults();
+  config.lease_duration_ms = 60_000;
+  let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-a".to_string(),
+    address: "10.0.0.1:8080".to_string(),
+  }]));
+
+  let engine = WriteEngineImpl::new_with_time_provider(
+    config,
+    topics,
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    lease_store.clone(),
+    "node-a".to_string(),
+    Some(membership_rx),
+    time_provider,
+    &metrics_scope(),
+  )?;
+
+  assert!(
+    wait_for_all_partitions(|| {
+      all_partitions_held_by(&lease_store, "node-a", partition_count, now_ts_ms)
+    })
+    .await,
+    "node-a did not acquire its initial leases"
+  );
+
+  membership_tx.send(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-b".to_string(),
+    address: "10.0.0.2:8080".to_string(),
+  }]))?;
+  assert!(
+    wait_for_all_partitions(|| all_partitions_expired(&lease_store, partition_count, now_ts_ms))
+      .await,
+    "node-a did not release leases after losing membership"
+  );
+
+  membership_tx.send(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-a".to_string(),
+    address: "10.0.0.1:8080".to_string(),
+  }]))?;
+  assert!(
+    wait_for_all_partitions(|| {
+      all_partitions_held_by(&lease_store, "node-a", partition_count, now_ts_ms)
+    })
+    .await,
+    "node-a did not reacquire leases after rejoining membership"
+  );
+
+  drop(engine);
+  Ok(())
 }
 
 #[tokio::test]

@@ -228,7 +228,8 @@ impl ProducerDiagnostics {
     let writer_id = producer_writer_id(&self.config);
     let membership = self.membership_rx.borrow().clone();
     let mut brokers = membership
-      .nodes
+      .nodes()
+      .unwrap_or_default()
       .iter()
       .map(|node| ProducerBrokerSnapshot {
         node_id: node.node_id.clone(),
@@ -835,7 +836,7 @@ async fn send_batch_with_retry(
               "producer no broker owner: topic={}, virtual_partition_id={}, membership_nodes={}",
               batch.topic,
               batch.virtual_partition_id,
-              membership.nodes.len()
+              membership.nodes().map_or(0, <[BrokerNode]>::len)
             );
             None
           },
