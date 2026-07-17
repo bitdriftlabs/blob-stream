@@ -5,6 +5,7 @@ mod tests;
 use crate::config::{ConsumerGroupConfig, consumer_lease_duration_ms, validate_group_config};
 use anyhow::Result;
 use async_trait::async_trait;
+use bd_log::warn_every;
 use blob_stream_metadata_store::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentOutcome,
@@ -17,9 +18,10 @@ use blob_stream_metadata_store::{
   ConsumerGroupReleaseOutcome,
 };
 use blob_stream_types::{CommittedCursor, VirtualPartitionId};
-use log::{debug, info};
+use log::{debug, info, trace};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use time::ext::NumericalDuration;
 use uuid::Uuid;
 
 //
@@ -104,6 +106,51 @@ pub struct RebalanceReport {
   pub owned_partitions: Vec<VirtualPartitionId>,
   /// Last committed cursor state per owned partition, when present in lease store.
   pub recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
+  /// Version of the valid persisted assignment plan accepted during this rebalance.
+  pub accepted_assignment_plan_version: Option<u64>,
+  /// Invalid persisted plan version rejected during this rebalance, when one was observed.
+  pub rejected_assignment_plan_version: Option<u64>,
+  /// Whether this coordinator advanced to a newly accepted assignment plan version.
+  pub assignment_plan_applied: bool,
+  /// Number of partitions the accepted plan assigned to this member before lease reconciliation.
+  pub desired_partitions: usize,
+}
+
+//
+// AssignmentPlanValidationError
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Reason a persisted assignment plan cannot safely be applied.
+pub enum AssignmentPlanValidationError {
+  /// The plan does not include any members.
+  EmptyMembers,
+  /// The recorded planner is not one of the plan members.
+  PlannerNotMember,
+  /// The plan has a different number of assignments than the configured partition inventory.
+  AssignmentCountMismatch { expected: usize, actual: usize },
+  /// An assignment refers to a member absent from the plan membership.
+  AssignmentOwnerNotMember { member_id: String },
+  /// More than one assignment refers to the same partition.
+  DuplicatePartitionAssignment {
+    virtual_partition_id: VirtualPartitionId,
+  },
+  /// The plan omits a configured partition.
+  MissingExpectedPartition {
+    virtual_partition_id: VirtualPartitionId,
+  },
+  /// Members differ by more than one assigned partition.
+  ImbalancedLoad { min_load: usize, max_load: usize },
+}
+
+//
+// SharedAssignment
+//
+
+/// Result of resolving the persisted plan, including a rejected version when a planner repairs it.
+struct SharedAssignment {
+  plan: Option<ConsumerGroupAssignmentPlan>,
+  rejected_assignment_plan_version: Option<u64>,
 }
 
 //
@@ -178,14 +225,39 @@ impl ConsumerGroupCoordinatorImpl {
     members: &[String],
     partitions: &[VirtualPartitionId],
     now_ts_ms: i64,
-  ) -> Result<Option<ConsumerGroupAssignmentPlan>> {
+  ) -> Result<SharedAssignment> {
     let current_plan = self
       .membership_store
       .get_assignment_plan(&self.config.topic, &self.config.group_id)
       .await?;
-    let current_plan_is_valid = current_plan
+    let current_plan_validation_error = current_plan
       .as_ref()
-      .is_some_and(|plan| assignment_plan_is_valid(plan, partitions));
+      .and_then(|plan| assignment_plan_validation_error(plan, partitions));
+    if let Some(plan) = current_plan.as_ref() {
+      trace!(
+        "consumer assignment plan read: topic={}, group_id={}, member_id={}, version={}, \
+         planner_member_id={}, members={}, assignments={}",
+        self.config.topic,
+        self.config.group_id,
+        self.config.member_id,
+        plan.version,
+        plan.planner_member_id,
+        plan.members.len(),
+        plan.assignments.len()
+      );
+      if let Some(reason) = current_plan_validation_error.as_ref() {
+        log_assignment_plan_rejection(&self.config, plan, partitions, reason);
+      }
+    } else {
+      trace!(
+        "consumer assignment plan absent: topic={}, group_id={}, member_id={}",
+        self.config.topic, self.config.group_id, self.config.member_id
+      );
+    }
+    let current_plan_is_valid = current_plan.is_some() && current_plan_validation_error.is_none();
+    let rejected_assignment_plan_version = current_plan
+      .as_ref()
+      .and_then(|plan| current_plan_validation_error.as_ref().map(|_| plan.version));
     let current_members = canonical_members(members, &self.config.member_id);
     let topology_changed = current_plan
       .as_ref()
@@ -201,7 +273,19 @@ impl ConsumerGroupCoordinatorImpl {
         lease.member_id == plan.planner_member_id && lease.lease_expiration_ts_ms > now_ts_ms
       });
       if planner_is_active && plan.planner_member_id != self.config.member_id.as_ref() {
-        return Ok(Some(plan.clone()));
+        debug!(
+          "consumer assignment plan accepted from active planner: topic={}, group_id={}, \
+           member_id={}, version={}, planner_member_id={}",
+          self.config.topic,
+          self.config.group_id,
+          self.config.member_id,
+          plan.version,
+          plan.planner_member_id
+        );
+        return Ok(SharedAssignment {
+          plan: Some(plan.clone()),
+          rejected_assignment_plan_version,
+        });
       }
       if planner_is_active && !topology_changed {
         let outcome = self
@@ -216,7 +300,15 @@ impl ConsumerGroupCoordinatorImpl {
           )
           .await?;
         if outcome == ConsumerGroupPlannerLeaseOutcome::Acquired {
-          return Ok(Some(plan.clone()));
+          debug!(
+            "consumer assignment plan retained by planner: topic={}, group_id={}, member_id={}, \
+             version={}",
+            self.config.topic, self.config.group_id, self.config.member_id, plan.version
+          );
+          return Ok(SharedAssignment {
+            plan: Some(plan.clone()),
+            rejected_assignment_plan_version,
+          });
         }
       }
     }
@@ -253,6 +345,16 @@ impl ConsumerGroupCoordinatorImpl {
         &self.config.member_id,
         now_ts_ms,
       );
+      debug!(
+        "consumer assignment plan publishing: topic={}, group_id={}, member_id={}, version={}, \
+         members={}, assignments={}",
+        self.config.topic,
+        self.config.group_id,
+        self.config.member_id,
+        plan.version,
+        plan.members.len(),
+        plan.assignments.len()
+      );
       if self
         .membership_store
         .publish_assignment_plan(
@@ -275,15 +377,47 @@ impl ConsumerGroupCoordinatorImpl {
           plan.members.len(),
           plan.assignments.len()
         );
-        return Ok(Some(plan));
+        return Ok(SharedAssignment {
+          plan: Some(plan),
+          rejected_assignment_plan_version,
+        });
       }
+      debug!(
+        "consumer assignment plan publication not applied: topic={}, group_id={}, member_id={}, \
+         version={}",
+        self.config.topic, self.config.group_id, self.config.member_id, plan.version
+      );
+    } else {
+      debug!(
+        "consumer planner lease unavailable: topic={}, group_id={}, member_id={}",
+        self.config.topic, self.config.group_id, self.config.member_id
+      );
     }
 
     let refreshed_plan = self
       .membership_store
       .get_assignment_plan(&self.config.topic, &self.config.group_id)
       .await?;
-    Ok(refreshed_plan.filter(|plan| assignment_plan_is_valid(plan, partitions)))
+    if let Some(plan) = refreshed_plan.as_ref()
+      && let Some(reason) = assignment_plan_validation_error(plan, partitions)
+    {
+      log_assignment_plan_rejection(&self.config, plan, partitions, &reason);
+      return Ok(SharedAssignment {
+        plan: None,
+        rejected_assignment_plan_version: rejected_assignment_plan_version.or(Some(plan.version)),
+      });
+    }
+    if let Some(plan) = refreshed_plan.as_ref() {
+      debug!(
+        "consumer assignment plan accepted after refresh: topic={}, group_id={}, member_id={}, \
+         version={}",
+        self.config.topic, self.config.group_id, self.config.member_id, plan.version
+      );
+    }
+    Ok(SharedAssignment {
+      plan: refreshed_plan,
+      rejected_assignment_plan_version,
+    })
   }
 }
 
@@ -297,10 +431,29 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
   ) -> Result<RebalanceReport> {
     // Desired ownership is accepted only from a valid persisted plan. During a planner transition
     // without one, this member makes no local ownership decision.
-    let shared_plan = self
+    let SharedAssignment {
+      plan: shared_plan,
+      rejected_assignment_plan_version,
+    } = self
       .shared_assignment(&members, &partitions, now_ts_ms)
       .await?;
+    let accepted_assignment_plan_version = shared_plan.as_ref().map(|plan| plan.version);
+    let assignment_plan_applied =
+      accepted_assignment_plan_version.is_some_and(|plan_version| self.generation != plan_version);
     if let Some(plan) = shared_plan.as_ref() {
+      if assignment_plan_applied {
+        info!(
+          "consumer assignment plan accepted: topic={}, group_id={}, member_id={}, version={}, \
+           planner_member_id={}, members={}, assignments={}",
+          self.config.topic,
+          self.config.group_id,
+          self.config.member_id,
+          plan.version,
+          plan.planner_member_id,
+          plan.members.len(),
+          plan.assignments.len()
+        );
+      }
       self.generation = plan.version;
     }
     let desired_assignment = shared_plan
@@ -311,6 +464,10 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     // Keep previously owned partitions that are still locally desired, then reconcile each lease
     // outcome below. This avoids rebuilding the local ownership set on stable rebalances.
     let member_id = self.config.member_id.to_string();
+    let desired_partitions = desired_assignment
+      .values()
+      .filter(|owner_id| *owner_id == &member_id)
+      .count();
     let mut assignment_changed = false;
     self.owned.retain(|partition_id| {
       let retain = desired_assignment
@@ -385,28 +542,33 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     owned.sort_unstable();
     if assignment_changed {
       info!(
-        "consumer rebalance applied: topic={}, group_id={}, member_id={}, generation={}, owned={}",
+        "consumer rebalance applied: topic={}, group_id={}, member_id={}, \
+         accepted_assignment_plan_version={accepted_assignment_plan_version:?}, owned={}",
         self.config.topic,
         self.config.group_id,
         self.config.member_id,
-        self.generation,
         owned.len()
       );
     }
     debug!(
-      "consumer rebalance completed: topic={}, group_id={}, member_id={}, generation={}, \
-       members={}, desired_partitions={}, owned={}",
+      "consumer rebalance completed: topic={}, group_id={}, member_id={}, \
+       accepted_assignment_plan_version={accepted_assignment_plan_version:?}, \
+       rejected_assignment_plan_version={rejected_assignment_plan_version:?}, members={}, \
+       desired_partitions={}, owned={}",
       self.config.topic,
       self.config.group_id,
       self.config.member_id,
-      self.generation,
       members.len(),
-      desired_assignment.len(),
+      desired_partitions,
       owned.len()
     );
     Ok(RebalanceReport {
       owned_partitions: owned,
       recovered_cursors,
+      accepted_assignment_plan_version,
+      rejected_assignment_plan_version,
+      assignment_plan_applied,
+      desired_partitions,
     })
   }
 
@@ -628,27 +790,27 @@ pub fn cooperative_sticky_assignment(
     }
   }
 
-  // Rebalance only if needed. Move the smallest number of partitions from overloaded members
-  // to underloaded members to keep assignment cooperative and sticky.
-  let member_count = deduped_members.len();
-  let partition_count = deduped_partitions.len();
-  let min_target = partition_count / member_count;
-  let max_target = min_target + usize::from(!partition_count.is_multiple_of(member_count));
-
+  // Rebalance only if needed. A member at the integer-ceiling target may still need to donate
+  // when another member has no partition, so compare the actual extreme loads instead of only
+  // checking whether owners are above/below static target bounds.
   loop {
-    // Find current over/under loaded candidates according to target bounds.
     let over = deduped_members
       .iter()
-      .find(|member| load.get(*member).copied().unwrap_or(0) > max_target)
+      .max_by_key(|member| load.get(*member).copied().unwrap_or(0))
       .cloned();
     let under = deduped_members
       .iter()
-      .find(|member| load.get(*member).copied().unwrap_or(0) < min_target)
+      .min_by_key(|member| load.get(*member).copied().unwrap_or(0))
       .cloned();
 
     let (Some(over_member), Some(under_member)) = (over, under) else {
       break;
     };
+    let over_load = load.get(&over_member).copied().unwrap_or_default();
+    let under_load = load.get(&under_member).copied().unwrap_or_default();
+    if over_load.saturating_sub(under_load) <= 1 {
+      break;
+    }
 
     // Move exactly one partition at a time from over->under, then recompute. This keeps moves
     // minimal and predictable.
@@ -725,24 +887,29 @@ fn assignment_plan(
   }
 }
 
-fn assignment_plan_is_valid(
+fn assignment_plan_validation_error(
   plan: &ConsumerGroupAssignmentPlan,
   partitions: &[VirtualPartitionId],
-) -> bool {
-  if plan.members.is_empty()
-    || !plan
-      .members
-      .iter()
-      .any(|member| member == &plan.planner_member_id)
+) -> Option<AssignmentPlanValidationError> {
+  if plan.members.is_empty() {
+    return Some(AssignmentPlanValidationError::EmptyMembers);
+  }
+  if !plan
+    .members
+    .iter()
+    .any(|member| member == &plan.planner_member_id)
   {
-    return false;
+    return Some(AssignmentPlanValidationError::PlannerNotMember);
   }
 
   let mut expected_partitions = partitions.to_vec();
   expected_partitions.sort_unstable();
   expected_partitions.dedup();
   if plan.assignments.len() != expected_partitions.len() {
-    return false;
+    return Some(AssignmentPlanValidationError::AssignmentCountMismatch {
+      expected: expected_partitions.len(),
+      actual: plan.assignments.len(),
+    });
   }
 
   let member_set = plan.members.iter().collect::<HashSet<_>>();
@@ -753,10 +920,17 @@ fn assignment_plan_is_valid(
     .map(|member| (member, 0_usize))
     .collect::<HashMap<_, _>>();
   for assignment in &plan.assignments {
-    if !member_set.contains(&assignment.member_id)
-      || !assignment_partitions.insert(assignment.virtual_partition_id)
-    {
-      return false;
+    if !member_set.contains(&assignment.member_id) {
+      return Some(AssignmentPlanValidationError::AssignmentOwnerNotMember {
+        member_id: assignment.member_id.clone(),
+      });
+    }
+    if !assignment_partitions.insert(assignment.virtual_partition_id) {
+      return Some(
+        AssignmentPlanValidationError::DuplicatePartitionAssignment {
+          virtual_partition_id: assignment.virtual_partition_id,
+        },
+      );
     }
     if let Some(member_load) = load.get_mut(&assignment.member_id) {
       *member_load += 1;
@@ -766,12 +940,41 @@ fn assignment_plan_is_valid(
     .iter()
     .all(|partition| assignment_partitions.contains(partition))
   {
-    return false;
+    let virtual_partition_id = expected_partitions
+      .iter()
+      .find(|partition| !assignment_partitions.contains(partition))
+      .copied()
+      .expect("assignment completeness check found no missing partition");
+    return Some(AssignmentPlanValidationError::MissingExpectedPartition {
+      virtual_partition_id,
+    });
   }
 
   let min_load = load.values().min().copied().unwrap_or_default();
   let max_load = load.values().max().copied().unwrap_or_default();
-  max_load.saturating_sub(min_load) <= 1
+  (max_load.saturating_sub(min_load) > 1)
+    .then_some(AssignmentPlanValidationError::ImbalancedLoad { min_load, max_load })
+}
+
+fn log_assignment_plan_rejection(
+  config: &ConsumerGroupConfig,
+  plan: &ConsumerGroupAssignmentPlan,
+  partitions: &[VirtualPartitionId],
+  reason: &AssignmentPlanValidationError,
+) {
+  warn_every!(
+    15.seconds(),
+    "consumer assignment plan rejected: topic={}, group_id={}, member_id={}, version={}, \
+     planner_member_id={}, members={}, assignments={}, expected_partitions={}, reason={reason:?}",
+    config.topic,
+    config.group_id,
+    config.member_id,
+    plan.version,
+    plan.planner_member_id,
+    plan.members.len(),
+    plan.assignments.len(),
+    partitions.iter().collect::<HashSet<_>>().len()
+  );
 }
 
 fn plan_assignment_map(plan: &ConsumerGroupAssignmentPlan) -> HashMap<VirtualPartitionId, String> {

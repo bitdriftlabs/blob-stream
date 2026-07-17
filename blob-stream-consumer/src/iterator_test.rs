@@ -463,7 +463,7 @@ async fn diagnostics_report_assignment_and_start_state() {
     .diagnostics()
     .expect("consumer implementation provides diagnostics");
   let snapshot = diagnostics.state_snapshot().await;
-  assert_eq!(snapshot.schema_version, 7);
+  assert_eq!(snapshot.schema_version, 8);
   assert!(snapshot.generated_at.ends_with('Z'));
   assert_eq!(snapshot.topic, "telemetry");
   assert_eq!(snapshot.group_id, "group-a");
@@ -486,6 +486,43 @@ async fn diagnostics_report_assignment_and_start_state() {
   assert!(started_snapshot.started);
   assert!(started_snapshot.prefetch_worker_running);
 
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn assignment_callback_replays_active_partitions() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![0, 1],
+  }));
+  let assigned_partitions = Arc::new(AtomicUsize::new(0));
+
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  )
+  .await
+  .unwrap();
+
+  let assignment_count = Arc::clone(&assigned_partitions);
+  iterator.set_assignment_callback(Arc::new(move |partitions| {
+    assignment_count.fetch_add(partitions.len(), Ordering::SeqCst);
+  }));
+
+  assert_eq!(assigned_partitions.load(Ordering::SeqCst), 2);
   Box::new(iterator).shutdown().await.unwrap();
 }
 

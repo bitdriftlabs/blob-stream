@@ -98,6 +98,14 @@ struct ConsumerIteratorMetrics {
   retries: IntCounter,
   failures: IntCounter,
   revocations: IntCounter,
+  rebalances_total: IntCounter,
+  rebalance_failures_total: IntCounter,
+  assignment_plans_applied_total: IntCounter,
+  assignment_plan_rejections_total: IntCounter,
+  assignment_applications_total: IntCounter,
+  desired_partitions: IntGauge,
+  owned_partitions: IntGauge,
+  active_partitions: IntGauge,
   prefetch_buffered_batches: IntGauge,
   prefetch_buffered_bytes: IntGauge,
   prefetch_paused_budget: IntCounter,
@@ -123,6 +131,14 @@ impl ConsumerIteratorMetrics {
       retries: scope.counter("retries"),
       failures: scope.counter("failures"),
       revocations: scope.counter("revocations"),
+      rebalances_total: scope.counter("rebalances_total"),
+      rebalance_failures_total: scope.counter("rebalance_failures_total"),
+      assignment_plans_applied_total: scope.counter("assignment_plans_applied_total"),
+      assignment_plan_rejections_total: scope.counter("assignment_plan_rejections_total"),
+      assignment_applications_total: scope.counter("assignment_applications_total"),
+      desired_partitions: scope.gauge("desired_partitions"),
+      owned_partitions: scope.gauge("owned_partitions"),
+      active_partitions: scope.gauge("active_partitions"),
       prefetch_buffered_batches: scope.gauge("prefetch_buffered_batches"),
       prefetch_buffered_bytes: scope.gauge("prefetch_buffered_bytes"),
       prefetch_paused_budget: scope.counter("prefetch_paused_budget"),
@@ -411,7 +427,8 @@ pub struct ConsumerStateSnapshot {
   pub group_id: String,
   pub member_id: String,
   pub started: bool,
-  pub coordinator_generation: u64,
+  /// Version of the assignment plan most recently accepted by this process.
+  pub accepted_assignment_plan_version: u64,
   pub assignment_plan: Option<ConsumerAssignmentPlanSnapshot>,
   pub owned_partitions: Vec<VirtualPartitionId>,
   pub active_assignment: Vec<VirtualPartitionId>,
@@ -473,7 +490,7 @@ pub struct ConsumerOffsetSnapshot {
 
 #[derive(Default)]
 struct ConsumerDiagnosticsRuntimeState {
-  coordinator_generation: u64,
+  accepted_assignment_plan_version: u64,
   owned_partitions: Vec<VirtualPartitionId>,
   active_assignment: Vec<VirtualPartitionId>,
   pending_assignment: Option<Vec<VirtualPartitionId>>,
@@ -527,7 +544,7 @@ impl ConsumerDiagnostics {
       pending_commits,
       last_committed_offsets,
       last_successful_heartbeat_at_ms,
-      coordinator_generation,
+      accepted_assignment_plan_version,
       next_heartbeat_at_ms,
       next_rebalance_at_ms,
       delivery_state,
@@ -552,7 +569,7 @@ impl ConsumerDiagnostics {
         offsets_from_pending_commits(&shared_state.pending_commits),
         offsets_from_map(&runtime_state.last_committed_offsets),
         runtime_state.last_successful_heartbeat_at_ms,
-        runtime_state.coordinator_generation,
+        runtime_state.accepted_assignment_plan_version,
         runtime_state.next_heartbeat_at_ms,
         runtime_state.next_rebalance_at_ms,
         if shared_state.delivery_state.pending_revocation.is_some()
@@ -585,13 +602,13 @@ impl ConsumerDiagnostics {
       .map(assignment_plan_snapshot);
 
     ConsumerStateSnapshot {
-      schema_version: 7,
+      schema_version: 8,
       generated_at,
       topic: self.group_config.topic.to_string(),
       group_id: self.group_config.group_id.to_string(),
       member_id: self.group_config.member_id.to_string(),
       started: self.started.load(Ordering::Acquire),
-      coordinator_generation,
+      accepted_assignment_plan_version,
       assignment_plan,
       owned_partitions,
       active_assignment,
@@ -663,6 +680,9 @@ fn offsets_from_pending_commits(
 // ConsumerIterator
 //
 
+/// Callback invoked when virtual partitions become active for this iterator.
+pub type AssignmentCallback = Arc<dyn Fn(&[VirtualPartitionId]) + Send + Sync>;
+
 #[async_trait]
 /// High-level pull API used by applications.
 pub trait ConsumerIterator: Send + Sync {
@@ -678,6 +698,13 @@ pub trait ConsumerIterator: Send + Sync {
   async fn shutdown(self: Box<Self>) -> Result<()>;
   /// Reposition read cursor for a partition.
   async fn seek(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()>;
+  /// Register a callback for active partition assignments.
+  ///
+  /// The callback replays the current assignment when nonempty, then receives only newly active
+  /// partitions after each successful assignment change.
+  fn set_assignment_callback(&mut self, callback: AssignmentCallback) {
+    drop(callback);
+  }
   /// Returns a handle for observing this consumer's local runtime state.
   fn diagnostics(&self) -> Option<ConsumerDiagnostics> {
     None
@@ -707,6 +734,7 @@ struct ConsumerDriver {
   prefetch_idle_base_delay_ms: u64,
   prefetch_idle_max_delay_ms: Option<u64>,
   active_assignment: HashSet<VirtualPartitionId>,
+  assignment_callback: Arc<ParkingLotMutex<Option<AssignmentCallback>>>,
   pending_assignment: Option<Vec<VirtualPartitionId>>,
   pending_revocation_completion: Option<oneshot::Receiver<()>>,
   revocation_notify: Arc<Notify>,
@@ -745,6 +773,7 @@ pub struct ConsumerIteratorImpl {
   delivery_notify: Arc<Notify>,
   prefetch_space_notify: Arc<Notify>,
   metrics: ConsumerIteratorMetrics,
+  assignment_callback: Arc<ParkingLotMutex<Option<AssignmentCallback>>>,
   command_tx: Option<mpsc::UnboundedSender<ConsumerDriverCommand>>,
   driver: Option<ConsumerDriver>,
   driver_task: Option<JoinHandle<()>>,
@@ -783,6 +812,7 @@ impl ConsumerIteratorImpl {
     let prefetch_max_bytes = consumer_prefetch_max_bytes(&read_config);
 
     let active_assignment = HashSet::new();
+    let assignment_callback = Arc::new(ParkingLotMutex::new(None));
     let shared_state = Arc::new(ParkingLotMutex::new(ConsumerSharedState::default()));
     let reader = Arc::new(Mutex::new(
       ConsumerReaderImpl::new_with_retention_and_publication_lag(
@@ -840,6 +870,7 @@ impl ConsumerIteratorImpl {
       prefetch_idle_base_delay_ms: idle_poll_delay_ms,
       prefetch_idle_max_delay_ms: max_idle_poll_delay_ms,
       active_assignment,
+      assignment_callback: Arc::clone(&assignment_callback),
       pending_assignment: None,
       pending_revocation_completion: None,
       revocation_notify,
@@ -860,10 +891,19 @@ impl ConsumerIteratorImpl {
       .await?;
     let snapshot = driver.coordination_source.snapshot().await?;
     driver.record_coordination_snapshot(&snapshot);
+    driver.metrics.rebalances_total.inc();
     let report = driver
       .coordinator
       .rebalance(snapshot.members, snapshot.virtual_partitions, now_ts_ms)
-      .await?;
+      .await;
+    let report = match report {
+      Ok(report) => report,
+      Err(error) => {
+        driver.metrics.rebalance_failures_total.inc();
+        return Err(error);
+      },
+    };
+    driver.record_rebalance_metrics(&report);
     let owned = driver.apply_rebalance_report(report).await?;
     info!(
       "consumer iterator bootstrapped: topic={}, group_id={}, member_id={}, owned={}",
@@ -880,6 +920,7 @@ impl ConsumerIteratorImpl {
       delivery_notify,
       prefetch_space_notify,
       metrics: driver.metrics.clone(),
+      assignment_callback,
       command_tx: None,
       driver: Some(driver),
       driver_task: None,
@@ -888,6 +929,23 @@ impl ConsumerIteratorImpl {
 }
 
 impl ConsumerDriver {
+  fn record_rebalance_metrics(&self, report: &RebalanceReport) {
+    if report.assignment_plan_applied {
+      self.metrics.assignment_plans_applied_total.inc();
+    }
+    if report.rejected_assignment_plan_version.is_some() {
+      self.metrics.assignment_plan_rejections_total.inc();
+    }
+    self
+      .metrics
+      .desired_partitions
+      .set(i64::try_from(report.desired_partitions).unwrap_or(i64::MAX));
+    self
+      .metrics
+      .owned_partitions
+      .set(i64::try_from(report.owned_partitions.len()).unwrap_or(i64::MAX));
+  }
+
   async fn apply_rebalance_report(
     &mut self,
     report: RebalanceReport,
@@ -895,6 +953,7 @@ impl ConsumerDriver {
     let RebalanceReport {
       owned_partitions,
       recovered_cursors,
+      ..
     } = report;
     self
       .hydrate_cursors(recovered_cursors, now_unix_millis() / 1_000)
@@ -983,12 +1042,21 @@ impl ConsumerDriver {
     active_assignment: HashSet<VirtualPartitionId>,
   ) -> Result<()> {
     let assignment_changed = self.active_assignment != active_assignment;
+    let mut newly_assigned = active_assignment
+      .difference(&self.active_assignment)
+      .copied()
+      .collect::<Vec<_>>();
+    newly_assigned.sort_unstable();
     self
       .reader
       .lock()
       .await
       .set_assigned_virtual_partitions(assignment.to_owned(), now_unix_millis() / 1_000)?;
     self.active_assignment = active_assignment;
+    self
+      .metrics
+      .active_partitions
+      .set(i64::try_from(self.active_assignment.len()).unwrap_or(i64::MAX));
     {
       let mut shared_state = self.shared_state.lock();
       shared_state
@@ -1003,6 +1071,7 @@ impl ConsumerDriver {
       self.refresh_diagnostics_locked(&mut shared_state);
     }
     if assignment_changed {
+      self.metrics.assignment_applications_total.inc();
       info!(
         "consumer assignment active: topic={}, group_id={}, member_id={}, partitions={:?}",
         self.group_config.topic,
@@ -1010,6 +1079,11 @@ impl ConsumerDriver {
         self.group_config.member_id,
         assignment
       );
+    }
+    if !newly_assigned.is_empty()
+      && let Some(callback) = self.assignment_callback.lock().clone()
+    {
+      callback(&newly_assigned);
     }
     Ok(())
   }
@@ -1021,7 +1095,7 @@ impl ConsumerDriver {
 
   fn refresh_diagnostics_locked(&self, shared_state: &mut ConsumerSharedState) {
     let diagnostics = &mut shared_state.diagnostics;
-    diagnostics.coordinator_generation = self.coordinator.generation();
+    diagnostics.accepted_assignment_plan_version = self.coordinator.generation();
     diagnostics.owned_partitions = self.coordinator.owned_partitions();
     diagnostics.active_assignment = self.active_assignment.iter().copied().collect();
     diagnostics
@@ -1035,7 +1109,7 @@ impl ConsumerDriver {
   fn refresh_rebalance_diagnostics(&self) {
     let mut shared_state = self.shared_state.lock();
     let diagnostics = &mut shared_state.diagnostics;
-    diagnostics.coordinator_generation = self.coordinator.generation();
+    diagnostics.accepted_assignment_plan_version = self.coordinator.generation();
     diagnostics.next_rebalance_at_ms = self.next_rebalance_at_ms;
   }
 
@@ -1062,13 +1136,24 @@ impl ConsumerDriver {
 
     let snapshot = self.coordination_source.snapshot().await?;
     self.record_coordination_snapshot(&snapshot);
+    self.metrics.rebalances_total.inc();
+    let report = match self
+      .coordinator
+      .rebalance(snapshot.members, snapshot.virtual_partitions, now_ts_ms)
+      .await
+    {
+      Ok(report) => report,
+      Err(error) => {
+        self.metrics.rebalance_failures_total.inc();
+        return Err(error);
+      },
+    };
+    self.record_rebalance_metrics(&report);
     let RebalanceReport {
       owned_partitions: next_assignment,
       recovered_cursors,
-    } = self
-      .coordinator
-      .rebalance(snapshot.members, snapshot.virtual_partitions, now_ts_ms)
-      .await?;
+      ..
+    } = report;
 
     self.next_rebalance_at_ms = now_ts_ms + consumer_rebalance_interval_ms(&self.group_config);
 
@@ -1525,7 +1610,7 @@ impl ConsumerDriver {
           Err(error) => {
             warn_every!(
               15.seconds(),
-              "consumer rebalance retrying after error: error={error}"
+              "consumer rebalance retrying after error: error={error:#}"
             );
             self.next_rebalance_at_ms = now_ts_ms.saturating_add(1_000);
             self.refresh_rebalance_diagnostics();
@@ -1855,6 +1940,21 @@ impl ConsumerIterator for ConsumerIteratorImpl {
     response_rx
       .await
       .map_err(|_| anyhow!("consumer driver stopped before seek completed"))?
+  }
+
+  fn set_assignment_callback(&mut self, callback: AssignmentCallback) {
+    let mut active_assignment = self
+      .shared_state
+      .lock()
+      .active_assignment
+      .iter()
+      .copied()
+      .collect::<Vec<_>>();
+    active_assignment.sort_unstable();
+    *self.assignment_callback.lock() = Some(Arc::clone(&callback));
+    if !active_assignment.is_empty() {
+      callback(&active_assignment);
+    }
   }
 
   fn diagnostics(&self) -> Option<ConsumerDiagnostics> {

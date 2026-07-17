@@ -149,6 +149,59 @@ after an interrupted commit or a partition rebalance. Consumers need S3 object r
 metadata-table query access, and read/write/delete access to the consumer lease and membership
 tables. Brokers need S3 object write access, segment-metadata writes, and producer-lease access.
 
+### Consumer IAM permissions
+
+For DynamoDB, a consumer role needs `dynamodb:Query` on the segment metadata and consumer
+membership tables, `dynamodb:GetItem`, `dynamodb:UpdateItem`, and `dynamodb:DeleteItem` on the
+consumer lease and membership tables, and `dynamodb:TransactWriteItems` plus
+`dynamodb:ConditionCheckItem` on the consumer membership table.
+
+Assignment-plan publication atomically verifies the separate, session-fenced planner-lease item
+and writes the plan item. DynamoDB therefore authorizes the conditional transaction as both
+`TransactWriteItems` and `ConditionCheckItem`; omitting the latter causes plan publication to
+fail with `AccessDeniedException`. With this two-item layout, the transaction is required to
+prevent a planner whose lease has expired or been replaced from publishing a plan.
+
+The following policy fragment grants the DynamoDB permissions used by a consumer. Substitute the
+configured table names, region, and account ID. S3 `GetObject` access for the configured blob
+prefix is also required, but is omitted here because its bucket and prefix are deployment-specific.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["dynamodb:Query"],
+      "Resource": [
+        "arn:aws:dynamodb:<region>:<account-id>:table/<segment-metadata-table>",
+        "arn:aws:dynamodb:<region>:<account-id>:table/<consumer-membership-table>"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:<region>:<account-id>:table/<consumer-lease-table>",
+        "arn:aws:dynamodb:<region>:<account-id>:table/<consumer-membership-table>"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:TransactWriteItems",
+        "dynamodb:ConditionCheckItem"
+      ],
+      "Resource": "arn:aws:dynamodb:<region>:<account-id>:table/<consumer-membership-table>"
+    }
+  ]
+}
+```
+
 ## DynamoDB tables required
 
 Production deployments should provision the following logical tables.

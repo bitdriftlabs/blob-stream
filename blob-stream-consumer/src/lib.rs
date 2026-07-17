@@ -101,6 +101,7 @@ pub use coordination::{
   cooperative_sticky_assignment,
 };
 pub use iterator::{
+  AssignmentCallback,
   ConsumerAssignmentPlanSnapshot,
   ConsumerCoordinationSource,
   ConsumerDeliveryState,
