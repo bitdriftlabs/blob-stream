@@ -23,6 +23,7 @@ pub struct BufferedBatch {
   pub(crate) virtual_partition_id: VirtualPartitionId,
   pub(super) next_offset: u64,
   pub(super) source_checkpoint: CommittedSourceCheckpoint,
+  pub(super) remaining_payload_bytes: u64,
   pub records: std::vec::IntoIter<Record>,
 }
 
@@ -54,17 +55,12 @@ pub struct DeliveryState {
 impl DeliveryState {
   /// Return payload bytes retained in both queued and currently delivered batches.
   pub(super) fn retained_bytes(&self) -> u64 {
-    self
-      .buffered_bytes
-      .saturating_add(self.current_batch.as_ref().map_or(0, |batch| {
-        batch
-          .records
-          .as_slice()
-          .iter()
-          .fold(0_u64, |total, record| {
-            total.saturating_add(record.payload.len() as u64)
-          })
-      }))
+    self.buffered_bytes.saturating_add(
+      self
+        .current_batch
+        .as_ref()
+        .map_or(0, |batch| batch.remaining_payload_bytes),
+    )
   }
 
   /// Return the next revocation or record that remains valid for the active assignment.
@@ -94,6 +90,9 @@ impl DeliveryState {
 
       if let Some(current_batch) = self.current_batch.as_mut() {
         if let Some(record) = current_batch.records.next() {
+          current_batch.remaining_payload_bytes = current_batch
+            .remaining_payload_bytes
+            .saturating_sub(u64::try_from(record.payload.len()).unwrap_or(u64::MAX));
           let offset = current_batch.next_offset;
           current_batch.next_offset = current_batch.next_offset.saturating_add(1);
           record_delivered_source(
@@ -121,10 +120,12 @@ impl DeliveryState {
       }
 
       metrics.batches_delivered.inc();
+      let remaining_payload_bytes = prefetched_batch_bytes(&batch);
       self.current_batch = Some(BufferedBatch {
         virtual_partition_id: batch.virtual_partition_id,
         next_offset: batch.seq_range.start,
         source_checkpoint: batch.source_checkpoint,
+        remaining_payload_bytes,
         records: batch.records.into_iter(),
       });
     }

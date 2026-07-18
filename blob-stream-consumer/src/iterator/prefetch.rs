@@ -284,14 +284,14 @@ impl PrefetchWorker {
           continue;
         }
         let buffer = &mut shared_state.delivery_state;
-        let would_cross = buffer
-          .buffered_bytes
+        let retained_bytes = buffer.retained_bytes();
+        let would_cross = retained_bytes
           .saturating_add(batch_bytes)
           .gt(&prefetch_max_bytes);
 
         // The configured budget is a soft target: one batch may cross it so a single oversized
-        // batch remains deliverable. Once a batch is buffered, pause before adding another.
-        if would_cross && !buffer.batches.is_empty() {
+        // batch remains deliverable. Once delivery retains payload, pause before adding another.
+        if would_cross && retained_bytes > 0 {
           self.metrics.prefetch_paused_budget.inc();
           break;
         }

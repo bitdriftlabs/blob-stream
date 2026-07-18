@@ -35,7 +35,7 @@ const MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG: &str =
 //
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ConsumerReadRuntimeSettings {
+pub struct ConsumerReadRuntimeSettings {
   pub(crate) prefetch_max_bytes: u64,
   pub(crate) max_in_flight_batch_reads: usize,
 }
@@ -69,6 +69,7 @@ pub fn consumer_max_idle_poll_delay_ms(config: &ConsumerReadConfig) -> u64 {
 pub fn consumer_prefetch_max_bytes(config: &ConsumerReadConfig) -> u64 {
   config
     .prefetch_max_bytes
+    .filter(|prefetch_max_bytes| *prefetch_max_bytes > 0)
     .unwrap_or(DEFAULT_PREFETCH_MAX_BYTES)
 }
 
@@ -89,7 +90,7 @@ pub fn consumer_max_in_flight_batch_reads(config: &ConsumerReadConfig) -> u64 {
 }
 
 /// Resolve immutable settings for one consumer scan pass.
-pub(crate) fn consumer_read_runtime_settings(
+pub fn consumer_read_runtime_settings(
   config: &ConsumerReadConfig,
   feature_flags: Option<&FeatureFlagsWatch>,
 ) -> ConsumerReadRuntimeSettings {
@@ -103,9 +104,8 @@ pub(crate) fn consumer_read_runtime_settings(
   let prefetch_max_bytes = if prefetch_max_bytes == 0 {
     warn_every!(
       15.seconds(),
-      "consumer feature flag {} was zero; using configured prefetch_max_bytes={}",
-      PREFETCH_MAX_BYTES_FEATURE_FLAG,
-      configured_prefetch_max_bytes
+      "consumer feature flag {PREFETCH_MAX_BYTES_FEATURE_FLAG} was zero; using configured \
+       prefetch_max_bytes={configured_prefetch_max_bytes}"
     );
     configured_prefetch_max_bytes
   } else {
@@ -125,9 +125,8 @@ pub(crate) fn consumer_read_runtime_settings(
     Ok(_) | Err(_) => {
       warn_every!(
         15.seconds(),
-        "consumer feature flag {} was invalid; using configured max_in_flight_batch_reads={}",
-        MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG,
-        configured_max_in_flight_batch_reads
+        "consumer feature flag {MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG} was invalid; using \
+         configured max_in_flight_batch_reads={configured_max_in_flight_batch_reads}"
       );
       usize::try_from(configured_max_in_flight_batch_reads).unwrap_or(usize::MAX)
     },

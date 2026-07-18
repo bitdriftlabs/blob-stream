@@ -415,6 +415,7 @@ fn current_batch_for_fenced_partition_is_not_delivered() {
         window_start_unix_seconds: 0,
         snowflake_id: 1,
       },
+      remaining_payload_bytes: 1,
       records: vec![new_record(vec![1], 0)].into_iter(),
     }),
     ..Default::default()
@@ -430,6 +431,34 @@ fn current_batch_for_fenced_partition_is_not_delivered() {
       .is_none()
   );
   assert!(delivery_state.current_batch.is_none());
+}
+
+#[test]
+fn current_batch_remaining_bytes_decrease_as_records_are_delivered() {
+  let mut delivery_state = DeliveryState {
+    current_batch: Some(BufferedBatch {
+      virtual_partition_id: 7,
+      next_offset: 1,
+      source_checkpoint: CommittedSourceCheckpoint {
+        window_start_unix_seconds: 0,
+        snowflake_id: 1,
+      },
+      remaining_payload_bytes: 3,
+      records: vec![new_record(vec![1, 2, 3], 0)].into_iter(),
+    }),
+    ..Default::default()
+  };
+
+  let active_assignment = HashSet::from([7]);
+  assert!(matches!(
+    delivery_state.try_take_next(
+      &active_assignment,
+      &mut HashMap::new(),
+      &ConsumerIteratorMetrics::new(&metrics_scope())
+    ),
+    Some(NextResult::Record(_))
+  ));
+  assert_eq!(delivery_state.retained_bytes(), 0);
 }
 
 async fn write_segment(

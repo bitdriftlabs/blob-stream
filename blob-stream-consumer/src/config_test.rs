@@ -75,6 +75,18 @@ fn prefetch_max_bytes_uses_explicit_value() {
 }
 
 #[test]
+fn prefetch_max_bytes_zero_uses_default() {
+  let mut read = read_config();
+  read.prefetch_max_bytes = Some(0);
+
+  assert_eq!(consumer_prefetch_max_bytes(&read), 64 * 1024 * 1024);
+  assert_eq!(
+    consumer_read_runtime_settings(&read, None).prefetch_max_bytes,
+    64 * 1024 * 1024
+  );
+}
+
+#[test]
 fn max_in_flight_batch_reads_uses_explicit_value() {
   let mut read = read_config();
   read.max_in_flight_batch_reads = Some(64);

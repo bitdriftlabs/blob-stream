@@ -842,7 +842,7 @@ async fn failed_scan_restores_cursor_before_retrying_undelivered_batches() {
       },
       vec![new_record(
         vec![u8::try_from(sequence).unwrap()],
-        1_000 + sequence as i64,
+        1_000 + i64::try_from(sequence).unwrap(),
       )],
       Compression::none(),
     )
@@ -899,7 +899,7 @@ async fn byte_capacity_defers_later_batches_until_the_next_scan() {
       },
       vec![new_record(
         vec![u8::try_from(sequence).unwrap()],
-        1_000 + sequence as i64,
+        1_000 + i64::try_from(sequence).unwrap(),
       )],
       Compression::none(),
     )
@@ -961,7 +961,7 @@ async fn bounded_parallel_reads_respect_configured_limit() {
       },
       vec![new_record(
         vec![u8::try_from(sequence).unwrap()],
-        1_000 + sequence as i64,
+        1_000 + i64::try_from(sequence).unwrap(),
       )],
       Compression::none(),
     )
