@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
-use crate::bootstrap::ConsumerBootstrapConfig;
+use crate::bootstrap::{ConsumerBootstrapConfig, consumer_group_lease_ttl_buffer_seconds};
 use crate::{
   ConsumerConfigFactory,
   ConsumerGroupConfig,
@@ -75,6 +75,14 @@ fn proto_bootstrap_config(member_id: &str) -> ConsumerIteratorBootstrapConfig {
 
 fn metrics_scope() -> bd_server_stats::stats::Scope {
   Collector::default().scope("blob_stream_consumer_test")
+}
+
+#[test]
+fn consumer_group_lease_ttl_matches_topic_retention() {
+  assert_eq!(
+    consumer_group_lease_ttl_buffer_seconds(7).unwrap(),
+    7 * 24 * 60 * 60
+  );
 }
 
 #[tokio::test]

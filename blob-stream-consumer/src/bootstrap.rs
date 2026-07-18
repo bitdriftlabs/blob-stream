@@ -32,7 +32,8 @@ use blob_stream_proto::protos::blobstream::v1::config::{
 use blob_stream_types::{VirtualPartitionId, now_unix_millis};
 use std::sync::Arc;
 
-const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
+const DEFAULT_MEMBERSHIP_TTL_BUFFER_SECONDS: u32 = 3_600;
+const SECONDS_PER_DAY: u32 = 86_400;
 
 //
 // ConsumerBootstrapConfig
@@ -157,7 +158,8 @@ impl ConsumerIteratorImpl {
 
     let blob_store = build_blob_store(&config.blob_store).await?;
     let (metadata_store, lease_store, membership_store) =
-      build_metadata_and_coordination_stores(&config.metadata_store).await?;
+      build_metadata_and_coordination_stores(&config.metadata_store, config.topic.retention_days)
+        .await?;
 
     let coordination = Arc::new(MembershipCoordinationSource::new(
       group.topic.to_string(),
@@ -230,6 +232,7 @@ async fn build_blob_store(config: &BlobStoreConfig) -> Result<Arc<dyn BlobStore>
 
 async fn build_metadata_and_coordination_stores(
   config: &MetadataStoreConfig,
+  retention_days: u32,
 ) -> Result<(
   Arc<dyn MetadataStore>,
   Arc<dyn ConsumerGroupLeaseStore>,
@@ -261,25 +264,33 @@ async fn build_metadata_and_coordination_stores(
 
     let metadata_store: Arc<dyn MetadataStore> =
       Arc::new(DynamoMetadataStore::new(client.clone(), metadata_table));
-    let lease_ttl_buffer_seconds = dynamo
+    let membership_ttl_buffer_seconds = dynamo
       .lease_ttl_buffer_seconds
-      .unwrap_or(DEFAULT_LEASE_TTL_BUFFER_SECONDS);
+      .unwrap_or(DEFAULT_MEMBERSHIP_TTL_BUFFER_SECONDS);
+    let consumer_lease_ttl_buffer_seconds =
+      consumer_group_lease_ttl_buffer_seconds(retention_days)?;
     let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
       Arc::new(DynamoConsumerGroupLeaseStore::with_ttl_buffer_seconds(
         client.clone(),
         consumer_lease_table,
-        lease_ttl_buffer_seconds,
+        consumer_lease_ttl_buffer_seconds,
       ));
     let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
       Arc::new(DynamoConsumerGroupMembershipStore::with_ttl_buffer_seconds(
         client,
         consumer_membership_table,
-        lease_ttl_buffer_seconds,
+        membership_ttl_buffer_seconds,
       ));
     return Ok((metadata_store, lease_store, membership_store));
   }
 
   Err(anyhow!("metadata_store backend not configured"))
+}
+
+fn consumer_group_lease_ttl_buffer_seconds(retention_days: u32) -> Result<u32> {
+  retention_days.checked_mul(SECONDS_PER_DAY).ok_or_else(|| {
+    anyhow!("topic retention_days {retention_days} exceeds the maximum consumer lease retention")
+  })
 }
 
 /// Dynamic coordination source backed by membership-store liveness entries.

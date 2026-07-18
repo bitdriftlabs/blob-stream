@@ -1,19 +1,14 @@
 #![allow(clippy::unwrap_used)]
 
+use super::delivery::{BufferedBatch, DeliveryState};
+use super::prefetch::IdlePollBackoff;
 use super::{
-  BufferedBatch,
-  ConsumerAssignmentPlanSnapshot,
   ConsumerCoordinationSource,
   ConsumerDeliveryState,
-  ConsumerGroupLeaseObservation,
   ConsumerIterator,
   ConsumerIteratorImpl,
   ConsumerIteratorMetrics,
-  ConsumerPartitionAssignmentSnapshot,
-  ConsumerPartitionReadMode,
   CoordinationSnapshot,
-  DeliveryState,
-  IdlePollBackoff,
   NextResult,
 };
 use crate::config::{
@@ -21,6 +16,15 @@ use crate::config::{
   ConsumerReadConfig,
   ConsumerRuntimeConfig,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+};
+use crate::diagnostics::{
+  ConsumerAssignmentPlanSnapshot,
+  ConsumerGroupLeaseObservation,
+  ConsumerLocalPartitionSnapshot,
+  ConsumerPartitionAssignmentSnapshot,
+  ConsumerPartitionReadMode,
+  ConsumerSourceCheckpointSnapshot,
+  ConsumerStateSnapshot,
 };
 use bd_server_stats::stats::Collector;
 use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
@@ -54,6 +58,7 @@ use blob_stream_types::{
   SnowflakeId,
   TopicWindowKey,
   VirtualPartitionId,
+  format_unix_timestamp_ms,
   new_record,
   now_unix_millis,
 };
@@ -559,14 +564,11 @@ async fn wait_for_prefetch_pending_record_count(
 
 async fn wait_for_active_assignment(iterator: &ConsumerIteratorImpl, expected_partitions: &[u32]) {
   for _ in 0 .. 40 {
-    let mut active_assignment = iterator
+    let snapshot = iterator
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
-      .state_snapshot()
-      .active_assignment
-      .clone();
-    active_assignment.sort_unstable();
-    if active_assignment == expected_partitions {
+      .state_snapshot();
+    if active_partition_ids(&snapshot) == expected_partitions {
       return;
     }
     sleep(Duration::from_millis(25)).await;
@@ -578,8 +580,30 @@ async fn wait_for_active_assignment(iterator: &ConsumerIteratorImpl, expected_pa
     .state_snapshot();
   panic!(
     "active assignment {:?} did not reach expected assignment {expected_partitions:?}",
-    snapshot.active_assignment
+    active_partition_ids(&snapshot)
   );
+}
+
+fn active_partition_ids(snapshot: &ConsumerStateSnapshot) -> Vec<VirtualPartitionId> {
+  snapshot
+    .local
+    .partitions
+    .iter()
+    .filter(|partition| partition.active)
+    .map(|partition| partition.virtual_partition_id)
+    .collect()
+}
+
+fn local_partition(
+  snapshot: &ConsumerStateSnapshot,
+  virtual_partition_id: VirtualPartitionId,
+) -> &ConsumerLocalPartitionSnapshot {
+  snapshot
+    .local
+    .partitions
+    .iter()
+    .find(|partition| partition.virtual_partition_id == virtual_partition_id)
+    .unwrap()
 }
 
 fn metrics_scope() -> bd_server_stats::stats::Scope {
@@ -617,14 +641,13 @@ async fn diagnostics_report_assignment_and_start_state() {
     .diagnostics()
     .expect("consumer implementation provides diagnostics");
   let snapshot = diagnostics.state_snapshot();
-  assert_eq!(snapshot.schema_version, 10);
+  assert_eq!(snapshot.schema_version, 11);
   assert!(snapshot.generated_at.ends_with('Z'));
   assert_eq!(snapshot.topic, "telemetry");
   assert_eq!(snapshot.group_id, "group-a");
   assert_eq!(snapshot.member_id, "member-a");
   assert!(!snapshot.started);
-  assert_eq!(snapshot.owned_partitions, vec![0, 1]);
-  assert_eq!(snapshot.active_assignment, vec![0, 1]);
+  assert_eq!(active_partition_ids(&snapshot), vec![0, 1]);
   assert_eq!(
     snapshot
       .assignment_plan
@@ -637,11 +660,16 @@ async fn diagnostics_report_assignment_and_start_state() {
   assert_eq!(snapshot.prefetch_pending_batch_count, 0);
   assert_eq!(snapshot.prefetch_pending_record_count, 0);
   assert_eq!(snapshot.prefetch_pending_bytes, 0);
-  assert_eq!(snapshot.reader_partitions.len(), 2);
-  assert!(snapshot.reader_partitions.iter().all(|partition| {
-    partition.mode == ConsumerPartitionReadMode::Fresh
-      && partition.recovery_next_window_start.is_some()
-      && partition.recovery_cutover_window_start.is_none()
+  assert_eq!(snapshot.local.partitions.len(), 2);
+  assert!(snapshot.local.partitions.iter().all(|partition| {
+    partition.owned
+      && partition.active
+      && !partition.pending_assignment
+      && partition.reader.as_ref().is_some_and(|reader| {
+        reader.mode == ConsumerPartitionReadMode::Fresh
+          && reader.recovery_next_window_start.is_some()
+          && reader.recovery_cutover_window_start.is_none()
+      })
   }));
 
   iterator.start().unwrap();
@@ -718,7 +746,7 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
     .expect("consumer implementation provides diagnostics")
     .state_response()
     .await;
-  assert_eq!(response.state.schema_version, 11);
+  assert_eq!(response.state.schema_version, 12);
   assert_eq!(
     response
       .state
@@ -744,8 +772,8 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
   assert_eq!(member_b_partition.committed_offset, Some(42));
   assert_eq!(
     member_b_partition.committed_source_checkpoint,
-    Some(CommittedSourceCheckpoint {
-      window_start_unix_seconds: 1_000,
+    Some(ConsumerSourceCheckpointSnapshot {
+      window_start: format_unix_timestamp_ms(1_000_000),
       snowflake_id: 99,
     })
   );
@@ -790,8 +818,8 @@ async fn state_response_reports_lease_lookup_failure_without_blocking_local_diag
   let local_snapshot = diagnostics.state_snapshot();
   let response = diagnostics.state_response().await;
 
-  assert_eq!(local_snapshot.schema_version, 10);
-  assert_eq!(response.state.schema_version, 11);
+  assert_eq!(local_snapshot.schema_version, 11);
+  assert_eq!(response.state.schema_version, 12);
   assert!(matches!(
     response.group_lease_observation,
     ConsumerGroupLeaseObservation::LookupFailed { .. }
@@ -816,7 +844,7 @@ fn group_lease_observation_includes_unleased_plan_partitions() {
     ],
     published_at: "2026-07-17T00:00:00Z".to_string(),
   };
-  let observation = super::group_lease_observation(
+  let observation = crate::diagnostics::group_lease_observation(
     Some(&plan),
     vec![ConsumerGroupLease {
       key: ConsumerGroupLeaseKey {
@@ -943,6 +971,7 @@ async fn next_returns_revocation_until_completed() {
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
+      .local
       .pending_revocation
     {
       break;
@@ -954,6 +983,7 @@ async fn next_returns_revocation_until_completed() {
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
+      .local
       .pending_revocation,
     "expected autonomous rebalance to request revocation"
   );
@@ -1057,11 +1087,10 @@ async fn next_delivers_records_and_commit_renews() {
   assert!(report.fenced_partitions.is_empty());
 
   let state = iterator.diagnostics.state_snapshot();
-  assert_eq!(state.pending_commits.len(), 1);
-  assert_eq!(state.pending_commits[0].virtual_partition_id, 3);
-  assert_eq!(state.pending_commits[0].offset, 2);
-  assert_eq!(state.last_committed_offsets, state.pending_commits);
-  assert!(state.last_successful_heartbeat_at.is_some());
+  let partition = local_partition(&state, 3);
+  assert_eq!(partition.pending_commit_offset, Some(2));
+  assert_eq!(partition.last_committed_offset, Some(2));
+  assert!(state.local.last_successful_heartbeat_at.is_some());
 }
 
 #[tokio::test]
@@ -1120,7 +1149,7 @@ async fn seek_waits_for_prefetch_scan_without_stalling_heartbeats() {
     .expect("consumer implementation provides diagnostics")
     .state_snapshot();
   assert!(snapshot.started);
-  assert_eq!(snapshot.active_assignment, vec![3]);
+  assert_eq!(active_partition_ids(&snapshot), vec![3]);
 
   let heartbeat_calls_before = concrete_membership_store
     .heartbeat_calls
@@ -1329,6 +1358,15 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
   assert_eq!(first_record.virtual_partition_id, 7);
   assert_eq!(first_record.offset, 1);
 
+  let in_flight_snapshot = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_snapshot();
+  assert_eq!(
+    local_partition(&in_flight_snapshot, 7).prefetch_buffered_record_count,
+    in_flight_snapshot.prefetch_buffered_record_count
+  );
+
   timeout(Duration::from_secs(2), iterator.seek(7, 0))
     .await
     .unwrap()
@@ -1348,7 +1386,11 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
     .expect("consumer implementation provides diagnostics")
     .state_snapshot();
   assert_eq!(
-    recovered_snapshot.reader_partitions[0].mode,
+    local_partition(&recovered_snapshot, 7)
+      .reader
+      .as_ref()
+      .unwrap()
+      .mode,
     ConsumerPartitionReadMode::Fast
   );
 
@@ -1429,6 +1471,7 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
+      .local
       .pending_revocation
     {
       break;
@@ -1440,6 +1483,7 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
+      .local
       .pending_revocation,
     "expected autonomous rebalance to request revocation"
   );
@@ -1459,9 +1503,11 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
     .state_snapshot();
   assert!(
     snapshot
-      .prefetch_buffered_partitions
+      .local
+      .partitions
       .iter()
-      .all(|partition| *partition != revoked_partition),
+      .find(|partition| partition.virtual_partition_id == revoked_partition)
+      .is_none_or(|partition| partition.prefetch_buffered_batch_count == 0),
     "revoked partition batch was not removed from prefetch buffer"
   );
 
@@ -1526,7 +1572,7 @@ async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot();
-    if snapshot.last_successful_heartbeat_at.is_some() {
+    if snapshot.local.last_successful_heartbeat_at.is_some() {
       break;
     }
     sleep(Duration::from_millis(25)).await;
@@ -1537,7 +1583,7 @@ async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
     .diagnostics()
     .expect("consumer implementation provides diagnostics")
     .state_snapshot();
-  assert!(snapshot.last_successful_heartbeat_at.is_some());
+  assert!(snapshot.local.last_successful_heartbeat_at.is_some());
   Box::new(iterator).shutdown().await.unwrap();
 }
 
@@ -1647,6 +1693,7 @@ async fn cancelled_next_preserves_prefetched_record() {
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
+      .local
       .delivery_state
       == ConsumerDeliveryState::Pending
     {
@@ -1659,6 +1706,7 @@ async fn cancelled_next_preserves_prefetched_record() {
       .diagnostics()
       .expect("consumer implementation provides diagnostics")
       .state_snapshot()
+      .local
       .delivery_state,
     ConsumerDeliveryState::Pending
   );

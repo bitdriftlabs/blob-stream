@@ -1,12 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
-use super::{
-  ConsumerReadConfig,
-  ConsumerReader,
-  ConsumerReaderImpl,
-  PartitionReadState,
-  RecoveryState,
-};
+use super::state::{RecoveryState, VirtualPartitionState};
+use super::{ConsumerReadConfig, ConsumerReader, ConsumerReaderImpl};
 use crate::config::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -313,7 +308,7 @@ async fn retention_recovery_scans_from_checkpoint_before_fast_path() {
     90_000,
   );
   reader
-    .set_assigned_virtual_partitions(vec![7], 90_000)
+    .set_assigned_virtual_partitions(&[7], 90_000)
     .unwrap();
 
   let batches = reader.read_available(90_000).await.unwrap();
@@ -327,13 +322,66 @@ async fn retention_recovery_scans_from_checkpoint_before_fast_path() {
       .any(|(window_start, _)| *window_start == 90_000)
   );
 
-  let PartitionReadState::Recovering(recovery_state) =
-    reader.partition_read_states.get(&7).unwrap()
+  let VirtualPartitionState::Recovering { recovery_state, .. } =
+    reader.virtual_partition_states.get(&7).unwrap()
   else {
     panic!("partition must remain in recovery before the cutover is scanned");
   };
   assert_eq!(recovery_state.cutover_window_start_unix_seconds, 90_000);
   assert_eq!(recovery_state.next_window_start_unix_seconds, 24_600);
+}
+
+#[tokio::test]
+async fn assignment_activates_hydrated_state_and_removes_revoked_state() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  )
+  .unwrap();
+
+  reader.hydrate_cursor_with_source(
+    7,
+    &CommittedCursor {
+      virtual_partition_id: 7,
+      seq_end: 4,
+      source_checkpoint: Some(CommittedSourceCheckpoint {
+        window_start_unix_seconds: 15_000,
+        snowflake_id: 1,
+      }),
+    },
+    Some(15_000_000),
+    90_000,
+  );
+
+  assert!(matches!(
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::PendingRecovering { .. })
+  ));
+  assert_eq!(reader.cursor(7), Some(4));
+
+  reader
+    .set_assigned_virtual_partitions(&[7], 90_000)
+    .unwrap();
+  assert!(matches!(
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::Recovering { .. })
+  ));
+
+  reader.set_assigned_virtual_partitions(&[], 90_000).unwrap();
+  assert!(!reader.virtual_partition_states.contains_key(&7));
+  assert_eq!(reader.cursor(7), None);
 }
 
 #[tokio::test]
@@ -367,7 +415,7 @@ async fn retention_recovery_clamps_legacy_cursor_to_retention_floor() {
     90_000,
   );
   reader
-    .set_assigned_virtual_partitions(vec![7], 90_000)
+    .set_assigned_virtual_partitions(&[7], 90_000)
     .unwrap();
 
   assert!(reader.read_available(90_000).await.unwrap().is_empty());
@@ -435,7 +483,7 @@ async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
     cutover_window_start,
   );
   reader
-    .set_assigned_virtual_partitions(vec![7], cutover_window_start)
+    .set_assigned_virtual_partitions(&[7], cutover_window_start)
     .unwrap();
 
   let first_slice = reader.read_available(cutover_window_start).await.unwrap();
@@ -453,8 +501,8 @@ async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
     .collect::<Vec<_>>();
   assert_eq!(recovered_sequences, vec![1, 2, 3, 4]);
   assert!(matches!(
-    reader.partition_read_states.get(&7),
-    Some(PartitionReadState::Fast)
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::Fast { .. })
   ));
 }
 
@@ -522,7 +570,7 @@ async fn recovery_waits_for_visibility_deferred_window_before_advancing() {
     cutover_window_start,
   );
   reader
-    .set_assigned_virtual_partitions(vec![7], cutover_window_start)
+    .set_assigned_virtual_partitions(&[7], cutover_window_start)
     .unwrap();
 
   assert_eq!(
@@ -540,8 +588,8 @@ async fn recovery_waits_for_visibility_deferred_window_before_advancing() {
       .unwrap()
       .is_empty()
   );
-  let PartitionReadState::Recovering(recovery_state) =
-    reader.partition_read_states.get(&7).unwrap()
+  let VirtualPartitionState::Recovering { recovery_state, .. } =
+    reader.virtual_partition_states.get(&7).unwrap()
   else {
     panic!("visibility-deferred recovery window must remain pending");
   };
@@ -925,18 +973,21 @@ async fn historical_seek_recovers_recent_windows_then_returns_to_fast_path() {
   assert_eq!(current.len(), 1);
   assert_eq!(current[0].seq_range, SeqRange { start: 2, end: 2 });
   assert!(matches!(
-    reader.partition_read_states.get(&7),
-    Some(PartitionReadState::Fast)
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::Fast { .. })
   ));
   recording_metadata_store.scans.lock().clear();
 
   reader.seek(7, 0, 1_200);
   assert!(matches!(
-    reader.partition_read_states.get(&7),
-    Some(PartitionReadState::Recovering(RecoveryState {
-      next_window_start_unix_seconds: 600,
-      cutover_window_start_unix_seconds: 1_200,
-    }))
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::Recovering {
+      recovery_state: RecoveryState {
+        next_window_start_unix_seconds: 600,
+        cutover_window_start_unix_seconds: 1_200,
+      },
+      ..
+    })
   ));
 
   let recovered = reader.read_available(1_200).await.unwrap();
@@ -948,8 +999,8 @@ async fn historical_seek_recovers_recent_windows_then_returns_to_fast_path() {
     vec![1, 2]
   );
   assert!(matches!(
-    reader.partition_read_states.get(&7),
-    Some(PartitionReadState::Fast)
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::Fast { .. })
   ));
   let scans = recording_metadata_store.scans.lock();
   assert!(scans.contains(&(600, None)));

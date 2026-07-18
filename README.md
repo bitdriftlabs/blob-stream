@@ -313,9 +313,10 @@ aws dynamodb update-time-to-live \
 TTL behavior by table:
 - `blob_segments`: broker writes `ttl_epoch_seconds` using `topic.retention_days` plus
   `metadata_store.dynamo.segment_ttl_buffer_seconds`.
-- `producer_partition_leases`, `consumer_group_leases`, `consumer_group_membership`: lease rows
-  write `ttl_epoch_seconds` from their lease expiration plus
-  `metadata_store.dynamo.lease_ttl_buffer_seconds`.
+- `consumer_group_leases`: consumer writes `ttl_epoch_seconds` from lease expiry plus the topic
+  `retention_days`, preserving committed cursors through the readable-data retention period.
+- `producer_partition_leases`, `consumer_group_membership`: lease rows write `ttl_epoch_seconds`
+  from their lease expiration plus `metadata_store.dynamo.lease_ttl_buffer_seconds`.
 
 Notes:
 - DynamoDB TTL is asynchronous; expired items are typically deleted within hours, not immediately.
