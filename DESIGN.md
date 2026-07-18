@@ -230,9 +230,10 @@ The production metadata configuration names four DynamoDB tables:
 | `consumer_group_leases` | topic-group and virtual partition | Consumer ownership, generation fencing, and committed cursor. |
 | `consumer_group_membership` | topic-group and member ID | Consumer member liveness plus shared assignment-plan/planner records. |
 
-Lease and membership rows receive TTL values based on their expiration plus the configured lease
-TTL buffer. DynamoDB TTL cleanup is asynchronous, so expiry checks in the store also use the
-stored lease timestamp.
+Consumer-group lease rows retain their committed cursor for the topic retention period after lease
+expiry. Producer leases and consumer membership rows receive TTL values based on their expiration
+plus the configured lease TTL buffer. DynamoDB TTL cleanup is asynchronous, so expiry checks in
+the store also use the stored lease timestamp.
 
 ### Consumer Assignment Plan
 

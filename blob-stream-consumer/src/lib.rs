@@ -81,6 +81,7 @@ mod bootstrap;
 mod config;
 mod consumer;
 mod coordination;
+mod diagnostics;
 mod iterator;
 
 pub use bootstrap::{ConsumerBootstrapConfig, ConsumerConfigFactory, MembershipCoordinationSource};
@@ -99,23 +100,27 @@ pub use coordination::{
   RecoveredCursor,
   cooperative_sticky_assignment,
 };
-pub use iterator::{
-  AssignmentCallback,
+pub use diagnostics::{
   ConsumerAssignmentPlanSnapshot,
-  ConsumerCoordinationSource,
-  ConsumerDeliveryState,
   ConsumerDiagnostics,
   ConsumerGroupLeaseObservation,
   ConsumerGroupPartitionLeaseSnapshot,
-  ConsumerIterator,
-  ConsumerIteratorImpl,
-  ConsumerOffsetSnapshot,
+  ConsumerLocalPartitionSnapshot,
+  ConsumerLocalStateSnapshot,
   ConsumerPartitionAssignmentSnapshot,
   ConsumerPartitionReadMode,
-  ConsumerReaderPartitionSnapshot,
-  ConsumerRecord,
+  ConsumerReaderStateSnapshot,
+  ConsumerSourceCheckpointSnapshot,
   ConsumerStateResponse,
   ConsumerStateSnapshot,
+};
+pub use iterator::{
+  AssignmentCallback,
+  ConsumerCoordinationSource,
+  ConsumerDeliveryState,
+  ConsumerIterator,
+  ConsumerIteratorImpl,
+  ConsumerRecord,
   CoordinationSnapshot,
   NextResult,
   RevokedPartitions,
