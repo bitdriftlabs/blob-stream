@@ -505,7 +505,7 @@ impl GrpcBrokerTransport {
     Ok(client)
   }
 
-  fn reconcile_membership(&self, membership: &BrokerMembership) {
+  fn reconcile_cached_clients(&self, membership: &BrokerMembership) {
     let addresses = membership
       .nodes()
       .unwrap_or_default()
@@ -552,7 +552,7 @@ impl BrokerTransport for GrpcBrokerTransport {
   }
 
   fn reconcile_membership(&self, membership: &BrokerMembership) {
-    self.reconcile_membership(membership);
+    self.reconcile_cached_clients(membership);
   }
 }
 

@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::{
+  BrokerTransport,
   GrpcBrokerTransport,
   ProducerClient,
   ProducerClientImpl,
@@ -158,18 +159,19 @@ fn grpc_transport_reuses_client_for_broker_address() {
 }
 
 #[test]
-fn grpc_transport_evicts_clients_for_removed_brokers() {
-  let transport = GrpcBrokerTransport::new(default_config());
-  let removed = transport.client_for_address("a:8080").unwrap();
-  let retained = transport.client_for_address("b:8080").unwrap();
+fn grpc_transport_trait_dispatch_evicts_clients_for_removed_brokers() {
+  let concrete_transport = Arc::new(GrpcBrokerTransport::new(default_config()));
+  let removed = concrete_transport.client_for_address("a:8080").unwrap();
+  let retained = concrete_transport.client_for_address("b:8080").unwrap();
+  let transport: Arc<dyn BrokerTransport> = concrete_transport.clone();
 
   transport.reconcile_membership(&BrokerMembership::new(vec![BrokerNode {
     node_id: "node-b".to_string(),
     address: "b:8080".to_string(),
   }]));
 
-  let retained_after_reconcile = transport.client_for_address("b:8080").unwrap();
-  let recreated = transport.client_for_address("a:8080").unwrap();
+  let retained_after_reconcile = concrete_transport.client_for_address("b:8080").unwrap();
+  let recreated = concrete_transport.client_for_address("a:8080").unwrap();
 
   assert!(Arc::ptr_eq(&retained, &retained_after_reconcile));
   assert!(!Arc::ptr_eq(&removed, &recreated));

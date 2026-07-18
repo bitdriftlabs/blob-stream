@@ -93,9 +93,10 @@ RUST_LOG=off cargo run -p blob-stream-integration-tests --bin blob-stream-stress
   --drain-timeout-seconds 120
 ```
 
-The runner exits unsuccessfully if an acknowledged record is missing, a producer or consumer
-fails, or a consumed payload does not belong to the current run. It reports raw duplicate
-deliveries but does not fail solely on them because blob-stream delivery is at least once.
+The runner exits unsuccessfully if an acknowledged record is missing, duplicated, misrouted, a
+producer or consumer fails, or a consumed payload does not belong to the current run. This is
+intentionally stricter than blob-stream's at-least-once delivery contract: duplicate deliveries
+are a stress-test correctness failure.
 
 ## Local Rust docs and doctests
 
