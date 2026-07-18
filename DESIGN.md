@@ -302,9 +302,13 @@ counts successful recovery passes that emit one or more new batches, and
 recovery results discarded by cursor deduplication; `metadata_recovery_scan_segments` instead
 measures the raw recovery scan volume.
 
-The iterator adds a background prefetch buffer with a configurable soft byte budget. It pauses
-prefetch after crossing the budget and resumes when callers drain buffered records. A partition
-revocation removes buffered data for that partition before the new assignment becomes active.
+The iterator adds a background prefetch buffer with a configurable byte budget. It reserves batch
+payload capacity before blob reads, retains decoded batches only within that budget, and resumes
+prefetch when callers drain records. One oversized batch may proceed only when no payload is
+otherwise retained. Metadata scans remain concurrent, while batch range reads and decodes are
+ordered and bounded by `max_in_flight_batch_reads` (default 32). Both limits can be overridden
+between scan passes through runtime feature flags. A partition revocation removes buffered data
+for that partition before the new assignment becomes active.
 
 ### Delayed Metadata Bound
 

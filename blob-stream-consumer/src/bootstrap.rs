@@ -10,6 +10,7 @@ use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
 use aws_types::region::Region;
 use bd_pgv::proto_validate;
+use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_metadata_store::{
@@ -64,17 +65,19 @@ impl ConsumerConfigFactory {
   pub async fn build_iterator(
     config: ConsumerBootstrapConfig,
     metrics_scope: Scope,
+    feature_flags: Option<FeatureFlagsWatch>,
   ) -> Result<ConsumerIteratorImpl> {
-    ConsumerIteratorImpl::from_bootstrap_config(config, metrics_scope).await
+    ConsumerIteratorImpl::from_bootstrap_config(config, metrics_scope, feature_flags).await
   }
 
   /// Build an iterator directly from protobuf bootstrap configuration.
   pub async fn build_iterator_from_proto_config(
     config: ConsumerIteratorBootstrapConfig,
     metrics_scope: Scope,
+    feature_flags: Option<FeatureFlagsWatch>,
   ) -> Result<ConsumerIteratorImpl> {
     let bootstrap = ConsumerBootstrapConfig::from_proto_config(&config)?;
-    Self::build_iterator(bootstrap, metrics_scope).await
+    Self::build_iterator(bootstrap, metrics_scope, feature_flags).await
   }
 }
 
@@ -133,6 +136,7 @@ impl ConsumerIteratorImpl {
   pub async fn from_bootstrap_config(
     config: ConsumerBootstrapConfig,
     metrics_scope: Scope,
+    feature_flags: Option<FeatureFlagsWatch>,
   ) -> Result<Self> {
     validate_runtime_config(&config.runtime)?;
     proto_validate::validate(&config.topic)?;
@@ -182,6 +186,7 @@ impl ConsumerIteratorImpl {
         .topic
         .max_metadata_publication_lag_ms
         .unwrap_or(crate::config::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS),
+      feature_flags,
     )
     .await
   }

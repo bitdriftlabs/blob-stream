@@ -52,6 +52,21 @@ pub struct DeliveryState {
 }
 
 impl DeliveryState {
+  /// Return payload bytes retained in both queued and currently delivered batches.
+  pub(super) fn retained_bytes(&self) -> u64 {
+    self
+      .buffered_bytes
+      .saturating_add(self.current_batch.as_ref().map_or(0, |batch| {
+        batch
+          .records
+          .as_slice()
+          .iter()
+          .fold(0_u64, |total, record| {
+            total.saturating_add(record.payload.len() as u64)
+          })
+      }))
+  }
+
   /// Return the next revocation or record that remains valid for the active assignment.
   pub(super) fn try_take_next(
     &mut self,
@@ -101,7 +116,6 @@ impl DeliveryState {
       self.buffered_bytes = self
         .buffered_bytes
         .saturating_sub(prefetched_batch_bytes(&batch));
-      update_worker_prefetch_metrics(metrics, self);
       if !active_assignment.contains(&batch.virtual_partition_id) {
         continue;
       }
@@ -164,7 +178,7 @@ pub(super) fn prefetched_batch_bytes(batch: &ConsumerBatch) -> u64 {
   })
 }
 
-/// Keep the worker-facing queue metrics aligned with the batches awaiting caller delivery.
+/// Keep delivery-owned occupancy metrics aligned with queued and current caller-visible records.
 pub(super) fn update_worker_prefetch_metrics(
   metrics: &ConsumerIteratorMetrics,
   buffer: &DeliveryState,
@@ -174,5 +188,16 @@ pub(super) fn update_worker_prefetch_metrics(
     .set(i64::try_from(buffer.batches.len()).unwrap_or(i64::MAX));
   metrics
     .prefetch_buffered_bytes
-    .set(i64::try_from(buffer.buffered_bytes).unwrap_or(i64::MAX));
+    .set(i64::try_from(buffer.retained_bytes()).unwrap_or(i64::MAX));
+}
+
+/// Publish total decoded payload occupancy across delivery-owned and worker-pending batches.
+pub(super) fn update_total_prefetch_bytes(
+  metrics: &ConsumerIteratorMetrics,
+  buffer: &DeliveryState,
+  pending_bytes: u64,
+) {
+  metrics
+    .prefetch_total_bytes
+    .set(i64::try_from(buffer.retained_bytes().saturating_add(pending_bytes)).unwrap_or(i64::MAX));
 }

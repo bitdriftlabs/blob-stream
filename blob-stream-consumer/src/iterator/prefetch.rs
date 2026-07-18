@@ -14,6 +14,7 @@ use super::{
   ConsumerIteratorMetrics,
   ConsumerSharedState,
   prefetched_batch_bytes,
+  update_total_prefetch_bytes,
   update_worker_prefetch_metrics,
 };
 use crate::consumer::{
@@ -21,6 +22,7 @@ use crate::consumer::{
   ConsumerReader,
   ConsumerReaderImpl,
   ConsumerReaderPartitionMode,
+  ReadCapacity,
 };
 use crate::coordination::RecoveredCursor;
 use crate::diagnostics::{
@@ -109,7 +111,6 @@ pub(super) struct PrefetchWorker {
   prefetch_space_notify: Arc<Notify>,
   prefetch_shutdown: Arc<AtomicBool>,
   metrics: ConsumerIteratorMetrics,
-  prefetch_max_bytes: u64,
   base_idle_delay_ms: u64,
   max_idle_delay_ms: Option<u64>,
 }
@@ -124,7 +125,6 @@ impl PrefetchWorker {
     prefetch_space_notify: Arc<Notify>,
     prefetch_shutdown: Arc<AtomicBool>,
     metrics: ConsumerIteratorMetrics,
-    prefetch_max_bytes: u64,
     base_idle_delay_ms: u64,
     max_idle_delay_ms: Option<u64>,
   ) -> Self {
@@ -136,7 +136,6 @@ impl PrefetchWorker {
       prefetch_space_notify,
       prefetch_shutdown,
       metrics,
-      prefetch_max_bytes,
       base_idle_delay_ms,
       max_idle_delay_ms,
     }
@@ -165,15 +164,35 @@ impl PrefetchWorker {
         return;
       }
 
+      let runtime_settings = self.reader.runtime_settings();
+
       if self
-        .admit_pending_batches(&mut pending, &mut pending_record_count, &mut pending_bytes)
+        .admit_pending_batches(
+          &mut pending,
+          &mut pending_record_count,
+          &mut pending_bytes,
+          runtime_settings.prefetch_max_bytes,
+        )
         .await
       {
         continue;
       }
 
+      let Some(capacity) = self.read_capacity(pending_bytes, runtime_settings.prefetch_max_bytes)
+      else {
+        self.metrics.prefetch_paused_budget.inc();
+        let _ = tokio::time::timeout(
+          std::time::Duration::from_millis(250),
+          self.prefetch_space_notify.notified(),
+        )
+        .await;
+        continue;
+      };
+
       let read_started_at = Instant::now();
-      let batches = self.read_available_with_retry().await;
+      let batches = self
+        .read_available_with_retry(capacity, runtime_settings)
+        .await;
       record_reader_diagnostics(&self.reader, &self.shared_state);
 
       self
@@ -198,7 +217,45 @@ impl PrefetchWorker {
       pending_bytes =
         pending_bytes.saturating_add(batches.iter().map(prefetched_batch_bytes).sum::<u64>());
       pending.extend(batches);
+      self.record_pending_diagnostics(&pending, pending_record_count, pending_bytes);
     }
+  }
+
+  /// Return capacity remaining after queued, pending, and partially delivered records.
+  fn read_capacity(&self, pending_bytes: u64, prefetch_max_bytes: u64) -> Option<ReadCapacity> {
+    let retained_bytes = self
+      .shared_state
+      .lock()
+      .delivery_state
+      .retained_bytes()
+      .saturating_add(pending_bytes);
+    (retained_bytes < prefetch_max_bytes).then(|| {
+      ReadCapacity::with_oversized_batch(
+        prefetch_max_bytes.saturating_sub(retained_bytes),
+        retained_bytes == 0,
+      )
+    })
+  }
+
+  fn record_pending_diagnostics(
+    &self,
+    pending: &VecDeque<ConsumerBatch>,
+    pending_record_count: usize,
+    pending_bytes: u64,
+  ) {
+    let mut shared_state = self.shared_state.lock();
+    shared_state.diagnostics.prefetch_pending_batch_count = pending.len();
+    shared_state.diagnostics.prefetch_pending_record_count = pending_record_count;
+    shared_state.diagnostics.prefetch_pending_bytes = pending_bytes;
+    self
+      .metrics
+      .prefetch_pending_batches
+      .set(i64::try_from(pending.len()).unwrap_or(i64::MAX));
+    self
+      .metrics
+      .prefetch_pending_bytes
+      .set(i64::try_from(pending_bytes).unwrap_or(i64::MAX));
+    update_total_prefetch_bytes(&self.metrics, &shared_state.delivery_state, pending_bytes);
   }
 
   /// Move pending batches into the shared delivery queue, returning true after a backpressure wait.
@@ -207,6 +264,7 @@ impl PrefetchWorker {
     pending: &mut VecDeque<ConsumerBatch>,
     pending_record_count: &mut usize,
     pending_bytes: &mut u64,
+    prefetch_max_bytes: u64,
   ) -> bool {
     let pending_remains = {
       let mut shared_state = self.shared_state.lock();
@@ -229,7 +287,7 @@ impl PrefetchWorker {
         let would_cross = buffer
           .buffered_bytes
           .saturating_add(batch_bytes)
-          .gt(&self.prefetch_max_bytes);
+          .gt(&prefetch_max_bytes);
 
         // The configured budget is a soft target: one batch may cross it so a single oversized
         // batch remains deliverable. Once a batch is buffered, pause before adding another.
@@ -247,15 +305,26 @@ impl PrefetchWorker {
         buffer.batches.push_back(batch);
       }
 
-      let buffer = &mut shared_state.delivery_state;
-      if !buffer.batches.is_empty() {
-        update_worker_prefetch_metrics(&self.metrics, buffer);
-        self.delivery_notify.notify_waiters();
+      {
+        let buffer = &mut shared_state.delivery_state;
+        if !buffer.batches.is_empty() {
+          update_worker_prefetch_metrics(&self.metrics, buffer);
+          self.delivery_notify.notify_waiters();
+        }
       }
       // These counts describe worker-owned pending work, not the shared delivery queue.
       shared_state.diagnostics.prefetch_pending_batch_count = pending.len();
       shared_state.diagnostics.prefetch_pending_record_count = *pending_record_count;
       shared_state.diagnostics.prefetch_pending_bytes = *pending_bytes;
+      self
+        .metrics
+        .prefetch_pending_batches
+        .set(i64::try_from(pending.len()).unwrap_or(i64::MAX));
+      self
+        .metrics
+        .prefetch_pending_bytes
+        .set(i64::try_from(*pending_bytes).unwrap_or(i64::MAX));
+      update_total_prefetch_bytes(&self.metrics, &shared_state.delivery_state, *pending_bytes);
 
       !pending.is_empty()
     };
@@ -272,11 +341,19 @@ impl PrefetchWorker {
   }
 
   /// Retry one failed read immediately, then wait before subsequent retry attempts.
-  async fn read_available_with_retry(&mut self) -> Vec<ConsumerBatch> {
+  async fn read_available_with_retry(
+    &mut self,
+    capacity: ReadCapacity,
+    runtime_settings: crate::config::ConsumerReadRuntimeSettings,
+  ) -> Vec<ConsumerBatch> {
     let mut read_attempt: u8 = 0;
     loop {
       let now_s = now_unix_seconds();
-      match self.reader.read_available(now_s).await {
+      match self
+        .reader
+        .read_available_with_capacity_and_settings(now_s, capacity, runtime_settings)
+        .await
+      {
         Ok(batches) => return batches,
         Err(read_error) => {
           if read_attempt == 0 {

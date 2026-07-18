@@ -4,7 +4,6 @@ use blob_stream_consumer::{
   ConsumerIterator,
   ConsumerIteratorImpl,
   ConsumerReadConfig,
-  ConsumerReader,
   ConsumerReaderImpl,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   MembershipCoordinationSource,
@@ -30,6 +29,7 @@ use framework::{
   StoreFaultOperation,
   StoreFaultRule,
   TOPIC,
+  TestConsumerReader,
   TestEventMatcher,
   WINDOW_SIZE_SECONDS,
   consumer_runtime_config,
@@ -93,7 +93,7 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
     "expected at least one retry after injected drop fault"
   );
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -106,6 +106,7 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -197,7 +198,7 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
     expected_ids.insert(id);
   }
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -210,6 +211,7 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -347,7 +349,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     "expected retries while active broker was partitioned before reroute"
   );
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -360,6 +362,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -453,7 +456,7 @@ async fn broker_response_timeout_retry_budget_respected() -> Result<()> {
     "expected recovery produce to succeed without retries after fault budget was consumed"
   );
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -466,6 +469,7 @@ async fn broker_response_timeout_retry_budget_respected() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -544,7 +548,7 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
     "expected retries after transient blob put failures were injected"
   );
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -557,6 +561,7 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -626,7 +631,7 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
     })
     .await;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -639,6 +644,7 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -742,7 +748,7 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
   )
   .await?;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -755,6 +761,7 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -838,7 +845,7 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
     })
     .await;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -851,6 +858,7 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -997,7 +1005,7 @@ async fn producer_lease_store_conflict_then_expiry_takeover() -> Result<()> {
     "expected retries while producer lease conflicts were injected"
   );
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -1010,6 +1018,7 @@ async fn producer_lease_store_conflict_then_expiry_takeover() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -1281,6 +1290,7 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -1301,6 +1311,7 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -1407,7 +1418,7 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
   }
 
   if consumed_ids.len() < expected_ids.len() {
-    let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+    let mut reader = ConsumerReaderImpl::new(
       ConsumerReadConfig {
         topic: TOPIC.to_string().into(),
         window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -1420,6 +1431,7 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
       &metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )?;
     drain_reader_until(
       &mut reader,
@@ -1558,7 +1570,7 @@ async fn combined_network_and_metadata_faults_end_to_end() -> Result<()> {
     "expected retries under combined network and metadata faults"
   );
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -1571,6 +1583,7 @@ async fn combined_network_and_metadata_faults_end_to_end() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut consumed_ids = HashSet::new();
@@ -1692,7 +1705,7 @@ async fn run_fit_012_scenario() -> Result<Fit012Outcome> {
     expected_ids.insert(id);
   }
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -1705,6 +1718,7 @@ async fn run_fit_012_scenario() -> Result<Fit012Outcome> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut consumed_ids = HashSet::new();

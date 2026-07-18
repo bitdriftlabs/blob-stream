@@ -17,6 +17,7 @@ aws-types.workspace             = true
 axum.workspace                  = true
 bd-log.workspace                = true
 bd-pgv.workspace                = true
+bd-runtime-config.workspace     = true
 bd-server-stats.workspace       = true
 blob-stream-blob-store.path     = "../blob-stream-blob-store"
 blob-stream-metadata-store.path = "../blob-stream-metadata-store"
@@ -35,4 +36,5 @@ uuid.workspace                  = true
 zstd.workspace                  = true
 
 [dev-dependencies]
-bytes.workspace = true
+bd-test-helpers.workspace = true
+bytes.workspace           = true

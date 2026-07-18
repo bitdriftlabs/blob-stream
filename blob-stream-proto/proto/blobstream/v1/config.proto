@@ -306,13 +306,12 @@ message ConsumerReadConfig {
   // 1,000 ms, then 2,000 ms until data arrives.
   optional uint64 max_idle_poll_delay_ms = 5;
 
-  // Soft target RAM budget for iterator-side prefetch buffering.
+  // RAM budget for consumer-owned decoded payload buffering.
   // Default when unset: 67,108,864 bytes (64 MiB).
   //
-  // The consumer iterator prefetches decoded batches in a background task and serves
-  // `next()` from this memory buffer. This value caps that buffer as a soft target:
-  // - The iterator may admit one additional batch that crosses the target boundary.
-  // - After crossing the boundary, prefetch pauses until buffered bytes drain below target.
+  // The consumer iterator reserves payload capacity before it reads a batch and accounts for
+  // decoded batches awaiting delivery. One oversized batch may be read only when no payload is
+  // otherwise retained; prefetch then pauses until callers drain it.
   //
   // Tuning guidance:
   // - Increase to reduce foreground `next()` latency and improve burst absorption.
@@ -325,6 +324,14 @@ message ConsumerReadConfig {
   // Default when unset: 2,000 ms. This is a best-effort staleness margin, not a
   // consistency guarantee because the metadata store has no bounded replication delay.
   optional uint64 metadata_visibility_delay_ms = 9;
+
+  // Maximum number of batch byte-range reads and decodes that may run concurrently.
+  // Default when unset: 32.
+  //
+  // This controls I/O and temporary decode-memory parallelism, while prefetch_max_bytes controls
+  // total consumer-owned payload capacity. Increase only after confirming object-store and host
+  // capacity can sustain the additional concurrent work.
+  optional uint64 max_in_flight_batch_reads = 10 [(validate.rules).uint64.gt = 0];
 }
 
 // Consumer group lease and heartbeat settings.

@@ -1,12 +1,19 @@
 #![allow(clippy::unwrap_used)]
 
 use super::state::{RecoveryState, VirtualPartitionState};
-use super::{ConsumerReadConfig, ConsumerReader, ConsumerReaderImpl};
-use crate::config::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS;
+use super::{
+  ConsumerReadConfig,
+  ConsumerReader as BoundedConsumerReader,
+  ConsumerReaderImpl,
+  ReadCapacity,
+};
+use crate::config::{ConsumerReadRuntimeSettings, DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS};
 use anyhow::Result;
 use async_trait::async_trait;
+use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
-use blob_stream_blob_store::{BlobKey, BlobStore, InMemoryBlobStore};
+use bd_test_helpers::feature_flags::{DefaultFeatureFlags, FakeLoader};
+use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
 use blob_stream_metadata_store::{InMemoryMetadataStore, MetadataStore, SegmentMetadata};
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
@@ -29,6 +36,22 @@ use protobuf::Message;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::Semaphore;
+use tokio::time::{Duration, timeout};
+
+const TEST_READ_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
+
+impl ConsumerReaderImpl {
+  async fn read_available(&mut self, now_unix_seconds: i64) -> Result<Vec<super::ConsumerBatch>> {
+    BoundedConsumerReader::read_available(
+      self,
+      now_unix_seconds,
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+    )
+    .await
+  }
+}
 
 struct RecordingMetadataStore {
   inner: InMemoryMetadataStore,
@@ -66,8 +89,150 @@ impl MetadataStore for RecordingMetadataStore {
   }
 }
 
+//
+// FailSecondRangeBlobStore
+//
+
+struct FailSecondRangeBlobStore {
+  inner: InMemoryBlobStore,
+  range_reads: AtomicUsize,
+}
+
+impl FailSecondRangeBlobStore {
+  fn new() -> Self {
+    Self {
+      inner: InMemoryBlobStore::new(),
+      range_reads: AtomicUsize::new(0),
+    }
+  }
+}
+
+#[async_trait]
+impl BlobStore for FailSecondRangeBlobStore {
+  async fn put(&self, key: &BlobKey, payload: Bytes) -> Result<()> {
+    self.inner.put(key, payload).await
+  }
+
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> Result<Bytes> {
+    if self.range_reads.fetch_add(1, Ordering::SeqCst) == 1 {
+      return Err(anyhow::anyhow!("injected second range-read failure"));
+    }
+    self.inner.get_range(key, range).await
+  }
+}
+
+//
+// BlockingRangeBlobStore
+//
+
+struct BlockingRangeBlobStore {
+  inner: InMemoryBlobStore,
+  active_reads: AtomicUsize,
+  maximum_active_reads: AtomicUsize,
+  started_reads: Arc<Semaphore>,
+  released_reads: Arc<Semaphore>,
+}
+
+impl BlockingRangeBlobStore {
+  fn new() -> Self {
+    Self {
+      inner: InMemoryBlobStore::new(),
+      active_reads: AtomicUsize::new(0),
+      maximum_active_reads: AtomicUsize::new(0),
+      started_reads: Arc::new(Semaphore::new(0)),
+      released_reads: Arc::new(Semaphore::new(0)),
+    }
+  }
+
+  fn record_active_read(&self, active_reads: usize) {
+    let mut maximum_active_reads = self.maximum_active_reads.load(Ordering::SeqCst);
+    while active_reads > maximum_active_reads {
+      match self.maximum_active_reads.compare_exchange(
+        maximum_active_reads,
+        active_reads,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+      ) {
+        Ok(_) => return,
+        Err(current) => maximum_active_reads = current,
+      }
+    }
+  }
+}
+
+#[async_trait]
+impl BlobStore for BlockingRangeBlobStore {
+  async fn put(&self, key: &BlobKey, payload: Bytes) -> Result<()> {
+    self.inner.put(key, payload).await
+  }
+
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> Result<Bytes> {
+    let active_reads = self
+      .active_reads
+      .fetch_add(1, Ordering::SeqCst)
+      .saturating_add(1);
+    self.record_active_read(active_reads);
+    self.started_reads.add_permits(1);
+    self
+      .released_reads
+      .acquire()
+      .await
+      .expect("test range-read release semaphore is open")
+      .forget();
+    let result = self.inner.get_range(key, range).await;
+    self.active_reads.fetch_sub(1, Ordering::SeqCst);
+    result
+  }
+}
+
 fn metrics_scope() -> bd_server_stats::stats::Scope {
   Collector::default().scope("blob_stream_consumer_test")
+}
+
+#[test]
+fn reader_applies_live_feature_flag_updates_between_scan_passes() {
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag("blob_stream_consumer_prefetch_max_bytes", 16)
+      .with_integer_flag("blob_stream_consumer_max_in_flight_batch_reads", 2),
+  ));
+  let reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      prefetch_max_bytes: Some(8),
+      max_in_flight_batch_reads: Some(1),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap();
+  assert_eq!(
+    reader.runtime_settings(),
+    ConsumerReadRuntimeSettings {
+      prefetch_max_bytes: 16,
+      max_in_flight_batch_reads: 2,
+    }
+  );
+
+  feature_flags.update(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag("blob_stream_consumer_prefetch_max_bytes", 32)
+      .with_integer_flag("blob_stream_consumer_max_in_flight_batch_reads", 4),
+  ));
+  assert_eq!(
+    reader.runtime_settings(),
+    ConsumerReadRuntimeSettings {
+      prefetch_max_bytes: 32,
+      max_in_flight_batch_reads: 4,
+    }
+  );
 }
 
 async fn write_segment(
@@ -183,7 +348,7 @@ async fn visibility_delay_defers_newly_published_metadata() {
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
@@ -197,6 +362,7 @@ async fn visibility_delay_defers_newly_published_metadata() {
     &metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .unwrap();
 
@@ -225,7 +391,7 @@ async fn derived_horizon_retries_visibility_deferred_metadata_across_window_boun
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
@@ -239,6 +405,7 @@ async fn derived_horizon_retries_visibility_deferred_metadata_across_window_boun
     &metrics_scope(),
     1,
     30_000,
+    None,
   )
   .unwrap();
 
@@ -279,7 +446,7 @@ async fn retention_recovery_scans_from_checkpoint_before_fast_path() {
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
@@ -292,6 +459,7 @@ async fn retention_recovery_scans_from_checkpoint_before_fast_path() {
     &metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .unwrap();
   reader.hydrate_cursor_with_source(
@@ -335,7 +503,7 @@ async fn retention_recovery_scans_from_checkpoint_before_fast_path() {
 async fn assignment_activates_hydrated_state_and_removes_revoked_state() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
@@ -348,6 +516,7 @@ async fn assignment_activates_hydrated_state_and_removes_revoked_state() {
     &metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .unwrap();
 
@@ -389,7 +558,7 @@ async fn retention_recovery_clamps_legacy_cursor_to_retention_floor() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store = Arc::new(RecordingMetadataStore::new());
   let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
@@ -402,6 +571,7 @@ async fn retention_recovery_clamps_legacy_cursor_to_retention_floor() {
     &metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .unwrap();
   reader.hydrate_cursor_with_source(
@@ -453,7 +623,7 @@ async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
     .await;
   }
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(window_size_seconds),
@@ -467,6 +637,7 @@ async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
     &metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .unwrap();
   reader.hydrate_cursor_with_source(
@@ -540,7 +711,7 @@ async fn recovery_waits_for_visibility_deferred_window_before_advancing() {
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(window_size_seconds),
@@ -554,6 +725,7 @@ async fn recovery_waits_for_visibility_deferred_window_before_advancing() {
     &metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .unwrap();
   reader.hydrate_cursor_with_source(
@@ -624,7 +796,7 @@ async fn advances_cursor_and_dedupes_on_rescan() {
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
@@ -637,6 +809,7 @@ async fn advances_cursor_and_dedupes_on_rescan() {
     &metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .unwrap();
 
@@ -648,6 +821,187 @@ async fn advances_cursor_and_dedupes_on_rescan() {
   let second = reader.read_available(950).await.unwrap();
   assert!(second.is_empty());
   assert_eq!(reader.cursor(7), Some(2));
+}
+
+#[tokio::test]
+async fn failed_scan_restores_cursor_before_retrying_undelivered_batches() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(FailSecondRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+
+  for sequence in 1 ..= 2 {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      900,
+      sequence,
+      7,
+      SeqRange {
+        start: sequence,
+        end: sequence,
+      },
+      vec![new_record(
+        vec![u8::try_from(sequence).unwrap()],
+        1_000 + sequence as i64,
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .unwrap();
+
+  assert!(reader.read_available(950).await.is_err());
+  assert_eq!(reader.cursor(7), None);
+
+  let batches = reader.read_available(950).await.unwrap();
+  assert_eq!(
+    batches
+      .iter()
+      .map(|batch| batch.seq_range.clone())
+      .collect::<Vec<_>>(),
+    vec![SeqRange { start: 1, end: 1 }, SeqRange { start: 2, end: 2 }]
+  );
+  assert_eq!(reader.cursor(7), Some(2));
+}
+
+#[tokio::test]
+async fn byte_capacity_defers_later_batches_until_the_next_scan() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+
+  for sequence in 1 ..= 2 {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      900,
+      sequence,
+      7,
+      SeqRange {
+        start: sequence,
+        end: sequence,
+      },
+      vec![new_record(
+        vec![u8::try_from(sequence).unwrap()],
+        1_000 + sequence as i64,
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .unwrap();
+
+  let first_settings = reader.runtime_settings();
+  let first = reader
+    .read_available_with_capacity_and_settings(950, ReadCapacity::new(1), first_settings)
+    .await
+    .unwrap();
+  assert_eq!(first.len(), 1);
+  assert_eq!(first[0].seq_range, SeqRange { start: 1, end: 1 });
+  assert_eq!(reader.cursor(7), Some(1));
+
+  let second_settings = reader.runtime_settings();
+  let second = reader
+    .read_available_with_capacity_and_settings(950, ReadCapacity::new(1), second_settings)
+    .await
+    .unwrap();
+  assert_eq!(second.len(), 1);
+  assert_eq!(second[0].seq_range, SeqRange { start: 2, end: 2 });
+  assert_eq!(reader.cursor(7), Some(2));
+}
+
+#[tokio::test]
+async fn bounded_parallel_reads_respect_configured_limit() {
+  let blob_store = Arc::new(BlockingRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+
+  for sequence in 1 ..= 4 {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      900,
+      sequence,
+      7,
+      SeqRange {
+        start: sequence,
+        end: sequence,
+      },
+      vec![new_record(
+        vec![u8::try_from(sequence).unwrap()],
+        1_000 + sequence as i64,
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      max_in_flight_batch_reads: Some(2),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store.clone(),
+    metadata_store,
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .unwrap();
+
+  let read_task = tokio::spawn(async move { reader.read_available(950).await });
+  timeout(
+    Duration::from_secs(1),
+    blob_store.started_reads.acquire_many(2),
+  )
+  .await
+  .expect("expected two concurrent range reads")
+  .expect("range-read start semaphore is open")
+  .forget();
+  assert_eq!(blob_store.started_reads.available_permits(), 0);
+  assert_eq!(blob_store.maximum_active_reads.load(Ordering::SeqCst), 2);
+
+  blob_store.released_reads.add_permits(4);
+  let batches = read_task.await.unwrap().unwrap();
+  assert_eq!(batches.len(), 4);
+  assert_eq!(blob_store.maximum_active_reads.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -668,7 +1022,7 @@ async fn catches_late_metadata_with_derived_candidate_horizon() {
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
@@ -681,6 +1035,7 @@ async fn catches_late_metadata_with_derived_candidate_horizon() {
     &metrics_scope(),
     1,
     600_000,
+    None,
   )
   .unwrap();
 
@@ -725,7 +1080,7 @@ async fn decodes_zstd_compressed_batches() {
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
@@ -738,6 +1093,7 @@ async fn decodes_zstd_compressed_batches() {
     &metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .unwrap();
 
@@ -767,7 +1123,7 @@ async fn fast_scan_uses_per_partition_inclusive_frontier() {
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
@@ -781,6 +1137,7 @@ async fn fast_scan_uses_per_partition_inclusive_frontier() {
     &metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .unwrap();
 
@@ -826,7 +1183,7 @@ async fn fast_scan_uses_lowest_partition_frontier_for_cross_partition_ordering()
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
@@ -840,6 +1197,7 @@ async fn fast_scan_uses_lowest_partition_frontier_for_cross_partition_ordering()
     &metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .unwrap();
 
@@ -897,7 +1255,7 @@ async fn seek_resets_partition_fast_frontier() {
     .await;
   }
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
@@ -911,6 +1269,7 @@ async fn seek_resets_partition_fast_frontier() {
     &metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .unwrap();
 
@@ -952,7 +1311,7 @@ async fn historical_seek_recovers_recent_windows_then_returns_to_fast_path() {
     .await;
   }
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
@@ -966,6 +1325,7 @@ async fn historical_seek_recovers_recent_windows_then_returns_to_fast_path() {
     &metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .unwrap();
 
@@ -1039,7 +1399,7 @@ async fn fast_scan_uses_per_window_frontiers_across_candidate_window_boundary() 
   )
   .await;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       window_size_seconds: Some(300),
@@ -1053,6 +1413,7 @@ async fn fast_scan_uses_per_window_frontiers_across_candidate_window_boundary() 
     &metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .unwrap();
   assert_eq!(reader.read_available(900).await.unwrap().len(), 2);

@@ -3,29 +3,42 @@
 mod tests;
 
 use anyhow::{Result, anyhow, ensure};
+use bd_log::warn_every;
 use bd_pgv::proto_validate;
+use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
 pub use blob_stream_proto::protos::blobstream::v1::config::{
   ConsumerGroupConfig,
   ConsumerReadConfig,
   ConsumerRuntimeConfig,
 };
 use log::{debug, trace};
+use time::ext::NumericalDuration;
 
 const DEFAULT_WINDOW_SIZE_SECONDS: i64 = 300;
 const DEFAULT_IDLE_POLL_DELAY_MS: u64 = 250;
 const DEFAULT_MAX_IDLE_POLL_DELAY_MS: u64 = 2_000;
 const DEFAULT_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_METADATA_VISIBILITY_DELAY_MS: u64 = 2_000;
+const DEFAULT_MAX_IN_FLIGHT_BATCH_READS: u64 = 32;
 pub const DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS: u64 = 30_000;
 const MAX_CANDIDATE_WINDOWS: usize = 32;
 const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: i64 = 10_000;
 const DEFAULT_REBALANCE_INTERVAL_MS: i64 = 10_000;
 const RESERVED_MEMBER_ID_PREFIX: &str = "__blob_stream_";
+const PREFETCH_MAX_BYTES_FEATURE_FLAG: &str = "blob_stream_consumer_prefetch_max_bytes";
+const MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG: &str =
+  "blob_stream_consumer_max_in_flight_batch_reads";
 
 //
 // ConsumerReadConfig
 //
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConsumerReadRuntimeSettings {
+  pub(crate) prefetch_max_bytes: u64,
+  pub(crate) max_in_flight_batch_reads: usize,
+}
 
 #[must_use]
 /// Return the configured read window size in seconds, applying defaults when omitted.
@@ -52,7 +65,7 @@ pub fn consumer_max_idle_poll_delay_ms(config: &ConsumerReadConfig) -> u64 {
 }
 
 #[must_use]
-/// Return the soft-target prefetch RAM budget in bytes.
+/// Return the consumer prefetch RAM budget in bytes.
 pub fn consumer_prefetch_max_bytes(config: &ConsumerReadConfig) -> u64 {
   config
     .prefetch_max_bytes
@@ -65,6 +78,65 @@ pub fn consumer_metadata_visibility_delay_ms(config: &ConsumerReadConfig) -> u64
   config
     .metadata_visibility_delay_ms
     .unwrap_or(DEFAULT_METADATA_VISIBILITY_DELAY_MS)
+}
+
+#[must_use]
+/// Return the maximum concurrent blob range reads and decodes, applying the default when omitted.
+pub fn consumer_max_in_flight_batch_reads(config: &ConsumerReadConfig) -> u64 {
+  config
+    .max_in_flight_batch_reads
+    .unwrap_or(DEFAULT_MAX_IN_FLIGHT_BATCH_READS)
+}
+
+/// Resolve immutable settings for one consumer scan pass.
+pub(crate) fn consumer_read_runtime_settings(
+  config: &ConsumerReadConfig,
+  feature_flags: Option<&FeatureFlagsWatch>,
+) -> ConsumerReadRuntimeSettings {
+  let configured_prefetch_max_bytes = consumer_prefetch_max_bytes(config);
+  let prefetch_max_bytes = feature_flags.map_or(configured_prefetch_max_bytes, |feature_flags| {
+    feature_flags.get_integer(
+      PREFETCH_MAX_BYTES_FEATURE_FLAG,
+      configured_prefetch_max_bytes,
+    )
+  });
+  let prefetch_max_bytes = if prefetch_max_bytes == 0 {
+    warn_every!(
+      15.seconds(),
+      "consumer feature flag {} was zero; using configured prefetch_max_bytes={}",
+      PREFETCH_MAX_BYTES_FEATURE_FLAG,
+      configured_prefetch_max_bytes
+    );
+    configured_prefetch_max_bytes
+  } else {
+    prefetch_max_bytes
+  };
+
+  let configured_max_in_flight_batch_reads = consumer_max_in_flight_batch_reads(config);
+  let max_in_flight_batch_reads =
+    feature_flags.map_or(configured_max_in_flight_batch_reads, |feature_flags| {
+      feature_flags.get_integer(
+        MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG,
+        configured_max_in_flight_batch_reads,
+      )
+    });
+  let max_in_flight_batch_reads = match usize::try_from(max_in_flight_batch_reads) {
+    Ok(max_in_flight_batch_reads) if max_in_flight_batch_reads > 0 => max_in_flight_batch_reads,
+    Ok(_) | Err(_) => {
+      warn_every!(
+        15.seconds(),
+        "consumer feature flag {} was invalid; using configured max_in_flight_batch_reads={}",
+        MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG,
+        configured_max_in_flight_batch_reads
+      );
+      usize::try_from(configured_max_in_flight_batch_reads).unwrap_or(usize::MAX)
+    },
+  };
+
+  ConsumerReadRuntimeSettings {
+    prefetch_max_bytes,
+    max_in_flight_batch_reads,
+  }
 }
 
 /// Derive the candidate windows needed to cover publication and visibility delay.

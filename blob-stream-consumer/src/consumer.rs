@@ -5,9 +5,16 @@ mod tests;
 mod scan;
 mod state;
 
-use crate::config::{ConsumerReadConfig, consumer_window_size_seconds, validate_read_config};
+use crate::config::{
+  ConsumerReadConfig,
+  ConsumerReadRuntimeSettings,
+  consumer_read_runtime_settings,
+  consumer_window_size_seconds,
+  validate_read_config,
+};
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
+use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
 use blob_stream_blob_store::BlobStore;
 use blob_stream_metadata_store::MetadataStore;
@@ -23,6 +30,7 @@ use blob_stream_types::{
 };
 use log::info;
 use prometheus::{Histogram, IntCounter, IntGauge};
+pub use scan::ReadCapacity;
 pub use state::{ConsumerReaderPartitionMode, ConsumerReaderPartitionState};
 use state::{RecoveryState, VirtualPartitionState};
 use std::collections::{HashMap, HashSet};
@@ -266,8 +274,12 @@ impl ConsumerReaderMetrics {
 #[async_trait]
 /// Low-level batch reader over blob + metadata stores.
 pub trait ConsumerReader: Send {
-  /// Scan available windows and return newly available batches.
-  async fn read_available(&mut self, now_unix_seconds: i64) -> Result<Vec<ConsumerBatch>>;
+  /// Scan available windows and return batches that fit within the supplied payload capacity.
+  async fn read_available(
+    &mut self,
+    now_unix_seconds: i64,
+    capacity: ReadCapacity,
+  ) -> Result<Vec<ConsumerBatch>>;
   /// Return committed cursor for a virtual partition, if known.
   fn cursor(&self, virtual_partition_id: VirtualPartitionId) -> Option<u64>;
   /// Return all tracked cursors.
@@ -287,12 +299,13 @@ pub struct ConsumerReaderImpl {
   retention_days: u32,
   maximum_metadata_publication_lag_ms: u64,
   fast_frontiers: HashMap<(VirtualPartitionId, i64), SnowflakeId>,
+  feature_flags: Option<FeatureFlagsWatch>,
   metrics: ConsumerReaderMetrics,
 }
 
 impl ConsumerReaderImpl {
   /// Create a reader with finite retention recovery and an explicit metadata publication bound.
-  pub fn new_with_retention_and_publication_lag(
+  pub fn new(
     config: ConsumerReadConfig,
     assigned_virtual_partitions: Vec<VirtualPartitionId>,
     initial_cursors: HashMap<VirtualPartitionId, u64>,
@@ -301,6 +314,7 @@ impl ConsumerReaderImpl {
     metrics_scope: &Scope,
     retention_days: u32,
     maximum_metadata_publication_lag_ms: u64,
+    feature_flags: Option<FeatureFlagsWatch>,
   ) -> Result<Self> {
     validate_read_config(&config)?;
     ensure!(
@@ -309,10 +323,12 @@ impl ConsumerReaderImpl {
     );
     info!(
       "consumer reader initialized: topic={}, retention_days={}, \
-       maximum_metadata_publication_lag_ms={}, assigned_partitions={}, initial_cursors={}",
+       maximum_metadata_publication_lag_ms={}, max_in_flight_batch_reads={}, \
+       assigned_partitions={}, initial_cursors={}",
       config.topic,
       retention_days,
       maximum_metadata_publication_lag_ms,
+      consumer_read_runtime_settings(&config, feature_flags.as_ref()).max_in_flight_batch_reads,
       assigned_virtual_partitions.len(),
       initial_cursors.len()
     );
@@ -341,6 +357,7 @@ impl ConsumerReaderImpl {
       config,
       blob_store,
       metadata_store,
+      feature_flags,
       metrics: ConsumerReaderMetrics::new(metrics_scope),
     })
   }
@@ -348,6 +365,10 @@ impl ConsumerReaderImpl {
   fn window_start(&self, unix_seconds: i64) -> i64 {
     Window::for_timestamp(unix_seconds, consumer_window_size_seconds(&self.config))
       .start_unix_seconds
+  }
+
+  pub(crate) fn runtime_settings(&self) -> ConsumerReadRuntimeSettings {
+    consumer_read_runtime_settings(&self.config, self.feature_flags.as_ref())
   }
 
   fn retention_floor_window_start(&self, cutover_window_start_unix_seconds: i64) -> i64 {
@@ -569,12 +590,30 @@ impl ConsumerReaderImpl {
     partition_ids.sort_unstable();
     partition_ids
   }
+
+  pub(crate) async fn read_available_with_capacity_and_settings(
+    &mut self,
+    now_unix_seconds: i64,
+    capacity: ReadCapacity,
+    runtime_settings: ConsumerReadRuntimeSettings,
+  ) -> Result<Vec<ConsumerBatch>> {
+    self
+      .read_available_impl(now_unix_seconds, capacity, runtime_settings)
+      .await
+  }
 }
 
 #[async_trait]
 impl ConsumerReader for ConsumerReaderImpl {
-  async fn read_available(&mut self, now_unix_seconds: i64) -> Result<Vec<ConsumerBatch>> {
-    self.read_available_impl(now_unix_seconds).await
+  async fn read_available(
+    &mut self,
+    now_unix_seconds: i64,
+    capacity: ReadCapacity,
+  ) -> Result<Vec<ConsumerBatch>> {
+    let runtime_settings = self.runtime_settings();
+    self
+      .read_available_impl(now_unix_seconds, capacity, runtime_settings)
+      .await
   }
 
   fn cursor(&self, virtual_partition_id: VirtualPartitionId) -> Option<u64> {

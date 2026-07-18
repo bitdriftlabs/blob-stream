@@ -32,6 +32,7 @@ use crate::diagnostics::{
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use bd_log::warn_every;
+use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
 use blob_stream_blob_store::BlobStore;
 use blob_stream_metadata_store::{
@@ -53,6 +54,7 @@ use delivery::{
   DeliveredSourceRange,
   DeliveryState,
   prefetched_batch_bytes,
+  update_total_prefetch_bytes,
   update_worker_prefetch_metrics,
 };
 use log::{debug, info, trace};
@@ -90,6 +92,9 @@ struct ConsumerIteratorMetrics {
   active_partitions: IntGauge,
   prefetch_buffered_batches: IntGauge,
   prefetch_buffered_bytes: IntGauge,
+  prefetch_pending_batches: IntGauge,
+  prefetch_pending_bytes: IntGauge,
+  prefetch_total_bytes: IntGauge,
   prefetch_paused_budget: IntCounter,
   prefetch_refill_cycles: IntCounter,
   heartbeat_calls: IntCounter,
@@ -123,6 +128,9 @@ impl ConsumerIteratorMetrics {
       active_partitions: scope.gauge("active_partitions"),
       prefetch_buffered_batches: scope.gauge("prefetch_buffered_batches"),
       prefetch_buffered_bytes: scope.gauge("prefetch_buffered_bytes"),
+      prefetch_pending_batches: scope.gauge("prefetch_pending_batches"),
+      prefetch_pending_bytes: scope.gauge("prefetch_pending_bytes"),
+      prefetch_total_bytes: scope.gauge("prefetch_total_bytes"),
       prefetch_paused_budget: scope.counter("prefetch_paused_budget"),
       prefetch_refill_cycles: scope.counter("prefetch_refill_cycles"),
       heartbeat_calls: scope.counter("heartbeat_calls"),
@@ -332,7 +340,6 @@ struct ConsumerDriver {
   metrics: ConsumerIteratorMetrics,
   started: bool,
   shared_state: Arc<Mutex<ConsumerSharedState>>,
-  prefetch_max_bytes: u64,
   delivery_notify: Arc<Notify>,
   prefetch_space_notify: Arc<Notify>,
   prefetch_shutdown: Arc<AtomicBool>,
@@ -397,6 +404,7 @@ impl ConsumerIteratorImpl {
     metrics_scope: Scope,
     retention_days: u32,
     maximum_metadata_publication_lag_ms: u64,
+    feature_flags: Option<FeatureFlagsWatch>,
   ) -> Result<Self> {
     validate_runtime_config(runtime)?;
     ensure!(
@@ -420,7 +428,7 @@ impl ConsumerIteratorImpl {
     let active_assignment = HashSet::new();
     let assignment_callback = Arc::new(Mutex::new(None));
     let shared_state = Arc::new(Mutex::new(ConsumerSharedState::default()));
-    let reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+    let reader = ConsumerReaderImpl::new(
       read_config,
       Vec::new(),
       HashMap::new(),
@@ -429,6 +437,7 @@ impl ConsumerIteratorImpl {
       &metrics_scope.scope("consumer"),
       retention_days,
       maximum_metadata_publication_lag_ms,
+      feature_flags,
     )?;
     let coordinator = ConsumerGroupCoordinatorImpl::new(
       group_config.clone(),
@@ -462,7 +471,6 @@ impl ConsumerIteratorImpl {
       metrics: ConsumerIteratorMetrics::new(&metrics_scope.scope("consumer")),
       started: false,
       shared_state: Arc::clone(&shared_state),
-      prefetch_max_bytes,
       delivery_notify: Arc::clone(&delivery_notify),
       prefetch_space_notify: Arc::clone(&prefetch_space_notify),
       prefetch_shutdown,
@@ -855,6 +863,7 @@ impl ConsumerDriver {
     let (completion_tx, completion_rx) = oneshot::channel();
     {
       let mut shared_state = self.shared_state.lock();
+      let pending_bytes = shared_state.diagnostics.prefetch_pending_bytes;
       let delivery_state = &mut shared_state.delivery_state;
       delivery_state.drop_partitions(&revoked_set);
       delivery_state.pending_revocation =
@@ -864,6 +873,7 @@ impl ConsumerDriver {
           completion_notify: Arc::clone(&self.revocation_notify),
         })));
       update_worker_prefetch_metrics(&self.metrics, delivery_state);
+      update_total_prefetch_bytes(&self.metrics, delivery_state, pending_bytes);
     }
     self.prefetch_space_notify.notify_waiters();
 
@@ -898,7 +908,6 @@ impl ConsumerDriver {
     let space_notify = Arc::clone(&self.prefetch_space_notify);
     let shutdown = Arc::clone(&self.prefetch_shutdown);
     let metrics = self.metrics.clone();
-    let prefetch_max_bytes = self.prefetch_max_bytes;
     let base_idle_delay_ms = self.prefetch_idle_base_delay_ms;
     let max_idle_delay_ms = self.prefetch_idle_max_delay_ms;
 
@@ -911,7 +920,6 @@ impl ConsumerDriver {
         space_notify,
         shutdown,
         metrics,
-        prefetch_max_bytes,
         base_idle_delay_ms,
         max_idle_delay_ms,
       )
@@ -1337,6 +1345,11 @@ impl ConsumerDriver {
         .delivered_source_ranges
         .remove(&virtual_partition_id);
       update_worker_prefetch_metrics(&self.metrics, &shared_state.delivery_state);
+      update_total_prefetch_bytes(
+        &self.metrics,
+        &shared_state.delivery_state,
+        shared_state.diagnostics.prefetch_pending_bytes,
+      );
     }
     self.prefetch_space_notify.notify_waiters();
     self.refresh_diagnostics();
@@ -1382,6 +1395,7 @@ impl ConsumerIterator for ConsumerIteratorImpl {
       let notified = self.delivery_notify.notified();
       let (next_result, terminal_error) = {
         let mut shared_state = self.shared_state.lock();
+        let pending_bytes = shared_state.diagnostics.prefetch_pending_bytes;
         let ConsumerSharedState {
           active_assignment,
           delivered_source_ranges,
@@ -1389,10 +1403,11 @@ impl ConsumerIterator for ConsumerIteratorImpl {
           terminal_error,
           ..
         } = &mut *shared_state;
-        (
-          delivery_state.try_take_next(active_assignment, delivered_source_ranges, &self.metrics),
-          terminal_error.clone(),
-        )
+        let next_result =
+          delivery_state.try_take_next(active_assignment, delivered_source_ranges, &self.metrics);
+        update_worker_prefetch_metrics(&self.metrics, delivery_state);
+        update_total_prefetch_bytes(&self.metrics, delivery_state, pending_bytes);
+        (next_result, terminal_error.clone())
       };
       if let Some(next_result) = next_result {
         self.prefetch_space_notify.notify_waiters();

@@ -91,7 +91,7 @@ pub use config::{
   ConsumerRuntimeConfig,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
 };
-pub use consumer::{ConsumerBatch, ConsumerReader, ConsumerReaderImpl};
+pub use consumer::{ConsumerBatch, ConsumerReader, ConsumerReaderImpl, ReadCapacity};
 pub use coordination::{
   ConsumerGroupCoordinator,
   ConsumerGroupCoordinatorImpl,

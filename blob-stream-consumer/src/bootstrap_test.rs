@@ -94,7 +94,7 @@ async fn bootstrap_builds_iterator_for_in_memory_backends() {
     in_memory_metadata_store(),
   );
 
-  let mut iterator = ConsumerConfigFactory::build_iterator(config, metrics_scope())
+  let mut iterator = ConsumerConfigFactory::build_iterator(config, metrics_scope(), None)
     .await
     .unwrap();
   iterator.start().unwrap();
@@ -109,7 +109,7 @@ async fn bootstrap_builds_iterator_without_static_members() {
     in_memory_metadata_store(),
   );
 
-  let mut iterator = ConsumerConfigFactory::build_iterator(config, metrics_scope())
+  let mut iterator = ConsumerConfigFactory::build_iterator(config, metrics_scope(), None)
     .await
     .unwrap();
   iterator.start().unwrap();
@@ -120,7 +120,7 @@ async fn proto_bootstrap_builds_iterator_for_in_memory_backends() {
   let config = proto_bootstrap_config("member-a");
 
   let mut iterator =
-    ConsumerConfigFactory::build_iterator_from_proto_config(config, metrics_scope())
+    ConsumerConfigFactory::build_iterator_from_proto_config(config, metrics_scope(), None)
       .await
       .unwrap();
   iterator.start().unwrap();
@@ -130,10 +130,11 @@ async fn proto_bootstrap_builds_iterator_for_in_memory_backends() {
 async fn proto_bootstrap_rejects_missing_required_message_fields() {
   let config = ConsumerIteratorBootstrapConfig::new();
 
-  let error = ConsumerConfigFactory::build_iterator_from_proto_config(config, metrics_scope())
-    .await
-    .err()
-    .unwrap();
+  let error =
+    ConsumerConfigFactory::build_iterator_from_proto_config(config, metrics_scope(), None)
+      .await
+      .err()
+      .unwrap();
   assert!(
     error
       .to_string()
@@ -152,7 +153,7 @@ async fn bootstrap_rejects_zero_retention_for_recovery() {
     in_memory_metadata_store(),
   );
 
-  let error = ConsumerConfigFactory::build_iterator(config, metrics_scope())
+  let error = ConsumerConfigFactory::build_iterator(config, metrics_scope(), None)
     .await
     .err()
     .unwrap();
