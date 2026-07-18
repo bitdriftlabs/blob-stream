@@ -243,7 +243,7 @@ impl ConsumerDiagnostics {
       runtime_state,
       pending_commit_state,
       buffered_batches,
-      current_batch_record_count,
+      current_batch,
       prefetch_buffered_bytes,
       delivery_pending,
     ) = {
@@ -261,7 +261,7 @@ impl ConsumerDiagnostics {
           .delivery_state
           .current_batch
           .as_ref()
-          .map_or(0, |batch| batch.records.len()),
+          .map(|batch| (batch.virtual_partition_id, batch.records.len())),
         shared_state.delivery_state.buffered_bytes,
         shared_state.delivery_state.pending_revocation.is_some()
           || shared_state.delivery_state.current_batch.is_some()
@@ -315,11 +315,19 @@ impl ConsumerDiagnostics {
         .prefetch_buffered_record_count
         .saturating_add(*record_count);
     }
+    // The active batch has already left the queue, but its remaining records are still buffered
+    // locally until `next()` yields them. Attribute them without changing the queued batch count.
+    if let Some((partition_id, record_count)) = current_batch {
+      let snapshot = local_partition_snapshot(&mut local_partitions, partition_id);
+      snapshot.prefetch_buffered_record_count = snapshot
+        .prefetch_buffered_record_count
+        .saturating_add(record_count);
+    }
     let prefetch_buffered_record_count = buffered_batches
       .iter()
       .map(|(_, record_count)| *record_count)
       .sum::<usize>()
-      .saturating_add(current_batch_record_count);
+      .saturating_add(current_batch.map_or(0, |(_, record_count)| record_count));
 
     ConsumerStateSnapshot {
       schema_version: 11,

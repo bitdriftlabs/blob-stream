@@ -1358,6 +1358,15 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
   assert_eq!(first_record.virtual_partition_id, 7);
   assert_eq!(first_record.offset, 1);
 
+  let in_flight_snapshot = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_snapshot();
+  assert_eq!(
+    local_partition(&in_flight_snapshot, 7).prefetch_buffered_record_count,
+    in_flight_snapshot.prefetch_buffered_record_count
+  );
+
   timeout(Duration::from_secs(2), iterator.seek(7, 0))
     .await
     .unwrap()

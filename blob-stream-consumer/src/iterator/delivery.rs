@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 /// A batch currently being expanded into individual records for the caller.
 pub struct BufferedBatch {
-  pub(super) virtual_partition_id: VirtualPartitionId,
+  pub(crate) virtual_partition_id: VirtualPartitionId,
   pub(super) next_offset: u64,
   pub(super) source_checkpoint: CommittedSourceCheckpoint,
   pub records: std::vec::IntoIter<Record>,
