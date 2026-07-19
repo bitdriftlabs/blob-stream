@@ -53,7 +53,7 @@ use time::ext::NumericalDuration;
 use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{Notify, oneshot, watch};
 
-const DEFAULT_ZSTD_LEVEL: i32 = 3;
+pub(super) const DEFAULT_ZSTD_LEVEL: i32 = 3;
 const MAX_IN_FLIGHT_FLUSH_PLANS: usize = 4;
 const UPLOADED_OBJECT_SIZE_BUCKETS_BYTES: &[f64] = &[
   64.0 * 1024.0,
@@ -280,6 +280,9 @@ struct WriteMetrics {
   flush_plans_total: prometheus::IntCounter,
   flush_failures_total: prometheus::IntCounter,
   flush_latency_seconds: prometheus::Histogram,
+  metadata_publication_latency_seconds: prometheus::Histogram,
+  metadata_publication_deadline_exhausted_before_persistence_total: prometheus::IntCounter,
+  metadata_publication_deadline_exhausted_while_persisting_total: prometheus::IntCounter,
   flush_uploaded_object_bytes_total: prometheus::IntCounter,
   flush_uploaded_object_bytes: prometheus::Histogram,
   lease_drain_starts_total: prometheus::IntCounter,
@@ -310,6 +313,11 @@ impl WriteMetrics {
       flush_plans_total: scope.counter("flush_plans_total"),
       flush_failures_total: scope.counter("flush_failures_total"),
       flush_latency_seconds: scope.histogram("flush_latency_seconds"),
+      metadata_publication_latency_seconds: scope.histogram("metadata_publication_latency_seconds"),
+      metadata_publication_deadline_exhausted_before_persistence_total: scope
+        .counter("metadata_publication_deadline_exhausted_before_persistence_total"),
+      metadata_publication_deadline_exhausted_while_persisting_total: scope
+        .counter("metadata_publication_deadline_exhausted_while_persisting_total"),
       flush_uploaded_object_bytes_total: scope.counter("flush_uploaded_object_bytes_total"),
       flush_uploaded_object_bytes: scope.histogram_with_buckets(
         "flush_uploaded_object_bytes",
@@ -363,6 +371,24 @@ impl WriteMetrics {
     self
       .flush_uploaded_object_bytes
       .observe(payload_bytes as f64);
+  }
+
+  fn record_metadata_publication_latency(&self, started_at: Instant) {
+    self
+      .metadata_publication_latency_seconds
+      .observe(started_at.elapsed().as_secs_f64());
+  }
+
+  fn record_metadata_publication_deadline_exhausted_before_persistence(&self) {
+    self
+      .metadata_publication_deadline_exhausted_before_persistence_total
+      .inc();
+  }
+
+  fn record_metadata_publication_deadline_exhausted_while_persisting(&self) {
+    self
+      .metadata_publication_deadline_exhausted_while_persisting_total
+      .inc();
   }
 
   fn record_sequence_reservation(&self, range: &SeqRange) {

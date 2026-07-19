@@ -743,6 +743,73 @@ async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> 
     metrics.contains("blob_stream_broker_test:write:flush_uploaded_object_bytes_total"),
     "{metrics}"
   );
+  assert!(
+    metrics.contains("blob_stream_broker_test:write:metadata_publication_latency_seconds_count 2"),
+    "{metrics}"
+  );
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
+  let collector = Collector::default();
+  let scope = collector.scope("blob_stream_broker_test");
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  config.flush_max_delay_ms = 60_000;
+
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+    config,
+    HashMap::from([(
+      "telemetry".to_string(),
+      TopicInfo {
+        name: "telemetry".to_string(),
+        partition_count: 1,
+        num_writers: 1,
+        retention_days: 7,
+        max_metadata_publication_lag_ms: 1,
+      },
+    )]),
+    Arc::new(BlockingBlobStore {
+      entered_tx,
+      release,
+    }),
+    Arc::new(InMemoryMetadataStore::new()),
+    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+    "test-node".to_string(),
+    None,
+    time_provider,
+    &scope,
+  )?);
+
+  let pending = tokio::spawn(async move {
+    engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  receive_blob_write(&mut entered_rx).await;
+  tokio::time::advance(StdDuration::from_millis(1)).await;
+  assert!(pending.await?.is_err());
+
+  let metrics = String::from_utf8(collector.prometheus_output())?;
+  assert!(
+    metrics.contains(
+      "blob_stream_broker_test:write:\
+       metadata_publication_deadline_exhausted_while_persisting_total 1"
+    ),
+    "{metrics}"
+  );
+  assert!(
+    metrics.contains("blob_stream_broker_test:write:metadata_publication_latency_seconds_count 1"),
+    "{metrics}"
+  );
   Ok(())
 }
 

@@ -8,6 +8,7 @@ mod state;
 use crate::config::{
   ConsumerReadConfig,
   ConsumerReadRuntimeSettings,
+  consumer_metadata_visibility_delay_ms,
   consumer_read_runtime_settings,
   consumer_window_size_seconds,
   validate_read_config,
@@ -39,6 +40,16 @@ use std::time::Instant;
 
 const MAX_RECOVERY_WINDOWS_PER_SCAN: usize = 32;
 const HISTORICAL_SEEK_RECOVERY_SECONDS: i64 = 10 * 60;
+
+fn metadata_availability_delay_seconds(
+  config: &ConsumerReadConfig,
+  maximum_metadata_publication_lag_ms: u64,
+) -> i64 {
+  let delay_ms = maximum_metadata_publication_lag_ms
+    .saturating_add(consumer_metadata_visibility_delay_ms(config));
+  let delay_seconds = delay_ms.saturating_add(999) / 1_000;
+  i64::try_from(delay_seconds).unwrap_or(i64::MAX)
+}
 
 fn format_unix_timestamp_seconds(timestamp_seconds: i64) -> String {
   format_unix_timestamp_ms(timestamp_seconds.saturating_mul(1_000))
@@ -224,6 +235,8 @@ struct ConsumerReaderMetrics {
   metadata_batches_skipped_by_cursor: IntCounter,
   blob_range_requests: IntCounter,
   blob_range_bytes: IntCounter,
+  blob_batch_ranges: IntCounter,
+  blob_batch_range_bytes: IntCounter,
   blob_range_latency_seconds: Histogram,
   decompression_latency_seconds: Histogram,
   batches_read: IntCounter,
@@ -261,6 +274,8 @@ impl ConsumerReaderMetrics {
       metadata_batches_skipped_by_cursor: scope.counter("metadata_batches_skipped_by_cursor"),
       blob_range_requests: scope.counter("blob_range_requests"),
       blob_range_bytes: scope.counter("blob_range_bytes"),
+      blob_batch_ranges: scope.counter("blob_batch_ranges"),
+      blob_batch_range_bytes: scope.counter("blob_batch_range_bytes"),
       blob_range_latency_seconds: scope.histogram("blob_range_latency_seconds"),
       decompression_latency_seconds: scope.histogram("decompression_latency_seconds"),
       batches_read: scope.counter("batches_read"),
@@ -306,6 +321,13 @@ impl ConsumerReaderMetrics {
     self
       .blob_range_latency_seconds
       .observe(started_at.elapsed().as_secs_f64());
+  }
+
+  fn record_blob_batch_ranges(&self, range_count: usize, bytes: u64) {
+    self
+      .blob_batch_ranges
+      .inc_by(u64::try_from(range_count).unwrap_or(u64::MAX));
+    self.blob_batch_range_bytes.inc_by(bytes);
   }
 
   fn record_batch(&self, record_count: usize, payload_bytes: usize) {
@@ -546,6 +568,8 @@ impl ConsumerReaderImpl {
     let recovery_state = RecoveryState {
       next_window_start_unix_seconds: recovery_start_window_unix_seconds,
       cutover_window_start_unix_seconds,
+      first_window_start_unix_seconds: None,
+      first_window_min_snowflake: None,
     };
     if let Some(state) = self.virtual_partition_states.get_mut(&virtual_partition_id) {
       state.start_recovery(recovery_state);
@@ -582,6 +606,7 @@ impl ConsumerReaderImpl {
     // state retains the recovery plan without allowing the reader to scan this partition.
     let cutover_window_start_unix_seconds = self.window_start(now_unix_seconds);
     let retention_floor = self.retention_floor_window_start(cutover_window_start_unix_seconds);
+    let source_checkpoint = committed_cursor.source_checkpoint.as_ref();
     let source_window_start_unix_seconds = committed_cursor
       .source_checkpoint
       .as_ref()
@@ -589,6 +614,24 @@ impl ConsumerReaderImpl {
       .or_else(|| committed_ts_ms.map(|timestamp_ms| self.window_start(timestamp_ms / 1_000)))
       .unwrap_or(retention_floor)
       .max(retention_floor);
+    let first_window_min_snowflake = source_checkpoint
+      .filter(|checkpoint| {
+        checkpoint.window_start_unix_seconds == source_window_start_unix_seconds
+          && source_window_start_unix_seconds <= cutover_window_start_unix_seconds
+      })
+      .and_then(|checkpoint| {
+        let checkpoint_timestamp = SnowflakeId(checkpoint.snowflake_id).timestamp()?;
+        let floor_timestamp_unix_seconds = checkpoint_timestamp
+          .unix_timestamp()
+          .saturating_sub(metadata_availability_delay_seconds(
+            &self.config,
+            self.maximum_metadata_publication_lag_ms,
+          ))
+          .max(source_window_start_unix_seconds);
+        time::OffsetDateTime::from_unix_timestamp(floor_timestamp_unix_seconds)
+          .ok()
+          .map(SnowflakeId::minimum_for_timestamp)
+      });
     let hydrated_cursor = self
       .virtual_partition_states
       .get(&virtual_partition_id)
@@ -614,6 +657,9 @@ impl ConsumerReaderImpl {
           recovery_state: RecoveryState {
             next_window_start_unix_seconds: source_window_start_unix_seconds,
             cutover_window_start_unix_seconds,
+            first_window_start_unix_seconds: source_checkpoint
+              .map(|checkpoint| checkpoint.window_start_unix_seconds),
+            first_window_min_snowflake,
           },
           last_scan,
         },

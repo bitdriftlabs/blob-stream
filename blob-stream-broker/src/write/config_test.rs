@@ -3,8 +3,9 @@ use blob_stream_proto::protos::blobstream::v1::config::{
   BrokerConfig,
   DynamoMetadataStoreConfig,
   SegmentCompression,
+  TopicConfig,
 };
-use blob_stream_types::CompressionCodec;
+use blob_stream_types::{CompressionCodec, DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS};
 use std::collections::HashMap;
 
 fn dynamo_config() -> DynamoMetadataStoreConfig {
@@ -52,6 +53,16 @@ fn defaults_segment_compression_to_zstd() {
   assert_eq!(config.compression.level, Some(3));
   assert_eq!(config.writer_id, 0);
   assert_eq!(config.reservation_size, 10_000);
+}
+
+#[test]
+fn topic_defaults_metadata_publication_lag_to_fifteen_seconds() {
+  let topic = TopicInfo::from_proto(&TopicConfig::new()).unwrap();
+
+  assert_eq!(
+    topic.max_metadata_publication_lag_ms,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS
+  );
 }
 
 #[test]

@@ -3,6 +3,7 @@
 use super::delivery::{BufferedBatch, DeliveryState};
 use super::prefetch::IdlePollBackoff;
 use super::{
+  ActivePartitionState,
   ConsumerCoordinationSource,
   ConsumerDeliveryState,
   ConsumerIterator,
@@ -65,7 +66,7 @@ use blob_stream_types::{
 use bytes::Bytes;
 use parking_lot::Mutex;
 use protobuf::Message;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -427,7 +428,6 @@ fn current_batch_for_fenced_partition_is_not_delivered() {
   assert!(
     delivery_state
       .try_take_next(
-        &HashSet::new(),
         &mut HashMap::new(),
         &ConsumerIteratorMetrics::new(&metrics_scope())
       )
@@ -452,11 +452,10 @@ fn current_batch_remaining_bytes_decrease_as_records_are_delivered() {
     ..Default::default()
   };
 
-  let active_assignment = HashSet::from([7]);
+  let mut active_partitions = HashMap::from([(7, ActivePartitionState::default())]);
   assert!(matches!(
     delivery_state.try_take_next(
-      &active_assignment,
-      &mut HashMap::new(),
+      &mut active_partitions,
       &ConsumerIteratorMetrics::new(&metrics_scope())
     ),
     Some(NextResult::Record(_))

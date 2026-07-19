@@ -1,4 +1,4 @@
-use crate::write::{WriteEngine, WriteEngineImpl};
+use crate::write::{DEFAULT_ZSTD_LEVEL, WriteEngine, WriteEngineImpl};
 use anyhow::{Context, Result, anyhow, ensure};
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
@@ -25,7 +25,12 @@ use blob_stream_proto::protos::blobstream::v1::config::{
   SegmentCompression,
   TopicConfig,
 };
-use blob_stream_types::{Compression, VirtualPartitionId};
+use blob_stream_types::{
+  Compression,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  DEFAULT_METADATA_WINDOW_SIZE_SECONDS,
+  VirtualPartitionId,
+};
 use hostname::get as get_hostname;
 use log::{debug, trace};
 use protobuf::EnumOrUnknown;
@@ -38,11 +43,8 @@ const DEFAULT_FLUSH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_FLUSH_MAX_DELAY_MS: i64 = 1_000;
 const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_RESERVATION_SIZE: u64 = 10_000;
-const DEFAULT_WINDOW_SIZE_SECONDS: i64 = 300;
 const DEFAULT_SEGMENT_TTL_BUFFER_SECONDS: u32 = 3_600;
 const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
-const DEFAULT_ZSTD_LEVEL: i32 = 3;
-const DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS: u64 = 30_000;
 const PRODUCE_REQUEST_TIMEOUT_FLUSH_DELAY_MULTIPLIER: u64 = 10;
 
 #[cfg(test)]
@@ -79,7 +81,7 @@ impl WriteConfig {
       flush_max_delay_ms: DEFAULT_FLUSH_MAX_DELAY_MS,
       lease_duration_ms: DEFAULT_LEASE_DURATION_MS,
       reservation_size: DEFAULT_RESERVATION_SIZE,
-      window_size_seconds: DEFAULT_WINDOW_SIZE_SECONDS,
+      window_size_seconds: DEFAULT_METADATA_WINDOW_SIZE_SECONDS,
       writer_id: 0,
       compression: Compression::zstd(DEFAULT_ZSTD_LEVEL),
       blob_prefix: None,

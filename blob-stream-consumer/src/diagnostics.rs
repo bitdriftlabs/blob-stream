@@ -303,7 +303,16 @@ impl ConsumerDiagnostics {
       let shared_state = self.shared_state.lock();
       (
         shared_state.diagnostics.clone(),
-        shared_state.pending_commits.clone(),
+        shared_state
+          .active_partitions
+          .iter()
+          .filter_map(|(partition_id, state)| {
+            state
+              .pending_commit
+              .as_ref()
+              .map(|commit| (*partition_id, commit.clone()))
+          })
+          .collect::<HashMap<_, _>>(),
         shared_state
           .delivery_state
           .batches

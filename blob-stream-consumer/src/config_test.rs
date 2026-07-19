@@ -14,6 +14,7 @@ use super::{
 use crate::config::ConsumerGroupConfig;
 use bd_runtime_config::loader::Loader;
 use bd_test_helpers::feature_flags::{DefaultFeatureFlags, FakeLoader};
+use blob_stream_types::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS as SHARED_PUBLICATION_LAG_MS;
 use std::sync::Arc;
 
 fn read_config() -> ConsumerReadConfig {
@@ -25,6 +26,10 @@ fn read_config() -> ConsumerReadConfig {
 #[test]
 fn read_defaults_derive_two_candidate_windows_and_two_second_idle_cap() {
   let read = read_config();
+  assert_eq!(
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    SHARED_PUBLICATION_LAG_MS
+  );
   assert_eq!(
     consumer_candidate_window_count(&read, DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS).unwrap(),
     2

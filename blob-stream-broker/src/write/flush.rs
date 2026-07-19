@@ -240,12 +240,14 @@ impl FlushContext {
     let remaining_budget = publication_budget
       .checked_sub(publication_started_at.elapsed())
       .ok_or_else(|| {
+        metrics.record_metadata_publication_latency(publication_started_at);
+        metrics.record_metadata_publication_deadline_exhausted_before_persistence();
         anyhow::anyhow!(
           "metadata publication exceeded {} ms before segment persistence",
           plan.max_metadata_publication_lag_ms
         )
       })?;
-    timeout(remaining_budget, async {
+    let persistence_result = timeout(remaining_budget, async {
       self
         .blob_store
         .put(&envelope.blob_key, payload)
@@ -259,8 +261,10 @@ impl FlushContext {
         .await
         .context("write segment metadata")
     })
-    .await
-    .map_err(|_| {
+    .await;
+    metrics.record_metadata_publication_latency(publication_started_at);
+    persistence_result.map_err(|_| {
+      metrics.record_metadata_publication_deadline_exhausted_while_persisting();
       anyhow::anyhow!(
         "metadata publication exceeded {} ms while persisting segment",
         plan.max_metadata_publication_lag_ms

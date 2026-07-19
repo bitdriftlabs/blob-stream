@@ -10,6 +10,7 @@ use super::{
   MAX_RECOVERY_WINDOWS_PER_SCAN,
   VirtualPartitionState,
   format_unix_timestamp_seconds,
+  metadata_availability_delay_seconds,
 };
 use crate::config::{
   ConsumerReadRuntimeSettings,
@@ -126,11 +127,52 @@ impl ReadCapacity {
 // BatchReadCandidate
 //
 
-/// One ordered, capacity-reserved blob range read.
+/// One ordered, capacity-reserved batch contained in a segment read plan.
 struct BatchReadCandidate {
-  metadata: SegmentMetadata,
   batch_metadata: BatchMetadata,
   virtual_partition_id: VirtualPartitionId,
+}
+
+//
+// SegmentReadPlan
+//
+
+/// One consolidated segment range read and the ordered batches it supplies.
+struct SegmentReadPlan {
+  metadata: SegmentMetadata,
+  candidates: Vec<BatchReadCandidate>,
+  byte_range: ByteRange,
+}
+
+impl SegmentReadPlan {
+  /// Create the smallest range containing every selected batch in this segment.
+  fn new(metadata: SegmentMetadata, candidates: Vec<BatchReadCandidate>) -> Result<Self> {
+    ensure!(
+      !candidates.is_empty(),
+      "segment read plan for {} has no batch candidates",
+      metadata.blob_key.as_str()
+    );
+
+    let mut start = u64::MAX;
+    let mut end = 0;
+    for candidate in &candidates {
+      let range = &candidate.batch_metadata.byte_range;
+      ensure!(
+        !range.is_empty(),
+        "segment {} has an empty batch range for partition {}",
+        metadata.blob_key.as_str(),
+        candidate.virtual_partition_id
+      );
+      start = start.min(range.start);
+      end = end.max(range.end);
+    }
+
+    Ok(Self {
+      metadata,
+      candidates,
+      byte_range: ByteRange { start, end },
+    })
+  }
 }
 
 impl ConsumerReaderImpl {
@@ -304,9 +346,12 @@ impl ConsumerReaderImpl {
 
     let mut next_fast_frontiers = self.fast_frontiers.clone();
     let mut blocked_fast_sources = HashSet::new();
+    // A deferred recovery window must hold back later windows for the same partition. Otherwise a
+    // later sequence could advance the cursor and make the deferred batch permanently ineligible.
+    let mut blocked_recovering_partitions = HashSet::new();
     let mut deferred_recovery_windows = HashSet::new();
     let mut deferred_fresh_partitions = HashSet::new();
-    let mut read_candidates = Vec::new();
+    let mut segment_read_plans = Vec::new();
     let mut capacity_exhausted = false;
     'windows: for (request, mut segments) in window_results {
       let window = request.window;
@@ -322,6 +367,7 @@ impl ConsumerReaderImpl {
       for segment in segments {
         // Restrict work to currently assigned virtual partitions only.
         let mut segment_has_assigned_batches = false;
+        let mut segment_read_candidates = Vec::new();
         for &partition_id in &assigned_partition_ids {
           let partition_state = self.virtual_partition_states.get(&partition_id);
           let partition_is_eligible = match partition_state {
@@ -347,6 +393,13 @@ impl ConsumerReaderImpl {
             | None => false,
           };
           if !partition_is_eligible {
+            continue;
+          }
+          if matches!(
+            partition_state,
+            Some(VirtualPartitionState::Recovering { .. })
+          ) && blocked_recovering_partitions.contains(&partition_id)
+          {
             continue;
           }
           let scan_state = scan_states
@@ -436,6 +489,7 @@ impl ConsumerReaderImpl {
               deferred_fresh_partitions.insert(partition_id);
             } else {
               deferred_recovery_windows.insert(window.window_start_unix_seconds);
+              blocked_recovering_partitions.insert(partition_id);
             }
             continue;
           }
@@ -503,14 +557,17 @@ impl ConsumerReaderImpl {
               scan_state.metadata_batches_deferred_by_capacity = scan_state
                 .metadata_batches_deferred_by_capacity
                 .saturating_add(1);
-              break 'windows;
+              break;
             }
 
-            read_candidates.push(BatchReadCandidate {
-              metadata: segment.clone(),
+            segment_read_candidates.push(BatchReadCandidate {
               batch_metadata: batch_metadata.clone(),
               virtual_partition_id: partition_id,
             });
+          }
+
+          if capacity_exhausted {
+            break;
           }
 
           if fast_partition {
@@ -526,26 +583,27 @@ impl ConsumerReaderImpl {
             .metadata_fast_scan_segments_without_assigned_batches
             .inc();
         }
+        if !segment_read_candidates.is_empty() {
+          segment_read_plans.push(SegmentReadPlan::new(segment, segment_read_candidates)?);
+        }
+        if capacity_exhausted {
+          break 'windows;
+        }
       }
     }
 
-    // `buffered` preserves candidate order while allowing independent object-store requests and
-    // decoding work to overlap. Cursor changes occur only after every planned read succeeds.
-    let decoded_batches = stream::iter(read_candidates.into_iter().map(|candidate| async {
-      let batch = self
-        .read_batch(
-          &candidate.metadata,
-          &candidate.batch_metadata,
-          candidate.virtual_partition_id,
-        )
-        .await?;
-      Ok::<_, Error>((candidate, batch))
-    }))
+    // `buffered` preserves segment-plan order while allowing independent object-store requests
+    // and decoding work to overlap. Cursor changes occur only after every planned read succeeds.
+    let decoded_batches = stream::iter(
+      segment_read_plans
+        .into_iter()
+        .map(|plan| async { self.read_segment_plan(plan).await }),
+    )
     .buffered(runtime_settings.max_in_flight_batch_reads)
     .try_collect::<Vec<_>>()
     .await?;
 
-    for (candidate, batch) in decoded_batches {
+    for (candidate, batch) in decoded_batches.into_iter().flatten() {
       let current_cursor = self
         .virtual_partition_states
         .get(&candidate.virtual_partition_id)
@@ -868,11 +926,10 @@ impl ConsumerReaderImpl {
     // This relies on the existing deployment assumption that broker and consumer clocks are
     // synchronized. Keep the two configured timing bounds together so a future skew margin has
     // one obvious place to join the safety calculation.
-    let safe_delay_ms = self
-      .maximum_metadata_publication_lag_ms
-      .saturating_add(consumer_metadata_visibility_delay_ms(&self.config));
-    let safe_delay_seconds = safe_delay_ms.saturating_add(999) / 1_000;
-    now_unix_seconds.saturating_sub(i64::try_from(safe_delay_seconds).unwrap_or(i64::MAX))
+    now_unix_seconds.saturating_sub(metadata_availability_delay_seconds(
+      &self.config,
+      self.maximum_metadata_publication_lag_ms,
+    ))
   }
 
   /// Return the lowest possible segment ID for a timestamp, preserving safety for invalid input.
@@ -905,6 +962,33 @@ impl ConsumerReaderImpl {
       })
       .collect();
     Ok(windows)
+  }
+
+  /// Return the least lower bound that can serve every recovering partition in one window.
+  fn recovery_scan_min_snowflake(&self, window_start_unix_seconds: i64) -> Option<SnowflakeId> {
+    let mut minimum = None;
+    for state in self
+      .virtual_partition_states
+      .values()
+      .filter(|state| state.is_assigned())
+    {
+      let VirtualPartitionState::Recovering { recovery_state, .. } = state else {
+        continue;
+      };
+      if recovery_state.next_window_start_unix_seconds > window_start_unix_seconds
+        || window_start_unix_seconds > recovery_state.cutover_window_start_unix_seconds
+      {
+        continue;
+      }
+      let min_snowflake = recovery_state.first_window_min_snowflake.filter(|_| {
+        recovery_state.first_window_start_unix_seconds == Some(window_start_unix_seconds)
+          && recovery_state.next_window_start_unix_seconds == window_start_unix_seconds
+      })?;
+      minimum = Some(minimum.map_or(min_snowflake, |current: SnowflakeId| {
+        current.min(min_snowflake)
+      }));
+    }
+    minimum
   }
 
   /// Build a scan pass that prioritizes bounded recovery before using the fast path.
@@ -962,7 +1046,7 @@ impl ConsumerReaderImpl {
           &mut scan_requests,
           self.config.topic.as_str(),
           window_start,
-          None,
+          self.recovery_scan_min_snowflake(window_start),
           true,
           ScanEligibility {
             recovering: true,
@@ -1044,42 +1128,90 @@ impl ConsumerReaderImpl {
     Ok(())
   }
 
-  /// Fetch, decompress, validate, and decode the byte range referenced by one segment batch.
-  pub(super) async fn read_batch(
+  /// Fetch one segment range and decode all of its selected batches in planning order.
+  async fn read_segment_plan(
+    &self,
+    plan: SegmentReadPlan,
+  ) -> Result<Vec<(BatchReadCandidate, ConsumerBatch)>> {
+    trace!(
+      "consumer read segment range start: topic={}, blob_key={}, start={}, end={}, batches={}",
+      self.config.topic,
+      plan.metadata.blob_key.as_str(),
+      plan.byte_range.start,
+      plan.byte_range.end,
+      plan.candidates.len()
+    );
+
+    let blob_read_started_at = Instant::now();
+    let payload = self
+      .blob_store
+      .get_range(&plan.metadata.blob_key, plan.byte_range.clone())
+      .await?;
+    self
+      .metrics
+      .record_blob_range(blob_read_started_at, payload.len());
+    let selected_bytes = plan.candidates.iter().fold(0_u64, |total, candidate| {
+      total.saturating_add(candidate.batch_metadata.byte_range.len())
+    });
+    self
+      .metrics
+      .record_blob_batch_ranges(plan.candidates.len(), selected_bytes);
+
+    let mut decoded_batches = Vec::with_capacity(plan.candidates.len());
+    for candidate in plan.candidates {
+      let batch_range = &candidate.batch_metadata.byte_range;
+      let start = batch_range
+        .start
+        .checked_sub(plan.byte_range.start)
+        .ok_or_else(|| anyhow!("batch range starts before its segment read range"))?;
+      let end = batch_range
+        .end
+        .checked_sub(plan.byte_range.start)
+        .ok_or_else(|| anyhow!("batch range ends before its segment read range"))?;
+      let start =
+        usize::try_from(start).map_err(|_| anyhow!("batch range start does not fit in memory"))?;
+      let end =
+        usize::try_from(end).map_err(|_| anyhow!("batch range end does not fit in memory"))?;
+      ensure!(
+        start < end && end <= payload.len(),
+        "batch range is outside fetched segment range: start={start}, end={end}, fetched_bytes={}",
+        payload.len()
+      );
+      let batch_payload = payload.slice(start .. end);
+      let batch = self.decode_batch(
+        &plan.metadata,
+        &candidate.batch_metadata,
+        candidate.virtual_partition_id,
+        batch_payload.as_ref(),
+      )?;
+      decoded_batches.push((candidate, batch));
+    }
+
+    Ok(decoded_batches)
+  }
+
+  /// Decompress, validate, and decode one batch payload supplied by a segment range read.
+  fn decode_batch(
     &self,
     metadata: &SegmentMetadata,
     batch_metadata: &BatchMetadata,
     virtual_partition_id: VirtualPartitionId,
+    payload: &[u8],
   ) -> Result<ConsumerBatch> {
     trace!(
-      "consumer read batch start: topic={}, partition={}, blob_key={}, seq_start={}, seq_end={}",
+      "consumer decode batch: topic={}, partition={}, blob_key={}, seq_start={}, seq_end={}",
       self.config.topic,
       virtual_partition_id,
       metadata.blob_key.as_str(),
       batch_metadata.seq_range.start,
       batch_metadata.seq_range.end
     );
-    // Pull only the referenced byte range for this batch to avoid downloading full segments.
-    let blob_read_started_at = Instant::now();
-    let payload = self
-      .blob_store
-      .get_range(
-        &metadata.blob_key,
-        ByteRange {
-          start: batch_metadata.byte_range.start,
-          end: batch_metadata.byte_range.end,
-        },
-      )
-      .await?;
-    self
-      .metrics
-      .record_blob_range(blob_read_started_at, payload.len());
 
     // Decode in two stages: transport/storage compression first, then logical RecordBatch format.
     let decompression_started_at = Instant::now();
     let decoded: Cow<'_, [u8]> = match batch_metadata.compression.codec {
-      CompressionCodec::None => Cow::Borrowed(payload.as_ref()),
-      CompressionCodec::Zstd => zstd::stream::decode_all(Cursor::new(payload.as_ref()))
+      CompressionCodec::None => Cow::Borrowed(payload),
+      CompressionCodec::Zstd => zstd::stream::decode_all(Cursor::new(payload))
         .map(Cow::Owned)
         .map_err(|error| anyhow!("failed to decode zstd batch: {error}"))?,
     };
