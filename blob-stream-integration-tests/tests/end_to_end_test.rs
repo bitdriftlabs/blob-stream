@@ -10,8 +10,10 @@ use blob_stream_consumer::{
   ConsumerReadConfig,
   ConsumerReaderImpl,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  HeartbeatReport,
   MembershipCoordinationSource,
   NextResult,
+  RevokedPartitions,
 };
 use blob_stream_integration_tests::test_framework::{self as framework, TestConsumerReader};
 use blob_stream_metadata_store::{
@@ -33,6 +35,7 @@ use blob_stream_types::{
   SeqRange,
   SnowflakeId,
   TopicWindowKey,
+  VirtualPartitionId,
   Window,
   logical_partition_for_key,
   new_record,
@@ -207,7 +210,7 @@ enum ConsumerTaskEvent {
 }
 
 async fn run_consumer_task(
-  mut consumer: Box<ConsumerIteratorImpl>,
+  mut consumer: Box<dyn ConsumerIterator>,
   mut stop_rx: watch::Receiver<bool>,
   event_tx: mpsc::UnboundedSender<ConsumerTaskEvent>,
 ) -> Result<()> {
@@ -232,11 +235,28 @@ async fn run_consumer_task(
         match next_result {
           NextResult::Revoked(revoked) => {
             let (ack_tx, ack_rx) = oneshot::channel();
-            let _ = event_tx.send(ConsumerTaskEvent::Revoked { ack: ack_tx });
-            if ack_rx.await.is_err() {
+            if event_tx.send(ConsumerTaskEvent::Revoked { ack: ack_tx }).is_err() {
+              revoked.complete().await;
               break;
             }
+
+            let acknowledged = {
+              tokio::pin!(ack_rx);
+              loop {
+                tokio::select! {
+                  result = &mut ack_rx => break result.is_ok(),
+                  changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                      break false;
+                    }
+                  }
+                }
+              }
+            };
             revoked.complete().await;
+            if !acknowledged {
+              break;
+            }
           },
           NextResult::Record(record) => {
             let id = String::from_utf8(record.record.payload.to_vec())
@@ -252,6 +272,101 @@ async fn run_consumer_task(
   }
 
   let _ = consumer.shutdown().await;
+  Ok(())
+}
+
+//
+// StopAwareRevocationTestConsumer
+//
+
+struct StopAwareRevocationTestConsumer {
+  revocation_completed: Arc<AtomicBool>,
+  sent_revocation: bool,
+}
+
+struct StopAwareRevokedPartitions {
+  revocation_completed: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl RevokedPartitions for StopAwareRevokedPartitions {
+  fn partitions(&self) -> Vec<VirtualPartitionId> {
+    vec![0]
+  }
+
+  async fn complete(self: Box<Self>) {
+    self.revocation_completed.store(true, Ordering::Release);
+  }
+}
+
+#[async_trait::async_trait]
+impl ConsumerIterator for StopAwareRevocationTestConsumer {
+  fn start(&mut self) -> Result<()> {
+    Ok(())
+  }
+
+  async fn next(&mut self) -> Result<NextResult> {
+    if self.sent_revocation {
+      std::future::pending().await
+    } else {
+      self.sent_revocation = true;
+      Ok(NextResult::Revoked(Box::new(StopAwareRevokedPartitions {
+        revocation_completed: Arc::clone(&self.revocation_completed),
+      })))
+    }
+  }
+
+  fn store_offset(
+    &mut self,
+    _virtual_partition_id: VirtualPartitionId,
+    _offset: u64,
+  ) -> Result<()> {
+    Ok(())
+  }
+
+  async fn commit(&mut self) -> Result<HeartbeatReport> {
+    unreachable!("revocation-only test consumer does not commit records")
+  }
+
+  async fn shutdown(self: Box<Self>) -> Result<()> {
+    Ok(())
+  }
+
+  async fn seek(&mut self, _virtual_partition_id: VirtualPartitionId, _offset: u64) -> Result<()> {
+    Ok(())
+  }
+}
+
+#[tokio::test]
+async fn consumer_task_stops_while_waiting_for_revocation_ack() -> Result<()> {
+  let revocation_completed = Arc::new(AtomicBool::new(false));
+  let consumer = Box::new(StopAwareRevocationTestConsumer {
+    revocation_completed: Arc::clone(&revocation_completed),
+    sent_revocation: false,
+  });
+  let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+  let (stop_tx, stop_rx) = watch::channel(false);
+  let task = tokio::spawn(run_consumer_task(consumer, stop_rx, event_tx));
+
+  let event = timeout(Duration::from_secs(1), event_rx.recv())
+    .await
+    .map_err(|_| anyhow!("consumer task did not request revocation acknowledgement"))?
+    .ok_or_else(|| anyhow!("consumer task stopped before requesting revocation acknowledgement"))?;
+  let ConsumerTaskEvent::Revoked { ack } = event else {
+    return Err(anyhow!(
+      "consumer task emitted a batch instead of a revocation"
+    ));
+  };
+
+  stop_tx
+    .send(true)
+    .map_err(|_| anyhow!("consumer task stopped before receiving stop signal"))?;
+  timeout(Duration::from_secs(1), task)
+    .await
+    .map_err(|_| anyhow!("consumer task did not stop while revocation acknowledgement was held"))?
+    .map_err(|error| anyhow!("consumer task join error: {error}"))??;
+  assert!(revocation_completed.load(Ordering::Acquire));
+  drop(ack);
   Ok(())
 }
 
