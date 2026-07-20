@@ -367,9 +367,22 @@ async fn visibility_delay_defers_newly_published_metadata() {
   .unwrap();
 
   assert!(reader.read_available(902).await.unwrap().is_empty());
+  let scan_state = reader.partition_scan_states();
+  assert_eq!(scan_state.len(), 1);
+  assert_eq!(scan_state[0].virtual_partition_id, 7);
+  assert_eq!(scan_state[0].cursor_before, None);
+  assert_eq!(scan_state[0].cursor_after, None);
+  assert_eq!(scan_state[0].metadata_segments_seen, 1);
+  assert_eq!(scan_state[0].metadata_segments_deferred_by_visibility, 1);
+  assert_eq!(scan_state[0].batches_accepted, 0);
   let batches = reader.read_available(903).await.unwrap();
   assert_eq!(batches.len(), 1);
   assert_eq!(batches[0].seq_range, SeqRange { start: 1, end: 1 });
+  let scan_state = reader.partition_scan_states();
+  assert_eq!(scan_state[0].cursor_before, None);
+  assert_eq!(scan_state[0].cursor_after, Some(1));
+  assert_eq!(scan_state[0].batches_accepted, 1);
+  assert_eq!(scan_state[0].records_accepted, 1);
 }
 
 #[tokio::test]

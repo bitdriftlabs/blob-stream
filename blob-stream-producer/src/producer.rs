@@ -223,7 +223,6 @@ impl ProducerRetryDiagnostics {
 
 #[derive(Debug, Serialize)]
 pub struct ProducerStateSnapshot {
-  pub schema_version: u32,
   pub generated_at: String,
   pub writer_id: u32,
   pub max_batch_records: u32,
@@ -395,7 +394,6 @@ impl ProducerDiagnostics {
     });
 
     ProducerStateSnapshot {
-      schema_version: 3,
       generated_at,
       writer_id,
       max_batch_records: producer_max_batch_records(&self.config),

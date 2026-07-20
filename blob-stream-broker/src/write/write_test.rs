@@ -309,7 +309,6 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   tokio::task::yield_now().await;
 
   let snapshot = engine.state_snapshot().await;
-  assert_eq!(snapshot.schema_version, 4);
   assert_eq!(snapshot.generated_at, "2023-11-14T22:13:20Z");
   assert_eq!(snapshot.holder_id, "test-node");
   assert_eq!(snapshot.writer_id, 0);

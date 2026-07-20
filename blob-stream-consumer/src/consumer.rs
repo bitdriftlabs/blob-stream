@@ -114,6 +114,70 @@ pub struct ConsumerBatch {
 }
 
 //
+// ConsumerReaderPartitionScanState
+//
+
+/// Most recent successful metadata-scan outcome for one assigned virtual partition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerReaderPartitionScanState {
+  pub virtual_partition_id: VirtualPartitionId,
+  pub scanned_window_starts: Arc<[i64]>,
+  pub fast_frontiers: Vec<ConsumerReaderFastFrontierState>,
+  pub completed_at_unix_seconds: i64,
+  pub cursor_before: Option<u64>,
+  pub cursor_after: Option<u64>,
+  pub metadata_segments_seen: usize,
+  pub metadata_segments_without_partition_batches: usize,
+  pub metadata_batches_seen: usize,
+  pub metadata_batches_skipped_by_cursor: usize,
+  pub metadata_segments_skipped_by_frontier: usize,
+  pub metadata_segments_deferred_by_visibility: usize,
+  pub metadata_segments_blocked_by_visibility: usize,
+  pub metadata_batches_deferred_by_capacity: usize,
+  pub batches_accepted: usize,
+  pub records_accepted: usize,
+}
+
+//
+// ConsumerReaderFastFrontierState
+//
+
+/// Inclusive metadata frontier retained for one virtual-partition/window pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsumerReaderFastFrontierState {
+  pub window_start_unix_seconds: i64,
+  pub snowflake_id: SnowflakeId,
+}
+
+impl ConsumerReaderPartitionScanState {
+  pub(super) fn new(
+    virtual_partition_id: VirtualPartitionId,
+    scanned_window_starts: Arc<[i64]>,
+    completed_at_unix_seconds: i64,
+    cursor_before: Option<u64>,
+  ) -> Self {
+    Self {
+      virtual_partition_id,
+      scanned_window_starts,
+      fast_frontiers: Vec::new(),
+      completed_at_unix_seconds,
+      cursor_before,
+      cursor_after: cursor_before,
+      metadata_segments_seen: 0,
+      metadata_segments_without_partition_batches: 0,
+      metadata_batches_seen: 0,
+      metadata_batches_skipped_by_cursor: 0,
+      metadata_segments_skipped_by_frontier: 0,
+      metadata_segments_deferred_by_visibility: 0,
+      metadata_segments_blocked_by_visibility: 0,
+      metadata_batches_deferred_by_capacity: 0,
+      batches_accepted: 0,
+      records_accepted: 0,
+    }
+  }
+}
+
+//
 // ConsumerReaderMetrics
 //
 
@@ -338,7 +402,10 @@ impl ConsumerReaderImpl {
       .map(|(partition_id, cursor)| {
         (
           partition_id,
-          VirtualPartitionState::PendingCursor { cursor },
+          VirtualPartitionState::PendingCursor {
+            cursor,
+            last_scan: None,
+          },
         )
       })
       .collect::<HashMap<_, _>>();
@@ -346,7 +413,13 @@ impl ConsumerReaderImpl {
       let cursor = virtual_partition_states
         .remove(&partition_id)
         .and_then(|state| state.cursor());
-      virtual_partition_states.insert(partition_id, VirtualPartitionState::Fast { cursor });
+      virtual_partition_states.insert(
+        partition_id,
+        VirtualPartitionState::Fast {
+          cursor,
+          last_scan: None,
+        },
+      );
     }
 
     Ok(Self {
@@ -432,7 +505,10 @@ impl ConsumerReaderImpl {
       .virtual_partition_states
       .entry(virtual_partition_id)
       .and_modify(|state| state.set_cursor(seq_end))
-      .or_insert(VirtualPartitionState::PendingFast { cursor: seq_end });
+      .or_insert(VirtualPartitionState::PendingFast {
+        cursor: seq_end,
+        last_scan: None,
+      });
     self
       .fast_frontiers
       .retain(|(partition_id, _), _| *partition_id != virtual_partition_id);
@@ -462,6 +538,7 @@ impl ConsumerReaderImpl {
         VirtualPartitionState::PendingRecovering {
           cursor: seq_end,
           recovery_state,
+          last_scan: None,
         },
       );
     }
@@ -502,6 +579,10 @@ impl ConsumerReaderImpl {
       .map_or(committed_cursor.seq_end, |cursor| {
         cursor.max(committed_cursor.seq_end)
       });
+    let last_scan = self
+      .virtual_partition_states
+      .get(&virtual_partition_id)
+      .and_then(VirtualPartitionState::last_scan_handle);
     if let Some(state) = self.virtual_partition_states.get_mut(&virtual_partition_id)
       && !matches!(state, VirtualPartitionState::PendingCursor { .. })
     {
@@ -517,6 +598,7 @@ impl ConsumerReaderImpl {
             next_window_start_unix_seconds: source_window_start_unix_seconds,
             cutover_window_start_unix_seconds,
           },
+          last_scan,
         },
       );
       info!(
@@ -533,6 +615,7 @@ impl ConsumerReaderImpl {
         virtual_partition_id,
         VirtualPartitionState::PendingFast {
           cursor: hydrated_cursor,
+          last_scan,
         },
       );
       info!(
@@ -559,6 +642,16 @@ impl ConsumerReaderImpl {
             mode,
           })
       })
+      .collect::<Vec<_>>();
+    states.sort_by_key(|state| state.virtual_partition_id);
+    states
+  }
+
+  pub(super) fn partition_scan_states(&self) -> Vec<&ConsumerReaderPartitionScanState> {
+    let mut states = self
+      .virtual_partition_states
+      .values()
+      .filter_map(VirtualPartitionState::last_scan)
       .collect::<Vec<_>>();
     states.sort_by_key(|state| state.virtual_partition_id);
     states
