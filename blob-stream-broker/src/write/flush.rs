@@ -31,6 +31,10 @@ use std::time::Instant;
 use time::OffsetDateTime;
 use tokio::time::{Duration, timeout};
 
+#[cfg(test)]
+#[path = "./flush_test.rs"]
+mod tests;
+
 //
 // SnowflakeGenerator
 //
@@ -42,7 +46,17 @@ pub(super) struct SnowflakeGenerator {
 use bd_time::TimeProvider;
 impl SnowflakeGenerator {
   pub(super) fn new() -> Result<Self> {
-    let generator = Sonyflake::new().context("initialize sonyflake generator")?;
+    let generator = Sonyflake::builder()
+      .finalize()
+      .context("initialize sonyflake generator")?;
+    Ok(Self { generator })
+  }
+
+  pub(super) fn with_machine_id(machine_id: u16) -> Result<Self> {
+    let generator = Sonyflake::builder()
+      .machine_id(&|| Ok(machine_id))
+      .finalize()
+      .context("initialize sonyflake generator")?;
     Ok(Self { generator })
   }
 

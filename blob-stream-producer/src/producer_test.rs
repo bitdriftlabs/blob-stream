@@ -1,10 +1,13 @@
 #![allow(clippy::unwrap_used)]
 
 use super::{
+  BrokerTransport,
+  GrpcBrokerTransport,
   ProducerClient,
   ProducerClientImpl,
   ProducerError,
   ProducerRecord,
+  ProducerRetryReason,
   broker_assignment,
   compute_virtual_partition_id,
   retry_delay_ms,
@@ -21,7 +24,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceStatus,
 };
 use blob_stream_types::VirtualPartitionId;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore, mpsc, watch};
@@ -141,6 +144,37 @@ fn default_config() -> ProducerConfig {
   config.max_request_concurrency = Some(16);
   config.compression = Some(ProducerCompression::PRODUCER_COMPRESSION_SNAPPY.into());
   config
+}
+
+#[test]
+fn grpc_transport_reuses_client_for_broker_address() {
+  let transport = GrpcBrokerTransport::new(default_config());
+
+  let first = transport.client_for_address("127.0.0.1:8080").unwrap();
+  let second = transport.client_for_address("127.0.0.1:8080").unwrap();
+  let other = transport.client_for_address("127.0.0.1:8081").unwrap();
+
+  assert!(Arc::ptr_eq(&first, &second));
+  assert!(!Arc::ptr_eq(&first, &other));
+}
+
+#[test]
+fn grpc_transport_trait_dispatch_evicts_clients_for_removed_brokers() {
+  let concrete_transport = Arc::new(GrpcBrokerTransport::new(default_config()));
+  let removed = concrete_transport.client_for_address("a:8080").unwrap();
+  let retained = concrete_transport.client_for_address("b:8080").unwrap();
+  let transport: Arc<dyn BrokerTransport> = concrete_transport.clone();
+
+  transport.reconcile_membership(&BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-b".to_string(),
+    address: "b:8080".to_string(),
+  }]));
+
+  let retained_after_reconcile = concrete_transport.client_for_address("b:8080").unwrap();
+  let recreated = concrete_transport.client_for_address("a:8080").unwrap();
+
+  assert!(Arc::ptr_eq(&retained, &retained_after_reconcile));
+  assert!(!Arc::ptr_eq(&removed, &recreated));
 }
 
 fn membership() -> BrokerMembership {
@@ -385,6 +419,28 @@ async fn retries_transient_status_until_success() {
 
   assert_eq!(ack.attempts, 3);
   assert_eq!(transport.sent.lock().await.len(), 3);
+  let retry_summary = producer
+    .diagnostics()
+    .expect("producer implementation provides diagnostics")
+    .retry_summary();
+  assert_eq!(
+    retry_summary.reason_counts,
+    BTreeMap::from([
+      (ProducerRetryReason::NotLeaseHolder, 1),
+      (ProducerRetryReason::Overloaded, 1),
+    ])
+  );
+  assert_eq!(retry_summary.samples.len(), 2);
+  assert_eq!(
+    retry_summary.samples[0].reason,
+    ProducerRetryReason::NotLeaseHolder
+  );
+  assert_eq!(retry_summary.samples[0].detail, "lease moved");
+  assert_eq!(
+    retry_summary.samples[1].reason,
+    ProducerRetryReason::Overloaded
+  );
+  assert_eq!(retry_summary.samples[1].detail, "busy");
 }
 
 #[tokio::test]

@@ -350,6 +350,7 @@ struct ConsumerDriver {
   assignment_callback: Arc<Mutex<Option<AssignmentCallback>>>,
   pending_assignment: Option<Vec<VirtualPartitionId>>,
   pending_revocation_completion: Option<oneshot::Receiver<()>>,
+  pending_revocation_partitions: Option<Vec<VirtualPartitionId>>,
   revocation_notify: Arc<Notify>,
   next_heartbeat_at_ms: i64,
   next_rebalance_at_ms: i64,
@@ -390,6 +391,14 @@ pub struct ConsumerIteratorImpl {
   command_tx: Option<mpsc::UnboundedSender<ConsumerDriverCommand>>,
   driver: Option<ConsumerDriver>,
   driver_task: Option<JoinHandle<()>>,
+  #[cfg(test)]
+  next_after_delivery_state_check_hook: Option<NextAfterDeliveryStateCheckHook>,
+}
+
+#[cfg(test)]
+struct NextAfterDeliveryStateCheckHook {
+  state_checked: oneshot::Sender<()>,
+  release: oneshot::Receiver<()>,
 }
 
 impl ConsumerIteratorImpl {
@@ -481,6 +490,7 @@ impl ConsumerIteratorImpl {
       assignment_callback: Arc::clone(&assignment_callback),
       pending_assignment: None,
       pending_revocation_completion: None,
+      pending_revocation_partitions: None,
       revocation_notify,
       next_heartbeat_at_ms: now_ts_ms,
       next_rebalance_at_ms: now_ts_ms,
@@ -532,7 +542,21 @@ impl ConsumerIteratorImpl {
       command_tx: None,
       driver: Some(driver),
       driver_task: None,
+      #[cfg(test)]
+      next_after_delivery_state_check_hook: None,
     })
+  }
+
+  #[cfg(test)]
+  fn set_next_after_delivery_state_check_hook(
+    &mut self,
+    state_checked: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+  ) {
+    self.next_after_delivery_state_check_hook = Some(NextAfterDeliveryStateCheckHook {
+      state_checked,
+      release,
+    });
   }
 }
 
@@ -792,13 +816,21 @@ impl ConsumerDriver {
     diagnostics.prefetch_worker_running = self.prefetch_task.is_some();
   }
 
-  fn finish_pending_revocation_if_completed(&mut self) -> Result<bool> {
+  async fn finish_pending_revocation_if_completed(&mut self) -> Result<bool> {
     let Some(recv) = self.pending_revocation_completion.as_mut() else {
       return Ok(true);
     };
 
     match recv.try_recv() {
       Ok(()) | Err(oneshot::error::TryRecvError::Closed) => {
+        let revoked = self
+          .pending_revocation_partitions
+          .take()
+          .unwrap_or_default();
+        self
+          .coordinator
+          .release_partitions(&revoked, now_unix_millis())
+          .await?;
         let assignment = self.pending_assignment.take().unwrap_or_default();
         self.pending_revocation_completion = None;
         self.apply_assignment(&assignment)?;
@@ -879,6 +911,7 @@ impl ConsumerDriver {
 
     self.pending_assignment = Some(next_assignment);
     self.pending_revocation_completion = Some(completion_rx);
+    self.pending_revocation_partitions = Some(revoked.clone());
     self.refresh_diagnostics();
     self.delivery_notify.notify_waiters();
 
@@ -1161,7 +1194,7 @@ impl ConsumerDriver {
     }
 
     loop {
-      let revocation_completed = match self.finish_pending_revocation_if_completed() {
+      let revocation_completed = match self.finish_pending_revocation_if_completed().await {
         Ok(completed) => completed,
         Err(error) => {
           self.shared_state.lock().terminal_error = Some(error.to_string());
@@ -1393,6 +1426,8 @@ impl ConsumerIterator for ConsumerIteratorImpl {
 
     loop {
       let notified = self.delivery_notify.notified();
+      tokio::pin!(notified);
+      notified.as_mut().enable();
       let (next_result, terminal_error) = {
         let mut shared_state = self.shared_state.lock();
         let pending_bytes = shared_state.diagnostics.prefetch_pending_bytes;
@@ -1409,6 +1444,11 @@ impl ConsumerIterator for ConsumerIteratorImpl {
         update_total_prefetch_bytes(&self.metrics, delivery_state, pending_bytes);
         (next_result, terminal_error.clone())
       };
+      #[cfg(test)]
+      if let Some(hook) = self.next_after_delivery_state_check_hook.take() {
+        let _ = hook.state_checked.send(());
+        let _ = hook.release.await;
+      }
       if let Some(next_result) = next_result {
         self.prefetch_space_notify.notify_waiters();
         return Ok(next_result);

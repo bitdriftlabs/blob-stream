@@ -73,6 +73,11 @@ that broker returns `NOT_LEASE_HOLDER`, and the producer retries with exponentia
 its current membership view. An empty local membership has no producer route; it never falls back
 to a different writer/AZ.
 
+The producer keeps gRPC clients keyed by broker address so normal batches reuse an HTTP/2
+connection. Whenever discovery removes an address, it drops that address's cached client
+reference immediately. In-flight requests retain their own reference and can finish normally;
+the producer does not force-close an active connection.
+
 Broker discovery distinguishes a pending initial watch value from an initialized membership
 snapshot. A broker starts its listener while discovery is pending so Kubernetes can mark the pod
 ready and include it in Endpoints, but it performs no lease acquisition, renewal, release, or
@@ -170,6 +175,10 @@ invariant.
 7. Only after both blob upload and metadata write succeed does the broker complete the waiting
    write and return `OK`. A producer acknowledgement therefore represents durable segment
    metadata, not merely in-memory buffering.
+
+Segment IDs use Sonyflake's default machine-ID provider in production. The local in-process test
+cluster supplies stable, distinct machine IDs because every broker runs on the same host; this is
+test-harness wiring only and does not change production identity selection.
 
 The gRPC response has only `status` and `error_message`; it does not return sequence ranges.
 Sequence ranges are internal durable metadata used by consumers. The protocol statuses are:

@@ -66,9 +66,12 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use protobuf::Message;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll, Waker};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep, timeout};
 
 struct MutableCoordinationSource {
@@ -1041,6 +1044,162 @@ async fn next_returns_revocation_until_completed() {
     timeout(Duration::from_millis(50), iterator.next())
       .await
       .is_err()
+  );
+
+  revoked.complete().await;
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn next_does_not_lose_notification_between_state_check_and_wait() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![0],
+  }));
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .await
+  .unwrap();
+  iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[0]).await;
+
+  let (state_checked_tx, state_checked_rx) = oneshot::channel();
+  let (release_tx, release_rx) = oneshot::channel();
+  iterator.set_next_after_delivery_state_check_hook(state_checked_tx, release_rx);
+  let shared_state = Arc::clone(&iterator.shared_state);
+  let delivery_notify = Arc::clone(&iterator.delivery_notify);
+  let mut next = Box::pin(iterator.next());
+  let waker = Waker::noop();
+  let mut context = Context::from_waker(waker);
+  assert!(matches!(next.as_mut().poll(&mut context), Poll::Pending));
+  state_checked_rx.await.unwrap();
+  shared_state.lock().terminal_error = Some("injected test terminal error".to_string());
+  delivery_notify.notify_waiters();
+  release_tx.send(()).unwrap();
+
+  let Err(error) = timeout(Duration::from_secs(1), next.as_mut())
+    .await
+    .unwrap()
+  else {
+    panic!("expected the injected terminal error");
+  };
+  assert!(error.to_string().contains("injected test terminal error"));
+  drop(next);
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn commit_during_revocation_persists_revoked_partition_cursor() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let concrete_lease_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> = concrete_lease_store.clone();
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let now_window = (SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap()
+    .as_secs()
+    .try_into()
+    .unwrap_or(i64::MAX)
+    / 300)
+    * 300;
+  for virtual_partition_id in [0, 1] {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      now_window,
+      u64::from(virtual_partition_id) + 1,
+      virtual_partition_id,
+      SeqRange { start: 1, end: 1 },
+      vec![new_record(
+        vec![u8::try_from(virtual_partition_id).unwrap()],
+        now_window * 1_000,
+      )],
+    )
+    .await;
+  }
+
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![0, 1],
+  }));
+  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source.clone(),
+    metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[0, 1]).await;
+  for _ in 0 .. 2 {
+    let next = timeout(Duration::from_secs(1), iterator.next())
+      .await
+      .unwrap()
+      .unwrap();
+    let record = match next {
+      NextResult::Record(record) => record,
+      NextResult::Revoked(_) => panic!("expected record before revocation"),
+    };
+    iterator
+      .store_offset(record.virtual_partition_id, record.offset)
+      .unwrap();
+  }
+
+  source.update(CoordinationSnapshot {
+    members: vec!["member-a".to_string(), "member-b".to_string()],
+    virtual_partitions: vec![0, 1],
+  });
+  let revoked = timeout(Duration::from_secs(1), async {
+    loop {
+      let next = iterator.next().await.unwrap();
+      if let NextResult::Revoked(revoked) = next {
+        return revoked;
+      }
+    }
+  })
+  .await
+  .unwrap();
+  let revoked_partition_id = revoked.partitions()[0];
+
+  iterator.commit().await.unwrap();
+  let lease = concrete_lease_store
+    .list_group_leases("telemetry", "group-a")
+    .await
+    .unwrap()
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == revoked_partition_id)
+    .unwrap();
+  assert_eq!(
+    lease.committed_cursor.map(|cursor| cursor.seq_end),
+    Some(1),
+    "commit before revocation completion must persist the revoked partition cursor"
   );
 
   revoked.complete().await;

@@ -46,11 +46,12 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 use blob_stream_types::{VirtualPartitionId, format_unix_timestamp_ms, virtual_partition_for_key};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use hyper_util::client::legacy::connect::HttpConnector;
 use log::{debug, trace};
 use parking_lot::Mutex;
 use prometheus::{Histogram, IntCounter};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -59,6 +60,8 @@ use time::ext::NumericalDuration;
 use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval};
+
+type HttpGrpcClient = GrpcClient<HttpConnector>;
 
 // TODO(mattklein123): Consider adding disk buffering of segments.
 
@@ -143,6 +146,78 @@ pub struct ProducerAck {
 }
 
 //
+// ProducerRetryReason
+//
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ProducerRetryReason {
+  TransportError,
+  NotLeaseHolder,
+  Overloaded,
+}
+
+//
+// ProducerRetrySample
+//
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProducerRetrySample {
+  pub reason: ProducerRetryReason,
+  pub topic: String,
+  pub virtual_partition_id: VirtualPartitionId,
+  pub attempt: u32,
+  pub detail: String,
+}
+
+//
+// ProducerRetrySummary
+//
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProducerRetrySummary {
+  pub reason_counts: BTreeMap<ProducerRetryReason, u64>,
+  pub samples: Vec<ProducerRetrySample>,
+}
+
+//
+// ProducerRetryDiagnostics
+//
+
+#[derive(Clone, Default)]
+struct ProducerRetryDiagnostics {
+  summary: Arc<Mutex<ProducerRetrySummary>>,
+}
+
+impl ProducerRetryDiagnostics {
+  fn record(
+    &self,
+    reason: ProducerRetryReason,
+    topic: &str,
+    virtual_partition_id: VirtualPartitionId,
+    attempt: u32,
+    detail: String,
+  ) {
+    const MAX_SAMPLES: usize = 20;
+
+    let mut summary = self.summary.lock();
+    *summary.reason_counts.entry(reason).or_default() += 1;
+    if summary.samples.len() < MAX_SAMPLES {
+      summary.samples.push(ProducerRetrySample {
+        reason,
+        topic: topic.to_string(),
+        virtual_partition_id,
+        attempt,
+        detail,
+      });
+    }
+  }
+
+  fn summary(&self) -> ProducerRetrySummary {
+    self.summary.lock().clone()
+  }
+}
+
+//
 // ProducerStateSnapshot
 //
 
@@ -219,9 +294,15 @@ pub struct ProducerDiagnostics {
   topics: HashMap<String, ProducerTopicConfig>,
   membership_rx: watch::Receiver<BrokerMembership>,
   state: Arc<Mutex<ProducerState>>,
+  retry_diagnostics: ProducerRetryDiagnostics,
 }
 
 impl ProducerDiagnostics {
+  #[must_use]
+  pub fn retry_summary(&self) -> ProducerRetrySummary {
+    self.retry_diagnostics.summary()
+  }
+
   #[must_use]
   pub fn state_snapshot(&self) -> ProducerStateSnapshot {
     let generated_at_ts_ms = time::OffsetDateTime::now_utc().unix_timestamp() * 1_000;
@@ -381,6 +462,11 @@ pub trait BrokerTransport: Send + Sync {
     broker_address: &str,
     request: ProduceBatchRequest,
   ) -> Result<ProduceBatchResponse>;
+
+  /// Retire any transport resources for brokers absent from the current discovery snapshot.
+  fn reconcile_membership(&self, membership: &BrokerMembership) {
+    let _ = membership;
+  }
 }
 
 //
@@ -390,13 +476,52 @@ pub trait BrokerTransport: Send + Sync {
 /// Default gRPC transport implementation used by `ProducerClientImpl`.
 pub struct GrpcBrokerTransport {
   config: ProducerConfig,
+  clients: Mutex<HashMap<String, Arc<HttpGrpcClient>>>,
 }
 
 impl GrpcBrokerTransport {
   /// Create a transport from producer configuration.
   #[must_use]
   pub fn new(config: ProducerConfig) -> Self {
-    Self { config }
+    Self {
+      config,
+      clients: Mutex::new(HashMap::new()),
+    }
+  }
+
+  fn client_for_address(&self, broker_address: &str) -> Result<Arc<HttpGrpcClient>> {
+    let mut clients = self.clients.lock();
+    if let Some(client) = clients.get(broker_address) {
+      return Ok(Arc::clone(client));
+    }
+
+    let connect_timeout = TimeDuration::milliseconds(producer_connect_timeout_ms(&self.config));
+    let client = Arc::new(GrpcClient::new_http(
+      broker_address,
+      connect_timeout,
+      producer_max_request_concurrency(&self.config),
+    )?);
+    clients.insert(broker_address.to_string(), Arc::clone(&client));
+    Ok(client)
+  }
+
+  fn reconcile_cached_clients(&self, membership: &BrokerMembership) {
+    let addresses = membership
+      .nodes()
+      .unwrap_or_default()
+      .iter()
+      .map(|node| &node.address)
+      .collect::<HashSet<_>>();
+    let mut clients = self.clients.lock();
+    let client_count = clients.len();
+    clients.retain(|address, _| addresses.contains(address));
+    let evicted = client_count.saturating_sub(clients.len());
+    if evicted > 0 {
+      debug!(
+        "producer transport retired stale broker clients: evicted={evicted}, retained={}",
+        clients.len()
+      );
+    }
   }
 }
 
@@ -407,12 +532,7 @@ impl BrokerTransport for GrpcBrokerTransport {
     broker_address: &str,
     request: ProduceBatchRequest,
   ) -> Result<ProduceBatchResponse> {
-    let connect_timeout = TimeDuration::milliseconds(producer_connect_timeout_ms(&self.config));
-    let client = GrpcClient::new_http(
-      broker_address,
-      connect_timeout,
-      producer_max_request_concurrency(&self.config),
-    )?;
+    let client = self.client_for_address(broker_address)?;
     let service_method = ServiceMethod::<ProduceBatchRequest, ProduceBatchResponse>::new(
       "BrokerService",
       "ProduceBatch",
@@ -430,6 +550,10 @@ impl BrokerTransport for GrpcBrokerTransport {
       .map_err(|error| anyhow!(error.to_string()))?;
     Ok(response)
   }
+
+  fn reconcile_membership(&self, membership: &BrokerMembership) {
+    self.reconcile_cached_clients(membership);
+  }
 }
 
 //
@@ -443,6 +567,7 @@ pub struct ProducerClientImpl {
   membership_rx: watch::Receiver<BrokerMembership>,
   transport: Arc<dyn BrokerTransport>,
   metrics: Arc<ProducerMetrics>,
+  retry_diagnostics: ProducerRetryDiagnostics,
   state: Arc<Mutex<ProducerState>>,
   dispatch_permits: Arc<Semaphore>,
   flush_task: JoinHandle<()>,
@@ -527,8 +652,11 @@ impl ProducerClientImpl {
     );
 
     let membership_rx = discovery.watch_membership().await?;
+    let initial_membership = membership_rx.borrow().clone();
+    transport.reconcile_membership(&initial_membership);
     let state = Arc::new(Mutex::new(ProducerState::default()));
     let metrics = Arc::new(ProducerMetrics::new(&metrics_scope));
+    let retry_diagnostics = ProducerRetryDiagnostics::default();
     let max_request_concurrency = usize::try_from(producer_max_request_concurrency(&config))
       .map_err(|_| anyhow!("producer max request concurrency exceeds usize"))?;
     ensure!(
@@ -554,6 +682,7 @@ impl ProducerClientImpl {
       topic_map.clone(),
       membership_rx.clone(),
       Arc::clone(&metrics),
+      retry_diagnostics.clone(),
       Arc::clone(&dispatch_permits),
     );
 
@@ -563,6 +692,7 @@ impl ProducerClientImpl {
       membership_rx,
       transport,
       metrics,
+      retry_diagnostics,
       state,
       dispatch_permits,
       flush_task,
@@ -574,18 +704,30 @@ impl ProducerClientImpl {
     transport: Arc<dyn BrokerTransport>,
     config: ProducerConfig,
     topics: HashMap<String, ProducerTopicConfig>,
-    membership_rx: watch::Receiver<BrokerMembership>,
+    mut membership_rx: watch::Receiver<BrokerMembership>,
     metrics: Arc<ProducerMetrics>,
+    retry_diagnostics: ProducerRetryDiagnostics,
     dispatch_permits: Arc<Semaphore>,
   ) -> JoinHandle<()> {
     // The flush loop handles time-based flushes so producers can efficiently batch sparse traffic.
     tokio::spawn(async move {
+      // Dispatches share this read-only receiver while the loop keeps its receiver for updates.
+      let dispatch_membership_rx = membership_rx.clone();
       let tick_ms = (producer_flush_max_delay_ms(&config) / 2).max(10);
       let mut ticker = interval(Duration::from_millis(tick_ms));
       let mut dispatches = FuturesUnordered::new();
+      let mut membership_closed = false;
 
       loop {
         tokio::select! {
+          changed = membership_rx.changed(), if !membership_closed => {
+            if changed.is_ok() {
+              let membership = membership_rx.borrow_and_update().clone();
+              transport.reconcile_membership(&membership);
+            } else {
+              membership_closed = true;
+            }
+          },
           _ = ticker.tick() => {
             let max_dispatches = usize::try_from(producer_max_request_concurrency(&config))
               .unwrap_or(usize::MAX);
@@ -609,9 +751,10 @@ impl ProducerClientImpl {
               dispatches.push(dispatch_batch_and_notify(
                 &config,
                 &topics,
-                &membership_rx,
+                &dispatch_membership_rx,
                 &transport,
                 &metrics,
+                &retry_diagnostics,
                 &dispatch_permits,
                 batch,
               ));
@@ -692,6 +835,7 @@ impl ProducerClient for ProducerClientImpl {
         &self.membership_rx,
         &self.transport,
         &self.metrics,
+        &self.retry_diagnostics,
         &self.dispatch_permits,
         batch,
       )
@@ -719,6 +863,7 @@ impl ProducerClient for ProducerClientImpl {
         &self.membership_rx,
         &self.transport,
         &self.metrics,
+        &self.retry_diagnostics,
         &self.dispatch_permits,
         batch,
       ));
@@ -742,6 +887,7 @@ impl ProducerClient for ProducerClientImpl {
       topics: self.topics.clone(),
       membership_rx: self.membership_rx.clone(),
       state: Arc::clone(&self.state),
+      retry_diagnostics: self.retry_diagnostics.clone(),
     })
   }
 }
@@ -761,6 +907,7 @@ async fn dispatch_batch_and_notify(
   membership_rx: &watch::Receiver<BrokerMembership>,
   transport: &Arc<dyn BrokerTransport>,
   metrics: &Arc<ProducerMetrics>,
+  retry_diagnostics: &ProducerRetryDiagnostics,
   dispatch_permits: &Arc<Semaphore>,
   batch: BufferedBatch,
 ) {
@@ -773,6 +920,7 @@ async fn dispatch_batch_and_notify(
         transport.as_ref(),
         &batch,
         metrics,
+        retry_diagnostics,
       )
       .await
     },
@@ -808,6 +956,7 @@ async fn send_batch_with_retry(
   transport: &dyn BrokerTransport,
   batch: &BufferedBatch,
   metrics: &ProducerMetrics,
+  retry_diagnostics: &ProducerRetryDiagnostics,
 ) -> Result<ProducerAck, ProducerError> {
   let _topic = topics
     .get(&batch.topic)
@@ -876,7 +1025,7 @@ async fn send_batch_with_retry(
     };
 
     let response = transport.produce_batch(&broker_address, request).await;
-    let current_error = match response {
+    let (current_error, retry_reason) = match response {
       Ok(response) => {
         let status = response.status.enum_value_or_default();
         match status {
@@ -897,15 +1046,21 @@ async fn send_batch_with_retry(
           },
           ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER
           | ProduceStatus::PRODUCE_STATUS_OVERLOADED => {
-            if response.error_message.is_empty() {
+            let error = if response.error_message.is_empty() {
               format!("broker status: {status:?}")
             } else {
               response.error_message.to_string()
-            }
+            };
+            let reason = match status {
+              ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER => ProducerRetryReason::NotLeaseHolder,
+              ProduceStatus::PRODUCE_STATUS_OVERLOADED => ProducerRetryReason::Overloaded,
+              _ => unreachable!("only retryable statuses reach this branch"),
+            };
+            (error, reason)
           },
         }
       },
-      Err(error) => error.to_string(),
+      Err(error) => (error.to_string(), ProducerRetryReason::TransportError),
     };
 
     if attempt >= producer_max_retries(config) {
@@ -926,6 +1081,13 @@ async fn send_batch_with_retry(
 
     let delay_ms = retry_delay_ms(config, attempt);
     metrics.retries.inc();
+    retry_diagnostics.record(
+      retry_reason,
+      &batch.topic,
+      batch.virtual_partition_id,
+      attempt.saturating_add(1),
+      current_error.clone(),
+    );
     warn_every!(
       15.seconds(),
       "producer retrying batch: topic={}, virtual_partition_id={}, attempt={}, delay_ms={}, \

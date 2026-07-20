@@ -41,9 +41,17 @@ pub fn producer_topic_named(topic: &str) -> ProducerTopicConfig {
 }
 
 pub fn producer_topic_named_with_writers(topic: &str, num_writers: u32) -> ProducerTopicConfig {
+  producer_topic_named_with_partition_count(topic, PARTITION_COUNT, num_writers)
+}
+
+pub fn producer_topic_named_with_partition_count(
+  topic: &str,
+  partition_count: u32,
+  num_writers: u32,
+) -> ProducerTopicConfig {
   ProducerTopicConfig {
     name: topic.to_string().into(),
-    partition_count: PARTITION_COUNT,
+    partition_count,
     num_writers,
     retention_days: 0,
     ..Default::default()
@@ -74,11 +82,42 @@ pub fn consumer_bootstrap_config(
   member_id: &str,
   resources: &IntegrationResources,
 ) -> ConsumerIteratorBootstrapConfig {
-  let runtime = consumer_runtime_config(member_id);
+  consumer_bootstrap_config_for(
+    TOPIC,
+    PARTITION_COUNT,
+    "integration-group",
+    member_id,
+    resources,
+  )
+}
+
+pub fn consumer_bootstrap_config_for(
+  topic_name: &str,
+  partition_count: u32,
+  group_id: &str,
+  member_id: &str,
+  resources: &IntegrationResources,
+) -> ConsumerIteratorBootstrapConfig {
+  // Keep lease and rebalance intervals short so local runs converge quickly.
+  let mut read = ConsumerReadConfig::new();
+  read.topic = topic_name.to_string().into();
+  read.window_size_seconds = Some(WINDOW_SIZE_SECONDS);
+
+  let mut group = ConsumerGroupConfig::new();
+  group.topic = topic_name.to_string().into();
+  group.group_id = group_id.to_string().into();
+  group.member_id = member_id.to_string().into();
+  group.lease_duration_ms = Some(2_000);
+  group.heartbeat_interval_ms = Some(200);
+  group.rebalance_interval_ms = Some(200);
+
+  let mut runtime = ConsumerRuntimeConfig::new();
+  runtime.read = Some(read).into();
+  runtime.group = Some(group).into();
 
   let mut topic = TopicConfig::new();
-  topic.name = TOPIC.to_string().into();
-  topic.partition_count = PARTITION_COUNT;
+  topic.name = topic_name.to_string().into();
+  topic.partition_count = partition_count;
   topic.num_writers = 1;
   topic.retention_days = 1;
 

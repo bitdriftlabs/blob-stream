@@ -358,6 +358,33 @@ impl WriteEngineImpl {
       metadata_store,
       lease_store,
       holder_id,
+      None,
+      membership_rx,
+      Arc::new(SystemTimeProvider),
+      metrics_scope,
+    )
+  }
+
+  /// Construct a broker with an explicit Sonyflake machine ID for an in-process test cluster.
+  pub fn new_with_snowflake_machine_id(
+    config: WriteConfig,
+    topics: HashMap<String, TopicInfo>,
+    blob_store: Arc<dyn BlobStore>,
+    metadata_store: Arc<dyn MetadataStore>,
+    lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+    holder_id: String,
+    machine_id: u16,
+    membership_rx: Option<watch::Receiver<BrokerMembership>>,
+    metrics_scope: &Scope,
+  ) -> Result<Self> {
+    Self::new_with_time_provider_and_scope(
+      config,
+      topics,
+      blob_store,
+      metadata_store,
+      lease_store,
+      holder_id,
+      Some(machine_id),
       membership_rx,
       Arc::new(SystemTimeProvider),
       metrics_scope,
@@ -382,6 +409,7 @@ impl WriteEngineImpl {
       metadata_store,
       lease_store,
       holder_id,
+      None,
       membership_rx,
       time_provider,
       metrics_scope,
@@ -395,11 +423,15 @@ impl WriteEngineImpl {
     metadata_store: Arc<dyn MetadataStore>,
     lease_store: Arc<dyn ProducerPartitionLeaseStore>,
     holder_id: String,
+    machine_id: Option<u16>,
     membership_rx: Option<watch::Receiver<BrokerMembership>>,
     time_provider: Arc<dyn TimeProvider>,
     metrics_scope: &Scope,
   ) -> Result<Self> {
-    let snowflake = flush::SnowflakeGenerator::new()?;
+    let snowflake = match machine_id {
+      Some(machine_id) => flush::SnowflakeGenerator::with_machine_id(machine_id)?,
+      None => flush::SnowflakeGenerator::new()?,
+    };
     let initial_membership = membership_rx.as_ref().map_or_else(
       || {
         BrokerMembership::new(vec![BrokerNode {
