@@ -288,7 +288,7 @@ For every `read_available()` call, a consumer plans work independently for each 
   live fast path until it reaches its captured cutover. Recovery scans do not use the checkpoint
   snowflake as a DynamoDB lower bound, so late lower-snowflake metadata remains discoverable.
 4. Fast partitions scan a trailing horizon derived from the topic's enforced metadata-publication
-  deadline plus `metadata_visibility_delay_ms`. They omit windows whose end is older than that
+  deadline plus `metadata_visibility_delay_ms`. They omit windows whose end is no newer than the
   safe timestamp. For a remaining window, the aggregate DynamoDB query starts at the lowest
   effective bound across assigned fast partitions: a Sonyflake time floor for the safe timestamp
   (or the window start) tightened by that partition's observed inclusive frontier. Frontiers

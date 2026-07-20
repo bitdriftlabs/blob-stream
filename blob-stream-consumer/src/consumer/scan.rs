@@ -30,6 +30,7 @@ use blob_stream_types::{
   VirtualPartitionId,
   Window,
   format_unix_timestamp_ms,
+  now_unix_seconds as system_now_unix_seconds,
 };
 use futures::future::try_join_all;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -680,6 +681,7 @@ impl ConsumerReaderImpl {
 
     self.fast_frontiers = next_fast_frontiers;
     self.prune_fast_frontiers(now_unix_seconds)?;
+    let completed_at_unix_seconds = system_now_unix_seconds();
     for ((partition_id, window_start_unix_seconds), snowflake_id) in &self.fast_frontiers {
       if let Some(scan_state) = scan_states.get_mut(partition_id) {
         scan_state
@@ -691,6 +693,7 @@ impl ConsumerReaderImpl {
       }
     }
     for (partition_id, scan_state) in &mut scan_states {
+      scan_state.completed_at_unix_seconds = completed_at_unix_seconds;
       scan_state.cursor_after = self
         .virtual_partition_states
         .get(partition_id)
