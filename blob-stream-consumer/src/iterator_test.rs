@@ -415,6 +415,7 @@ fn current_batch_for_fenced_partition_is_not_delivered() {
         window_start_unix_seconds: 0,
         snowflake_id: 1,
       },
+      remaining_payload_bytes: 1,
       records: vec![new_record(vec![1], 0)].into_iter(),
     }),
     ..Default::default()
@@ -430,6 +431,34 @@ fn current_batch_for_fenced_partition_is_not_delivered() {
       .is_none()
   );
   assert!(delivery_state.current_batch.is_none());
+}
+
+#[test]
+fn current_batch_remaining_bytes_decrease_as_records_are_delivered() {
+  let mut delivery_state = DeliveryState {
+    current_batch: Some(BufferedBatch {
+      virtual_partition_id: 7,
+      next_offset: 1,
+      source_checkpoint: CommittedSourceCheckpoint {
+        window_start_unix_seconds: 0,
+        snowflake_id: 1,
+      },
+      remaining_payload_bytes: 3,
+      records: vec![new_record(vec![1, 2, 3], 0)].into_iter(),
+    }),
+    ..Default::default()
+  };
+
+  let active_assignment = HashSet::from([7]);
+  assert!(matches!(
+    delivery_state.try_take_next(
+      &active_assignment,
+      &mut HashMap::new(),
+      &ConsumerIteratorMetrics::new(&metrics_scope())
+    ),
+    Some(NextResult::Record(_))
+  ));
+  assert_eq!(delivery_state.retained_bytes(), 0);
 }
 
 async fn write_segment(
@@ -535,33 +564,6 @@ async fn wait_for_prefetch_buffer_len(iterator: &ConsumerIteratorImpl, expected_
   );
 }
 
-async fn wait_for_prefetch_pending_record_count(
-  iterator: &ConsumerIteratorImpl,
-  expected_min: usize,
-) {
-  for _ in 0 .. 40 {
-    let count = iterator
-      .diagnostics()
-      .expect("consumer implementation provides diagnostics")
-      .state_snapshot()
-      .prefetch_pending_record_count;
-    if count >= expected_min {
-      return;
-    }
-    sleep(Duration::from_millis(25)).await;
-  }
-
-  let count = iterator
-    .diagnostics()
-    .expect("consumer implementation provides diagnostics")
-    .state_snapshot()
-    .prefetch_pending_record_count;
-  assert!(
-    count >= expected_min,
-    "prefetch pending record count {count} did not reach expected minimum {expected_min}"
-  );
-}
-
 async fn wait_for_active_assignment(iterator: &ConsumerIteratorImpl, expected_partitions: &[u32]) {
   for _ in 0 .. 40 {
     let snapshot = iterator
@@ -581,6 +583,39 @@ async fn wait_for_active_assignment(iterator: &ConsumerIteratorImpl, expected_pa
   panic!(
     "active assignment {:?} did not reach expected assignment {expected_partitions:?}",
     active_partition_ids(&snapshot)
+  );
+}
+
+async fn wait_for_reader_mode(
+  iterator: &ConsumerIteratorImpl,
+  virtual_partition_id: VirtualPartitionId,
+  expected_mode: ConsumerPartitionReadMode,
+) {
+  for _ in 0 .. 40 {
+    let snapshot = iterator
+      .diagnostics()
+      .expect("consumer implementation provides diagnostics")
+      .state_snapshot();
+    if local_partition(&snapshot, virtual_partition_id)
+      .reader
+      .as_ref()
+      .is_some_and(|reader| reader.mode == expected_mode)
+    {
+      return;
+    }
+    sleep(Duration::from_millis(25)).await;
+  }
+
+  let snapshot = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_snapshot();
+  assert_eq!(
+    local_partition(&snapshot, virtual_partition_id)
+      .reader
+      .as_ref()
+      .map(|reader| reader.mode.clone()),
+    Some(expected_mode)
   );
 }
 
@@ -633,6 +668,7 @@ async fn diagnostics_report_assignment_and_start_state() {
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .await
   .unwrap();
@@ -703,6 +739,7 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .await
   .unwrap();
@@ -809,6 +846,7 @@ async fn state_response_reports_lease_lookup_failure_without_blocking_local_diag
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .await
   .unwrap();
@@ -893,6 +931,7 @@ async fn assignment_callback_replays_active_partitions() {
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .await
   .unwrap();
@@ -954,6 +993,7 @@ async fn next_returns_revocation_until_completed() {
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .await
   .unwrap();
@@ -1055,6 +1095,7 @@ async fn next_delivers_records_and_commit_renews() {
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .await
   .unwrap();
@@ -1136,6 +1177,7 @@ async fn seek_waits_for_prefetch_scan_without_stalling_heartbeats() {
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .await
   .unwrap();
@@ -1209,6 +1251,7 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .await
   .unwrap();
@@ -1331,21 +1374,21 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .await
   .unwrap();
   iterator.start().unwrap();
 
   wait_for_prefetch_buffer_len(&iterator, 1).await;
-  wait_for_prefetch_pending_record_count(&iterator, 4).await;
   let buffered_before = iterator
     .diagnostics()
     .expect("consumer implementation provides diagnostics")
     .state_snapshot();
   assert_eq!(buffered_before.prefetch_buffered_batch_count, 1);
   assert_eq!(buffered_before.prefetch_buffered_record_count, 2);
-  assert_eq!(buffered_before.prefetch_pending_batch_count, 2);
-  assert_eq!(buffered_before.prefetch_pending_record_count, 4);
+  assert_eq!(buffered_before.prefetch_pending_batch_count, 0);
+  assert_eq!(buffered_before.prefetch_pending_record_count, 0);
 
   let first = timeout(Duration::from_secs(2), iterator.next())
     .await
@@ -1381,6 +1424,17 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
   };
   assert_eq!(rewound_record.virtual_partition_id, 7);
   assert_eq!(rewound_record.offset, 1);
+  for expected_offset in 2 ..= 6 {
+    let next = timeout(Duration::from_secs(2), iterator.next())
+      .await
+      .unwrap()
+      .unwrap();
+    let NextResult::Record(record) = next else {
+      panic!("expected replayed record");
+    };
+    assert_eq!(record.offset, expected_offset);
+  }
+  wait_for_reader_mode(&iterator, 7, ConsumerPartitionReadMode::Fast).await;
   let recovered_snapshot = iterator
     .diagnostics()
     .expect("consumer implementation provides diagnostics")
@@ -1454,6 +1508,7 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .await
   .unwrap();
@@ -1545,6 +1600,7 @@ async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .await
   .unwrap();
@@ -1613,6 +1669,7 @@ async fn cancelled_next_does_not_restart_rebalance() {
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .await
   .unwrap();
@@ -1682,6 +1739,7 @@ async fn cancelled_next_preserves_prefetched_record() {
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )
   .await
   .unwrap();

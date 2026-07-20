@@ -23,6 +23,7 @@ pub struct BufferedBatch {
   pub(crate) virtual_partition_id: VirtualPartitionId,
   pub(super) next_offset: u64,
   pub(super) source_checkpoint: CommittedSourceCheckpoint,
+  pub(super) remaining_payload_bytes: u64,
   pub records: std::vec::IntoIter<Record>,
 }
 
@@ -52,6 +53,16 @@ pub struct DeliveryState {
 }
 
 impl DeliveryState {
+  /// Return payload bytes retained in both queued and currently delivered batches.
+  pub(super) fn retained_bytes(&self) -> u64 {
+    self.buffered_bytes.saturating_add(
+      self
+        .current_batch
+        .as_ref()
+        .map_or(0, |batch| batch.remaining_payload_bytes),
+    )
+  }
+
   /// Return the next revocation or record that remains valid for the active assignment.
   pub(super) fn try_take_next(
     &mut self,
@@ -79,6 +90,9 @@ impl DeliveryState {
 
       if let Some(current_batch) = self.current_batch.as_mut() {
         if let Some(record) = current_batch.records.next() {
+          current_batch.remaining_payload_bytes = current_batch
+            .remaining_payload_bytes
+            .saturating_sub(u64::try_from(record.payload.len()).unwrap_or(u64::MAX));
           let offset = current_batch.next_offset;
           current_batch.next_offset = current_batch.next_offset.saturating_add(1);
           record_delivered_source(
@@ -101,16 +115,17 @@ impl DeliveryState {
       self.buffered_bytes = self
         .buffered_bytes
         .saturating_sub(prefetched_batch_bytes(&batch));
-      update_worker_prefetch_metrics(metrics, self);
       if !active_assignment.contains(&batch.virtual_partition_id) {
         continue;
       }
 
       metrics.batches_delivered.inc();
+      let remaining_payload_bytes = prefetched_batch_bytes(&batch);
       self.current_batch = Some(BufferedBatch {
         virtual_partition_id: batch.virtual_partition_id,
         next_offset: batch.seq_range.start,
         source_checkpoint: batch.source_checkpoint,
+        remaining_payload_bytes,
         records: batch.records.into_iter(),
       });
     }
@@ -164,7 +179,7 @@ pub(super) fn prefetched_batch_bytes(batch: &ConsumerBatch) -> u64 {
   })
 }
 
-/// Keep the worker-facing queue metrics aligned with the batches awaiting caller delivery.
+/// Keep delivery-owned occupancy metrics aligned with queued and current caller-visible records.
 pub(super) fn update_worker_prefetch_metrics(
   metrics: &ConsumerIteratorMetrics,
   buffer: &DeliveryState,
@@ -174,5 +189,16 @@ pub(super) fn update_worker_prefetch_metrics(
     .set(i64::try_from(buffer.batches.len()).unwrap_or(i64::MAX));
   metrics
     .prefetch_buffered_bytes
-    .set(i64::try_from(buffer.buffered_bytes).unwrap_or(i64::MAX));
+    .set(i64::try_from(buffer.retained_bytes()).unwrap_or(i64::MAX));
+}
+
+/// Publish total decoded payload occupancy across delivery-owned and worker-pending batches.
+pub(super) fn update_total_prefetch_bytes(
+  metrics: &ConsumerIteratorMetrics,
+  buffer: &DeliveryState,
+  pending_bytes: u64,
+) {
+  metrics
+    .prefetch_total_bytes
+    .set(i64::try_from(buffer.retained_bytes().saturating_add(pending_bytes)).unwrap_or(i64::MAX));
 }

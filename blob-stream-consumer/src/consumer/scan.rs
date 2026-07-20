@@ -12,6 +12,7 @@ use super::{
   format_unix_timestamp_seconds,
 };
 use crate::config::{
+  ConsumerReadRuntimeSettings,
   consumer_candidate_window_count,
   consumer_metadata_visibility_delay_ms,
   consumer_window_size_seconds,
@@ -31,6 +32,7 @@ use blob_stream_types::{
   format_unix_timestamp_ms,
 };
 use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt, stream};
 use log::{info, trace};
 use protobuf::Message;
 use std::borrow::Cow;
@@ -44,6 +46,10 @@ use std::time::Instant;
 //
 
 /// One metadata-window request, with all reader modes that require its results.
+///
+/// A single window can simultaneously serve fresh partitions, retained-history recovery, and the
+/// live fast path. `insert_scan_request` merges those independent demands into one metadata query,
+/// so this uses fixed flags rather than a single mode or an allocating mode set.
 #[derive(Clone)]
 pub(super) struct ScanRequest {
   pub(super) window: TopicWindowKey,
@@ -56,12 +62,74 @@ pub(super) struct ScanRequest {
 // ScanEligibility
 //
 
-/// Reader modes allowed to consume a request's metadata results.
+/// Reader modes eligible to consume a shared metadata-window request.
+///
+/// These flags are intentionally not mutually exclusive: recovery can overlap the fast horizon,
+/// and a newly assigned partition can share a window with either. They avoid duplicate metadata
+/// queries while each partition still applies its own cursor and mode filtering.
 #[derive(Clone, Copy)]
 pub(super) struct ScanEligibility {
   pub(super) recovering: bool,
   pub(super) fast: bool,
   pub(super) fresh: bool,
+}
+
+//
+// ReadCapacity
+//
+
+/// Payload-byte capacity available for one reader pass.
+#[derive(Clone, Copy)]
+pub struct ReadCapacity {
+  remaining_payload_bytes: u64,
+  oversized_batch_allowed: bool,
+}
+
+impl ReadCapacity {
+  /// Create a capacity that admits decoded payloads up to `remaining_payload_bytes`.
+  #[must_use]
+  pub fn new(remaining_payload_bytes: u64) -> Self {
+    Self {
+      remaining_payload_bytes,
+      oversized_batch_allowed: false,
+    }
+  }
+
+  pub(crate) fn with_oversized_batch(
+    remaining_payload_bytes: u64,
+    oversized_batch_allowed: bool,
+  ) -> Self {
+    Self {
+      remaining_payload_bytes,
+      oversized_batch_allowed,
+    }
+  }
+
+  /// Reserve one decoded batch. A single oversized batch may make progress from an empty buffer.
+  fn reserve(&mut self, payload_bytes: u64) -> bool {
+    if payload_bytes <= self.remaining_payload_bytes {
+      self.remaining_payload_bytes = self.remaining_payload_bytes.saturating_sub(payload_bytes);
+      self.oversized_batch_allowed = false;
+      return true;
+    }
+    if self.oversized_batch_allowed {
+      self.remaining_payload_bytes = 0;
+      self.oversized_batch_allowed = false;
+      return true;
+    }
+    false
+  }
+}
+
+//
+// BatchReadCandidate
+//
+
+/// One ordered, capacity-reserved blob range read.
+struct BatchReadCandidate {
+  metadata: SegmentMetadata,
+  batch_metadata: BatchMetadata,
+  virtual_partition_id: VirtualPartitionId,
 }
 
 impl ConsumerReaderImpl {
@@ -96,10 +164,33 @@ impl ConsumerReaderImpl {
     Ok(windows)
   }
 
-  /// Execute one metadata scan pass, then advance scan modes only for windows fully observed.
+  /// Execute one metadata scan pass, retaining no progress when a batch cannot reach the caller.
   pub(super) async fn read_available_impl(
     &mut self,
     now_unix_seconds: i64,
+    capacity: ReadCapacity,
+    runtime_settings: ConsumerReadRuntimeSettings,
+  ) -> Result<Vec<ConsumerBatch>> {
+    // Cursor and frontier changes are only valid once every decoded batch is returned. A later
+    // range-read failure must not make already decoded output disappear behind an advanced cursor.
+    let virtual_partition_states = self.virtual_partition_states.clone();
+    let fast_frontiers = self.fast_frontiers.clone();
+    let result = self
+      .read_available_impl_once(now_unix_seconds, capacity, runtime_settings)
+      .await;
+    if result.is_err() {
+      self.virtual_partition_states = virtual_partition_states;
+      self.fast_frontiers = fast_frontiers;
+    }
+    result
+  }
+
+  /// Execute one metadata scan pass, then advance scan modes only for windows fully observed.
+  async fn read_available_impl_once(
+    &mut self,
+    now_unix_seconds: i64,
+    mut capacity: ReadCapacity,
+    runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<Vec<ConsumerBatch>> {
     let read_started_at = Instant::now();
     trace!(
@@ -158,7 +249,9 @@ impl ConsumerReaderImpl {
     let mut blocked_fast_sources = HashSet::new();
     let mut deferred_recovery_windows = HashSet::new();
     let mut deferred_fresh_partitions = HashSet::new();
-    for (request, mut segments) in window_results {
+    let mut read_candidates = Vec::new();
+    let mut capacity_exhausted = false;
+    'windows: for (request, mut segments) in window_results {
       let window = request.window;
       trace!(
         "consumer scanned window: topic={}, window_start={}, segments={}",
@@ -287,27 +380,25 @@ impl ConsumerReaderImpl {
               continue;
             }
 
-            // Decode batch payload only after passing cursor filter to avoid unnecessary I/O.
-            let batch = self
-              .read_batch(&segment, batch_metadata, partition_id)
-              .await?;
-
-            // Cursor always moves forward. max() keeps monotonicity if metadata ordering is odd.
-            let next_cursor = batch.seq_range.end.max(current_cursor.unwrap_or(0));
-            if let Some(state) = self.virtual_partition_states.get_mut(&partition_id) {
-              state.advance_cursor(next_cursor);
+            if !capacity.reserve(batch_metadata.summary.payload_bytes) {
+              capacity_exhausted = true;
+              trace!(
+                "consumer deferred batch by prefetch capacity: topic={}, partition={}, \
+                 seq_start={}, seq_end={}, payload_bytes={}",
+                self.config.topic,
+                partition_id,
+                batch_metadata.seq_range.start,
+                batch_metadata.seq_range.end,
+                batch_metadata.summary.payload_bytes
+              );
+              break 'windows;
             }
-            trace!(
-              "consumer accepted batch: topic={}, partition={}, seq_start={}, seq_end={}, \
-               records={}, new_cursor={}",
-              self.config.topic,
-              partition_id,
-              batch.seq_range.start,
-              batch.seq_range.end,
-              batch.records.len(),
-              next_cursor
-            );
-            output.push(batch);
+
+            read_candidates.push(BatchReadCandidate {
+              metadata: segment.clone(),
+              batch_metadata: batch_metadata.clone(),
+              virtual_partition_id: partition_id,
+            });
           }
 
           if fast_partition {
@@ -326,59 +417,107 @@ impl ConsumerReaderImpl {
       }
     }
 
+    // `buffered` preserves candidate order while allowing independent object-store requests and
+    // decoding work to overlap. Cursor changes occur only after every planned read succeeds.
+    let decoded_batches = stream::iter(read_candidates.into_iter().map(|candidate| async {
+      let batch = self
+        .read_batch(
+          &candidate.metadata,
+          &candidate.batch_metadata,
+          candidate.virtual_partition_id,
+        )
+        .await?;
+      Ok::<_, Error>((candidate, batch))
+    }))
+    .buffered(runtime_settings.max_in_flight_batch_reads)
+    .try_collect::<Vec<_>>()
+    .await?;
+
+    for (candidate, batch) in decoded_batches {
+      let current_cursor = self
+        .virtual_partition_states
+        .get(&candidate.virtual_partition_id)
+        .and_then(VirtualPartitionState::cursor);
+      if current_cursor.is_some_and(|cursor| batch.seq_range.end <= cursor) {
+        metadata_batches_skipped_by_cursor = metadata_batches_skipped_by_cursor.saturating_add(1);
+        continue;
+      }
+
+      // Cursor always moves forward. max() keeps monotonicity if metadata ordering is odd.
+      let next_cursor = batch.seq_range.end.max(current_cursor.unwrap_or(0));
+      if let Some(state) = self
+        .virtual_partition_states
+        .get_mut(&candidate.virtual_partition_id)
+      {
+        state.advance_cursor(next_cursor);
+      }
+      trace!(
+        "consumer accepted batch: topic={}, partition={}, seq_start={}, seq_end={}, records={}, \
+         new_cursor={}",
+        self.config.topic,
+        candidate.virtual_partition_id,
+        batch.seq_range.start,
+        batch.seq_range.end,
+        batch.records.len(),
+        next_cursor
+      );
+      output.push(batch);
+    }
+
     let window_size_seconds = consumer_window_size_seconds(&self.config);
     let mut initial_scans_completed = Vec::new();
     let mut recoveries_completed = Vec::new();
-    for (partition_id, state) in &mut self.virtual_partition_states {
-      let mut next_state = None;
-      match state {
-        VirtualPartitionState::Fresh {
-          cursor,
-          initial_window_start_unix_seconds,
-        } if scanned_fresh_window_starts.contains(initial_window_start_unix_seconds)
-          && !deferred_fresh_partitions.contains(partition_id) =>
-        {
-          initial_scans_completed.push((*partition_id, *initial_window_start_unix_seconds));
-          next_state = Some(VirtualPartitionState::Fast { cursor: *cursor });
-        },
-        VirtualPartitionState::Recovering {
-          cursor,
-          recovery_state,
-        } => {
-          let Some(recovery_window_end) = recovery_window_end else {
-            continue;
-          };
-          let recovery_window_end =
-            deferred_recovery_windows
-              .iter()
-              .min()
-              .map_or(recovery_window_end, |deferred_window| {
+    if !capacity_exhausted {
+      for (partition_id, state) in &mut self.virtual_partition_states {
+        let mut next_state = None;
+        match state {
+          VirtualPartitionState::Fresh {
+            cursor,
+            initial_window_start_unix_seconds,
+          } if scanned_fresh_window_starts.contains(initial_window_start_unix_seconds)
+            && !deferred_fresh_partitions.contains(partition_id) =>
+          {
+            initial_scans_completed.push((*partition_id, *initial_window_start_unix_seconds));
+            next_state = Some(VirtualPartitionState::Fast { cursor: *cursor });
+          },
+          VirtualPartitionState::Recovering {
+            cursor,
+            recovery_state,
+          } => {
+            let Some(recovery_window_end) = recovery_window_end else {
+              continue;
+            };
+            let recovery_window_end = deferred_recovery_windows.iter().min().map_or(
+              recovery_window_end,
+              |deferred_window| {
                 recovery_window_end
                   .min(deferred_window.saturating_sub(consumer_window_size_seconds(&self.config)))
-              });
-          if recovery_state.next_window_start_unix_seconds > recovery_window_end {
-            continue;
-          }
-          recovery_state.next_window_start_unix_seconds =
-            recovery_window_end.saturating_add(window_size_seconds);
-          if recovery_state.next_window_start_unix_seconds
-            > recovery_state.cutover_window_start_unix_seconds
-          {
-            recoveries_completed.push((
-              *partition_id,
-              recovery_state.cutover_window_start_unix_seconds,
-            ));
-            next_state = Some(VirtualPartitionState::Fast { cursor: *cursor });
-          }
-        },
-        VirtualPartitionState::PendingCursor { .. }
-        | VirtualPartitionState::PendingRecovering { .. }
-        | VirtualPartitionState::PendingFast { .. }
-        | VirtualPartitionState::Fresh { .. }
-        | VirtualPartitionState::Fast { .. } => {},
-      }
-      if let Some(next_state) = next_state {
-        *state = next_state;
+              },
+            );
+            if recovery_state.next_window_start_unix_seconds > recovery_window_end {
+              continue;
+            }
+            recovery_state.next_window_start_unix_seconds =
+              recovery_window_end.saturating_add(window_size_seconds);
+            if recovery_state.next_window_start_unix_seconds
+              > recovery_state.cutover_window_start_unix_seconds
+            {
+              recoveries_completed.push((
+                *partition_id,
+                recovery_state.cutover_window_start_unix_seconds,
+              ));
+              next_state = Some(VirtualPartitionState::Fast { cursor: *cursor });
+            }
+          },
+          VirtualPartitionState::PendingCursor { .. }
+          | VirtualPartitionState::PendingRecovering { .. }
+          | VirtualPartitionState::PendingFast { .. }
+          | VirtualPartitionState::Fresh { .. }
+          | VirtualPartitionState::Fast { .. } => {},
+        }
+        if let Some(next_state) = next_state {
+          *state = next_state;
+        }
       }
     }
     for (partition_id, initial_window_start_unix_seconds) in initial_scans_completed {

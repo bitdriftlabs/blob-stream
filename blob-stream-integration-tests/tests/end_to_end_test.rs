@@ -8,13 +8,12 @@ use blob_stream_consumer::{
   ConsumerIterator,
   ConsumerIteratorImpl,
   ConsumerReadConfig,
-  ConsumerReader,
   ConsumerReaderImpl,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   MembershipCoordinationSource,
   NextResult,
 };
-use blob_stream_integration_tests::test_framework as framework;
+use blob_stream_integration_tests::test_framework::{self as framework, TestConsumerReader};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupCommitOutcome,
@@ -327,7 +326,7 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
   assert!(ack.attempts >= 1);
 
   // Step 4: Read from the exact virtual partition and assert the record is visible.
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -340,6 +339,7 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut observed_ids = HashSet::new();
@@ -456,7 +456,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
   let metadata_store = resources.metadata_store();
   let consumer_lease_store = resources.consumer_lease_store();
   let consumer_membership_store = resources.consumer_membership_store();
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -469,6 +469,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   // Step 3: Produce and drain phase 1 traffic.
@@ -524,6 +525,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -544,6 +546,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -567,6 +570,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -626,7 +630,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
     expected_ids.insert(id);
   }
 
-  let mut post_failover_reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut post_failover_reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -639,6 +643,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut post_failover_consumed_ids = HashSet::new();
@@ -687,7 +692,7 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
   assert!(first_ack.attempts >= 1);
 
   // Step 3: Read the produced data and validate dedupe/cursor monotonicity on repeated scans.
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -700,6 +705,7 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   let mut observed_ids = HashSet::new();
@@ -779,6 +785,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -847,6 +854,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -1025,6 +1033,7 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -1139,6 +1148,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -1159,6 +1169,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -1221,6 +1232,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -1362,7 +1374,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
   // If task-based consumption is just shy of completion during scale transitions,
   // do a final direct reader catch-up pass to assert end-state no-loss.
   if consumed_ids.len() < expected_ids.len() {
-    let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+    let mut reader = ConsumerReaderImpl::new(
       ConsumerReadConfig {
         topic: TOPIC.to_string().into(),
         window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -1376,6 +1388,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
       &metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )?;
     let catchup_deadline = Instant::now() + Duration::from_secs(15);
     drain_reader_until(
@@ -1506,7 +1519,7 @@ async fn active_broker_restart_continuity() -> Result<()> {
   )
   .await?;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -1519,6 +1532,7 @@ async fn active_broker_restart_continuity() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   // Step 2: Produce continuously, restart the active broker mid-stream, and continue producing.
@@ -1632,7 +1646,7 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
   )
   .await?;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -1645,6 +1659,7 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   // Step 2: Produce a stream of records and track which virtual partitions were targeted.
@@ -1758,7 +1773,7 @@ async fn multi_topic_isolation() -> Result<()> {
   )
   .await?;
 
-  let mut topic_a_reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut topic_a_reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -1771,9 +1786,10 @@ async fn multi_topic_isolation() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
-  let mut topic_b_reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut topic_b_reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: SECOND_TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -1786,6 +1802,7 @@ async fn multi_topic_isolation() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   // Step 2: Produce interleaved traffic to both topics.
@@ -1913,7 +1930,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
     .await?,
   );
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -1926,6 +1943,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   // Step 2: Produce boundary payload sizes, including true empty and near-limit payloads.
@@ -2061,7 +2079,7 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
   )
   .await?;
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -2074,6 +2092,7 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   // Step 2: Produce traffic while metadata remains temporarily invisible to readers.
@@ -2186,6 +2205,7 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -2245,6 +2265,7 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -2304,7 +2325,7 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
   // Task-driven draining can stall near completion across rebalance transitions.
   // Do a final direct reader catch-up pass to assert end-state no-loss semantics.
   if consumed_ids.len() < expected_ids.len() {
-    let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+    let mut reader = ConsumerReaderImpl::new(
       ConsumerReadConfig {
         topic: TOPIC.to_string().into(),
         window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -2317,6 +2338,7 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
       &metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )?;
     let catchup_deadline = Instant::now() + Duration::from_secs(5);
     drain_reader_until(
@@ -2615,7 +2637,7 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
   .await?;
 
   let virtual_partition_ids: Vec<u32> = (0 .. (PARTITION_COUNT * 2)).collect();
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -2628,6 +2650,7 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
 
   // Step 3: Produce records into matching logical partitions from both writers.
@@ -2825,6 +2848,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
       metrics_scope("blob_stream_consumer_it"),
       1,
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
     )
     .await?,
   );
@@ -2906,6 +2930,7 @@ async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
     ConsumerConfigFactory::build_iterator_from_proto_config(
       config_a,
       metrics_scope("blob_stream_consumer_it"),
+      None,
     )
     .await?,
   );
@@ -2913,6 +2938,7 @@ async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
     ConsumerConfigFactory::build_iterator_from_proto_config(
       config_b,
       metrics_scope("blob_stream_consumer_it"),
+      None,
     )
     .await?,
   );
@@ -2977,7 +3003,7 @@ async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
   );
 
   // Final correctness check: independent reader must recover the exact produced set (no loss).
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -2990,6 +3016,7 @@ async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
   let mut consumed_ids = HashSet::new();
   drain_reader_until(
@@ -3030,6 +3057,7 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
     ConsumerConfigFactory::build_iterator_from_proto_config(
       config_a,
       metrics_scope("blob_stream_consumer_it"),
+      None,
     )
     .await?,
   );
@@ -3037,6 +3065,7 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
     ConsumerConfigFactory::build_iterator_from_proto_config(
       config_b,
       metrics_scope("blob_stream_consumer_it"),
+      None,
     )
     .await?,
   );
@@ -3104,7 +3133,7 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
     "expected surviving bootstrap member to renew ownership after scale-in"
   );
 
-  let mut reader = ConsumerReaderImpl::new_with_retention_and_publication_lag(
+  let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
@@ -3117,6 +3146,7 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
     &metrics_scope("blob_stream_consumer_it"),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
   )?;
   let mut consumed_ids = HashSet::new();
   drain_reader_until(
