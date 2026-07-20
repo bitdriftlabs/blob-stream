@@ -1425,16 +1425,20 @@ impl BufferState {
   }
 
   fn flush_trigger(&self, now_ts_ms: i64, config: &WriteConfig) -> Option<FlushTrigger> {
+    // Empty buffers never flush.
     if self.batches.is_empty() {
       return None;
     }
 
+    // Size trigger: flush immediately once accumulated payload bytes cross threshold.
     if self.buffered_bytes >= config.flush_max_bytes {
       return Some(FlushTrigger::MaxBytes);
     }
 
     let first_ts = self.first_buffered_ts_ms?;
 
+    // Time trigger: once oldest buffered batch has waited long enough, flush whatever is present.
+    // This ensures low-throughput partitions still make progress without waiting for size growth.
     (now_ts_ms.saturating_sub(first_ts) >= config.flush_max_delay_ms)
       .then_some(FlushTrigger::MaxDelay)
   }
