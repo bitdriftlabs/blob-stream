@@ -106,6 +106,7 @@ pub struct ConsumerReaderStateSnapshot {
 pub struct ConsumerReaderScanSnapshot {
   pub completed_at: String,
   pub scanned_window_starts: Vec<String>,
+  pub fast_scan_bounds: Vec<ConsumerReaderFastScanBoundSnapshot>,
   pub fast_frontiers: Vec<ConsumerReaderFastFrontierSnapshot>,
   pub cursor_before: Option<u64>,
   pub cursor_after: Option<u64>,
@@ -119,6 +120,21 @@ pub struct ConsumerReaderScanSnapshot {
   pub metadata_batches_deferred_by_capacity: usize,
   pub batches_accepted: usize,
   pub records_accepted: usize,
+}
+
+//
+// ConsumerReaderFastScanBoundSnapshot
+//
+
+/// Human-readable Fast-path lower-bound inputs and resulting metadata-query lower bound.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ConsumerReaderFastScanBoundSnapshot {
+  pub window_start: String,
+  pub floor_timestamp: String,
+  pub time_floor_snowflake_id: u64,
+  pub observed_frontier_snowflake_id: Option<u64>,
+  pub partition_lower_bound_snowflake_id: u64,
+  pub query_lower_bound_snowflake_id: Option<u64>,
 }
 
 //

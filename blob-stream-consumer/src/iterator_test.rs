@@ -703,6 +703,7 @@ async fn diagnostics_report_assignment_and_start_state() {
     partition.owned
       && partition.active
       && !partition.pending_assignment
+      && partition.last_scan.is_none()
       && partition.reader.as_ref().is_some_and(|reader| {
         reader.mode == ConsumerPartitionReadMode::Fresh
           && reader.recovery_next_window_start.is_some()
