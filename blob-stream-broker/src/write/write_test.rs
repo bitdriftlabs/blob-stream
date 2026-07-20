@@ -682,6 +682,71 @@ async fn flushes_on_time_rollover() -> Result<()> {
 }
 
 #[tokio::test(start_paused = true)]
+async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> {
+  let collector = Collector::default();
+  let scope = collector.scope("blob_stream_broker_test");
+
+  let size_time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let mut size_config = WriteConfig::with_defaults();
+  size_config.flush_max_bytes = 1;
+  size_config.flush_max_delay_ms = 60_000;
+  let (size_engine, _metadata_store, _lease_store) =
+    make_engine_with_lease_store_and_scope(size_time_provider, size_config, &scope)?;
+  size_engine
+    .produce_batch(WriteRequest {
+      topic: "telemetry".to_string(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![1; 16], 10)],
+    })
+    .await?;
+
+  let delay_time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let mut delay_config = WriteConfig::with_defaults();
+  delay_config.flush_max_bytes = 1_024;
+  delay_config.flush_max_delay_ms = 10;
+  let (delay_engine, _metadata_store, _lease_store) = make_engine_with_lease_store_and_scope(
+    Arc::clone(&delay_time_provider),
+    delay_config.clone(),
+    &scope,
+  )?;
+  let delayed_write = tokio::spawn(async move {
+    delay_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![2; 16], 20)],
+      })
+      .await
+  });
+  tokio::task::yield_now().await;
+  delay_time_provider.advance(TimeDuration::milliseconds(delay_config.flush_max_delay_ms));
+  tokio::time::advance(StdDuration::from_millis(
+    delay_config.flush_max_delay_ms.cast_unsigned(),
+  ))
+  .await;
+  delayed_write.await??;
+
+  let metrics = String::from_utf8(collector.prometheus_output())?;
+  assert!(
+    metrics.contains("blob_stream_broker_test:write:flush_batches_max_bytes_total 1"),
+    "{metrics}"
+  );
+  assert!(
+    metrics.contains("blob_stream_broker_test:write:flush_batches_max_delay_total 1"),
+    "{metrics}"
+  );
+  assert!(
+    metrics.contains("blob_stream_broker_test:write:flush_uploaded_object_bytes_count 2"),
+    "{metrics}"
+  );
+  assert!(
+    metrics.contains("blob_stream_broker_test:write:flush_uploaded_object_bytes_total"),
+    "{metrics}"
+  );
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
 async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));

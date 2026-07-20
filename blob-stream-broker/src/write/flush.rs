@@ -6,6 +6,7 @@ use super::{
   SegmentEnvelope,
   WriteConfig,
   WriteError,
+  WriteMetrics,
 };
 use anyhow::{Context, Result};
 use bd_time::OffsetDateTimeExt;
@@ -226,6 +227,7 @@ impl FlushContext {
     &self,
     plan: &mut FlushPlan,
     now: OffsetDateTime,
+    metrics: &WriteMetrics,
   ) -> Result<(), WriteError> {
     let publication_started_at = Instant::now();
     let partitions = std::mem::take(&mut plan.partitions);
@@ -249,6 +251,7 @@ impl FlushContext {
         .put(&envelope.blob_key, payload)
         .await
         .context("write segment blob")?;
+      metrics.record_uploaded_object(payload_bytes);
       let metadata = envelope.into_metadata(self.time_provider.now().unix_timestamp_ms());
       self
         .metadata_store

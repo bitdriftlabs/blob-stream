@@ -4,12 +4,13 @@ use super::state::{RecoveryState, VirtualPartitionState};
 use super::{
   ConsumerReadConfig,
   ConsumerReader as BoundedConsumerReader,
+  ConsumerReaderFastFrontierState,
   ConsumerReaderFastScanBoundState,
   ConsumerReaderImpl,
   ReadCapacity,
 };
 use crate::config::{ConsumerReadRuntimeSettings, DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
@@ -89,6 +90,23 @@ impl MetadataStore for RecordingMetadataStore {
       .inner
       .scan_window_from_snowflake(window, min_snowflake)
       .await
+  }
+}
+
+struct FailingMetadataStore;
+
+#[async_trait]
+impl MetadataStore for FailingMetadataStore {
+  async fn write_segment(&self, _metadata: SegmentMetadata) -> Result<()> {
+    Ok(())
+  }
+
+  async fn scan_window_from_snowflake(
+    &self,
+    _window: &TopicWindowKey,
+    _min_snowflake: Option<SnowflakeId>,
+  ) -> Result<Vec<SegmentMetadata>> {
+    Err(anyhow!("injected DynamoDB dispatch error").context("injected DynamoDB service error"))
   }
 }
 
@@ -897,6 +915,36 @@ async fn failed_scan_restores_cursor_before_retrying_undelivered_batches() {
 }
 
 #[tokio::test]
+async fn metadata_scan_error_preserves_aws_source_chain() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(FailingMetadataStore);
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .unwrap();
+
+  let Err(error) = reader.read_available(950).await else {
+    panic!("metadata scan should fail");
+  };
+  let error_chain = format!("{error:#}");
+  assert!(error_chain.contains("consumer metadata scan failed: topic=telemetry"));
+  assert!(error_chain.contains("injected DynamoDB service error"));
+  assert!(error_chain.contains("injected DynamoDB dispatch error"));
+}
+
+#[tokio::test]
 async fn byte_capacity_defers_later_batches_until_the_next_scan() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
@@ -1518,6 +1566,181 @@ async fn fast_scan_omits_windows_before_the_safe_publication_floor() {
   assert_eq!(
     *metadata_store.scans.lock(),
     vec![(window_start, Some(safe_floor))]
+  );
+}
+
+#[tokio::test]
+async fn fast_scan_prunes_frontiers_for_windows_before_the_safe_publication_floor() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let current_window_start = 1_700_000_100;
+  let previous_window_start = current_window_start - 300;
+  let previous_snowflake = SnowflakeId::minimum_for_timestamp(
+    OffsetDateTime::from_unix_timestamp(current_window_start - 20).unwrap(),
+  );
+  let current_snowflake = SnowflakeId::minimum_for_timestamp(
+    OffsetDateTime::from_unix_timestamp(current_window_start).unwrap(),
+  );
+
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    previous_window_start,
+    previous_snowflake.as_u64(),
+    7,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(
+      vec![1],
+      current_window_start.saturating_mul(1_000),
+    )],
+    Compression::none(),
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      metadata_visibility_delay_ms: Some(0),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    Arc::clone(&blob_store),
+    Arc::clone(&metadata_store),
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .unwrap();
+
+  assert_eq!(
+    reader
+      .read_available(current_window_start)
+      .await
+      .unwrap()
+      .len(),
+    1
+  );
+  let scan_at_rollover = reader
+    .partition_scan_states()
+    .into_iter()
+    .find(|state| state.virtual_partition_id == 7)
+    .unwrap();
+  assert_eq!(
+    scan_at_rollover.fast_scan_bounds,
+    vec![
+      ConsumerReaderFastScanBoundState {
+        window_start_unix_seconds: previous_window_start,
+        floor_timestamp_unix_seconds: current_window_start - 30,
+        time_floor: SnowflakeId::minimum_for_timestamp(
+          OffsetDateTime::from_unix_timestamp(current_window_start - 30).unwrap(),
+        ),
+        observed_frontier: None,
+        partition_lower_bound: SnowflakeId::minimum_for_timestamp(
+          OffsetDateTime::from_unix_timestamp(current_window_start - 30).unwrap(),
+        ),
+        query_lower_bound: Some(SnowflakeId::minimum_for_timestamp(
+          OffsetDateTime::from_unix_timestamp(current_window_start - 30).unwrap(),
+        )),
+      },
+      ConsumerReaderFastScanBoundState {
+        window_start_unix_seconds: current_window_start,
+        floor_timestamp_unix_seconds: current_window_start,
+        time_floor: current_snowflake,
+        observed_frontier: None,
+        partition_lower_bound: current_snowflake,
+        query_lower_bound: Some(current_snowflake),
+      },
+    ]
+  );
+  assert_eq!(
+    scan_at_rollover.fast_frontiers,
+    vec![ConsumerReaderFastFrontierState {
+      window_start_unix_seconds: previous_window_start,
+      snowflake_id: previous_snowflake,
+    }]
+  );
+
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    current_window_start,
+    current_snowflake.as_u64(),
+    7,
+    SeqRange { start: 2, end: 2 },
+    vec![new_record(
+      vec![2],
+      current_window_start.saturating_mul(1_000),
+    )],
+    Compression::none(),
+  )
+  .await;
+  assert_eq!(
+    reader
+      .read_available(current_window_start + 1)
+      .await
+      .unwrap()
+      .len(),
+    1
+  );
+  let scan_after_previous_frontier = reader
+    .partition_scan_states()
+    .into_iter()
+    .find(|state| state.virtual_partition_id == 7)
+    .unwrap();
+  assert_eq!(
+    scan_after_previous_frontier
+      .fast_scan_bounds
+      .iter()
+      .map(|bound| bound.observed_frontier)
+      .collect::<Vec<_>>(),
+    vec![Some(previous_snowflake), None]
+  );
+  let frontiers_at_rollover = reader
+    .partition_scan_states()
+    .into_iter()
+    .find(|state| state.virtual_partition_id == 7)
+    .unwrap()
+    .fast_frontiers
+    .clone();
+  assert_eq!(
+    frontiers_at_rollover,
+    vec![
+      ConsumerReaderFastFrontierState {
+        window_start_unix_seconds: previous_window_start,
+        snowflake_id: previous_snowflake,
+      },
+      ConsumerReaderFastFrontierState {
+        window_start_unix_seconds: current_window_start,
+        snowflake_id: current_snowflake,
+      },
+    ]
+  );
+
+  assert!(
+    reader
+      .read_available(current_window_start + 120)
+      .await
+      .unwrap()
+      .is_empty()
+  );
+  let frontiers_after_cutoff = reader
+    .partition_scan_states()
+    .into_iter()
+    .find(|state| state.virtual_partition_id == 7)
+    .unwrap()
+    .fast_frontiers
+    .clone();
+  assert_eq!(
+    frontiers_after_cutoff,
+    vec![ConsumerReaderFastFrontierState {
+      window_start_unix_seconds: current_window_start,
+      snowflake_id: current_snowflake,
+    }]
   );
 }
 

@@ -1065,7 +1065,7 @@ impl ConsumerDriver {
     {
       debug!(
         "consumer membership heartbeat failed: topic={}, group_id={}, member_id={}, trigger={}, \
-         generation={}, elapsed_ms={}, error={error}",
+         generation={}, elapsed_ms={}, error={error:#}",
         self.group_config.topic,
         self.group_config.group_id,
         self.group_config.member_id,
@@ -1099,7 +1099,7 @@ impl ConsumerDriver {
       Err(error) => {
         debug!(
           "consumer coordinator heartbeat failed: topic={}, group_id={}, member_id={}, \
-           trigger={}, generation={}, elapsed_ms={}, error={error}",
+           trigger={}, generation={}, elapsed_ms={}, error={error:#}",
           self.group_config.topic,
           self.group_config.group_id,
           self.group_config.member_id,
@@ -1185,7 +1185,7 @@ impl ConsumerDriver {
     if let Err(error) = self.start() {
       {
         let mut shared_state = self.shared_state.lock();
-        shared_state.terminal_error = Some(error.to_string());
+        shared_state.terminal_error = Some(format!("{error:#}"));
         shared_state.diagnostics.started = false;
         shared_state.diagnostics.prefetch_worker_running = false;
       }
@@ -1197,7 +1197,7 @@ impl ConsumerDriver {
       let revocation_completed = match self.finish_pending_revocation_if_completed().await {
         Ok(completed) => completed,
         Err(error) => {
-          self.shared_state.lock().terminal_error = Some(error.to_string());
+          self.shared_state.lock().terminal_error = Some(format!("{error:#}"));
           let _ = self.shutdown().await;
           self.delivery_notify.notify_waiters();
           return;
@@ -1236,7 +1236,7 @@ impl ConsumerDriver {
         if let Err(error) = self.heartbeat(now_ts_ms, HeartbeatTrigger::Scheduled).await {
           warn_every!(
             15.seconds(),
-            "consumer scheduled heartbeat retrying after error: error={error}"
+            "consumer scheduled heartbeat retrying after error: error={error:#}"
           );
           self.next_heartbeat_at_ms = now_ts_ms.saturating_add(1_000);
           self.refresh_diagnostics();
@@ -1330,14 +1330,14 @@ impl ConsumerDriver {
       {
         debug!(
           "consumer planner release failed during shutdown: topic={}, group_id={}, member_id={}, \
-           error={error}",
+           error={error:#}",
           self.group_config.topic, self.group_config.group_id, self.group_config.member_id
         );
       }
       if let Err(error) = deregistration_result {
         debug!(
           "consumer membership deregistration failed during shutdown: topic={}, group_id={}, \
-           member_id={}, error={error}",
+           member_id={}, error={error:#}",
           self.group_config.topic, self.group_config.group_id, self.group_config.member_id
         );
       }
