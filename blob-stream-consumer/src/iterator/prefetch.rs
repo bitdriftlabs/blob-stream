@@ -21,6 +21,7 @@ use crate::consumer::{
   ConsumerBatch,
   ConsumerReader,
   ConsumerReaderFastFrontierState,
+  ConsumerReaderFastScanBoundState,
   ConsumerReaderImpl,
   ConsumerReaderPartitionMode,
   ConsumerReaderPartitionScanState,
@@ -30,13 +31,19 @@ use crate::coordination::RecoveredCursor;
 use crate::diagnostics::{
   ConsumerPartitionReadMode,
   ConsumerReaderFastFrontierSnapshot,
+  ConsumerReaderFastScanBoundSnapshot,
   ConsumerReaderPartitionSnapshot,
   ConsumerReaderScanSnapshot,
   offsets_from_map,
 };
 use anyhow::Result;
 use bd_log::warn_every;
-use blob_stream_types::{VirtualPartitionId, format_unix_timestamp_ms, now_unix_seconds};
+use blob_stream_types::{
+  SnowflakeId,
+  VirtualPartitionId,
+  format_unix_timestamp_ms,
+  now_unix_seconds,
+};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -416,6 +423,11 @@ fn reader_partition_scan_snapshot(
       .iter()
       .map(|window_start| format_unix_timestamp_ms(window_start.saturating_mul(1_000)))
       .collect(),
+    fast_scan_bounds: state
+      .fast_scan_bounds
+      .iter()
+      .map(reader_fast_scan_bound_snapshot)
+      .collect(),
     fast_frontiers: state
       .fast_frontiers
       .iter()
@@ -433,6 +445,21 @@ fn reader_partition_scan_snapshot(
     metadata_batches_deferred_by_capacity: state.metadata_batches_deferred_by_capacity,
     batches_accepted: state.batches_accepted,
     records_accepted: state.records_accepted,
+  }
+}
+
+fn reader_fast_scan_bound_snapshot(
+  state: &ConsumerReaderFastScanBoundState,
+) -> ConsumerReaderFastScanBoundSnapshot {
+  ConsumerReaderFastScanBoundSnapshot {
+    window_start: format_unix_timestamp_ms(state.window_start_unix_seconds.saturating_mul(1_000)),
+    floor_timestamp: format_unix_timestamp_ms(
+      state.floor_timestamp_unix_seconds.saturating_mul(1_000),
+    ),
+    time_floor_snowflake_id: state.time_floor.as_u64(),
+    observed_frontier_snowflake_id: state.observed_frontier.map(SnowflakeId::as_u64),
+    partition_lower_bound_snowflake_id: state.partition_lower_bound.as_u64(),
+    query_lower_bound_snowflake_id: state.query_lower_bound.map(SnowflakeId::as_u64),
   }
 }
 

@@ -13,11 +13,11 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-anyhow            = "1.0.103"
-async-trait       = "0.1.89"
+anyhow            = "1.0.104"
+async-trait       = "0.1.91"
 aws-config        = "1.9.0"
 aws-sdk-dynamodb  = "1.117.0"
-aws-sdk-s3        = "1.138.0"
+aws-sdk-s3        = "1.138.1"
 aws-types         = "1.4.0"
 axum              = { version = "0.8.9", features = ["http2", "macros"] }
 bd-grpc           = { git = "https://github.com/bitdriftlabs/shared-core.git" }
@@ -30,9 +30,9 @@ bd-server-stats   = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bd-test-helpers   = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bd-time           = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bytes             = "1.12.1"
-clap              = { version = "4.6.2", features = ["derive", "env"] }
+clap              = { version = "4.6.3", features = ["derive", "env"] }
 ctor              = "1.0.9"
-futures           = "0.3.32"
+futures           = "0.3.33"
 hostname          = "0.4.2"
 http              = "1.4.2"
 hyper-util        = { version = "0.1.20", features = ["client", "client-legacy"] }
@@ -49,15 +49,15 @@ protobuf = { git = "https://github.com/bitdriftlabs/rust-protobuf.git", branch =
 protobuf-codegen = { git = "https://github.com/bitdriftlabs/rust-protobuf.git", branch = "patch-stack" }
 protobuf-json-mapping = { git = "https://github.com/bitdriftlabs/rust-protobuf.git", branch = "patch-stack" }
 
-serde             = { version = "1.0.228", features = ["derive"] }
+serde             = { version = "1.0.229", features = ["derive"] }
 serde_dynamo      = "4.3.0"
-serde_json        = { version = "1.0.150" }
+serde_json        = { version = "1.0.151" }
 serde_yaml        = "0.9.34"
 sonyflake         = { git = "https://github.com/mattklein123/sonyflake-rs.git" }
-thiserror         = "2.0.18"
+thiserror         = "2.0.19"
 tikv-jemallocator = "0.7.0"
-time              = { version = "0.3.53", features = ["formatting", "serde-well-known", "macros", "parsing"] }
-tokio             = { version = "1.52.4", features = ["full"] }
+time              = { version = "0.3.54", features = ["formatting", "serde-well-known", "macros", "parsing"] }
+tokio             = { version = "1.53.1", features = ["full"] }
 tokio-stream      = "0.1.18"
 uuid              = { version = "1.24.0", features = ["v4"] }
 zstd              = "0.13.3"

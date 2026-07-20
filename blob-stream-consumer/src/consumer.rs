@@ -59,11 +59,12 @@ fn format_unix_timestamp_seconds(timestamp_seconds: i64) -> String {
 //      window, so a stale eventual read cannot skip it.
 //
 // 2) Scan the active publication horizon
-//    - Fast partitions scan the current window and enough trailing windows to cover the configured
-//      metadata publication bound plus the visibility delay.
-//    - Each partition/window pair has an inclusive snowflake frontier. The query uses the lowest
-//      frontier among eligible fast partitions, then each partition filters independently. This
-//      finds late metadata without requiring a broad metadata projection.
+//    - Fast partitions scan only windows that can still contain unpublished or invisible metadata.
+//      The shared Sonyflake time floor derived from the publication and visibility bounds narrows
+//      each query, including when a sparse partition has no observed segment frontier.
+//    - Each partition/window pair retains an inclusive observed frontier. The query uses the lowest
+//      effective lower bound among eligible fast partitions, then each partition filters
+//      independently. This finds late metadata without rereading a completed sparse window.
 //
 // 3) Filter, decode, and advance cursors
 //    - Metadata scans are unordered, so segments are sorted by snowflake id and each partition's
@@ -122,6 +123,7 @@ pub struct ConsumerBatch {
 pub struct ConsumerReaderPartitionScanState {
   pub virtual_partition_id: VirtualPartitionId,
   pub scanned_window_starts: Arc<[i64]>,
+  pub fast_scan_bounds: Vec<ConsumerReaderFastScanBoundState>,
   pub fast_frontiers: Vec<ConsumerReaderFastFrontierState>,
   pub completed_at_unix_seconds: i64,
   pub cursor_before: Option<u64>,
@@ -136,6 +138,21 @@ pub struct ConsumerReaderPartitionScanState {
   pub metadata_batches_deferred_by_capacity: usize,
   pub batches_accepted: usize,
   pub records_accepted: usize,
+}
+
+//
+// ConsumerReaderFastScanBoundState
+//
+
+/// Fast-path lower-bound inputs and the resulting shared metadata-query bound for one window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsumerReaderFastScanBoundState {
+  pub window_start_unix_seconds: i64,
+  pub floor_timestamp_unix_seconds: i64,
+  pub time_floor: SnowflakeId,
+  pub observed_frontier: Option<SnowflakeId>,
+  pub partition_lower_bound: SnowflakeId,
+  pub query_lower_bound: Option<SnowflakeId>,
 }
 
 //
@@ -159,6 +176,7 @@ impl ConsumerReaderPartitionScanState {
     Self {
       virtual_partition_id,
       scanned_window_starts,
+      fast_scan_bounds: Vec::new(),
       fast_frontiers: Vec::new(),
       completed_at_unix_seconds,
       cursor_before,

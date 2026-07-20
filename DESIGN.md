@@ -288,9 +288,12 @@ For every `read_available()` call, a consumer plans work independently for each 
   live fast path until it reaches its captured cutover. Recovery scans do not use the checkpoint
   snowflake as a DynamoDB lower bound, so late lower-snowflake metadata remains discoverable.
 4. Fast partitions scan a trailing horizon derived from the topic's enforced metadata-publication
-  deadline plus `metadata_visibility_delay_ms`. Each aggregate window query starts at the lowest
-  established inclusive frontier across assigned partitions; frontiers remain per partition and
-  window because snowflake ordering is not shared across concurrently flushed partitions.
+  deadline plus `metadata_visibility_delay_ms`. They omit windows whose end is older than that
+  safe timestamp. For a remaining window, the aggregate DynamoDB query starts at the lowest
+  effective bound across assigned fast partitions: a Sonyflake time floor for the safe timestamp
+  (or the window start) tightened by that partition's observed inclusive frontier. Frontiers
+  remain per partition and window because snowflake ordering is not shared across concurrently
+  flushed partitions.
 5. The reader sorts segments by snowflake ID, filters their indexes to eligible assigned
   partitions, sorts batches by `seq_start`, skips ranges covered by the in-memory cursor, and
   decodes only the required blob byte ranges.
@@ -321,17 +324,25 @@ for that partition before the new assignment becomes active.
 
 ### Delayed Metadata Bound
 
-delays, retries, outages, and clock skew.
-guarantee. DynamoDB does not provide a maximum convergence delay for eventually consistent
-The fast path considers metadata only after the configured visibility delay. Its candidate horizon
-covers the broker's metadata-publication deadline plus that delay, so a metadata row that meets the
-publication contract remains in a scanned window when it becomes eligible. Event timestamps do not
-affect metadata selection; the bound is based on segment windows and snowflakes.
+The fast path defines a safe timestamp by subtracting the broker's enforced metadata-publication
+deadline and the configured visibility delay from its current time. It omits candidate windows
+whose end is no newer than that timestamp. For an overlapping window, it uses the Sonyflake lower
+bound for the safe timestamp; for newer windows, it uses the window-start lower bound. This keeps
+a sparse partition from forcing its peers to repeatedly query an entire window. Observed inclusive
+frontiers only tighten that time-derived bound.
 
-The default visibility delay is two seconds. It is a best-effort staleness margin, not a DynamoDB
-replication-delay guarantee: eventually consistent reads have no bounded convergence time. A row
-that becomes visible after its derived candidate window leaves the horizon is not automatically
-rediscovered by the fast path; a resumed consumer instead performs retention-bounded recovery.
+This calculation relies on the existing deployment assumption that broker and consumer clocks are
+synchronized. There is currently no separately configured clock-skew allowance. Event timestamps
+do not affect metadata selection; the bound uses the broker-assigned Sonyflake ID and segment
+window.
+
+The candidate horizon covers the broker's metadata-publication deadline plus the visibility delay,
+so a metadata row that meets the publication contract remains in a scanned window when it becomes
+eligible. The default visibility delay is two seconds. It is a best-effort staleness margin, not a
+DynamoDB replication-delay guarantee: eventually consistent reads have no bounded convergence
+time. A row that becomes visible after its derived candidate window leaves the horizon is not
+automatically rediscovered by the fast path; a resumed consumer instead performs
+retention-bounded recovery.
 
 ### Read Consistency and Delivery Tradeoffs
 

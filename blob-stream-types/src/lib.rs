@@ -342,6 +342,12 @@ impl SnowflakeId {
   }
 
   #[must_use]
+  /// Return the lowest Sonyflake ID that can be generated at or after `timestamp`.
+  pub fn minimum_for_timestamp(timestamp: OffsetDateTime) -> Self {
+    Self(sonyflake::minimum_for_timestamp(timestamp))
+  }
+
+  #[must_use]
   /// Lexicographically sortable fixed-width decimal representation.
   pub fn format_lex(self) -> String {
     format!("{:020}", self.0)

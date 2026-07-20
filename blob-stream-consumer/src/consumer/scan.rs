@@ -246,6 +246,12 @@ impl ConsumerReaderImpl {
           })
       })
       .collect::<HashMap<_, _>>();
+    self.record_fast_scan_bounds(
+      &scan_requests,
+      &assigned_partition_ids,
+      now_unix_seconds,
+      &mut scan_states,
+    );
     let recovery_window_end = scan_requests
       .iter()
       .filter(|request| request.eligibility.recovering)
@@ -699,7 +705,7 @@ impl ConsumerReaderImpl {
          metadata_batches_skipped_by_cursor={}, metadata_segments_skipped_by_frontier={}, \
          metadata_segments_deferred_by_visibility={}, metadata_segments_blocked_by_visibility={}, \
          metadata_batches_deferred_by_capacity={}, batches_accepted={}, records_accepted={}, \
-         fast_frontiers={:?}",
+         fast_scan_bounds={:?}, fast_frontiers={:?}",
         self.config.topic,
         partition_id,
         scan_state.scanned_window_starts,
@@ -715,6 +721,7 @@ impl ConsumerReaderImpl {
         scan_state.metadata_batches_deferred_by_capacity,
         scan_state.batches_accepted,
         scan_state.records_accepted,
+        scan_state.fast_scan_bounds,
         scan_state.fast_frontiers
       );
     }
@@ -764,27 +771,111 @@ impl ConsumerReaderImpl {
       });
   }
 
-  /// Find the least inclusive frontier required when one query serves several fast partitions.
+  /// Find the least inclusive lower bound required when one query serves several fast partitions.
   fn fast_scan_min_snowflake(
     &self,
     assigned_partition_ids: &[VirtualPartitionId],
     window_start_unix_seconds: i64,
-  ) -> Option<SnowflakeId> {
+    safe_floor: SnowflakeId,
+  ) -> SnowflakeId {
     let mut minimum = None;
     for &partition_id in assigned_partition_ids {
-      if !matches!(
-        self.virtual_partition_states.get(&partition_id),
-        Some(VirtualPartitionState::Fast { .. })
-      ) {
+      let Some((_, partition_lower_bound)) =
+        self.fast_scan_partition_lower_bound(partition_id, window_start_unix_seconds, safe_floor)
+      else {
+        continue;
+      };
+      minimum = Some(
+        minimum.map_or(partition_lower_bound, |current: SnowflakeId| {
+          current.min(partition_lower_bound)
+        }),
+      );
+    }
+    minimum.unwrap_or(safe_floor)
+  }
+
+  /// Return the observed and effective lower bounds for one Fast partition/window pair.
+  fn fast_scan_partition_lower_bound(
+    &self,
+    partition_id: VirtualPartitionId,
+    window_start_unix_seconds: i64,
+    safe_floor: SnowflakeId,
+  ) -> Option<(Option<SnowflakeId>, SnowflakeId)> {
+    if !matches!(
+      self.virtual_partition_states.get(&partition_id),
+      Some(VirtualPartitionState::Fast { .. })
+    ) {
+      return None;
+    }
+    let observed_frontier = self
+      .fast_frontiers
+      .get(&(partition_id, window_start_unix_seconds))
+      .copied();
+    let partition_lower_bound =
+      observed_frontier.map_or(safe_floor, |frontier| frontier.max(safe_floor));
+    Some((observed_frontier, partition_lower_bound))
+  }
+
+  /// Record the time and frontier inputs that determined each Fast partition's shared query.
+  fn record_fast_scan_bounds(
+    &self,
+    scan_requests: &[ScanRequest],
+    assigned_partition_ids: &[VirtualPartitionId],
+    now_unix_seconds: i64,
+    scan_states: &mut HashMap<VirtualPartitionId, super::ConsumerReaderPartitionScanState>,
+  ) {
+    let safe_timestamp_unix_seconds = self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds);
+    for request in scan_requests {
+      if !request.eligibility.fast {
         continue;
       }
-      let frontier = self
-        .fast_frontiers
-        .get(&(partition_id, window_start_unix_seconds))
-        .copied()?;
-      minimum = Some(minimum.map_or(frontier, |current: SnowflakeId| current.min(frontier)));
+      let floor_timestamp_unix_seconds = request
+        .window
+        .window_start_unix_seconds
+        .max(safe_timestamp_unix_seconds);
+      let time_floor = Self::snowflake_floor(floor_timestamp_unix_seconds);
+      for &partition_id in assigned_partition_ids {
+        let Some((observed_frontier, partition_lower_bound)) = self
+          .fast_scan_partition_lower_bound(
+            partition_id,
+            request.window.window_start_unix_seconds,
+            time_floor,
+          )
+        else {
+          continue;
+        };
+        if let Some(scan_state) = scan_states.get_mut(&partition_id) {
+          scan_state
+            .fast_scan_bounds
+            .push(super::ConsumerReaderFastScanBoundState {
+              window_start_unix_seconds: request.window.window_start_unix_seconds,
+              floor_timestamp_unix_seconds,
+              time_floor,
+              observed_frontier,
+              partition_lower_bound,
+              query_lower_bound: request.min_snowflake,
+            });
+        }
+      }
     }
-    minimum
+  }
+
+  /// Return the oldest timestamp whose metadata may still be unpublished or invisible.
+  fn fast_scan_safe_timestamp_unix_seconds(&self, now_unix_seconds: i64) -> i64 {
+    // This relies on the existing deployment assumption that broker and consumer clocks are
+    // synchronized. Keep the two configured timing bounds together so a future skew margin has
+    // one obvious place to join the safety calculation.
+    let safe_delay_ms = self
+      .maximum_metadata_publication_lag_ms
+      .saturating_add(consumer_metadata_visibility_delay_ms(&self.config));
+    let safe_delay_seconds = safe_delay_ms.saturating_add(999) / 1_000;
+    now_unix_seconds.saturating_sub(i64::try_from(safe_delay_seconds).unwrap_or(i64::MAX))
+  }
+
+  /// Return the lowest possible segment ID for a timestamp, preserving safety for invalid input.
+  fn snowflake_floor(timestamp_unix_seconds: i64) -> SnowflakeId {
+    time::OffsetDateTime::from_unix_timestamp(timestamp_unix_seconds)
+      .map_or(SnowflakeId(0), SnowflakeId::minimum_for_timestamp)
   }
 
   /// Build a scan pass that prioritizes bounded recovery before using the fast path.
@@ -885,12 +976,30 @@ impl ConsumerReaderImpl {
       .values()
       .any(|state| state.is_assigned() && matches!(state, VirtualPartitionState::Fast { .. }))
     {
+      let safe_timestamp_unix_seconds =
+        self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds);
+      let window_size_seconds = consumer_window_size_seconds(&self.config);
       for window in self.scan_windows(now_unix_seconds)? {
+        let window_end_unix_seconds = window
+          .window_start_unix_seconds
+          .saturating_add(window_size_seconds);
+        if window_end_unix_seconds <= safe_timestamp_unix_seconds {
+          continue;
+        }
+        let safe_floor = Self::snowflake_floor(
+          window
+            .window_start_unix_seconds
+            .max(safe_timestamp_unix_seconds),
+        );
         Self::insert_scan_request(
           &mut scan_requests,
           self.config.topic.as_str(),
           window.window_start_unix_seconds,
-          self.fast_scan_min_snowflake(assigned_partition_ids, window.window_start_unix_seconds),
+          Some(self.fast_scan_min_snowflake(
+            assigned_partition_ids,
+            window.window_start_unix_seconds,
+            safe_floor,
+          )),
           false,
           ScanEligibility {
             recovering: false,
