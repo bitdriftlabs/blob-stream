@@ -20,14 +20,18 @@ use super::{
 use crate::consumer::{
   ConsumerBatch,
   ConsumerReader,
+  ConsumerReaderFastFrontierState,
   ConsumerReaderImpl,
   ConsumerReaderPartitionMode,
+  ConsumerReaderPartitionScanState,
   ReadCapacity,
 };
 use crate::coordination::RecoveredCursor;
 use crate::diagnostics::{
   ConsumerPartitionReadMode,
+  ConsumerReaderFastFrontierSnapshot,
   ConsumerReaderPartitionSnapshot,
+  ConsumerReaderScanSnapshot,
   offsets_from_map,
 };
 use anyhow::Result;
@@ -390,6 +394,55 @@ pub(super) fn record_reader_diagnostics(
     .into_iter()
     .map(|state| reader_partition_snapshot(state.virtual_partition_id, state.mode))
     .collect();
+  shared_state.diagnostics.reader_partition_scans = reader
+    .partition_scan_states()
+    .into_iter()
+    .map(|state| {
+      (
+        state.virtual_partition_id,
+        reader_partition_scan_snapshot(state),
+      )
+    })
+    .collect();
+}
+
+fn reader_partition_scan_snapshot(
+  state: &ConsumerReaderPartitionScanState,
+) -> ConsumerReaderScanSnapshot {
+  ConsumerReaderScanSnapshot {
+    completed_at: format_unix_timestamp_ms(state.completed_at_unix_seconds.saturating_mul(1_000)),
+    scanned_window_starts: state
+      .scanned_window_starts
+      .iter()
+      .map(|window_start| format_unix_timestamp_ms(window_start.saturating_mul(1_000)))
+      .collect(),
+    fast_frontiers: state
+      .fast_frontiers
+      .iter()
+      .map(reader_fast_frontier_snapshot)
+      .collect(),
+    cursor_before: state.cursor_before,
+    cursor_after: state.cursor_after,
+    metadata_segments_seen: state.metadata_segments_seen,
+    metadata_segments_without_partition_batches: state.metadata_segments_without_partition_batches,
+    metadata_batches_seen: state.metadata_batches_seen,
+    metadata_batches_skipped_by_cursor: state.metadata_batches_skipped_by_cursor,
+    metadata_segments_skipped_by_frontier: state.metadata_segments_skipped_by_frontier,
+    metadata_segments_deferred_by_visibility: state.metadata_segments_deferred_by_visibility,
+    metadata_segments_blocked_by_visibility: state.metadata_segments_blocked_by_visibility,
+    metadata_batches_deferred_by_capacity: state.metadata_batches_deferred_by_capacity,
+    batches_accepted: state.batches_accepted,
+    records_accepted: state.records_accepted,
+  }
+}
+
+fn reader_fast_frontier_snapshot(
+  state: &ConsumerReaderFastFrontierState,
+) -> ConsumerReaderFastFrontierSnapshot {
+  ConsumerReaderFastFrontierSnapshot {
+    window_start: format_unix_timestamp_ms(state.window_start_unix_seconds.saturating_mul(1_000)),
+    snowflake_id: state.snowflake_id.as_u64(),
+  }
 }
 
 /// Apply every queued reader mutation before starting another asynchronous reader scan.

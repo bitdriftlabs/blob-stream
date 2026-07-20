@@ -680,7 +680,6 @@ async fn diagnostics_report_assignment_and_start_state() {
     .diagnostics()
     .expect("consumer implementation provides diagnostics");
   let snapshot = diagnostics.state_snapshot();
-  assert_eq!(snapshot.schema_version, 11);
   assert!(snapshot.generated_at.ends_with('Z'));
   assert_eq!(snapshot.topic, "telemetry");
   assert_eq!(snapshot.group_id, "group-a");
@@ -786,7 +785,6 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
     .expect("consumer implementation provides diagnostics")
     .state_response()
     .await;
-  assert_eq!(response.state.schema_version, 12);
   assert_eq!(
     response
       .state
@@ -856,11 +854,8 @@ async fn state_response_reports_lease_lookup_failure_without_blocking_local_diag
   let diagnostics = iterator
     .diagnostics()
     .expect("consumer implementation provides diagnostics");
-  let local_snapshot = diagnostics.state_snapshot();
   let response = diagnostics.state_response().await;
 
-  assert_eq!(local_snapshot.schema_version, 11);
-  assert_eq!(response.state.schema_version, 12);
   assert!(matches!(
     response.group_lease_observation,
     ConsumerGroupLeaseObservation::LookupFailed { .. }

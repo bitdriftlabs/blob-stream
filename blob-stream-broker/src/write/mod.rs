@@ -83,7 +83,6 @@ pub struct WriteResponse {
 
 #[derive(Debug, Serialize)]
 pub struct BrokerStateSnapshot {
-  pub schema_version: u32,
   pub generated_at: String,
   pub holder_id: String,
   pub writer_id: u32,
@@ -958,7 +957,6 @@ impl WriteEngine for WriteEngineImpl {
     });
 
     BrokerStateSnapshot {
-      schema_version: 4,
       generated_at,
       holder_id: self.holder_id.clone(),
       writer_id: self.config.writer_id,

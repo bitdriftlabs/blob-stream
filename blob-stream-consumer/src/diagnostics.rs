@@ -31,7 +31,6 @@ pub struct ConsumerStateResponse {
 #[derive(Clone, Debug, Serialize)]
 /// Immutable local state that is available without awaiting external work.
 pub struct ConsumerStateSnapshot {
-  pub schema_version: u32,
   pub generated_at: String,
   pub topic: String,
   pub group_id: String,
@@ -81,6 +80,7 @@ pub struct ConsumerLocalPartitionSnapshot {
   pub last_committed_offset: Option<u64>,
   pub cursor: Option<u64>,
   pub reader: Option<ConsumerReaderStateSnapshot>,
+  pub last_scan: Option<ConsumerReaderScanSnapshot>,
   pub prefetch_buffered_batch_count: usize,
   pub prefetch_buffered_record_count: usize,
 }
@@ -95,6 +95,41 @@ pub struct ConsumerReaderStateSnapshot {
   pub mode: ConsumerPartitionReadMode,
   pub recovery_next_window_start: Option<String>,
   pub recovery_cutover_window_start: Option<String>,
+}
+
+//
+// ConsumerReaderScanSnapshot
+//
+
+/// Most recent successful scan outcome for one local reader partition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ConsumerReaderScanSnapshot {
+  pub completed_at: String,
+  pub scanned_window_starts: Vec<String>,
+  pub fast_frontiers: Vec<ConsumerReaderFastFrontierSnapshot>,
+  pub cursor_before: Option<u64>,
+  pub cursor_after: Option<u64>,
+  pub metadata_segments_seen: usize,
+  pub metadata_segments_without_partition_batches: usize,
+  pub metadata_batches_seen: usize,
+  pub metadata_batches_skipped_by_cursor: usize,
+  pub metadata_segments_skipped_by_frontier: usize,
+  pub metadata_segments_deferred_by_visibility: usize,
+  pub metadata_segments_blocked_by_visibility: usize,
+  pub metadata_batches_deferred_by_capacity: usize,
+  pub batches_accepted: usize,
+  pub records_accepted: usize,
+}
+
+//
+// ConsumerReaderFastFrontierSnapshot
+//
+
+/// Retained inclusive metadata frontier for one reader window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ConsumerReaderFastFrontierSnapshot {
+  pub window_start: String,
+  pub snowflake_id: u64,
 }
 
 //
@@ -202,6 +237,7 @@ pub struct ConsumerDiagnosticsRuntimeState {
   pub last_committed_offsets: HashMap<VirtualPartitionId, u64>,
   pub cursors: Vec<ConsumerOffsetSnapshot>,
   pub reader_partitions: Vec<ConsumerReaderPartitionSnapshot>,
+  pub reader_partition_scans: Vec<(VirtualPartitionId, ConsumerReaderScanSnapshot)>,
   pub last_successful_heartbeat_at_ms: Option<i64>,
   pub next_heartbeat_at_ms: i64,
   pub next_rebalance_at_ms: i64,
@@ -307,6 +343,9 @@ impl ConsumerDiagnostics {
           recovery_cutover_window_start,
         });
     }
+    for (partition_id, scan) in runtime_state.reader_partition_scans {
+      local_partition_snapshot(&mut local_partitions, partition_id).last_scan = Some(scan);
+    }
     for (partition_id, record_count) in &buffered_batches {
       let snapshot = local_partition_snapshot(&mut local_partitions, *partition_id);
       snapshot.prefetch_buffered_batch_count =
@@ -330,7 +369,6 @@ impl ConsumerDiagnostics {
       .saturating_add(current_batch.map_or(0, |(_, record_count)| record_count));
 
     ConsumerStateSnapshot {
-      schema_version: 11,
       generated_at: format_unix_timestamp_ms(now_unix_millis()),
       topic: self.group_config.topic.to_string(),
       group_id: self.group_config.group_id.to_string(),
@@ -394,7 +432,6 @@ impl ConsumerDiagnostics {
       },
     };
 
-    state.schema_version = 12;
     state.generated_at = format_unix_timestamp_ms(now_unix_millis());
     ConsumerStateResponse {
       state,
@@ -527,6 +564,7 @@ fn local_partition_snapshot(
       last_committed_offset: None,
       cursor: None,
       reader: None,
+      last_scan: None,
       prefetch_buffered_batch_count: 0,
       prefetch_buffered_record_count: 0,
     })
