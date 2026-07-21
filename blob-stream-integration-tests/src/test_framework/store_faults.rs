@@ -31,6 +31,10 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
 
+#[cfg(test)]
+#[path = "./store_faults_test.rs"]
+mod tests;
+
 //
 // StoreFaultDomain
 //
@@ -782,6 +786,32 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
       return Err(anyhow!(
         "producer acquire_lease_and_reserve_sequences fault for key {key_format}: {message}"
       ));
+    }
+    if reservation_size.is_some() {
+      let effects = self
+        .controller
+        .effects_for_call(
+          StoreFaultDomain::ProducerLease,
+          StoreFaultOperation::ProducerReserveSequences,
+          &key_format,
+        )
+        .await;
+      if let Some(delay) = effects.delay {
+        sleep(delay).await;
+      }
+      if let Some(timeout) = effects.timeout {
+        sleep(timeout).await;
+        return Err(anyhow!(
+          "producer acquire_lease_and_reserve_sequences timed out reserving sequences for key \
+           {key_format}"
+        ));
+      }
+      if let Some(message) = effects.fail_message {
+        return Err(anyhow!(
+          "producer acquire_lease_and_reserve_sequences sequence reservation fault for key \
+           {key_format}: {message}"
+        ));
+      }
     }
 
     let result = self

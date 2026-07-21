@@ -329,6 +329,65 @@ fn maintenance_top_up_extends_the_current_reservation() {
   );
 }
 
+#[test]
+fn lease_reacquisition_discards_stale_sequence_capacity() {
+  let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
+  let initial = begin_allocation_transition(&state, "telemetry", 0, 1, 1_000, false, 10);
+  let AllocationTransitionDecision::Claimed(initial) = initial else {
+    panic!("expected initial reservation transition");
+  };
+  initial.transition.finish(
+    LeaseExpirationUpdate::Set(Some(2_000)),
+    Some(SeqRange { start: 0, end: 9 }),
+  );
+
+  {
+    let mut state = state.lock();
+    let partition = state.partition_state_mut("telemetry", 0);
+    assert_eq!(
+      partition.seq_allocator.allocate(5),
+      Some(SeqRange { start: 0, end: 4 })
+    );
+  }
+
+  let reacquire = begin_allocation_transition(&state, "telemetry", 0, 1, 2_000, false, 10);
+  let AllocationTransitionDecision::Claimed(reacquire) = reacquire else {
+    panic!("expected lease reacquisition transition");
+  };
+  assert!(reacquire.reservation.is_none());
+  reacquire
+    .transition
+    .finish(LeaseExpirationUpdate::Set(Some(3_000)), None);
+
+  let reservation = begin_allocation_transition(&state, "telemetry", 0, 1, 2_001, false, 10);
+  let AllocationTransitionDecision::Claimed(reservation) = reservation else {
+    panic!("expected reservation transition after reacquisition");
+  };
+  reservation.transition.finish(
+    LeaseExpirationUpdate::Preserve,
+    Some(SeqRange { start: 20, end: 29 }),
+  );
+
+  let mut state = state.lock();
+  let partition = state.partition_state_mut("telemetry", 0);
+  assert_eq!(
+    partition.seq_allocator.allocate(1),
+    Some(SeqRange { start: 20, end: 20 })
+  );
+}
+
+#[test]
+fn nonadjacent_reservation_replaces_remaining_capacity() {
+  let mut allocator = super::SeqAllocator {
+    reservation: Some(SeqRange { start: 0, end: 9 }),
+    next_seq: 5,
+  };
+
+  allocator.install_or_extend_reservation(SeqRange { start: 20, end: 29 });
+
+  assert_eq!(allocator.allocate(1), Some(SeqRange { start: 20, end: 20 }));
+}
+
 fn make_engine(
   time_provider: Arc<TestTimeProvider>,
   config: WriteConfig,

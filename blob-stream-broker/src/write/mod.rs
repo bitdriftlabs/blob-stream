@@ -677,9 +677,8 @@ impl WriteEngineImpl {
         self.metrics.record_sequence_reservation(&reservation);
         debug!(
           "broker sequence reservation acquired during produce with coalesced lease update: \
-           topic={topic}, \
-           virtual_partition_id={virtual_partition_id}, requested_size={reservation_size}, \
-           start={}, end={}",
+           topic={topic}, virtual_partition_id={virtual_partition_id}, \
+           requested_size={reservation_size}, start={}, end={}",
           reservation.start, reservation.end
         );
         Ok((lease.lease_expiration_ts_ms, reservation))
@@ -1448,6 +1447,7 @@ struct AllocationTransition {
   state: Arc<Mutex<WriteState>>,
   topic: String,
   virtual_partition_id: VirtualPartitionId,
+  reset_sequence_allocation_on_finish: bool,
   finished: bool,
 }
 
@@ -1488,6 +1488,12 @@ impl AllocationTransition {
       let partition_state = state.partition_state_mut(&self.topic, self.virtual_partition_id);
       if let LeaseExpirationUpdate::Set(lease_expiration_ts_ms) = lease_expiration_update {
         partition_state.lease_expiration_ts_ms = lease_expiration_ts_ms;
+      }
+      if matches!(lease_expiration_update, LeaseExpirationUpdate::Set(None))
+        || (self.reset_sequence_allocation_on_finish
+          && matches!(lease_expiration_update, LeaseExpirationUpdate::Set(Some(_))))
+      {
+        partition_state.reset_sequence_allocation();
       }
       if let Some(reservation) = reservation {
         partition_state
@@ -1594,7 +1600,8 @@ fn begin_allocation_transition(
     );
   }
 
-  let needs_lease = renew_lease || partition_state.needs_lease(now_ts_ms);
+  let lease_was_expired = partition_state.needs_lease(now_ts_ms);
+  let needs_lease = renew_lease || lease_was_expired;
   let remaining_capacity = partition_state.seq_allocator.remaining_capacity();
   let records_allocated_since_last_maintenance =
     partition_state.records_allocated_since_lease_maintenance;
@@ -1645,6 +1652,7 @@ fn begin_allocation_transition(
       state: Arc::clone(state),
       topic: topic.to_string(),
       virtual_partition_id,
+      reset_sequence_allocation_on_finish: lease_was_expired,
       finished: false,
     },
     needs_lease,
@@ -1773,20 +1781,23 @@ impl SeqAllocator {
         .reservation
         .as_mut()
         .expect("remaining capacity requires a reservation");
-      debug_assert_eq!(
-        range.start,
-        reservation.end.saturating_add(1),
-        "reservation extensions must be adjacent"
+      if reservation
+        .end
+        .checked_add(1)
+        .is_some_and(|next_start| range.start == next_start)
+      {
+        reservation.end = range.end;
+        return;
+      }
+
+      debug!(
+        "broker sequence reservation replaced nonadjacent local range: previous_start={}, \
+         previous_end={}, replacement_start={}, replacement_end={}",
+        reservation.start, reservation.end, range.start, range.end
       );
-      reservation.end = range.end;
-      return;
     }
 
-    // A fully consumed local range must continue at the durable high-water mark.
-    debug_assert_eq!(
-      range.start, self.next_seq,
-      "replacement reservations must begin at the next sequence"
-    );
+    // A new owner can reserve above an intervening durable range after the local lease expires.
     self.next_seq = range.start;
     self.reservation = Some(range);
   }

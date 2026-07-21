@@ -163,6 +163,10 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
         AttributeValue::N(reservation_size.to_string()),
       );
       values.insert(":initial".to_string(), AttributeValue::N("-1".to_string()));
+      values.insert(
+        ":max_reservable".to_string(),
+        AttributeValue::N((u64::MAX - reservation_size).to_string()),
+      );
     }
 
     let update = match reservation_size {
@@ -174,9 +178,16 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
         format!("SET {ATTR_HOLDER} = :holder, {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl")
       },
     };
-    let condition = format!(
+    let lease_condition = format!(
       "attribute_not_exists({ATTR_PK}) OR {ATTR_EXPIRES} <= :now OR {ATTR_HOLDER} = :holder"
     );
+    let condition = match reservation_size {
+      Some(_) => format!(
+        "({lease_condition}) AND (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= \
+         :max_reservable)"
+      ),
+      None => lease_condition,
+    };
 
     let response = self
       .client
@@ -218,6 +229,9 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
           .read_lease(&key)
           .await?
           .ok_or_else(|| anyhow!("lease missing after conditional failure"))?;
+        if reservation_would_overflow(&lease, &holder_id, now_ts_ms, reservation_size) {
+          return Err(anyhow!("sequence range overflow"));
+        }
         Ok(LeaseAcquireAndReserveOutcome::HeldByOther(lease))
       },
       Err(error) => Err(error.into()),
@@ -322,9 +336,16 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       AttributeValue::N(reservation_size.to_string()),
     );
     values.insert(":initial".to_string(), AttributeValue::N("-1".to_string()));
+    values.insert(
+      ":max_reservable".to_string(),
+      AttributeValue::N((u64::MAX - reservation_size).to_string()),
+    );
 
     let update = format!("SET {ATTR_MAX_SEQ} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta");
-    let condition = format!("{ATTR_HOLDER} = :holder AND {ATTR_EXPIRES} > :now");
+    let condition = format!(
+      "{ATTR_HOLDER} = :holder AND {ATTR_EXPIRES} > :now AND \
+       (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= :max_reservable)"
+    );
 
     let response = self
       .client
@@ -344,9 +365,8 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
           .attributes
           .as_ref()
           .and_then(|attrs| attrs.get(ATTR_MAX_SEQ))
-          .map(parse_i64)
-          .transpose()?
-          .unwrap_or(-1);
+          .map(parse_u64)
+          .transpose()?;
 
         let reservation = reservation_from_old(old_max, reservation_size)?;
         let lease = self
@@ -370,6 +390,9 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
           debug!("producer lease(dynamo) reserve result: expired");
           return Ok(SequenceReservationOutcome::Expired);
         };
+        if reservation_would_overflow(&lease, holder_id, now_ts_ms, Some(reservation_size)) {
+          return Err(anyhow!("sequence range overflow"));
+        }
         if lease.lease_expiration_ts_ms <= now_ts_ms {
           debug!("producer lease(dynamo) reserve result: expired");
           Ok(SequenceReservationOutcome::Expired)
@@ -467,19 +490,12 @@ impl DynamoLeaseItem {
   }
 }
 
-fn reservation_from_old(old_max: i64, reservation_size: u64) -> Result<SeqRange> {
-  if old_max < -1 {
-    return Err(anyhow!("sequence range underflow"));
-  }
-
-  let start = if old_max < 0 {
-    0
-  } else {
-    u64::try_from(old_max)
-      .map_err(|error| anyhow!("sequence range overflow: {error}"))?
+fn reservation_from_old(old_max: Option<u64>, reservation_size: u64) -> Result<SeqRange> {
+  let start = old_max.map_or(Ok(0), |max| {
+    max
       .checked_add(1)
-      .ok_or_else(|| anyhow!("sequence range overflow"))?
-  };
+      .ok_or_else(|| anyhow!("sequence range overflow"))
+  })?;
 
   let end = start
     .checked_add(reservation_size.saturating_sub(1))
@@ -498,13 +514,28 @@ fn reservation_from_new_max(max_allocated_seq: u64, reservation_size: u64) -> Re
   })
 }
 
-fn parse_i64(value: &AttributeValue) -> Result<i64> {
+fn parse_u64(value: &AttributeValue) -> Result<u64> {
   match value {
     AttributeValue::N(value) => value
-      .parse::<i64>()
+      .parse::<u64>()
       .map_err(|error| anyhow!("invalid number {value}: {error}")),
     other => Err(anyhow!("unexpected attribute value {other:?}")),
   }
+}
+
+fn reservation_would_overflow(
+  lease: &ProducerPartitionLease,
+  holder_id: &str,
+  now_ts_ms: i64,
+  reservation_size: Option<u64>,
+) -> bool {
+  reservation_size.is_some_and(|size| {
+    lease.holder_id == holder_id
+      && lease.lease_expiration_ts_ms > now_ts_ms
+      && lease
+        .max_allocated_seq
+        .is_some_and(|max_allocated_seq| max_allocated_seq > u64::MAX - size)
+  })
 }
 
 fn expires_at(now_ts_ms: i64, lease_duration_ms: i64) -> Result<i64> {

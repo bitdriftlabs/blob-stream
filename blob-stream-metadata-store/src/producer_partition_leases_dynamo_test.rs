@@ -199,6 +199,46 @@ async fn acquires_and_reserves_sequences_in_one_operation() -> Result<()> {
 }
 
 #[tokio::test]
+async fn rejects_overflowing_atomic_sequence_reservation() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
+  create_leases_table(&client, &table_name).await?;
+
+  let store = DynamoProducerPartitionLeaseStore::new(client.clone(), table_name.clone());
+  let key = lease_key();
+  store
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "broker-a".to_string(),
+      1_000,
+      100,
+      Some(u64::MAX),
+    )
+    .await?;
+
+  let error = store
+    .acquire_lease_and_reserve_sequences(key.clone(), "broker-a".to_string(), 1_050, 100, Some(2))
+    .await
+    .expect_err("overflowing reservation must fail");
+  assert!(error.to_string().contains("sequence range overflow"));
+
+  let error = store
+    .reserve_sequences(&key, "broker-a", 1_050, 2)
+    .await
+    .expect_err("overflowing standalone reservation must fail");
+  assert!(error.to_string().contains("sequence range overflow"));
+
+  let lease = store
+    .get_lease(&key)
+    .await?
+    .ok_or_else(|| anyhow!("lease should remain readable after rejected reservation"))?;
+  assert_eq!(lease.max_allocated_seq, Some(u64::MAX - 1));
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[tokio::test]
 async fn releases_lease_for_current_holder() -> Result<()> {
   let client = dynamo_client().await?;
   let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
