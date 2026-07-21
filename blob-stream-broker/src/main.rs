@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use bd_panic::PanicType;
+use bd_shutdown::{ComponentShutdownTrigger, real_graceful_shutdown};
 use blob_stream_broker::config::load_runtime_config;
 use blob_stream_broker::grpc::make_broker_router;
 use blob_stream_broker::metrics::BrokerMetrics;
@@ -45,10 +46,31 @@ async fn async_main() -> Result<()> {
 
   let metrics = BrokerMetrics::new();
   let metrics_scope = metrics.scope();
-  let write_engine = build_write_engine(&config, &metrics_scope).await?;
+  let broker_shutdown_trigger = ComponentShutdownTrigger::default();
+  let write_engine = build_write_engine(
+    &config,
+    broker_shutdown_trigger.make_handle(),
+    &metrics_scope,
+  )
+  .await?;
   let listener = tokio::net::TcpListener::bind(addr).await?;
   info!("broker listening: bind_addr={addr}, metrics_path=/metrics, log_path=/admin/log");
-  axum::serve(listener, make_broker_router(write_engine, &metrics)).await?;
+
+  let listener_shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut listener_shutdown = listener_shutdown_trigger.make_shutdown();
+  let server = tokio::spawn(async move {
+    axum::serve(listener, make_broker_router(write_engine, &metrics))
+      .with_graceful_shutdown(async move { listener_shutdown.cancelled().await })
+      .await
+  });
+
+  real_graceful_shutdown().await;
+  info!("broker stopping listener and draining active requests");
+  listener_shutdown_trigger.shutdown().await;
+  server.await??;
+
+  info!("broker draining writes and releasing producer leases");
+  broker_shutdown_trigger.shutdown().await;
   info!("broker shutdown complete");
   Ok(())
 }

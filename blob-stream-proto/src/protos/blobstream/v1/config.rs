@@ -2921,6 +2921,8 @@ pub struct ProducerConfig {
     pub max_request_concurrency: ::std::option::Option<u64>,
     // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.compression)
     pub compression: ::std::option::Option<::protobuf::EnumOrUnknown<ProducerCompression>>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.retry_deadline_ms)
+    pub retry_deadline_ms: ::std::option::Option<u64>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.ProducerConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -2938,7 +2940,7 @@ impl ProducerConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(11);
+        let mut fields = ::std::vec::Vec::with_capacity(12);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
             "writer_id",
@@ -2995,6 +2997,11 @@ impl ProducerConfig {
             |m: &ProducerConfig| { &m.compression },
             |m: &mut ProducerConfig| { &mut m.compression },
         ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "retry_deadline_ms",
+            |m: &ProducerConfig| { &m.retry_deadline_ms },
+            |m: &mut ProducerConfig| { &mut m.retry_deadline_ms },
+        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ProducerConfig>(
             "ProducerConfig",
             fields,
@@ -3046,6 +3053,9 @@ impl ::protobuf::Message for ProducerConfig {
                 88 => {
                     self.compression = ::std::option::Option::Some(is.read_enum_or_unknown()?);
                 },
+                96 => {
+                    self.retry_deadline_ms = ::std::option::Option::Some(is.read_uint64()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -3091,6 +3101,9 @@ impl ::protobuf::Message for ProducerConfig {
         if let Some(v) = self.compression {
             my_size += ::protobuf::rt::int32_size(11, v.value());
         }
+        if let Some(v) = self.retry_deadline_ms {
+            my_size += ::protobuf::rt::uint64_size(12, v);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -3130,6 +3143,9 @@ impl ::protobuf::Message for ProducerConfig {
         if let Some(v) = self.compression {
             os.write_enum(11, ::protobuf::EnumOrUnknown::value(&v))?;
         }
+        if let Some(v) = self.retry_deadline_ms {
+            os.write_uint64(12, v)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -3158,6 +3174,7 @@ impl ::protobuf::Message for ProducerConfig {
         self.request_timeout_ms = ::std::option::Option::None;
         self.max_request_concurrency = ::std::option::Option::None;
         self.compression = ::std::option::Option::None;
+        self.retry_deadline_ms = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -3174,6 +3191,7 @@ impl ::protobuf::Message for ProducerConfig {
             request_timeout_ms: ::std::option::Option::None,
             max_request_concurrency: ::std::option::Option::None,
             compression: ::std::option::Option::None,
+            retry_deadline_ms: ::std::option::Option::None,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -4316,7 +4334,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x0b2\x1e.blobstream.v1.BlobStoreConfigR\tblobStoreB\x08\xfaB\x05\x8a\
     \x01\x02\x10\x01\x12S\n\x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobst\
     ream.v1.MetadataStoreConfigR\rmetadataStoreB\x08\xfaB\x05\x8a\x01\x02\
-    \x10\x01\"\xf6\x06\n\x0eProducerConfig\x12\x20\n\twriter_id\x18\x01\x20\
+    \x10\x01\"\xc6\x07\n\x0eProducerConfig\x12\x20\n\twriter_id\x18\x01\x20\
     \x01(\rH\0R\x08writerId\x88\x01\x01\x128\n\x11max_batch_records\x18\x02\
     \x20\x01(\rH\x01R\x0fmaxBatchRecordsB\x07\xfaB\x04*\x02\x20\0\x88\x01\
     \x01\x124\n\x0fmax_batch_bytes\x18\x03\x20\x01(\rH\x02R\rmaxBatchBytesB\
@@ -4333,56 +4351,58 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x20\x01(\x04H\tR\x15maxRequestConcurrencyB\x07\xfaB\x042\x02\x20\0\
     \x88\x01\x01\x12S\n\x0bcompression\x18\x0b\x20\x01(\x0e2\".blobstream.v1\
     .ProducerCompressionH\nR\x0bcompressionB\x08\xfaB\x05\x82\x01\x02\x10\
-    \x01\x88\x01\x01B\x0c\n\n_writer_idB\x14\n\x12_max_batch_recordsB\x12\n\
-    \x10_max_batch_bytesB\x15\n\x13_flush_max_delay_msB\x0e\n\x0c_max_retrie\
-    sB\x16\n\x14_retry_base_delay_msB\x15\n\x13_retry_max_delay_msB\x15\n\
-    \x13_connect_timeout_msB\x15\n\x13_request_timeout_msB\x1a\n\x18_max_req\
-    uest_concurrencyB\x0e\n\x0c_compression\"\xe8\x01\n\x15ProducerRuntimeCo\
-    nfig\x12C\n\x08producer\x18\x01\x20\x01(\x0b2\x1d.blobstream.v1.Producer\
-    ConfigR\x08producerB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12L\n\tdiscovery\
-    \x18\x02\x20\x01(\x0b2$.blobstream.v1.BrokerDiscoveryConfigR\tdiscoveryB\
-    \x08\xfaB\x05\x8a\x01\x02\x10\x01\x12<\n\x06topics\x18\x03\x20\x03(\x0b2\
-    \x1a.blobstream.v1.TopicConfigR\x06topicsB\x08\xfaB\x05\x92\x01\x02\x08\
-    \x01\"\xe1\x04\n\x12ConsumerReadConfig\x12\x1d\n\x05topic\x18\x01\x20\
-    \x01(\tR\x05topicB\x07\xfaB\x04r\x02\x10\x01\x12<\n\x13window_size_secon\
-    ds\x18\x02\x20\x01(\x03H\0R\x11windowSizeSecondsB\x07\xfaB\x04\"\x02\x20\
-    \0\x88\x01\x01\x129\n\x12idle_poll_delay_ms\x18\x04\x20\x01(\x04H\x01R\
-    \x0fidlePollDelayMsB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x127\n\x16max_i\
-    dle_poll_delay_ms\x18\x05\x20\x01(\x04H\x02R\x12maxIdlePollDelayMs\x88\
-    \x01\x01\x12:\n\x12prefetch_max_bytes\x18\x06\x20\x01(\x04H\x03R\x10pref\
-    etchMaxBytesB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x12D\n\x1cmetadata_vis\
-    ibility_delay_ms\x18\t\x20\x01(\x04H\x04R\x19metadataVisibilityDelayMs\
-    \x88\x01\x01\x12F\n\x19max_in_flight_batch_reads\x18\n\x20\x01(\x04H\x05\
-    R\x15maxInFlightBatchReadsB\x07\xfaB\x042\x02\x20\0\x88\x01\x01B\x16\n\
-    \x14_window_size_secondsB\x15\n\x13_idle_poll_delay_msB\x19\n\x17_max_id\
-    le_poll_delay_msB\x15\n\x13_prefetch_max_bytesB\x1f\n\x1d_metadata_visib\
-    ility_delay_msB\x1c\n\x1a_max_in_flight_batch_readsJ\x04\x08\x03\x10\x04\
-    J\x04\x08\x07\x10\x08J\x04\x08\x08\x10\t\"\x86\x03\n\x13ConsumerGroupCon\
-    fig\x12\x1d\n\x05topic\x18\x01\x20\x01(\tR\x05topicB\x07\xfaB\x04r\x02\
-    \x10\x01\x12\"\n\x08group_id\x18\x02\x20\x01(\tR\x07groupIdB\x07\xfaB\
-    \x04r\x02\x10\x01\x12$\n\tmember_id\x18\x03\x20\x01(\tR\x08memberIdB\x07\
-    \xfaB\x04r\x02\x10\x01\x128\n\x11lease_duration_ms\x18\x04\x20\x01(\x03H\
-    \0R\x0fleaseDurationMsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\x01\x12@\n\x15h\
-    eartbeat_interval_ms\x18\x05\x20\x01(\x03H\x01R\x13heartbeatIntervalMsB\
-    \x07\xfaB\x04\"\x02\x20\0\x88\x01\x01\x12@\n\x15rebalance_interval_ms\
-    \x18\x06\x20\x01(\x03H\x02R\x13rebalanceIntervalMsB\x07\xfaB\x04\"\x02\
-    \x20\0\x88\x01\x01B\x14\n\x12_lease_duration_msB\x18\n\x16_heartbeat_int\
-    erval_msB\x18\n\x16_rebalance_interval_ms\"\x9c\x01\n\x15ConsumerRuntime\
-    Config\x12?\n\x04read\x18\x01\x20\x01(\x0b2!.blobstream.v1.ConsumerReadC\
-    onfigR\x04readB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12B\n\x05group\x18\x02\
-    \x20\x01(\x0b2\".blobstream.v1.ConsumerGroupConfigR\x05groupB\x08\xfaB\
-    \x05\x8a\x01\x02\x10\x01\"\xc5\x02\n\x1fConsumerIteratorBootstrapConfig\
-    \x12H\n\x07runtime\x18\x01\x20\x01(\x0b2$.blobstream.v1.ConsumerRuntimeC\
-    onfigR\x07runtimeB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12:\n\x05topic\x18\
-    \x02\x20\x01(\x0b2\x1a.blobstream.v1.TopicConfigR\x05topicB\x08\xfaB\x05\
-    \x8a\x01\x02\x10\x01\x12G\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobst\
-    ream.v1.BlobStoreConfigR\tblobStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\
-    \x12S\n\x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobstream.v1.Metadata\
-    StoreConfigR\rmetadataStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01*P\n\x12Seg\
-    mentCompression\x12\x1c\n\x18SEGMENT_COMPRESSION_NONE\x10\0\x12\x1c\n\
-    \x18SEGMENT_COMPRESSION_ZSTD\x10\x01*U\n\x13ProducerCompression\x12\x1d\
-    \n\x19PRODUCER_COMPRESSION_NONE\x10\0\x12\x1f\n\x1bPRODUCER_COMPRESSION_\
-    SNAPPY\x10\x01b\x06proto3\
+    \x01\x88\x01\x01\x128\n\x11retry_deadline_ms\x18\x0c\x20\x01(\x04H\x0bR\
+    \x0fretryDeadlineMsB\x07\xfaB\x042\x02\x20\0\x88\x01\x01B\x0c\n\n_writer\
+    _idB\x14\n\x12_max_batch_recordsB\x12\n\x10_max_batch_bytesB\x15\n\x13_f\
+    lush_max_delay_msB\x0e\n\x0c_max_retriesB\x16\n\x14_retry_base_delay_msB\
+    \x15\n\x13_retry_max_delay_msB\x15\n\x13_connect_timeout_msB\x15\n\x13_r\
+    equest_timeout_msB\x1a\n\x18_max_request_concurrencyB\x0e\n\x0c_compress\
+    ionB\x14\n\x12_retry_deadline_ms\"\xe8\x01\n\x15ProducerRuntimeConfig\
+    \x12C\n\x08producer\x18\x01\x20\x01(\x0b2\x1d.blobstream.v1.ProducerConf\
+    igR\x08producerB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12L\n\tdiscovery\x18\
+    \x02\x20\x01(\x0b2$.blobstream.v1.BrokerDiscoveryConfigR\tdiscoveryB\x08\
+    \xfaB\x05\x8a\x01\x02\x10\x01\x12<\n\x06topics\x18\x03\x20\x03(\x0b2\x1a\
+    .blobstream.v1.TopicConfigR\x06topicsB\x08\xfaB\x05\x92\x01\x02\x08\x01\
+    \"\xe1\x04\n\x12ConsumerReadConfig\x12\x1d\n\x05topic\x18\x01\x20\x01(\t\
+    R\x05topicB\x07\xfaB\x04r\x02\x10\x01\x12<\n\x13window_size_seconds\x18\
+    \x02\x20\x01(\x03H\0R\x11windowSizeSecondsB\x07\xfaB\x04\"\x02\x20\0\x88\
+    \x01\x01\x129\n\x12idle_poll_delay_ms\x18\x04\x20\x01(\x04H\x01R\x0fidle\
+    PollDelayMsB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x127\n\x16max_idle_poll\
+    _delay_ms\x18\x05\x20\x01(\x04H\x02R\x12maxIdlePollDelayMs\x88\x01\x01\
+    \x12:\n\x12prefetch_max_bytes\x18\x06\x20\x01(\x04H\x03R\x10prefetchMaxB\
+    ytesB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x12D\n\x1cmetadata_visibility_\
+    delay_ms\x18\t\x20\x01(\x04H\x04R\x19metadataVisibilityDelayMs\x88\x01\
+    \x01\x12F\n\x19max_in_flight_batch_reads\x18\n\x20\x01(\x04H\x05R\x15max\
+    InFlightBatchReadsB\x07\xfaB\x042\x02\x20\0\x88\x01\x01B\x16\n\x14_windo\
+    w_size_secondsB\x15\n\x13_idle_poll_delay_msB\x19\n\x17_max_idle_poll_de\
+    lay_msB\x15\n\x13_prefetch_max_bytesB\x1f\n\x1d_metadata_visibility_dela\
+    y_msB\x1c\n\x1a_max_in_flight_batch_readsJ\x04\x08\x03\x10\x04J\x04\x08\
+    \x07\x10\x08J\x04\x08\x08\x10\t\"\x86\x03\n\x13ConsumerGroupConfig\x12\
+    \x1d\n\x05topic\x18\x01\x20\x01(\tR\x05topicB\x07\xfaB\x04r\x02\x10\x01\
+    \x12\"\n\x08group_id\x18\x02\x20\x01(\tR\x07groupIdB\x07\xfaB\x04r\x02\
+    \x10\x01\x12$\n\tmember_id\x18\x03\x20\x01(\tR\x08memberIdB\x07\xfaB\x04\
+    r\x02\x10\x01\x128\n\x11lease_duration_ms\x18\x04\x20\x01(\x03H\0R\x0fle\
+    aseDurationMsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\x01\x12@\n\x15heartbeat_\
+    interval_ms\x18\x05\x20\x01(\x03H\x01R\x13heartbeatIntervalMsB\x07\xfaB\
+    \x04\"\x02\x20\0\x88\x01\x01\x12@\n\x15rebalance_interval_ms\x18\x06\x20\
+    \x01(\x03H\x02R\x13rebalanceIntervalMsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\
+    \x01B\x14\n\x12_lease_duration_msB\x18\n\x16_heartbeat_interval_msB\x18\
+    \n\x16_rebalance_interval_ms\"\x9c\x01\n\x15ConsumerRuntimeConfig\x12?\n\
+    \x04read\x18\x01\x20\x01(\x0b2!.blobstream.v1.ConsumerReadConfigR\x04rea\
+    dB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12B\n\x05group\x18\x02\x20\x01(\x0b\
+    2\".blobstream.v1.ConsumerGroupConfigR\x05groupB\x08\xfaB\x05\x8a\x01\
+    \x02\x10\x01\"\xc5\x02\n\x1fConsumerIteratorBootstrapConfig\x12H\n\x07ru\
+    ntime\x18\x01\x20\x01(\x0b2$.blobstream.v1.ConsumerRuntimeConfigR\x07run\
+    timeB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12:\n\x05topic\x18\x02\x20\x01(\
+    \x0b2\x1a.blobstream.v1.TopicConfigR\x05topicB\x08\xfaB\x05\x8a\x01\x02\
+    \x10\x01\x12G\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobstream.v1.Blob\
+    StoreConfigR\tblobStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12S\n\x0emeta\
+    data_store\x18\x04\x20\x01(\x0b2\".blobstream.v1.MetadataStoreConfigR\rm\
+    etadataStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01*P\n\x12SegmentCompression\
+    \x12\x1c\n\x18SEGMENT_COMPRESSION_NONE\x10\0\x12\x1c\n\x18SEGMENT_COMPRE\
+    SSION_ZSTD\x10\x01*U\n\x13ProducerCompression\x12\x1d\n\x19PRODUCER_COMP\
+    RESSION_NONE\x10\0\x12\x1f\n\x1bPRODUCER_COMPRESSION_SNAPPY\x10\x01b\x06\
+    proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

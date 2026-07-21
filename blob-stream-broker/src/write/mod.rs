@@ -5,13 +5,16 @@ mod tests;
 mod config;
 mod flush;
 mod lease_assignment;
+mod memory_pressure;
 
 use crate::write::flush::FlushContext;
+use crate::write::memory_pressure::MemoryPressureController;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use bd_log::warn_every;
 use bd_server_stats::stats::Scope;
-use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
+use bd_shutdown::ComponentShutdownTriggerHandle;
+use bd_time::{OffsetDateTimeExt, TimeProvider};
 use blob_stream_blob_store::{BlobKey, BlobStore};
 use blob_stream_broker_discovery::{
   BrokerMembership,
@@ -268,6 +271,7 @@ struct WriteMetrics {
   produce_not_lease_holder_total: prometheus::IntCounter,
   produce_overloaded_total: prometheus::IntCounter,
   produce_unknown_topic_total: prometheus::IntCounter,
+  admission_rejections_total: prometheus::IntCounter,
   produce_latency_seconds: prometheus::Histogram,
   sequence_reservations_total: prometheus::IntCounter,
   sequence_reservation_records_total: prometheus::IntCounter,
@@ -301,6 +305,7 @@ impl WriteMetrics {
       produce_not_lease_holder_total: scope.counter("produce_not_lease_holder_total"),
       produce_overloaded_total: scope.counter("produce_overloaded_total"),
       produce_unknown_topic_total: scope.counter("produce_unknown_topic_total"),
+      admission_rejections_total: scope.counter("admission_rejections_total"),
       produce_latency_seconds: scope.histogram("produce_latency_seconds"),
       sequence_reservations_total: scope.counter("sequence_reservations_total"),
       sequence_reservation_records_total: scope.counter("sequence_reservation_records_total"),
@@ -430,6 +435,7 @@ async fn acquire_lease_and_reserve_sequences(
 
 pub struct WriteEngineImpl {
   config: WriteConfig,
+  admission: Arc<dyn AdmissionController>,
   topics: HashMap<String, TopicInfo>,
   flush_context: FlushContext,
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
@@ -438,7 +444,7 @@ pub struct WriteEngineImpl {
   metrics: WriteMetrics,
   state: Arc<Mutex<WriteState>>,
   flush_notifier: Arc<Notify>,
-  lease_assignment_shutdown_tx: Option<oneshot::Sender<()>>,
+  shutdown_trigger_handle: ComponentShutdownTriggerHandle,
 }
 
 impl WriteEngineImpl {
@@ -449,83 +455,10 @@ impl WriteEngineImpl {
     metadata_store: Arc<dyn MetadataStore>,
     lease_store: Arc<dyn ProducerPartitionLeaseStore>,
     holder_id: String,
-    membership_rx: Option<watch::Receiver<BrokerMembership>>,
-    metrics_scope: &Scope,
-  ) -> Result<Self> {
-    Self::new_with_time_provider_and_scope(
-      config,
-      topics,
-      blob_store,
-      metadata_store,
-      lease_store,
-      holder_id,
-      None,
-      membership_rx,
-      Arc::new(SystemTimeProvider),
-      metrics_scope,
-    )
-  }
-
-  /// Construct a broker with an explicit Sonyflake machine ID for an in-process test cluster.
-  pub fn new_with_snowflake_machine_id(
-    config: WriteConfig,
-    topics: HashMap<String, TopicInfo>,
-    blob_store: Arc<dyn BlobStore>,
-    metadata_store: Arc<dyn MetadataStore>,
-    lease_store: Arc<dyn ProducerPartitionLeaseStore>,
-    holder_id: String,
-    machine_id: u16,
-    membership_rx: Option<watch::Receiver<BrokerMembership>>,
-    metrics_scope: &Scope,
-  ) -> Result<Self> {
-    Self::new_with_time_provider_and_scope(
-      config,
-      topics,
-      blob_store,
-      metadata_store,
-      lease_store,
-      holder_id,
-      Some(machine_id),
-      membership_rx,
-      Arc::new(SystemTimeProvider),
-      metrics_scope,
-    )
-  }
-
-  pub fn new_with_time_provider(
-    config: WriteConfig,
-    topics: HashMap<String, TopicInfo>,
-    blob_store: Arc<dyn BlobStore>,
-    metadata_store: Arc<dyn MetadataStore>,
-    lease_store: Arc<dyn ProducerPartitionLeaseStore>,
-    holder_id: String,
-    membership_rx: Option<watch::Receiver<BrokerMembership>>,
-    time_provider: Arc<dyn TimeProvider>,
-    metrics_scope: &Scope,
-  ) -> Result<Self> {
-    Self::new_with_time_provider_and_scope(
-      config,
-      topics,
-      blob_store,
-      metadata_store,
-      lease_store,
-      holder_id,
-      None,
-      membership_rx,
-      time_provider,
-      metrics_scope,
-    )
-  }
-
-  fn new_with_time_provider_and_scope(
-    config: WriteConfig,
-    topics: HashMap<String, TopicInfo>,
-    blob_store: Arc<dyn BlobStore>,
-    metadata_store: Arc<dyn MetadataStore>,
-    lease_store: Arc<dyn ProducerPartitionLeaseStore>,
-    holder_id: String,
     machine_id: Option<u16>,
     membership_rx: Option<watch::Receiver<BrokerMembership>>,
+    admission: Arc<dyn AdmissionController>,
+    shutdown_trigger_handle: ComponentShutdownTriggerHandle,
     time_provider: Arc<dyn TimeProvider>,
     metrics_scope: &Scope,
   ) -> Result<Self> {
@@ -553,9 +486,9 @@ impl WriteEngineImpl {
       snowflake,
       Arc::clone(&time_provider),
     );
-
-    let mut engine = Self {
+    let engine = Self {
       config,
+      admission,
       topics,
       flush_context,
       lease_store,
@@ -564,13 +497,12 @@ impl WriteEngineImpl {
       metrics: WriteMetrics::new(metrics_scope),
       state,
       flush_notifier: Arc::new(Notify::new()),
-      lease_assignment_shutdown_tx: None,
+      shutdown_trigger_handle,
     };
 
     engine.spawn_flush_loop();
     if let Some(membership_rx) = membership_rx {
-      engine.lease_assignment_shutdown_tx =
-        Some(engine.spawn_lease_self_assignment_loop(membership_rx));
+      engine.spawn_lease_self_assignment_loop(membership_rx);
     }
     Ok(engine)
   }
@@ -714,11 +646,18 @@ impl WriteEngineImpl {
     let time_provider = Arc::clone(&self.time_provider);
     let metrics = self.metrics.clone();
     let flush_notifier = Arc::clone(&self.flush_notifier);
+    let mut shutdown = self.shutdown_trigger_handle.make_shutdown();
 
     tokio::spawn(async move {
       let mut ticker = tokio::time::interval(interval);
       let mut flushes = FuturesUnordered::new();
+      let mut shutdown_requested = false;
       loop {
+        if shutdown_requested && flushes.is_empty() {
+          log::info!("broker flush loop shutdown complete");
+          return;
+        }
+
         let available_slots = MAX_IN_FLIGHT_FLUSH_PLANS.saturating_sub(flushes.len());
         let now = time_provider.now();
         let plans = collect_flush_plans(
@@ -744,6 +683,12 @@ impl WriteEngineImpl {
         }
 
         tokio::select! {
+          () = shutdown.cancelled(), if !shutdown_requested => {
+            shutdown_requested = true;
+            begin_shutdown_drain(&state);
+            flush_notifier.notify_waiters();
+            log::info!("broker flush loop draining buffered writes for shutdown");
+          },
           // Timer wakes time-eligible buffers; new writes wake size-eligible buffers.
           _ = ticker.tick() => {},
           () = flush_notifier.notified() => {},
@@ -751,14 +696,6 @@ impl WriteEngineImpl {
         }
       }
     });
-  }
-}
-
-impl Drop for WriteEngineImpl {
-  fn drop(&mut self) {
-    if let Some(shutdown_tx) = self.lease_assignment_shutdown_tx.take() {
-      let _ignored = shutdown_tx.send(());
-    }
   }
 }
 
@@ -804,6 +741,12 @@ impl WriteEngine for WriteEngineImpl {
 
     let summary = RecordBatch::summary_from_records(&request.records)
       .ok_or_else(|| anyhow!("failed to summarize record batch"))?;
+    if self.admission.is_overloaded() {
+      self.metrics.admission_rejections_total.inc();
+      return Err(WriteError::Overloaded(
+        "broker admission controller is overloaded".to_string(),
+      ));
+    }
     let topic = request.topic;
     let virtual_partition_id = request.virtual_partition_id;
     let mut records = Some(request.records);
@@ -1314,6 +1257,15 @@ fn collect_flush_plans(
     .collect()
 }
 
+fn begin_shutdown_drain(state: &Arc<Mutex<WriteState>>) {
+  let mut state = state.lock();
+  for topic_state in state.topics.values_mut() {
+    for partition_state in topic_state.partitions.values_mut() {
+      partition_state.draining = true;
+    }
+  }
+}
+
 //
 // WriteState
 //
@@ -1720,6 +1672,41 @@ struct BufferedBatch {
   summary: BatchSummary,
   seq_range: SeqRange,
   completion: Option<FlushCompletion>,
+}
+
+//
+// AdmissionController
+//
+
+pub trait AdmissionController: Send + Sync {
+  fn is_overloaded(&self) -> bool;
+}
+
+//
+// MemoryPressureAdmissionController
+//
+
+#[derive(Clone, Debug)]
+pub struct MemoryPressureAdmissionController {
+  memory_pressure: MemoryPressureController,
+}
+
+impl MemoryPressureAdmissionController {
+  #[must_use]
+  pub fn new(
+    shutdown_trigger_handle: &ComponentShutdownTriggerHandle,
+    metrics_scope: &Scope,
+  ) -> Self {
+    Self {
+      memory_pressure: MemoryPressureController::new(shutdown_trigger_handle, metrics_scope),
+    }
+  }
+}
+
+impl AdmissionController for MemoryPressureAdmissionController {
+  fn is_overloaded(&self) -> bool {
+    self.memory_pressure.is_overloaded()
+  }
 }
 
 //

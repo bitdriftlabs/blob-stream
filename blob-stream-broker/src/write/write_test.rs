@@ -1,8 +1,10 @@
 #![allow(clippy::unwrap_used)]
 
 use super::{
+  AdmissionController,
   AllocationTransitionDecision,
   LeaseExpirationUpdate,
+  MemoryPressureAdmissionController,
   TopicInfo,
   WriteConfig,
   WriteEngine,
@@ -14,6 +16,7 @@ use super::{
 use anyhow::Result;
 use async_trait::async_trait;
 use bd_server_stats::stats::{Collector, Scope};
+use bd_shutdown::ComponentShutdownTrigger;
 use bd_time::{OffsetDateTimeExt, TestTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
@@ -242,6 +245,16 @@ fn metrics_scope() -> bd_server_stats::stats::Scope {
   Collector::default().scope("blob_stream_broker_test")
 }
 
+fn default_admission(
+  shutdown_trigger_handle: &bd_shutdown::ComponentShutdownTriggerHandle,
+  metrics_scope: &Scope,
+) -> Arc<dyn AdmissionController> {
+  Arc::new(MemoryPressureAdmissionController::new(
+    shutdown_trigger_handle,
+    &metrics_scope.scope("write"),
+  ))
+}
+
 #[test]
 fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
   let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
@@ -391,27 +404,31 @@ fn nonadjacent_reservation_replaces_remaining_capacity() {
 fn make_engine(
   time_provider: Arc<TestTimeProvider>,
   config: WriteConfig,
+  shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
 ) -> Result<(Arc<WriteEngineImpl>, Arc<InMemoryMetadataStore>)> {
-  let (engine, metadata_store, _lease_store) = make_engine_with_lease_store(time_provider, config)?;
+  let (engine, metadata_store, _lease_store) =
+    make_engine_with_lease_store(time_provider, config, shutdown_trigger_handle)?;
   Ok((engine, metadata_store))
 }
 
 fn make_engine_with_lease_store(
   time_provider: Arc<TestTimeProvider>,
   config: WriteConfig,
+  shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
 ) -> Result<(
   Arc<WriteEngineImpl>,
   Arc<InMemoryMetadataStore>,
   Arc<InMemoryProducerPartitionLeaseStore>,
 )> {
   let scope = metrics_scope();
-  make_engine_with_lease_store_and_scope(time_provider, config, &scope)
+  make_engine_with_lease_store_and_scope(time_provider, config, &scope, shutdown_trigger_handle)
 }
 
 fn make_engine_with_lease_store_and_scope(
   time_provider: Arc<TestTimeProvider>,
   config: WriteConfig,
   metrics_scope: &Scope,
+  shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
 ) -> Result<(
   Arc<WriteEngineImpl>,
   Arc<InMemoryMetadataStore>,
@@ -433,7 +450,7 @@ fn make_engine_with_lease_store_and_scope(
   let metadata_store = Arc::new(InMemoryMetadataStore::new());
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
 
-  let engine = WriteEngineImpl::new_with_time_provider(
+  let engine = WriteEngineImpl::new(
     config,
     topics,
     blob_store,
@@ -441,6 +458,9 @@ fn make_engine_with_lease_store_and_scope(
     lease_store.clone(),
     "test-node".to_string(),
     None,
+    None,
+    default_admission(&shutdown_trigger_handle, metrics_scope),
+    shutdown_trigger_handle,
     time_provider,
     metrics_scope,
   )?;
@@ -480,12 +500,14 @@ async fn wait_for_partition_draining_start(engine: &WriteEngineImpl) {
 async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.writer_id = 0;
   config.flush_max_bytes = 1024;
   config.flush_max_delay_ms = 60_000;
 
-  let (engine, _metadata_store) = make_engine(time_provider, config)?;
+  let (engine, _metadata_store) =
+    make_engine(time_provider, config, shutdown_trigger.make_handle())?;
   let pending_engine = Arc::clone(&engine);
   let pending_write = tokio::spawn(async move {
     pending_engine
@@ -563,10 +585,12 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
 async fn state_snapshot_reports_expired_observed_lease() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.writer_id = 0;
 
-  let (engine, _metadata_store, lease_store) = make_engine_with_lease_store(time_provider, config)?;
+  let (engine, _metadata_store, lease_store) =
+    make_engine_with_lease_store(time_provider, config, shutdown_trigger.make_handle())?;
   let key = ProducerPartitionLeaseKey {
     topic: "telemetry".to_string(),
     virtual_partition_id: 0,
@@ -597,14 +621,19 @@ async fn state_snapshot_reports_expired_observed_lease() -> Result<()> {
 #[tokio::test]
 async fn successful_sequence_reservation_records_metrics() -> Result<()> {
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
   config.flush_max_delay_ms = 60_000;
 
   let collector = Collector::default();
   let scope = collector.scope("blob_stream_broker_test");
-  let (engine, _metadata_store, _lease_store) =
-    make_engine_with_lease_store_and_scope(time_provider, config, &scope)?;
+  let (engine, _metadata_store, _lease_store) = make_engine_with_lease_store_and_scope(
+    time_provider,
+    config,
+    &scope,
+    shutdown_trigger.make_handle(),
+  )?;
   engine
     .produce_batch(WriteRequest {
       topic: "telemetry".to_string(),
@@ -631,12 +660,17 @@ async fn successful_sequence_reservation_records_metrics() -> Result<()> {
 #[tokio::test]
 async fn buffers_until_size_rollover() -> Result<()> {
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 10;
   config.flush_max_delay_ms = 60_000;
   config.window_size_seconds = 60;
 
-  let (engine, metadata_store) = make_engine(time_provider.clone(), config.clone())?;
+  let (engine, metadata_store) = make_engine(
+    time_provider.clone(),
+    config.clone(),
+    shutdown_trigger.make_handle(),
+  )?;
 
   let request = WriteRequest {
     topic: "telemetry".to_string(),
@@ -685,6 +719,7 @@ async fn buffers_until_size_rollover() -> Result<()> {
 #[tokio::test]
 async fn same_partition_requests_serialize_sequence_reservations() -> Result<()> {
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
   config.reservation_size = 1;
@@ -697,7 +732,7 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
     release_first: Arc::clone(&release_first),
     first_reservation: AtomicBool::new(true),
   });
-  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+  let engine = Arc::new(WriteEngineImpl::new(
     config,
     HashMap::from([(
       "telemetry".to_string(),
@@ -714,6 +749,9 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
     lease_store,
     "test-node".to_string(),
     None,
+    None,
+    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
+    shutdown_trigger.make_handle(),
     time_provider,
     &metrics_scope(),
   )?);
@@ -759,6 +797,7 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
 #[tokio::test]
 async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
   config.reservation_size = 1;
@@ -770,7 +809,7 @@ async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
     release_first: Arc::new(Semaphore::new(0)),
     first_reservation: AtomicBool::new(true),
   });
-  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+  let engine = Arc::new(WriteEngineImpl::new(
     config,
     HashMap::from([(
       "telemetry".to_string(),
@@ -787,6 +826,9 @@ async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
     lease_store,
     "test-node".to_string(),
     None,
+    None,
+    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
+    shutdown_trigger.make_handle(),
     time_provider,
     &metrics_scope(),
   )?);
@@ -833,12 +875,17 @@ async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn flushes_on_time_rollover() -> Result<()> {
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1024;
   config.flush_max_delay_ms = 500;
   config.window_size_seconds = 60;
 
-  let (engine, metadata_store) = make_engine(time_provider.clone(), config.clone())?;
+  let (engine, metadata_store) = make_engine(
+    time_provider.clone(),
+    config.clone(),
+    shutdown_trigger.make_handle(),
+  )?;
 
   let request = WriteRequest {
     topic: "telemetry".to_string(),
@@ -876,13 +923,18 @@ async fn flushes_on_time_rollover() -> Result<()> {
 async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> {
   let collector = Collector::default();
   let scope = collector.scope("blob_stream_broker_test");
+  let shutdown_trigger = ComponentShutdownTrigger::default();
 
   let size_time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let mut size_config = WriteConfig::with_defaults();
   size_config.flush_max_bytes = 1;
   size_config.flush_max_delay_ms = 60_000;
-  let (size_engine, _metadata_store, _lease_store) =
-    make_engine_with_lease_store_and_scope(size_time_provider, size_config, &scope)?;
+  let (size_engine, _metadata_store, _lease_store) = make_engine_with_lease_store_and_scope(
+    size_time_provider,
+    size_config,
+    &scope,
+    shutdown_trigger.make_handle(),
+  )?;
   size_engine
     .produce_batch(WriteRequest {
       topic: "telemetry".to_string(),
@@ -899,6 +951,7 @@ async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> 
     Arc::clone(&delay_time_provider),
     delay_config.clone(),
     &scope,
+    shutdown_trigger.make_handle(),
   )?;
   let delayed_write = tokio::spawn(async move {
     delay_engine
@@ -946,13 +999,14 @@ async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
   let collector = Collector::default();
   let scope = collector.scope("blob_stream_broker_test");
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
   config.flush_max_delay_ms = 60_000;
 
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release = Arc::new(Semaphore::new(0));
-  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+  let engine = Arc::new(WriteEngineImpl::new(
     config,
     HashMap::from([(
       "telemetry".to_string(),
@@ -972,6 +1026,9 @@ async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
     Arc::new(InMemoryProducerPartitionLeaseStore::new()),
     "test-node".to_string(),
     None,
+    None,
+    default_admission(&shutdown_trigger.make_handle(), &scope),
+    shutdown_trigger.make_handle(),
     time_provider,
     &scope,
   )?);
@@ -1008,6 +1065,7 @@ async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
 async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
   config.flush_max_delay_ms = 10;
@@ -1028,7 +1086,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
 
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release_first = Arc::new(Semaphore::new(0));
-  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+  let engine = Arc::new(WriteEngineImpl::new(
     config.clone(),
     topics,
     Arc::new(GatedBlobStore {
@@ -1040,6 +1098,9 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
     Arc::new(InMemoryProducerPartitionLeaseStore::new()),
     "test-node".to_string(),
     None,
+    None,
+    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
+    shutdown_trigger.make_handle(),
     time_provider.clone(),
     &metrics_scope(),
   )?);
@@ -1097,6 +1158,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
 async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
   config.flush_max_delay_ms = 10;
@@ -1104,7 +1166,7 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release_first = Arc::new(Semaphore::new(0));
   let metadata_store = Arc::new(InMemoryMetadataStore::new());
-  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+  let engine = Arc::new(WriteEngineImpl::new(
     config.clone(),
     HashMap::from([(
       "telemetry".to_string(),
@@ -1125,6 +1187,9 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
     Arc::new(InMemoryProducerPartitionLeaseStore::new()),
     "test-node".to_string(),
     None,
+    None,
+    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
+    shutdown_trigger.make_handle(),
     time_provider.clone(),
     &metrics_scope(),
   )?);
@@ -1187,6 +1252,7 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
 async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
   config.flush_max_delay_ms = 60_000;
@@ -1199,7 +1265,7 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   let release = Arc::new(Semaphore::new(0));
   let metadata_store = Arc::new(InMemoryMetadataStore::new());
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
-  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+  let engine = Arc::new(WriteEngineImpl::new(
     config,
     HashMap::from([(
       "telemetry".to_string(),
@@ -1218,7 +1284,10 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
     metadata_store.clone(),
     lease_store.clone(),
     "node-a".to_string(),
+    None,
     Some(membership_rx),
+    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
+    shutdown_trigger.make_handle(),
     time_provider.clone(),
     &metrics_scope(),
   )?);
@@ -1315,10 +1384,94 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   Ok(())
 }
 
+#[tokio::test]
+async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  config.flush_max_delay_ms = 60_000;
+
+  let (_membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-a".to_string(),
+    address: "10.0.0.1:8080".to_string(),
+  }]));
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let engine = Arc::new(WriteEngineImpl::new(
+    config,
+    HashMap::from([(
+      "telemetry".to_string(),
+      TopicInfo {
+        name: "telemetry".to_string(),
+        partition_count: 1,
+        num_writers: 1,
+        retention_days: 7,
+        max_metadata_publication_lag_ms: 30_000,
+      },
+    )]),
+    Arc::new(BlockingBlobStore {
+      entered_tx,
+      release: Arc::clone(&release),
+    }),
+    Arc::new(InMemoryMetadataStore::new()),
+    lease_store.clone(),
+    "node-a".to_string(),
+    None,
+    Some(membership_rx),
+    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
+    shutdown_trigger.make_handle(),
+    time_provider,
+    &metrics_scope(),
+  )?);
+
+  let produce_engine = Arc::clone(&engine);
+  let produce = tokio::spawn(async move {
+    produce_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  receive_blob_write(&mut entered_rx).await;
+
+  let shutdown = tokio::spawn(async move {
+    shutdown_trigger.shutdown().await;
+  });
+  wait_for_partition_draining_start(&engine).await;
+
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".to_string(),
+    virtual_partition_id: 0,
+  };
+  let held_by_a = lease_store
+    .acquire_lease(key.clone(), "node-b".to_string(), now_ms, 30_000)
+    .await?;
+  assert!(matches!(held_by_a, LeaseAcquireOutcome::HeldByOther(_)));
+  assert!(!shutdown.is_finished());
+
+  release.add_permits(1);
+  produce.await??;
+  tokio::time::timeout(StdDuration::from_secs(1), shutdown)
+    .await
+    .expect("component shutdown did not complete after flush drained")?;
+
+  let acquired_by_b = lease_store
+    .acquire_lease(key, "node-b".to_string(), now_ms, 30_000)
+    .await?;
+  assert!(matches!(acquired_by_b, LeaseAcquireOutcome::Acquired(_)));
+  Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
   config.flush_max_delay_ms = 10;
@@ -1339,7 +1492,7 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
 
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release_first = Arc::new(Semaphore::new(0));
-  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+  let engine = Arc::new(WriteEngineImpl::new(
     config.clone(),
     topics,
     Arc::new(GatedBlobStore {
@@ -1351,6 +1504,9 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
     Arc::new(InMemoryProducerPartitionLeaseStore::new()),
     "test-node".to_string(),
     None,
+    None,
+    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
+    shutdown_trigger.make_handle(),
     time_provider.clone(),
     &metrics_scope(),
   )?);
@@ -1396,6 +1552,7 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
 async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
   config.flush_max_delay_ms = 10;
@@ -1417,7 +1574,7 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
     .collect();
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release = Arc::new(Semaphore::new(0));
-  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+  let engine = Arc::new(WriteEngineImpl::new(
     config.clone(),
     topics,
     Arc::new(BlockingBlobStore {
@@ -1428,6 +1585,9 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
     Arc::new(InMemoryProducerPartitionLeaseStore::new()),
     "test-node".to_string(),
     None,
+    None,
+    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
+    shutdown_trigger.make_handle(),
     time_provider.clone(),
     &metrics_scope(),
   )?);
@@ -1495,6 +1655,7 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
 async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
   config.flush_max_delay_ms = 10;
@@ -1513,7 +1674,7 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
     );
   }
 
-  let engine = Arc::new(WriteEngineImpl::new_with_time_provider(
+  let engine = Arc::new(WriteEngineImpl::new(
     config.clone(),
     topics,
     Arc::new(InMemoryBlobStore::new()),
@@ -1524,6 +1685,9 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
     Arc::new(InMemoryProducerPartitionLeaseStore::new()),
     "test-node".to_string(),
     None,
+    None,
+    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
+    shutdown_trigger.make_handle(),
     time_provider.clone(),
     &metrics_scope(),
   )?);
@@ -1564,11 +1728,16 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
 #[tokio::test]
 async fn assigns_monotonic_sequences() -> Result<()> {
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
   config.flush_max_delay_ms = 60_000;
 
-  let (engine, _metadata_store) = make_engine(time_provider.clone(), config)?;
+  let (engine, _metadata_store) = make_engine(
+    time_provider.clone(),
+    config,
+    shutdown_trigger.make_handle(),
+  )?;
 
   let request = WriteRequest {
     topic: "telemetry".to_string(),
@@ -1593,12 +1762,17 @@ async fn assigns_monotonic_sequences() -> Result<()> {
 #[tokio::test]
 async fn writes_compressed_metadata() -> Result<()> {
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 5;
   config.flush_max_delay_ms = 60_000;
   config.window_size_seconds = 60;
 
-  let (engine, metadata_store) = make_engine(time_provider.clone(), config.clone())?;
+  let (engine, metadata_store) = make_engine(
+    time_provider.clone(),
+    config.clone(),
+    shutdown_trigger.make_handle(),
+  )?;
 
   let request = WriteRequest {
     topic: "telemetry".to_string(),
@@ -1643,6 +1817,7 @@ impl MetadataStore for FailingMetadataStore {
 #[tokio::test]
 async fn returns_error_when_flush_fails() -> Result<()> {
   let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut topics = HashMap::new();
   topics.insert(
     "telemetry".to_string(),
@@ -1659,7 +1834,7 @@ async fn returns_error_when_flush_fails() -> Result<()> {
   config.flush_max_bytes = 1;
   config.flush_max_delay_ms = 60_000;
 
-  let engine = WriteEngineImpl::new_with_time_provider(
+  let engine = WriteEngineImpl::new(
     config,
     topics,
     Arc::new(InMemoryBlobStore::new()),
@@ -1667,6 +1842,9 @@ async fn returns_error_when_flush_fails() -> Result<()> {
     Arc::new(InMemoryProducerPartitionLeaseStore::new()),
     "test-node".to_string(),
     None,
+    None,
+    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
+    shutdown_trigger.make_handle(),
     time_provider,
     &metrics_scope(),
   )?;

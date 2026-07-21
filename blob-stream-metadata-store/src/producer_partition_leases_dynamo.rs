@@ -3,6 +3,7 @@
 mod tests;
 
 use crate::{
+  DynamoCapacityMetrics,
   LeaseAcquireAndReserveOutcome,
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
@@ -17,7 +18,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
-use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
+use aws_sdk_dynamodb::types::{AttributeValue, ReturnConsumedCapacity, ReturnValue};
 use blob_stream_types::SeqRange;
 use log::{debug, trace};
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,6 @@ const ATTR_HOLDER: &str = "holder_id";
 const ATTR_EXPIRES: &str = "lease_expiration_ts_ms";
 const ATTR_MAX_SEQ: &str = "max_allocated_seq";
 const ATTR_TTL: &str = "ttl_epoch_seconds";
-const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
 
 //
 // DynamoProducerPartitionLeaseStore
@@ -39,24 +39,40 @@ pub struct DynamoProducerPartitionLeaseStore {
   client: Client,
   table_name: String,
   ttl_buffer_seconds: i64,
+  capacity_metrics: Option<DynamoCapacityMetrics>,
 }
 
 impl DynamoProducerPartitionLeaseStore {
   #[must_use]
-  pub fn new(client: Client, table_name: impl Into<String>) -> Self {
-    Self::with_ttl_buffer_seconds(client, table_name, DEFAULT_LEASE_TTL_BUFFER_SECONDS)
-  }
-
-  #[must_use]
-  pub fn with_ttl_buffer_seconds(
+  pub fn new(
     client: Client,
     table_name: impl Into<String>,
     ttl_buffer_seconds: u32,
+    capacity_metrics: Option<DynamoCapacityMetrics>,
   ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
       ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
+      capacity_metrics,
+    }
+  }
+
+  fn record_read_capacity(
+    &self,
+    consumed_capacity: Option<&aws_sdk_dynamodb::types::ConsumedCapacity>,
+  ) {
+    if let Some(capacity_metrics) = &self.capacity_metrics {
+      capacity_metrics.record_read(consumed_capacity);
+    }
+  }
+
+  fn record_write_capacity(
+    &self,
+    consumed_capacity: Option<&aws_sdk_dynamodb::types::ConsumedCapacity>,
+  ) {
+    if let Some(capacity_metrics) = &self.capacity_metrics {
+      capacity_metrics.record_write(consumed_capacity);
     }
   }
 
@@ -70,8 +86,10 @@ impl DynamoProducerPartitionLeaseStore {
       .table_name(&self.table_name)
       .key(ATTR_PK, AttributeValue::S(key.format()))
       .consistent_read(false)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await?;
+    self.record_read_capacity(response.consumed_capacity.as_ref());
 
     let Some(item) = response.item else {
       return Ok(None);
@@ -198,11 +216,13 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       .condition_expression(condition)
       .set_expression_attribute_values(Some(values))
       .return_values(ReturnValue::AllNew)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await;
 
     match response {
       Ok(output) => {
+        self.record_write_capacity(output.consumed_capacity.as_ref());
         let attributes = output
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
@@ -279,11 +299,13 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       .condition_expression(condition)
       .set_expression_attribute_values(Some(values))
       .return_values(ReturnValue::AllNew)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await;
 
     match response {
       Ok(output) => {
+        self.record_write_capacity(output.consumed_capacity.as_ref());
         let attributes = output
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
@@ -356,11 +378,13 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       .condition_expression(condition)
       .set_expression_attribute_values(Some(values))
       .return_values(ReturnValue::UpdatedOld)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await;
 
     match response {
       Ok(output) => {
+        self.record_write_capacity(output.consumed_capacity.as_ref());
         let old_max = output
           .attributes
           .as_ref()
@@ -440,11 +464,13 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       .condition_expression(condition)
       .set_expression_attribute_values(Some(values))
       .return_values(ReturnValue::AllNew)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await;
 
     match response {
-      Ok(_) => {
+      Ok(output) => {
+        self.record_write_capacity(output.consumed_capacity.as_ref());
         debug!("producer lease(dynamo) release result: released");
         Ok(LeaseReleaseOutcome::Released)
       },

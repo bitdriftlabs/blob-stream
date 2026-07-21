@@ -11,6 +11,7 @@ doctest = true
 anyhow.workspace                  = true
 async-trait.workspace             = true
 axum.workspace                    = true
+bd-backoff.workspace              = true
 bd-grpc.workspace                 = true
 bd-log.workspace                  = true
 bd-pgv.workspace                  = true

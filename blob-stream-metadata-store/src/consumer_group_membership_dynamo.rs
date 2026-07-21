@@ -8,12 +8,19 @@ use crate::{
   ConsumerGroupMembershipStore,
   ConsumerGroupPlannerLease,
   ConsumerGroupPlannerLeaseOutcome,
+  DynamoCapacityMetrics,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
-use aws_sdk_dynamodb::types::{AttributeValue, ConditionCheck, TransactWriteItem, Update};
+use aws_sdk_dynamodb::types::{
+  AttributeValue,
+  ConditionCheck,
+  ReturnConsumedCapacity,
+  TransactWriteItem,
+  Update,
+};
 use log::trace;
 use std::collections::{HashMap, HashSet};
 
@@ -38,7 +45,6 @@ const RECORD_TYPE_PLANNER_LEASE: &str = "assignment_planner_lease";
 const ASSIGNMENT_CONTROL_PARTITION_PREFIX: &str = "__blob_stream_assignment_control_v1__";
 const ASSIGNMENT_PLAN_SORT_KEY: &str = "__blob_stream_assignment_plan_v1__";
 const PLANNER_LEASE_SORT_KEY: &str = "__blob_stream_assignment_planner_v1__";
-const DEFAULT_MEMBERSHIP_TTL_BUFFER_SECONDS: u32 = 3_600;
 
 //
 // DynamoConsumerGroupMembershipStore
@@ -49,24 +55,49 @@ pub struct DynamoConsumerGroupMembershipStore {
   client: Client,
   table_name: String,
   ttl_buffer_seconds: i64,
+  capacity_metrics: Option<DynamoCapacityMetrics>,
 }
 
 impl DynamoConsumerGroupMembershipStore {
   #[must_use]
-  pub fn new(client: Client, table_name: impl Into<String>) -> Self {
-    Self::with_ttl_buffer_seconds(client, table_name, DEFAULT_MEMBERSHIP_TTL_BUFFER_SECONDS)
-  }
-
-  #[must_use]
-  pub fn with_ttl_buffer_seconds(
+  pub fn new(
     client: Client,
     table_name: impl Into<String>,
     ttl_buffer_seconds: u32,
+    capacity_metrics: Option<DynamoCapacityMetrics>,
   ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
       ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
+      capacity_metrics,
+    }
+  }
+
+  fn record_read_capacity(
+    &self,
+    consumed_capacity: Option<&aws_sdk_dynamodb::types::ConsumedCapacity>,
+  ) {
+    if let Some(capacity_metrics) = &self.capacity_metrics {
+      capacity_metrics.record_read(consumed_capacity);
+    }
+  }
+
+  fn record_write_capacity(
+    &self,
+    consumed_capacity: Option<&aws_sdk_dynamodb::types::ConsumedCapacity>,
+  ) {
+    if let Some(capacity_metrics) = &self.capacity_metrics {
+      capacity_metrics.record_write(consumed_capacity);
+    }
+  }
+
+  fn record_write_capacities(
+    &self,
+    consumed_capacities: &[aws_sdk_dynamodb::types::ConsumedCapacity],
+  ) {
+    if let Some(capacity_metrics) = &self.capacity_metrics {
+      capacity_metrics.record_writes(consumed_capacities);
     }
   }
 
@@ -264,7 +295,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       AttributeValue::S(RECORD_TYPE_MEMBER.to_string()),
     );
 
-    self
+    let response = self
       .client
       .update_item()
       .table_name(&self.table_name)
@@ -275,8 +306,10 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
          {ATTR_RECORD_TYPE} = :member_type"
       ))
       .set_expression_attribute_values(Some(values))
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await?;
+    self.record_write_capacity(response.consumed_capacity.as_ref());
 
     Ok(())
   }
@@ -304,14 +337,16 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       self.table_name, topic, group_id, member_id
     );
 
-    self
+    let response = self
       .client
       .delete_item()
       .table_name(&self.table_name)
       .key(ATTR_PK, AttributeValue::S(Self::pk(topic, group_id)))
       .key(ATTR_SK, AttributeValue::S(Self::sk(member_id)))
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await?;
+    self.record_write_capacity(response.consumed_capacity.as_ref());
 
     Ok(())
   }
@@ -359,7 +394,11 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
         query = query.set_exclusive_start_key(Some(key));
       }
 
-      let response = query.send().await?;
+      let response = query
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .await?;
+      self.record_read_capacity(response.consumed_capacity.as_ref());
       for item in response.items() {
         if let Some(AttributeValue::S(member_id)) = item.get(ATTR_SK) {
           members.insert(member_id.clone());
@@ -393,8 +432,10 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       )
       .key(ATTR_SK, AttributeValue::S(Self::plan_key()))
       .consistent_read(true)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await?;
+    self.record_read_capacity(response.consumed_capacity.as_ref());
     let Some(item) = response.item else {
       return Ok(None);
     };
@@ -425,8 +466,10 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       )
       .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
       .consistent_read(true)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await?;
+    self.record_read_capacity(response.consumed_capacity.as_ref());
     let Some(item) = response.item else {
       return Ok(None);
     };
@@ -493,11 +536,15 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
          :owner AND {ATTR_PLANNER_SESSION} = :session)"
       ))
       .set_expression_attribute_values(Some(values))
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await;
 
     match response {
-      Ok(_) => Ok(ConsumerGroupPlannerLeaseOutcome::Acquired),
+      Ok(output) => {
+        self.record_write_capacity(output.consumed_capacity.as_ref());
+        Ok(ConsumerGroupPlannerLeaseOutcome::Acquired)
+      },
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
       {
@@ -536,11 +583,15 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
         "{ATTR_OWNER} = :owner AND {ATTR_PLANNER_SESSION} = :session"
       ))
       .set_expression_attribute_values(Some(values))
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await;
 
     match response {
-      Ok(_) => Ok(true),
+      Ok(output) => {
+        self.record_write_capacity(output.consumed_capacity.as_ref());
+        Ok(true)
+      },
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
       {
@@ -606,11 +657,15 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
           .build(),
       )
       .transact_items(TransactWriteItem::builder().update(plan_update).build())
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await;
 
     match response {
-      Ok(_) => Ok(true),
+      Ok(output) => {
+        self.record_write_capacities(output.consumed_capacity.as_deref().unwrap_or_default());
+        Ok(true)
+      },
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_transaction_canceled_exception() =>
       {

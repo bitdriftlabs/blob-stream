@@ -8,11 +8,14 @@ use super::{
   ProducerError,
   ProducerRecord,
   ProducerRetryReason,
+  RetryClock,
   broker_assignment,
   compute_virtual_partition_id,
-  retry_delay_ms,
+  next_retry_delay,
+  producer_retry_backoff,
+  send_batch_with_retry_and_retry_control,
 };
-use crate::config::{producer_config_with_defaults, producer_writer_id};
+use crate::config::{producer_config_with_defaults, producer_writer_id, validate_producer_config};
 use crate::{ProducerCompression, ProducerConfig, ProducerTopicConfig};
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -28,7 +31,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore, mpsc, watch};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
 struct TestBrokerDiscovery {
   membership: BrokerMembership,
@@ -76,7 +79,9 @@ impl super::BrokerTransport for FakeBrokerTransport {
     &self,
     broker_address: &str,
     request: blob_stream_proto::protos::blobstream::v1::broker::ProduceBatchRequest,
+    request_timeout: Duration,
   ) -> anyhow::Result<ProduceBatchResponse> {
+    assert!(!request_timeout.is_zero());
     self.sent.lock().await.push(SentBatch {
       broker_address: broker_address.to_string(),
       request,
@@ -102,7 +107,9 @@ impl super::BrokerTransport for GatedBrokerTransport {
     &self,
     _broker_address: &str,
     request: ProduceBatchRequest,
+    request_timeout: Duration,
   ) -> anyhow::Result<ProduceBatchResponse> {
+    assert!(!request_timeout.is_zero());
     self
       .entered_tx
       .send(request.virtual_partition_id)
@@ -139,6 +146,7 @@ fn default_config() -> ProducerConfig {
   config.max_retries = Some(4);
   config.retry_base_delay_ms = Some(1);
   config.retry_max_delay_ms = Some(8);
+  config.retry_deadline_ms = Some(1_000);
   config.connect_timeout_ms = Some(1_000);
   config.request_timeout_ms = Some(1_000);
   config.max_request_concurrency = Some(16);
@@ -539,6 +547,43 @@ async fn surfaces_retry_exhaustion_for_transport_errors() {
 }
 
 #[tokio::test]
+async fn retry_deadline_bounds_a_blocked_transport_attempt() {
+  let mut config = default_config();
+  config.request_timeout_ms = Some(1_000);
+  config.retry_deadline_ms = Some(20);
+
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let transport = Arc::new(GatedBrokerTransport {
+    entered_tx,
+    release: Arc::new(Semaphore::new(0)),
+  });
+  let producer = ProducerClientImpl::new_with_transport(
+    config,
+    vec![topic_config()],
+    discovery,
+    transport,
+    metrics_scope(),
+  )
+  .await
+  .unwrap();
+
+  let produce = producer.produce(ProducerRecord::new(
+    "telemetry",
+    b"deadline".to_vec(),
+    vec![1],
+    0,
+  ));
+  let error = timeout(Duration::from_millis(200), produce)
+    .await
+    .expect("producer request should respect retry deadline")
+    .unwrap_err();
+
+  assert!(entered_rx.recv().await.is_some());
+  assert!(matches!(error, ProducerError::RetriesExhausted(_)));
+}
+
+#[tokio::test]
 async fn flush_returns_batch_failure_after_notifying_waiters() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
@@ -925,12 +970,91 @@ async fn producer_dispatch_respects_the_shared_concurrency_limit() {
   }
 }
 
+struct FixedRetryClock {
+  now: parking_lot::Mutex<Instant>,
+  sleeps: parking_lot::Mutex<Vec<Duration>>,
+}
+
+impl FixedRetryClock {
+  fn new(now: Instant) -> Self {
+    Self {
+      now: parking_lot::Mutex::new(now),
+      sleeps: parking_lot::Mutex::new(Vec::new()),
+    }
+  }
+}
+
+#[async_trait]
+impl RetryClock for FixedRetryClock {
+  fn now(&self) -> Instant {
+    *self.now.lock()
+  }
+
+  async fn sleep(&self, duration: Duration) {
+    self.sleeps.lock().push(duration);
+    *self.now.lock() += duration;
+  }
+}
+
 #[test]
-fn retry_backoff_is_exponential_and_capped() {
-  let config = default_config();
-  assert_eq!(retry_delay_ms(&config, 0), 1);
-  assert_eq!(retry_delay_ms(&config, 1), 2);
-  assert_eq!(retry_delay_ms(&config, 2), 4);
-  assert_eq!(retry_delay_ms(&config, 3), 8);
-  assert_eq!(retry_delay_ms(&config, 4), 8);
+fn retry_backoff_respects_configured_maximum() {
+  let mut config = default_config();
+  config.retry_base_delay_ms = Some(1);
+  config.retry_max_delay_ms = Some(8);
+  let mut backoff = producer_retry_backoff(&config);
+
+  for _ in 0 .. 10 {
+    assert!(next_retry_delay(&mut backoff, Duration::from_millis(8)) <= Duration::from_millis(8));
+  }
+}
+
+#[test]
+fn rejects_retry_backoff_with_base_above_maximum() {
+  let mut config = default_config();
+  config.retry_base_delay_ms = Some(9);
+  config.retry_max_delay_ms = Some(8);
+
+  let error = validate_producer_config(&config).unwrap_err();
+  assert!(error.to_string().contains("must not exceed"));
+}
+
+#[tokio::test]
+async fn retry_deadline_clips_the_retry_delay() {
+  let mut config = default_config();
+  config.max_retries = Some(4);
+  config.retry_base_delay_ms = Some(100);
+  config.retry_max_delay_ms = Some(100);
+  config.retry_deadline_ms = Some(10);
+
+  let transport = FakeBrokerTransport::default();
+  transport
+    .enqueue_response(Err(anyhow!("network down")))
+    .await;
+  let clock = FixedRetryClock::new(Instant::now());
+  let mut retry_backoff = producer_retry_backoff(&config);
+  let membership = watch::channel(membership()).1;
+  let topics = HashMap::from([("telemetry".to_string(), topic_config())]);
+  let batch = super::BufferedBatch {
+    topic: "telemetry".to_string(),
+    virtual_partition_id: 16,
+    records: Vec::new(),
+    waiters: Vec::new(),
+  };
+
+  let result = send_batch_with_retry_and_retry_control(
+    &config,
+    &topics,
+    &membership,
+    &transport,
+    &batch,
+    &super::ProducerMetrics::new(&metrics_scope()),
+    &super::ProducerRetryDiagnostics::default(),
+    &clock,
+    &mut retry_backoff,
+  )
+  .await;
+
+  assert!(matches!(result, Err(ProducerError::RetriesExhausted(_))));
+  assert_eq!(transport.sent.lock().await.len(), 1);
+  assert_eq!(*clock.sleeps.lock(), vec![Duration::from_millis(10)]);
 }

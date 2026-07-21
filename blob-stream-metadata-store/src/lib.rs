@@ -17,20 +17,24 @@ use blob_stream_types::{
 };
 use std::collections::HashMap;
 
+mod aws;
 mod consumer_group_leases_dynamo;
 mod consumer_group_leases_memory;
 mod consumer_group_membership_dynamo;
 mod consumer_group_membership_memory;
 mod dynamo;
+mod dynamo_metrics;
 mod memory;
 mod producer_partition_leases_dynamo;
 mod producer_partition_leases_memory;
 
+pub use aws::{aws_retry_config, aws_timeout_config};
 pub use consumer_group_leases_dynamo::DynamoConsumerGroupLeaseStore;
 pub use consumer_group_leases_memory::InMemoryConsumerGroupLeaseStore;
 pub use consumer_group_membership_dynamo::DynamoConsumerGroupMembershipStore;
 pub use consumer_group_membership_memory::InMemoryConsumerGroupMembershipStore;
 pub use dynamo::DynamoMetadataStore;
+pub use dynamo_metrics::DynamoCapacityMetrics;
 pub use memory::InMemoryMetadataStore;
 pub use producer_partition_leases_dynamo::DynamoProducerPartitionLeaseStore;
 pub use producer_partition_leases_memory::InMemoryProducerPartitionLeaseStore;

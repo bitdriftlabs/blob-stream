@@ -10,12 +10,13 @@ use crate::{
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
   ConsumerGroupReleaseOutcome,
+  DynamoCapacityMetrics,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
-use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
+use aws_sdk_dynamodb::types::{AttributeValue, ReturnConsumedCapacity, ReturnValue};
 use blob_stream_types::CommittedCursor;
 use log::{debug, trace};
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,6 @@ const ATTR_LAST_HEARTBEAT: &str = "last_heartbeat_ts";
 const ATTR_COMMITTED_CURSOR: &str = "committed_cursor";
 const ATTR_COMMITTED_TS: &str = "committed_ts";
 const ATTR_TTL: &str = "ttl_epoch_seconds";
-const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
 
 //
 // DynamoConsumerGroupLeaseStore
@@ -41,24 +41,40 @@ pub struct DynamoConsumerGroupLeaseStore {
   client: Client,
   table_name: String,
   ttl_buffer_seconds: i64,
+  capacity_metrics: Option<DynamoCapacityMetrics>,
 }
 
 impl DynamoConsumerGroupLeaseStore {
   #[must_use]
-  pub fn new(client: Client, table_name: impl Into<String>) -> Self {
-    Self::with_ttl_buffer_seconds(client, table_name, DEFAULT_LEASE_TTL_BUFFER_SECONDS)
-  }
-
-  #[must_use]
-  pub fn with_ttl_buffer_seconds(
+  pub fn new(
     client: Client,
     table_name: impl Into<String>,
     ttl_buffer_seconds: u32,
+    capacity_metrics: Option<DynamoCapacityMetrics>,
   ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
       ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
+      capacity_metrics,
+    }
+  }
+
+  fn record_read_capacity(
+    &self,
+    consumed_capacity: Option<&aws_sdk_dynamodb::types::ConsumedCapacity>,
+  ) {
+    if let Some(capacity_metrics) = &self.capacity_metrics {
+      capacity_metrics.record_read(consumed_capacity);
+    }
+  }
+
+  fn record_write_capacity(
+    &self,
+    consumed_capacity: Option<&aws_sdk_dynamodb::types::ConsumedCapacity>,
+  ) {
+    if let Some(capacity_metrics) = &self.capacity_metrics {
+      capacity_metrics.record_write(consumed_capacity);
     }
   }
 
@@ -70,8 +86,10 @@ impl DynamoConsumerGroupLeaseStore {
       .key(ATTR_PK, AttributeValue::S(key.partition_key()))
       .key(ATTR_SK, AttributeValue::S(key.sort_key()))
       .consistent_read(false)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await?;
+    self.record_read_capacity(response.consumed_capacity.as_ref());
 
     let Some(item) = response.item else {
       return Ok(None);
@@ -124,7 +142,11 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
         query = query.set_exclusive_start_key(Some(key));
       }
 
-      let response = query.send().await?;
+      let response = query
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .await?;
+      self.record_read_capacity(response.consumed_capacity.as_ref());
       for item in response.items() {
         let partition_id = item
           .get(ATTR_SK)
@@ -203,11 +225,13 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       .condition_expression(condition)
       .set_expression_attribute_values(Some(values))
       .return_values(ReturnValue::AllNew)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await;
 
     match response {
       Ok(output) => {
+        self.record_write_capacity(output.consumed_capacity.as_ref());
         let attributes = output
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
@@ -294,11 +318,13 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       .condition_expression(condition)
       .set_expression_attribute_values(Some(values))
       .return_values(ReturnValue::AllNew)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await;
 
     match response {
       Ok(output) => {
+        self.record_write_capacity(output.consumed_capacity.as_ref());
         let attributes = output
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
@@ -376,11 +402,13 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       .condition_expression(condition)
       .set_expression_attribute_values(Some(values))
       .return_values(ReturnValue::AllNew)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await;
 
     match response {
       Ok(output) => {
+        self.record_write_capacity(output.consumed_capacity.as_ref());
         let attributes = output
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
@@ -450,11 +478,13 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       .condition_expression(condition)
       .set_expression_attribute_values(Some(values))
       .return_values(ReturnValue::AllNew)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await;
 
     match response {
-      Ok(_) => {
+      Ok(output) => {
+        self.record_write_capacity(output.consumed_capacity.as_ref());
         debug!("consumer lease(dynamo) release result: released");
         Ok(ConsumerGroupReleaseOutcome::Released)
       },

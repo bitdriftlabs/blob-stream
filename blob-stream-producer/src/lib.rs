@@ -33,6 +33,7 @@
 //!   producer.max_retries = Some(5);
 //!   producer.retry_base_delay_ms = Some(25);
 //!   producer.retry_max_delay_ms = Some(1000);
+//!   producer.retry_deadline_ms = Some(30_000);
 //!   producer.connect_timeout_ms = Some(2000);
 //!   producer.request_timeout_ms = Some(5000);
 //!   producer.max_request_concurrency = Some(64);

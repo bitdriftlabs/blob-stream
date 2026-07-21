@@ -97,7 +97,8 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
   create_membership_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone());
+  let store =
+    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
 
   store
     .register_member("topic-a", "group-a", "member-a", 1_000, 100)
@@ -145,7 +146,8 @@ async fn register_rejects_invalid_ttl() -> Result<()> {
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
   create_membership_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone());
+  let store =
+    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
   let err = store
     .register_member("topic-a", "group-a", "member-a", 1_000, 0)
     .await
@@ -166,11 +168,8 @@ async fn writes_ttl_attribute_for_membership_rows() -> Result<()> {
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
   create_membership_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupMembershipStore::with_ttl_buffer_seconds(
-    client.clone(),
-    table_name.clone(),
-    120,
-  );
+  let store =
+    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 120, None);
 
   store
     .register_member("topic-a", "group-a", "member-a", 1_000, 1_000)
@@ -216,7 +215,8 @@ async fn planner_release_allows_immediate_takeover_and_fences_stale_owner() -> R
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
   create_membership_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone());
+  let store =
+    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
   assert_eq!(
     store
       .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-a", 1_000, 1_000)
@@ -257,7 +257,8 @@ async fn planner_records_do_not_appear_in_legacy_member_partition() -> Result<()
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
   create_membership_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone());
+  let store =
+    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
   store
     .register_member("topic-a", "group-a", "member-a", 1_000, 1_000)
     .await?;
@@ -316,7 +317,8 @@ async fn planner_session_fences_stale_process_and_mismatched_plan_publisher() ->
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
   create_membership_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone());
+  let store =
+    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
   assert_eq!(
     store
       .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-old", 1_000, 100)

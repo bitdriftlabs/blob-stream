@@ -262,6 +262,10 @@ message ProducerConfig {
   // Request compression strategy.
   // Default when unset: PRODUCER_COMPRESSION_NONE.
   optional ProducerCompression compression = 11 [(validate.rules).enum.defined_only = true];
+
+  // Maximum total time spent retrying one producer batch, including retry delays and RPCs.
+  // Default when unset: 30,000 ms.
+  optional uint64 retry_deadline_ms = 12 [(validate.rules).uint64.gt = 0];
 }
 
 // Runtime configuration for producer clients.

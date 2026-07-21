@@ -30,6 +30,7 @@ use blob_stream_metadata_store::{
   MetadataStore,
   ProducerPartitionLeaseStore,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -132,6 +133,9 @@ impl IntegrationResources {
     let inner: Arc<dyn MetadataStore> = Arc::new(DynamoMetadataStore::new(
       self.dynamo.clone(),
       self.metadata_table.clone(),
+      HashMap::new(),
+      3_600,
+      None,
     ));
     Arc::new(FaultInjectedMetadataStore::new(
       inner,
@@ -144,6 +148,8 @@ impl IntegrationResources {
       Arc::new(DynamoProducerPartitionLeaseStore::new(
         self.dynamo.clone(),
         self.producer_lease_table.clone(),
+        3_600,
+        None,
       ));
     Arc::new(FaultInjectedProducerPartitionLeaseStore::new(
       inner,
@@ -155,6 +161,8 @@ impl IntegrationResources {
     let inner: Arc<dyn ConsumerGroupLeaseStore> = Arc::new(DynamoConsumerGroupLeaseStore::new(
       self.dynamo.clone(),
       self.consumer_lease_table.clone(),
+      3_600,
+      None,
     ));
     Arc::new(FaultInjectedConsumerGroupLeaseStore::new(
       inner,
@@ -167,6 +175,8 @@ impl IntegrationResources {
       Arc::new(DynamoConsumerGroupMembershipStore::new(
         self.dynamo.clone(),
         self.consumer_membership_table.clone(),
+        3_600,
+        None,
       ));
     Arc::new(FaultInjectedConsumerGroupMembershipStore::new(
       inner,

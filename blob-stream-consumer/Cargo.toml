@@ -15,6 +15,7 @@ aws-sdk-dynamodb.workspace      = true
 aws-sdk-s3.workspace            = true
 aws-types.workspace             = true
 axum.workspace                  = true
+bd-backoff.workspace            = true
 bd-log.workspace                = true
 bd-pgv.workspace                = true
 bd-runtime-config.workspace     = true

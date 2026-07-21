@@ -37,6 +37,7 @@ use crate::diagnostics::{
   offsets_from_map,
 };
 use anyhow::Result;
+use bd_backoff::{ExponentialBackoff, ExponentialBackoffBuilder, InfiniteBackoff as _};
 use bd_log::warn_every;
 use blob_stream_types::{
   SnowflakeId,
@@ -58,32 +59,37 @@ use tokio::sync::{Notify, mpsc, oneshot};
 
 /// Exponential idle delay used only when a complete reader pass produces no batches.
 pub(super) struct IdlePollBackoff {
-  base_delay_ms: u64,
-  max_delay_ms: Option<u64>,
-  current_delay_ms: u64,
+  inner: ExponentialBackoff,
 }
 
 impl IdlePollBackoff {
   pub(super) fn new(base_delay_ms: u64, max_delay_ms: Option<u64>) -> Self {
     Self {
-      base_delay_ms,
-      max_delay_ms,
-      current_delay_ms: base_delay_ms,
+      inner: ExponentialBackoffBuilder::new_infinite()
+        .with_initial_interval(
+          time::Duration::try_from(std::time::Duration::from_millis(base_delay_ms))
+            .unwrap_or(time::Duration::MAX),
+        )
+        .with_randomization_factor(0.0)
+        .with_multiplier(2.0)
+        .with_max_interval(
+          time::Duration::try_from(std::time::Duration::from_millis(
+            max_delay_ms.unwrap_or(base_delay_ms),
+          ))
+          .unwrap_or(time::Duration::MAX),
+        )
+        .build(),
     }
   }
 
   /// Return the current delay before increasing it for the next consecutive empty read.
   pub(super) fn next_delay_ms(&mut self) -> u64 {
-    let delay_ms = self.current_delay_ms;
-    if let Some(max_delay_ms) = self.max_delay_ms {
-      self.current_delay_ms = self.current_delay_ms.saturating_mul(2).min(max_delay_ms);
-    }
-    delay_ms
+    u64::try_from(self.inner.next_backoff().whole_milliseconds()).unwrap_or(u64::MAX)
   }
 
   /// A nonempty reader result restores the configured base poll delay.
   pub(super) fn reset(&mut self) {
-    self.current_delay_ms = self.base_delay_ms;
+    self.inner.reset();
   }
 }
 
