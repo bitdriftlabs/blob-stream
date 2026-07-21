@@ -20,6 +20,7 @@ use blob_stream_broker_discovery::{
   writer_virtual_partitions,
 };
 use blob_stream_metadata_store::{
+  LeaseAcquireAndReserveOutcome,
   LeaseAcquireOutcome,
   MetadataStore,
   ProducerPartitionLeaseKey,
@@ -41,7 +42,7 @@ use blob_stream_types::{
 pub use config::{TopicInfo, WriteConfig, build_write_engine};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use log::{error, trace};
+use log::{debug, error, trace};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -399,6 +400,34 @@ impl WriteMetrics {
   }
 }
 
+async fn acquire_lease_and_reserve_sequences(
+  lease_store: &Arc<dyn ProducerPartitionLeaseStore>,
+  holder_id: &str,
+  key: ProducerPartitionLeaseKey,
+  now_ts_ms: i64,
+  lease_duration_ms: i64,
+  reservation_size: Option<u64>,
+  metrics: &WriteMetrics,
+) -> Result<LeaseAcquireAndReserveOutcome> {
+  let reservation_started = reservation_size.map(|_| Instant::now());
+  let outcome = lease_store
+    .acquire_lease_and_reserve_sequences(
+      key,
+      holder_id.to_string(),
+      now_ts_ms,
+      lease_duration_ms,
+      reservation_size,
+    )
+    .await
+    .context("acquire producer partition lease and reserve sequences");
+  if let Some(reservation_started) = reservation_started {
+    metrics
+      .sequence_reservation_latency_seconds
+      .observe(reservation_started.elapsed().as_secs_f64());
+  }
+  outcome
+}
+
 pub struct WriteEngineImpl {
   config: WriteConfig,
   topics: HashMap<String, TopicInfo>,
@@ -581,6 +610,7 @@ impl WriteEngineImpl {
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
     now_ts_ms: i64,
+    reservation_size: u64,
   ) -> Result<SeqRange, WriteError> {
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string(),
@@ -590,12 +620,7 @@ impl WriteEngineImpl {
 
     let outcome = self
       .lease_store
-      .reserve_sequences(
-        &key,
-        &self.holder_id,
-        now_ts_ms,
-        self.config.reservation_size,
-      )
+      .reserve_sequences(&key, &self.holder_id, now_ts_ms, reservation_size)
       .await
       .context("reserve sequences");
     self
@@ -609,6 +634,64 @@ impl WriteEngineImpl {
         Ok(reservation.range)
       },
       Ok(SequenceReservationOutcome::HeldByOther(_) | SequenceReservationOutcome::Expired) => {
+        self.metrics.sequence_reservation_failures_total.inc();
+        Err(WriteError::NotLeaseHolder {
+          topic: topic.to_string(),
+          virtual_partition_id,
+        })
+      },
+      Err(error) => {
+        self.metrics.sequence_reservation_failures_total.inc();
+        Err(error.into())
+      },
+    }
+  }
+
+  async fn acquire_lease_and_reserve_sequences(
+    &self,
+    topic: &str,
+    virtual_partition_id: VirtualPartitionId,
+    now_ts_ms: i64,
+    reservation_size: u64,
+  ) -> Result<(i64, SeqRange), WriteError> {
+    let key = ProducerPartitionLeaseKey {
+      topic: topic.to_string(),
+      virtual_partition_id,
+    };
+    let outcome = acquire_lease_and_reserve_sequences(
+      &self.lease_store,
+      &self.holder_id,
+      key,
+      now_ts_ms,
+      self.config.lease_duration_ms,
+      Some(reservation_size),
+      &self.metrics,
+    )
+    .await;
+
+    match outcome {
+      Ok(LeaseAcquireAndReserveOutcome::Acquired {
+        lease,
+        reservation: Some(reservation),
+      }) => {
+        self.metrics.record_sequence_reservation(&reservation);
+        debug!(
+          "broker sequence reservation acquired during produce with coalesced lease update: \
+           topic={topic}, virtual_partition_id={virtual_partition_id}, \
+           requested_size={reservation_size}, start={}, end={}",
+          reservation.start, reservation.end
+        );
+        Ok((lease.lease_expiration_ts_ms, reservation))
+      },
+      Ok(LeaseAcquireAndReserveOutcome::Acquired {
+        reservation: None, ..
+      }) => {
+        self.metrics.sequence_reservation_failures_total.inc();
+        Err(WriteError::Internal(anyhow!(
+          "lease store acquired lease without requested sequence reservation"
+        )))
+      },
+      Ok(LeaseAcquireAndReserveOutcome::HeldByOther(_)) => {
         self.metrics.sequence_reservation_failures_total.inc();
         Err(WriteError::NotLeaseHolder {
           topic: topic.to_string(),
@@ -753,6 +836,17 @@ impl WriteEngine for WriteEngineImpl {
             .seq_allocator
             .allocate(record_count)
             .ok_or_else(|| WriteError::Overloaded("sequence reservation exhausted".to_string()))?;
+          partition_state.records_allocated_since_lease_maintenance = partition_state
+            .records_allocated_since_lease_maintenance
+            .saturating_add(record_count);
+          trace!(
+            "broker sequence allocation: topic={topic}, \
+             virtual_partition_id={virtual_partition_id}, record_count={record_count}, start={}, \
+             end={}, remaining_capacity={}",
+            seq_range.start,
+            seq_range.end,
+            partition_state.seq_allocator.remaining_capacity(),
+          );
           partition_state.buffer.push(
             BufferedBatch {
               records: records.take().expect("records are buffered only once"),
@@ -776,6 +870,7 @@ impl WriteEngine for WriteEngineImpl {
         record_count,
         now_ts_ms,
         false,
+        self.config.reservation_size,
       );
       match decision {
         AllocationTransitionDecision::Draining => {
@@ -791,8 +886,29 @@ impl WriteEngine for WriteEngineImpl {
           // Sequence reservation is conditionally accepted only for the current active lease
           // holder. When acquisition is required, the lease may be absent or expired, so it must
           // complete before reserving sequences; these calls cannot be run in parallel.
-          if work.needs_lease {
-            match self
+          let mut reservation = None;
+          match (work.needs_lease, work.reservation) {
+            (true, Some(request)) => match self
+              .acquire_lease_and_reserve_sequences(
+                &topic,
+                virtual_partition_id,
+                now_ts_ms,
+                request.size,
+              )
+              .await
+            {
+              Ok((expires_at, range)) => {
+                lease_expiration = LeaseExpirationUpdate::Set(Some(expires_at));
+                reservation = Some(range);
+              },
+              Err(error) => {
+                work
+                  .transition
+                  .finish(LeaseExpirationUpdate::Preserve, None);
+                return Err(error);
+              },
+            },
+            (true, None) => match self
               .ensure_lease(&topic, virtual_partition_id, now_ts_ms)
               .await
             {
@@ -803,13 +919,9 @@ impl WriteEngine for WriteEngineImpl {
                   .finish(LeaseExpirationUpdate::Preserve, None);
                 return Err(error);
               },
-            }
-          }
-
-          let mut reservation = None;
-          if work.needs_reservation {
-            match self
-              .reserve_sequences(&topic, virtual_partition_id, now_ts_ms)
+            },
+            (false, Some(request)) => match self
+              .reserve_sequences(&topic, virtual_partition_id, now_ts_ms, request.size)
               .await
             {
               Ok(range) => reservation = Some(range),
@@ -817,7 +929,8 @@ impl WriteEngine for WriteEngineImpl {
                 work.transition.finish(lease_expiration, None);
                 return Err(error);
               },
-            }
+            },
+            (false, None) => {},
           }
           work.transition.finish(lease_expiration, reservation);
         },
@@ -1280,6 +1393,8 @@ struct TopicState {
 struct PartitionState {
   buffer: BufferState,
   seq_allocator: SeqAllocator,
+  adaptive_reservation_size: Option<u64>,
+  records_allocated_since_lease_maintenance: u64,
   lease_expiration_ts_ms: Option<i64>,
   flush_in_flight: bool,
   allocation_in_flight: bool,
@@ -1299,6 +1414,29 @@ impl PartitionState {
   fn is_drained(&self) -> bool {
     !self.flush_in_flight && !self.allocation_in_flight && self.buffer.batches.is_empty()
   }
+
+  fn reservation_target(&mut self, base_reservation_size: u64) -> u64 {
+    *self
+      .adaptive_reservation_size
+      .get_or_insert(base_reservation_size)
+  }
+
+  fn double_reservation_target(&mut self, base_reservation_size: u64) -> u64 {
+    let previous = self.reservation_target(base_reservation_size);
+    let target = previous.saturating_mul(2).min(u64::from(u32::MAX));
+    self.adaptive_reservation_size = Some(target);
+    debug!(
+      "broker sequence reservation target increased: previous_size={previous}, \
+       target_size={target}"
+    );
+    target
+  }
+
+  fn reset_sequence_allocation(&mut self) {
+    self.seq_allocator = SeqAllocator::default();
+    self.adaptive_reservation_size = None;
+    self.records_allocated_since_lease_maintenance = 0;
+  }
 }
 
 //
@@ -1309,6 +1447,7 @@ struct AllocationTransition {
   state: Arc<Mutex<WriteState>>,
   topic: String,
   virtual_partition_id: VirtualPartitionId,
+  reset_sequence_allocation_on_finish: bool,
   finished: bool,
 }
 
@@ -1318,13 +1457,27 @@ impl AllocationTransition {
     lease_expiration_update: LeaseExpirationUpdate,
     reservation: Option<SeqRange>,
   ) {
-    self.finish_inner(lease_expiration_update, reservation);
+    self.finish_inner(lease_expiration_update, reservation, None);
+  }
+
+  fn finish_lease_maintenance(
+    mut self,
+    lease_expiration_update: LeaseExpirationUpdate,
+    reservation: Option<SeqRange>,
+    records_allocated_since_last_maintenance: u64,
+  ) {
+    self.finish_inner(
+      lease_expiration_update,
+      reservation,
+      Some(records_allocated_since_last_maintenance),
+    );
   }
 
   fn finish_inner(
     &mut self,
     lease_expiration_update: LeaseExpirationUpdate,
     reservation: Option<SeqRange>,
+    records_allocated_since_last_maintenance: Option<u64>,
   ) {
     if self.finished {
       return;
@@ -1336,8 +1489,24 @@ impl AllocationTransition {
       if let LeaseExpirationUpdate::Set(lease_expiration_ts_ms) = lease_expiration_update {
         partition_state.lease_expiration_ts_ms = lease_expiration_ts_ms;
       }
+      if matches!(lease_expiration_update, LeaseExpirationUpdate::Set(None))
+        || (self.reset_sequence_allocation_on_finish
+          && matches!(lease_expiration_update, LeaseExpirationUpdate::Set(Some(_))))
+      {
+        partition_state.reset_sequence_allocation();
+      }
       if let Some(reservation) = reservation {
-        partition_state.seq_allocator.set_reservation(reservation);
+        partition_state
+          .seq_allocator
+          .install_or_extend_reservation(reservation);
+      }
+      if let Some(records_allocated_since_last_maintenance) =
+        records_allocated_since_last_maintenance
+        && matches!(lease_expiration_update, LeaseExpirationUpdate::Set(Some(_)))
+      {
+        partition_state.records_allocated_since_lease_maintenance = partition_state
+          .records_allocated_since_lease_maintenance
+          .saturating_sub(records_allocated_since_last_maintenance);
       }
       partition_state.allocation_in_flight = false;
       partition_state.allocation_started_ts_ms = None;
@@ -1354,7 +1523,7 @@ impl AllocationTransition {
 
 impl Drop for AllocationTransition {
   fn drop(&mut self) {
-    self.finish_inner(LeaseExpirationUpdate::Preserve, None);
+    self.finish_inner(LeaseExpirationUpdate::Preserve, None, None);
   }
 }
 
@@ -1375,7 +1544,29 @@ enum LeaseExpirationUpdate {
 struct AllocationTransitionWork {
   transition: AllocationTransition,
   needs_lease: bool,
-  needs_reservation: bool,
+  reservation: Option<ReservationRequest>,
+  records_allocated_since_last_maintenance: Option<u64>,
+}
+
+//
+// ReservationRequest
+//
+
+#[derive(Clone, Copy, Debug)]
+struct ReservationRequest {
+  size: u64,
+  reason: ReservationReason,
+}
+
+//
+// ReservationReason
+//
+
+#[derive(Clone, Copy, Debug)]
+enum ReservationReason {
+  Initial,
+  ForegroundExhaustion,
+  MaintenanceTopUp,
 }
 
 //
@@ -1396,6 +1587,7 @@ fn begin_allocation_transition(
   record_count: u64,
   now_ts_ms: i64,
   renew_lease: bool,
+  base_reservation_size: u64,
 ) -> AllocationTransitionDecision {
   let mut state_guard = state.lock();
   let partition_state = state_guard.partition_state_mut(topic, virtual_partition_id);
@@ -1408,9 +1600,48 @@ fn begin_allocation_transition(
     );
   }
 
-  let needs_lease = renew_lease || partition_state.needs_lease(now_ts_ms);
-  let needs_reservation = !partition_state.seq_allocator.can_allocate(record_count);
-  if !needs_lease && !needs_reservation {
+  let lease_was_expired = partition_state.needs_lease(now_ts_ms);
+  let needs_lease = renew_lease || lease_was_expired;
+  let remaining_capacity = partition_state.seq_allocator.remaining_capacity();
+  let records_allocated_since_last_maintenance =
+    partition_state.records_allocated_since_lease_maintenance;
+  let reservation = if !partition_state.seq_allocator.can_allocate(record_count) {
+    let reason = if !partition_state.seq_allocator.has_reservation() {
+      ReservationReason::Initial
+    } else if renew_lease {
+      ReservationReason::MaintenanceTopUp
+    } else {
+      ReservationReason::ForegroundExhaustion
+    };
+    let size = match reason {
+      ReservationReason::ForegroundExhaustion => {
+        partition_state.double_reservation_target(base_reservation_size)
+      },
+      ReservationReason::Initial | ReservationReason::MaintenanceTopUp => {
+        partition_state.reservation_target(base_reservation_size)
+      },
+    };
+    Some(ReservationRequest { size, reason })
+  } else if renew_lease && remaining_capacity < records_allocated_since_last_maintenance {
+    Some(ReservationRequest {
+      size: partition_state.reservation_target(base_reservation_size),
+      reason: ReservationReason::MaintenanceTopUp,
+    })
+  } else {
+    None
+  };
+  trace!(
+    "broker sequence allocation decision: topic={topic}, \
+     virtual_partition_id={virtual_partition_id}, record_count={record_count}, \
+     renew_lease={renew_lease}, needs_lease={needs_lease}, \
+     remaining_capacity={remaining_capacity}, \
+     records_allocated_since_last_maintenance={records_allocated_since_last_maintenance}, \
+     target_size={}, reservation={reservation:?}",
+    partition_state
+      .adaptive_reservation_size
+      .unwrap_or(base_reservation_size),
+  );
+  if !needs_lease && reservation.is_none() {
     return AllocationTransitionDecision::Ready;
   }
 
@@ -1421,10 +1652,13 @@ fn begin_allocation_transition(
       state: Arc::clone(state),
       topic: topic.to_string(),
       virtual_partition_id,
+      reset_sequence_allocation_on_finish: lease_was_expired,
       finished: false,
     },
     needs_lease,
-    needs_reservation,
+    reservation,
+    records_allocated_since_last_maintenance: renew_lease
+      .then_some(records_allocated_since_last_maintenance),
   })
 }
 
@@ -1499,6 +1733,18 @@ struct SeqAllocator {
 }
 
 impl SeqAllocator {
+  fn has_reservation(&self) -> bool {
+    self.reservation.is_some()
+  }
+
+  fn remaining_capacity(&self) -> u64 {
+    self
+      .reservation
+      .as_ref()
+      .and_then(|reservation| reservation.end.checked_sub(self.next_seq))
+      .map_or(0, |remaining| remaining.saturating_add(1))
+  }
+
   fn can_allocate(&self, count: u64) -> bool {
     let Some(reservation) = self.reservation.as_ref() else {
       return false;
@@ -1523,7 +1769,35 @@ impl SeqAllocator {
     Some(SeqRange { start, end })
   }
 
-  fn set_reservation(&mut self, range: SeqRange) {
+  fn install_or_extend_reservation(&mut self, range: SeqRange) {
+    if self.reservation.is_none() {
+      self.next_seq = range.start;
+      self.reservation = Some(range);
+      return;
+    }
+
+    if self.remaining_capacity() > 0 {
+      let reservation = self
+        .reservation
+        .as_mut()
+        .expect("remaining capacity requires a reservation");
+      if reservation
+        .end
+        .checked_add(1)
+        .is_some_and(|next_start| range.start == next_start)
+      {
+        reservation.end = range.end;
+        return;
+      }
+
+      debug!(
+        "broker sequence reservation replaced nonadjacent local range: previous_start={}, \
+         previous_end={}, replacement_start={}, replacement_end={}",
+        reservation.start, reservation.end, range.start, range.end
+      );
+    }
+
+    // A new owner can reserve above an intervening durable range after the local lease expires.
     self.next_seq = range.start;
     self.reservation = Some(range);
   }

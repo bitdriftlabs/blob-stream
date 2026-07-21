@@ -1,6 +1,16 @@
 #![allow(clippy::unwrap_used)]
 
-use super::{TopicInfo, WriteConfig, WriteEngine, WriteEngineImpl, WriteRequest};
+use super::{
+  AllocationTransitionDecision,
+  LeaseExpirationUpdate,
+  TopicInfo,
+  WriteConfig,
+  WriteEngine,
+  WriteEngineImpl,
+  WriteRequest,
+  WriteState,
+  begin_allocation_transition,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use bd_server_stats::stats::{Collector, Scope};
@@ -10,6 +20,7 @@ use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{
   InMemoryMetadataStore,
   InMemoryProducerPartitionLeaseStore,
+  LeaseAcquireAndReserveOutcome,
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
@@ -140,6 +151,40 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
       .await
   }
 
+  async fn acquire_lease_and_reserve_sequences(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+    reservation_size: Option<u64>,
+  ) -> Result<LeaseAcquireAndReserveOutcome> {
+    if reservation_size.is_some() {
+      self
+        .entered_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("test receiver dropped"))?;
+      if self.first_reservation.swap(false, Ordering::SeqCst) {
+        self
+          .release_first
+          .acquire()
+          .await
+          .map_err(|_| anyhow::anyhow!("test gate closed"))?
+          .forget();
+      }
+    }
+    self
+      .inner
+      .acquire_lease_and_reserve_sequences(
+        key,
+        holder_id,
+        now_ts_ms,
+        lease_duration_ms,
+        reservation_size,
+      )
+      .await
+  }
+
   async fn heartbeat_lease(
     &self,
     key: &ProducerPartitionLeaseKey,
@@ -195,6 +240,152 @@ fn time_from_ms(ms: i64) -> OffsetDateTime {
 
 fn metrics_scope() -> bd_server_stats::stats::Scope {
   Collector::default().scope("blob_stream_broker_test")
+}
+
+#[test]
+fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
+  let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
+  let initial = begin_allocation_transition(&state, "telemetry", 0, 1, 1_000, false, 4);
+  let AllocationTransitionDecision::Claimed(initial) = initial else {
+    panic!("expected initial reservation transition");
+  };
+  let request = initial.reservation.expect("initial reservation request");
+  assert_eq!(request.size, 4);
+  assert!(matches!(request.reason, super::ReservationReason::Initial));
+  initial.transition.finish(
+    LeaseExpirationUpdate::Set(Some(2_000)),
+    Some(SeqRange { start: 0, end: 3 }),
+  );
+
+  {
+    let mut state = state.lock();
+    let partition = state.partition_state_mut("telemetry", 0);
+    assert_eq!(
+      partition.seq_allocator.allocate(4),
+      Some(SeqRange { start: 0, end: 3 })
+    );
+  }
+
+  let refill = begin_allocation_transition(&state, "telemetry", 0, 1, 1_001, false, 4);
+  let AllocationTransitionDecision::Claimed(refill) = refill else {
+    panic!("expected foreground refill transition");
+  };
+  let request = refill.reservation.expect("foreground refill request");
+  assert_eq!(request.size, 8);
+  assert!(matches!(
+    request.reason,
+    super::ReservationReason::ForegroundExhaustion
+  ));
+}
+
+#[test]
+fn maintenance_top_up_extends_the_current_reservation() {
+  let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
+  let initial = begin_allocation_transition(&state, "telemetry", 0, 1, 1_000, true, 10);
+  let AllocationTransitionDecision::Claimed(initial) = initial else {
+    panic!("expected initial reservation transition");
+  };
+  initial.transition.finish_lease_maintenance(
+    LeaseExpirationUpdate::Set(Some(2_000)),
+    Some(SeqRange { start: 0, end: 9 }),
+    0,
+  );
+
+  {
+    let mut state = state.lock();
+    let partition = state.partition_state_mut("telemetry", 0);
+    assert_eq!(
+      partition.seq_allocator.allocate(6),
+      Some(SeqRange { start: 0, end: 5 })
+    );
+    partition.records_allocated_since_lease_maintenance = 6;
+  }
+
+  let top_up = begin_allocation_transition(&state, "telemetry", 0, 1, 1_100, true, 10);
+  let AllocationTransitionDecision::Claimed(top_up) = top_up else {
+    panic!("expected maintenance top-up transition");
+  };
+  let request = top_up.reservation.expect("maintenance top-up request");
+  assert_eq!(request.size, 10);
+  assert!(matches!(
+    request.reason,
+    super::ReservationReason::MaintenanceTopUp
+  ));
+  top_up.transition.finish_lease_maintenance(
+    LeaseExpirationUpdate::Set(Some(2_100)),
+    Some(SeqRange { start: 10, end: 19 }),
+    top_up
+      .records_allocated_since_last_maintenance
+      .unwrap_or_default(),
+  );
+
+  let mut state = state.lock();
+  let partition = state.partition_state_mut("telemetry", 0);
+  assert_eq!(partition.seq_allocator.remaining_capacity(), 14);
+  assert_eq!(partition.records_allocated_since_lease_maintenance, 0);
+  assert_eq!(
+    partition.seq_allocator.allocate(14),
+    Some(SeqRange { start: 6, end: 19 })
+  );
+}
+
+#[test]
+fn lease_reacquisition_discards_stale_sequence_capacity() {
+  let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
+  let initial = begin_allocation_transition(&state, "telemetry", 0, 1, 1_000, false, 10);
+  let AllocationTransitionDecision::Claimed(initial) = initial else {
+    panic!("expected initial reservation transition");
+  };
+  initial.transition.finish(
+    LeaseExpirationUpdate::Set(Some(2_000)),
+    Some(SeqRange { start: 0, end: 9 }),
+  );
+
+  {
+    let mut state = state.lock();
+    let partition = state.partition_state_mut("telemetry", 0);
+    assert_eq!(
+      partition.seq_allocator.allocate(5),
+      Some(SeqRange { start: 0, end: 4 })
+    );
+  }
+
+  let reacquire = begin_allocation_transition(&state, "telemetry", 0, 1, 2_000, false, 10);
+  let AllocationTransitionDecision::Claimed(reacquire) = reacquire else {
+    panic!("expected lease reacquisition transition");
+  };
+  assert!(reacquire.reservation.is_none());
+  reacquire
+    .transition
+    .finish(LeaseExpirationUpdate::Set(Some(3_000)), None);
+
+  let reservation = begin_allocation_transition(&state, "telemetry", 0, 1, 2_001, false, 10);
+  let AllocationTransitionDecision::Claimed(reservation) = reservation else {
+    panic!("expected reservation transition after reacquisition");
+  };
+  reservation.transition.finish(
+    LeaseExpirationUpdate::Preserve,
+    Some(SeqRange { start: 20, end: 29 }),
+  );
+
+  let mut state = state.lock();
+  let partition = state.partition_state_mut("telemetry", 0);
+  assert_eq!(
+    partition.seq_allocator.allocate(1),
+    Some(SeqRange { start: 20, end: 20 })
+  );
+}
+
+#[test]
+fn nonadjacent_reservation_replaces_remaining_capacity() {
+  let mut allocator = super::SeqAllocator {
+    reservation: Some(SeqRange { start: 0, end: 9 }),
+    next_seq: 5,
+  };
+
+  allocator.install_or_extend_reservation(SeqRange { start: 20, end: 29 });
+
+  assert_eq!(allocator.allocate(1), Some(SeqRange { start: 20, end: 20 }));
 }
 
 fn make_engine(

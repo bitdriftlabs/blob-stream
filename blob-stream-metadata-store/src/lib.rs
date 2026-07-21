@@ -173,6 +173,20 @@ pub enum LeaseAcquireOutcome {
 }
 
 //
+// LeaseAcquireAndReserveOutcome
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Result of atomically acquiring or renewing a producer lease and optionally reserving sequences.
+pub enum LeaseAcquireAndReserveOutcome {
+  Acquired {
+    lease: ProducerPartitionLease,
+    reservation: Option<SeqRange>,
+  },
+  HeldByOther(ProducerPartitionLease),
+}
+
+//
 // LeaseHeartbeatOutcome
 //
 
@@ -230,6 +244,16 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome>;
+
+  /// Atomically acquire or renew a lease and optionally reserve a Hi-Lo sequence block.
+  async fn acquire_lease_and_reserve_sequences(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+    reservation_size: Option<u64>,
+  ) -> Result<LeaseAcquireAndReserveOutcome>;
 
   /// Heartbeat a lease to keep ownership.
   async fn heartbeat_lease(

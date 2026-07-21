@@ -1,5 +1,6 @@
 use crate::{
   InMemoryProducerPartitionLeaseStore,
+  LeaseAcquireAndReserveOutcome,
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
@@ -7,6 +8,7 @@ use crate::{
   ProducerPartitionLeaseStore,
   SequenceReservationOutcome,
 };
+use blob_stream_types::SeqRange;
 
 fn lease_key() -> ProducerPartitionLeaseKey {
   ProducerPartitionLeaseKey {
@@ -82,6 +84,34 @@ async fn reserves_sequences_in_order() {
 
   assert_eq!(second.range.start, 5);
   assert_eq!(second.range.end, 7);
+}
+
+#[tokio::test]
+async fn acquires_and_reserves_sequences_in_one_operation() {
+  let store = InMemoryProducerPartitionLeaseStore::new();
+  let key = lease_key();
+
+  let first = store
+    .acquire_lease_and_reserve_sequences(key.clone(), "broker-a".to_string(), 1_000, 100, Some(5))
+    .await
+    .expect("acquire and reserve");
+  let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = first else {
+    panic!("expected acquired lease");
+  };
+  assert_eq!(lease.lease_expiration_ts_ms, 1_100);
+  assert_eq!(lease.max_allocated_seq, Some(4));
+  assert_eq!(reservation, Some(SeqRange { start: 0, end: 4 }));
+
+  let second = store
+    .acquire_lease_and_reserve_sequences(key, "broker-a".to_string(), 1_050, 100, Some(3))
+    .await
+    .expect("renew and reserve");
+  let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = second else {
+    panic!("expected renewed lease");
+  };
+  assert_eq!(lease.lease_expiration_ts_ms, 1_150);
+  assert_eq!(lease.max_allocated_seq, Some(7));
+  assert_eq!(reservation, Some(SeqRange { start: 5, end: 7 }));
 }
 
 #[tokio::test]

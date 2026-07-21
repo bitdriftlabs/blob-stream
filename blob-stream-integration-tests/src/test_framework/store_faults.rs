@@ -14,6 +14,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupPlannerLease,
   ConsumerGroupPlannerLeaseOutcome,
   ConsumerGroupReleaseOutcome,
+  LeaseAcquireAndReserveOutcome,
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
@@ -29,6 +30,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
+
+#[cfg(test)]
+#[path = "./store_faults_test.rs"]
+mod tests;
 
 //
 // StoreFaultDomain
@@ -744,6 +749,90 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
         result.as_ref().ok().map(|outcome| match outcome {
           LeaseAcquireOutcome::Acquired(_) => "acquired".to_string(),
           LeaseAcquireOutcome::HeldByOther(_) => "held_by_other".to_string(),
+        }),
+      )
+      .await;
+    result
+  }
+
+  async fn acquire_lease_and_reserve_sequences(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+    reservation_size: Option<u64>,
+  ) -> Result<LeaseAcquireAndReserveOutcome> {
+    let key_format = key.format();
+    let effects = self
+      .controller
+      .effects_for_call(
+        StoreFaultDomain::ProducerLease,
+        StoreFaultOperation::ProducerAcquireLease,
+        &key_format,
+      )
+      .await;
+
+    if let Some(delay) = effects.delay {
+      sleep(delay).await;
+    }
+    if let Some(timeout) = effects.timeout {
+      sleep(timeout).await;
+      return Err(anyhow!(
+        "producer acquire_lease_and_reserve_sequences timed out for key {key_format}"
+      ));
+    }
+    if let Some(message) = effects.fail_message {
+      return Err(anyhow!(
+        "producer acquire_lease_and_reserve_sequences fault for key {key_format}: {message}"
+      ));
+    }
+    if reservation_size.is_some() {
+      let effects = self
+        .controller
+        .effects_for_call(
+          StoreFaultDomain::ProducerLease,
+          StoreFaultOperation::ProducerReserveSequences,
+          &key_format,
+        )
+        .await;
+      if let Some(delay) = effects.delay {
+        sleep(delay).await;
+      }
+      if let Some(timeout) = effects.timeout {
+        sleep(timeout).await;
+        return Err(anyhow!(
+          "producer acquire_lease_and_reserve_sequences timed out reserving sequences for key \
+           {key_format}"
+        ));
+      }
+      if let Some(message) = effects.fail_message {
+        return Err(anyhow!(
+          "producer acquire_lease_and_reserve_sequences sequence reservation fault for key \
+           {key_format}: {message}"
+        ));
+      }
+    }
+
+    let result = self
+      .inner
+      .acquire_lease_and_reserve_sequences(
+        key,
+        holder_id,
+        now_ts_ms,
+        lease_duration_ms,
+        reservation_size,
+      )
+      .await;
+    self
+      .controller
+      .record_operation_outcome(
+        StoreFaultOperation::ProducerAcquireLease,
+        key_format,
+        if result.is_ok() { "ok" } else { "error" },
+        result.as_ref().ok().map(|outcome| match outcome {
+          LeaseAcquireAndReserveOutcome::Acquired { .. } => "acquired".to_string(),
+          LeaseAcquireAndReserveOutcome::HeldByOther(_) => "held_by_other".to_string(),
         }),
       )
       .await;

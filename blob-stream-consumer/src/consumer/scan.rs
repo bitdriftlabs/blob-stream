@@ -1208,19 +1208,12 @@ impl ConsumerReaderImpl {
     );
 
     // Decode in two stages: transport/storage compression first, then logical RecordBatch format.
-    let decompression_started_at = Instant::now();
     let decoded: Cow<'_, [u8]> = match batch_metadata.compression.codec {
       CompressionCodec::None => Cow::Borrowed(payload),
       CompressionCodec::Zstd => zstd::stream::decode_all(Cursor::new(payload))
         .map(Cow::Owned)
         .map_err(|error| anyhow!("failed to decode zstd batch: {error}"))?,
     };
-    if matches!(batch_metadata.compression.codec, CompressionCodec::Zstd) {
-      self
-        .metrics
-        .decompression_latency_seconds
-        .observe(decompression_started_at.elapsed().as_secs_f64());
-    }
 
     let record_batch = StoredRecordBatch::parse_from_bytes(decoded.as_ref())
       .map_err(|error| anyhow!("failed to decode record batch protobuf: {error}"))?;
