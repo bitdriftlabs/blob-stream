@@ -17,7 +17,7 @@ use crate::config::{
   consumer_metadata_visibility_delay_ms,
   consumer_window_size_seconds,
 };
-use anyhow::{Error, Result, anyhow, ensure};
+use anyhow::{Context, Error, Result, anyhow, ensure};
 use blob_stream_blob_store::ByteRange;
 use blob_stream_metadata_store::SegmentMetadata;
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
@@ -274,10 +274,10 @@ impl ConsumerReaderImpl {
         let segments = metadata_store
           .scan_window_from_snowflake(&request.window, request.min_snowflake)
           .await
-          .map_err(|error| {
-            anyhow!(
+          .with_context(|| {
+            format!(
               "consumer metadata scan failed: topic={}, window_start={}, recovery={}, fast={}, \
-               fresh={}, min_snowflake={:?}: {error}",
+               fresh={}, min_snowflake={:?}",
               request.window.topic,
               format_unix_timestamp_seconds(request.window.window_start_unix_seconds),
               request.eligibility.recovering,
@@ -881,6 +881,32 @@ impl ConsumerReaderImpl {
       .map_or(SnowflakeId(0), SnowflakeId::minimum_for_timestamp)
   }
 
+  /// Return Fast windows that can still contain unpublished or invisible metadata and their floors.
+  fn eligible_fast_scan_windows(
+    &self,
+    now_unix_seconds: i64,
+  ) -> Result<Vec<(TopicWindowKey, SnowflakeId)>> {
+    let safe_timestamp_unix_seconds = self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds);
+    let window_size_seconds = consumer_window_size_seconds(&self.config);
+    let windows = self
+      .scan_windows(now_unix_seconds)?
+      .into_iter()
+      .filter(|window| {
+        window
+          .window_start_unix_seconds
+          .saturating_add(window_size_seconds)
+          > safe_timestamp_unix_seconds
+      })
+      .map(|window| {
+        let floor_timestamp_unix_seconds = window
+          .window_start_unix_seconds
+          .max(safe_timestamp_unix_seconds);
+        (window, Self::snowflake_floor(floor_timestamp_unix_seconds))
+      })
+      .collect();
+    Ok(windows)
+  }
+
   /// Build a scan pass that prioritizes bounded recovery before using the fast path.
   pub(super) fn scan_requests(
     &self,
@@ -979,21 +1005,7 @@ impl ConsumerReaderImpl {
       .values()
       .any(|state| state.is_assigned() && matches!(state, VirtualPartitionState::Fast { .. }))
     {
-      let safe_timestamp_unix_seconds =
-        self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds);
-      let window_size_seconds = consumer_window_size_seconds(&self.config);
-      for window in self.scan_windows(now_unix_seconds)? {
-        let window_end_unix_seconds = window
-          .window_start_unix_seconds
-          .saturating_add(window_size_seconds);
-        if window_end_unix_seconds <= safe_timestamp_unix_seconds {
-          continue;
-        }
-        let safe_floor = Self::snowflake_floor(
-          window
-            .window_start_unix_seconds
-            .max(safe_timestamp_unix_seconds),
-        );
+      for (window, safe_floor) in self.eligible_fast_scan_windows(now_unix_seconds)? {
         Self::insert_scan_request(
           &mut scan_requests,
           self.config.topic.as_str(),
@@ -1016,14 +1028,16 @@ impl ConsumerReaderImpl {
     Ok((scan_requests.into_values().collect(), recovery_scan))
   }
 
-  /// Discard frontiers outside the bounded fast-scan horizon to cap reader-local state.
+  /// Discard frontiers for windows that Fast scans no longer query.
   pub(super) fn prune_fast_frontiers(&mut self, now_unix_seconds: i64) -> Result<()> {
-    let windows = self.scan_windows(now_unix_seconds)?;
-    if let Some(oldest_window) = windows.first() {
-      self
-        .fast_frontiers
-        .retain(|(_, window_start), _| *window_start >= oldest_window.window_start_unix_seconds);
-    }
+    let eligible_window_starts = self
+      .eligible_fast_scan_windows(now_unix_seconds)?
+      .into_iter()
+      .map(|(window, _)| window.window_start_unix_seconds)
+      .collect::<HashSet<_>>();
+    self
+      .fast_frontiers
+      .retain(|(_, window_start), _| eligible_window_starts.contains(window_start));
     self
       .metrics
       .record_fast_frontiers(self.fast_frontiers.len());
@@ -1076,13 +1090,8 @@ impl ConsumerReaderImpl {
         .observe(decompression_started_at.elapsed().as_secs_f64());
     }
 
-    let protobuf_decode_started_at = Instant::now();
     let record_batch = StoredRecordBatch::parse_from_bytes(decoded.as_ref())
       .map_err(|error| anyhow!("failed to decode record batch protobuf: {error}"))?;
-    self
-      .metrics
-      .protobuf_decode_latency_seconds
-      .observe(protobuf_decode_started_at.elapsed().as_secs_f64());
 
     // Defensive integrity check: segment index entry and decoded payload must agree on partition.
     ensure!(

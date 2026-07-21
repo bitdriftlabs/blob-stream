@@ -144,7 +144,7 @@ pub struct ConsumerReaderPartitionScanState {
 // ConsumerReaderFastScanBoundState
 //
 
-/// Fast-path lower-bound inputs and the resulting shared metadata-query bound for one window.
+/// Fast-path lower-bound inputs used to plan the shared metadata query for one window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConsumerReaderFastScanBoundState {
   pub window_start_unix_seconds: i64,
@@ -159,7 +159,8 @@ pub struct ConsumerReaderFastScanBoundState {
 // ConsumerReaderFastFrontierState
 //
 
-/// Inclusive metadata frontier retained for one virtual-partition/window pair.
+/// Observed inclusive metadata frontier retained after a successful scan of one eligible Fast
+/// window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConsumerReaderFastFrontierState {
   pub window_start_unix_seconds: i64,
@@ -225,7 +226,6 @@ struct ConsumerReaderMetrics {
   blob_range_bytes: IntCounter,
   blob_range_latency_seconds: Histogram,
   decompression_latency_seconds: Histogram,
-  protobuf_decode_latency_seconds: Histogram,
   batches_read: IntCounter,
   records_read: IntCounter,
   record_payload_bytes: IntCounter,
@@ -263,7 +263,6 @@ impl ConsumerReaderMetrics {
       blob_range_bytes: scope.counter("blob_range_bytes"),
       blob_range_latency_seconds: scope.histogram("blob_range_latency_seconds"),
       decompression_latency_seconds: scope.histogram("decompression_latency_seconds"),
-      protobuf_decode_latency_seconds: scope.histogram("protobuf_decode_latency_seconds"),
       batches_read: scope.counter("batches_read"),
       records_read: scope.counter("records_read"),
       record_payload_bytes: scope.counter("record_payload_bytes"),

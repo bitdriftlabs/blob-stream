@@ -304,9 +304,14 @@ lease heartbeat, so a replacement owner can resume the correct finite-retention 
 
 The reader advances an in-memory `(virtual_partition_id, window)` snowflake frontier only after
 the source is visibility-eligible and its batches are successfully processed. It retains the bound
-inclusively, so the boundary row is replayed and removed by cursor deduplication. Assignment loss
-clears only the affected partition's frontiers, which are pruned once their windows leave the
-derived horizon.
+inclusively, so the boundary row is replayed and removed by cursor deduplication. A frontier is an
+optional optimization for its own window; the time floor remains the correctness bound when a
+window has no observed frontier. Assignment loss clears only the affected partition's frontiers,
+which are pruned once their windows no longer qualify for Fast scanning.
+
+Reader diagnostics report these separately: `fast_scan_bounds` explains each Fast query before it
+runs and records a missing observed frontier as `null`; `fast_frontiers` is a sparse post-scan list
+containing only real observed frontiers for currently eligible windows.
 
 Consumer metrics distinguish fast and recovery query volume. `metadata_recovery_scan_hits`
 counts successful recovery passes that emit one or more new batches, and

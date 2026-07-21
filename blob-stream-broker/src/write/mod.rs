@@ -55,6 +55,19 @@ use tokio::sync::{Notify, oneshot, watch};
 
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
 const MAX_IN_FLIGHT_FLUSH_PLANS: usize = 4;
+const UPLOADED_OBJECT_SIZE_BUCKETS_BYTES: &[f64] = &[
+  64.0 * 1024.0,
+  256.0 * 1024.0,
+  1024.0 * 1024.0,
+  4.0 * 1024.0 * 1024.0,
+  5.0 * 1024.0 * 1024.0,
+  8.0 * 1024.0 * 1024.0,
+  16.0 * 1024.0 * 1024.0,
+  32.0 * 1024.0 * 1024.0,
+  64.0 * 1024.0 * 1024.0,
+  128.0 * 1024.0 * 1024.0,
+  512.0 * 1024.0 * 1024.0,
+];
 type FlushCompletion = oneshot::Sender<Result<(), String>>;
 
 //
@@ -260,10 +273,15 @@ struct WriteMetrics {
   sequence_reservation_failures_total: prometheus::IntCounter,
   sequence_reservation_latency_seconds: prometheus::Histogram,
   flush_batches_total: prometheus::IntCounter,
+  flush_batches_max_bytes_total: prometheus::IntCounter,
+  flush_batches_max_delay_total: prometheus::IntCounter,
+  flush_batches_lease_drain_total: prometheus::IntCounter,
   flush_partitions_total: prometheus::IntCounter,
   flush_plans_total: prometheus::IntCounter,
   flush_failures_total: prometheus::IntCounter,
   flush_latency_seconds: prometheus::Histogram,
+  flush_uploaded_object_bytes_total: prometheus::IntCounter,
+  flush_uploaded_object_bytes: prometheus::Histogram,
   lease_drain_starts_total: prometheus::IntCounter,
   lease_drain_completions_total: prometheus::IntCounter,
 }
@@ -285,10 +303,18 @@ impl WriteMetrics {
       sequence_reservation_failures_total: scope.counter("sequence_reservation_failures_total"),
       sequence_reservation_latency_seconds: scope.histogram("sequence_reservation_latency_seconds"),
       flush_batches_total: scope.counter("flush_batches_total"),
+      flush_batches_max_bytes_total: scope.counter("flush_batches_max_bytes_total"),
+      flush_batches_max_delay_total: scope.counter("flush_batches_max_delay_total"),
+      flush_batches_lease_drain_total: scope.counter("flush_batches_lease_drain_total"),
       flush_partitions_total: scope.counter("flush_partitions_total"),
       flush_plans_total: scope.counter("flush_plans_total"),
       flush_failures_total: scope.counter("flush_failures_total"),
       flush_latency_seconds: scope.histogram("flush_latency_seconds"),
+      flush_uploaded_object_bytes_total: scope.counter("flush_uploaded_object_bytes_total"),
+      flush_uploaded_object_bytes: scope.histogram_with_buckets(
+        "flush_uploaded_object_bytes",
+        UPLOADED_OBJECT_SIZE_BUCKETS_BYTES,
+      ),
       lease_drain_starts_total: scope.counter("lease_drain_starts_total"),
       lease_drain_completions_total: scope.counter("lease_drain_completions_total"),
     }
@@ -314,8 +340,29 @@ impl WriteMetrics {
         self
           .flush_batches_total
           .inc_by(partition.batches.len() as u64);
+        match partition.trigger {
+          FlushTrigger::MaxBytes => self
+            .flush_batches_max_bytes_total
+            .inc_by(partition.batches.len() as u64),
+          FlushTrigger::MaxDelay => self
+            .flush_batches_max_delay_total
+            .inc_by(partition.batches.len() as u64),
+          FlushTrigger::LeaseDrain => self
+            .flush_batches_lease_drain_total
+            .inc_by(partition.batches.len() as u64),
+        }
       }
     }
+  }
+
+  #[allow(clippy::cast_precision_loss)] // Prometheus histograms require f64 observations.
+  fn record_uploaded_object(&self, payload_bytes: usize) {
+    self
+      .flush_uploaded_object_bytes_total
+      .inc_by(payload_bytes as u64);
+    self
+      .flush_uploaded_object_bytes
+      .observe(payload_bytes as f64);
   }
 
   fn record_sequence_reservation(&self, range: &SeqRange) {
@@ -991,7 +1038,7 @@ async fn flush_plan_and_notify(
   }
 
   let flush_started = Instant::now();
-  let result = flush_context.flush_plan(&mut plan, now).await;
+  let result = flush_context.flush_plan(&mut plan, now, metrics).await;
   let topic = plan.topic;
   if result.is_err() {
     metrics.flush_failures_total.inc();
@@ -1076,11 +1123,17 @@ fn collect_flush_plans(
     else {
       continue;
     };
-    if partition_state.flush_in_flight
-      || (!partition_state.draining && !partition_state.buffer.should_flush(now_ts_ms, config))
-    {
+    if partition_state.flush_in_flight {
       continue;
     }
+    let flush_trigger = if partition_state.draining {
+      Some(FlushTrigger::LeaseDrain)
+    } else {
+      partition_state.buffer.flush_trigger(now_ts_ms, config)
+    };
+    let Some(flush_trigger) = flush_trigger else {
+      continue;
+    };
 
     // Once flush is triggered, all currently buffered batches for the partition are moved as one
     // partition plan. New writes arriving later start a new buffer epoch.
@@ -1098,6 +1151,7 @@ fn collect_flush_plans(
       .push(FlushPartition {
         virtual_partition_id: *virtual_partition_id,
         batches,
+        trigger: flush_trigger,
       });
     if is_new_topic {
       last_planned_topic = Some(topic.clone());
@@ -1370,24 +1424,23 @@ impl BufferState {
     self.batches.push(batch);
   }
 
-  fn should_flush(&self, now_ts_ms: i64, config: &WriteConfig) -> bool {
+  fn flush_trigger(&self, now_ts_ms: i64, config: &WriteConfig) -> Option<FlushTrigger> {
     // Empty buffers never flush.
     if self.batches.is_empty() {
-      return false;
+      return None;
     }
 
     // Size trigger: flush immediately once accumulated payload bytes cross threshold.
     if self.buffered_bytes >= config.flush_max_bytes {
-      return true;
+      return Some(FlushTrigger::MaxBytes);
     }
 
-    let Some(first_ts) = self.first_buffered_ts_ms else {
-      return false;
-    };
+    let first_ts = self.first_buffered_ts_ms?;
 
     // Time trigger: once oldest buffered batch has waited long enough, flush whatever is present.
     // This ensures low-throughput partitions still make progress without waiting for size growth.
-    now_ts_ms.saturating_sub(first_ts) >= config.flush_max_delay_ms
+    (now_ts_ms.saturating_sub(first_ts) >= config.flush_max_delay_ms)
+      .then_some(FlushTrigger::MaxDelay)
   }
 
   fn reset(&mut self) {
@@ -1469,6 +1522,14 @@ struct FlushPlan {
 struct FlushPartition {
   virtual_partition_id: VirtualPartitionId,
   batches: Vec<BufferedBatch>,
+  trigger: FlushTrigger,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FlushTrigger {
+  MaxBytes,
+  MaxDelay,
+  LeaseDrain,
 }
 
 //

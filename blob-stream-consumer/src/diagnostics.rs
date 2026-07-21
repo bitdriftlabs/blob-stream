@@ -126,7 +126,7 @@ pub struct ConsumerReaderScanSnapshot {
 // ConsumerReaderFastScanBoundSnapshot
 //
 
-/// Human-readable Fast-path lower-bound inputs and resulting metadata-query lower bound.
+/// Human-readable pre-query Fast-path lower-bound inputs and resulting metadata-query lower bound.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConsumerReaderFastScanBoundSnapshot {
   pub window_start: String,
@@ -141,7 +141,8 @@ pub struct ConsumerReaderFastScanBoundSnapshot {
 // ConsumerReaderFastFrontierSnapshot
 //
 
-/// Retained inclusive metadata frontier for one reader window.
+/// Sparse retained inclusive metadata frontier from a successful reader scan of one eligible
+/// window.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConsumerReaderFastFrontierSnapshot {
   pub window_start: String,
@@ -434,7 +435,7 @@ impl ConsumerDiagnostics {
           state.topic, state.group_id
         );
         ConsumerGroupLeaseObservation::LookupFailed {
-          error: error.to_string(),
+          error: format!("{error:#}"),
         }
       },
       Err(_) => {

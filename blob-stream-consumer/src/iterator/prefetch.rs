@@ -372,7 +372,7 @@ impl PrefetchWorker {
             self.metrics.retries.inc();
             warn_every!(
               15.seconds(),
-              "consumer prefetch read retrying after error: error={read_error}"
+              "consumer prefetch read retrying after error: error={read_error:#}"
             );
             continue;
           }
@@ -380,7 +380,7 @@ impl PrefetchWorker {
           self.metrics.failures.inc();
           warn_every!(
             15.seconds(),
-            "consumer prefetch read failed after retry: error={read_error}"
+            "consumer prefetch read failed after retry: error={read_error:#}"
           );
           tokio::time::sleep(std::time::Duration::from_millis(self.base_idle_delay_ms)).await;
         },
@@ -507,7 +507,7 @@ fn process_reader_commands(
         now_unix_seconds,
       } => {
         if let Err(error) = reader.set_assigned_virtual_partitions(&assignment, now_unix_seconds) {
-          shared_state.lock().terminal_error = Some(error.to_string());
+          shared_state.lock().terminal_error = Some(format!("{error:#}"));
           return false;
         }
         None
