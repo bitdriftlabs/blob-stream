@@ -11,13 +11,12 @@ use blob_stream_broker_discovery::{
   writer_virtual_partitions,
 };
 use blob_stream_metadata_store::{
-  LeaseAcquireOutcome,
+  LeaseAcquireAndReserveOutcome,
   LeaseReleaseOutcome,
   ProducerPartitionLeaseKey,
-  SequenceReservationOutcome,
 };
 use blob_stream_types::VirtualPartitionId;
-use log::info;
+use log::{debug, info};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -61,7 +60,7 @@ impl WriteEngineImpl {
     let holder_id = self.holder_id.clone();
     let writer_id = self.config.writer_id;
     let lease_duration_ms = self.config.lease_duration_ms;
-    let reservation_size = self.config.reservation_size;
+    let base_reservation_size = self.config.reservation_size;
     let lease_store = Arc::clone(&self.lease_store);
     let state = Arc::clone(&self.state);
     let time_provider = Arc::clone(&self.time_provider);
@@ -199,6 +198,7 @@ impl WriteEngineImpl {
               1,
               now_ts_ms,
               true,
+              base_reservation_size,
             ) {
               super::AllocationTransitionDecision::Draining => break None,
               super::AllocationTransitionDecision::Ready => {
@@ -212,45 +212,35 @@ impl WriteEngineImpl {
             continue;
           };
 
-          match lease_store
-            .acquire_lease(key.clone(), holder_id.clone(), now_ts_ms, lease_duration_ms)
-            .await
+          let reservation_request = transition.reservation;
+          match super::acquire_lease_and_reserve_sequences(
+            &lease_store,
+            &holder_id,
+            key,
+            now_ts_ms,
+            lease_duration_ms,
+            reservation_request.map(|request| request.size),
+            &metrics,
+          )
+          .await
           {
-            Ok(LeaseAcquireOutcome::Acquired(lease)) => {
-              let mut reservation = None;
-              if transition.needs_reservation {
-                let reservation_started = std::time::Instant::now();
-                let reservation_outcome = lease_store
-                  .reserve_sequences(&key, &holder_id, now_ts_ms, reservation_size)
-                  .await;
-                metrics
-                  .sequence_reservation_latency_seconds
-                  .observe(reservation_started.elapsed().as_secs_f64());
-                match reservation_outcome {
-                  Ok(SequenceReservationOutcome::Reserved(reserved)) => {
-                    metrics.record_sequence_reservation(&reserved.range);
-                    reservation = Some(reserved.range);
-                  },
-                  Ok(
-                    SequenceReservationOutcome::HeldByOther(_)
-                    | SequenceReservationOutcome::Expired,
-                  ) => {
-                    metrics.sequence_reservation_failures_total.inc();
-                    // Foreground writes will re-attempt allocation and return NOT_LEASE_HOLDER if
-                    // ownership has moved before the next maintenance pass.
-                  },
-                  Err(error) => {
-                    metrics.sequence_reservation_failures_total.inc();
-                    warn_every!(
-                      15.seconds(),
-                      "lease self-assignment reserve failed: {error}"
-                    );
-                  },
-                }
+            Ok(LeaseAcquireAndReserveOutcome::Acquired { lease, reservation }) => {
+              if let Some(reservation) = reservation.as_ref() {
+                metrics.record_sequence_reservation(reservation);
+                debug!(
+                  "broker sequence reservation coalesced with lease maintenance: topic={topic}, \
+                   virtual_partition_id={virtual_partition_id}, reason={:?}, start={}, end={}",
+                  reservation_request.map(|request| request.reason),
+                  reservation.start,
+                  reservation.end,
+                );
               }
-              transition.transition.finish(
+              transition.transition.finish_lease_maintenance(
                 super::LeaseExpirationUpdate::Set(Some(lease.lease_expiration_ts_ms)),
                 reservation,
+                transition
+                  .records_allocated_since_last_maintenance
+                  .unwrap_or_default(),
               );
               {
                 let mut state = state.lock();
@@ -261,15 +251,21 @@ impl WriteEngineImpl {
                 }
               }
             },
-            Ok(LeaseAcquireOutcome::HeldByOther(_)) => {
+            Ok(LeaseAcquireAndReserveOutcome::HeldByOther(_)) => {
+              if reservation_request.is_some() {
+                metrics.sequence_reservation_failures_total.inc();
+              }
               transition
                 .transition
                 .finish(super::LeaseExpirationUpdate::Set(None), None);
             },
             Err(error) => {
+              if reservation_request.is_some() {
+                metrics.sequence_reservation_failures_total.inc();
+              }
               warn_every!(
                 15.seconds(),
-                "lease self-assignment acquire failed: {error}"
+                "lease self-assignment acquire/reserve failed: {error}"
               );
               transition
                 .transition
@@ -321,7 +317,11 @@ impl WriteEngineImpl {
     );
 
     match lease_store.release_lease(&key, holder_id, now_ts_ms).await {
-      Ok(LeaseReleaseOutcome::Released | LeaseReleaseOutcome::Expired) => {
+      Ok(
+        LeaseReleaseOutcome::Released
+        | LeaseReleaseOutcome::Expired
+        | LeaseReleaseOutcome::HeldByOther(_),
+      ) => {
         // Clear local lease/allocator state immediately to avoid accepting writes based on stale
         // in-memory lease data after ownership moved away.
         let mut state = state.lock();
@@ -329,16 +329,7 @@ impl WriteEngineImpl {
           state.partition_state_mut_if_present(topic, virtual_partition_id)
         {
           partition_state.lease_expiration_ts_ms = None;
-          partition_state.seq_allocator = super::SeqAllocator::default();
-        }
-      },
-      Ok(LeaseReleaseOutcome::HeldByOther(_)) => {
-        let mut state = state.lock();
-        if let Some(partition_state) =
-          state.partition_state_mut_if_present(topic, virtual_partition_id)
-        {
-          partition_state.lease_expiration_ts_ms = None;
-          partition_state.seq_allocator = super::SeqAllocator::default();
+          partition_state.reset_sequence_allocation();
         }
       },
       Err(error) => {

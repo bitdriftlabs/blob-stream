@@ -3,6 +3,7 @@
 mod tests;
 
 use crate::{
+  LeaseAcquireAndReserveOutcome,
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
@@ -105,10 +106,42 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome> {
+    match self
+      .acquire_lease_and_reserve_sequences(key, holder_id, now_ts_ms, lease_duration_ms, None)
+      .await?
+    {
+      LeaseAcquireAndReserveOutcome::Acquired {
+        lease,
+        reservation: None,
+      } => Ok(LeaseAcquireOutcome::Acquired(lease)),
+      LeaseAcquireAndReserveOutcome::Acquired {
+        reservation: Some(_),
+        ..
+      } => {
+        unreachable!("lease acquisition did not request a sequence reservation")
+      },
+      LeaseAcquireAndReserveOutcome::HeldByOther(lease) => {
+        Ok(LeaseAcquireOutcome::HeldByOther(lease))
+      },
+    }
+  }
+
+  async fn acquire_lease_and_reserve_sequences(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+    reservation_size: Option<u64>,
+  ) -> Result<LeaseAcquireAndReserveOutcome> {
     trace!(
-      "producer lease(dynamo) acquire: table={}, topic={}, partition={}, holder_id={}",
+      "producer lease(dynamo) acquire/reserve: table={}, topic={}, partition={}, holder_id={}, \
+       reservation_size={reservation_size:?}",
       self.table_name, key.topic, key.virtual_partition_id, holder_id
     );
+    if reservation_size == Some(0) {
+      return Err(anyhow!("reservation_size must be greater than zero"));
+    }
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
     let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
     let pk = key.format();
@@ -124,9 +157,23 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       AttributeValue::N(ttl_epoch_seconds.to_string()),
     );
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+    if let Some(reservation_size) = reservation_size {
+      values.insert(
+        ":delta".to_string(),
+        AttributeValue::N(reservation_size.to_string()),
+      );
+      values.insert(":initial".to_string(), AttributeValue::N("-1".to_string()));
+    }
 
-    let update =
-      format!("SET {ATTR_HOLDER} = :holder, {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl");
+    let update = match reservation_size {
+      Some(_) => format!(
+        "SET {ATTR_HOLDER} = :holder, {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl, \
+         {ATTR_MAX_SEQ} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta"
+      ),
+      None => {
+        format!("SET {ATTR_HOLDER} = :holder, {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl")
+      },
+    };
     let condition = format!(
       "attribute_not_exists({ATTR_PK}) OR {ATTR_EXPIRES} <= :now OR {ATTR_HOLDER} = :holder"
     );
@@ -149,18 +196,29 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
           .attributes
           .ok_or_else(|| anyhow!("lease attributes missing"))?;
         let lease = Self::lease_from_item(attributes, key.clone())?;
-        debug!("producer lease(dynamo) acquire result: acquired");
-        Ok(LeaseAcquireOutcome::Acquired(lease))
+        let reservation = match reservation_size {
+          Some(size) => Some(reservation_from_new_max(
+            lease
+              .max_allocated_seq
+              .ok_or_else(|| anyhow!("reserved lease missing max allocated sequence"))?,
+            size,
+          )?),
+          None => None,
+        };
+        debug!(
+          "producer lease(dynamo) acquire/reserve result: acquired, reservation={reservation:?}"
+        );
+        Ok(LeaseAcquireAndReserveOutcome::Acquired { lease, reservation })
       },
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
       {
-        debug!("producer lease(dynamo) acquire result: held_by_other");
+        debug!("producer lease(dynamo) acquire/reserve result: held_by_other");
         let lease = self
           .read_lease(&key)
           .await?
           .ok_or_else(|| anyhow!("lease missing after conditional failure"))?;
-        Ok(LeaseAcquireOutcome::HeldByOther(lease))
+        Ok(LeaseAcquireAndReserveOutcome::HeldByOther(lease))
       },
       Err(error) => Err(error.into()),
     }
@@ -428,6 +486,16 @@ fn reservation_from_old(old_max: i64, reservation_size: u64) -> Result<SeqRange>
     .ok_or_else(|| anyhow!("sequence range overflow"))?;
 
   Ok(SeqRange { start, end })
+}
+
+fn reservation_from_new_max(max_allocated_seq: u64, reservation_size: u64) -> Result<SeqRange> {
+  let start = max_allocated_seq
+    .checked_sub(reservation_size.saturating_sub(1))
+    .ok_or_else(|| anyhow!("sequence range underflow"))?;
+  Ok(SeqRange {
+    start,
+    end: max_allocated_seq,
+  })
 }
 
 fn parse_i64(value: &AttributeValue) -> Result<i64> {

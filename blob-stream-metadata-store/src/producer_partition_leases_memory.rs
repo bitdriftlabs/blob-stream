@@ -3,6 +3,7 @@
 mod tests;
 
 use crate::{
+  LeaseAcquireAndReserveOutcome,
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
@@ -15,7 +16,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use blob_stream_types::SeqRange;
-use log::trace;
+use log::{debug, trace};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 
@@ -52,36 +53,68 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome> {
-    trace!(
-      "producer lease(memory) acquire: topic={}, partition={}, holder_id={}",
-      key.topic, key.virtual_partition_id, holder_id
-    );
-    let mut guard = self.leases.write();
-    let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
-
-    match guard.get_mut(&key) {
-      None => {
-        let lease = LeaseState {
-          holder_id,
-          lease_expiration_ts_ms: expires_at,
-          max_allocated_seq: None,
-        };
-        guard.insert(key.clone(), lease.clone());
-        Ok(LeaseAcquireOutcome::Acquired(lease.to_lease(key)))
+    match self
+      .acquire_lease_and_reserve_sequences(key, holder_id, now_ts_ms, lease_duration_ms, None)
+      .await?
+    {
+      LeaseAcquireAndReserveOutcome::Acquired {
+        lease,
+        reservation: None,
+      } => Ok(LeaseAcquireOutcome::Acquired(lease)),
+      LeaseAcquireAndReserveOutcome::Acquired {
+        reservation: Some(_),
+        ..
+      } => {
+        unreachable!("lease acquisition did not request a sequence reservation")
       },
-      Some(state) => {
-        if state.is_expired(now_ts_ms) {
-          state.holder_id = holder_id;
-          state.lease_expiration_ts_ms = expires_at;
-          Ok(LeaseAcquireOutcome::Acquired(state.to_lease(key)))
-        } else if state.holder_id == holder_id {
-          state.lease_expiration_ts_ms = expires_at;
-          Ok(LeaseAcquireOutcome::Acquired(state.to_lease(key)))
-        } else {
-          Ok(LeaseAcquireOutcome::HeldByOther(state.to_lease(key)))
-        }
+      LeaseAcquireAndReserveOutcome::HeldByOther(lease) => {
+        Ok(LeaseAcquireOutcome::HeldByOther(lease))
       },
     }
+  }
+
+  async fn acquire_lease_and_reserve_sequences(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+    reservation_size: Option<u64>,
+  ) -> Result<LeaseAcquireAndReserveOutcome> {
+    trace!(
+      "producer lease(memory) acquire/reserve: topic={}, partition={}, holder_id={}, \
+       reservation_size={reservation_size:?}",
+      key.topic, key.virtual_partition_id, holder_id
+    );
+    if reservation_size == Some(0) {
+      return Err(anyhow!("reservation_size must be greater than zero"));
+    }
+
+    let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
+    let mut guard = self.leases.write();
+    let state = guard.entry(key.clone()).or_insert_with(|| LeaseState {
+      holder_id: holder_id.clone(),
+      lease_expiration_ts_ms: expires_at,
+      max_allocated_seq: None,
+    });
+    if !state.is_expired(now_ts_ms) && state.holder_id != holder_id {
+      return Ok(LeaseAcquireAndReserveOutcome::HeldByOther(
+        state.to_lease(key),
+      ));
+    }
+
+    state.holder_id = holder_id;
+    state.lease_expiration_ts_ms = expires_at;
+    let reservation = if let Some(size) = reservation_size {
+      let (range, updated) = reserve_range(state.max_allocated_seq, size)?;
+      state.max_allocated_seq = Some(updated);
+      Some(range)
+    } else {
+      None
+    };
+    let lease = state.to_lease(key);
+    debug!("producer lease(memory) acquire/reserve result: acquired, reservation={reservation:?}");
+    Ok(LeaseAcquireAndReserveOutcome::Acquired { lease, reservation })
   }
 
   async fn heartbeat_lease(

@@ -110,12 +110,21 @@ not each carry a separate durable sequence-allocation record.
 
 Sequence allocation uses a Hi-Lo allocator to avoid a metadata-store operation for every record
 or every producer batch. The durable producer-partition lease stores a high-water mark. While it
-holds that lease, a broker atomically advances the high-water mark by the configured reservation
-size and receives the resulting inclusive block, for example `[10,000, 10,999]`. This durable
-block is the "high" portion. The broker keeps the next unused value and the block end in memory,
-which is the "low" portion, and hands out contiguous subranges to accepted batches until the
-block is exhausted. A batch with 250 records can therefore consume `[10,000, 10,249]` entirely
-from memory; only the next exhausted-block refill requires another lease-store update.
+holds that lease, a broker atomically advances the high-water mark and receives the resulting
+inclusive block, for example `[10,000, 10,999]`. This durable block is the "high" portion. The
+broker keeps the next unused value and the block end in memory, which is the "low" portion, and
+hands out contiguous subranges to accepted batches until the block is exhausted. A batch with 250
+records can therefore consume `[10,000, 10,249]` entirely from memory.
+
+`sequence_reservation_size` is the per-partition base reservation target rather than a permanent
+block size. A local target starts at this base after ownership acquisition or process start. If a
+foreground write exhausts its current range before the next lease-maintenance cycle, the broker
+doubles that partition's target, saturating at the maximum configuration value. At lease
+maintenance, the broker compares its remaining sequence capacity with the records allocated in
+the previous cycle. If that consumption would exhaust the current range before the next cycle,
+it reserves another target-sized range inline with the lease renewal and appends it to the local
+range. This normally makes a renewal plus proactive refill one conditional lease-store mutation
+rather than two writes. The adaptive target is process-local and has no decay policy.
 
 Broker metrics expose aggregate refill behavior without topic or partition labels:
 `sequence_reservations_total` counts successful durable block refills,
@@ -549,7 +558,7 @@ defaults are:
 | --- | --- |
 | Broker flush bytes | 64 MiB raw buffered payload per virtual partition |
 | Broker flush delay | 1 second |
-| Broker sequence reservation | 10,000 sequence values per virtual partition |
+| Broker sequence reservation | 10,000 base sequence values per virtual partition |
 | Broker segment compression | zstd, level 3 |
 | Producer batch records | 1,000 |
 | Producer batch payload bytes | 1 MiB |

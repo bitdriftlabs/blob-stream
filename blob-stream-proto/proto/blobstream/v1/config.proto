@@ -38,8 +38,9 @@ message BrokerConfig {
   // configured even when the value is 0.
   optional uint32 writer_id = 7;
 
-  // Number of sequence values reserved from the lease store at once for each virtual partition.
-  // Default when unset: 10,000.
+  // Base number of sequence values reserved from the lease store for each virtual partition.
+  // The broker doubles its process-local target after out-of-cycle exhaustion and resets it on
+  // ownership loss or restart. Default when unset: 10,000.
   optional uint32 sequence_reservation_size = 8;
 }
 

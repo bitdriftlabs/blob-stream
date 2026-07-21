@@ -1,5 +1,6 @@
 use crate::{
   DynamoProducerPartitionLeaseStore,
+  LeaseAcquireAndReserveOutcome,
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
@@ -156,6 +157,44 @@ async fn reserves_sequences_in_order() -> Result<()> {
 
   client.delete_table().table_name(table_name).send().await?;
 
+  Ok(())
+}
+
+#[tokio::test]
+async fn acquires_and_reserves_sequences_in_one_operation() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
+  create_leases_table(&client, &table_name).await?;
+
+  let store = DynamoProducerPartitionLeaseStore::new(client.clone(), table_name.clone());
+  let key = lease_key();
+  let first = store
+    .acquire_lease_and_reserve_sequences(key.clone(), "broker-a".to_string(), 1_000, 100, Some(5))
+    .await?;
+  let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = first else {
+    panic!("expected acquired lease");
+  };
+  assert_eq!(lease.lease_expiration_ts_ms, 1_100);
+  assert_eq!(lease.max_allocated_seq, Some(4));
+  assert_eq!(
+    reservation,
+    Some(blob_stream_types::SeqRange { start: 0, end: 4 })
+  );
+
+  let second = store
+    .acquire_lease_and_reserve_sequences(key, "broker-a".to_string(), 1_050, 100, Some(3))
+    .await?;
+  let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = second else {
+    panic!("expected renewed lease");
+  };
+  assert_eq!(lease.lease_expiration_ts_ms, 1_150);
+  assert_eq!(lease.max_allocated_seq, Some(7));
+  assert_eq!(
+    reservation,
+    Some(blob_stream_types::SeqRange { start: 5, end: 7 })
+  );
+
+  client.delete_table().table_name(table_name).send().await?;
   Ok(())
 }
 
