@@ -11,16 +11,16 @@ pub use blob_stream_proto::protos::blobstream::v1::config::{
   ConsumerReadConfig,
   ConsumerRuntimeConfig,
 };
+pub use blob_stream_types::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS;
+use blob_stream_types::DEFAULT_METADATA_WINDOW_SIZE_SECONDS;
 use log::{debug, trace};
 use time::ext::NumericalDuration;
 
-const DEFAULT_WINDOW_SIZE_SECONDS: i64 = 300;
 const DEFAULT_IDLE_POLL_DELAY_MS: u64 = 250;
 const DEFAULT_MAX_IDLE_POLL_DELAY_MS: u64 = 2_000;
 const DEFAULT_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_METADATA_VISIBILITY_DELAY_MS: u64 = 2_000;
 const DEFAULT_MAX_IN_FLIGHT_BATCH_READS: u64 = 32;
-pub const DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS: u64 = 30_000;
 const MAX_CANDIDATE_WINDOWS: usize = 32;
 const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS: i64 = 10_000;
@@ -45,7 +45,7 @@ pub struct ConsumerReadRuntimeSettings {
 pub fn consumer_window_size_seconds(config: &ConsumerReadConfig) -> i64 {
   config
     .window_size_seconds
-    .unwrap_or(DEFAULT_WINDOW_SIZE_SECONDS)
+    .unwrap_or(DEFAULT_METADATA_WINDOW_SIZE_SECONDS)
 }
 
 #[must_use]

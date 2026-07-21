@@ -10,11 +10,21 @@ pub use blob_stream_proto::protos::blobstream::v1::broker::Record;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use time::macros::datetime;
+use time::{Duration, OffsetDateTime};
 
 /// Identifier of a virtual partition (`logical_partition + writer_offset`).
 pub type VirtualPartitionId = u32;
+
+/// Default duration of a metadata window used for segment keys and consumer scans.
+pub const DEFAULT_METADATA_WINDOW_SIZE_SECONDS: i64 = 300;
+
+/// Default maximum elapsed time for segment construction and durable metadata publication.
+///
+/// Brokers enforce this value for topic configurations that leave the deadline unset. Consumers
+/// use the same value when deriving their metadata availability horizon.
+pub const DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS: u64 = 15_000;
 
 #[must_use]
 /// Return current Unix time in milliseconds.
@@ -345,6 +355,13 @@ impl SnowflakeId {
   /// Return the lowest Sonyflake ID that can be generated at or after `timestamp`.
   pub fn minimum_for_timestamp(timestamp: OffsetDateTime) -> Self {
     Self(sonyflake::minimum_for_timestamp(timestamp))
+  }
+
+  #[must_use]
+  /// Return the default-epoch Sonyflake timestamp encoded in this ID.
+  pub fn timestamp(self) -> Option<OffsetDateTime> {
+    let elapsed_nanoseconds = sonyflake::decompose(self.0).nanos_time();
+    datetime!(2014-09-01 00:00 UTC).checked_add(Duration::nanoseconds(elapsed_nanoseconds))
   }
 
   #[must_use]

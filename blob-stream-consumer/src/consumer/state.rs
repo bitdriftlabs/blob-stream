@@ -9,7 +9,7 @@
 //! monotonically, which makes unordered metadata scans and boundary-row replays safe.
 
 use super::ConsumerReaderPartitionScanState;
-use blob_stream_types::VirtualPartitionId;
+use blob_stream_types::{SnowflakeId, VirtualPartitionId};
 use std::sync::Arc;
 
 //
@@ -21,6 +21,8 @@ use std::sync::Arc;
 pub struct RecoveryState {
   pub next_window_start_unix_seconds: i64,
   pub cutover_window_start_unix_seconds: i64,
+  pub first_window_start_unix_seconds: Option<i64>,
+  pub first_window_min_snowflake: Option<SnowflakeId>,
 }
 
 //

@@ -286,8 +286,8 @@ impl PrefetchWorker {
         // Assignment can change while the reader is blocked. Drop obsolete pending work before it
         // consumes shared buffer capacity or becomes visible to the caller.
         if !shared_state
-          .active_assignment
-          .contains(&batch.virtual_partition_id)
+          .active_partitions
+          .contains_key(&batch.virtual_partition_id)
         {
           pending.pop_front();
           *pending_record_count = pending_record_count.saturating_sub(batch_record_count);

@@ -118,8 +118,9 @@ message TopicConfig {
   // Default when unset: 0 days.
   uint32 retention_days = 4;
 
-  // Maximum time from assigning a segment to its window until its metadata is durably written.
-  // Default when unset: 30,000 ms. Brokers enforce this deadline and consumers use it to derive
+  // Maximum time from beginning segment construction until its metadata is durably written.
+  // This includes segment encoding/compression, blob upload, and metadata persistence.
+  // Default when unset: 15,000 ms. Brokers enforce this deadline and consumers use it to derive
   // the finite steady-state metadata scan horizon.
   optional uint64 max_metadata_publication_lag_ms = 5 [(validate.rules).uint64.gt = 0];
 }

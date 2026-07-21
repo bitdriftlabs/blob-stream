@@ -44,7 +44,7 @@
 //!   topic.partition_count = 128;
 //!   topic.num_writers = 1;
 //!   topic.retention_days = 7;
-//!   topic.max_metadata_publication_lag_ms = Some(30_000);
+//!   topic.max_metadata_publication_lag_ms = Some(15_000);
 //!
 //!   let mut in_memory_blob = BlobStoreConfig::new();
 //!   in_memory_blob.backend = Some(blob_store_config::Backend::InMemory(Default::default()));

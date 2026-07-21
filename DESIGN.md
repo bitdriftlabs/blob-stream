@@ -160,7 +160,7 @@ invariant.
    preserve producer submission order, including within one virtual partition. The broker assigns
    sequence ranges in the order that it accepts requests and preserves that durable order.
 3. It routes `ProduceBatch(topic, virtual_partition_id, records)` to the locally balanced broker
-  selected for its configured writer ID.
+   selected for its configured writer ID.
 4. The broker validates the topic, validates the virtual partition range, acquires or renews the
    producer-partition lease, and reserves sequence space as necessary.
 5. The broker buffers accepted batches in memory. It flushes a virtual-partition buffer when its
@@ -218,10 +218,10 @@ pk = "<topic>#<window_start_unix_seconds>"
 ```
 
 Its sort key is a fixed-width, lexicographically sortable snowflake ID. The row includes the
-blob key, segment compression, aggregate record and event-time statistics, creation time,
-metadata publication time, and a per-virtual-partition index. Each index entry identifies a byte
-range, sequence range, batch summary, and compression setting. Publication time is captured after
-the blob upload and immediately before the metadata write.
+blob key, creation time, metadata publication time, optional TTL, and a per-virtual-partition
+index. Each index entry identifies a byte range, sequence range, batch summary, and compression
+setting. Publication time is captured after the blob upload and immediately before the metadata
+write.
 
 Metadata is written only after the blob upload succeeds. Segment metadata TTL is derived from the
 topic retention setting plus the configured DynamoDB TTL buffer. S3 lifecycle expiration is not
@@ -239,115 +239,199 @@ The production metadata configuration names four DynamoDB tables:
 | `consumer_group_leases` | topic-group and virtual partition | Consumer ownership, generation fencing, and committed cursor. |
 | `consumer_group_membership` | topic-group and member ID | Consumer member liveness plus shared assignment-plan/planner records. |
 
-Consumer-group lease rows retain their committed cursor for the topic retention period after lease
-expiry. Producer leases and consumer membership rows receive TTL values based on their expiration
-plus the configured lease TTL buffer. DynamoDB TTL cleanup is asynchronous, so expiry checks in
-the store also use the stored lease timestamp.
+Consumer-group lease rows retain their committed cursor only until their TTL, derived from lease
+expiration plus the configured lease TTL buffer. Producer leases and consumer membership rows use
+the same expiry-plus-buffer model. DynamoDB TTL cleanup is asynchronous, so expiry checks in the
+store also use the stored lease timestamp.
 
-### Consumer Assignment Plan
-
-Consumers use one shared, versioned assignment plan per topic-group instead of independently
-retaining local sticky maps. The plan and planner lease are stored in the existing
-`consumer_group_membership` table under the separate reserved partition key
+The assignment plan and planner lease use the existing `consumer_group_membership` table under the
+separate reserved partition key
 `__blob_stream_assignment_control_v1__#<topic>#<group_id>`, with reserved sort keys
 `__blob_stream_assignment_plan_v1__` and `__blob_stream_assignment_planner_v1__`. Member rows
 remain under `<topic>#<group_id>`, so rolling deployments with legacy membership queries neither
 interpret the planner lease as a member nor read the full plan item. This retains the four-table
 deployment model.
 
-On a membership or partition-inventory change, the current planner derives a complete sticky map
-from the previous persisted plan and conditionally publishes it while it owns the planner lease.
-Every plan must cover each configured virtual partition exactly once and name only a plan member.
-Consumers use the plan version as their existing per-partition lease generation. Partition leases
-continue to fence actual ownership and preserve committed cursors; they do not determine desired
-coverage.
-
-If a consumer observes a stale local membership view while the elected planner remains live, it
-continues using the last structurally valid shared plan rather than creating an incompatible local
-map. The lease is fenced by a unique coordinator session, preventing a stale process that reused
-the same member ID from publishing or releasing a successor's lease. Once the planner lease
-expires, any live member can acquire it and publish a successor plan. On graceful shutdown, a
-member attempts deregistration before conditionally releasing its own planner lease, allowing a
-remaining member to elect immediately without discarding the sticky assignment plan.
-
-TODO: A single DynamoDB assignment-plan item is limited to 400 KB. If group plans can approach
-that limit, replace it with sharded or S3-backed plan storage; an S3-backed design will require
-the corresponding consumer IAM read permissions.
-
 ## Read Path
 
 Consumers read DynamoDB metadata and blob storage directly. The broker is not in the read path.
-For every `read_available()` call, a consumer plans work independently for each owned partition:
+The reader has two different progress markers for each virtual partition:
 
-1. A fresh group scans only its current aligned metadata window.
-2. A resumed partition reads its committed cursor and source checkpoint from the lease. It scans
-  full metadata windows from that source through a fixed current-window cutover, clamped to the
-  configured finite topic retention. Legacy rows without a source checkpoint fall back to their
-  committed timestamp; if that timestamp is absent, recovery starts at the retention floor.
-3. Recovery proceeds in chronological bounded slices. A recovering partition does not use the
-  live fast path until it reaches its captured cutover. Recovery scans do not use the checkpoint
-  snowflake as a DynamoDB lower bound, so late lower-snowflake metadata remains discoverable.
-4. Fast partitions scan a trailing horizon derived from the topic's enforced metadata-publication
-  deadline plus `metadata_visibility_delay_ms`. They omit windows whose end is no newer than the
-  safe timestamp. For a remaining window, the aggregate DynamoDB query starts at the lowest
-  effective bound across assigned fast partitions: a Sonyflake time floor for the safe timestamp
-  (or the window start) tightened by that partition's observed inclusive frontier. Frontiers
-  remain per partition and window because snowflake ordering is not shared across concurrently
-  flushed partitions.
-5. The reader sorts segments by snowflake ID, filters their indexes to eligible assigned
-  partitions, sorts batches by `seq_start`, skips ranges covered by the in-memory cursor, and
-  decodes only the required blob byte ranges.
+- The **cursor** is the greatest delivered-and-committed sequence end. It decides whether a batch
+  is new: `batch.seq_end > cursor` is required for delivery.
+- The **source checkpoint** is the `(metadata window, segment snowflake)` of the batch that
+  produced that cursor. It tells a replacement owner where retained recovery begins and, when it
+  remains within retention, supplies the first-window query floor. It is not a correctness or
+  metadata-ordering watermark.
 
-Every committed cursor includes the source window and snowflake of the record batch that produced
-it. The iterator carries that provenance from decoded batches through `store_offset()` to the
-lease heartbeat, so a replacement owner can resume the correct finite-retention recovery range.
+Each `read_available()` pass first plans work per owned partition, then merges that work into at
+most one DynamoDB query for each metadata window. A merged query has no snowflake lower bound when
+any Fresh or unbounded Recovering partition needs a full-window scan. Fast partitions sharing that
+query still apply their own frontier filters after the result is returned.
 
-The reader advances an in-memory `(virtual_partition_id, window)` snowflake frontier only after
-the source is visibility-eligible and its batches are successfully processed. It retains the bound
-inclusively, so the boundary row is replayed and removed by cursor deduplication. A frontier is an
-optional optimization for its own window; the time floor remains the correctness bound when a
-window has no observed frontier. Assignment loss clears only the affected partition's frontiers,
-which are pruned once their windows no longer qualify for Fast scanning.
+### Reader Modes and Progress
 
-Reader diagnostics report these separately: `fast_scan_bounds` explains each Fast query before it
-runs and records a missing observed frontier as `null`; `fast_frontiers` is a sparse post-scan list
-containing only real observed frontiers for currently eligible windows.
+1. **Fresh:** A partition with no durable cursor scans only the current aligned window, with no
+   snowflake lower bound. It becomes Fast only after that window is fully scanned without a
+   visibility deferral or prefetch-capacity exhaustion.
+2. **Recovering:** A resumed partition starts at the checkpoint's window, clamped to the topic
+  retention floor, and captures the current aligned window as its cutover. A legacy cursor without
+  a checkpoint starts from its committed timestamp's window; if that is also absent, it starts at
+  the retention floor. Recovery scans up to 32 consecutive windows per pass, from oldest to newest,
+  and becomes Fast only after its cutover window is fully scanned. When the checkpoint window is
+  the cutover window, recovery is a single-window pass.
+3. **Fast:** A partition that has completed Fresh or Recovery scans only the bounded recent horizon
+   where metadata can still be unpublished or invisible. Fast is an optimization; it is never used
+   to replace retained recovery for a resumed partition.
 
-Consumer metrics distinguish fast and recovery query volume. `metadata_recovery_scan_hits`
-counts successful recovery passes that emit one or more new batches, and
-`metadata_recovery_scan_batches_read` counts those emitted batches. These counters exclude
-recovery results discarded by cursor deduplication; `metadata_recovery_scan_segments` instead
-measures the raw recovery scan volume.
+For a usable source checkpoint that was not clamped to retention, recovery uses an inclusive lower
+bound only for its first window. Let $D$ be the broker's publication deadline plus the reader's
+visibility delay, rounded up to whole seconds. The lower bound is the minimum Sonyflake at
+$max(checkpoint\_window\_start, checkpoint\_snowflake\_time - D)$. The cursor remains the
+correctness watermark: the inclusive boundary row is replayed and skipped if its sequence end is
+already committed. Every later recovery window is queried without a Sonyflake lower bound.
+
+This deliberately adopts Fast's bounded-availability tradeoff for replacement startup. A metadata
+row older than the overlap that becomes visible only after the reader leaves the first source window
+is not automatically rediscovered. Legacy checkpoints, retention-clamped checkpoints, malformed
+checkpoint IDs, and explicit seeks retain the conservative full-window behavior. Neither path uses
+the source checkpoint as a correctness ordering certificate.
+
+The visibility delay applies in every mode. When an eligible metadata row has
+`metadata_published_ts_ms > now_ms - metadata_visibility_delay_ms`, the reader defers it. In
+Recovery, deferring a window blocks later recovery windows for that partition in the same pass, so
+the cursor cannot advance past a missing earlier sequence range. The recovery pointer remains at
+the deferred window for the next pass. In Fast, a deferral blocks later snowflakes for that
+partition/window during the pass; a later pass retries from an inclusive frontier. A failed metadata
+or blob read restores the pass's cursor and frontier state, so an undelivered batch is retried.
+
+### Fast Query Bounds
+
+Let $D$ be the broker's enforced maximum metadata-publication lag plus
+`metadata_visibility_delay_ms`, rounded up to whole seconds. The Fast safe timestamp is
+$T_{safe} = now - D$. The reader considers the current window plus enough preceding windows to
+cover $D$, then omits every window whose end is at or before $T_{safe}$.
+
+For each remaining window, the time floor is the smallest Sonyflake for
+$max(window_start, T_{safe})$. A Fast partition's effective lower bound is the greater of this
+time floor and its observed inclusive `(virtual_partition_id, window)` frontier. If several Fast
+partitions share a window, the DynamoDB query uses the lowest effective bound, then each partition
+filters rows below its own frontier. This protects a sparse partition whose last observed
+snowflake is lower than another partition's. Frontiers are updated only after visibility-eligible
+metadata is selected, are inclusive so the boundary row is safely replayed, and are cleared on
+assignment loss or explicit seek and pruned when their window leaves the Fast horizon.
+
+After the metadata query, the reader sorts segment rows by snowflake ID, filters each row to
+eligible assigned partitions, and sorts batches within that row's partition index by `seq_start`.
+It then skips batches covered by the cursor, reserves prefetch capacity, and plans blob reads. The
+reader relies on the producer's per-partition durable publication order for ordering across segment
+rows; local sorting does not create a global sequence merge.
+
+Every decoded batch carries its source checkpoint. Delivery retains this provenance for each
+delivered offset, so `store_offset()` can persist the checkpoint paired with the committed cursor
+on the next heartbeat. A replacement owner can then start retained recovery from the correct
+window.
+
+Reader diagnostics expose the inputs and result of Fast planning separately: `fast_scan_bounds`
+shows each Fast partition/window's time floor, observed frontier, effective partition bound, and
+the merged query bound; `fast_frontiers` contains only real retained frontiers. Recovery metrics
+are pass-level: if a pass includes Fresh or Recovering work, its query and emitted-batch counters
+are classified as recovery even when the merged query also serves Fast work.
 
 The iterator adds a background prefetch buffer with a configurable byte budget. It reserves batch
 payload capacity before blob reads, retains decoded batches only within that budget, and resumes
 prefetch when callers drain records. One oversized batch may proceed only when no payload is
-otherwise retained. Metadata scans remain concurrent, while batch range reads and decodes are
-ordered and bounded by `max_in_flight_batch_reads` (default 32). Both limits can be overridden
-between scan passes through runtime feature flags. A partition revocation removes buffered data
-for that partition before the new assignment becomes active.
+otherwise retained. For every segment with selected batches, the reader fetches one range spanning
+the lowest selected start offset through the highest selected end offset, then decodes only the
+selected batch slices. This lowers S3 request count when an owner holds several partitions packed
+into one segment, at the cost of downloading intervening unowned batches. Segment range reads and
+decodes overlap up to `max_in_flight_batch_reads` (default 32), while buffered completion preserves
+planned output order. Both limits can be overridden between scan passes through runtime feature
+flags. A partition revocation removes buffered data for that partition before the new assignment
+becomes active.
 
-### Delayed Metadata Bound
+### Worked Read Scenarios
 
-The fast path defines a safe timestamp by subtracting the broker's enforced metadata-publication
-deadline and the configured visibility delay from its current time. It omits candidate windows
-whose end is no newer than that timestamp. For an overlapping window, it uses the Sonyflake lower
-bound for the safe timestamp; for newer windows, it uses the window-start lower bound. This keeps
-a sparse partition from forcing its peers to repeatedly query an entire window. Observed inclusive
-frontiers only tighten that time-derived bound.
+**Fresh assignment.** Assume topic `telemetry` uses 300-second windows and `now = 950`, so the
+current window is `[900, 1200)`. Partition 7 has no committed cursor and is therefore Fresh. It
+queries `pk = telemetry#900` with no snowflake lower bound. If the query returns an already
+visibility-eligible segment containing sequence range `[1, 2]`, the reader delivers that range,
+advances its in-memory cursor to 2, and enters Fast after it completes this one window.
 
-This calculation relies on the existing deployment assumption that broker and consumer clocks are
-synchronized. There is currently no separately configured clock-skew allowance. Event timestamps
-do not affect metadata selection; the bound uses the broker-assigned Sonyflake ID and segment
-window.
+**Same-window checkpoint recovery.** Assume topic `telemetry` uses 300-second windows, the broker
+publication deadline is 15 seconds, and the consumer visibility delay is explicitly zero. At
+`now = 1,050`, the current and cutover window is `[900, 1200)`. A replacement owner restores
+partition 7 with cursor 10 and a usable source checkpoint at timestamp 1,020 in that same window.
+Here $D = 15s$, so its one recovery query is `pk = telemetry#900` with the Sonyflake minimum for
+timestamp $1,020 - 15 = 1,005$. The checkpoint row is replayed and skipped because its sequence
+end is 10; a later row ending at 11 is delivered. Because the source and cutover are the same
+window, recovery completes in one scan and the partition enters Fast. This is covered by
+`recovery_scans_single_checkpoint_window_with_overlap_bound` and is the expected shape during a
+consumer recovery or reassignment that overlaps a broker rolling restart.
 
-The candidate horizon covers the broker's metadata-publication deadline plus the visibility delay,
-so a metadata row that meets the publication contract remains in a scanned window when it becomes
-eligible. The default visibility delay is two seconds. It is a best-effort staleness margin, not a
-DynamoDB replication-delay guarantee: eventually consistent reads have no bounded convergence
-time. A row that becomes visible after its derived candidate window leaves the horizon is not
-automatically rediscovered by the fast path; a resumed consumer instead performs
-retention-bounded recovery.
+**Later recovery window.** Assume topic `telemetry` uses 300-second windows, the default
+15-second publication deadline, and the default 2-second visibility delay, making $D = 17s$. At
+`now = 1,350`, the cutover window is `[1,200, 1,500)`. Partition 7 restores a usable source
+checkpoint from timestamp 1,020 in the earlier `[900, 1,200)` window. Its source-window query is
+`pk = telemetry#900` with a Sonyflake lower bound for $1,020 - 17 = 1,003$. Its later cutover-window
+query is `pk = telemetry#1200` with no snowflake lower bound. Only the source window uses the
+checkpoint overlap; every later recovery window remains a full-window query. Partition 7 enters
+Fast only after it has fully scanned the `[1,200, 1,500)` cutover window in a recovery pass. If a
+visibility deferral or prefetch-capacity limit blocks that window, it remains Recovering and retries
+that window on a later pass.
+
+**Recovery waits for a visibility gap.** Assume topic `telemetry` uses 300-second windows and a
+2-second visibility delay. At `now = 1,230`, a partition with cursor 1 performs legacy recovery
+from window `[900, 1,200)` through its cutover window `[1,200, 1,500)`; legacy recovery has no
+checkpoint lower bound. The `[2, 2]` row in the first window has
+`metadata_published_ts_ms = 1,229,000`, so it is deferred because it is newer than
+`1,230,000 - 2,000`. The `[3, 3]` row in the cutover window has
+`metadata_published_ts_ms = 1,200,000` and is already visible. The pass delivers neither range
+and retains cursor 1, because the deferred earlier window blocks recovery progress. At
+`now = 1,232`, the `[2, 2]` row becomes eligible; the next pass delivers `[2, 2]` followed by
+`[3, 3]`. This prevents cursor 3 from hiding sequence 2 and is covered by
+`recovery_does_not_advance_cursor_past_visibility_deferred_window`.
+
+**Fast time floor and frontiers.** Assume topic `telemetry` uses 300-second windows, the default
+15-second publication deadline, and the default 2-second visibility delay. At `now = 1,020`, the
+current window is `[900, 1,200)` and $D = 17s$, so $T_{safe} = 1,003$. The preceding window
+`[600, 900)` ended before $T_{safe}$ and is omitted. In the current window, partition 7 has an
+inclusive frontier at Sonyflake timestamp 1,005, while partition 8 has an inclusive frontier at
+timestamp 1,001. Their shared query uses the lower effective bound, timestamp 1,001; partition 7
+filters rows below its own 1,005 frontier locally, while partition 8 can still receive rows at or
+after 1,001.
+
+**One range read for several selected batches.** Assume a selected segment from topic `telemetry`
+contains three independently compressed batches: batches for owned partitions 7 and 9 occupy
+`[0, 100)` and `[150, 240)`, while an unowned partition 8 batch occupies `[100, 150)`. Window
+size, publication deadline, and visibility delay no longer affect this stage: metadata selection
+has already chosen the two owned batches. The reader issues one blob range request for `[0, 240)`,
+then decodes only `[0, 100)` and `[150, 240)`. The middle 50 bytes are intentional overfetch that
+trades data transfer for one fewer object-store request.
+
+### Publication and Visibility Bound
+
+The broker starts `max_metadata_publication_lag_ms` before segment construction and requires both
+blob upload and metadata persistence to finish within the remaining budget. The unset topic default
+is 15 seconds. Consumers combine that deadline with `metadata_visibility_delay_ms` (two seconds by
+default), so their default availability overlap is $D = 17s$.
+
+The Fast safe timestamp is $T_{safe} = now - D$; it omits older windows and uses the Sonyflake
+minimum for $max(window\_start, T_{safe})$ in the remaining windows. Checkpoint recovery uses the
+same $D$ only for its first source window as described above. This calculation relies on synchronized
+broker and consumer clocks; there is no separately configured clock-skew allowance. Event timestamps
+do not affect metadata selection.
+
+Fifteen seconds is a configurable operational deadline, not a DynamoDB replication-delay guarantee
+or an empirically proven universal value. It is intentionally short enough to limit Fast and
+checkpoint-recovery scan work, while still budgeting for segment construction, blob upload, and
+metadata persistence. A deadline exhaustion fails the flush, so the setting is also a producer
+availability limit, not only a reader-cost control.
+
+Broker metrics expose whole-publication latency and whether the deadline expired before persistence
+or while persisting. Operators should set a topic-specific deadline with headroom above sustained
+high-percentile publication latency, include the visibility delay when evaluating reader work, and
+investigate deadline exhaustion and flush failures rather than silently widening the scan horizon.
 
 ### Read Consistency and Delivery Tradeoffs
 
@@ -357,6 +441,11 @@ reader replica may not observe that row immediately. `metadata_visibility_delay_
 accepting metadata whose publication timestamp is too recent. It defaults to two seconds and is a
 best-effort staleness margin, not a correctness guarantee: DynamoDB supplies no bounded
 replication-delay contract, and the delay does not solve stale-writer publication.
+
+A Fast or checkpoint-overlap recovery scan can miss a row that becomes visible outside its bounded
+availability horizon. Strongly consistent metadata reads remove the read-replica component, but
+they still do not prevent a stale former producer from publishing after lease expiry. A transactional
+producer publication fence is required with stronger reads for a complete ordering guarantee.
 
 The reader's cursor filtering relies on metadata becoming visible in compatible sequence order.
 Graceful broker handoff drains locally accepted work before lease release, but the expiry/stale
@@ -370,23 +459,42 @@ Future reader modes may offer the following cost/correctness tradeoffs:
   consistency removes read-replica staleness at approximately twice the metadata-query RRU
   component. It does not by itself prevent a stale former producer from publishing metadata after
   lease expiry, so it must be paired with a publication fence for a complete ordering guarantee.
+
 Use `cost_analysis.py` with real page sizes, poll rates, consumer counts, and regional pricing
 before selecting strong reads: they approximately double metadata scan RRUs, while shorter
 recovery intervals or delayed-visibility horizons add rescans.
 
 ## Consumer Group Coordination
 
-Consumer instances with the same topic and group ID register membership liveness. They use the
-observed active-member list to calculate a deterministic cooperative sticky assignment of virtual
-partitions. Existing placements are preserved where possible, then the minimum required moves
-balance overloaded and underloaded members.
+Consumer instances with the same topic and group ID register membership liveness. They use one
+shared, versioned assignment plan per topic-group rather than independently retaining local sticky
+maps. A planner lease elects the member that refreshes or replaces this plan. On a membership or
+partition-inventory change, the planner derives a complete cooperative sticky assignment from the
+previous persisted plan, preserving existing placements where possible before moving the minimum
+required partitions to balance member load. It conditionally publishes the result while it owns the
+planner lease.
+
+Every accepted plan must name its planner as a member, cover each configured virtual partition
+exactly once, assign every partition to a plan member, and keep member loads within one partition.
+A consumer makes no local desired-ownership decision while no structurally valid persisted plan is
+available. If it observes a stale local membership view while the elected planner remains live, it
+continues using the last valid shared plan rather than creating an incompatible local map. The
+planner lease is fenced by a unique coordinator session, preventing a stale process that reused a
+member ID from publishing or releasing a successor's lease. Once it expires, any live member can
+acquire it and publish a successor plan.
+
+TODO: A single DynamoDB assignment-plan item is limited to 400 KB. If group plans can approach
+that limit, replace it with sharded or S3-backed plan storage; an S3-backed design will require
+the corresponding consumer IAM read permissions.
 
 An assignment is only intent. A consumer becomes an active owner after the lease store grants its
-lease for the current generation. The generation increments when the desired assignment changes;
-heartbeat and commit operations include the generation so stale owners cannot renew or advance the
-cursor after replacement. Consumers include their latest cursors in lease heartbeats to avoid a
-separate steady-state commit write. On shutdown they release owned leases best-effort to shorten
-handoff time.
+lease for the plan version, which is also its per-partition lease generation. Partition leases
+continue to fence actual ownership and preserve committed cursors; they do not determine desired
+coverage. Heartbeat and commit operations include the generation so stale owners cannot renew or
+advance the cursor after replacement. Consumers include their latest cursors in lease heartbeats to
+avoid a separate steady-state commit write. On shutdown they release owned leases best-effort,
+deregister membership, and conditionally release their planner lease so a remaining member can
+elect immediately without discarding the sticky assignment plan.
 
 During rebalance, an iterator stops delivering revoked partitions, discards their prefetched
 records, invokes the configured revocation callback, and waits for callback completion before
@@ -425,8 +533,8 @@ The design relies on these invariants:
 - Valid later batches for a virtual partition have `seq_end` greater than already processed
   batches, so cursors never regress.
 - A consumer lease generation fences stale ownership and stale cursor commits.
-- Resumed-partition recovery scans find late lower-snowflake metadata throughout the topic
-  retention horizon; fast-path rediscovery covers the derived publication and visibility horizon.
+- Legacy and retention-clamped recovery scans traverse full retained windows; usable checkpoints
+  instead apply the bounded publication-and-visibility overlap to only their first window.
 
 These invariants prevent a consumer from treating an already committed cursor as unprocessed
 work, but they do not provide exactly-once delivery. Applications needing exactly-once effects
@@ -448,9 +556,9 @@ defaults are:
 | Producer flush delay | 200 ms |
 | Producer retries | 5 |
 | Consumer metadata window | 300 seconds |
-| Consumer lookback | 2 windows |
-| Consumer metadata recovery scan | 60 seconds |
-| Consumer metadata fast scan | enabled |
+| Broker metadata publication deadline | 15 seconds |
+| Consumer metadata visibility delay | 2 seconds |
+| Consumer recovery slice | Up to 32 metadata windows per scan pass |
 | Consumer prefetch target | 64 MiB |
 | Consumer lease duration | 30 seconds |
 | Consumer heartbeat and rebalance intervals | 10 seconds |

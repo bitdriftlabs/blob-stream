@@ -1,6 +1,16 @@
 use super::*;
 
 #[test]
+fn default_metadata_publication_lag_is_fifteen_seconds() {
+  assert_eq!(DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS, 15_000);
+}
+
+#[test]
+fn default_metadata_window_is_five_minutes() {
+  assert_eq!(DEFAULT_METADATA_WINDOW_SIZE_SECONDS, 300);
+}
+
+#[test]
 fn record_batch_summary() {
   let batch = RecordBatch::new(
     7,
@@ -51,6 +61,16 @@ fn snowflake_formatting_is_lex_ordered() {
 
   assert!(low.format_lex() < high.format_lex());
   assert_eq!(low.format_lex(), "00000000000000000012");
+}
+
+#[test]
+fn snowflake_timestamp_decodes_default_epoch_time() {
+  let timestamp = time::OffsetDateTime::from_unix_timestamp(1_700_000_000)
+    .unwrap()
+    .saturating_add(time::Duration::milliseconds(120));
+  let snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp);
+
+  assert_eq!(snowflake_id.timestamp(), Some(timestamp));
 }
 
 #[test]

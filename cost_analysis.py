@@ -118,7 +118,9 @@ def estimate_segments_per_hour(i: Inputs) -> float:
 def estimate_batch_reads_per_hour(i: Inputs) -> float:
   """Estimate S3 range GET count if not directly provided.
 
-  Current consumer code path performs one range GET per accepted batch.
+  This fallback assumes one range GET per accepted batch. The current consumer coalesces selected
+  batch ranges per segment, so set `s_batch_read_per_hour` from observed metrics for a useful
+  production estimate.
   Approximation:
     new_batches_per_hour ~= R_ingest / avg_records_per_batch
     S_batch_read ~= G * new_batches_per_hour
