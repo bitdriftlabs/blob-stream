@@ -17,6 +17,7 @@ use crate::config::{
   producer_max_retries,
   producer_request_timeout_ms,
   producer_retry_base_delay_ms,
+  producer_retry_deadline_ms,
   producer_retry_max_delay_ms,
   producer_writer_id,
   validate_producer_config,
@@ -25,6 +26,7 @@ use crate::config::{
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use async_trait::async_trait;
+use bd_backoff::{ExponentialBackoff, ExponentialBackoffBuilder, InfiniteBackoff};
 use bd_grpc::client::Client as GrpcClient;
 use bd_grpc::service::ServiceMethod;
 use bd_log::warn_every;
@@ -459,6 +461,7 @@ pub trait BrokerTransport: Send + Sync {
     &self,
     broker_address: &str,
     request: ProduceBatchRequest,
+    request_timeout: Duration,
   ) -> Result<ProduceBatchResponse>;
 
   /// Retire any transport resources for brokers absent from the current discovery snapshot.
@@ -529,13 +532,15 @@ impl BrokerTransport for GrpcBrokerTransport {
     &self,
     broker_address: &str,
     request: ProduceBatchRequest,
+    request_timeout: Duration,
   ) -> Result<ProduceBatchResponse> {
     let client = self.client_for_address(broker_address)?;
     let service_method = ServiceMethod::<ProduceBatchRequest, ProduceBatchResponse>::new(
       "BrokerService",
       "ProduceBatch",
     );
-    let request_timeout = TimeDuration::milliseconds(producer_request_timeout_ms(&self.config));
+    let request_timeout = TimeDuration::try_from(request_timeout)
+      .map_err(|_| anyhow!("producer retry request timeout exceeds supported range"))?;
     let response = client
       .unary(
         &service_method,
@@ -956,15 +961,55 @@ async fn send_batch_with_retry(
   metrics: &ProducerMetrics,
   retry_diagnostics: &ProducerRetryDiagnostics,
 ) -> Result<ProducerAck, ProducerError> {
+  let retry_clock = TokioRetryClock;
+  let mut retry_backoff = producer_retry_backoff(config);
+  send_batch_with_retry_and_retry_control(
+    config,
+    topics,
+    membership_rx,
+    transport,
+    batch,
+    metrics,
+    retry_diagnostics,
+    &retry_clock,
+    &mut retry_backoff,
+  )
+  .await
+}
+
+async fn send_batch_with_retry_and_retry_control(
+  config: &ProducerConfig,
+  topics: &HashMap<String, ProducerTopicConfig>,
+  membership_rx: &watch::Receiver<BrokerMembership>,
+  transport: &dyn BrokerTransport,
+  batch: &BufferedBatch,
+  metrics: &ProducerMetrics,
+  retry_diagnostics: &ProducerRetryDiagnostics,
+  retry_clock: &dyn RetryClock,
+  retry_backoff: &mut (dyn InfiniteBackoff + Send),
+) -> Result<ProducerAck, ProducerError> {
   let _topic = topics
     .get(&batch.topic)
     .ok_or_else(|| ProducerError::UnknownTopic(batch.topic.clone()))?;
 
   let mut attempt: u32 = 0;
   let mut previous_owner: Option<String> = None;
-  let started_at = Instant::now();
+  let started_at = retry_clock.now();
+  let retry_deadline = started_at + Duration::from_millis(producer_retry_deadline_ms(config));
   loop {
-    let Some((broker_node_id, broker_address)) = ({
+    let remaining = retry_deadline.saturating_duration_since(retry_clock.now());
+    if remaining.is_zero() {
+      metrics.failures.inc();
+      metrics
+        .send_latency_seconds
+        .observe(retry_clock.now().duration_since(started_at).as_secs_f64());
+      return Err(ProducerError::RetriesExhausted(format!(
+        "retry deadline of {} ms elapsed",
+        producer_retry_deadline_ms(config)
+      )));
+    }
+
+    let (broker_node_id, broker_address) = {
       let membership = membership_rx.borrow();
       broker_assignment(topics, producer_writer_id(config), &membership)
         .get(&BrokerPartition {
@@ -977,7 +1022,7 @@ async fn send_batch_with_retry(
             metrics.failures.inc();
             metrics
               .send_latency_seconds
-              .observe(started_at.elapsed().as_secs_f64());
+              .observe(retry_clock.now().duration_since(started_at).as_secs_f64());
             warn_every!(
               15.seconds(),
               "producer no broker owner: topic={}, virtual_partition_id={}, membership_nodes={}",
@@ -985,12 +1030,10 @@ async fn send_batch_with_retry(
               batch.virtual_partition_id,
               membership.nodes().map_or(0, <[BrokerNode]>::len)
             );
-            None
+            Err(ProducerError::NoBrokersAvailable)
           },
-          |broker| Some((broker.node_id.clone(), broker.address.clone())),
-        )
-    }) else {
-      return Err(ProducerError::NoBrokersAvailable);
+          |broker| Ok((broker.node_id.clone(), broker.address.clone())),
+        )?
     };
 
     if previous_owner
@@ -1022,7 +1065,22 @@ async fn send_batch_with_retry(
       ..Default::default()
     };
 
-    let response = transport.produce_batch(&broker_address, request).await;
+    let request_timeout = Duration::from_millis(
+      u64::try_from(producer_request_timeout_ms(config))
+        .expect("producer config validation requires a positive request timeout"),
+    )
+    .min(remaining);
+    let response = tokio::time::timeout(
+      request_timeout,
+      transport.produce_batch(&broker_address, request, request_timeout),
+    )
+    .await
+    .unwrap_or_else(|_| {
+      Err(anyhow!(
+        "producer request timed out after {} ms",
+        request_timeout.as_millis()
+      ))
+    });
     let (current_error, retry_reason) = match response {
       Ok(response) => {
         let status = response.status.enum_value_or_default();
@@ -1032,7 +1090,7 @@ async fn send_batch_with_retry(
             metrics.records_sent.inc_by(batch.records.len() as u64);
             metrics
               .send_latency_seconds
-              .observe(started_at.elapsed().as_secs_f64());
+              .observe(retry_clock.now().duration_since(started_at).as_secs_f64());
             return Ok(ProducerAck {
               topic: batch.topic.clone(),
               virtual_partition_id: batch.virtual_partition_id,
@@ -1065,7 +1123,7 @@ async fn send_batch_with_retry(
       metrics.failures.inc();
       metrics
         .send_latency_seconds
-        .observe(started_at.elapsed().as_secs_f64());
+        .observe(retry_clock.now().duration_since(started_at).as_secs_f64());
       warn_every!(
         15.seconds(),
         "producer retries exhausted: topic={}, virtual_partition_id={}, attempts={}, error={}",
@@ -1077,7 +1135,11 @@ async fn send_batch_with_retry(
       return Err(ProducerError::RetriesExhausted(current_error));
     }
 
-    let delay_ms = retry_delay_ms(config, attempt);
+    let delay = next_retry_delay(
+      retry_backoff,
+      Duration::from_millis(producer_retry_max_delay_ms(config)),
+    )
+    .min(retry_deadline.saturating_duration_since(retry_clock.now()));
     metrics.retries.inc();
     retry_diagnostics.record(
       retry_reason,
@@ -1093,18 +1155,53 @@ async fn send_batch_with_retry(
       batch.topic,
       batch.virtual_partition_id,
       attempt.saturating_add(1),
-      delay_ms,
+      delay.as_millis(),
       current_error
     );
-    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    retry_clock.sleep(delay).await;
     attempt = attempt.saturating_add(1);
   }
 }
 
-fn retry_delay_ms(config: &ProducerConfig, attempt: u32) -> u64 {
-  let exponential =
-    producer_retry_base_delay_ms(config).saturating_mul(2u64.saturating_pow(attempt));
-  exponential.min(producer_retry_max_delay_ms(config))
+fn producer_retry_backoff(config: &ProducerConfig) -> ExponentialBackoff {
+  let base_delay = Duration::from_millis(producer_retry_base_delay_ms(config));
+  let max_delay = Duration::from_millis(producer_retry_max_delay_ms(config));
+  ExponentialBackoffBuilder::new_infinite()
+    .with_initial_interval(TimeDuration::try_from(base_delay).unwrap_or(TimeDuration::MAX))
+    .with_randomization_factor(0.5)
+    .with_multiplier(2.0)
+    .with_max_interval(TimeDuration::try_from(max_delay).unwrap_or(TimeDuration::MAX))
+    .build()
+}
+
+fn next_retry_delay(
+  retry_backoff: &mut (dyn InfiniteBackoff + Send),
+  max_delay: Duration,
+) -> Duration {
+  retry_backoff.next_backoff().unsigned_abs().min(max_delay)
+}
+
+//
+// RetryClock
+//
+
+#[async_trait]
+trait RetryClock: Send + Sync {
+  fn now(&self) -> Instant;
+  async fn sleep(&self, duration: Duration);
+}
+
+struct TokioRetryClock;
+
+#[async_trait]
+impl RetryClock for TokioRetryClock {
+  fn now(&self) -> Instant {
+    Instant::now()
+  }
+
+  async fn sleep(&self, duration: Duration) {
+    tokio::time::sleep(duration).await;
+  }
 }
 
 fn compute_virtual_partition_id(

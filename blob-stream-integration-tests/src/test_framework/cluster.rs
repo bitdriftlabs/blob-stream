@@ -12,12 +12,15 @@ use super::transport::{
 use crate::test_framework::{PARTITION_COUNT, SECOND_TOPIC, TOPIC};
 use anyhow::{Result, anyhow};
 use bd_server_stats::stats::Collector;
+use bd_shutdown::{ComponentShutdownTrigger, ComponentShutdownTriggerHandle};
+use bd_time::SystemTimeProvider;
 use blob_stream_blob_store::BlobStore;
 use blob_stream_broker::grpc::make_broker_router;
 use blob_stream_broker::metrics::BrokerMetrics;
 use blob_stream_broker::write::{
   BrokerLeaseStatus,
   BrokerStateSnapshot,
+  MemoryPressureAdmissionController,
   TopicInfo,
   WriteConfig,
   WriteEngine,
@@ -40,13 +43,14 @@ use tokio::time::{Instant, sleep, timeout};
 struct BrokerHandle {
   node: BrokerNode,
   write_engine: Arc<dyn WriteEngine>,
-  shutdown_tx: Option<oneshot::Sender<()>>,
+  listener_shutdown_tx: Option<oneshot::Sender<()>>,
+  broker_shutdown_trigger: Option<ComponentShutdownTrigger>,
   serve_task: JoinHandle<()>,
 }
 
 impl BrokerHandle {
   async fn shutdown(&mut self) -> Result<()> {
-    if let Some(tx) = self.shutdown_tx.take() {
+    if let Some(tx) = self.listener_shutdown_tx.take() {
       let _ = tx.send(());
     }
 
@@ -54,6 +58,10 @@ impl BrokerHandle {
       .await
       .map_err(|_| anyhow!("broker graceful shutdown timed out"))?;
     join_result.map_err(|error| anyhow!("broker task join failed: {error}"))?;
+
+    if let Some(shutdown_trigger) = self.broker_shutdown_trigger.take() {
+      shutdown_trigger.shutdown().await;
+    }
 
     Ok(())
   }
@@ -368,6 +376,7 @@ impl ClusterHarness {
       .machine_ids
       .get(&node.node_id)
       .ok_or_else(|| anyhow!("missing machine ID for broker {}", node.node_id))?;
+    let broker_shutdown_trigger = ComponentShutdownTrigger::default();
     let write_engine = build_write_engine(
       node.node_id.clone(),
       machine_id,
@@ -378,6 +387,7 @@ impl ClusterHarness {
       partition_count,
       topic_num_writers,
       self.broker_flush_max_delay,
+      broker_shutdown_trigger.make_handle(),
     )?;
 
     self
@@ -410,7 +420,8 @@ impl ClusterHarness {
     Ok(BrokerHandle {
       node,
       write_engine,
-      shutdown_tx: Some(shutdown_tx),
+      listener_shutdown_tx: Some(shutdown_tx),
+      broker_shutdown_trigger: Some(broker_shutdown_trigger),
       serve_task,
     })
   }
@@ -443,9 +454,8 @@ impl ClusterHarness {
     let mut removed = self.brokers.remove(index);
     removed.shutdown().await?;
 
-    // Drop the retired write engine before starting its same-ID replacement. Its lease-assignment
-    // loop performs asynchronous cleanup on drop; keeping it alive could release a lease that the
-    // replacement has just acquired.
+    // The explicit broker component shutdown completed before the replacement starts, so the
+    // retired engine cannot release a lease after its replacement has acquired it.
     drop(removed);
 
     let endpoint = self.transport.bind_endpoint(&old_node.node_id).await?;
@@ -475,6 +485,7 @@ fn build_write_engine(
   partition_count: u32,
   topic_num_writers: u32,
   broker_flush_max_delay: Duration,
+  shutdown_trigger_handle: ComponentShutdownTriggerHandle,
 ) -> Result<Arc<dyn WriteEngine>> {
   let mut topics = HashMap::new();
   for topic in [TOPIC, SECOND_TOPIC] {
@@ -496,17 +507,25 @@ fn build_write_engine(
     .map_err(|_| anyhow!("broker_flush_max_delay exceeds milliseconds as i64"))?;
   config.flush_max_bytes = 1024;
   config.reservation_size = 64;
+  let metrics_scope = Collector::default().scope("blob_stream_broker_it");
+  let admission = Arc::new(MemoryPressureAdmissionController::new(
+    &shutdown_trigger_handle,
+    &metrics_scope.scope("write"),
+  ));
 
-  let engine = WriteEngineImpl::new_with_snowflake_machine_id(
+  let engine = WriteEngineImpl::new(
     config,
     topics,
     blob_store,
     metadata_store,
     lease_store,
     holder_id,
-    machine_id,
+    Some(machine_id),
     Some(membership_rx),
-    &Collector::default().scope("blob_stream_broker_it"),
+    admission,
+    shutdown_trigger_handle,
+    Arc::new(SystemTimeProvider),
+    &metrics_scope,
   )?;
 
   Ok(Arc::new(engine))

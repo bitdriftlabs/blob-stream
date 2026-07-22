@@ -88,13 +88,17 @@ fn lease_key() -> ProducerPartitionLeaseKey {
   }
 }
 
+fn default_lease_store(client: Client, table_name: String) -> DynamoProducerPartitionLeaseStore {
+  DynamoProducerPartitionLeaseStore::new(client, table_name, 3_600, None)
+}
+
 #[tokio::test]
 async fn fences_lease_holders() -> Result<()> {
   let client = dynamo_client().await?;
   let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoProducerPartitionLeaseStore::new(client.clone(), table_name.clone());
+  let store = default_lease_store(client.clone(), table_name.clone());
   let key = lease_key();
 
   let outcome = store
@@ -130,7 +134,7 @@ async fn reserves_sequences_in_order() -> Result<()> {
   let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoProducerPartitionLeaseStore::new(client.clone(), table_name.clone());
+  let store = default_lease_store(client.clone(), table_name.clone());
   let key = lease_key();
 
   store
@@ -166,7 +170,7 @@ async fn acquires_and_reserves_sequences_in_one_operation() -> Result<()> {
   let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoProducerPartitionLeaseStore::new(client.clone(), table_name.clone());
+  let store = default_lease_store(client.clone(), table_name.clone());
   let key = lease_key();
   let first = store
     .acquire_lease_and_reserve_sequences(key.clone(), "broker-a".to_string(), 1_000, 100, Some(5))
@@ -204,7 +208,7 @@ async fn rejects_overflowing_atomic_sequence_reservation() -> Result<()> {
   let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoProducerPartitionLeaseStore::new(client.clone(), table_name.clone());
+  let store = default_lease_store(client.clone(), table_name.clone());
   let key = lease_key();
   store
     .acquire_lease_and_reserve_sequences(
@@ -244,7 +248,7 @@ async fn releases_lease_for_current_holder() -> Result<()> {
   let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoProducerPartitionLeaseStore::new(client.clone(), table_name.clone());
+  let store = default_lease_store(client.clone(), table_name.clone());
   let key = lease_key();
 
   store
@@ -289,7 +293,7 @@ async fn lookup_reports_absent_and_active_leases() -> Result<()> {
   let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoProducerPartitionLeaseStore::new(client.clone(), table_name.clone());
+  let store = default_lease_store(client.clone(), table_name.clone());
   let key = lease_key();
   assert!(store.get_lease(&key).await?.is_none());
 
@@ -314,11 +318,7 @@ async fn writes_ttl_attribute_for_lease_rows() -> Result<()> {
   let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoProducerPartitionLeaseStore::with_ttl_buffer_seconds(
-    client.clone(),
-    table_name.clone(),
-    120,
-  );
+  let store = DynamoProducerPartitionLeaseStore::new(client.clone(), table_name.clone(), 120, None);
   let key = lease_key();
 
   store

@@ -22,6 +22,7 @@ const DEFAULT_FLUSH_MAX_DELAY_MS: u64 = 200;
 const DEFAULT_MAX_RETRIES: u32 = 5;
 const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 25;
 const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 1_000;
+const DEFAULT_RETRY_DEADLINE_MS: u64 = 30_000;
 const DEFAULT_CONNECT_TIMEOUT_MS: i64 = 2_000;
 const DEFAULT_REQUEST_TIMEOUT_MS: i64 = 5_000;
 const DEFAULT_MAX_REQUEST_CONCURRENCY: u64 = 64;
@@ -42,6 +43,7 @@ pub fn producer_config_with_defaults() -> ProducerConfig {
   config.max_retries = Some(DEFAULT_MAX_RETRIES);
   config.retry_base_delay_ms = Some(DEFAULT_RETRY_BASE_DELAY_MS);
   config.retry_max_delay_ms = Some(DEFAULT_RETRY_MAX_DELAY_MS);
+  config.retry_deadline_ms = Some(DEFAULT_RETRY_DEADLINE_MS);
   config.connect_timeout_ms = Some(DEFAULT_CONNECT_TIMEOUT_MS);
   config.request_timeout_ms = Some(DEFAULT_REQUEST_TIMEOUT_MS);
   config.max_request_concurrency = Some(DEFAULT_MAX_REQUEST_CONCURRENCY);
@@ -93,6 +95,13 @@ pub fn producer_retry_max_delay_ms(config: &ProducerConfig) -> u64 {
 }
 
 #[must_use]
+pub fn producer_retry_deadline_ms(config: &ProducerConfig) -> u64 {
+  config
+    .retry_deadline_ms
+    .unwrap_or(DEFAULT_RETRY_DEADLINE_MS)
+}
+
+#[must_use]
 pub fn producer_connect_timeout_ms(config: &ProducerConfig) -> i64 {
   config
     .connect_timeout_ms
@@ -132,6 +141,10 @@ pub fn compression_as_grpc(compression: ProducerCompression) -> Compression {
 pub fn validate_producer_config(config: &ProducerConfig) -> Result<()> {
   trace!("validating producer config");
   proto_validate::validate(config)?;
+  ensure!(
+    producer_retry_base_delay_ms(config) <= producer_retry_max_delay_ms(config),
+    "producer retry_base_delay_ms must not exceed retry_max_delay_ms"
+  );
   Ok(())
 }
 

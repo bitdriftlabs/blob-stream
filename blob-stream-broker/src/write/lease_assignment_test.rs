@@ -1,24 +1,124 @@
 #![allow(clippy::unwrap_used)]
 
-use crate::write::{TopicInfo, WriteConfig, WriteEngineImpl};
+use crate::write::{MemoryPressureAdmissionController, TopicInfo, WriteConfig, WriteEngineImpl};
 use anyhow::Result;
+use async_trait::async_trait;
 use bd_server_stats::stats::Collector;
+use bd_shutdown::ComponentShutdownTrigger;
 use bd_time::TestTimeProvider;
 use blob_stream_blob_store::InMemoryBlobStore;
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{
   InMemoryMetadataStore,
   InMemoryProducerPartitionLeaseStore,
+  LeaseAcquireAndReserveOutcome,
   LeaseAcquireOutcome,
+  LeaseHeartbeatOutcome,
+  ProducerPartitionLease,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
+  SequenceReservationOutcome,
 };
-use blob_stream_types::virtual_partition_for_logical;
+use blob_stream_types::{VirtualPartitionId, virtual_partition_for_logical};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use time::OffsetDateTime;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, mpsc, watch};
+
+struct BlockingReleaseLeaseStore {
+  inner: InMemoryProducerPartitionLeaseStore,
+  started_tx: mpsc::UnboundedSender<VirtualPartitionId>,
+  release: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
+  async fn get_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+  ) -> Result<Option<ProducerPartitionLease>> {
+    self.inner.get_lease(key).await
+  }
+
+  async fn acquire_lease(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+  ) -> Result<LeaseAcquireOutcome> {
+    self
+      .inner
+      .acquire_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .await
+  }
+
+  async fn acquire_lease_and_reserve_sequences(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+    reservation_size: Option<u64>,
+  ) -> Result<LeaseAcquireAndReserveOutcome> {
+    self
+      .inner
+      .acquire_lease_and_reserve_sequences(
+        key,
+        holder_id,
+        now_ts_ms,
+        lease_duration_ms,
+        reservation_size,
+      )
+      .await
+  }
+
+  async fn heartbeat_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+  ) -> Result<LeaseHeartbeatOutcome> {
+    self
+      .inner
+      .heartbeat_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .await
+  }
+
+  async fn reserve_sequences(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    now_ts_ms: i64,
+    reservation_size: u64,
+  ) -> Result<SequenceReservationOutcome> {
+    self
+      .inner
+      .reserve_sequences(key, holder_id, now_ts_ms, reservation_size)
+      .await
+  }
+
+  async fn release_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    now_ts_ms: i64,
+  ) -> Result<blob_stream_metadata_store::LeaseReleaseOutcome> {
+    self
+      .started_tx
+      .send(key.virtual_partition_id)
+      .expect("parallel release test receiver remains open");
+    self
+      .release
+      .acquire()
+      .await
+      .expect("parallel release test gate remains open")
+      .forget();
+    self.inner.release_lease(key, holder_id, now_ts_ms).await
+  }
+}
 
 fn time_from_ms(ms: i64) -> OffsetDateTime {
   OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
@@ -234,6 +334,42 @@ async fn all_partitions_expired(
   true
 }
 
+#[tokio::test]
+async fn releases_partitions_in_parallel_after_their_drains_complete() {
+  let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let lease_store: Arc<dyn ProducerPartitionLeaseStore> = Arc::new(BlockingReleaseLeaseStore {
+    inner: InMemoryProducerPartitionLeaseStore::new(),
+    started_tx,
+    release: Arc::clone(&release),
+  });
+  let state = Arc::new(parking_lot::Mutex::new(super::super::WriteState::default()));
+  let flush_notifier = Arc::new(tokio::sync::Notify::new());
+  let metrics = super::super::WriteMetrics::new(&metrics_scope());
+  let releases = WriteEngineImpl::release_partition_leases(
+    &lease_store,
+    &state,
+    &flush_notifier,
+    &metrics,
+    "node-a",
+    vec![("telemetry".to_string(), 0), ("telemetry".to_string(), 1)],
+    1_000,
+  );
+  tokio::pin!(releases);
+
+  let first = tokio::select! {
+    () = &mut releases => panic!("releases completed before reaching the release gates"),
+    partition = started_rx.recv() => partition.expect("first release started"),
+  };
+  let second = tokio::select! {
+    () = &mut releases => panic!("releases completed before reaching the release gates"),
+    partition = started_rx.recv() => partition.expect("second release started"),
+  };
+  assert_eq!(HashSet::from([first, second]), HashSet::from([0, 1]));
+  release.add_permits(2);
+  releases.await;
+}
+
 async fn wait_for_all_partitions(mut predicate: impl AsyncFnMut() -> bool) -> bool {
   for _ in 0 .. 300 {
     if predicate().await {
@@ -255,15 +391,22 @@ async fn lease_assignment_waits_for_initialized_self_membership() -> Result<()> 
   let mut config = WriteConfig::with_defaults();
   config.lease_duration_ms = 60_000;
   let (membership_tx, membership_rx) = watch::channel(BrokerMembership::default());
+  let shutdown_trigger = ComponentShutdownTrigger::default();
 
-  let engine = WriteEngineImpl::new_with_time_provider(
+  let _engine = WriteEngineImpl::new(
     config,
     topics,
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
     lease_store.clone(),
     "node-a".to_string(),
+    None,
     Some(membership_rx),
+    Arc::new(MemoryPressureAdmissionController::new(
+      &shutdown_trigger.make_handle(),
+      &metrics_scope().scope("write"),
+    )),
+    shutdown_trigger.make_handle(),
     time_provider,
     &metrics_scope(),
   )?;
@@ -290,7 +433,7 @@ async fn lease_assignment_waits_for_initialized_self_membership() -> Result<()> 
     "leases were not acquired after node-a appeared in membership"
   );
 
-  drop(engine);
+  shutdown_trigger.shutdown().await;
   Ok(())
 }
 
@@ -307,15 +450,22 @@ async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Resul
     node_id: "node-a".to_string(),
     address: "10.0.0.1:8080".to_string(),
   }]));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
 
-  let engine = WriteEngineImpl::new_with_time_provider(
+  let _engine = WriteEngineImpl::new(
     config,
     topics,
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
     lease_store.clone(),
     "node-a".to_string(),
+    None,
     Some(membership_rx),
+    Arc::new(MemoryPressureAdmissionController::new(
+      &shutdown_trigger.make_handle(),
+      &metrics_scope().scope("write"),
+    )),
+    shutdown_trigger.make_handle(),
     time_provider,
     &metrics_scope(),
   )?;
@@ -350,7 +500,7 @@ async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Resul
     "node-a did not reacquire leases after rejoining membership"
   );
 
-  drop(engine);
+  shutdown_trigger.shutdown().await;
   Ok(())
 }
 
@@ -367,15 +517,22 @@ async fn scale_down_releases_previously_owned_leases() -> Result<()> {
     node_id: "node-a".to_string(),
     address: "10.0.0.1:8080".to_string(),
   }]));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
 
-  let engine = WriteEngineImpl::new_with_time_provider(
+  let _engine = WriteEngineImpl::new(
     config,
     topics,
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
     lease_store.clone(),
     "node-a".to_string(),
+    None,
     Some(membership_rx),
+    Arc::new(MemoryPressureAdmissionController::new(
+      &shutdown_trigger.make_handle(),
+      &metrics_scope().scope("write"),
+    )),
+    shutdown_trigger.make_handle(),
     time_provider,
     &metrics_scope(),
   )?;
@@ -398,7 +555,7 @@ async fn scale_down_releases_previously_owned_leases() -> Result<()> {
   }
   assert!(converged, "leases did not converge to node-b");
 
-  drop(engine);
+  shutdown_trigger.shutdown().await;
   Ok(())
 }
 
@@ -415,22 +572,29 @@ async fn shutdown_releases_currently_owned_leases() -> Result<()> {
     node_id: "node-a".to_string(),
     address: "10.0.0.1:8080".to_string(),
   }]));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
 
-  let engine = WriteEngineImpl::new_with_time_provider(
+  let _engine = WriteEngineImpl::new(
     config,
     topics,
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
     lease_store.clone(),
     "node-a".to_string(),
+    None,
     Some(membership_rx),
+    Arc::new(MemoryPressureAdmissionController::new(
+      &shutdown_trigger.make_handle(),
+      &metrics_scope().scope("write"),
+    )),
+    shutdown_trigger.make_handle(),
     time_provider,
     &metrics_scope(),
   )?;
 
   acquire_all_partitions(&lease_store, "node-a", partition_count).await;
 
-  drop(engine);
+  shutdown_trigger.shutdown().await;
 
   let mut released = false;
   for _ in 0 .. 300 {

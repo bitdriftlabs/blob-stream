@@ -1,20 +1,30 @@
-use crate::write::{DEFAULT_ZSTD_LEVEL, WriteEngine, WriteEngineImpl};
+use crate::write::{
+  DEFAULT_ZSTD_LEVEL,
+  MemoryPressureAdmissionController,
+  WriteEngine,
+  WriteEngineImpl,
+};
 use anyhow::{Context, Result, anyhow, ensure};
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
 use aws_types::region::Region;
 use bd_pgv::proto_validate;
 use bd_server_stats::stats::Scope;
+use bd_shutdown::ComponentShutdownTriggerHandle;
+use bd_time::SystemTimeProvider;
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_broker_discovery::k8s::K8sServiceBrokerDiscovery;
 use blob_stream_broker_discovery::r#static::StaticBrokerDiscovery;
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{
+  DynamoCapacityMetrics,
   DynamoProducerPartitionLeaseStore,
   InMemoryMetadataStore,
   InMemoryProducerPartitionLeaseStore,
   MetadataStore,
   ProducerPartitionLeaseStore,
+  aws_retry_config,
+  aws_timeout_config,
 };
 use blob_stream_proto::protos::blobstream::v1::config::{
   BlobStoreConfig,
@@ -172,6 +182,7 @@ impl TopicInfo {
 
 pub async fn build_write_engine(
   config: &RuntimeConfig,
+  shutdown_trigger_handle: ComponentShutdownTriggerHandle,
   metrics_scope: &Scope,
 ) -> Result<Arc<dyn WriteEngine>> {
   trace!("building broker write engine from runtime config");
@@ -199,12 +210,23 @@ pub async fn build_write_engine(
     .metadata_store
     .as_ref()
     .context("runtime config missing metadata_store config")?;
-  let metadata_store = build_metadata_store(metadata_store_config, &topics).await?;
+  let dynamo_capacity_metrics = DynamoCapacityMetrics::new(&metrics_scope.scope("dynamo"));
+  let metadata_store = build_metadata_store(
+    metadata_store_config,
+    &topics,
+    dynamo_capacity_metrics.clone(),
+  )
+  .await?;
 
-  let lease_store = build_producer_partition_lease_store(metadata_store_config).await?;
+  let lease_store =
+    build_producer_partition_lease_store(metadata_store_config, dynamo_capacity_metrics).await?;
   let topics_count = topics.len();
   let holder_id_for_log = holder_id.clone();
   let writer_id = write_config.writer_id;
+  let admission = Arc::new(MemoryPressureAdmissionController::new(
+    &shutdown_trigger_handle,
+    &metrics_scope.scope("write"),
+  ));
 
   let engine = WriteEngineImpl::new(
     write_config,
@@ -213,7 +235,11 @@ pub async fn build_write_engine(
     metadata_store,
     lease_store,
     holder_id,
+    None,
     Some(membership_rx),
+    admission,
+    shutdown_trigger_handle,
+    Arc::new(SystemTimeProvider),
     metrics_scope,
   )?;
 
@@ -227,6 +253,7 @@ pub async fn build_write_engine(
 
 async fn build_producer_partition_lease_store(
   config: &MetadataStoreConfig,
+  capacity_metrics: DynamoCapacityMetrics,
 ) -> Result<Arc<dyn ProducerPartitionLeaseStore>> {
   if config.has_in_memory() {
     debug!("using in-memory producer partition lease store backend");
@@ -243,7 +270,10 @@ async fn build_producer_partition_lease_store(
     let region = dynamo.region.to_string();
 
     let region_provider = RegionProviderChain::first_try(Some(Region::new(region)));
-    let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(region_provider);
+    let mut loader = aws_config::defaults(BehaviorVersion::latest())
+      .region(region_provider)
+      .retry_config(aws_retry_config())
+      .timeout_config(aws_timeout_config());
     if !dynamo.endpoint.is_empty() {
       loader = loader.endpoint_url(dynamo.endpoint.to_string());
     }
@@ -254,10 +284,11 @@ async fn build_producer_partition_lease_store(
       .lease_ttl_buffer_seconds
       .unwrap_or(DEFAULT_LEASE_TTL_BUFFER_SECONDS);
     let store: Arc<dyn ProducerPartitionLeaseStore> =
-      Arc::new(DynamoProducerPartitionLeaseStore::with_ttl_buffer_seconds(
+      Arc::new(DynamoProducerPartitionLeaseStore::new(
         client,
         table_name,
         ttl_buffer_seconds,
+        Some(capacity_metrics),
       ));
     return Ok(store);
   }
@@ -375,13 +406,24 @@ async fn build_blob_store(
     let region = s3.region.to_string();
 
     let region_provider = RegionProviderChain::first_try(Some(Region::new(region)));
-    let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(region_provider);
+    let mut loader = aws_config::defaults(BehaviorVersion::latest())
+      .region(region_provider)
+      .retry_config(aws_retry_config())
+      .timeout_config(aws_timeout_config());
     if !s3.endpoint.is_empty() {
       loader = loader.endpoint_url(s3.endpoint.to_string());
     }
 
     let shared = loader.load().await;
-    let client = aws_sdk_s3::Client::new(&shared);
+    let client = if s3.endpoint.is_empty() {
+      aws_sdk_s3::Client::new(&shared)
+    } else {
+      // Local S3-compatible endpoints (e.g. LocalStack) require path-style requests.
+      let config = aws_sdk_s3::config::Builder::from(&shared)
+        .force_path_style(true)
+        .build();
+      aws_sdk_s3::Client::from_conf(config)
+    };
     let store: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(client, bucket));
     let prefix = if s3.prefix.is_empty() {
       None
@@ -398,6 +440,7 @@ async fn build_blob_store(
 async fn build_metadata_store(
   config: &MetadataStoreConfig,
   topics: &HashMap<String, TopicInfo>,
+  capacity_metrics: DynamoCapacityMetrics,
 ) -> Result<Arc<dyn MetadataStore>> {
   if config.has_in_memory() {
     debug!("using in-memory metadata store backend");
@@ -412,7 +455,10 @@ async fn build_metadata_store(
     let region = dynamo.region.to_string();
 
     let region_provider = RegionProviderChain::first_try(Some(Region::new(region)));
-    let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(region_provider);
+    let mut loader = aws_config::defaults(BehaviorVersion::latest())
+      .region(region_provider)
+      .retry_config(aws_retry_config())
+      .timeout_config(aws_timeout_config());
     if !dynamo.endpoint.is_empty() {
       loader = loader.endpoint_url(dynamo.endpoint.to_string());
     }
@@ -428,14 +474,14 @@ async fn build_metadata_store(
       .segment_ttl_buffer_seconds
       .unwrap_or(DEFAULT_SEGMENT_TTL_BUFFER_SECONDS);
 
-    let store: Arc<dyn MetadataStore> = Arc::new(
-      blob_stream_metadata_store::DynamoMetadataStore::with_segment_ttl(
+    let store: Arc<dyn MetadataStore> =
+      Arc::new(blob_stream_metadata_store::DynamoMetadataStore::new(
         client,
         table_name,
         retention_days_by_topic,
         ttl_buffer_seconds,
-      ),
-    );
+        Some(capacity_metrics),
+      ));
     return Ok(store);
   }
 

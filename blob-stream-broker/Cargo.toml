@@ -21,6 +21,7 @@ bd-panic.workspace                = true
 bd-pgv.workspace                  = true
 bd-rt.workspace                   = true
 bd-server-stats.workspace         = true
+bd-shutdown.workspace             = true
 bd-time.workspace                 = true
 blob-stream-blob-store.path       = "../blob-stream-blob-store"
 blob-stream-broker-discovery.path = "../blob-stream-broker-discovery"
@@ -42,11 +43,15 @@ serde_json.workspace              = true
 serde_yaml.workspace              = true
 sonyflake.workspace               = true
 thiserror.workspace               = true
+tikv-jemalloc-ctl.workspace       = true
 tikv-jemallocator.workspace       = true
 time.workspace                    = true
 tokio.workspace                   = true
 uuid.workspace                    = true
 zstd.workspace                    = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cgroups-rs.workspace = true
 
 [dev-dependencies]
 mockall.workspace = true

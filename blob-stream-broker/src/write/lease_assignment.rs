@@ -16,12 +16,14 @@ use blob_stream_metadata_store::{
   ProducerPartitionLeaseKey,
 };
 use blob_stream_types::VirtualPartitionId;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use log::{debug, info};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use time::ext::NumericalDuration;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::watch;
 
 impl WriteEngineImpl {
   pub(super) fn owned_virtual_partitions(
@@ -51,7 +53,7 @@ impl WriteEngineImpl {
   pub(super) fn spawn_lease_self_assignment_loop(
     &self,
     mut membership_rx: watch::Receiver<BrokerMembership>,
-  ) -> oneshot::Sender<()> {
+  ) {
     let interval_ms = (self.config.lease_duration_ms / 3)
       .max(1_000)
       .cast_unsigned();
@@ -66,7 +68,7 @@ impl WriteEngineImpl {
     let time_provider = Arc::clone(&self.time_provider);
     let metrics = self.metrics.clone();
     let flush_notifier = Arc::clone(&self.flush_notifier);
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let mut shutdown = self.shutdown_trigger_handle.make_shutdown();
 
     tokio::spawn(async move {
       let mut ticker = tokio::time::interval(interval);
@@ -86,12 +88,12 @@ impl WriteEngineImpl {
               }
               false
             }
-            _ = &mut shutdown_rx => true,
+            () = shutdown.cancelled() => true,
           }
         } else {
           tokio::select! {
             _ = ticker.tick() => false,
-            _ = &mut shutdown_rx => true,
+            () = shutdown.cancelled() => true,
           }
         };
 
@@ -100,6 +102,33 @@ impl WriteEngineImpl {
           let mut guard = state.lock();
           guard.membership = membership.clone();
         }
+        if shutting_down {
+          let mut partitions: HashSet<_> = owned_partitions_for_shutdown(&state);
+          partitions.extend(Self::owned_virtual_partitions(
+            &topics,
+            writer_id,
+            &holder_id,
+            &membership,
+          ));
+          let mut partitions = partitions.into_iter().collect::<Vec<_>>();
+          partitions.sort_unstable();
+          info!(
+            "broker releasing drained leases for shutdown: holder_id={holder_id}, \
+             partitions={partitions:?}"
+          );
+          Self::release_partition_leases(
+            &lease_store,
+            &state,
+            &flush_notifier,
+            &metrics,
+            &holder_id,
+            partitions,
+            time_provider.now().unix_timestamp_ms(),
+          )
+          .await;
+          return;
+        }
+
         // Kubernetes does not publish this pod to Endpoints until it is ready. Waiting here keeps
         // the server available for readiness checks without treating an incomplete snapshot as
         // authoritative ownership.
@@ -142,42 +171,16 @@ impl WriteEngineImpl {
         // On membership changes (scale up/down), we release any partition that moved away from
         // this broker instead of waiting for lease TTL expiration. This shortens convergence and
         // reduces transient NOT_LEASE_HOLDER retries for producers during rebalance.
-        for (topic, virtual_partition_id) in &lost_partitions {
-          Self::release_partition_lease(
-            &lease_store,
-            &state,
-            &flush_notifier,
-            &metrics,
-            &holder_id,
-            topic,
-            *virtual_partition_id,
-            time_provider.now().unix_timestamp_ms(),
-          )
-          .await;
-        }
-
-        // During shutdown we release all currently owned partitions so another broker can acquire
-        // immediately. If release fails, normal lease expiry still guarantees eventual progress.
-        if shutting_down {
-          info!(
-            "broker releasing assigned leases for shutdown: holder_id={holder_id}, \
-             partitions={owned:?}"
-          );
-          for (topic, virtual_partition_id) in owned {
-            Self::release_partition_lease(
-              &lease_store,
-              &state,
-              &flush_notifier,
-              &metrics,
-              &holder_id,
-              &topic,
-              virtual_partition_id,
-              time_provider.now().unix_timestamp_ms(),
-            )
-            .await;
-          }
-          break;
-        }
+        Self::release_partition_leases(
+          &lease_store,
+          &state,
+          &flush_notifier,
+          &metrics,
+          &holder_id,
+          lost_partitions,
+          time_provider.now().unix_timestamp_ms(),
+        )
+        .await;
 
         // Record assignment after reconciling releases so the next pass can compute deltas.
         previously_assigned = currently_owned;
@@ -275,8 +278,6 @@ impl WriteEngineImpl {
         }
       }
     });
-
-    shutdown_tx
   }
 
   async fn release_partition_lease(
@@ -341,6 +342,35 @@ impl WriteEngineImpl {
     }
   }
 
+  async fn release_partition_leases(
+    lease_store: &Arc<dyn blob_stream_metadata_store::ProducerPartitionLeaseStore>,
+    state: &Arc<parking_lot::Mutex<super::WriteState>>,
+    flush_notifier: &Arc<tokio::sync::Notify>,
+    metrics: &super::WriteMetrics,
+    holder_id: &str,
+    partitions: Vec<(String, VirtualPartitionId)>,
+    now_ts_ms: i64,
+  ) {
+    let mut releases = FuturesUnordered::new();
+    for (topic, virtual_partition_id) in partitions {
+      releases.push(async move {
+        Self::release_partition_lease(
+          lease_store,
+          state,
+          flush_notifier,
+          metrics,
+          holder_id,
+          &topic,
+          virtual_partition_id,
+          now_ts_ms,
+        )
+        .await;
+      });
+    }
+
+    while releases.next().await.is_some() {}
+  }
+
   async fn wait_for_partition_drain(
     state: &Arc<parking_lot::Mutex<super::WriteState>>,
     topic: &str,
@@ -360,6 +390,12 @@ impl WriteEngineImpl {
       notified.await;
     }
   }
+}
+
+fn owned_partitions_for_shutdown(
+  state: &Arc<parking_lot::Mutex<super::WriteState>>,
+) -> HashSet<(String, VirtualPartitionId)> {
+  state.lock().partition_keys().into_iter().collect()
 }
 
 fn sorted_partition_delta(

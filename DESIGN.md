@@ -172,11 +172,13 @@ invariant.
    selected for its configured writer ID.
 4. The broker validates the topic, validates the virtual partition range, acquires or renews the
    producer-partition lease, and reserves sequence space as necessary.
-5. The broker buffers accepted batches in memory. It flushes a virtual-partition buffer when its
-   raw payload bytes reach `flush_max_bytes` or its oldest batch reaches `flush_max_delay_ms`. A
-   partition with a durable plan in progress continues buffering its next epoch until that prior
-   plan completes. A single bounded flush scheduler wakes for eligible writes, timer ticks, and
-   durable-plan completions; a completion immediately promotes an eligible successor epoch.
+5. The broker samples jemalloc allocation against its Linux cgroup memory limit and rejects new
+   batches with `OVERLOADED` when utilization exceeds its admission threshold. It flushes a
+   virtual-partition buffer when its raw payload bytes reach `flush_max_bytes` or its oldest batch
+   reaches `flush_max_delay_ms`. A partition with a durable plan in progress continues buffering its
+   next epoch until that prior plan completes. A single bounded flush scheduler wakes for eligible
+   writes, timer ticks, and durable-plan completions; a completion immediately promotes an eligible
+   successor epoch.
 6. A flush serializes each batch as `StoredRecordBatch`, compresses each serialized batch
    independently, concatenates the stored bytes into a segment blob, uploads the blob, and then
    writes the segment metadata row. Plans may run concurrently for different virtual partitions,
@@ -199,8 +201,10 @@ Sequence ranges are internal durable metadata used by consumers. The protocol st
   sequence reservation, or another internal write-path failure.
 
 The producer treats `NOT_LEASE_HOLDER`, `OVERLOADED`, and transport errors as retryable until its
-configured retry budget is exhausted. Retrying after an ambiguous failure can produce a duplicate
-batch, which is part of the at-least-once contract.
+configured attempt count or total retry deadline is exhausted. It uses shared capped exponential
+backoff with randomized delays and clips each RPC and delay to the remaining deadline. Retrying
+after an ambiguous failure
+can produce a duplicate batch, which is part of the at-least-once contract.
 
 ## Persistent Data Layout
 

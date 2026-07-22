@@ -461,6 +461,7 @@ impl ProducerBrokerTransport for InMemoryProducerTransport {
     &self,
     broker_address: &str,
     request: ProduceBatchRequest,
+    request_timeout: Duration,
   ) -> Result<ProduceBatchResponse> {
     let node_id = broker_address
       .strip_prefix("inmemory://")
@@ -505,17 +506,23 @@ impl ProducerBrokerTransport for InMemoryProducerTransport {
         records: request.records.clone(),
       };
 
-      let response = match write_engine.produce_batch(write_request).await {
-        Ok(_write_response) => ProduceBatchResponse {
+      let response = match tokio::time::timeout(
+        request_timeout,
+        write_engine.produce_batch(write_request),
+      )
+      .await
+      {
+        Ok(Ok(_write_response)) => ProduceBatchResponse {
           status: ProduceStatus::PRODUCE_STATUS_OK.into(),
           error_message: String::new().into(),
           ..Default::default()
         },
-        Err(error) => ProduceBatchResponse {
+        Ok(Err(error)) => ProduceBatchResponse {
           status: error.status().into(),
           error_message: write_error_message(&error).into(),
           ..Default::default()
         },
+        Err(_) => return Err(anyhow!("in-memory transport timed out for node {node_id}")),
       };
 
       if first_response.is_none() {

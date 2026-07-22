@@ -166,7 +166,6 @@ impl FlushContext {
     let mut payload = BytesMut::new();
     let mut segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>> = HashMap::new();
     let mut record_count = 0_u64;
-
     for partition in partitions {
       trace!(
         "encoding partition batches: topic={}, virtual_partition_id={}, batches={}",

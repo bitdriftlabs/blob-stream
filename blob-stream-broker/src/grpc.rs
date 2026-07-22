@@ -24,6 +24,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::ext::NumericalDuration;
 
+const MAX_DECODED_PRODUCE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
 //
 // BrokerGrpcMetrics
 //
@@ -179,9 +181,7 @@ pub fn make_broker_router(write_engine: Arc<dyn WriteEngine>, metrics: &BrokerMe
     &service_method,
     Arc::new(BrokerGrpc::new(write_engine, &grpc_metrics_scope)),
   )
-  .request_config(
-    UnaryRequestConfig::default().with_validation_options(ValidationOptions::default()),
-  )
+  .request_config(produce_request_config())
   .error_handler(|error| {
     warn_every!(15.seconds(), "broker gRPC handler error: {error}");
   })
@@ -207,6 +207,14 @@ pub fn make_broker_router(write_engine: Arc<dyn WriteEngine>, metrics: &BrokerMe
     }),
   )
   .route("/admin/log", post(log))
+}
+
+fn produce_request_config() -> UnaryRequestConfig {
+  UnaryRequestConfig {
+    max_decoded_request_bytes: MAX_DECODED_PRODUCE_REQUEST_BYTES,
+    ..UnaryRequestConfig::default()
+  }
+  .with_validation_options(ValidationOptions::default())
 }
 
 // Handler for /admin/log. Allows changing the active log level.

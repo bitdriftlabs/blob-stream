@@ -1,8 +1,8 @@
-use crate::{MetadataStore, SegmentMetadata};
+use crate::{DynamoCapacityMetrics, MetadataStore, SegmentMetadata};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
-use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::types::{AttributeValue, ReturnConsumedCapacity};
 use blob_stream_blob_store::BlobKey;
 use blob_stream_types::{
   BatchMetadata,
@@ -22,7 +22,6 @@ mod tests;
 
 const ATTR_PK: &str = "pk";
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
-const DEFAULT_SEGMENT_TTL_BUFFER_SECONDS: u32 = 3_600;
 
 //
 // DynamoMetadataStore
@@ -34,31 +33,42 @@ pub struct DynamoMetadataStore {
   table_name: String,
   topic_retention_days: HashMap<String, u32>,
   ttl_buffer_seconds: i64,
+  capacity_metrics: Option<DynamoCapacityMetrics>,
 }
 
 impl DynamoMetadataStore {
   #[must_use]
-  pub fn new(client: Client, table_name: impl Into<String>) -> Self {
-    Self::with_segment_ttl(
-      client,
-      table_name,
-      HashMap::new(),
-      DEFAULT_SEGMENT_TTL_BUFFER_SECONDS,
-    )
-  }
-
-  #[must_use]
-  pub fn with_segment_ttl(
+  pub fn new(
     client: Client,
     table_name: impl Into<String>,
     topic_retention_days: HashMap<String, u32>,
     ttl_buffer_seconds: u32,
+    capacity_metrics: Option<DynamoCapacityMetrics>,
   ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
       topic_retention_days,
       ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
+      capacity_metrics,
+    }
+  }
+
+  fn record_read_capacity(
+    &self,
+    consumed_capacity: Option<&aws_sdk_dynamodb::types::ConsumedCapacity>,
+  ) {
+    if let Some(capacity_metrics) = &self.capacity_metrics {
+      capacity_metrics.record_read(consumed_capacity);
+    }
+  }
+
+  fn record_write_capacity(
+    &self,
+    consumed_capacity: Option<&aws_sdk_dynamodb::types::ConsumedCapacity>,
+  ) {
+    if let Some(capacity_metrics) = &self.capacity_metrics {
+      capacity_metrics.record_write(consumed_capacity);
     }
   }
 
@@ -96,13 +106,15 @@ impl MetadataStore for DynamoMetadataStore {
     let item = DynamoSegmentItem::from_metadata(metadata, ttl_epoch_seconds);
     let item = serde_dynamo::to_item(item)?;
 
-    self
+    let response = self
       .client
       .put_item()
       .table_name(&self.table_name)
       .set_item(Some(item))
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await?;
+    self.record_write_capacity(response.consumed_capacity.as_ref());
 
     debug!(
       "metadata(dynamo) write_segment complete: table={}",
@@ -153,7 +165,11 @@ impl MetadataStore for DynamoMetadataStore {
         query = query.set_exclusive_start_key(Some(key));
       }
 
-      let response = query.send().await?;
+      let response = query
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .await?;
+      self.record_read_capacity(response.consumed_capacity.as_ref());
       segments.extend(
         response
           .items
