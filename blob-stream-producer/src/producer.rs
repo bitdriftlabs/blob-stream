@@ -44,13 +44,20 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceStatus,
   Record,
 };
-use blob_stream_types::{VirtualPartitionId, format_unix_timestamp_ms, virtual_partition_for_key};
+use blob_stream_types::{
+  VirtualPartitionId,
+  format_unix_timestamp_ms,
+  serialize_as_string,
+  virtual_partition_for_key,
+};
+use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use hyper_util::client::legacy::connect::HttpConnector;
 use log::{debug, trace};
 use parking_lot::Mutex;
 use prometheus::{Histogram, IntCounter};
+use protobuf::Chars;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -121,7 +128,7 @@ pub struct ProducerRecord {
   /// Partitioning key used to derive logical and virtual partition assignment.
   pub record_key: Vec<u8>,
   /// Opaque payload bytes.
-  pub payload: Vec<u8>,
+  pub payload: Bytes,
   /// Event time in Unix milliseconds.
   pub event_ts_ms: i64,
 }
@@ -132,13 +139,13 @@ impl ProducerRecord {
   pub fn new(
     topic: impl Into<String>,
     record_key: Vec<u8>,
-    payload: Vec<u8>,
+    payload: impl Into<Bytes>,
     event_ts_ms: i64,
   ) -> Self {
     Self {
       topic: topic.into(),
       record_key,
-      payload,
+      payload: payload.into(),
       event_ts_ms,
     }
   }
@@ -264,7 +271,8 @@ pub struct ProducerBrokerSnapshot {
 
 #[derive(Debug, Serialize)]
 pub struct ProducerTopicSnapshot {
-  pub name: String,
+  #[serde(serialize_with = "serialize_as_string")]
+  pub name: Chars,
   pub partition_count: u32,
   pub num_writers: u32,
   pub retention_days: u32,
@@ -276,7 +284,8 @@ pub struct ProducerTopicSnapshot {
 
 #[derive(Debug, Serialize)]
 pub struct ProducerRouteSnapshot {
-  pub topic: String,
+  #[serde(serialize_with = "serialize_as_string")]
+  pub topic: Chars,
   pub virtual_partition_id: VirtualPartitionId,
   pub producer_writer_id: u32,
   pub logical_partition_id: u32,
@@ -342,7 +351,7 @@ impl ProducerDiagnostics {
       .topics
       .values()
       .map(|topic| ProducerTopicSnapshot {
-        name: topic.name.to_string(),
+        name: topic.name.clone(),
         partition_count: topic.partition_count,
         num_writers: topic.num_writers,
         retention_days: topic.retention_days,
@@ -352,20 +361,17 @@ impl ProducerDiagnostics {
 
     let assignment = broker_assignment(&self.topics, writer_id, &membership);
     let mut route_map = writer_virtual_partitions(
-      self.topics.values().map(|topic| {
-        (
-          topic.name.to_string(),
-          topic.partition_count,
-          topic.num_writers,
-        )
-      }),
+      self
+        .topics
+        .values()
+        .map(|topic| (topic.name.clone(), topic.partition_count, topic.num_writers)),
       writer_id,
     )
     .into_iter()
     .map(|partition| {
       let topic = self
         .topics
-        .get(&partition.topic)
+        .get(partition.topic.as_str())
         .expect("partition inventory must reference a configured topic");
       let selected_broker = assignment
         .get(&partition)
@@ -390,18 +396,22 @@ impl ProducerDiagnostics {
     let mut partition_buffers = state
       .buffers
       .iter()
-      .map(
-        |((topic, virtual_partition_id), buffer)| ProducerPartitionBufferSnapshot {
-          topic: topic.clone(),
-          virtual_partition_id: *virtual_partition_id,
-          buffered_record_count: buffer.records.len(),
-          pending_ack_count: buffer.waiters.len(),
-          buffered_bytes: buffer.buffered_bytes,
-          oldest_buffered_age_ms: buffer
-            .first_buffered_at
-            .map(|first| u64::try_from(first.elapsed().as_millis()).unwrap_or(u64::MAX)),
-        },
-      )
+      .flat_map(|(topic, partitions)| {
+        partitions
+          .iter()
+          .map(
+            move |(virtual_partition_id, buffer)| ProducerPartitionBufferSnapshot {
+              topic: topic.to_string(),
+              virtual_partition_id: *virtual_partition_id,
+              buffered_record_count: buffer.records.len(),
+              pending_ack_count: buffer.waiters.len(),
+              buffered_bytes: buffer.buffered_bytes,
+              oldest_buffered_age_ms: buffer
+                .first_buffered_at
+                .map(|first| u64::try_from(first.elapsed().as_millis()).unwrap_or(u64::MAX)),
+            },
+          )
+      })
       .collect::<Vec<_>>();
     partition_buffers.sort_by(|left, right| {
       (&left.topic, left.virtual_partition_id).cmp(&(&right.topic, right.virtual_partition_id))
@@ -816,6 +826,7 @@ impl ProducerClient for ProducerClientImpl {
       "record buffered: topic={topic}, virtual_partition_id={virtual_partition_id}, \
        payload_bytes={payload_len}"
     );
+    let topic = topic.into();
 
     let maybe_batch = {
       let mut guard = self.state.lock();
@@ -824,7 +835,7 @@ impl ProducerClient for ProducerClientImpl {
           topic,
           virtual_partition_id,
           proto_record: Record {
-            payload: payload.into(),
+            payload,
             event_ts_ms,
             ..Default::default()
           },
@@ -951,13 +962,9 @@ fn broker_assignment(
 ) -> BTreeMap<BrokerPartition, BrokerNode> {
   balanced_assignment(
     writer_virtual_partitions(
-      topics.values().map(|topic| {
-        (
-          topic.name.to_string(),
-          topic.partition_count,
-          topic.num_writers,
-        )
-      }),
+      topics
+        .values()
+        .map(|topic| (topic.name.clone(), topic.partition_count, topic.num_writers)),
       writer_id,
     ),
     membership,
@@ -1004,8 +1011,8 @@ async fn send_batch_with_retry_and_retry_control(
   not_lease_holder_retry_backoff: &mut (dyn InfiniteBackoff + Send),
 ) -> Result<ProducerAck, ProducerError> {
   let _topic = topics
-    .get(&batch.topic)
-    .ok_or_else(|| ProducerError::UnknownTopic(batch.topic.clone()))?;
+    .get(batch.topic.as_str())
+    .ok_or_else(|| ProducerError::UnknownTopic(batch.topic.to_string()))?;
 
   let mut attempt: u32 = 0;
   let mut previous_owner: Option<String> = None;
@@ -1093,7 +1100,7 @@ async fn send_batch_with_retry_and_retry_control(
     );
 
     let request = ProduceBatchRequest {
-      topic: batch.topic.clone().into(),
+      topic: batch.topic.clone(),
       virtual_partition_id: batch.virtual_partition_id,
       records: batch.records.clone(),
       ..Default::default()
@@ -1126,13 +1133,13 @@ async fn send_batch_with_retry_and_retry_control(
               .send_latency_seconds
               .observe(retry_clock.now().duration_since(started_at).as_secs_f64());
             return Ok(ProducerAck {
-              topic: batch.topic.clone(),
+              topic: batch.topic.to_string(),
               virtual_partition_id: batch.virtual_partition_id,
               attempts: attempt.saturating_add(1),
             });
           },
           ProduceStatus::PRODUCE_STATUS_UNKNOWN_TOPIC => {
-            return Err(ProducerError::UnknownTopic(batch.topic.clone()));
+            return Err(ProducerError::UnknownTopic(batch.topic.to_string()));
           },
           ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER
           | ProduceStatus::PRODUCE_STATUS_OVERLOADED => {
@@ -1169,7 +1176,7 @@ async fn send_batch_with_retry_and_retry_control(
     metrics.retries.inc();
     retry_diagnostics.record(
       retry_reason,
-      &batch.topic,
+      batch.topic.as_str(),
       batch.virtual_partition_id,
       attempt.saturating_add(1),
       current_error.clone(),
@@ -1327,7 +1334,7 @@ fn compute_virtual_partition_id(
 //
 
 struct BufferedRecord {
-  topic: String,
+  topic: Chars,
   virtual_partition_id: VirtualPartitionId,
   proto_record: Record,
   waiter: oneshot::Sender<Result<ProducerAck, ProducerError>>,
@@ -1337,7 +1344,7 @@ struct BufferedRecord {
 //
 
 struct BufferedBatch {
-  topic: String,
+  topic: Chars,
   virtual_partition_id: VirtualPartitionId,
   records: Vec<Record>,
   waiters: Vec<oneshot::Sender<Result<ProducerAck, ProducerError>>>,
@@ -1377,7 +1384,7 @@ impl PartitionBuffer {
 
   fn take_batch(
     &mut self,
-    topic: &str,
+    topic: Chars,
     virtual_partition_id: VirtualPartitionId,
   ) -> Option<BufferedBatch> {
     if self.records.is_empty() {
@@ -1390,7 +1397,7 @@ impl PartitionBuffer {
     self.first_buffered_at = None;
 
     Some(BufferedBatch {
-      topic: topic.to_string(),
+      topic,
       virtual_partition_id,
       records,
       waiters,
@@ -1404,8 +1411,8 @@ impl PartitionBuffer {
 
 #[derive(Default)]
 struct ProducerState {
-  buffers: HashMap<(String, VirtualPartitionId), PartitionBuffer>,
-  last_time_flush_partition: Option<(String, VirtualPartitionId)>,
+  buffers: BTreeMap<Chars, BTreeMap<VirtualPartitionId, PartitionBuffer>>,
+  last_time_flush_partition: Option<(Chars, VirtualPartitionId)>,
 }
 
 impl ProducerState {
@@ -1423,12 +1430,21 @@ impl ProducerState {
     } = record;
     let buffer = self
       .buffers
-      .entry((topic.clone(), virtual_partition_id))
+      .entry(topic.clone())
+      .or_default()
+      .entry(virtual_partition_id)
       .or_default();
     buffer.push(proto_record, waiter);
+    let should_flush = buffer.should_flush_by_size(max_batch_records, max_batch_bytes);
 
-    if buffer.should_flush_by_size(max_batch_records, max_batch_bytes) {
-      return buffer.take_batch(&topic, virtual_partition_id);
+    if should_flush {
+      return self
+        .buffers
+        .get_mut(&topic)
+        .expect("buffered topic must exist")
+        .get_mut(&virtual_partition_id)
+        .expect("buffered partition must exist")
+        .take_batch(topic, virtual_partition_id);
     }
 
     None
@@ -1439,36 +1455,36 @@ impl ProducerState {
     flush_max_delay_ms: u64,
     max_batches: usize,
   ) -> Vec<BufferedBatch> {
-    let mut ready = Vec::new();
-    let mut partition_keys: Vec<_> = self.buffers.keys().cloned().collect();
-    partition_keys.sort_unstable();
-    let start = self.last_time_flush_partition.as_ref().map_or(0, |last| {
-      partition_keys
-        .iter()
-        .position(|partition| partition > last)
-        .unwrap_or(0)
-    });
+    if max_batches == 0 {
+      return Vec::new();
+    }
 
-    for (topic, virtual_partition_id) in partition_keys
-      .into_iter()
-      .cycle()
-      .skip(start)
-      .take(self.buffers.len())
-    {
-      if ready.len() == max_batches {
-        break;
-      }
-      let buffer = self
-        .buffers
-        .get_mut(&(topic.clone(), virtual_partition_id))
-        .expect("partition key must reference an existing buffer");
-      if !buffer.should_flush_by_time(flush_max_delay_ms) {
-        continue;
-      }
+    let mut ready = Vec::with_capacity(max_batches);
+    let previous_last = self.last_time_flush_partition.clone();
 
-      if let Some(batch) = buffer.take_batch(&topic, virtual_partition_id) {
-        self.last_time_flush_partition = Some((topic, virtual_partition_id));
-        ready.push(batch);
+    // Resume immediately after the last dispatched pair, then wrap once. This prevents a
+    // low-sorting, continually due partition from starving later partitions when capacity is
+    // limited, while the ordered buffer map avoids allocating a temporary key list per tick.
+    for after_previous_last in [true, false] {
+      for (topic, partitions) in &mut self.buffers {
+        for (virtual_partition_id, buffer) in partitions {
+          if ready.len() == max_batches {
+            return ready;
+          }
+          let is_after_previous_last = previous_last
+            .as_ref()
+            .is_none_or(|last| (topic.as_str(), *virtual_partition_id) > (last.0.as_str(), last.1));
+          if is_after_previous_last != after_previous_last
+            || !buffer.should_flush_by_time(flush_max_delay_ms)
+          {
+            continue;
+          }
+
+          if let Some(batch) = buffer.take_batch(topic.clone(), *virtual_partition_id) {
+            self.last_time_flush_partition = Some((batch.topic.clone(), *virtual_partition_id));
+            ready.push(batch);
+          }
+        }
       }
     }
 
@@ -1477,9 +1493,11 @@ impl ProducerState {
 
   fn drain_all_batches(&mut self) -> Vec<BufferedBatch> {
     let mut batches = Vec::new();
-    for ((topic, virtual_partition_id), buffer) in &mut self.buffers {
-      if let Some(batch) = buffer.take_batch(topic, *virtual_partition_id) {
-        batches.push(batch);
+    for (topic, partitions) in &mut self.buffers {
+      for (virtual_partition_id, buffer) in partitions {
+        if let Some(batch) = buffer.take_batch(topic.clone(), *virtual_partition_id) {
+          batches.push(batch);
+        }
       }
     }
     batches

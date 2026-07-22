@@ -27,6 +27,7 @@ use blob_stream_types::VirtualPartitionId;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use log::{debug, info};
+use protobuf::Chars;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -35,11 +36,11 @@ use tokio::sync::watch;
 
 impl WriteEngineImpl {
   pub(super) fn owned_virtual_partitions(
-    topics: &HashMap<String, TopicInfo>,
+    topics: &HashMap<Chars, TopicInfo>,
     writer_id: u32,
     holder_id: &str,
     membership: &BrokerMembership,
-  ) -> Vec<(String, VirtualPartitionId)> {
+  ) -> Vec<(Chars, VirtualPartitionId)> {
     let partitions = writer_virtual_partitions(
       topics
         .values()
@@ -47,7 +48,7 @@ impl WriteEngineImpl {
       writer_id,
     );
 
-    let mut owned: Vec<(String, VirtualPartitionId)> = balanced_assignment(partitions, membership)
+    let mut owned: Vec<(Chars, VirtualPartitionId)> = balanced_assignment(partitions, membership)
       .into_iter()
       .filter_map(|(partition, owner)| {
         (owner.node_id == holder_id).then_some((partition.topic, partition.virtual_partition_id))
@@ -84,7 +85,7 @@ impl WriteEngineImpl {
       // running instead of silently stalling.
       let mut membership_updates_open = true;
       let mut assignment_activated = false;
-      let mut previously_assigned: HashSet<(String, VirtualPartitionId)> = HashSet::new();
+      let mut previously_assigned: HashSet<(Chars, VirtualPartitionId)> = HashSet::new();
 
       loop {
         let shutting_down = if membership_updates_open {
@@ -161,8 +162,7 @@ impl WriteEngineImpl {
         }
 
         let owned = Self::owned_virtual_partitions(&topics, writer_id, &holder_id, &membership);
-        let currently_owned: HashSet<(String, VirtualPartitionId)> =
-          owned.iter().cloned().collect();
+        let currently_owned: HashSet<(Chars, VirtualPartitionId)> = owned.iter().cloned().collect();
 
         let gained_partitions = sorted_partition_delta(&currently_owned, &previously_assigned);
         let lost_partitions = sorted_partition_delta(&previously_assigned, &currently_owned);
@@ -293,12 +293,12 @@ impl WriteEngineImpl {
     flush_notifier: &Arc<tokio::sync::Notify>,
     metrics: &WriteMetrics,
     holder_id: &str,
-    topic: &str,
+    topic: &Chars,
     virtual_partition_id: VirtualPartitionId,
     now_ts_ms: i64,
   ) {
     let key = ProducerPartitionLeaseKey {
-      topic: topic.to_string(),
+      topic: topic.clone(),
       virtual_partition_id,
     };
 
@@ -355,7 +355,7 @@ impl WriteEngineImpl {
     flush_notifier: &Arc<tokio::sync::Notify>,
     metrics: &WriteMetrics,
     holder_id: &str,
-    partitions: Vec<(String, VirtualPartitionId)>,
+    partitions: Vec<(Chars, VirtualPartitionId)>,
     now_ts_ms: i64,
   ) {
     let mut releases = FuturesUnordered::new();
@@ -401,14 +401,14 @@ impl WriteEngineImpl {
 
 fn owned_partitions_for_shutdown(
   state: &Arc<parking_lot::Mutex<WriteState>>,
-) -> HashSet<(String, VirtualPartitionId)> {
+) -> HashSet<(Chars, VirtualPartitionId)> {
   state.lock().partition_keys().into_iter().collect()
 }
 
 fn sorted_partition_delta(
-  left: &HashSet<(String, VirtualPartitionId)>,
-  right: &HashSet<(String, VirtualPartitionId)>,
-) -> Vec<(String, VirtualPartitionId)> {
+  left: &HashSet<(Chars, VirtualPartitionId)>,
+  right: &HashSet<(Chars, VirtualPartitionId)>,
+) -> Vec<(Chars, VirtualPartitionId)> {
   let mut partitions: Vec<_> = left.difference(right).cloned().collect();
   partitions.sort_unstable();
   partitions

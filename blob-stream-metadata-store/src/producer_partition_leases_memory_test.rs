@@ -12,7 +12,7 @@ use blob_stream_types::SeqRange;
 
 fn lease_key() -> ProducerPartitionLeaseKey {
   ProducerPartitionLeaseKey {
-    topic: "topic-a".to_string(),
+    topic: "topic-a".into(),
     virtual_partition_id: 42,
   }
 }

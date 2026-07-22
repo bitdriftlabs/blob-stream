@@ -1,6 +1,7 @@
 use super::WriteConfig;
 use anyhow::Result;
 use blob_stream_types::{BatchSummary, Record, SeqRange, VirtualPartitionId};
+use protobuf::Chars;
 use tokio::sync::oneshot;
 
 pub(super) type FlushCompletion = oneshot::Sender<Result<(), String>>;
@@ -71,7 +72,7 @@ pub(super) struct BufferedBatch {
 
 #[derive(Debug)]
 pub(super) struct FlushPlan {
-  pub(super) topic: String,
+  pub(super) topic: Chars,
   pub(super) partitions: Vec<FlushPartition>,
   pub(super) max_metadata_publication_lag_ms: u64,
 }

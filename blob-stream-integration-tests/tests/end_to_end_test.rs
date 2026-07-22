@@ -31,7 +31,6 @@ use blob_stream_types::{
   CommittedCursor,
   CommittedSourceCheckpoint,
   Compression,
-  RecordBatch,
   SeqRange,
   SnowflakeId,
   TopicWindowKey,
@@ -108,6 +107,7 @@ async fn write_recovery_segment(
       },
       SnowflakeId(snowflake_id),
       blob_key,
+      Compression::none(),
       HashMap::from([(
         0,
         vec![BatchMetadata {
@@ -119,10 +119,7 @@ async fn write_recovery_segment(
             start: 0,
             end: u64::try_from(encoded.len())?,
           },
-          summary: RecordBatch::new(0, vec![record])
-            .summary()
-            .ok_or_else(|| anyhow!("recovery segment must contain one record"))?,
-          compression: Compression::none(),
+          payload_bytes: u64::try_from(encoded.len())?,
         }],
       )]),
       window_start_unix_seconds * 1_000,
@@ -467,6 +464,149 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
   assert!(duplicate_scan.is_empty());
 
   // Step 6: Tear down broker and dependency resources.
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn broker_coalesces_same_partition_requests_into_one_consumer_batch() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .broker_flush_max_delay(Duration::from_millis(500))
+    .start()
+    .await?;
+  let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
+  let producer = Arc::new(
+    ProducerClientImpl::new(
+      producer_config(),
+      vec![producer_topic()],
+      discovery,
+      metrics_scope("blob_stream_producer_it"),
+    )
+    .await?,
+  );
+
+  let key = b"coalesced-partition".to_vec();
+  let virtual_partition_id = virtual_partition_for_logical(
+    logical_partition_for_key(&key, PARTITION_COUNT),
+    PARTITION_COUNT,
+    0,
+  );
+  let first_producer = Arc::clone(&producer);
+  let first_key = key.clone();
+  let first = tokio::spawn(async move {
+    first_producer
+      .produce(ProducerRecord::new(
+        TOPIC,
+        first_key,
+        b"first".to_vec(),
+        now_unix_millis(),
+      ))
+      .await
+  });
+
+  let buffered_deadline = Instant::now() + Duration::from_secs(2);
+  loop {
+    let buffered = cluster
+      .broker_state_snapshots()
+      .await
+      .iter()
+      .any(|snapshot| {
+        snapshot
+          .topics
+          .iter()
+          .flat_map(|topic| &topic.local_partitions)
+          .any(|partition| {
+            partition.virtual_partition_id == virtual_partition_id
+              && partition.buffered_batch_count == 1
+          })
+      });
+    if buffered {
+      break;
+    }
+    if Instant::now() >= buffered_deadline {
+      return Err(anyhow!("first request did not enter the broker buffer"));
+    }
+    sleep(Duration::from_millis(5)).await;
+  }
+
+  let second = producer
+    .produce(ProducerRecord::new(
+      TOPIC,
+      key,
+      b"second".to_vec(),
+      now_unix_millis(),
+    ))
+    .await?;
+  let first = first
+    .await
+    .map_err(|error| anyhow!("first request join error: {error}"))??;
+  assert_eq!(first.virtual_partition_id, virtual_partition_id);
+  assert_eq!(second.virtual_partition_id, virtual_partition_id);
+
+  let window = Window::for_timestamp(now_unix_seconds(), WINDOW_SIZE_SECONDS).key(TOPIC);
+  let metadata_deadline = Instant::now() + Duration::from_secs(5);
+  let segments = loop {
+    let segments = resources
+      .metadata_store()
+      .scan_window_from_snowflake(&window, None)
+      .await?;
+    if !segments.is_empty() {
+      break segments;
+    }
+    if Instant::now() >= metadata_deadline {
+      return Err(anyhow!("coalesced segment metadata did not become visible"));
+    }
+    sleep(Duration::from_millis(10)).await;
+  };
+  assert_eq!(segments.len(), 1);
+  assert_eq!(segments[0].segment_index[&virtual_partition_id].len(), 1);
+  assert_eq!(
+    segments[0].segment_index[&virtual_partition_id][0].seq_range,
+    SeqRange { start: 0, end: 1 }
+  );
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: TOPIC.to_string().into(),
+      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      metadata_visibility_delay_ms: Some(0),
+      ..Default::default()
+    },
+    vec![virtual_partition_id],
+    HashMap::new(),
+    resources.blob_store(),
+    resources.metadata_store(),
+    &metrics_scope("blob_stream_consumer_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )?;
+  let consumer_deadline = Instant::now() + Duration::from_secs(5);
+  let batches = loop {
+    let batches = reader.read_available(now_unix_seconds()).await?;
+    if !batches.is_empty() {
+      break batches;
+    }
+    if Instant::now() >= consumer_deadline {
+      return Err(anyhow!(
+        "coalesced segment did not become visible to the consumer"
+      ));
+    }
+    sleep(Duration::from_millis(10)).await;
+  };
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].seq_range, SeqRange { start: 0, end: 1 });
+  assert_eq!(
+    batches[0]
+      .records
+      .iter()
+      .map(|record| record.payload.as_ref())
+      .collect::<Vec<_>>(),
+    vec![b"first".as_slice(), b"second".as_slice()]
+  );
+
   cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())
@@ -1579,7 +1719,7 @@ async fn wait_for_broker_lease_ownership(
       .is_some_and(|snapshot| {
         virtual_partition_ids.iter().all(|virtual_partition_id| {
           snapshot.ownership.iter().any(|ownership| {
-            ownership.topic == topic
+            ownership.topic.as_str() == topic
               && ownership.virtual_partition_id == *virtual_partition_id
               && ownership.assignment_is_local
               && ownership.lease_status == BrokerLeaseStatus::LocalActive

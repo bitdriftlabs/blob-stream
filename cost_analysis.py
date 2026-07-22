@@ -309,8 +309,9 @@ DEFAULTS = Inputs(
   pages_per_scan_window_query=1.2,
   pages_per_membership_query=1.0,
 
-  # Item/query sizes (KB).
-  kb_seg_item=3.0,
+  # Item/query sizes (KB). A representative 8-partition, one-batch-per-partition compact metadata
+  # item measured 475 bytes including top-level DynamoDB attributes, TTL, and per-item overhead.
+  kb_seg_item=0.475,
   kb_lease_prod=1.0,
   kb_lease_cons=1.0,
   kb_membership=1.0,

@@ -4,6 +4,7 @@ use super::metrics::WriteMetrics;
 use super::state::{PartitionState, WriteState};
 use super::{TopicInfo, WriteConfig};
 use parking_lot::Mutex;
+use protobuf::Chars;
 use std::collections::HashMap;
 use std::iter;
 use std::sync::Arc;
@@ -51,7 +52,7 @@ pub(super) async fn flush_plan_and_notify(
 
 fn mark_flush_complete(
   state: &Arc<Mutex<WriteState>>,
-  topic: &str,
+  topic: &Chars,
   virtual_partition_ids: &[blob_stream_types::VirtualPartitionId],
 ) {
   let mut drain_notifiers = Vec::new();
@@ -59,7 +60,7 @@ fn mark_flush_complete(
     let mut state = state.lock();
     for virtual_partition_id in virtual_partition_ids {
       let Some(partition_state) =
-        state.partition_state_mut_if_present(topic, *virtual_partition_id)
+        state.partition_state_mut_if_present(topic.as_str(), *virtual_partition_id)
       else {
         continue;
       };
@@ -113,14 +114,15 @@ fn flush_trigger(
 
 fn take_flush_partitions(
   state: &mut WriteState,
-  topic: &str,
+  topic: &Chars,
   virtual_partition_ids: impl IntoIterator<Item = blob_stream_types::VirtualPartitionId>,
   trigger: FlushTrigger,
 ) -> Vec<FlushPartition> {
   virtual_partition_ids
     .into_iter()
     .filter_map(|virtual_partition_id| {
-      let partition_state = state.partition_state_mut_if_present(topic, virtual_partition_id)?;
+      let partition_state =
+        state.partition_state_mut_if_present(topic.as_str(), virtual_partition_id)?;
       if partition_state.flush_in_flight {
         None
       } else {
@@ -134,7 +136,7 @@ pub(super) fn collect_flush_plans(
   state: &Arc<Mutex<WriteState>>,
   now_ts_ms: i64,
   config: &WriteConfig,
-  topics: &HashMap<String, TopicInfo>,
+  topics: &HashMap<Chars, TopicInfo>,
   max_plans: usize,
 ) -> Vec<FlushPlan> {
   if max_plans == 0 {
@@ -158,7 +160,7 @@ pub(super) fn collect_flush_plans(
       .unwrap_or(0)
   });
   let partition_state_count = partition_keys.len();
-  let mut plans_by_topic: HashMap<String, Vec<FlushPartition>> = HashMap::new();
+  let mut plans_by_topic: HashMap<Chars, Vec<FlushPartition>> = HashMap::new();
   let mut last_planned_topic = None;
 
   for (topic, virtual_partition_id) in partition_keys
@@ -168,14 +170,14 @@ pub(super) fn collect_flush_plans(
     .take(partition_state_count)
   {
     topics
-      .get(topic)
+      .get(topic.as_str())
       .expect("write state is created only for configured topics");
     let is_new_topic = !plans_by_topic.contains_key(topic);
     if is_new_topic && plans_by_topic.len() == max_plans {
       continue;
     }
     let flush_trigger = state
-      .partition_state(topic, *virtual_partition_id)
+      .partition_state(topic.as_str(), *virtual_partition_id)
       .and_then(|partition_state| flush_trigger(partition_state, now_ts_ms, config));
     let Some(flush_trigger) = flush_trigger else {
       continue;
@@ -221,7 +223,7 @@ pub(super) fn collect_flush_plans(
     .into_iter()
     .map(|(topic, partitions)| FlushPlan {
       max_metadata_publication_lag_ms: topics
-        .get(&topic)
+        .get(topic.as_str())
         .expect("flush plans are created only for configured topics")
         .max_metadata_publication_lag_ms,
       topic,

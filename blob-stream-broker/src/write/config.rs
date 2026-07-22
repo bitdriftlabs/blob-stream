@@ -43,7 +43,7 @@ use blob_stream_types::{
 };
 use hostname::get as get_hostname;
 use log::{debug, trace};
-use protobuf::EnumOrUnknown;
+use protobuf::{Chars, EnumOrUnknown};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -147,7 +147,7 @@ impl WriteConfig {
 
 #[derive(Clone, Debug)]
 pub struct TopicInfo {
-  pub name: String,
+  pub name: Chars,
   pub partition_count: u32,
   pub num_writers: u32,
   pub retention_days: u32,
@@ -156,7 +156,7 @@ pub struct TopicInfo {
 
 impl TopicInfo {
   pub fn from_proto(proto: &TopicConfig) -> Result<Self> {
-    let name = proto.name.to_string();
+    let name = proto.name.clone();
 
     Ok(Self {
       name,
@@ -335,7 +335,7 @@ async fn build_membership_watch(
   Ok(rx)
 }
 
-fn build_topics(topics: &[TopicConfig]) -> Result<HashMap<String, TopicInfo>> {
+fn build_topics(topics: &[TopicConfig]) -> Result<HashMap<Chars, TopicInfo>> {
   trace!(
     "building topic map from {} configured topic(s)",
     topics.len()
@@ -353,7 +353,7 @@ fn build_topics(topics: &[TopicConfig]) -> Result<HashMap<String, TopicInfo>> {
   Ok(map)
 }
 
-fn validate_writer_id(writer_id: u32, topics: &HashMap<String, TopicInfo>) -> Result<()> {
+fn validate_writer_id(writer_id: u32, topics: &HashMap<Chars, TopicInfo>) -> Result<()> {
   for topic in topics.values() {
     ensure!(
       writer_id < topic.num_writers,
@@ -439,7 +439,7 @@ async fn build_blob_store(
 
 async fn build_metadata_store(
   config: &MetadataStoreConfig,
-  topics: &HashMap<String, TopicInfo>,
+  topics: &HashMap<Chars, TopicInfo>,
   capacity_metrics: DynamoCapacityMetrics,
 ) -> Result<Arc<dyn MetadataStore>> {
   if config.has_in_memory() {

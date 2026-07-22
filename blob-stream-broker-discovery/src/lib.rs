@@ -12,6 +12,7 @@ pub mod r#static;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use protobuf::Chars;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
@@ -69,7 +70,7 @@ impl BrokerMembership {
 /// A virtual partition that requires a broker assignment.
 pub struct BrokerPartition {
   /// Topic containing the virtual partition.
-  pub topic: String,
+  pub topic: Chars,
   /// Virtual partition ID, including the producer writer offset.
   pub virtual_partition_id: u32,
 }
@@ -81,7 +82,7 @@ pub struct BrokerPartition {
 #[must_use]
 /// Build the virtual-partition inventory for one configured producer writer.
 pub fn writer_virtual_partitions(
-  topics: impl IntoIterator<Item = (String, u32, u32)>,
+  topics: impl IntoIterator<Item = (Chars, u32, u32)>,
   writer_id: u32,
 ) -> Vec<BrokerPartition> {
   let mut partitions = Vec::new();

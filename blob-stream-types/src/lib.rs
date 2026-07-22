@@ -7,7 +7,8 @@ mod tests;
 use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 pub use blob_stream_blob_store::ByteRange;
 pub use blob_stream_proto::protos::blobstream::v1::broker::Record;
-use serde::{Deserialize, Serialize};
+use bytes::Bytes;
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use time::format_description::well_known::Rfc3339;
@@ -25,6 +26,19 @@ pub const DEFAULT_METADATA_WINDOW_SIZE_SECONDS: i64 = 300;
 /// Brokers enforce this value for topic configurations that leave the deadline unset. Consumers
 /// use the same value when deriving their metadata availability horizon.
 pub const DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS: u64 = 15_000;
+
+//
+// Serde Helpers
+//
+
+/// Serialize any displayable string-like value as a JSON string without requiring `Serialize`.
+pub fn serialize_as_string<S, T>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+  S: Serializer,
+  T: std::fmt::Display + ?Sized,
+{
+  serializer.collect_str(value)
+}
 
 #[must_use]
 /// Return current Unix time in milliseconds.
@@ -84,7 +98,7 @@ pub fn virtual_partition_for_key(
 
 #[must_use]
 /// Build a protobuf-backed `Record` from owned payload bytes.
-pub fn new_record(payload: Vec<u8>, event_ts_ms: i64) -> Record {
+pub fn new_record(payload: impl Into<Bytes>, event_ts_ms: i64) -> Record {
   Record {
     payload: payload.into(),
     event_ts_ms,
@@ -116,23 +130,19 @@ impl RecordBatch {
   }
 
   #[must_use]
-  /// Summarize record count, payload bytes, and event-time bounds for this batch.
+  /// Summarize record count and payload bytes for this batch.
   pub fn summary(&self) -> Option<BatchSummary> {
     Self::summary_from_records(&self.records)
   }
 
   #[must_use]
-  /// Summarize record count, payload bytes, and event-time bounds for a record slice.
+  /// Summarize record count and payload bytes for a record slice.
   pub fn summary_from_records(records: &[Record]) -> Option<BatchSummary> {
     let mut iter = records.iter();
     let first = iter.next()?;
-    let mut min_event_ts_ms = first.event_ts_ms;
-    let mut max_event_ts_ms = first.event_ts_ms;
     let mut payload_bytes = first.payload.len() as u64;
 
     for record in iter {
-      min_event_ts_ms = min_event_ts_ms.min(record.event_ts_ms);
-      max_event_ts_ms = max_event_ts_ms.max(record.event_ts_ms);
       payload_bytes += record.payload.len() as u64;
     }
 
@@ -141,8 +151,6 @@ impl RecordBatch {
     Some(BatchSummary {
       record_count,
       payload_bytes,
-      min_event_ts_ms,
-      max_event_ts_ms,
     })
   }
 }
@@ -158,10 +166,6 @@ pub struct BatchSummary {
   pub record_count: u32,
   /// Total payload bytes across all records.
   pub payload_bytes: u64,
-  /// Minimum event timestamp in milliseconds.
-  pub min_event_ts_ms: i64,
-  /// Maximum event timestamp in milliseconds.
-  pub max_event_ts_ms: i64,
 }
 
 //
@@ -275,10 +279,8 @@ pub struct BatchMetadata {
   pub seq_range: SeqRange,
   /// Byte range in the segment blob.
   pub byte_range: ByteRange,
-  /// Batch-level summary fields.
-  pub summary: BatchSummary,
-  /// Stored compression settings.
-  pub compression: Compression,
+  /// Total payload bytes across all records in this batch.
+  pub payload_bytes: u64,
 }
 
 //

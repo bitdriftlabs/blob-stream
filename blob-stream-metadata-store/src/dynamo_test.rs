@@ -2,6 +2,7 @@ use crate::{DynamoMetadataStore, MetadataStore, SegmentMetadata};
 use anyhow::{Context, Result, anyhow};
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
   AttributeDefinition,
   AttributeValue,
@@ -11,15 +12,16 @@ use aws_sdk_dynamodb::types::{
   ScalarAttributeType,
 };
 use blob_stream_blob_store::BlobKey;
+use blob_stream_proto::protos::blobstream::v1::metadata::SegmentMetadataV1;
 use blob_stream_types::{
   BatchMetadata,
-  BatchSummary,
   Compression,
   SeqRange,
   SnowflakeId,
   TopicWindowKey,
   VirtualPartitionId,
 };
+use protobuf::Message;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -104,13 +106,7 @@ fn build_segment(
   let batch = BatchMetadata {
     seq_range: SeqRange { start: 10, end: 19 },
     byte_range: blob_stream_types::ByteRange { start: 0, end: 512 },
-    summary: BatchSummary {
-      record_count: 10,
-      payload_bytes: 512,
-      min_event_ts_ms: 1000,
-      max_event_ts_ms: 2000,
-    },
-    compression: Compression::none(),
+    payload_bytes: 512,
   };
   segment_index.insert(0 as VirtualPartitionId, vec![batch]);
 
@@ -121,6 +117,7 @@ fn build_segment(
     },
     SnowflakeId(snowflake_id),
     BlobKey::from("topic/1/segment"),
+    Compression::none(),
     segment_index,
     3000,
     3000,
@@ -202,7 +199,7 @@ async fn writes_segment_ttl_attribute() -> Result<()> {
   create_segments_table(&client, &table_name).await?;
 
   let mut retention_days = HashMap::new();
-  retention_days.insert("topic-a".to_string(), 7);
+  retention_days.insert("topic-a".into(), 7);
   let store = DynamoMetadataStore::new(
     client.clone(),
     table_name.clone(),
@@ -232,14 +229,24 @@ async fn writes_segment_ttl_attribute() -> Result<()> {
   let expected = (segment.created_ts_ms / 1_000) + (7 * 24 * 60 * 60) + 3_600;
 
   assert_eq!(ttl, expected);
+  assert!(
+    item
+      .get(super::ATTR_SEGMENT_METADATA_V1)
+      .is_some_and(|value| value.as_b().is_ok()),
+    "metadata item must contain binary compact metadata"
+  );
   for attribute in [
     "topic",
     "window_start_ts",
+    "blob_key",
+    "created_ts_ms",
+    "metadata_published_ts_ms",
     "compression",
     "record_count",
     "min_event_ts_ms",
     "max_event_ts_ms",
     "checksum",
+    "segment_index",
   ] {
     assert!(
       !item.contains_key(attribute),
@@ -248,5 +255,59 @@ async fn writes_segment_ttl_attribute() -> Result<()> {
   }
 
   client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn skips_noncompliant_segment_rows() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("blob_segments_test_{}", Uuid::new_v4());
+  create_segments_table(&client, &table_name).await?;
+
+  let store = DynamoMetadataStore::new(
+    client.clone(),
+    table_name.clone(),
+    HashMap::new(),
+    3_600,
+    None,
+  );
+  let valid = build_segment("topic-a", 100, 2);
+  store.write_segment(valid.clone()).await?;
+  let encoded = crate::codec::encode(valid.clone())?;
+  let mut invalid_metadata = SegmentMetadataV1::parse_from_tokio_bytes(&encoded.payload)?;
+  invalid_metadata.partitions[0].batches[0].byte_end = 0;
+  client
+    .put_item()
+    .table_name(&table_name)
+    .item("pk", AttributeValue::S(valid.partition_key()))
+    .item("sk", AttributeValue::S(SnowflakeId(1).format_lex()))
+    .item(
+      super::ATTR_SEGMENT_METADATA_V1,
+      AttributeValue::S("not a binary payload".to_string()),
+    )
+    .send()
+    .await?;
+  client
+    .put_item()
+    .table_name(&table_name)
+    .item("pk", AttributeValue::S(valid.partition_key()))
+    .item("sk", AttributeValue::S(SnowflakeId(3).format_lex()))
+    .item(
+      super::ATTR_SEGMENT_METADATA_V1,
+      AttributeValue::B(Blob::new(invalid_metadata.write_to_bytes()?)),
+    )
+    .send()
+    .await?;
+
+  let window = TopicWindowKey {
+    topic: "topic-a".to_string(),
+    window_start_unix_seconds: 100,
+  };
+  assert_eq!(
+    store.scan_window_from_snowflake(&window, None).await?,
+    vec![valid]
+  );
+
+  client.delete_table().table_name(&table_name).send().await?;
   Ok(())
 }

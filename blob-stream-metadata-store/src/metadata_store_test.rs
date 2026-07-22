@@ -1,13 +1,6 @@
 use crate::SegmentMetadata;
 use blob_stream_blob_store::BlobKey;
-use blob_stream_types::{
-  BatchMetadata,
-  BatchSummary,
-  Compression,
-  SeqRange,
-  SnowflakeId,
-  TopicWindowKey,
-};
+use blob_stream_types::{BatchMetadata, Compression, SeqRange, SnowflakeId, TopicWindowKey};
 use std::collections::HashMap;
 
 #[test]
@@ -16,13 +9,7 @@ fn formats_partition_and_snowflake_keys() {
   let batch = BatchMetadata {
     seq_range: SeqRange { start: 1, end: 2 },
     byte_range: blob_stream_types::ByteRange { start: 0, end: 10 },
-    summary: BatchSummary {
-      record_count: 2,
-      payload_bytes: 10,
-      min_event_ts_ms: 100,
-      max_event_ts_ms: 200,
-    },
-    compression: Compression::none(),
+    payload_bytes: 10,
   };
   segment_index.insert(0 as blob_stream_types::VirtualPartitionId, vec![batch]);
 
@@ -33,6 +20,7 @@ fn formats_partition_and_snowflake_keys() {
     },
     SnowflakeId(42),
     BlobKey::from("topic/300/42"),
+    Compression::none(),
     segment_index,
     400,
     400,

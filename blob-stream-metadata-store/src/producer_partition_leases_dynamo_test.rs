@@ -83,7 +83,7 @@ async fn wait_for_table_active(client: &Client, table_name: &str) -> Result<()> 
 
 fn lease_key() -> ProducerPartitionLeaseKey {
   ProducerPartitionLeaseKey {
-    topic: "topic-a".to_string(),
+    topic: "topic-a".into(),
     virtual_partition_id: 42,
   }
 }

@@ -497,6 +497,7 @@ async fn write_segment(
     },
     SnowflakeId(snowflake_id),
     blob_key,
+    Compression::none(),
     HashMap::from([(
       virtual_partition_id,
       vec![BatchMetadata {
@@ -505,8 +506,7 @@ async fn write_segment(
           start: 0,
           end: payload.len() as u64,
         },
-        summary,
-        compression: Compression::none(),
+        payload_bytes: summary.payload_bytes,
       }],
     )]),
     window_start * 1_000,

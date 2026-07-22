@@ -32,7 +32,7 @@ async fn coalesced_reservation_honors_sequence_reservation_faults() {
     controller,
   );
   let key = ProducerPartitionLeaseKey {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 0,
   };
 

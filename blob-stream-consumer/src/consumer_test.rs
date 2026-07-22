@@ -393,6 +393,7 @@ async fn write_segment_with_publication_time(
     },
     SnowflakeId(snowflake_id),
     blob_key,
+    compression,
     HashMap::from([(
       virtual_partition_id,
       vec![BatchMetadata {
@@ -401,8 +402,7 @@ async fn write_segment_with_publication_time(
           start: 0,
           end: payload.len() as u64,
         },
-        summary,
-        compression,
+        payload_bytes: summary.payload_bytes,
       }],
     )]),
     window_start * 1_000,
@@ -418,12 +418,13 @@ async fn write_multi_partition_segment(
   topic: &str,
   window_start: i64,
   snowflake_id: u64,
-  batches: Vec<(VirtualPartitionId, SeqRange, Vec<Record>, Compression)>,
+  compression: Compression,
+  batches: Vec<(VirtualPartitionId, SeqRange, Vec<Record>)>,
 ) -> u64 {
   let mut payload = Vec::new();
   let mut segment_index = HashMap::new();
 
-  for (virtual_partition_id, seq_range, records, compression) in batches {
+  for (virtual_partition_id, seq_range, records) in batches {
     let batch = RecordBatch::new(virtual_partition_id, records.clone());
     let encoded = StoredRecordBatch {
       virtual_partition_id,
@@ -449,13 +450,18 @@ async fn write_multi_partition_segment(
       .push(BatchMetadata {
         seq_range,
         byte_range: blob_stream_types::ByteRange { start, end },
-        summary: batch.summary().unwrap(),
-        compression,
+        payload_bytes: batch.summary().unwrap().payload_bytes,
       });
   }
 
   let payload_len = u64::try_from(payload.len()).unwrap();
-  let blob_key = BlobKey::new(format!("{topic}/{window_start}/{snowflake_id}.bin"));
+  let blob_key = BlobKey::new(format!(
+    "{topic}/{window_start}/{snowflake_id}.{}",
+    match compression.codec {
+      CompressionCodec::None => "bin",
+      CompressionCodec::Zstd => "zst",
+    }
+  ));
   blob_store
     .put(&blob_key, Bytes::from(payload))
     .await
@@ -468,6 +474,7 @@ async fn write_multi_partition_segment(
       },
       SnowflakeId(snowflake_id),
       blob_key,
+      compression,
       segment_index,
       window_start * 1_000,
       window_start * 1_000,
@@ -1371,24 +1378,22 @@ async fn coalesces_owned_ranges_from_one_segment() {
     "telemetry",
     900,
     1,
+    Compression::zstd(3),
     vec![
       (
         7,
-        SeqRange { start: 1, end: 1 },
-        vec![new_record(vec![7], 1_001)],
-        Compression::none(),
+        SeqRange { start: 1, end: 2 },
+        vec![new_record(vec![7], 1_001), new_record(vec![17], 1_004)],
       ),
       (
         8,
         SeqRange { start: 1, end: 1 },
         vec![new_record(vec![8], 1_002)],
-        Compression::none(),
       ),
       (
         9,
         SeqRange { start: 1, end: 1 },
         vec![new_record(vec![9], 1_003)],
-        Compression::zstd(3),
       ),
     ],
   )
@@ -1420,6 +1425,15 @@ async fn coalesces_owned_ranges_from_one_segment() {
       .collect::<Vec<_>>(),
     vec![7, 9]
   );
+  assert_eq!(batches[0].seq_range, SeqRange { start: 1, end: 2 });
+  assert_eq!(
+    batches[0]
+      .records
+      .iter()
+      .map(|record| record.payload.as_ref())
+      .collect::<Vec<_>>(),
+    vec![&[7], &[17]]
+  );
   assert_eq!(
     blob_store.ranges(),
     vec![ByteRange {
@@ -1439,24 +1453,22 @@ async fn capacity_limited_segment_read_excludes_deferred_batches() {
     "telemetry",
     900,
     1,
+    Compression::none(),
     vec![
       (
         7,
         SeqRange { start: 1, end: 1 },
         vec![new_record(vec![7], 1_001)],
-        Compression::none(),
       ),
       (
         8,
         SeqRange { start: 1, end: 1 },
         vec![new_record(vec![8], 1_002)],
-        Compression::none(),
       ),
       (
         9,
         SeqRange { start: 1, end: 1 },
         vec![new_record(vec![9], 1_003)],
-        Compression::none(),
       ),
     ],
   )
@@ -1522,18 +1534,17 @@ async fn failed_slice_in_segment_read_does_not_advance_cursor() {
     "telemetry",
     900,
     1,
+    Compression::none(),
     vec![
       (
         7,
         SeqRange { start: 1, end: 1 },
         vec![new_record(vec![7], 1_001)],
-        Compression::none(),
       ),
       (
         7,
         SeqRange { start: 2, end: 2 },
         vec![new_record(vec![7], 1_002)],
-        Compression::none(),
       ),
     ],
   )

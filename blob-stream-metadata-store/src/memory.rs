@@ -2,13 +2,16 @@
 #[path = "./memory_test.rs"]
 mod tests;
 
+use crate::codec::EncodedSegmentMetadata;
 use crate::{MetadataStore, SegmentMetadata};
 use anyhow::Result;
 use async_trait::async_trait;
+use bd_log::warn_every;
 use blob_stream_types::{SnowflakeId, TopicWindowKey, format_unix_timestamp_ms};
 use log::trace;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use time::ext::NumericalDuration;
 
 //
 // InMemoryMetadataStore
@@ -16,7 +19,7 @@ use std::collections::HashMap;
 
 #[derive(Debug, Default)]
 pub struct InMemoryMetadataStore {
-  windows: RwLock<HashMap<String, Vec<SegmentMetadata>>>,
+  windows: RwLock<HashMap<String, Vec<EncodedSegmentMetadata>>>,
 }
 
 impl InMemoryMetadataStore {
@@ -40,9 +43,12 @@ impl MetadataStore for InMemoryMetadataStore {
       ),
       metadata.snowflake_id.as_u64()
     );
+    let encoded = crate::codec::encode(metadata)?;
     let mut guard = self.windows.write();
-    let key = metadata.partition_key();
-    guard.entry(key).or_default().push(metadata);
+    guard
+      .entry(encoded.partition_key.clone())
+      .or_default()
+      .push(encoded);
     Ok(())
   }
 
@@ -62,13 +68,27 @@ impl MetadataStore for InMemoryMetadataStore {
       return Ok(Vec::new());
     };
 
+    let min_sort_key = min_snowflake.map(SnowflakeId::format_lex);
     Ok(
       segments
         .iter()
         .filter(|segment| {
-          min_snowflake.is_none_or(|min_snowflake| segment.snowflake_id >= min_snowflake)
+          min_sort_key
+            .as_ref()
+            .is_none_or(|min_sort_key| segment.sort_key >= *min_sort_key)
         })
-        .cloned()
+        .filter_map(|segment| {
+          match crate::codec::decode(&segment.partition_key, &segment.sort_key, &segment.payload) {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+              warn_every!(
+                15.seconds(),
+                "metadata(memory) skipped noncompliant segment: {error}"
+              );
+              None
+            },
+          }
+        })
         .collect(),
     )
   }

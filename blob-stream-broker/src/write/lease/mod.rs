@@ -53,7 +53,7 @@ impl WriteEngineImpl {
     now_ts_ms: i64,
   ) -> Result<i64, WriteError> {
     let key = ProducerPartitionLeaseKey {
-      topic: topic.to_string(),
+      topic: topic.to_string().into(),
       virtual_partition_id,
     };
 
@@ -70,7 +70,7 @@ impl WriteEngineImpl {
     {
       LeaseAcquireOutcome::Acquired(lease) => Ok(lease.lease_expiration_ts_ms),
       LeaseAcquireOutcome::HeldByOther(_) => Err(WriteError::NotLeaseHolder {
-        topic: topic.to_string(),
+        topic: topic.to_string().into(),
         virtual_partition_id,
       }),
     }
@@ -84,7 +84,7 @@ impl WriteEngineImpl {
     reservation_size: u64,
   ) -> Result<SeqRange, WriteError> {
     let key = ProducerPartitionLeaseKey {
-      topic: topic.to_string(),
+      topic: topic.to_string().into(),
       virtual_partition_id,
     };
     let started = Instant::now();
@@ -105,7 +105,7 @@ impl WriteEngineImpl {
       },
       Ok(SequenceReservationOutcome::HeldByOther(_) | SequenceReservationOutcome::Expired) => {
         Err(WriteError::NotLeaseHolder {
-          topic: topic.to_string(),
+          topic: topic.to_string().into(),
           virtual_partition_id,
         })
       },
@@ -130,7 +130,7 @@ impl WriteEngineImpl {
     reservation_size: u64,
   ) -> Result<(i64, SeqRange), WriteError> {
     let key = ProducerPartitionLeaseKey {
-      topic: topic.to_string(),
+      topic: topic.to_string().into(),
       virtual_partition_id,
     };
     let outcome = acquire_lease_and_reserve_sequences(
@@ -172,7 +172,7 @@ impl WriteEngineImpl {
         Err(WriteError::Internal(anyhow!(error)))
       },
       Ok(LeaseAcquireAndReserveOutcome::HeldByOther(_)) => Err(WriteError::NotLeaseHolder {
-        topic: topic.to_string(),
+        topic: topic.to_string().into(),
         virtual_partition_id,
       }),
       Err(error) => {

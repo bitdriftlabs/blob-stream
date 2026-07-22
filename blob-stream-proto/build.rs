@@ -23,6 +23,7 @@ fn main() {
     .inputs([
       "proto/blobstream/v1/broker.proto",
       "proto/blobstream/v1/config.proto",
+      "proto/blobstream/v1/metadata.proto",
     ])
     .out_dir("src/protos/blobstream/v1")
     .capture_stderr()

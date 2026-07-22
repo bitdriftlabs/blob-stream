@@ -38,6 +38,7 @@ use blob_stream_metadata_store::{
 };
 use blob_stream_types::{CompressionCodec, SeqRange, SnowflakeId, Window, new_record};
 use bytes::Bytes;
+use protobuf::Chars;
 use serde_json::to_value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -423,9 +424,9 @@ fn make_two_partition_engine(
 ) -> Result<(Arc<WriteEngineImpl>, Arc<InMemoryMetadataStore>)> {
   let mut topics = HashMap::new();
   topics.insert(
-    "telemetry".to_string(),
+    "telemetry".into(),
     TopicInfo {
-      name: "telemetry".to_string(),
+      name: "telemetry".into(),
       partition_count: 2,
       num_writers: 1,
       retention_days: 7,
@@ -477,9 +478,9 @@ fn make_engine_with_lease_store_and_scope(
 )> {
   let mut topics = HashMap::new();
   topics.insert(
-    "telemetry".to_string(),
+    "telemetry".into(),
     TopicInfo {
-      name: "telemetry".to_string(),
+      name: "telemetry".into(),
       partition_count: 1,
       num_writers: 1,
       retention_days: 7,
@@ -553,7 +554,7 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   let pending_write = tokio::spawn(async move {
     pending_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![1, 2, 3], 10)],
       })
@@ -578,7 +579,7 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   assert_eq!(snapshot.topics.len(), 1);
 
   let topic = &snapshot.topics[0];
-  assert_eq!(topic.name, "telemetry");
+  assert_eq!(topic.name.as_str(), "telemetry");
   assert_eq!(topic.partition_count, 1);
   assert_eq!(topic.num_writers, 1);
   assert_eq!(topic.local_partitions.len(), 1);
@@ -608,6 +609,8 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   let state_dump = to_value(&snapshot)?;
   assert_eq!(state_dump["generated_at"], "2023-11-14T22:13:20Z");
   assert!(state_dump.get("generated_at_ts_ms").is_none());
+  assert_eq!(state_dump["topics"][0]["name"], "telemetry");
+  assert_eq!(state_dump["ownership"][0]["topic"], "telemetry");
   assert_eq!(
     state_dump["topics"][0]["local_partitions"][0]["lease_expires_at"],
     "2023-11-14T22:13:50Z"
@@ -633,7 +636,7 @@ async fn state_snapshot_reports_expired_observed_lease() -> Result<()> {
   let (engine, _metadata_store, lease_store) =
     make_engine_with_lease_store(time_provider, config, shutdown_trigger.make_handle())?;
   let key = ProducerPartitionLeaseKey {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 0,
   };
   lease_store
@@ -677,7 +680,7 @@ async fn successful_sequence_reservation_records_metrics() -> Result<()> {
   )?;
   engine
     .produce_batch(WriteRequest {
-      topic: "telemetry".to_string(),
+      topic: "telemetry".into(),
       virtual_partition_id: 0,
       records: vec![new_record(vec![1], 10)],
     })
@@ -713,7 +716,7 @@ async fn fenced_sequence_reservations_do_not_record_failure_metrics() -> Result<
   )?;
 
   let key = ProducerPartitionLeaseKey {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 0,
   };
   lease_store
@@ -721,7 +724,7 @@ async fn fenced_sequence_reservations_do_not_record_failure_metrics() -> Result<
     .await?;
   let error = engine
     .produce_batch(WriteRequest {
-      topic: "telemetry".to_string(),
+      topic: "telemetry".into(),
       virtual_partition_id: 0,
       records: vec![new_record(vec![1], 10)],
     })
@@ -759,7 +762,7 @@ async fn buffers_until_size_rollover() -> Result<()> {
   )?;
 
   let request = WriteRequest {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 0,
     records: vec![new_record(vec![1; 6], 10)],
   };
@@ -780,7 +783,7 @@ async fn buffers_until_size_rollover() -> Result<()> {
   assert!(segments.is_empty());
 
   let request = WriteRequest {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 0,
     records: vec![new_record(vec![2; 6], 20)],
   };
@@ -792,13 +795,12 @@ async fn buffers_until_size_rollover() -> Result<()> {
     .scan_window_from_snowflake(&window.key("telemetry"), None)
     .await?;
   assert_eq!(segments.len(), 1);
+  assert_eq!(segments[0].segment_index[&0].len(), 1);
   assert_eq!(
-    segments[0].segment_index[&0]
-      .iter()
-      .map(|batch| batch.summary.record_count)
-      .sum::<u32>(),
-    2
+    segments[0].segment_index[&0][0].seq_range,
+    SeqRange { start: 0, end: 1 }
   );
+  assert_eq!(segments[0].segment_index[&0][0].payload_bytes, 12);
   Ok(())
 }
 
@@ -821,9 +823,9 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
   let engine = Arc::new(WriteEngineImpl::new(
     config,
     HashMap::from([(
-      "telemetry".to_string(),
+      "telemetry".into(),
       TopicInfo {
-        name: "telemetry".to_string(),
+        name: "telemetry".into(),
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
@@ -846,7 +848,7 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
   let first = tokio::spawn(async move {
     first_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![1], 10)],
       })
@@ -858,7 +860,7 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
   let second = tokio::spawn(async move {
     second_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![2], 20)],
       })
@@ -898,9 +900,9 @@ async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
   let engine = Arc::new(WriteEngineImpl::new(
     config,
     HashMap::from([(
-      "telemetry".to_string(),
+      "telemetry".into(),
       TopicInfo {
-        name: "telemetry".to_string(),
+        name: "telemetry".into(),
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
@@ -923,7 +925,7 @@ async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
   let first = tokio::spawn(async move {
     first_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![1], 10)],
       })
@@ -947,7 +949,7 @@ async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
   let response = tokio::time::timeout(
     StdDuration::from_millis(100),
     engine.produce_batch(WriteRequest {
-      topic: "telemetry".to_string(),
+      topic: "telemetry".into(),
       virtual_partition_id: 0,
       records: vec![new_record(vec![2], 20)],
     }),
@@ -974,7 +976,7 @@ async fn flushes_on_time_rollover() -> Result<()> {
   )?;
 
   let request = WriteRequest {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 0,
     records: vec![new_record(vec![3; 4], 30)],
   };
@@ -1025,7 +1027,7 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
   let first = tokio::spawn(async move {
     first_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![1], 10)],
       })
@@ -1048,7 +1050,7 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
   let second = tokio::spawn(async move {
     second_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 1,
         records: vec![new_record(vec![2], 20)],
       })
@@ -1095,7 +1097,7 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
   let next_first = tokio::spawn(async move {
     next_first_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![3], 30)],
       })
@@ -1121,7 +1123,7 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
   let next_second = tokio::spawn(async move {
     next_second_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 1,
         records: vec![new_record(vec![4], 40)],
       })
@@ -1182,7 +1184,7 @@ async fn time_due_byte_flush_coalesces_buffered_topic_peers() -> Result<()> {
   let first = tokio::spawn(async move {
     first_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![1], 10)],
       })
@@ -1205,7 +1207,7 @@ async fn time_due_byte_flush_coalesces_buffered_topic_peers() -> Result<()> {
   let peer = tokio::spawn(async move {
     peer_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 1,
         records: vec![new_record(vec![2], 20)],
       })
@@ -1231,7 +1233,7 @@ async fn time_due_byte_flush_coalesces_buffered_topic_peers() -> Result<()> {
   let byte_due = tokio::spawn(async move {
     byte_due_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![3], 30)],
       })
@@ -1276,7 +1278,7 @@ async fn byte_flush_does_not_coalesce_buffered_topic_peers() -> Result<()> {
   let peer = tokio::spawn(async move {
     peer_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 1,
         records: vec![new_record(vec![1], 10)],
       })
@@ -1297,7 +1299,7 @@ async fn byte_flush_does_not_coalesce_buffered_topic_peers() -> Result<()> {
   time_provider.advance(TimeDuration::milliseconds(5));
   engine
     .produce_batch(WriteRequest {
-      topic: "telemetry".to_string(),
+      topic: "telemetry".into(),
       virtual_partition_id: 0,
       records: vec![new_record(vec![2; 2], 20)],
     })
@@ -1342,7 +1344,7 @@ async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> 
   )?;
   size_engine
     .produce_batch(WriteRequest {
-      topic: "telemetry".to_string(),
+      topic: "telemetry".into(),
       virtual_partition_id: 0,
       records: vec![new_record(vec![1; 16], 10)],
     })
@@ -1361,7 +1363,7 @@ async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> 
   let delayed_write = tokio::spawn(async move {
     delay_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![2; 16], 20)],
       })
@@ -1414,9 +1416,9 @@ async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
   let engine = Arc::new(WriteEngineImpl::new(
     config,
     HashMap::from([(
-      "telemetry".to_string(),
+      "telemetry".into(),
       TopicInfo {
-        name: "telemetry".to_string(),
+        name: "telemetry".into(),
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
@@ -1441,7 +1443,7 @@ async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
   let pending = tokio::spawn(async move {
     engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![1], 10)],
       })
@@ -1478,9 +1480,9 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
   let mut topics = HashMap::new();
   for topic in ["first", "second"] {
     topics.insert(
-      topic.to_string(),
+      topic.into(),
       TopicInfo {
-        name: topic.to_string(),
+        name: topic.into(),
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
@@ -1514,7 +1516,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
   let first = tokio::spawn(async move {
     first_engine
       .produce_batch(WriteRequest {
-        topic: "first".to_string(),
+        topic: "first".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![1], 10)],
       })
@@ -1532,7 +1534,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
   let second = tokio::spawn(async move {
     second_engine
       .produce_batch(WriteRequest {
-        topic: "second".to_string(),
+        topic: "second".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![2], 20)],
       })
@@ -1574,9 +1576,9 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
   let engine = Arc::new(WriteEngineImpl::new(
     config.clone(),
     HashMap::from([(
-      "telemetry".to_string(),
+      "telemetry".into(),
       TopicInfo {
-        name: "telemetry".to_string(),
+        name: "telemetry".into(),
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
@@ -1603,7 +1605,7 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
   let first = tokio::spawn(async move {
     first_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![1], 10)],
       })
@@ -1615,7 +1617,7 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
   let second = tokio::spawn(async move {
     second_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![2], 20)],
       })
@@ -1673,9 +1675,9 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   let engine = Arc::new(WriteEngineImpl::new(
     config,
     HashMap::from([(
-      "telemetry".to_string(),
+      "telemetry".into(),
       TopicInfo {
-        name: "telemetry".to_string(),
+        name: "telemetry".into(),
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
@@ -1701,7 +1703,7 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   let first = tokio::spawn(async move {
     first_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![1], 10)],
       })
@@ -1714,7 +1716,7 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   let buffered = tokio::spawn(async move {
     buffered_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![2], 20)],
       })
@@ -1731,7 +1733,7 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
 
   let second = engine
     .produce_batch(WriteRequest {
-      topic: "telemetry".to_string(),
+      topic: "telemetry".into(),
       virtual_partition_id: 0,
       records: vec![new_record(vec![3], 30)],
     })
@@ -1742,7 +1744,7 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   ));
 
   let key = ProducerPartitionLeaseKey {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 0,
   };
   let held_by_a = lease_store
@@ -1808,9 +1810,9 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
   let engine = Arc::new(WriteEngineImpl::new(
     config,
     HashMap::from([(
-      "telemetry".to_string(),
+      "telemetry".into(),
       TopicInfo {
-        name: "telemetry".to_string(),
+        name: "telemetry".into(),
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
@@ -1836,7 +1838,7 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
   let produce = tokio::spawn(async move {
     produce_engine
       .produce_batch(WriteRequest {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![1], 10)],
       })
@@ -1850,7 +1852,7 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
   wait_for_partition_draining_start(&engine).await;
 
   let key = ProducerPartitionLeaseKey {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 0,
   };
   let held_by_a = lease_store
@@ -1884,9 +1886,9 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
   let mut topics = HashMap::new();
   for topic in ["first", "second"] {
     topics.insert(
-      topic.to_string(),
+      topic.into(),
       TopicInfo {
-        name: topic.to_string(),
+        name: topic.into(),
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
@@ -1920,7 +1922,7 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
   let first = tokio::spawn(async move {
     first_engine
       .produce_batch(WriteRequest {
-        topic: "first".to_string(),
+        topic: "first".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![1], 10)],
       })
@@ -1930,7 +1932,7 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
   let second = tokio::spawn(async move {
     second_engine
       .produce_batch(WriteRequest {
-        topic: "second".to_string(),
+        topic: "second".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![2], 20)],
       })
@@ -1964,7 +1966,7 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
 
   let topics = (0 .. 5)
     .map(|index| {
-      let topic = format!("topic-{index}");
+      let topic: Chars = format!("topic-{index}").into();
       (
         topic.clone(),
         TopicInfo {
@@ -2003,7 +2005,7 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
     writes.push(tokio::spawn(async move {
       engine
         .produce_batch(WriteRequest {
-          topic: format!("topic-{index}"),
+          topic: format!("topic-{index}").into(),
           virtual_partition_id: 0,
           records: vec![new_record(vec![index], i64::from(index))],
         })
@@ -2068,9 +2070,9 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
   let mut topics = HashMap::new();
   for topic in ["first", "second"] {
     topics.insert(
-      topic.to_string(),
+      topic.into(),
       TopicInfo {
-        name: topic.to_string(),
+        name: topic.into(),
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
@@ -2101,7 +2103,7 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
   let first = tokio::spawn(async move {
     first_engine
       .produce_batch(WriteRequest {
-        topic: "first".to_string(),
+        topic: "first".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![1], 10)],
       })
@@ -2111,7 +2113,7 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
   let second = tokio::spawn(async move {
     second_engine
       .produce_batch(WriteRequest {
-        topic: "second".to_string(),
+        topic: "second".into(),
         virtual_partition_id: 0,
         records: vec![new_record(vec![2], 20)],
       })
@@ -2145,7 +2147,7 @@ async fn assigns_monotonic_sequences() -> Result<()> {
   )?;
 
   let request = WriteRequest {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 0,
     records: vec![new_record(vec![9; 2], 10), new_record(vec![9; 2], 11)],
   };
@@ -2154,7 +2156,7 @@ async fn assigns_monotonic_sequences() -> Result<()> {
   assert_eq!(response.seq_range, SeqRange { start: 0, end: 1 });
 
   let request = WriteRequest {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 0,
     records: vec![new_record(vec![10; 3], 12)],
   };
@@ -2180,7 +2182,7 @@ async fn writes_compressed_metadata() -> Result<()> {
   )?;
 
   let request = WriteRequest {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 0,
     records: vec![new_record(vec![7; 6], 10)],
   };
@@ -2196,8 +2198,7 @@ async fn writes_compressed_metadata() -> Result<()> {
     .await?;
   assert_eq!(segments.len(), 1);
 
-  let batch_metadata = segments[0].segment_index.get(&0).unwrap().first().unwrap();
-  assert_eq!(batch_metadata.compression.codec, CompressionCodec::Zstd);
+  assert_eq!(segments[0].compression.codec, CompressionCodec::Zstd);
   Ok(())
 }
 
@@ -2225,9 +2226,9 @@ async fn returns_error_when_flush_fails() -> Result<()> {
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut topics = HashMap::new();
   topics.insert(
-    "telemetry".to_string(),
+    "telemetry".into(),
     TopicInfo {
-      name: "telemetry".to_string(),
+      name: "telemetry".into(),
       partition_count: 1,
       num_writers: 1,
       retention_days: 7,
@@ -2255,7 +2256,7 @@ async fn returns_error_when_flush_fails() -> Result<()> {
   )?;
 
   let request = WriteRequest {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 0,
     records: vec![new_record(vec![1, 2, 3], 10)],
   };

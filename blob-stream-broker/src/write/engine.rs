@@ -63,12 +63,12 @@ impl WriteEngine for WriteEngineImpl {
 
     let topic_info = self
       .topics
-      .get(&request.topic)
+      .get(request.topic.as_str())
       .ok_or_else(|| WriteError::UnknownTopic(request.topic.clone()))?;
 
     if !topic_info.is_valid_partition(request.virtual_partition_id) {
       return Err(WriteError::InvalidPartition {
-        topic: request.topic,
+        topic: request.topic.clone(),
         virtual_partition_id: request.virtual_partition_id,
       });
     }
@@ -98,10 +98,10 @@ impl WriteEngine for WriteEngineImpl {
       let now_ts_ms = self.time_provider.now().unix_timestamp_ms();
       let buffered = {
         let mut state = self.state.lock();
-        let partition_state = state.partition_state_mut(&topic, virtual_partition_id);
+        let partition_state = state.partition_state_mut(topic.as_str(), virtual_partition_id);
         if partition_state.draining {
           return Err(WriteError::NotLeaseHolder {
-            topic,
+            topic: topic.clone(),
             virtual_partition_id,
           });
         }
@@ -146,7 +146,7 @@ impl WriteEngine for WriteEngineImpl {
 
       let decision = begin_allocation_transition(
         &self.state,
-        &topic,
+        topic.as_str(),
         virtual_partition_id,
         record_count,
         now_ts_ms,
@@ -156,7 +156,7 @@ impl WriteEngine for WriteEngineImpl {
       match decision {
         AllocationTransitionDecision::Draining => {
           return Err(WriteError::NotLeaseHolder {
-            topic,
+            topic: topic.clone(),
             virtual_partition_id,
           });
         },
@@ -322,7 +322,7 @@ impl WriteEngine for WriteEngineImpl {
       .values()
       .map(|topic| {
         let mut local_partitions = local_partitions_by_topic
-          .remove(&topic.name)
+          .remove(topic.name.as_str())
           .unwrap_or_default();
         local_partitions.sort_by_key(|partition| partition.virtual_partition_id);
         BrokerTopicStateSnapshot {

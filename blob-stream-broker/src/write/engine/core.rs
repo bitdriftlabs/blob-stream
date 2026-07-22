@@ -13,6 +13,7 @@ use blob_stream_metadata_store::{MetadataStore, ProducerPartitionLeaseStore};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use parking_lot::Mutex;
+use protobuf::Chars;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -25,7 +26,7 @@ use tokio::sync::{Notify, watch};
 pub struct WriteEngineImpl {
   pub(in crate::write) config: WriteConfig,
   pub(in crate::write) admission: Arc<dyn AdmissionController>,
-  pub(in crate::write) topics: HashMap<String, TopicInfo>,
+  pub(in crate::write) topics: HashMap<Chars, TopicInfo>,
   pub(in crate::write) flush_context: FlushContext,
   pub(in crate::write) lease_store: Arc<dyn ProducerPartitionLeaseStore>,
   pub(in crate::write) holder_id: String,
@@ -39,7 +40,7 @@ pub struct WriteEngineImpl {
 impl WriteEngineImpl {
   pub fn new(
     config: WriteConfig,
-    topics: HashMap<String, TopicInfo>,
+    topics: HashMap<Chars, TopicInfo>,
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
     lease_store: Arc<dyn ProducerPartitionLeaseStore>,

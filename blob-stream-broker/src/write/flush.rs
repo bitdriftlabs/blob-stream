@@ -8,8 +8,10 @@ use blob_stream_metadata_store::MetadataStore;
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
   BatchMetadata,
+  BatchSummary,
   CompressionCodec,
   Record,
+  SeqRange,
   SnowflakeId,
   TopicWindowKey,
   VirtualPartitionId,
@@ -73,6 +75,7 @@ struct SegmentEnvelope {
   window: TopicWindowKey,
   snowflake_id: SnowflakeId,
   blob_key: BlobKey,
+  compression: blob_stream_types::Compression,
   segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
   record_count: u64,
   created_ts_ms: i64,
@@ -87,6 +90,7 @@ impl SegmentEnvelope {
       self.window,
       self.snowflake_id,
       self.blob_key,
+      self.compression,
       self.segment_index,
       self.created_ts_ms,
       metadata_published_ts_ms,
@@ -150,21 +154,21 @@ impl FlushContext {
     BlobKey::new(key)
   }
 
-  fn encode_batch(
-    virtual_partition_id: VirtualPartitionId,
-    records: Vec<Record>,
-  ) -> Result<Vec<u8>> {
+  fn encode_batch(virtual_partition_id: VirtualPartitionId, records: Vec<Record>) -> Result<Bytes> {
     let proto_batch = StoredRecordBatch {
       virtual_partition_id,
       records,
       ..Default::default()
     };
-    proto_batch.write_to_bytes().context("encode record batch")
+    proto_batch
+      .write_to_bytes()
+      .map(Bytes::from)
+      .context("encode record batch")
   }
 
-  fn compress_batch(&self, payload: &[u8]) -> Result<Bytes> {
+  fn compress_batch(&self, payload: Bytes) -> Result<Bytes> {
     match self.config.compression.codec {
-      CompressionCodec::None => Ok(Bytes::copy_from_slice(payload)),
+      CompressionCodec::None => Ok(payload),
       CompressionCodec::Zstd => {
         let level = self.config.compression.level.unwrap_or(DEFAULT_ZSTD_LEVEL);
         let compressed =
@@ -172,6 +176,57 @@ impl FlushContext {
         Ok(Bytes::from(compressed))
       },
     }
+  }
+
+  fn merge_partition_batches(
+    partition: FlushPartition,
+  ) -> Result<(VirtualPartitionId, Vec<Record>, BatchSummary, SeqRange)> {
+    let virtual_partition_id = partition.virtual_partition_id;
+    let record_capacity = partition
+      .batches
+      .iter()
+      .map(|batch| batch.records.len())
+      .sum::<usize>();
+    let mut batches = partition.batches.into_iter();
+    let Some(first_batch) = batches.next() else {
+      return Err(anyhow::anyhow!(
+        "flush partition {virtual_partition_id} has no buffered batches"
+      ));
+    };
+    let BufferedBatch {
+      mut records,
+      mut summary,
+      mut seq_range,
+      ..
+    } = first_batch;
+    records.reserve(record_capacity.saturating_sub(records.len()));
+
+    // Broker allocation is consecutive within a partition. Rejecting a gap prevents metadata from
+    // advertising a sequence span that was never persisted.
+    for batch in batches {
+      let expected_start = seq_range
+        .end
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("sequence range ends at u64::MAX"))?;
+      anyhow::ensure!(
+        batch.seq_range.start == expected_start,
+        "flush partition {virtual_partition_id} has noncontiguous ranges: expected start \
+         {expected_start}, found {}",
+        batch.seq_range.start
+      );
+      seq_range.end = batch.seq_range.end;
+      summary.record_count = summary
+        .record_count
+        .checked_add(batch.summary.record_count)
+        .ok_or_else(|| anyhow::anyhow!("merged record count exceeds u32"))?;
+      summary.payload_bytes = summary
+        .payload_bytes
+        .checked_add(batch.summary.payload_bytes)
+        .ok_or_else(|| anyhow::anyhow!("merged payload bytes exceed u64"))?;
+      records.extend(batch.records);
+    }
+
+    Ok((virtual_partition_id, records, summary, seq_range))
   }
 
   fn build_segment(
@@ -197,39 +252,29 @@ impl FlushContext {
         partition.virtual_partition_id,
         partition.batches.len()
       );
-      for batch in partition.batches {
-        let BufferedBatch {
-          records,
-          summary,
-          seq_range,
-          ..
-        } = batch;
-        let encoded = Self::encode_batch(partition.virtual_partition_id, records)?;
-        let compressed = self.compress_batch(&encoded)?;
-        let start = payload.len() as u64;
-        payload.extend_from_slice(&compressed);
-        let end = payload.len() as u64;
+      let (virtual_partition_id, records, summary, seq_range) =
+        Self::merge_partition_batches(partition)?;
+      let encoded = Self::encode_batch(virtual_partition_id, records)?;
+      let compressed = self.compress_batch(encoded)?;
+      let start = payload.len() as u64;
+      payload.extend_from_slice(&compressed);
+      let end = payload.len() as u64;
 
-        record_count = record_count.saturating_add(u64::from(summary.record_count));
+      record_count = record_count.saturating_add(u64::from(summary.record_count));
+      let metadata = BatchMetadata {
+        seq_range,
+        byte_range: blob_stream_types::ByteRange { start, end },
+        payload_bytes: summary.payload_bytes,
+      };
 
-        let metadata = BatchMetadata {
-          seq_range,
-          byte_range: blob_stream_types::ByteRange { start, end },
-          summary,
-          compression: compression.clone(),
-        };
-
-        segment_index
-          .entry(partition.virtual_partition_id)
-          .or_default()
-          .push(metadata);
-      }
+      segment_index.insert(virtual_partition_id, vec![metadata]);
     }
 
     let envelope = SegmentEnvelope {
       window: window.key(topic),
       snowflake_id,
       blob_key,
+      compression,
       segment_index,
       record_count,
       created_ts_ms: now_ts_ms,
@@ -254,7 +299,7 @@ impl FlushContext {
   ) -> Result<(), WriteError> {
     let publication_started_at = Instant::now();
     let partitions = std::mem::take(&mut plan.partitions);
-    let (payload, envelope) = self.build_segment(&plan.topic, partitions, now)?;
+    let (payload, envelope) = self.build_segment(plan.topic.as_str(), partitions, now)?;
     let payload_bytes = payload.len();
     let record_count = envelope.record_count;
     let partition_count = envelope.segment_index.len();

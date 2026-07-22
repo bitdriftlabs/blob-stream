@@ -10,14 +10,17 @@ use blob_stream_blob_store::BlobKey;
 use blob_stream_types::{
   BatchMetadata,
   CommittedCursor,
+  Compression,
   SeqRange,
   SnowflakeId,
   TopicWindowKey,
   VirtualPartitionId,
 };
+use protobuf::Chars;
 use std::collections::HashMap;
 
 mod aws;
+mod codec;
 mod consumer_group_leases_dynamo;
 mod consumer_group_leases_memory;
 mod consumer_group_membership_dynamo;
@@ -52,6 +55,8 @@ pub struct SegmentMetadata {
   pub snowflake_id: SnowflakeId,
   /// Blob key containing this segment.
   pub blob_key: BlobKey,
+  /// Compression settings shared by every batch in the segment.
+  pub compression: Compression,
   /// Per-partition batch index for byte-range and sequence lookups.
   pub segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
   /// Creation timestamp in milliseconds.
@@ -67,6 +72,7 @@ impl SegmentMetadata {
     window: TopicWindowKey,
     snowflake_id: SnowflakeId,
     blob_key: BlobKey,
+    compression: Compression,
     segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
     created_ts_ms: i64,
     metadata_published_ts_ms: i64,
@@ -75,6 +81,7 @@ impl SegmentMetadata {
       window,
       snowflake_id,
       blob_key,
+      compression,
       segment_index,
       created_ts_ms,
       metadata_published_ts_ms,
@@ -122,7 +129,7 @@ pub trait MetadataStore: Send + Sync {
 /// Producer lease key scoped by topic and virtual partition.
 pub struct ProducerPartitionLeaseKey {
   /// Topic name.
-  pub topic: String,
+  pub topic: Chars,
   /// Virtual partition id.
   pub virtual_partition_id: VirtualPartitionId,
 }

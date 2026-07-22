@@ -20,6 +20,7 @@ use blob_stream_metadata_store::{
   SequenceReservationOutcome,
 };
 use blob_stream_types::{VirtualPartitionId, virtual_partition_for_logical};
+use protobuf::Chars;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -133,9 +134,9 @@ fn metrics_scope() -> bd_server_stats::stats::Scope {
 fn ownership_changes_with_membership() {
   let mut topics = HashMap::new();
   topics.insert(
-    "telemetry".to_string(),
+    "telemetry".into(),
     TopicInfo {
-      name: "telemetry".to_string(),
+      name: "telemetry".into(),
       partition_count: 8,
       num_writers: 1,
       retention_days: 7,
@@ -193,9 +194,9 @@ fn ownership_changes_with_membership() {
 fn ownership_includes_only_local_producer_writer_virtual_partitions() {
   let mut topics = HashMap::new();
   topics.insert(
-    "telemetry".to_string(),
+    "telemetry".into(),
     TopicInfo {
-      name: "telemetry".to_string(),
+      name: "telemetry".into(),
       partition_count: 2,
       num_writers: 2,
       retention_days: 7,
@@ -225,16 +226,16 @@ fn ownership_includes_only_local_producer_writer_virtual_partitions() {
   assert!(owned_a.is_disjoint(&owned_b));
   assert_eq!(
     owned_a.union(&owned_b).cloned().collect::<HashSet<_>>(),
-    HashSet::from([("telemetry".to_string(), 2), ("telemetry".to_string(), 3)])
+    HashSet::from([("telemetry".into(), 2), ("telemetry".into(), 3)])
   );
 }
 
-fn make_topic(partition_count: u32) -> HashMap<String, TopicInfo> {
+fn make_topic(partition_count: u32) -> HashMap<Chars, TopicInfo> {
   let mut topics = HashMap::new();
   topics.insert(
-    "telemetry".to_string(),
+    "telemetry".into(),
     TopicInfo {
-      name: "telemetry".to_string(),
+      name: "telemetry".into(),
       partition_count,
       num_writers: 1,
       retention_days: 7,
@@ -253,7 +254,7 @@ async fn acquire_all_partitions(
     let virtual_partition_id =
       virtual_partition_for_logical(logical_partition_id, partition_count, 0);
     let key = ProducerPartitionLeaseKey {
-      topic: "telemetry".to_string(),
+      topic: "telemetry".into(),
       virtual_partition_id,
     };
     let _outcome = store
@@ -272,7 +273,7 @@ async fn all_partitions_acquired(
     let virtual_partition_id =
       virtual_partition_for_logical(logical_partition_id, partition_count, 0);
     let key = ProducerPartitionLeaseKey {
-      topic: "telemetry".to_string(),
+      topic: "telemetry".into(),
       virtual_partition_id,
     };
     let outcome = store
@@ -297,7 +298,7 @@ async fn all_partitions_held_by(
     let virtual_partition_id =
       virtual_partition_for_logical(logical_partition_id, partition_count, 0);
     let key = ProducerPartitionLeaseKey {
-      topic: "telemetry".to_string(),
+      topic: "telemetry".into(),
       virtual_partition_id,
     };
     let Ok(Some(lease)) = store.get_lease(&key).await else {
@@ -320,7 +321,7 @@ async fn all_partitions_expired(
     let virtual_partition_id =
       virtual_partition_for_logical(logical_partition_id, partition_count, 0);
     let key = ProducerPartitionLeaseKey {
-      topic: "telemetry".to_string(),
+      topic: "telemetry".into(),
       virtual_partition_id,
     };
     let Ok(Some(lease)) = store.get_lease(&key).await else {
@@ -354,7 +355,7 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
     &flush_notifier,
     &metrics,
     "node-a",
-    vec![("telemetry".to_string(), 0), ("telemetry".to_string(), 1)],
+    vec![("telemetry".into(), 0), ("telemetry".into(), 1)],
     1_000,
   );
   tokio::pin!(releases);

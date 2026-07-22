@@ -1,14 +1,15 @@
 use crate::{InMemoryMetadataStore, MetadataStore, SegmentMetadata};
 use blob_stream_blob_store::BlobKey;
+use blob_stream_proto::protos::blobstream::v1::metadata::SegmentMetadataV1;
 use blob_stream_types::{
   BatchMetadata,
-  BatchSummary,
   Compression,
   SeqRange,
   SnowflakeId,
   TopicWindowKey,
   VirtualPartitionId,
 };
+use protobuf::Message;
 use std::collections::HashMap;
 
 fn build_segment(
@@ -20,13 +21,7 @@ fn build_segment(
   let batch = BatchMetadata {
     seq_range: SeqRange { start: 10, end: 19 },
     byte_range: blob_stream_types::ByteRange { start: 0, end: 512 },
-    summary: BatchSummary {
-      record_count: 10,
-      payload_bytes: 512,
-      min_event_ts_ms: 1000,
-      max_event_ts_ms: 2000,
-    },
-    compression: Compression::none(),
+    payload_bytes: 512,
   };
   segment_index.insert(0 as VirtualPartitionId, vec![batch]);
 
@@ -37,6 +32,7 @@ fn build_segment(
     },
     SnowflakeId(snowflake_id),
     BlobKey::from("topic/1/segment"),
+    Compression::none(),
     segment_index,
     3000,
     3000,
@@ -96,4 +92,53 @@ async fn scans_window_from_inclusive_snowflake() {
     .expect("scan bounded window");
 
   assert_eq!(segments, vec![second]);
+}
+
+#[tokio::test]
+async fn skips_noncompliant_segment_rows() {
+  let store = InMemoryMetadataStore::new();
+  let valid = build_segment("topic-a", 100, 2);
+  store
+    .write_segment(valid.clone())
+    .await
+    .expect("write valid segment");
+  store
+    .windows
+    .write()
+    .entry(valid.partition_key())
+    .or_default()
+    .push(super::EncodedSegmentMetadata {
+      partition_key: valid.partition_key(),
+      sort_key: SnowflakeId(1).format_lex(),
+      payload: vec![0xff].into(),
+    });
+  let encoded = crate::codec::encode(valid.clone()).expect("encode valid metadata");
+  let mut invalid_metadata =
+    SegmentMetadataV1::parse_from_tokio_bytes(&encoded.payload).expect("parse valid metadata");
+  invalid_metadata.partitions[0].batches[0].byte_end = 0;
+  store
+    .windows
+    .write()
+    .entry(valid.partition_key())
+    .or_default()
+    .push(super::EncodedSegmentMetadata {
+      partition_key: valid.partition_key(),
+      sort_key: SnowflakeId(3).format_lex(),
+      payload: invalid_metadata
+        .write_to_bytes()
+        .expect("encode invalid metadata")
+        .into(),
+    });
+
+  let window = TopicWindowKey {
+    topic: "topic-a".to_string(),
+    window_start_unix_seconds: 100,
+  };
+  assert_eq!(
+    store
+      .scan_window_from_snowflake(&window, None)
+      .await
+      .expect("scan window"),
+    vec![valid]
+  );
 }

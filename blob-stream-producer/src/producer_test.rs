@@ -29,6 +29,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceStatus,
 };
 use blob_stream_types::VirtualPartitionId;
+use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +38,21 @@ use tokio::time::{Instant, timeout};
 
 struct TestBrokerDiscovery {
   membership_rx: watch::Receiver<BrokerMembership>,
+}
+
+#[test]
+fn producer_record_retains_payload_allocation() {
+  let payload = vec![1, 2, 3];
+  let payload_pointer = payload.as_ptr();
+  let record = ProducerRecord::new("telemetry", Vec::new(), payload, 100);
+
+  assert_eq!(record.payload.as_ptr(), payload_pointer);
+
+  let payload = Bytes::from_static(b"payload");
+  let payload_pointer = payload.as_ptr();
+  let record = ProducerRecord::new("telemetry", Vec::new(), payload, 100);
+
+  assert_eq!(record.payload.as_ptr(), payload_pointer);
 }
 
 impl TestBrokerDiscovery {
@@ -353,7 +369,7 @@ async fn diagnostics_report_buffered_partition_state() {
     ]
   );
   assert_eq!(snapshot.topics.len(), 1);
-  assert_eq!(snapshot.topics[0].name, "telemetry");
+  assert_eq!(snapshot.topics[0].name.as_str(), "telemetry");
   assert_eq!(snapshot.route_map.len(), 16);
   let writer_one_partition = snapshot
     .route_map
@@ -415,7 +431,7 @@ async fn routes_to_expected_broker() {
   );
   let expected_owner = expected_assignment
     .get(&BrokerPartition {
-      topic: "telemetry".to_string(),
+      topic: "telemetry".into(),
       virtual_partition_id: expected_partition,
     })
     .unwrap();
@@ -515,7 +531,7 @@ async fn not_lease_holder_waits_longer_when_membership_is_unchanged() {
   let membership = watch::channel(membership()).1;
   let topics = HashMap::from([("telemetry".to_string(), topic_config())]);
   let batch = super::BufferedBatch {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 16,
     records: Vec::new(),
     waiters: Vec::new(),
@@ -1190,7 +1206,7 @@ async fn retry_deadline_clips_the_retry_delay() {
   let membership = watch::channel(membership()).1;
   let topics = HashMap::from([("telemetry".to_string(), topic_config())]);
   let batch = super::BufferedBatch {
-    topic: "telemetry".to_string(),
+    topic: "telemetry".into(),
     virtual_partition_id: 16,
     records: Vec::new(),
     waiters: Vec::new(),
