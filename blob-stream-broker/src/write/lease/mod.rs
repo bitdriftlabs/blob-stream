@@ -1,6 +1,7 @@
 use super::metrics::WriteMetrics;
 use super::{WriteEngineImpl, WriteError};
 use anyhow::{Context, Result, anyhow};
+use bd_log::warn_every;
 use blob_stream_metadata_store::{
   LeaseAcquireAndReserveOutcome,
   LeaseAcquireOutcome,
@@ -12,6 +13,7 @@ use blob_stream_types::{SeqRange, VirtualPartitionId};
 use log::debug;
 use std::sync::Arc;
 use std::time::Instant;
+use time::ext::NumericalDuration;
 
 mod assignment;
 
@@ -102,7 +104,6 @@ impl WriteEngineImpl {
         Ok(reservation.range)
       },
       Ok(SequenceReservationOutcome::HeldByOther(_) | SequenceReservationOutcome::Expired) => {
-        self.metrics.sequence_reservation_failures_total.inc();
         Err(WriteError::NotLeaseHolder {
           topic: topic.to_string(),
           virtual_partition_id,
@@ -110,6 +111,12 @@ impl WriteEngineImpl {
       },
       Err(error) => {
         self.metrics.sequence_reservation_failures_total.inc();
+        warn_every!(
+          15.seconds(),
+          "broker sequence reservation failed: operation=reserve, topic={topic}, \
+           virtual_partition_id={virtual_partition_id}, requested_size={reservation_size}, \
+           error={error}"
+        );
         Err(error.into())
       },
     }
@@ -155,19 +162,27 @@ impl WriteEngineImpl {
         reservation: None, ..
       }) => {
         self.metrics.sequence_reservation_failures_total.inc();
-        Err(WriteError::Internal(anyhow!(
-          "lease store acquired lease without requested sequence reservation"
-        )))
+        let error = "lease store acquired lease without requested sequence reservation";
+        warn_every!(
+          15.seconds(),
+          "broker sequence reservation failed: operation=acquire_and_reserve, topic={topic}, \
+           virtual_partition_id={virtual_partition_id}, requested_size={reservation_size}, \
+           error={error}"
+        );
+        Err(WriteError::Internal(anyhow!(error)))
       },
-      Ok(LeaseAcquireAndReserveOutcome::HeldByOther(_)) => {
-        self.metrics.sequence_reservation_failures_total.inc();
-        Err(WriteError::NotLeaseHolder {
-          topic: topic.to_string(),
-          virtual_partition_id,
-        })
-      },
+      Ok(LeaseAcquireAndReserveOutcome::HeldByOther(_)) => Err(WriteError::NotLeaseHolder {
+        topic: topic.to_string(),
+        virtual_partition_id,
+      }),
       Err(error) => {
         self.metrics.sequence_reservation_failures_total.inc();
+        warn_every!(
+          15.seconds(),
+          "broker sequence reservation failed: operation=acquire_and_reserve, topic={topic}, \
+           virtual_partition_id={virtual_partition_id}, requested_size={reservation_size}, \
+           error={error}"
+        );
         Err(error.into())
       },
     }

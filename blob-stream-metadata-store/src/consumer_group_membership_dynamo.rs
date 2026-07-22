@@ -21,8 +21,13 @@ use aws_sdk_dynamodb::types::{
   TransactWriteItem,
   Update,
 };
+use bd_backoff::{ExponentialBackoffBuilder, Finite, FiniteBackoff as _, SystemClock};
 use log::trace;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::time::Duration;
+use time::Duration as TimeDuration;
+use tokio::time::sleep;
 
 const ATTR_PK: &str = "pk";
 const ATTR_SK: &str = "sk";
@@ -45,6 +50,68 @@ const RECORD_TYPE_PLANNER_LEASE: &str = "assignment_planner_lease";
 const ASSIGNMENT_CONTROL_PARTITION_PREFIX: &str = "__blob_stream_assignment_control_v1__";
 const ASSIGNMENT_PLAN_SORT_KEY: &str = "__blob_stream_assignment_plan_v1__";
 const PLANNER_LEASE_SORT_KEY: &str = "__blob_stream_assignment_planner_v1__";
+const PLANNER_TRANSACTION_CONFLICT_RETRY_BUDGET: Duration = Duration::from_millis(175);
+const PLANNER_TRANSACTION_CONFLICT_INITIAL_DELAY: Duration = Duration::from_millis(25);
+const PLANNER_TRANSACTION_CONFLICT_MAX_DELAY: Duration = Duration::from_millis(100);
+
+//
+// retry_planner_transaction_conflicts
+//
+
+/// Retry only short-lived conflicts on the planner item.
+///
+/// `DynamoDB`'s standard SDK retry classifier does not retry `TransactionConflictException`.
+/// Assignment-plan publication condition-checks the planner item transactionally, so concurrent
+/// planner acquisition or release can receive that transient error even though its condition is
+/// valid. The bounded waits keep the normal lease-fencing behavior intact while letting the
+/// transaction finish.
+async fn retry_planner_transaction_conflicts<T, E, F, Fut, IsConflict>(
+  operation_name: &str,
+  mut operation: F,
+  is_transaction_conflict: IsConflict,
+) -> Result<T, E>
+where
+  F: FnMut() -> Fut,
+  Fut: Future<Output = Result<T, E>>,
+  IsConflict: Fn(&E) -> bool,
+{
+  let mut backoff = ExponentialBackoffBuilder::<SystemClock, Finite>::new()
+    .with_max_elapsed_time(
+      TimeDuration::try_from(PLANNER_TRANSACTION_CONFLICT_RETRY_BUDGET)
+        .unwrap_or(TimeDuration::MAX),
+    )
+    .with_initial_interval(
+      TimeDuration::try_from(PLANNER_TRANSACTION_CONFLICT_INITIAL_DELAY)
+        .unwrap_or(TimeDuration::MAX),
+    )
+    .with_multiplier(2.0)
+    .with_max_interval(
+      TimeDuration::try_from(PLANNER_TRANSACTION_CONFLICT_MAX_DELAY).unwrap_or(TimeDuration::MAX),
+    )
+    .build();
+  let mut retry = 0;
+
+  loop {
+    match operation().await {
+      Ok(value) => return Ok(value),
+      Err(error) if is_transaction_conflict(&error) => match backoff.next_backoff() {
+        Some(delay) => {
+          retry += 1;
+          trace!(
+            "consumer planner operation retrying transaction conflict: operation={}, retry={}, \
+             delay_ms={}",
+            operation_name,
+            retry,
+            delay.whole_milliseconds()
+          );
+          sleep(delay.unsigned_abs()).await;
+        },
+        None => return Err(error),
+      },
+      Err(error) => return Err(error),
+    }
+  }
+}
 
 //
 // DynamoConsumerGroupMembershipStore
@@ -517,28 +584,38 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       AttributeValue::S(RECORD_TYPE_PLANNER_LEASE.to_string()),
     );
 
-    let response = self
-      .client
-      .update_item()
-      .table_name(&self.table_name)
-      .key(
-        ATTR_PK,
-        AttributeValue::S(Self::control_pk(topic, group_id)),
-      )
-      .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
-      .update_expression(format!(
-        "SET {ATTR_RECORD_TYPE} = :planner_type, {ATTR_OWNER} = :owner, {ATTR_PLANNER_SESSION} = \
-         :session, {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = \
-         :ttl"
-      ))
-      .condition_expression(format!(
-        "attribute_not_exists({ATTR_PK}) OR {ATTR_LEASE_EXPIRES} <= :now OR ({ATTR_OWNER} = \
-         :owner AND {ATTR_PLANNER_SESSION} = :session)"
-      ))
-      .set_expression_attribute_values(Some(values))
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await;
+    let control_pk = Self::control_pk(topic, group_id);
+    let response = retry_planner_transaction_conflicts(
+      "acquire_or_renew",
+      || {
+        self
+          .client
+          .update_item()
+          .table_name(&self.table_name)
+          .key(ATTR_PK, AttributeValue::S(control_pk.clone()))
+          .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
+          .update_expression(format!(
+            "SET {ATTR_RECORD_TYPE} = :planner_type, {ATTR_OWNER} = :owner, \
+             {ATTR_PLANNER_SESSION} = :session, {ATTR_LEASE_EXPIRES} = :expires, \
+             {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl"
+          ))
+          .condition_expression(format!(
+            "attribute_not_exists({ATTR_PK}) OR {ATTR_LEASE_EXPIRES} <= :now OR ({ATTR_OWNER} = \
+             :owner AND {ATTR_PLANNER_SESSION} = :session)"
+          ))
+          .set_expression_attribute_values(Some(values.clone()))
+          .return_consumed_capacity(ReturnConsumedCapacity::Total)
+          .send()
+      },
+      |error| {
+        matches!(
+          error,
+          SdkError::ServiceError(service_error)
+            if service_error.err().is_transaction_conflict_exception()
+        )
+      },
+    )
+    .await;
 
     match response {
       Ok(output) => {
@@ -570,22 +647,32 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       ":session".to_string(),
       AttributeValue::S(planner_session_id.to_string()),
     );
-    let response = self
-      .client
-      .delete_item()
-      .table_name(&self.table_name)
-      .key(
-        ATTR_PK,
-        AttributeValue::S(Self::control_pk(topic, group_id)),
-      )
-      .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
-      .condition_expression(format!(
-        "{ATTR_OWNER} = :owner AND {ATTR_PLANNER_SESSION} = :session"
-      ))
-      .set_expression_attribute_values(Some(values))
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await;
+    let control_pk = Self::control_pk(topic, group_id);
+    let response = retry_planner_transaction_conflicts(
+      "release",
+      || {
+        self
+          .client
+          .delete_item()
+          .table_name(&self.table_name)
+          .key(ATTR_PK, AttributeValue::S(control_pk.clone()))
+          .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
+          .condition_expression(format!(
+            "{ATTR_OWNER} = :owner AND {ATTR_PLANNER_SESSION} = :session"
+          ))
+          .set_expression_attribute_values(Some(values.clone()))
+          .return_consumed_capacity(ReturnConsumedCapacity::Total)
+          .send()
+      },
+      |error| {
+        matches!(
+          error,
+          SdkError::ServiceError(service_error)
+            if service_error.err().is_transaction_conflict_exception()
+        )
+      },
+    )
+    .await;
 
     match response {
       Ok(output) => {

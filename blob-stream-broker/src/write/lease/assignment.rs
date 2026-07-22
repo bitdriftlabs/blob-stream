@@ -263,9 +263,6 @@ impl WriteEngineImpl {
               }
             },
             Ok(LeaseAcquireAndReserveOutcome::HeldByOther(_)) => {
-              if reservation_request.is_some() {
-                metrics.sequence_reservation_failures_total.inc();
-              }
               transition
                 .transition
                 .finish(LeaseExpirationUpdate::Set(None), None);
@@ -276,7 +273,9 @@ impl WriteEngineImpl {
               }
               warn_every!(
                 15.seconds(),
-                "lease self-assignment acquire/reserve failed: {error}"
+                "lease self-assignment acquire/reserve failed: topic={topic}, \
+                 virtual_partition_id={virtual_partition_id}, requested_size={:?}, error={error}",
+                reservation_request.map(|request| request.size),
               );
               transition
                 .transition

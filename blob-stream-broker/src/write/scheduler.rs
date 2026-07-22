@@ -1,10 +1,11 @@
 use super::buffer::{FlushPartition, FlushPlan, FlushTrigger};
 use super::flush::FlushContext;
 use super::metrics::WriteMetrics;
-use super::state::WriteState;
+use super::state::{PartitionState, WriteState};
 use super::{TopicInfo, WriteConfig};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::iter;
 use std::sync::Arc;
 use std::time::Instant;
 use time::OffsetDateTime;
@@ -71,6 +72,64 @@ fn mark_flush_complete(
   }
 }
 
+fn take_flush_partition(
+  partition_state: &mut PartitionState,
+  virtual_partition_id: blob_stream_types::VirtualPartitionId,
+  trigger: FlushTrigger,
+) -> Option<FlushPartition> {
+  let batches = std::mem::take(&mut partition_state.buffer.batches);
+  if batches.is_empty() {
+    partition_state.buffer.reset();
+    return None;
+  }
+
+  partition_state.buffer.reset();
+  partition_state.flush_in_flight = true;
+  Some(FlushPartition {
+    virtual_partition_id,
+    batches,
+    trigger,
+  })
+}
+
+fn flush_trigger(
+  partition_state: &PartitionState,
+  now_ts_ms: i64,
+  config: &WriteConfig,
+) -> Option<FlushTrigger> {
+  if partition_state.flush_in_flight {
+    return None;
+  }
+  if partition_state.draining {
+    Some(FlushTrigger::LeaseDrain)
+  } else {
+    partition_state
+      .buffer
+      .is_time_due(now_ts_ms, config)
+      .then_some(FlushTrigger::MaxDelay)
+      .or_else(|| partition_state.buffer.flush_trigger(now_ts_ms, config))
+  }
+}
+
+fn take_flush_partitions(
+  state: &mut WriteState,
+  topic: &str,
+  virtual_partition_ids: impl IntoIterator<Item = blob_stream_types::VirtualPartitionId>,
+  trigger: FlushTrigger,
+) -> Vec<FlushPartition> {
+  virtual_partition_ids
+    .into_iter()
+    .filter_map(|virtual_partition_id| {
+      let partition_state = state.partition_state_mut_if_present(topic, virtual_partition_id)?;
+      if partition_state.flush_in_flight {
+        None
+      } else {
+        take_flush_partition(partition_state, virtual_partition_id, trigger)
+      }
+    })
+    .collect()
+}
+
 pub(super) fn collect_flush_plans(
   state: &Arc<Mutex<WriteState>>,
   now_ts_ms: i64,
@@ -84,6 +143,13 @@ pub(super) fn collect_flush_plans(
   let mut state = state.lock();
   let mut partition_keys = state.partition_keys();
   partition_keys.sort_unstable();
+  let mut partition_ids_by_topic = HashMap::new();
+  for (topic, virtual_partition_id) in &partition_keys {
+    partition_ids_by_topic
+      .entry(topic.clone())
+      .or_insert_with(Vec::new)
+      .push(*virtual_partition_id);
+  }
   let last_flush_topic = state.last_flush_topic.clone();
   let start = last_flush_topic.as_ref().map_or(0, |last_topic| {
     partition_keys
@@ -108,38 +174,40 @@ pub(super) fn collect_flush_plans(
     if is_new_topic && plans_by_topic.len() == max_plans {
       continue;
     }
-    let Some(partition_state) = state.partition_state_mut_if_present(topic, *virtual_partition_id)
-    else {
-      continue;
-    };
-    if partition_state.flush_in_flight {
-      continue;
-    }
-    let flush_trigger = if partition_state.draining {
-      Some(FlushTrigger::LeaseDrain)
-    } else {
-      partition_state.buffer.flush_trigger(now_ts_ms, config)
-    };
+    let flush_trigger = state
+      .partition_state(topic, *virtual_partition_id)
+      .and_then(|partition_state| flush_trigger(partition_state, now_ts_ms, config));
     let Some(flush_trigger) = flush_trigger else {
       continue;
     };
 
-    let batches = std::mem::take(&mut partition_state.buffer.batches);
-    if batches.is_empty() {
-      partition_state.buffer.reset();
+    let partitions = match flush_trigger {
+      // A topic's first time-due partition establishes its flush cadence. Pulling its available
+      // peers forward produces one larger segment rather than retaining their startup skew.
+      FlushTrigger::MaxDelay => take_flush_partitions(
+        &mut state,
+        topic,
+        partition_ids_by_topic
+          .get(topic)
+          .expect("partition keys are grouped by topic")
+          .iter()
+          .copied(),
+        FlushTrigger::MaxDelay,
+      ),
+      FlushTrigger::MaxBytes | FlushTrigger::LeaseDrain => take_flush_partitions(
+        &mut state,
+        topic,
+        iter::once(*virtual_partition_id),
+        flush_trigger,
+      ),
+    };
+    if partitions.is_empty() {
       continue;
     }
-
-    partition_state.buffer.reset();
-    partition_state.flush_in_flight = true;
     plans_by_topic
       .entry(topic.clone())
       .or_default()
-      .push(FlushPartition {
-        virtual_partition_id: *virtual_partition_id,
-        batches,
-        trigger: flush_trigger,
-      });
+      .extend(partitions);
     if is_new_topic {
       last_planned_topic = Some(topic.clone());
     }

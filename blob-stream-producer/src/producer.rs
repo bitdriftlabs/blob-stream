@@ -14,7 +14,6 @@ use crate::config::{
   producer_max_batch_bytes,
   producer_max_batch_records,
   producer_max_request_concurrency,
-  producer_max_retries,
   producer_request_timeout_ms,
   producer_retry_base_delay_ms,
   producer_retry_deadline_ms,
@@ -67,6 +66,10 @@ type HttpGrpcClient = GrpcClient<HttpConnector>;
 
 // TODO(mattklein123): Consider adding disk buffering of segments.
 
+const NOT_LEASE_HOLDER_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const NOT_LEASE_HOLDER_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+const NOT_LEASE_HOLDER_MEMBERSHIP_SETTLE_DELAY: Duration = Duration::from_millis(100);
+
 //
 // ProducerMetrics
 //
@@ -77,6 +80,10 @@ struct ProducerMetrics {
   batches_sent: IntCounter,
   records_sent: IntCounter,
   retries: IntCounter,
+  not_lease_holder_retry_timers: IntCounter,
+  not_lease_holder_retry_membership_updates: IntCounter,
+  not_lease_holder_retry_same_owner: IntCounter,
+  not_lease_holder_retry_changed_owner: IntCounter,
   failures: IntCounter,
   no_brokers: IntCounter,
   send_latency_seconds: Histogram,
@@ -90,6 +97,11 @@ impl ProducerMetrics {
       batches_sent: scope.counter("batches_sent"),
       records_sent: scope.counter("records_sent"),
       retries: scope.counter("retries"),
+      not_lease_holder_retry_timers: scope.counter("not_lease_holder_retry_timers"),
+      not_lease_holder_retry_membership_updates: scope
+        .counter("not_lease_holder_retry_membership_updates"),
+      not_lease_holder_retry_same_owner: scope.counter("not_lease_holder_retry_same_owner"),
+      not_lease_holder_retry_changed_owner: scope.counter("not_lease_holder_retry_changed_owner"),
       failures: scope.counter("failures"),
       no_brokers: scope.counter("no_brokers"),
       send_latency_seconds: scope.histogram("send_latency_seconds"),
@@ -963,6 +975,7 @@ async fn send_batch_with_retry(
 ) -> Result<ProducerAck, ProducerError> {
   let retry_clock = TokioRetryClock;
   let mut retry_backoff = producer_retry_backoff(config);
+  let mut not_lease_holder_retry_backoff = producer_not_lease_holder_retry_backoff();
   send_batch_with_retry_and_retry_control(
     config,
     topics,
@@ -973,6 +986,7 @@ async fn send_batch_with_retry(
     retry_diagnostics,
     &retry_clock,
     &mut retry_backoff,
+    &mut not_lease_holder_retry_backoff,
   )
   .await
 }
@@ -987,6 +1001,7 @@ async fn send_batch_with_retry_and_retry_control(
   retry_diagnostics: &ProducerRetryDiagnostics,
   retry_clock: &dyn RetryClock,
   retry_backoff: &mut (dyn InfiniteBackoff + Send),
+  not_lease_holder_retry_backoff: &mut (dyn InfiniteBackoff + Send),
 ) -> Result<ProducerAck, ProducerError> {
   let _topic = topics
     .get(&batch.topic)
@@ -994,6 +1009,9 @@ async fn send_batch_with_retry_and_retry_control(
 
   let mut attempt: u32 = 0;
   let mut previous_owner: Option<String> = None;
+  let mut membership_updates = membership_rx.clone();
+  let mut membership_updates_open = true;
+  let mut retried_after_not_lease_holder = None;
   let started_at = retry_clock.now();
   let retry_deadline = started_at + Duration::from_millis(producer_retry_deadline_ms(config));
   loop {
@@ -1036,14 +1054,30 @@ async fn send_batch_with_retry_and_retry_control(
         )?
     };
 
-    if previous_owner
+    let owner_changed = previous_owner
       .as_deref()
-      .is_some_and(|old| old != broker_node_id)
-    {
+      .is_some_and(|old| old != broker_node_id);
+    if owner_changed {
       debug!(
         "producer routing changed after retry: topic={}, virtual_partition_id={}, from={}, to={}",
         batch.topic,
         batch.virtual_partition_id,
+        previous_owner.as_deref().unwrap_or_default(),
+        broker_node_id
+      );
+    }
+    if let Some(waited_for_membership_update) = retried_after_not_lease_holder.take() {
+      if owner_changed {
+        metrics.not_lease_holder_retry_changed_owner.inc();
+      } else {
+        metrics.not_lease_holder_retry_same_owner.inc();
+      }
+      debug!(
+        "producer retrying after not lease holder: topic={}, virtual_partition_id={}, \
+         membership_update={}, previous_broker={}, next_broker={}",
+        batch.topic,
+        batch.virtual_partition_id,
+        waited_for_membership_update,
         previous_owner.as_deref().unwrap_or_default(),
         broker_node_id
       );
@@ -1119,27 +1153,19 @@ async fn send_batch_with_retry_and_retry_control(
       Err(error) => (error.to_string(), ProducerRetryReason::TransportError),
     };
 
-    if attempt >= producer_max_retries(config) {
-      metrics.failures.inc();
-      metrics
-        .send_latency_seconds
-        .observe(retry_clock.now().duration_since(started_at).as_secs_f64());
-      warn_every!(
-        15.seconds(),
-        "producer retries exhausted: topic={}, virtual_partition_id={}, attempts={}, error={}",
-        batch.topic,
-        batch.virtual_partition_id,
-        attempt.saturating_add(1),
-        current_error
-      );
-      return Err(ProducerError::RetriesExhausted(current_error));
-    }
-
-    let delay = next_retry_delay(
-      retry_backoff,
-      Duration::from_millis(producer_retry_max_delay_ms(config)),
-    )
-    .min(retry_deadline.saturating_duration_since(retry_clock.now()));
+    let is_not_lease_holder = retry_reason == ProducerRetryReason::NotLeaseHolder;
+    let retry_delay = if is_not_lease_holder {
+      next_retry_delay(
+        not_lease_holder_retry_backoff,
+        NOT_LEASE_HOLDER_RETRY_MAX_DELAY,
+      )
+    } else {
+      next_retry_delay(
+        retry_backoff,
+        Duration::from_millis(producer_retry_max_delay_ms(config)),
+      )
+    };
+    let delay = retry_delay.min(retry_deadline.saturating_duration_since(retry_clock.now()));
     metrics.retries.inc();
     retry_diagnostics.record(
       retry_reason,
@@ -1151,14 +1177,31 @@ async fn send_batch_with_retry_and_retry_control(
     warn_every!(
       15.seconds(),
       "producer retrying batch: topic={}, virtual_partition_id={}, attempt={}, delay_ms={}, \
-       error={}",
+       reason={retry_reason:?}, error={}",
       batch.topic,
       batch.virtual_partition_id,
       attempt.saturating_add(1),
       delay.as_millis(),
       current_error
     );
-    retry_clock.sleep(delay).await;
+    if is_not_lease_holder {
+      let waited_for_membership_update = wait_for_not_lease_holder_retry(
+        &mut membership_updates,
+        &mut membership_updates_open,
+        retry_clock,
+        delay,
+        retry_deadline,
+      )
+      .await;
+      if waited_for_membership_update {
+        metrics.not_lease_holder_retry_membership_updates.inc();
+      } else {
+        metrics.not_lease_holder_retry_timers.inc();
+      }
+      retried_after_not_lease_holder = Some(waited_for_membership_update);
+    } else {
+      retry_clock.sleep(delay).await;
+    }
     attempt = attempt.saturating_add(1);
   }
 }
@@ -1174,11 +1217,78 @@ fn producer_retry_backoff(config: &ProducerConfig) -> ExponentialBackoff {
     .build()
 }
 
+/// Use a separate backoff because a lease rejection usually needs broker handoff to converge.
+fn producer_not_lease_holder_retry_backoff() -> ExponentialBackoff {
+  ExponentialBackoffBuilder::new_infinite()
+    .with_initial_interval(
+      TimeDuration::try_from(NOT_LEASE_HOLDER_RETRY_INITIAL_DELAY).unwrap_or(TimeDuration::MAX),
+    )
+    .with_randomization_factor(0.5)
+    .with_multiplier(2.0)
+    .with_max_interval(
+      TimeDuration::try_from(NOT_LEASE_HOLDER_RETRY_MAX_DELAY).unwrap_or(TimeDuration::MAX),
+    )
+    .build()
+}
+
 fn next_retry_delay(
   retry_backoff: &mut (dyn InfiniteBackoff + Send),
   max_delay: Duration,
 ) -> Duration {
   retry_backoff.next_backoff().unsigned_abs().min(max_delay)
+}
+
+/// Wait for broker routing to change, or for lease ownership to converge without a route update.
+async fn wait_for_not_lease_holder_retry(
+  membership_rx: &mut watch::Receiver<BrokerMembership>,
+  membership_updates_open: &mut bool,
+  retry_clock: &dyn RetryClock,
+  delay: Duration,
+  retry_deadline: Instant,
+) -> bool {
+  if !*membership_updates_open {
+    retry_clock.sleep(delay).await;
+    return false;
+  }
+  if membership_rx.has_changed().is_err() {
+    *membership_updates_open = false;
+    retry_clock.sleep(delay).await;
+    return false;
+  }
+  if membership_rx.has_changed().unwrap_or(false) {
+    membership_rx.borrow_and_update();
+    retry_clock
+      .sleep(
+        delay
+          .min(NOT_LEASE_HOLDER_MEMBERSHIP_SETTLE_DELAY)
+          .min(retry_deadline.saturating_duration_since(retry_clock.now())),
+      )
+      .await;
+    return true;
+  }
+
+  tokio::select! {
+    () = retry_clock.sleep(delay) => false,
+    changed = membership_rx.changed() => {
+      if changed.is_err() {
+        *membership_updates_open = false;
+        retry_clock.sleep(delay).await;
+        false
+      } else {
+        membership_rx.borrow_and_update();
+        // Endpoints can lead the new broker's lease acquisition, so avoid immediately moving a
+        // fleet of producers onto a broker that has not finished its handoff.
+        retry_clock
+          .sleep(
+            delay
+              .min(NOT_LEASE_HOLDER_MEMBERSHIP_SETTLE_DELAY)
+              .min(retry_deadline.saturating_duration_since(retry_clock.now())),
+          )
+          .await;
+        true
+      }
+    },
+  }
 }
 
 //

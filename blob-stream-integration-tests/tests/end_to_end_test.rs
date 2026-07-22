@@ -429,7 +429,7 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
   // Step 2: Build a producer against dynamic broker discovery.
   let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
   let producer = blob_stream_producer::ProducerClientImpl::new(
-    producer_config(8),
+    producer_config(),
     vec![producer_topic()],
     Arc::clone(&discovery),
     metrics_scope("blob_stream_producer_it"),
@@ -558,7 +558,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
   for _ in 0 .. 4 {
     producers.push(
       blob_stream_producer::ProducerClientImpl::new(
-        producer_config(8),
+        producer_config(),
         vec![producer_topic()],
         Arc::clone(&discovery),
         metrics_scope("blob_stream_producer_it"),
@@ -795,7 +795,7 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
     Arc::new(framework::DynamicBrokerDiscovery::new(vec![live_node]));
 
   let producer = blob_stream_producer::ProducerClientImpl::new(
-    producer_config(12),
+    producer_config(),
     vec![producer_topic()],
     Arc::clone(&producer_discovery),
     metrics_scope("blob_stream_producer_it"),
@@ -852,7 +852,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
 
   let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
   let producer = blob_stream_producer::ProducerClientImpl::new(
-    producer_config(8),
+    producer_config(),
     vec![producer_topic()],
     Arc::clone(&discovery),
     metrics_scope("blob_stream_producer_it"),
@@ -1204,7 +1204,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
 
   let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
   let producer = blob_stream_producer::ProducerClientImpl::new(
-    producer_config(8),
+    producer_config(),
     vec![producer_topic()],
     Arc::clone(&discovery),
     metrics_scope("blob_stream_producer_it"),
@@ -1620,7 +1620,7 @@ async fn active_broker_restart_continuity() -> Result<()> {
 
   let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
   let producer = blob_stream_producer::ProducerClientImpl::new(
-    producer_config(12),
+    producer_config(),
     vec![producer_topic()],
     Arc::clone(&discovery),
     metrics_scope("blob_stream_producer_it"),
@@ -1754,7 +1754,7 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
 
   let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
   let producer = blob_stream_producer::ProducerClientImpl::new(
-    producer_config(8),
+    producer_config(),
     vec![producer_topic()],
     Arc::clone(&discovery),
     metrics_scope("blob_stream_producer_it"),
@@ -1878,7 +1878,7 @@ async fn multi_topic_isolation() -> Result<()> {
 
   let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
   let producer = blob_stream_producer::ProducerClientImpl::new(
-    producer_config(8),
+    producer_config(),
     vec![
       producer_topic_named(TOPIC),
       producer_topic_named(SECOND_TOPIC),
@@ -2017,7 +2017,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
   let mut cluster = ClusterHarness::builder(&resources, 1).start().await?;
 
   let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
-  let mut config = producer_config(8);
+  let mut config = producer_config();
   config.max_batch_records = Some(8);
   config.max_batch_bytes = Some(4_096);
   config.flush_max_delay_ms = Some(50);
@@ -2031,7 +2031,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
     )
     .await?,
   );
-  let mut batching_config = producer_config(8);
+  let mut batching_config = producer_config();
   batching_config.max_batch_records = Some(8);
   batching_config.max_batch_bytes = Some(4_096);
   batching_config.flush_max_delay_ms = Some(1_000);
@@ -2187,7 +2187,7 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
 
   let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
   let producer = blob_stream_producer::ProducerClientImpl::new(
-    producer_config(8),
+    producer_config(),
     vec![producer_topic()],
     Arc::clone(&discovery),
     metrics_scope("blob_stream_producer_it"),
@@ -2269,7 +2269,7 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
 
   let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
   let producer = blob_stream_producer::ProducerClientImpl::new(
-    producer_config(8),
+    producer_config(),
     vec![producer_topic()],
     Arc::clone(&discovery),
     metrics_scope("blob_stream_producer_it"),
@@ -2737,14 +2737,14 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
 
   // Step 2: Create producers for writer 0 and writer 1 on the same topic.
   let producer_writer_0 = blob_stream_producer::ProducerClientImpl::new(
-    producer_config_with_writer_id(8, 0),
+    producer_config_with_writer_id(0),
     vec![producer_topic_named_with_writers(TOPIC, 2)],
     Arc::clone(&discovery),
     metrics_scope("blob_stream_producer_it"),
   )
   .await?;
   let producer_writer_1 = blob_stream_producer::ProducerClientImpl::new(
-    producer_config_with_writer_id(8, 1),
+    producer_config_with_writer_id(1),
     vec![producer_topic_named_with_writers(TOPIC, 2)],
     Arc::clone(&discovery),
     metrics_scope("blob_stream_producer_it"),
@@ -2883,7 +2883,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
 
   let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
   let producer = blob_stream_producer::ProducerClientImpl::new(
-    producer_config(8),
+    producer_config(),
     vec![producer_topic()],
     Arc::clone(&discovery),
     metrics_scope("blob_stream_producer_it"),
@@ -3021,7 +3021,7 @@ async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
     .await?;
 
   let producer = cluster
-    .create_producer(producer_config(8), vec![producer_topic()])
+    .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
   // Build two independent bootstrap consumers for the same group.
@@ -3162,7 +3162,7 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
     .await?;
 
   let producer = cluster
-    .create_producer(producer_config(8), vec![producer_topic()])
+    .create_producer(producer_config(), vec![producer_topic()])
     .await?;
   let membership_store = resources.consumer_membership_store();
 

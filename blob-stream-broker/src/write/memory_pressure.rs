@@ -181,7 +181,7 @@ impl MemoryPressureController {
     #[cfg(target_os = "linux")]
     {
       let source = match LinuxMemoryPressureSource::new() {
-        Ok(source) => Arc::new(source),
+        Ok(source) => source,
         Err(error) => {
           log::warn!("broker memory-pressure admission disabled: {error}");
           return Self::disabled(metrics_scope);
@@ -189,10 +189,11 @@ impl MemoryPressureController {
       };
 
       info!(
-        "broker memory-pressure admission enabled: \
-         overloaded_on_permyriad={OVERLOADED_ON_PERMYRIAD}"
+        "broker memory-pressure admission enabled: cgroup_memory_limit_bytes={}, \
+         overloaded_on_permyriad={OVERLOADED_ON_PERMYRIAD}",
+        source.cgroup_memory_limit_bytes,
       );
-      let controller = Self::with_source(source, metrics_scope);
+      let controller = Self::with_source(Arc::new(source), metrics_scope);
       controller.spawn_poller(shutdown_trigger_handle);
       controller
     }

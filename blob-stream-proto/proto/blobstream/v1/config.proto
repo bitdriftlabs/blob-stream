@@ -235,10 +235,6 @@ message ProducerConfig {
   // Default when unset: 200 ms.
   optional uint64 flush_max_delay_ms = 4 [(validate.rules).uint64.gt = 0];
 
-  // Maximum retry attempts for transient produce failures.
-  // Default when unset: 5.
-  optional uint32 max_retries = 5;
-
   // Exponential backoff base delay.
   // Default when unset: 25 ms.
   optional uint64 retry_base_delay_ms = 6 [(validate.rules).uint64.gt = 0];
@@ -301,8 +297,6 @@ message ConsumerReadConfig {
   //   partition-key scans, accepting coarser scan buckets.
   optional int64 window_size_seconds = 2 [(validate.rules).int64.gt = 0];
 
-  reserved 3;
-
   // Base idle poll delay in milliseconds when no batches are available.
   // Default when unset: 250 ms.
   optional uint64 idle_poll_delay_ms = 4 [(validate.rules).uint64.gt = 0];
@@ -323,8 +317,6 @@ message ConsumerReadConfig {
   // - Increase to reduce foreground `next()` latency and improve burst absorption.
   // - Decrease to reduce process memory footprint when running many consumers per host.
   optional uint64 prefetch_max_bytes = 6 [(validate.rules).uint64.gt = 0];
-
-  reserved 7, 8;
 
   // Delay accepting recently published metadata rows while using eventually consistent reads.
   // Default when unset: 2,000 ms. This is a best-effort staleness margin, not a

@@ -19,7 +19,6 @@ use std::sync::Arc;
 const DEFAULT_MAX_BATCH_RECORDS: u32 = 1_000;
 const DEFAULT_MAX_BATCH_BYTES: u32 = 1_048_576;
 const DEFAULT_FLUSH_MAX_DELAY_MS: u64 = 200;
-const DEFAULT_MAX_RETRIES: u32 = 5;
 const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 25;
 const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 1_000;
 const DEFAULT_RETRY_DEADLINE_MS: u64 = 30_000;
@@ -40,7 +39,6 @@ pub fn producer_config_with_defaults() -> ProducerConfig {
   config.max_batch_records = Some(DEFAULT_MAX_BATCH_RECORDS);
   config.max_batch_bytes = Some(DEFAULT_MAX_BATCH_BYTES);
   config.flush_max_delay_ms = Some(DEFAULT_FLUSH_MAX_DELAY_MS);
-  config.max_retries = Some(DEFAULT_MAX_RETRIES);
   config.retry_base_delay_ms = Some(DEFAULT_RETRY_BASE_DELAY_MS);
   config.retry_max_delay_ms = Some(DEFAULT_RETRY_MAX_DELAY_MS);
   config.retry_deadline_ms = Some(DEFAULT_RETRY_DEADLINE_MS);
@@ -73,11 +71,6 @@ pub fn producer_flush_max_delay_ms(config: &ProducerConfig) -> u64 {
   config
     .flush_max_delay_ms
     .unwrap_or(DEFAULT_FLUSH_MAX_DELAY_MS)
-}
-
-#[must_use]
-pub fn producer_max_retries(config: &ProducerConfig) -> u32 {
-  config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES)
 }
 
 #[must_use]

@@ -30,7 +30,6 @@
 //!   producer.max_batch_records = Some(1000);
 //!   producer.max_batch_bytes = Some(1_048_576);
 //!   producer.flush_max_delay_ms = Some(200);
-//!   producer.max_retries = Some(5);
 //!   producer.retry_base_delay_ms = Some(25);
 //!   producer.retry_max_delay_ms = Some(1000);
 //!   producer.retry_deadline_ms = Some(30_000);
