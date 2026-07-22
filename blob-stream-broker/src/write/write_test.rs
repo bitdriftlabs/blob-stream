@@ -1,17 +1,19 @@
 #![allow(clippy::unwrap_used)]
 
-use super::{
-  AdmissionController,
+use super::allocation::{
   AllocationTransitionDecision,
   LeaseExpirationUpdate,
+  begin_allocation_transition,
+};
+use super::state::WriteState;
+use super::{
+  AdmissionController,
   MemoryPressureAdmissionController,
   TopicInfo,
   WriteConfig,
   WriteEngine,
   WriteEngineImpl,
   WriteRequest,
-  WriteState,
-  begin_allocation_transition,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -264,7 +266,10 @@ fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
   };
   let request = initial.reservation.expect("initial reservation request");
   assert_eq!(request.size, 4);
-  assert!(matches!(request.reason, super::ReservationReason::Initial));
+  assert!(matches!(
+    request.reason,
+    super::allocation::ReservationReason::Initial
+  ));
   initial.transition.finish(
     LeaseExpirationUpdate::Set(Some(2_000)),
     Some(SeqRange { start: 0, end: 3 }),
@@ -287,7 +292,7 @@ fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
   assert_eq!(request.size, 8);
   assert!(matches!(
     request.reason,
-    super::ReservationReason::ForegroundExhaustion
+    super::allocation::ReservationReason::ForegroundExhaustion
   ));
 }
 
@@ -322,7 +327,7 @@ fn maintenance_top_up_extends_the_current_reservation() {
   assert_eq!(request.size, 10);
   assert!(matches!(
     request.reason,
-    super::ReservationReason::MaintenanceTopUp
+    super::allocation::ReservationReason::MaintenanceTopUp
   ));
   top_up.transition.finish_lease_maintenance(
     LeaseExpirationUpdate::Set(Some(2_100)),
@@ -391,7 +396,7 @@ fn lease_reacquisition_discards_stale_sequence_capacity() {
 
 #[test]
 fn nonadjacent_reservation_replaces_remaining_capacity() {
-  let mut allocator = super::SeqAllocator {
+  let mut allocator = super::state::SeqAllocator {
     reservation: Some(SeqRange { start: 0, end: 9 }),
     next_seq: 5,
   };
