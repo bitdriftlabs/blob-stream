@@ -1694,6 +1694,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
+ "bd-backoff",
  "bd-server-stats",
  "blob-stream-blob-store",
  "blob-stream-types",
@@ -1703,6 +1704,7 @@ dependencies = [
  "prometheus",
  "serde",
  "serde_dynamo",
+ "time",
  "tokio",
  "uuid",
 ]

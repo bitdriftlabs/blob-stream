@@ -40,6 +40,12 @@ impl BufferState {
       .then_some(FlushTrigger::MaxDelay)
   }
 
+  pub(super) fn is_time_due(&self, now_ts_ms: i64, config: &WriteConfig) -> bool {
+    self
+      .first_buffered_ts_ms
+      .is_some_and(|first_ts| now_ts_ms.saturating_sub(first_ts) >= config.flush_max_delay_ms)
+  }
+
   pub(super) fn reset(&mut self) {
     self.batches.clear();
     self.buffered_bytes = 0;

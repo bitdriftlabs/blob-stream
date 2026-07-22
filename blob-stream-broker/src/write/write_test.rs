@@ -416,6 +416,42 @@ fn make_engine(
   Ok((engine, metadata_store))
 }
 
+fn make_two_partition_engine(
+  time_provider: Arc<TestTimeProvider>,
+  config: WriteConfig,
+  shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
+) -> Result<(Arc<WriteEngineImpl>, Arc<InMemoryMetadataStore>)> {
+  let mut topics = HashMap::new();
+  topics.insert(
+    "telemetry".to_string(),
+    TopicInfo {
+      name: "telemetry".to_string(),
+      partition_count: 2,
+      num_writers: 1,
+      retention_days: 7,
+      max_metadata_publication_lag_ms: 30_000,
+    },
+  );
+
+  let metadata_store = Arc::new(InMemoryMetadataStore::new());
+  let engine = WriteEngineImpl::new(
+    config,
+    topics,
+    Arc::new(InMemoryBlobStore::new()),
+    metadata_store.clone(),
+    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+    "test-node".to_string(),
+    None,
+    None,
+    default_admission(&shutdown_trigger_handle, &metrics_scope()),
+    shutdown_trigger_handle,
+    time_provider,
+    &metrics_scope(),
+  )?;
+
+  Ok((Arc::new(engine), metadata_store))
+}
+
 fn make_engine_with_lease_store(
   time_provider: Arc<TestTimeProvider>,
   config: WriteConfig,
@@ -659,6 +695,51 @@ async fn successful_sequence_reservation_records_metrics() -> Result<()> {
     metrics.contains("blob_stream_broker_test:write:sequence_reservation_latency_seconds_count 1")
   );
 
+  Ok(())
+}
+
+#[tokio::test]
+async fn fenced_sequence_reservations_do_not_record_failure_metrics() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let collector = Collector::default();
+  let scope = collector.scope("blob_stream_broker_test");
+  let (engine, _metadata_store, lease_store) = make_engine_with_lease_store_and_scope(
+    time_provider,
+    WriteConfig::with_defaults(),
+    &scope,
+    shutdown_trigger.make_handle(),
+  )?;
+
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".to_string(),
+    virtual_partition_id: 0,
+  };
+  lease_store
+    .acquire_lease(key, "other-broker".to_string(), now_ms, 30_000)
+    .await?;
+  let error = engine
+    .produce_batch(WriteRequest {
+      topic: "telemetry".to_string(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![1], 10)],
+    })
+    .await
+    .expect_err("active lease held by another broker should fence the produce request");
+  assert!(matches!(error, super::WriteError::NotLeaseHolder { .. }));
+
+  let error = engine
+    .reserve_sequences("telemetry", 1, now_ms, 1)
+    .await
+    .expect_err("missing lease should fence the direct sequence reservation");
+  assert!(matches!(error, super::WriteError::NotLeaseHolder { .. }));
+
+  let metrics = String::from_utf8(collector.prometheus_output())?;
+  assert!(
+    metrics.contains("blob_stream_broker_test:write:sequence_reservation_failures_total 0"),
+    "{metrics}"
+  );
   Ok(())
 }
 
@@ -921,6 +1002,325 @@ async fn flushes_on_time_rollover() -> Result<()> {
     .scan_window_from_snowflake(&window.key("telemetry"), None)
     .await?;
   assert_eq!(segments.len(), 1);
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1_024;
+  config.flush_max_delay_ms = 10;
+  config.window_size_seconds = 60;
+
+  let (engine, metadata_store) = make_two_partition_engine(
+    time_provider.clone(),
+    config.clone(),
+    shutdown_trigger.make_handle(),
+  )?;
+
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  for _ in 0 .. 100 {
+    if engine
+      .state
+      .lock()
+      .partition_state("telemetry", 0)
+      .is_some()
+    {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+
+  time_provider.advance(TimeDuration::milliseconds(5));
+  let second_engine = Arc::clone(&engine);
+  let second = tokio::spawn(async move {
+    second_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 1,
+        records: vec![new_record(vec![2], 20)],
+      })
+      .await
+  });
+  for _ in 0 .. 100 {
+    let buffered_batches = engine
+      .state_snapshot()
+      .await
+      .topics
+      .iter()
+      .flat_map(|topic| &topic.local_partitions)
+      .map(|partition| partition.buffered_batch_count)
+      .sum::<usize>();
+    if buffered_batches == 2 {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+
+  time_provider.advance(TimeDuration::milliseconds(5));
+  tokio::time::advance(StdDuration::from_millis(
+    config.flush_max_delay_ms.cast_unsigned(),
+  ))
+  .await;
+  tokio::task::yield_now().await;
+
+  first.await??;
+  second.await??;
+
+  let window = Window::for_timestamp(
+    time_provider.now().unix_timestamp_ms() / 1_000,
+    config.window_size_seconds,
+  );
+  let segments = metadata_store
+    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .await?;
+  assert_eq!(segments.len(), 1);
+  assert_eq!(segments[0].segment_index.len(), 2);
+  assert!(segments[0].segment_index.contains_key(&0));
+  assert!(segments[0].segment_index.contains_key(&1));
+
+  let next_first_engine = Arc::clone(&engine);
+  let next_first = tokio::spawn(async move {
+    next_first_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![3], 30)],
+      })
+      .await
+  });
+  for _ in 0 .. 100 {
+    let buffered_batches = engine
+      .state_snapshot()
+      .await
+      .topics
+      .iter()
+      .flat_map(|topic| &topic.local_partitions)
+      .map(|partition| partition.buffered_batch_count)
+      .sum::<usize>();
+    if buffered_batches == 1 {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+
+  time_provider.advance(TimeDuration::milliseconds(5));
+  let next_second_engine = Arc::clone(&engine);
+  let next_second = tokio::spawn(async move {
+    next_second_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 1,
+        records: vec![new_record(vec![4], 40)],
+      })
+      .await
+  });
+  for _ in 0 .. 100 {
+    let buffered_batches = engine
+      .state_snapshot()
+      .await
+      .topics
+      .iter()
+      .flat_map(|topic| &topic.local_partitions)
+      .map(|partition| partition.buffered_batch_count)
+      .sum::<usize>();
+    if buffered_batches == 2 {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+
+  time_provider.advance(TimeDuration::milliseconds(5));
+  tokio::time::advance(StdDuration::from_millis(
+    config.flush_max_delay_ms.cast_unsigned(),
+  ))
+  .await;
+  tokio::task::yield_now().await;
+  next_first.await??;
+  next_second.await??;
+
+  let segments = metadata_store
+    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .await?;
+  assert_eq!(segments.len(), 2);
+  assert!(
+    segments
+      .iter()
+      .all(|segment| segment.segment_index.len() == 2)
+  );
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn time_due_byte_flush_coalesces_buffered_topic_peers() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 2;
+  config.flush_max_delay_ms = 10;
+  config.window_size_seconds = 60;
+
+  let (engine, metadata_store) = make_two_partition_engine(
+    time_provider.clone(),
+    config.clone(),
+    shutdown_trigger.make_handle(),
+  )?;
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  for _ in 0 .. 100 {
+    if engine
+      .state
+      .lock()
+      .partition_state("telemetry", 0)
+      .is_some()
+    {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+
+  time_provider.advance(TimeDuration::milliseconds(5));
+  let peer_engine = Arc::clone(&engine);
+  let peer = tokio::spawn(async move {
+    peer_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 1,
+        records: vec![new_record(vec![2], 20)],
+      })
+      .await
+  });
+  for _ in 0 .. 100 {
+    let buffered_batches = engine
+      .state_snapshot()
+      .await
+      .topics
+      .iter()
+      .flat_map(|topic| &topic.local_partitions)
+      .map(|partition| partition.buffered_batch_count)
+      .sum::<usize>();
+    if buffered_batches == 2 {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+
+  time_provider.advance(TimeDuration::milliseconds(5));
+  let byte_due_engine = Arc::clone(&engine);
+  let byte_due = tokio::spawn(async move {
+    byte_due_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![3], 30)],
+      })
+      .await
+  });
+  tokio::task::yield_now().await;
+
+  first.await??;
+  peer.await??;
+  byte_due.await??;
+
+  let window = Window::for_timestamp(
+    time_provider.now().unix_timestamp_ms() / 1_000,
+    config.window_size_seconds,
+  );
+  let segments = metadata_store
+    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .await?;
+  assert_eq!(segments.len(), 1);
+  assert_eq!(segments[0].segment_index.len(), 2);
+  assert!(segments[0].segment_index.contains_key(&0));
+  assert!(segments[0].segment_index.contains_key(&1));
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn byte_flush_does_not_coalesce_buffered_topic_peers() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 2;
+  config.flush_max_delay_ms = 10;
+  config.window_size_seconds = 60;
+
+  let (engine, metadata_store) = make_two_partition_engine(
+    time_provider.clone(),
+    config.clone(),
+    shutdown_trigger.make_handle(),
+  )?;
+  let peer_engine = Arc::clone(&engine);
+  let peer = tokio::spawn(async move {
+    peer_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".to_string(),
+        virtual_partition_id: 1,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  for _ in 0 .. 100 {
+    if engine
+      .state
+      .lock()
+      .partition_state("telemetry", 1)
+      .is_some()
+    {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+
+  time_provider.advance(TimeDuration::milliseconds(5));
+  engine
+    .produce_batch(WriteRequest {
+      topic: "telemetry".to_string(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![2; 2], 20)],
+    })
+    .await?;
+  assert!(!peer.is_finished());
+
+  let window = Window::for_timestamp(
+    time_provider.now().unix_timestamp_ms() / 1_000,
+    config.window_size_seconds,
+  );
+  let segments = metadata_store
+    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .await?;
+  assert_eq!(segments.len(), 1);
+  assert_eq!(segments[0].segment_index.len(), 1);
+  assert!(segments[0].segment_index.contains_key(&0));
+
+  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
+  tokio::time::advance(StdDuration::from_millis(
+    config.flush_max_delay_ms.cast_unsigned(),
+  ))
+  .await;
+  peer.await??;
   Ok(())
 }
 

@@ -69,9 +69,11 @@ For $P$ local writer-scoped partitions and $N$ live local brokers, each broker r
 $floor(P / N)$ or $ceil(P / N)$ partitions. Membership comes from either a static list or
 Kubernetes Endpoints. Brokers watch local membership and self-assign the partitions planned for
 their own node ID. A stale producer membership view can send a request to a previous local owner;
-that broker returns `NOT_LEASE_HOLDER`, and the producer retries with exponential backoff using
-its current membership view. An empty local membership has no producer route; it never falls back
-to a different writer/AZ.
+that broker returns `NOT_LEASE_HOLDER`. Producers treat this differently from transport and
+overload failures: they use a slower backoff and wait for either the next membership update or
+lease convergence before retrying. A membership update receives a short settle delay because
+Endpoints visibility can lead the new broker's lease acquisition. An empty local membership has no
+producer route; it never falls back to a different writer/AZ.
 
 The producer keeps gRPC clients keyed by broker address so normal batches reuse an HTTP/2
 connection. Whenever discovery removes an address, it drops that address's cached client
@@ -129,7 +131,7 @@ rather than two writes. The adaptive target is process-local and has no decay po
 Broker metrics expose aggregate refill behavior without topic or partition labels:
 `sequence_reservations_total` counts successful durable block refills,
 `sequence_reservation_records_total` counts values included in those blocks,
-`sequence_reservation_failures_total` counts failed or fenced refill attempts, and
+`sequence_reservation_failures_total` counts unexpected durable refill failures, and
 `sequence_reservation_latency_seconds` measures lease-store refill latency. For steady-state
 traffic, the ratio of reservation rate to record rate should be close to one divided by the
 reservation size. A materially higher ratio indicates allocation waste from ownership churn,
@@ -175,10 +177,13 @@ invariant.
 5. The broker samples jemalloc allocation against its Linux cgroup memory limit and rejects new
    batches with `OVERLOADED` when utilization exceeds its admission threshold. It flushes a
    virtual-partition buffer when its raw payload bytes reach `flush_max_bytes` or its oldest batch
-   reaches `flush_max_delay_ms`. A partition with a durable plan in progress continues buffering its
-   next epoch until that prior plan completes. A single bounded flush scheduler wakes for eligible
-   writes, timer ticks, and durable-plan completions; a completion immediately promotes an eligible
-   successor epoch.
+   reaches `flush_max_delay_ms`. A time-due partition establishes a flush cadence for its topic:
+   the broker includes every available buffered virtual partition for that topic in the same plan.
+   This can flush younger peer buffers slightly before their individual delay to produce larger
+   blobs and fewer metadata rows. Byte-threshold and lease-drain flushes remain partition-local.
+   A partition with a durable plan in progress continues buffering its next epoch until that prior
+   plan completes. A single bounded flush scheduler wakes for eligible writes, timer ticks, and
+   durable-plan completions; a completion immediately promotes an eligible successor epoch.
 6. A flush serializes each batch as `StoredRecordBatch`, compresses each serialized batch
    independently, concatenates the stored bytes into a segment blob, uploads the blob, and then
    writes the segment metadata row. Plans may run concurrently for different virtual partitions,
@@ -201,10 +206,10 @@ Sequence ranges are internal durable metadata used by consumers. The protocol st
   sequence reservation, or another internal write-path failure.
 
 The producer treats `NOT_LEASE_HOLDER`, `OVERLOADED`, and transport errors as retryable until its
-configured attempt count or total retry deadline is exhausted. It uses shared capped exponential
-backoff with randomized delays and clips each RPC and delay to the remaining deadline. Retrying
-after an ambiguous failure
-can produce a duplicate batch, which is part of the at-least-once contract.
+total retry deadline is exhausted. Transport and overload failures use capped exponential backoff;
+`NOT_LEASE_HOLDER` uses a slower, membership-aware backoff. Each RPC and delay is clipped to the
+remaining deadline. Retrying after an ambiguous failure can produce a duplicate batch, which is
+part of the at-least-once contract.
 
 ## Persistent Data Layout
 
@@ -496,6 +501,12 @@ planner lease is fenced by a unique coordinator session, preventing a stale proc
 member ID from publishing or releasing a successor's lease. Once it expires, any live member can
 acquire it and publish a successor plan.
 
+Assignment-plan publication transactionally condition-checks the planner lease and updates the
+plan. Concurrent acquisition, renewal, or release of that same lease can therefore receive
+`TransactionConflictException`; these planner-item mutations retry the short-lived conflict with
+a bounded exponential delay. The standard DynamoDB SDK retry policy does not classify this error
+as retryable. Conditional failures remain normal fencing outcomes and are not retried.
+
 TODO: A single DynamoDB assignment-plan item is limited to 400 KB. If group plans can approach
 that limit, replace it with sharded or S3-backed plan storage; an S3-backed design will require
 the corresponding consumer IAM read permissions.
@@ -567,7 +578,7 @@ defaults are:
 | Producer batch records | 1,000 |
 | Producer batch payload bytes | 1 MiB |
 | Producer flush delay | 200 ms |
-| Producer retries | 5 |
+| Producer retry deadline | 30 seconds |
 | Consumer metadata window | 300 seconds |
 | Broker metadata publication deadline | 15 seconds |
 | Consumer metadata visibility delay | 2 seconds |

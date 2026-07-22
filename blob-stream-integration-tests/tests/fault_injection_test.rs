@@ -70,7 +70,7 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
     .await;
 
   let producer = cluster
-    .create_producer(producer_config(8), vec![producer_topic()])
+    .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
   let mut expected_ids = HashSet::new();
@@ -183,7 +183,7 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
     .await;
 
   let producer = cluster
-    .create_producer(producer_config(8), vec![producer_topic()])
+    .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
   let mut expected_ids = HashSet::new();
@@ -303,7 +303,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     .await;
 
   let producer = cluster
-    .create_producer(producer_config(8), vec![producer_topic()])
+    .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
   let mut expected_ids = HashSet::new();
@@ -405,10 +405,10 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
   Ok(())
 }
 
-// High-level: validates timeout fault retry exhaustion at a bounded retry budget and verifies
-// deterministic recovery once the fault budget is consumed.
+// High-level: validates timeout fault retry exhaustion at the configured deadline and verifies
+// deterministic recovery once the fault window is consumed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn broker_response_timeout_retry_budget_respected() -> Result<()> {
+async fn broker_response_timeout_retry_deadline_respected() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let mut cluster = ClusterHarness::builder(&resources, 2)
     .in_memory_transport()
@@ -423,13 +423,15 @@ async fn broker_response_timeout_retry_budget_respected() -> Result<()> {
       target_node_id: None,
       operation: NetworkOperation::ProduceBatch,
       fault: NetworkFault::Timeout(Duration::from_millis(200)),
-      // max_retries=2 implies three total attempts for one produce call.
+      // The 500 ms producer deadline expires while the third timeout is in flight.
       remaining_hits: Some(3),
     })
     .await;
 
+  let mut config = producer_config();
+  config.retry_deadline_ms = Some(500);
   let producer = cluster
-    .create_producer(producer_config(2), vec![producer_topic()])
+    .create_producer(config, vec![producer_topic()])
     .await?;
 
   let exhausted = producer
@@ -522,7 +524,7 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
     .await;
 
   let producer = cluster
-    .create_producer(producer_config(8), vec![producer_topic()])
+    .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
   let mut expected_ids = HashSet::new();
@@ -601,7 +603,7 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
     .await?;
 
   let producer = cluster
-    .create_producer(producer_config(8), vec![producer_topic()])
+    .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
   let mut expected_ids = HashSet::new();
@@ -719,13 +721,15 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
       action: StoreFaultAction::Fail {
         message: "transient metadata write failure".to_string(),
       },
-      // max_retries=2 -> three total attempts for this first produce call.
+      // The 50 ms producer deadline expires after retrying the three immediate failures.
       remaining_hits: Some(3),
     })
     .await;
 
+  let mut config = producer_config();
+  config.retry_deadline_ms = Some(50);
   let producer = cluster
-    .create_producer(producer_config(2), vec![producer_topic()])
+    .create_producer(config, vec![producer_topic()])
     .await?;
 
   let failed_ack = producer
@@ -819,7 +823,7 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
     .await?;
 
   let producer = cluster
-    .create_producer(producer_config(8), vec![producer_topic()])
+    .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
   let mut expected_ids = HashSet::new();
@@ -959,7 +963,7 @@ async fn producer_lease_store_conflict_then_expiry_takeover() -> Result<()> {
 
   cluster.set_active_nodes(vec![active_node.clone()]);
   let producer = cluster
-    .create_producer(producer_config(8), vec![producer_topic()])
+    .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
   let mut expected_ids = HashSet::new();
@@ -1254,7 +1258,7 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
     .await?;
 
   let producer = cluster
-    .create_producer(producer_config(8), vec![producer_topic()])
+    .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
   let runtime_a = consumer_runtime_config("fit-015-a");
@@ -1544,7 +1548,7 @@ async fn combined_network_and_metadata_faults_end_to_end() -> Result<()> {
     .await;
 
   let producer = cluster
-    .create_producer(producer_config(8), vec![producer_topic()])
+    .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
   let mut expected_ids = HashSet::new();
@@ -1686,7 +1690,7 @@ async fn run_fit_012_scenario() -> Result<Fit012Outcome> {
     .await;
 
   let producer = cluster
-    .create_producer(producer_config(8), vec![producer_topic()])
+    .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
   let mut expected_ids = HashSet::new();

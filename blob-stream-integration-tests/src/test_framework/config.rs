@@ -11,20 +11,20 @@ use blob_stream_proto::protos::blobstream::v1::config::{
   TopicConfig,
 };
 
-pub fn producer_config(max_retries: u32) -> ProducerConfig {
-  producer_config_with_writer_id(max_retries, 0)
+pub fn producer_config() -> ProducerConfig {
+  producer_config_with_writer_id(0)
 }
 
-pub fn producer_config_with_writer_id(max_retries: u32, writer_id: u32) -> ProducerConfig {
+pub fn producer_config_with_writer_id(writer_id: u32) -> ProducerConfig {
   // Use tight batching/retry defaults so integration tests converge quickly.
   let mut config = ProducerConfig::new();
   config.writer_id = Some(writer_id);
   config.max_batch_records = Some(1);
   config.max_batch_bytes = Some(1_024);
   config.flush_max_delay_ms = Some(5);
-  config.max_retries = Some(max_retries);
   config.retry_base_delay_ms = Some(10);
   config.retry_max_delay_ms = Some(50);
+  config.retry_deadline_ms = Some(2_000);
   config.connect_timeout_ms = Some(100);
   config.request_timeout_ms = Some(2_000);
   config.max_request_concurrency = Some(32);

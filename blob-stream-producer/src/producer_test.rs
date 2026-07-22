@@ -12,8 +12,10 @@ use super::{
   broker_assignment,
   compute_virtual_partition_id,
   next_retry_delay,
+  producer_not_lease_holder_retry_backoff,
   producer_retry_backoff,
   send_batch_with_retry_and_retry_control,
+  wait_for_not_lease_holder_retry,
 };
 use crate::config::{producer_config_with_defaults, producer_writer_id, validate_producer_config};
 use crate::{ProducerCompression, ProducerConfig, ProducerTopicConfig};
@@ -34,21 +36,26 @@ use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 use tokio::time::{Instant, timeout};
 
 struct TestBrokerDiscovery {
-  membership: BrokerMembership,
+  membership_rx: watch::Receiver<BrokerMembership>,
 }
 
 impl TestBrokerDiscovery {
   fn new(membership: BrokerMembership) -> Self {
-    Self { membership }
+    let (tx, membership_rx) = watch::channel(membership);
+    drop(tx);
+    Self { membership_rx }
+  }
+
+  fn with_updates(membership: BrokerMembership) -> (Self, watch::Sender<BrokerMembership>) {
+    let (tx, membership_rx) = watch::channel(membership);
+    (Self { membership_rx }, tx)
   }
 }
 
 #[async_trait]
 impl blob_stream_broker_discovery::BrokerDiscovery for TestBrokerDiscovery {
   async fn watch_membership(&self) -> anyhow::Result<watch::Receiver<BrokerMembership>> {
-    let (tx, rx) = watch::channel(self.membership.clone());
-    drop(tx);
-    Ok(rx)
+    Ok(self.membership_rx.clone())
   }
 }
 
@@ -92,6 +99,49 @@ impl super::BrokerTransport for FakeBrokerTransport {
         status: ProduceStatus::PRODUCE_STATUS_OK.into(),
         ..Default::default()
       })
+    })
+  }
+}
+
+struct MembershipUpdateTransport {
+  sent: Mutex<Vec<SentBatch>>,
+  membership_tx: watch::Sender<BrokerMembership>,
+  updated_membership: BrokerMembership,
+}
+
+#[async_trait]
+impl super::BrokerTransport for MembershipUpdateTransport {
+  async fn produce_batch(
+    &self,
+    broker_address: &str,
+    request: blob_stream_proto::protos::blobstream::v1::broker::ProduceBatchRequest,
+    request_timeout: Duration,
+  ) -> anyhow::Result<ProduceBatchResponse> {
+    assert!(!request_timeout.is_zero());
+    let attempt = {
+      let mut sent = self.sent.lock().await;
+      sent.push(SentBatch {
+        broker_address: broker_address.to_string(),
+        request,
+      });
+      sent.len()
+    };
+
+    if attempt == 1 {
+      self
+        .membership_tx
+        .send(self.updated_membership.clone())
+        .map_err(|_| anyhow!("producer membership receiver dropped"))?;
+      return Ok(ProduceBatchResponse {
+        status: ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER.into(),
+        error_message: "lease moved".into(),
+        ..Default::default()
+      });
+    }
+
+    Ok(ProduceBatchResponse {
+      status: ProduceStatus::PRODUCE_STATUS_OK.into(),
+      ..Default::default()
     })
   }
 }
@@ -143,7 +193,6 @@ fn default_config() -> ProducerConfig {
   config.max_batch_records = Some(1);
   config.max_batch_bytes = Some(1_024);
   config.flush_max_delay_ms = Some(1_000);
-  config.max_retries = Some(4);
   config.retry_base_delay_ms = Some(1);
   config.retry_max_delay_ms = Some(8);
   config.retry_deadline_ms = Some(1_000);
@@ -451,6 +500,114 @@ async fn retries_transient_status_until_success() {
 }
 
 #[tokio::test]
+async fn not_lease_holder_waits_longer_when_membership_is_unchanged() {
+  let config = default_config();
+  let transport = FakeBrokerTransport::default();
+  transport
+    .enqueue_response(Ok(ProduceBatchResponse {
+      status: ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER.into(),
+      ..Default::default()
+    }))
+    .await;
+  let clock = FixedRetryClock::new(Instant::now());
+  let mut retry_backoff = producer_retry_backoff(&config);
+  let mut not_lease_holder_retry_backoff = producer_not_lease_holder_retry_backoff();
+  let membership = watch::channel(membership()).1;
+  let topics = HashMap::from([("telemetry".to_string(), topic_config())]);
+  let batch = super::BufferedBatch {
+    topic: "telemetry".to_string(),
+    virtual_partition_id: 16,
+    records: Vec::new(),
+    waiters: Vec::new(),
+  };
+
+  let result = send_batch_with_retry_and_retry_control(
+    &config,
+    &topics,
+    &membership,
+    &transport,
+    &batch,
+    &super::ProducerMetrics::new(&metrics_scope()),
+    &super::ProducerRetryDiagnostics::default(),
+    &clock,
+    &mut retry_backoff,
+    &mut not_lease_holder_retry_backoff,
+  )
+  .await;
+
+  assert!(result.is_ok());
+  assert_eq!(transport.sent.lock().await.len(), 2);
+  let sleeps = clock.sleeps.lock();
+  assert_eq!(sleeps.len(), 1);
+  assert!((Duration::from_millis(125) ..= Duration::from_millis(375)).contains(&sleeps[0]));
+}
+
+#[tokio::test]
+async fn not_lease_holder_membership_update_reroutes_after_settle_delay() {
+  let (discovery, membership_tx) = TestBrokerDiscovery::with_updates(membership());
+  let updated_membership = BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-c".to_string(),
+    address: "c:8080".to_string(),
+  }]);
+  let transport = Arc::new(MembershipUpdateTransport {
+    sent: Mutex::new(Vec::new()),
+    membership_tx,
+    updated_membership,
+  });
+  let producer = ProducerClientImpl::new_with_transport(
+    default_config(),
+    vec![topic_config()],
+    Arc::new(discovery),
+    transport.clone(),
+    metrics_scope(),
+  )
+  .await
+  .unwrap();
+
+  let ack = producer
+    .produce(ProducerRecord::new(
+      "telemetry",
+      b"membership-update-key".to_vec(),
+      vec![7],
+      100,
+    ))
+    .await
+    .unwrap();
+
+  assert_eq!(ack.attempts, 2);
+  let sent = transport.sent.lock().await;
+  assert_eq!(sent.len(), 2);
+  assert_ne!(sent[0].broker_address, sent[1].broker_address);
+  assert_eq!(sent[1].broker_address, "c:8080");
+}
+
+#[tokio::test]
+async fn membership_settle_delay_is_clipped_to_retry_deadline() {
+  let (membership_tx, mut membership_rx) = watch::channel(membership());
+  membership_tx
+    .send(BrokerMembership::new(vec![BrokerNode {
+      node_id: "node-c".to_string(),
+      address: "c:8080".to_string(),
+    }]))
+    .unwrap();
+  let clock = FixedRetryClock::new(Instant::now());
+  let retry_deadline = clock.now() + Duration::from_millis(50);
+  let mut membership_updates_open = true;
+
+  assert!(
+    wait_for_not_lease_holder_retry(
+      &mut membership_rx,
+      &mut membership_updates_open,
+      &clock,
+      Duration::from_millis(250),
+      retry_deadline,
+    )
+    .await
+  );
+  assert_eq!(*clock.sleeps.lock(), vec![Duration::from_millis(50)]);
+}
+
+#[tokio::test]
 async fn batches_by_partition_and_acks_waiters() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
@@ -510,19 +667,15 @@ async fn batches_by_partition_and_acks_waiters() {
 #[tokio::test]
 async fn surfaces_retry_exhaustion_for_transport_errors() {
   let mut config = default_config();
-  config.max_retries = Some(2);
+  config.retry_deadline_ms = Some(10);
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
   let transport = Arc::new(FakeBrokerTransport::default());
-  transport
-    .enqueue_response(Err(anyhow!("network down")))
-    .await;
-  transport
-    .enqueue_response(Err(anyhow!("network down")))
-    .await;
-  transport
-    .enqueue_response(Err(anyhow!("network down")))
-    .await;
+  for _ in 0 .. 16 {
+    transport
+      .enqueue_response(Err(anyhow!("network down")))
+      .await;
+  }
 
   let producer = ProducerClientImpl::new_with_transport(
     config,
@@ -588,13 +741,15 @@ async fn flush_returns_batch_failure_after_notifying_waiters() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
   config.flush_max_delay_ms = Some(60_000);
-  config.max_retries = Some(0);
+  config.retry_deadline_ms = Some(10);
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
   let transport = Arc::new(FakeBrokerTransport::default());
-  transport
-    .enqueue_response(Err(anyhow!("network down")))
-    .await;
+  for _ in 0 .. 16 {
+    transport
+      .enqueue_response(Err(anyhow!("network down")))
+      .await;
+  }
   let producer = Arc::new(
     ProducerClientImpl::new_with_transport(
       config,
@@ -1021,7 +1176,6 @@ fn rejects_retry_backoff_with_base_above_maximum() {
 #[tokio::test]
 async fn retry_deadline_clips_the_retry_delay() {
   let mut config = default_config();
-  config.max_retries = Some(4);
   config.retry_base_delay_ms = Some(100);
   config.retry_max_delay_ms = Some(100);
   config.retry_deadline_ms = Some(10);
@@ -1032,6 +1186,7 @@ async fn retry_deadline_clips_the_retry_delay() {
     .await;
   let clock = FixedRetryClock::new(Instant::now());
   let mut retry_backoff = producer_retry_backoff(&config);
+  let mut not_lease_holder_retry_backoff = producer_not_lease_holder_retry_backoff();
   let membership = watch::channel(membership()).1;
   let topics = HashMap::from([("telemetry".to_string(), topic_config())]);
   let batch = super::BufferedBatch {
@@ -1051,6 +1206,7 @@ async fn retry_deadline_clips_the_retry_delay() {
     &super::ProducerRetryDiagnostics::default(),
     &clock,
     &mut retry_backoff,
+    &mut not_lease_holder_retry_backoff,
   )
   .await;
 
