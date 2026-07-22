@@ -1,13 +1,6 @@
-use super::{
-  BufferedBatch,
-  DEFAULT_ZSTD_LEVEL,
-  FlushPartition,
-  FlushPlan,
-  SegmentEnvelope,
-  WriteConfig,
-  WriteError,
-  WriteMetrics,
-};
+use super::buffer::{BufferedBatch, FlushPartition, FlushPlan};
+use super::metrics::WriteMetrics;
+use super::{DEFAULT_ZSTD_LEVEL, WriteConfig, WriteError};
 use anyhow::{Context, Result};
 use bd_time::OffsetDateTimeExt;
 use blob_stream_blob_store::{BlobKey, BlobStore};
@@ -18,6 +11,7 @@ use blob_stream_types::{
   CompressionCodec,
   Record,
   SnowflakeId,
+  TopicWindowKey,
   VirtualPartitionId,
   Window,
 };
@@ -67,6 +61,36 @@ impl SnowflakeGenerator {
       .next_id(now)
       .context("generate sonyflake id")?;
     Ok(SnowflakeId(value))
+  }
+}
+
+//
+// SegmentEnvelope
+//
+
+#[derive(Debug)]
+struct SegmentEnvelope {
+  window: TopicWindowKey,
+  snowflake_id: SnowflakeId,
+  blob_key: BlobKey,
+  segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
+  record_count: u64,
+  created_ts_ms: i64,
+}
+
+impl SegmentEnvelope {
+  fn into_metadata(
+    self,
+    metadata_published_ts_ms: i64,
+  ) -> blob_stream_metadata_store::SegmentMetadata {
+    blob_stream_metadata_store::SegmentMetadata::new(
+      self.window,
+      self.snowflake_id,
+      self.blob_key,
+      self.segment_index,
+      self.created_ts_ms,
+      metadata_published_ts_ms,
+    )
   }
 }
 

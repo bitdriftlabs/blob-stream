@@ -343,9 +343,11 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
     started_tx,
     release: Arc::clone(&release),
   });
-  let state = Arc::new(parking_lot::Mutex::new(super::super::WriteState::default()));
+  let state = Arc::new(parking_lot::Mutex::new(
+    super::super::super::state::WriteState::default(),
+  ));
   let flush_notifier = Arc::new(tokio::sync::Notify::new());
-  let metrics = super::super::WriteMetrics::new(&metrics_scope());
+  let metrics = super::super::super::metrics::WriteMetrics::new(&metrics_scope());
   let releases = WriteEngineImpl::release_partition_leases(
     &lease_store,
     &state,

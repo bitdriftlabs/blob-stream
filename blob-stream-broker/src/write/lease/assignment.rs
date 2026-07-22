@@ -1,8 +1,16 @@
 #[cfg(test)]
-#[path = "./lease_assignment_test.rs"]
+#[path = "./assignment_test.rs"]
 mod tests;
 
-use super::{TopicInfo, WriteEngineImpl};
+use super::super::allocation::{
+  AllocationTransitionDecision,
+  LeaseExpirationUpdate,
+  begin_allocation_transition,
+};
+use super::super::metrics::WriteMetrics;
+use super::super::state::WriteState;
+use super::super::{TopicInfo, WriteEngineImpl};
+use super::acquire_lease_and_reserve_sequences;
 use bd_log::warn_every;
 use bd_time::OffsetDateTimeExt;
 use blob_stream_broker_discovery::{
@@ -50,7 +58,7 @@ impl WriteEngineImpl {
     owned
   }
 
-  pub(super) fn spawn_lease_self_assignment_loop(
+  pub(in crate::write) fn spawn_lease_self_assignment_loop(
     &self,
     mut membership_rx: watch::Receiver<BrokerMembership>,
   ) {
@@ -194,7 +202,7 @@ impl WriteEngineImpl {
           let now = time_provider.now();
           let now_ts_ms = now.unix_timestamp_ms();
           let transition = loop {
-            match super::begin_allocation_transition(
+            match begin_allocation_transition(
               &state,
               &topic,
               virtual_partition_id,
@@ -203,12 +211,12 @@ impl WriteEngineImpl {
               true,
               base_reservation_size,
             ) {
-              super::AllocationTransitionDecision::Draining => break None,
-              super::AllocationTransitionDecision::Ready => {
+              AllocationTransitionDecision::Draining => break None,
+              AllocationTransitionDecision::Ready => {
                 unreachable!("lease renewal always needs an allocation transition")
               },
-              super::AllocationTransitionDecision::Waiting(notified) => notified.await,
-              super::AllocationTransitionDecision::Claimed(transition) => break Some(transition),
+              AllocationTransitionDecision::Waiting(notified) => notified.await,
+              AllocationTransitionDecision::Claimed(transition) => break Some(transition),
             }
           };
           let Some(transition) = transition else {
@@ -216,7 +224,7 @@ impl WriteEngineImpl {
           };
 
           let reservation_request = transition.reservation;
-          match super::acquire_lease_and_reserve_sequences(
+          match acquire_lease_and_reserve_sequences(
             &lease_store,
             &holder_id,
             key,
@@ -239,7 +247,7 @@ impl WriteEngineImpl {
                 );
               }
               transition.transition.finish_lease_maintenance(
-                super::LeaseExpirationUpdate::Set(Some(lease.lease_expiration_ts_ms)),
+                LeaseExpirationUpdate::Set(Some(lease.lease_expiration_ts_ms)),
                 reservation,
                 transition
                   .records_allocated_since_last_maintenance
@@ -260,7 +268,7 @@ impl WriteEngineImpl {
               }
               transition
                 .transition
-                .finish(super::LeaseExpirationUpdate::Set(None), None);
+                .finish(LeaseExpirationUpdate::Set(None), None);
             },
             Err(error) => {
               if reservation_request.is_some() {
@@ -272,7 +280,7 @@ impl WriteEngineImpl {
               );
               transition
                 .transition
-                .finish(super::LeaseExpirationUpdate::Preserve, None);
+                .finish(LeaseExpirationUpdate::Preserve, None);
             },
           }
         }
@@ -282,9 +290,9 @@ impl WriteEngineImpl {
 
   async fn release_partition_lease(
     lease_store: &Arc<dyn blob_stream_metadata_store::ProducerPartitionLeaseStore>,
-    state: &Arc<parking_lot::Mutex<super::WriteState>>,
+    state: &Arc<parking_lot::Mutex<WriteState>>,
     flush_notifier: &Arc<tokio::sync::Notify>,
-    metrics: &super::WriteMetrics,
+    metrics: &WriteMetrics,
     holder_id: &str,
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
@@ -344,9 +352,9 @@ impl WriteEngineImpl {
 
   async fn release_partition_leases(
     lease_store: &Arc<dyn blob_stream_metadata_store::ProducerPartitionLeaseStore>,
-    state: &Arc<parking_lot::Mutex<super::WriteState>>,
+    state: &Arc<parking_lot::Mutex<WriteState>>,
     flush_notifier: &Arc<tokio::sync::Notify>,
-    metrics: &super::WriteMetrics,
+    metrics: &WriteMetrics,
     holder_id: &str,
     partitions: Vec<(String, VirtualPartitionId)>,
     now_ts_ms: i64,
@@ -372,7 +380,7 @@ impl WriteEngineImpl {
   }
 
   async fn wait_for_partition_drain(
-    state: &Arc<parking_lot::Mutex<super::WriteState>>,
+    state: &Arc<parking_lot::Mutex<WriteState>>,
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
   ) {
@@ -393,7 +401,7 @@ impl WriteEngineImpl {
 }
 
 fn owned_partitions_for_shutdown(
-  state: &Arc<parking_lot::Mutex<super::WriteState>>,
+  state: &Arc<parking_lot::Mutex<WriteState>>,
 ) -> HashSet<(String, VirtualPartitionId)> {
   state.lock().partition_keys().into_iter().collect()
 }
