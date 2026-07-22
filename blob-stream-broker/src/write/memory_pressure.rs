@@ -194,7 +194,7 @@ impl MemoryPressureController {
       );
       let controller = Self::with_source(source, metrics_scope);
       controller.spawn_poller(shutdown_trigger_handle);
-      return controller;
+      controller
     }
 
     #[cfg(not(target_os = "linux"))]
