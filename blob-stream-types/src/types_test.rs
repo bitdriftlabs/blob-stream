@@ -1,4 +1,5 @@
 use super::*;
+use bytes::Bytes;
 
 #[test]
 fn default_metadata_publication_lag_is_fifteen_seconds() {
@@ -25,8 +26,15 @@ fn record_batch_summary() {
 
   assert_eq!(summary.record_count, 3);
   assert_eq!(summary.payload_bytes, 7);
-  assert_eq!(summary.min_event_ts_ms, 1_699_999_999_999);
-  assert_eq!(summary.max_event_ts_ms, 1_700_000_000_999);
+}
+
+#[test]
+fn record_retains_bytes_payload_allocation() {
+  let payload = Bytes::from_static(b"payload");
+  let payload_pointer = payload.as_ptr();
+  let record = new_record(payload, 1_700_000_000_000);
+
+  assert_eq!(record.payload.as_ptr(), payload_pointer);
 }
 
 #[test]

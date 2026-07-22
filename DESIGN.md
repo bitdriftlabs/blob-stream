@@ -137,12 +137,12 @@ traffic, the ratio of reservation rate to record rate should be close to one div
 reservation size. A materially higher ratio indicates allocation waste from ownership churn,
 restarts, or unexpectedly small batches.
 
-The broker may combine several accepted producer batches from the same virtual partition into
-one flushed segment, but it preserves a distinct sequence range and metadata index entry for
-each original batch. Consumers use those batch ranges to skip data already covered by a cursor,
-then expose records in range order. A crash or ownership transfer can leave unused values from a
-reserved block, creating gaps, but a new holder reserves only above the durable high-water mark
-and therefore cannot reuse a successfully reserved value.
+The broker coalesces all accepted producer batches for one virtual partition in a flush plan into
+one stored batch and one metadata index entry. The stored sequence range spans the contiguous
+accepted ranges, and records retain broker acceptance order. Consumers use that range to skip
+data already covered by a cursor, then expose records in range order. A crash or ownership
+transfer can leave unused values from a reserved block, creating gaps, but a new holder reserves
+only above the durable high-water mark and therefore cannot reuse a successfully reserved value.
 
 The broker serializes lease/refill/allocation transitions and durable flush plans for each virtual
 partition within one live broker. Later accepted batches buffer while an earlier plan uploads its
@@ -184,10 +184,11 @@ invariant.
    A partition with a durable plan in progress continues buffering its next epoch until that prior
    plan completes. A single bounded flush scheduler wakes for eligible writes, timer ticks, and
    durable-plan completions; a completion immediately promotes an eligible successor epoch.
-6. A flush serializes each batch as `StoredRecordBatch`, compresses each serialized batch
-   independently, concatenates the stored bytes into a segment blob, uploads the blob, and then
-   writes the segment metadata row. Plans may run concurrently for different virtual partitions,
-   but each virtual partition persists plans in sequence order.
+6. A flush coalesces each virtual partition's accepted batches into one `StoredRecordBatch`,
+  compresses each serialized partition batch independently, concatenates the stored bytes into a
+  segment blob, uploads the blob, and then writes the segment metadata row. Plans may run
+  concurrently for different virtual partitions, but each virtual partition persists plans in
+  sequence order.
 7. Only after both blob upload and metadata write succeed does the broker complete the waiting
    write and return `OK`. A producer acknowledgement therefore represents durable segment
    metadata, not merely in-memory buffering.
@@ -235,11 +236,16 @@ range for a required batch.
 pk = "<topic>#<window_start_unix_seconds>"
 ```
 
-Its sort key is a fixed-width, lexicographically sortable snowflake ID. The row includes the
-blob key, creation time, metadata publication time, optional TTL, and a per-virtual-partition
-index. Each index entry identifies a byte range, sequence range, batch summary, and compression
-setting. Publication time is captured after the blob upload and immediately before the metadata
-write.
+Its sort key is a fixed-width, lexicographically sortable snowflake ID. The top-level row stores
+only `pk`, `sk`, the optional TTL, and `segment_metadata_v1`, a binary protobuf payload. That
+payload contains the blob key, creation and publication times, segment-level compression, and a
+per-virtual-partition index. Each flushed virtual partition has one index entry identifying its
+byte range, sequence range, and stored payload size. Publication time is captured after the blob
+upload and immediately before the metadata write.
+
+The consumer requires every metadata row to use this durable layout. During the testing-only
+cutover, missing, malformed, or legacy rows are skipped with a rate-limited warning rather than
+being decoded through a compatibility path.
 
 Metadata is written only after the blob upload succeeds. Segment metadata TTL is derived from the
 topic retention setting plus the configured DynamoDB TTL buffer. S3 lifecycle expiration is not

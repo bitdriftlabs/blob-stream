@@ -37,7 +37,6 @@ use futures::future::try_join_all;
 use futures::{StreamExt, TryStreamExt, stream};
 use log::{debug, info, trace};
 use protobuf::Message;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
@@ -543,7 +542,7 @@ impl ConsumerReaderImpl {
               continue;
             }
 
-            if !capacity.reserve(batch_metadata.summary.payload_bytes) {
+            if !capacity.reserve(batch_metadata.payload_bytes) {
               capacity_exhausted = true;
               trace!(
                 "consumer deferred batch by prefetch capacity: topic={}, partition={}, \
@@ -552,7 +551,7 @@ impl ConsumerReaderImpl {
                 partition_id,
                 batch_metadata.seq_range.start,
                 batch_metadata.seq_range.end,
-                batch_metadata.summary.payload_bytes
+                batch_metadata.payload_bytes
               );
               scan_state.metadata_batches_deferred_by_capacity = scan_state
                 .metadata_batches_deferred_by_capacity
@@ -1182,7 +1181,7 @@ impl ConsumerReaderImpl {
         &plan.metadata,
         &candidate.batch_metadata,
         candidate.virtual_partition_id,
-        batch_payload.as_ref(),
+        batch_payload,
       )?;
       decoded_batches.push((candidate, batch));
     }
@@ -1196,7 +1195,7 @@ impl ConsumerReaderImpl {
     metadata: &SegmentMetadata,
     batch_metadata: &BatchMetadata,
     virtual_partition_id: VirtualPartitionId,
-    payload: &[u8],
+    payload: bytes::Bytes,
   ) -> Result<ConsumerBatch> {
     trace!(
       "consumer decode batch: topic={}, partition={}, blob_key={}, seq_start={}, seq_end={}",
@@ -1208,14 +1207,14 @@ impl ConsumerReaderImpl {
     );
 
     // Decode in two stages: transport/storage compression first, then logical RecordBatch format.
-    let decoded: Cow<'_, [u8]> = match batch_metadata.compression.codec {
-      CompressionCodec::None => Cow::Borrowed(payload),
+    let decoded = match metadata.compression.codec {
+      CompressionCodec::None => payload,
       CompressionCodec::Zstd => zstd::stream::decode_all(Cursor::new(payload))
-        .map(Cow::Owned)
+        .map(bytes::Bytes::from)
         .map_err(|error| anyhow!("failed to decode zstd batch: {error}"))?,
     };
 
-    let record_batch = StoredRecordBatch::parse_from_bytes(decoded.as_ref())
+    let record_batch = StoredRecordBatch::parse_from_tokio_bytes(&decoded)
       .map_err(|error| anyhow!("failed to decode record batch protobuf: {error}"))?;
 
     // Defensive integrity check: segment index entry and decoded payload must agree on partition.

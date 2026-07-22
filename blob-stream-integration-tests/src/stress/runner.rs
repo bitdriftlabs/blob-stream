@@ -434,7 +434,7 @@ async fn wait_for_broker_readiness(
         let topic_ownership = snapshot
           .ownership
           .iter()
-          .filter(|ownership| ownership.topic == TOPIC)
+          .filter(|ownership| ownership.topic.as_str() == TOPIC)
           .collect::<Vec<_>>();
         snapshot.membership.len() == broker_count
           && topic_ownership.len() == expected_partition_count

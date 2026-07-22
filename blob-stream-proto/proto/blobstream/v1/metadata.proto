@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package blobstream.v1;
+
+// Compact durable metadata for one segment. DynamoDB stores this message as one binary attribute.
+message SegmentMetadataV1 {
+  string blob_key = 1;
+  int64 created_ts_ms = 2;
+  int64 metadata_published_ts_ms = 3;
+  StoredSegmentCompression compression = 4;
+  repeated SegmentPartitionIndex partitions = 5;
+}
+
+// Compression is uniform for every batch in a flushed segment.
+message StoredSegmentCompression {
+  StoredSegmentCompressionCodec codec = 1;
+  int32 level = 2;
+}
+
+enum StoredSegmentCompressionCodec {
+  STORED_SEGMENT_COMPRESSION_CODEC_NONE = 0;
+  STORED_SEGMENT_COMPRESSION_CODEC_ZSTD = 1;
+}
+
+// Batches indexed for a single virtual partition within a segment.
+message SegmentPartitionIndex {
+  uint32 virtual_partition_id = 1;
+  repeated SegmentBatchMetadata batches = 2;
+}
+
+// Consumer-required location and sequence metadata for one stored batch.
+message SegmentBatchMetadata {
+  uint64 seq_start = 1;
+  uint64 seq_end = 2;
+  uint64 byte_start = 3;
+  uint64 byte_end = 4;
+  uint64 payload_bytes = 5;
+}

@@ -1,7 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use blob_stream_proto::protos::blobstream::v1::broker::ProduceStatus;
-use blob_stream_types::{Record, SeqRange, VirtualPartitionId};
+use blob_stream_types::{Record, SeqRange, VirtualPartitionId, serialize_as_string};
+use protobuf::Chars;
 use serde::Serialize;
 use std::time::Duration as StdDuration;
 use thiserror::Error;
@@ -12,7 +13,7 @@ use thiserror::Error;
 
 #[derive(Clone, Debug)]
 pub struct WriteRequest {
-  pub topic: String,
+  pub topic: Chars,
   pub virtual_partition_id: VirtualPartitionId,
   pub records: Vec<Record>,
 }
@@ -58,7 +59,8 @@ pub struct BrokerNodeSnapshot {
 
 #[derive(Debug, Serialize)]
 pub struct BrokerPartitionOwnershipSnapshot {
-  pub topic: String,
+  #[serde(serialize_with = "serialize_as_string")]
+  pub topic: Chars,
   pub virtual_partition_id: VirtualPartitionId,
   pub producer_writer_id: u32,
   pub logical_partition_id: u32,
@@ -101,7 +103,8 @@ pub struct BrokerLeaseSnapshot {
 
 #[derive(Debug, Serialize)]
 pub struct BrokerTopicStateSnapshot {
-  pub name: String,
+  #[serde(serialize_with = "serialize_as_string")]
+  pub name: Chars,
   pub partition_count: u32,
   pub num_writers: u32,
   pub retention_days: u32,
@@ -143,15 +146,15 @@ pub struct SequenceReservationSnapshot {
 #[derive(Debug, Error)]
 pub enum WriteError {
   #[error("unknown topic: {0}")]
-  UnknownTopic(String),
+  UnknownTopic(Chars),
   #[error("invalid virtual partition {virtual_partition_id} for topic {topic}")]
   InvalidPartition {
-    topic: String,
+    topic: Chars,
     virtual_partition_id: VirtualPartitionId,
   },
   #[error("not lease holder for topic {topic} partition {virtual_partition_id}")]
   NotLeaseHolder {
-    topic: String,
+    topic: Chars,
     virtual_partition_id: VirtualPartitionId,
   },
   #[error("broker overloaded: {0}")]

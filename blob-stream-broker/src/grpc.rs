@@ -112,10 +112,12 @@ impl Handler<ProduceBatchRequest, ProduceBatchResponse> for BrokerGrpc {
       request.topic, request.virtual_partition_id, record_count
     );
 
-    let topic = request.topic.to_string();
+    let topic = request.topic;
     let virtual_partition_id = request.virtual_partition_id;
+    // WriteState retains a topic as a map key across requests. Copy it out of the decoded RPC
+    // buffer before handing it to the write path so one short topic cannot retain the full body.
     let write_request = WriteRequest {
-      topic: topic.clone(),
+      topic: topic.to_string().into(),
       virtual_partition_id,
       records: request.records,
     };

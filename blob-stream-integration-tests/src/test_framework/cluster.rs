@@ -490,9 +490,9 @@ fn build_write_engine(
   let mut topics = HashMap::new();
   for topic in [TOPIC, SECOND_TOPIC] {
     topics.insert(
-      topic.to_string(),
+      topic.into(),
       TopicInfo {
-        name: topic.to_string(),
+        name: topic.into(),
         partition_count,
         num_writers: topic_num_writers,
         retention_days: 7,

@@ -1,26 +1,25 @@
-use crate::{DynamoCapacityMetrics, MetadataStore, SegmentMetadata};
+use crate::{DynamoCapacityMetrics, MetadataStore, SegmentMetadata, codec};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnConsumedCapacity};
-use blob_stream_blob_store::BlobKey;
-use blob_stream_types::{
-  BatchMetadata,
-  SnowflakeId,
-  TopicWindowKey,
-  VirtualPartitionId,
-  format_unix_timestamp_ms,
-};
+use bd_log::warn_every;
+use blob_stream_types::{SnowflakeId, TopicWindowKey, format_unix_timestamp_ms};
+use bytes::Bytes;
 use log::{debug, trace};
-use serde::{Deserialize, Serialize};
+use protobuf::Chars;
 use std::collections::HashMap;
-use std::convert::TryFrom;
+use time::ext::NumericalDuration;
 
 #[cfg(test)]
 #[path = "./dynamo_test.rs"]
 mod tests;
 
 const ATTR_PK: &str = "pk";
+const ATTR_SK: &str = "sk";
+const ATTR_SEGMENT_METADATA_V1: &str = "segment_metadata_v1";
+const ATTR_TTL_EPOCH_SECONDS: &str = "ttl_epoch_seconds";
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
 //
@@ -31,7 +30,7 @@ const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 pub struct DynamoMetadataStore {
   client: Client,
   table_name: String,
-  topic_retention_days: HashMap<String, u32>,
+  topic_retention_days: HashMap<Chars, u32>,
   ttl_buffer_seconds: i64,
   capacity_metrics: Option<DynamoCapacityMetrics>,
 }
@@ -41,7 +40,7 @@ impl DynamoMetadataStore {
   pub fn new(
     client: Client,
     table_name: impl Into<String>,
-    topic_retention_days: HashMap<String, u32>,
+    topic_retention_days: HashMap<Chars, u32>,
     ttl_buffer_seconds: u32,
     capacity_metrics: Option<DynamoCapacityMetrics>,
   ) -> Self {
@@ -73,7 +72,9 @@ impl DynamoMetadataStore {
   }
 
   fn metadata_ttl_epoch_seconds(&self, metadata: &SegmentMetadata) -> Option<i64> {
-    let retention_days = self.topic_retention_days.get(&metadata.window.topic)?;
+    let retention_days = self
+      .topic_retention_days
+      .get(metadata.window.topic.as_str())?;
     if *retention_days == 0 {
       return None;
     }
@@ -103,8 +104,24 @@ impl MetadataStore for DynamoMetadataStore {
       metadata.snowflake_id.as_u64()
     );
     let ttl_epoch_seconds = self.metadata_ttl_epoch_seconds(&metadata);
-    let item = DynamoSegmentItem::from_metadata(metadata, ttl_epoch_seconds);
-    let item = serde_dynamo::to_item(item)?;
+    let encoded = codec::encode(metadata)?;
+    let mut item = HashMap::from([
+      (
+        ATTR_PK.to_string(),
+        AttributeValue::S(encoded.partition_key),
+      ),
+      (ATTR_SK.to_string(), AttributeValue::S(encoded.sort_key)),
+      (
+        ATTR_SEGMENT_METADATA_V1.to_string(),
+        AttributeValue::B(Blob::new(encoded.payload)),
+      ),
+    ]);
+    if let Some(ttl_epoch_seconds) = ttl_epoch_seconds {
+      item.insert(
+        ATTR_TTL_EPOCH_SECONDS.to_string(),
+        AttributeValue::N(ttl_epoch_seconds.to_string()),
+      );
+    }
 
     let response = self
       .client
@@ -159,6 +176,7 @@ impl MetadataStore for DynamoMetadataStore {
         .query()
         .table_name(&self.table_name)
         .key_condition_expression(key_condition)
+        .projection_expression(format!("{ATTR_PK}, {ATTR_SK}, {ATTR_SEGMENT_METADATA_V1}"))
         .set_expression_attribute_values(Some(values))
         .consistent_read(false);
       if let Some(key) = start_key.take() {
@@ -170,17 +188,17 @@ impl MetadataStore for DynamoMetadataStore {
         .send()
         .await?;
       self.record_read_capacity(response.consumed_capacity.as_ref());
-      segments.extend(
-        response
-          .items
-          .unwrap_or_default()
-          .into_iter()
-          .map(|item| {
-            let entry: DynamoSegmentItem = serde_dynamo::from_item(item)?;
-            SegmentMetadata::try_from(entry)
-          })
-          .collect::<Result<Vec<_>>>()?,
-      );
+      for item in response.items.unwrap_or_default() {
+        match Self::decode_item(item) {
+          Ok(metadata) => segments.push(metadata),
+          Err(error) => {
+            warn_every!(
+              15.seconds(),
+              "metadata(dynamo) skipped noncompliant segment: {error}"
+            );
+          },
+        }
+      }
 
       let Some(key) = response.last_evaluated_key else {
         break;
@@ -197,89 +215,32 @@ impl MetadataStore for DynamoMetadataStore {
   }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct DynamoSegmentItem {
-  #[serde(rename = "pk")]
-  partition_key: String,
-  #[serde(rename = "sk")]
-  sort_key: String,
-  blob_key: String,
-  segment_index: HashMap<String, Vec<BatchMetadata>>,
-  created_ts_ms: i64,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  metadata_published_ts_ms: Option<i64>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  #[serde(rename = "ttl_epoch_seconds")]
-  ttl_epoch_seconds: Option<i64>,
-}
-
-impl DynamoSegmentItem {
-  fn from_metadata(metadata: SegmentMetadata, ttl_epoch_seconds: Option<i64>) -> Self {
-    let partition_key = metadata.partition_key();
-    let sort_key = metadata.snowflake_key();
-    let blob_key = metadata.blob_key.as_str().to_string();
-    let created_ts_ms = metadata.created_ts_ms;
-    let metadata_published_ts_ms = Some(metadata.metadata_published_ts_ms);
-
-    let segment_index = metadata
-      .segment_index
-      .into_iter()
-      .map(|(virtual_partition_id, batches)| (virtual_partition_id.to_string(), batches))
-      .collect();
-
-    Self {
-      partition_key,
-      sort_key,
-      blob_key,
-      segment_index,
-      created_ts_ms,
-      metadata_published_ts_ms,
-      ttl_epoch_seconds,
-    }
-  }
-}
-
-impl TryFrom<DynamoSegmentItem> for SegmentMetadata {
-  type Error = anyhow::Error;
-
-  fn try_from(item: DynamoSegmentItem) -> Result<Self> {
-    let segment_index = item
-      .segment_index
-      .into_iter()
-      .map(|(virtual_partition_id, batches)| {
-        let virtual_partition_id =
-          virtual_partition_id
-            .parse::<VirtualPartitionId>()
-            .map_err(|error| {
-              anyhow!("invalid virtual_partition_id {virtual_partition_id}: {error}")
-            })?;
-        Ok((virtual_partition_id, batches))
-      })
-      .collect::<Result<HashMap<_, _>>>()?;
-
-    let (topic, window_start) = item
-      .partition_key
-      .rsplit_once('#')
-      .ok_or_else(|| anyhow!("invalid metadata partition key {}", item.partition_key))?;
-    let window_start_unix_seconds = window_start
-      .parse::<i64>()
-      .map_err(|error| anyhow!("invalid metadata window start {window_start}: {error}"))?;
-    let sort_key = item.sort_key;
-
-    Ok(Self {
-      window: TopicWindowKey {
-        topic: topic.to_string(),
-        window_start_unix_seconds,
+impl DynamoMetadataStore {
+  fn decode_item(mut item: HashMap<String, AttributeValue>) -> Result<SegmentMetadata> {
+    let partition_key = Self::take_string_attribute(&mut item, ATTR_PK)?;
+    let sort_key = Self::take_string_attribute(&mut item, ATTR_SK)?;
+    let payload = item
+      .remove(ATTR_SEGMENT_METADATA_V1)
+      .ok_or_else(|| anyhow!("metadata row {partition_key}/{sort_key} is missing v1 payload"))?;
+    let payload = match payload {
+      AttributeValue::B(payload) => Bytes::from(payload.into_inner()),
+      _ => {
+        return Err(anyhow!(
+          "metadata row {partition_key}/{sort_key} has a non-binary v1 payload"
+        ));
       },
-      snowflake_id: SnowflakeId(
-        sort_key
-          .parse::<u64>()
-          .map_err(|error| anyhow!("invalid snowflake id {sort_key}: {error}"))?,
-      ),
-      blob_key: BlobKey::from(item.blob_key),
-      segment_index,
-      created_ts_ms: item.created_ts_ms,
-      metadata_published_ts_ms: item.metadata_published_ts_ms.unwrap_or(item.created_ts_ms),
-    })
+    };
+    codec::decode(&partition_key, &sort_key, &payload)
+  }
+
+  fn take_string_attribute(
+    item: &mut HashMap<String, AttributeValue>,
+    attribute_name: &str,
+  ) -> Result<String> {
+    match item.remove(attribute_name) {
+      Some(AttributeValue::S(value)) => Ok(value),
+      Some(_) => Err(anyhow!("metadata row has a non-string {attribute_name}")),
+      None => Err(anyhow!("metadata row is missing {attribute_name}")),
+    }
   }
 }

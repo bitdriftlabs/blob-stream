@@ -123,9 +123,9 @@ fn rejects_broker_configuration_without_writer_id() {
 #[test]
 fn rejects_writer_id_outside_a_topic_range() {
   let topics = HashMap::from([(
-    "telemetry".to_string(),
+    "telemetry".into(),
     TopicInfo {
-      name: "telemetry".to_string(),
+      name: "telemetry".into(),
       partition_count: 2,
       num_writers: 1,
       retention_days: 7,

@@ -58,35 +58,35 @@ fn balanced_assignment_is_fair_and_independent_of_input_order() {
   };
   let partitions = vec![
     BrokerPartition {
-      topic: "client_reports".to_string(),
+      topic: "client_reports".into(),
       virtual_partition_id: 0,
     },
     BrokerPartition {
-      topic: "client_reports".to_string(),
+      topic: "client_reports".into(),
       virtual_partition_id: 1,
     },
     BrokerPartition {
-      topic: "dif_uploads".to_string(),
+      topic: "dif_uploads".into(),
       virtual_partition_id: 0,
     },
     BrokerPartition {
-      topic: "dif_uploads".to_string(),
+      topic: "dif_uploads".into(),
       virtual_partition_id: 1,
     },
     BrokerPartition {
-      topic: "insights".to_string(),
+      topic: "insights".into(),
       virtual_partition_id: 0,
     },
     BrokerPartition {
-      topic: "insights".to_string(),
+      topic: "insights".into(),
       virtual_partition_id: 1,
     },
     BrokerPartition {
-      topic: "logging".to_string(),
+      topic: "logging".into(),
       virtual_partition_id: 0,
     },
     BrokerPartition {
-      topic: "logging".to_string(),
+      topic: "logging".into(),
       virtual_partition_id: 1,
     },
   ];
@@ -113,17 +113,17 @@ fn balanced_assignment_is_fair_and_independent_of_input_order() {
 
 #[test]
 fn writer_virtual_partitions_selects_only_the_requested_writer_range() {
-  let partitions = writer_virtual_partitions([("telemetry".to_string(), 2, 3)], 1);
+  let partitions = writer_virtual_partitions([("telemetry".into(), 2, 3)], 1);
 
   assert_eq!(
     partitions,
     vec![
       BrokerPartition {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 2,
       },
       BrokerPartition {
-        topic: "telemetry".to_string(),
+        topic: "telemetry".into(),
         virtual_partition_id: 3,
       },
     ]

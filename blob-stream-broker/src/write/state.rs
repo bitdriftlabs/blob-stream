@@ -2,6 +2,7 @@ use super::buffer::BufferState;
 use blob_stream_broker_discovery::BrokerMembership;
 use blob_stream_types::{SeqRange, VirtualPartitionId};
 use log::debug;
+use protobuf::Chars;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -13,8 +14,8 @@ use tokio::sync::Notify;
 #[derive(Debug, Default)]
 pub(super) struct WriteState {
   pub(super) membership: BrokerMembership,
-  pub(super) topics: HashMap<String, TopicState>,
-  pub(super) last_flush_topic: Option<String>,
+  pub(super) topics: HashMap<Chars, TopicState>,
+  pub(super) last_flush_topic: Option<Chars>,
 }
 
 impl WriteState {
@@ -23,9 +24,19 @@ impl WriteState {
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
   ) -> &mut PartitionState {
+    if self.topics.contains_key(topic) {
+      return self
+        .topics
+        .get_mut(topic)
+        .expect("topic was present immediately before mutable lookup")
+        .partitions
+        .entry(virtual_partition_id)
+        .or_default();
+    }
+
     self
       .topics
-      .entry(topic.to_string())
+      .entry(topic.to_string().into())
       .or_default()
       .partitions
       .entry(virtual_partition_id)
@@ -54,7 +65,7 @@ impl WriteState {
       .and_then(|topic_state| topic_state.partitions.get_mut(&virtual_partition_id))
   }
 
-  pub(super) fn partition_keys(&self) -> Vec<(String, VirtualPartitionId)> {
+  pub(super) fn partition_keys(&self) -> Vec<(Chars, VirtualPartitionId)> {
     self
       .topics
       .iter()

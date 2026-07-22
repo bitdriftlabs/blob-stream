@@ -501,7 +501,7 @@ impl ProducerBrokerTransport for InMemoryProducerTransport {
       // Duplicate faults replay the same request into the write engine and return the
       // first response to keep producer semantics stable.
       let write_request = WriteRequest {
-        topic: request.topic.to_string(),
+        topic: request.topic.clone(),
         virtual_partition_id: request.virtual_partition_id,
         records: request.records.clone(),
       };

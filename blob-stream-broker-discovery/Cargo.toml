@@ -15,6 +15,7 @@ futures.workspace      = true
 k8s-openapi.workspace  = true
 kube.workspace         = true
 log.workspace          = true
+protobuf.workspace     = true
 time.workspace         = true
 tokio.workspace        = true
 tokio-stream.workspace = true

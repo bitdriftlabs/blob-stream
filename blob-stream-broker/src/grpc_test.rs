@@ -53,9 +53,9 @@ async fn returns_overloaded_when_admission_controller_rejects() -> Result<()> {
   let engine = Arc::new(WriteEngineImpl::new(
     WriteConfig::with_defaults(),
     HashMap::from([(
-      "telemetry".to_string(),
+      "telemetry".into(),
       TopicInfo {
-        name: "telemetry".to_string(),
+        name: "telemetry".into(),
         partition_count: 1,
         num_writers: 1,
         retention_days: 7,
