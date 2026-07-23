@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "./transport_test.rs"]
+mod tests;
+
 use crate::test_framework::event_log::TestEventLog;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -12,9 +16,10 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 };
 use protobuf::Chars;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, oneshot, watch};
 use tokio::time::sleep as tokio_sleep;
 
 //
@@ -95,6 +100,7 @@ pub enum NetworkOperation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NetworkFault {
   Drop,
+  DropResponse,
   Delay(Duration),
   Duplicate { copies: u32 },
   Reorder { delay: Duration },
@@ -145,6 +151,64 @@ pub struct NetworkFaultController {
 }
 
 //
+// ManualNetworkScheduler
+//
+
+/// Releases transport delay and reorder waits only when a test explicitly advances it.
+#[derive(Clone)]
+pub struct ManualNetworkScheduler {
+  generation: watch::Sender<u64>,
+  active_sleeps: Arc<AtomicUsize>,
+  sleep_registered: Arc<Notify>,
+}
+
+impl Default for ManualNetworkScheduler {
+  fn default() -> Self {
+    let (generation, _receiver) = watch::channel(0);
+    Self {
+      generation,
+      active_sleeps: Arc::new(AtomicUsize::new(0)),
+      sleep_registered: Arc::new(Notify::new()),
+    }
+  }
+}
+
+impl ManualNetworkScheduler {
+  /// Wait until the expected number of transport waits have registered.
+  pub async fn wait_until_sleeping(&self, expected_sleepers: usize) {
+    loop {
+      let notified = self.sleep_registered.notified();
+      tokio::pin!(notified);
+      notified.as_mut().enable();
+      if self.active_sleeps.load(Ordering::Acquire) >= expected_sleepers {
+        return;
+      }
+      notified.await;
+    }
+  }
+
+  /// Release all waits that were registered before this call.
+  pub fn advance(&self) {
+    self
+      .generation
+      .send_modify(|generation| *generation = generation.saturating_add(1));
+  }
+
+  async fn sleep(&self, _duration: Duration) {
+    let mut generations = self.generation.subscribe();
+    let generation = *generations.borrow_and_update();
+    self.active_sleeps.fetch_add(1, Ordering::Release);
+    self.sleep_registered.notify_waiters();
+    while *generations.borrow_and_update() <= generation {
+      if generations.changed().await.is_err() {
+        break;
+      }
+    }
+    self.active_sleeps.fetch_sub(1, Ordering::Release);
+  }
+}
+
+//
 // NetworkFaultControllerState
 //
 
@@ -155,6 +219,7 @@ struct NetworkFaultControllerState {
   rules: Vec<ActiveNetworkFaultRule>,
   script_steps: Vec<FaultScriptStep>,
   event_log: Option<TestEventLog>,
+  manual_scheduler: Option<ManualNetworkScheduler>,
 }
 
 //
@@ -173,6 +238,7 @@ struct ActiveNetworkFaultRule {
 #[derive(Default)]
 struct NetworkFaultEffects {
   drop_request: bool,
+  drop_response: bool,
   partition: bool,
   delay: Option<Duration>,
   reorder_delay: Option<Duration>,
@@ -195,6 +261,13 @@ impl Default for NetworkFaultController {
 impl NetworkFaultController {
   pub async fn attach_event_log(&self, event_log: TestEventLog) {
     self.inner.lock().await.event_log = Some(event_log);
+  }
+
+  /// Replace wall-clock transport sleeps with test-controlled manual scheduling.
+  pub async fn enable_manual_scheduling(&self) -> ManualNetworkScheduler {
+    let scheduler = ManualNetworkScheduler::default();
+    self.inner.lock().await.manual_scheduler = Some(scheduler.clone());
+    scheduler
   }
 
   pub async fn enable_fault(&self, rule: NetworkFaultRule) -> u64 {
@@ -244,6 +317,9 @@ impl NetworkFaultController {
         NetworkFault::Drop => {
           effects.drop_request = true;
         },
+        NetworkFault::DropResponse => {
+          effects.drop_response = true;
+        },
         NetworkFault::Delay(delay) => {
           effects.delay = Some(max_duration(effects.delay, *delay));
         },
@@ -271,6 +347,7 @@ impl NetworkFaultController {
       .retain(|entry| entry.rule.remaining_hits != Some(0));
     let event_log = guard.event_log.clone();
     let status = if effects.drop_request
+      || effects.drop_response
       || effects.partition
       || effects.delay.is_some()
       || effects.reorder_delay.is_some()
@@ -296,6 +373,39 @@ impl NetworkFaultController {
     }
 
     effects
+  }
+
+  async fn record_produce_event(
+    &self,
+    node_id: &str,
+    status: &'static str,
+    detail: Option<String>,
+  ) {
+    let event_log = self.inner.lock().await.event_log.clone();
+    if let Some(event_log) = event_log {
+      event_log
+        .record(
+          "transport",
+          describe_network_operation(NetworkOperation::ProduceBatch),
+          Some(node_id.to_string()),
+          status,
+          detail,
+        )
+        .await;
+    }
+  }
+
+  async fn sleep(&self, duration: Duration) {
+    let scheduler = self.inner.lock().await.manual_scheduler.clone();
+    if let Some(scheduler) = scheduler {
+      scheduler.sleep(duration).await;
+    } else {
+      tokio_sleep(duration).await;
+    }
+  }
+
+  async fn manual_scheduler(&self) -> Option<ManualNetworkScheduler> {
+    self.inner.lock().await.manual_scheduler.clone()
   }
 }
 
@@ -420,6 +530,89 @@ impl BrokerTransport for InMemoryTestTransport {
 struct InMemoryProducerTransport {
   engines: StdMutex<HashMap<String, Arc<dyn WriteEngine>>>,
   fault_controller: NetworkFaultController,
+  reorder_coordinator: ReorderCoordinator,
+}
+
+//
+// ReorderCoordinator
+//
+
+/// Coordinates a pair of faulted requests so the second reaches the broker before the first.
+struct ReorderCoordinator {
+  state: Mutex<ReorderCoordinatorState>,
+}
+
+#[derive(Default)]
+struct ReorderCoordinatorState {
+  next_generation: u64,
+  waiters_by_node: HashMap<String, ReorderWaiter>,
+}
+
+struct ReorderWaiter {
+  generation: u64,
+  release: oneshot::Sender<()>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ReorderOutcome {
+  FirstReleased,
+  FirstTimedOut,
+  SecondReleased,
+}
+
+impl ReorderCoordinator {
+  #[cfg(test)]
+  async fn rendezvous(&self, node_id: &str, max_wait: Duration) -> ReorderOutcome {
+    self
+      .rendezvous_with_scheduler(node_id, max_wait, None)
+      .await
+  }
+
+  async fn rendezvous_with_scheduler(
+    &self,
+    node_id: &str,
+    max_wait: Duration,
+    scheduler: Option<ManualNetworkScheduler>,
+  ) -> ReorderOutcome {
+    let (generation, waiting) = {
+      let mut state = self.state.lock().await;
+      if let Some(waiter) = state.waiters_by_node.remove(node_id) {
+        let _ = waiter.release.send(());
+        return ReorderOutcome::SecondReleased;
+      }
+
+      let generation = state.next_generation;
+      state.next_generation = state.next_generation.saturating_add(1);
+      let (release, waiting) = oneshot::channel();
+      state.waiters_by_node.insert(
+        node_id.to_string(),
+        ReorderWaiter {
+          generation,
+          release,
+        },
+      );
+      (generation, waiting)
+    };
+
+    let released = if scheduler.is_some() {
+      waiting.await.is_ok()
+    } else {
+      tokio::time::timeout(max_wait, waiting).await.is_ok()
+    };
+    if released {
+      return ReorderOutcome::FirstReleased;
+    }
+
+    let mut state = self.state.lock().await;
+    if state
+      .waiters_by_node
+      .get(node_id)
+      .is_some_and(|waiter| waiter.generation == generation)
+    {
+      state.waiters_by_node.remove(node_id);
+    }
+    ReorderOutcome::FirstTimedOut
+  }
 }
 
 //
@@ -431,6 +624,9 @@ impl InMemoryProducerTransport {
     Self {
       engines: StdMutex::new(HashMap::new()),
       fault_controller,
+      reorder_coordinator: ReorderCoordinator {
+        state: Mutex::new(ReorderCoordinatorState::default()),
+      },
     }
   }
 
@@ -486,13 +682,26 @@ impl ProducerBrokerTransport for InMemoryProducerTransport {
       ));
     }
     if let Some(delay) = effects.delay {
-      tokio_sleep(delay).await;
+      self.fault_controller.sleep(delay).await;
     }
     if let Some(delay) = effects.reorder_delay {
-      tokio_sleep(delay).await;
+      let scheduler = self.fault_controller.manual_scheduler().await;
+      let (status, detail) = match self
+        .reorder_coordinator
+        .rendezvous_with_scheduler(node_id, delay, scheduler)
+        .await
+      {
+        ReorderOutcome::FirstReleased => ("reorder_released", Some("role=first".to_string())),
+        ReorderOutcome::FirstTimedOut => ("reorder_expired", Some("role=first".to_string())),
+        ReorderOutcome::SecondReleased => ("reorder_released", Some("role=second".to_string())),
+      };
+      self
+        .fault_controller
+        .record_produce_event(node_id, status, detail)
+        .await;
     }
     if let Some(duration) = effects.timeout {
-      tokio_sleep(duration).await;
+      self.fault_controller.sleep(duration).await;
       return Err(anyhow!("in-memory transport timed out for node {node_id}"));
     }
 
@@ -548,6 +757,20 @@ impl ProducerBrokerTransport for InMemoryProducerTransport {
           Some(format!("copies={copies}")),
         )
         .await;
+    }
+
+    if effects.drop_response {
+      self
+        .fault_controller
+        .record_produce_event(
+          node_id,
+          "response_dropped",
+          Some("broker_completed=true".to_string()),
+        )
+        .await;
+      return Err(anyhow!(
+        "in-memory transport dropped response after broker completed request for node {node_id}"
+      ));
     }
 
     first_response.ok_or_else(|| anyhow!("in-memory transport did not produce a response"))

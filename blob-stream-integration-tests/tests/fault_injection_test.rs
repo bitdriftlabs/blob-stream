@@ -1,25 +1,20 @@
 use anyhow::Result;
 use bd_server_stats::stats::Collector;
+use bd_time::TimeProvider;
 use blob_stream_consumer::{
   ConsumerIterator,
-  ConsumerIteratorImpl,
   ConsumerReadConfig,
   ConsumerReaderImpl,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
-  MembershipCoordinationSource,
   NextResult,
 };
 use blob_stream_integration_tests::test_framework as framework;
-use blob_stream_metadata_store::{
-  ConsumerGroupAssignmentOutcome,
-  ConsumerGroupCommitOutcome,
-  ConsumerGroupHeartbeatOutcome,
-  ConsumerGroupLeaseKey,
-};
 use blob_stream_producer::{ProducerClient, ProducerError, ProducerRecord};
 use framework::{
   ClusterHarness,
   IntegrationResources,
+  ManualProducerRetryClock,
+  ManualTimeProvider,
   NetworkFault,
   NetworkFaultRule,
   NetworkOperation,
@@ -32,24 +27,28 @@ use framework::{
   TestConsumerReader,
   TestEventMatcher,
   WINDOW_SIZE_SECONDS,
+  append_reader_delivery_traces,
   consumer_runtime_config,
-  drain_reader_until,
+  drain_reader_until_with_trace,
   produce_message,
   producer_config,
   producer_topic,
+  reader_delivery_counts,
+  rescan_reader_with_trace,
 };
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{Instant, sleep};
+use time::{Duration as TimeDuration, OffsetDateTime};
+use tokio::time::{Instant, timeout};
 
 fn metrics_scope(component: &str) -> bd_server_stats::stats::Scope {
   Collector::default().scope(component)
 }
 
 // High-level: validates producer retry behavior under deterministic dropped transport requests.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn network_drop_produce_retry_no_loss() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let mut cluster = ClusterHarness::builder(&resources, 2)
@@ -65,38 +64,84 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
       target_node_id: None,
       operation: NetworkOperation::ProduceBatch,
       fault: NetworkFault::Drop,
-      remaining_hits: Some(1),
+      remaining_hits: Some(2),
     })
     .await;
 
+  let retry_clock = Arc::new(ManualProducerRetryClock::new(Instant::now()));
   let producer = cluster
-    .create_producer(producer_config(), vec![producer_topic()])
+    .producer_builder(producer_config(), vec![producer_topic()])
+    .retry_clock(retry_clock.clone())
+    .build()
     .await?;
 
   let mut expected_ids = HashSet::new();
-  let mut seen_retry = false;
   let mut produced_partitions = HashSet::new();
+  let first_id = "fit-001-0";
+  let first_produce = producer.produce(ProducerRecord::new(
+    TOPIC.into(),
+    b"fit-001-key-0".to_vec(),
+    first_id.as_bytes().to_vec().into(),
+    framework::now_unix_seconds() * 1_000,
+  ));
+  tokio::pin!(first_produce);
+  let fault_matcher = TestEventMatcher {
+    category: Some("transport".to_string()),
+    operation: Some("produce_batch".to_string()),
+    key_contains: None,
+    status: Some("fault_applied".to_string()),
+  };
+  let first_fault = timeout(Duration::from_secs(5), async {
+    tokio::select! {
+      event = cluster.wait_for_event_after(&fault_matcher, None, Duration::from_secs(5)) => event,
+      result = &mut first_produce => Err(anyhow::anyhow!(
+        "produce completed before the injected transport drop: {result:?}"
+      )),
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("producer did not issue the injected transport request"))??;
+  let _second_fault = cluster
+    .wait_for_event_after(
+      &fault_matcher,
+      Some(first_fault.sequence),
+      Duration::from_secs(5),
+    )
+    .await?;
+  timeout(Duration::from_secs(5), retry_clock.wait_until_sleeping())
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not enter retry backoff after transport drop"))?;
+  assert!(
+    retry_clock.advance_to_next_sleep().await,
+    "transport-drop retry backoff was not registered"
+  );
+  let first_ack = timeout(Duration::from_secs(5), &mut first_produce)
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not recover after retry clock advance"))??;
+  assert_eq!(
+    first_ack.attempts, 3,
+    "two injected transport drops must require the explicitly released retry"
+  );
+  expected_ids.insert(first_id.to_string());
+  produced_partitions.insert(first_ack.virtual_partition_id);
 
-  for message_id in 0 .. 12 {
+  for message_id in 1 .. 12 {
     let id = format!("fit-001-{message_id}");
     let key = format!("fit-001-key-{message_id}").into_bytes();
     let ack = produce_message(&producer, key, &id).await?;
-    if ack.attempts > 1 {
-      seen_retry = true;
-    }
+    assert_eq!(
+      ack.attempts, 1,
+      "post-fault request must not retry after the fault budget is consumed"
+    );
     produced_partitions.insert(ack.virtual_partition_id);
     expected_ids.insert(id);
   }
-
-  assert!(
-    seen_retry,
-    "expected at least one retry after injected drop fault"
-  );
 
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      metadata_visibility_delay_ms: Some(0),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -109,28 +154,22 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
     None,
   )?;
 
-  let mut consumed_ids = HashSet::new();
-  drain_reader_until(
+  let deliveries = drain_reader_until_with_trace(
     &mut reader,
-    &mut consumed_ids,
     expected_ids.len(),
+    framework::now_unix_seconds().saturating_add(3),
     Instant::now() + Duration::from_secs(15),
   )
   .await?;
-
-  assert_eq!(consumed_ids, expected_ids);
-
-  let _fault_event = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("transport".to_string()),
-        operation: Some("produce_batch".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(5),
-    )
-    .await?;
+  let delivered_id_counts = reader_delivery_counts(&deliveries);
+  assert_eq!(
+    delivered_id_counts.keys().cloned().collect::<HashSet<_>>(),
+    expected_ids
+  );
+  assert!(
+    delivered_id_counts.values().all(|count| *count == 1),
+    "dropped pre-persistence requests must be read exactly once: {deliveries:?}"
+  );
 
   let _scan_event = cluster
     .wait_for_event(
@@ -150,9 +189,154 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
   Ok(())
 }
 
+// High-level: validates that a response lost after broker persistence produces two committed,
+// duplicate logical records through the in-process producer, broker, and consumer-group path.
+#[tokio::test]
+async fn network_response_loss_after_persistence_retries_with_duplicate_batch() -> Result<()> {
+  let mut cluster = ClusterHarness::in_memory(1).start().await?;
+  let controller = cluster
+    .network_fault_controller()
+    .expect("in-memory transport should expose a fault controller");
+  controller
+    .enable_fault(NetworkFaultRule {
+      target_node_id: None,
+      operation: NetworkOperation::ProduceBatch,
+      fault: NetworkFault::DropResponse,
+      remaining_hits: Some(1),
+    })
+    .await;
+
+  let producer = cluster
+    .create_producer(producer_config(), vec![producer_topic()])
+    .await?;
+  let hooks = cluster.lifecycle_hooks();
+  let mut persisted_gate = hooks
+    .arm(framework::LifecycleEvent::BrokerMetadataPersisted)
+    .await?;
+  let produce = produce_message(
+    &producer,
+    b"fit-response-loss-key".to_vec(),
+    "fit-response-loss",
+  );
+  tokio::pin!(produce);
+
+  timeout(Duration::from_secs(5), async {
+    tokio::select! {
+      result = &mut produce => Err(anyhow::anyhow!(
+        "produce completed before the broker metadata-persisted gate: {result:?}"
+      )),
+      reached = persisted_gate.wait_until_reached() => reached,
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("broker did not persist metadata for response-loss request"))??;
+
+  persisted_gate.release()?;
+  let ack = timeout(Duration::from_secs(5), &mut produce)
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not recover after response loss"))??;
+  assert!(
+    ack.attempts == 2,
+    "expected exactly one retry after broker-completed response loss, got {} attempts",
+    ack.attempts
+  );
+
+  let mut runtime = consumer_runtime_config("fit-response-loss-member");
+  runtime
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow::anyhow!("response-loss consumer read config missing"))?
+    .metadata_visibility_delay_ms = Some(0);
+  let group = runtime
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow::anyhow!("response-loss consumer group config missing"))?;
+  let mut prefetch_gate = cluster
+    .lifecycle_hooks()
+    .arm(framework::LifecycleEvent::ConsumerPrefetchBatchBuffered)
+    .await?;
+  let mut consumer = cluster.create_consumer(&runtime).await?;
+  consumer.start()?;
+
+  timeout(Duration::from_secs(5), prefetch_gate.wait_until_reached())
+    .await
+    .map_err(|_| anyhow::anyhow!("consumer did not prefetch the retried response-loss batch"))??;
+  prefetch_gate.release()?;
+
+  let mut delivered_offsets = Vec::new();
+  let mut delivered_id_counts = HashMap::new();
+  while delivered_offsets.len() < 2 {
+    let next = timeout(Duration::from_secs(5), consumer.next())
+      .await
+      .map_err(|_| anyhow::anyhow!("consumer did not deliver the next response-loss record"))??;
+    match next {
+      NextResult::Revoked(revoked) => revoked.complete().await,
+      NextResult::Record(record) => {
+        let id = String::from_utf8(record.record.payload.to_vec())?;
+        *delivered_id_counts.entry(id).or_insert(0_usize) += 1;
+        delivered_offsets.push((record.virtual_partition_id, record.offset));
+        consumer.store_offset(record.virtual_partition_id, record.offset)?;
+        consumer.commit().await?;
+      },
+    }
+  }
+
+  assert_eq!(
+    delivered_id_counts,
+    HashMap::from([("fit-response-loss".to_string(), 2)]),
+    "at-least-once response loss must deliver the application record twice"
+  );
+  assert!(
+    delivered_offsets
+      .iter()
+      .all(|(partition_id, _)| *partition_id == ack.virtual_partition_id),
+    "response-loss records must remain on the acknowledged virtual partition"
+  );
+  assert_eq!(
+    delivered_offsets
+      .iter()
+      .map(|(_, offset)| *offset)
+      .collect::<Vec<_>>(),
+    vec![0, 1],
+    "duplicate attempts must have consecutive delivery offsets"
+  );
+
+  let leases = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?;
+  let committed_lease = leases
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == ack.virtual_partition_id)
+    .ok_or_else(|| anyhow::anyhow!("missing committed consumer group lease"))?;
+  assert_eq!(committed_lease.owner_id, group.member_id.as_str());
+  assert!(
+    committed_lease
+      .committed_cursor
+      .as_ref()
+      .is_some_and(|cursor| { cursor.seq_end == 1 && cursor.source_checkpoint.is_some() }),
+    "consumer group must durably commit the second duplicate delivery with its source checkpoint: \
+     {committed_lease:?}"
+  );
+
+  assert!(
+    cluster
+      .event_log()
+      .snapshot()
+      .await
+      .iter()
+      .any(|event| event.status == "response_dropped"),
+    "expected transport event log to record post-persistence response loss"
+  );
+
+  Box::new(consumer).shutdown().await?;
+  cluster.shutdown().await;
+  Ok(())
+}
+
 // High-level: validates that deterministic delay+reorder transport faults preserve data and
 // per-partition sequence monotonicity during reads.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let mut cluster = ClusterHarness::builder(&resources, 2)
@@ -163,6 +347,7 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
   let controller = cluster
     .network_fault_controller()
     .expect("in-memory transport should expose a fault controller");
+  let scheduler = controller.enable_manual_scheduling().await;
   controller
     .enable_fault(NetworkFaultRule {
       target_node_id: None,
@@ -182,20 +367,41 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
     })
     .await;
 
-  let producer = cluster
+  let first_producer = cluster
+    .create_producer(producer_config(), vec![producer_topic()])
+    .await?;
+  let second_producer = cluster
     .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
   let mut expected_ids = HashSet::new();
-  for message_id in 0 .. 48 {
-    let id = format!("fit-002-{message_id}");
-    produce_message(
-      &producer,
-      format!("fit-002-key-{}", message_id % 12).into_bytes(),
-      &id,
-    )
-    .await?;
-    expected_ids.insert(id);
+  for pair in 0 .. 24 {
+    let first_id = format!("fit-002-{}", pair * 2);
+    let second_id = format!("fit-002-{}", (pair * 2) + 1);
+    let key = format!("fit-002-key-{}", pair % 12).into_bytes();
+    let produce_pair = async {
+      tokio::try_join!(
+        produce_message(&first_producer, key.clone(), &first_id),
+        produce_message(&second_producer, key, &second_id),
+      )
+    };
+    tokio::pin!(produce_pair);
+    tokio::select! {
+      result = &mut produce_pair => {
+        return Err(anyhow::anyhow!(
+          "delay/reorder pair completed before both transport delays registered: {result:?}"
+        ));
+      },
+      () = scheduler.wait_until_sleeping(2) => {},
+    }
+    scheduler.advance();
+    timeout(Duration::from_secs(5), &mut produce_pair)
+      .await
+      .map_err(|_| {
+        anyhow::anyhow!("delay/reorder pair did not complete after scheduler advance")
+      })??;
+    expected_ids.insert(first_id.clone());
+    expected_ids.insert(second_id.clone());
   }
 
   let mut reader = ConsumerReaderImpl::new(
@@ -214,22 +420,24 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
     None,
   )?;
 
-  let mut consumed_ids = HashSet::new();
+  let mut deliveries = Vec::new();
   let mut last_seq_end_by_partition = HashMap::new();
+  let reader_now = framework::now_unix_seconds().saturating_add(3);
   let deadline = Instant::now() + Duration::from_secs(45);
 
-  while consumed_ids.len() < expected_ids.len() {
+  while reader_delivery_counts(&deliveries).len() < expected_ids.len() {
     if Instant::now() >= deadline {
       anyhow::bail!(
-        "deadline exceeded while validating delay/reorder monotonicity: expected={}, consumed={}",
+        "all manually scheduled delay/reorder pairs completed but the reader did not observe \
+         every record: expected={}, consumed={}",
         expected_ids.len(),
-        consumed_ids.len()
+        reader_delivery_counts(&deliveries).len()
       );
     }
 
-    let batches = reader.read_available(framework::now_unix_seconds()).await?;
+    let batches = reader.read_available(reader_now).await?;
     if batches.is_empty() {
-      sleep(Duration::from_millis(50)).await;
+      tokio::task::yield_now().await;
       continue;
     }
 
@@ -244,31 +452,34 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
         );
       }
       last_seq_end_by_partition.insert(batch.virtual_partition_id, batch.seq_range.end);
-
-      for record in batch.records {
-        let id = String::from_utf8(record.payload.to_vec())?;
-        consumed_ids.insert(id);
-      }
+      append_reader_delivery_traces(vec![batch], &mut deliveries)?;
     }
   }
 
-  assert_eq!(consumed_ids, expected_ids);
+  let delivered_id_counts = reader_delivery_counts(&deliveries);
+  assert_eq!(
+    delivered_id_counts.keys().cloned().collect::<HashSet<_>>(),
+    expected_ids
+  );
+  assert!(
+    delivered_id_counts.values().all(|count| *count == 1),
+    "delay/reorder transport must not duplicate reader delivery: {deliveries:?}"
+  );
   assert!(
     !last_seq_end_by_partition.is_empty(),
     "expected to observe at least one partition cursor"
   );
 
-  let _fault_event = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("transport".to_string()),
-        operation: Some("produce_batch".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(5),
-    )
-    .await?;
+  let events = cluster.event_log().snapshot().await;
+  assert!(
+    events.windows(2).any(|events| {
+      events[0].status == "reorder_released"
+        && events[0].detail.as_deref() == Some("role=second")
+        && events[1].status == "reorder_released"
+        && events[1].detail.as_deref() == Some("role=first")
+    }),
+    "expected an in-memory transport reorder to release the second request before the first"
+  );
 
   cluster.shutdown().await;
   resources.cleanup().await;
@@ -277,7 +488,7 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
 
 // High-level: validates active-broker partition fault handling with deterministic reroute to a
 // standby broker and no-loss completion.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn network_partition_active_broker_takeover() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let mut cluster = ClusterHarness::builder(&resources, 2)
@@ -289,6 +500,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
   assert_eq!(nodes.len(), 2, "expected a two-broker cluster");
   let active_node = nodes[0].clone();
   let standby_node = nodes[1].clone();
+  cluster.set_active_nodes(vec![active_node.clone()]);
 
   let controller = cluster
     .network_fault_controller()
@@ -302,15 +514,64 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     })
     .await;
 
+  let retry_clock = Arc::new(ManualProducerRetryClock::new(Instant::now()));
   let producer = cluster
-    .create_producer(producer_config(), vec![producer_topic()])
+    .producer_builder(producer_config(), vec![producer_topic()])
+    .retry_clock(retry_clock.clone())
+    .build()
     .await?;
 
   let mut expected_ids = HashSet::new();
-  let mut seen_retry = false;
   let mut produced_partitions = HashSet::new();
+  let first_id = "fit-003-pre-reroute-0";
+  let first_produce = producer.produce(ProducerRecord::new(
+    TOPIC.into(),
+    b"fit-003-key-pre-0".to_vec(),
+    first_id.as_bytes().to_vec().into(),
+    framework::now_unix_seconds() * 1_000,
+  ));
+  tokio::pin!(first_produce);
+  let fault_matcher = TestEventMatcher {
+    category: Some("transport".to_string()),
+    operation: Some("produce_batch".to_string()),
+    key_contains: Some(active_node.node_id.to_string()),
+    status: Some("fault_applied".to_string()),
+  };
+  let first_fault = timeout(Duration::from_secs(5), async {
+    tokio::select! {
+      event = cluster.wait_for_event_after(&fault_matcher, None, Duration::from_secs(5)) => event,
+      result = &mut first_produce => Err(anyhow::anyhow!(
+        "produce completed before the active-broker partition fault: {result:?}"
+      )),
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("producer did not reach the active-broker partition fault"))??;
+  let _second_fault = cluster
+    .wait_for_event_after(
+      &fault_matcher,
+      Some(first_fault.sequence),
+      Duration::from_secs(5),
+    )
+    .await?;
+  timeout(Duration::from_secs(5), retry_clock.wait_until_sleeping())
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not enter backoff after partition faults"))?;
+  assert!(
+    retry_clock.advance_to_next_sleep().await,
+    "partition-fault retry backoff was not registered"
+  );
+  let first_ack = timeout(Duration::from_secs(5), &mut first_produce)
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not recover after partition retry advance"))??;
+  assert_eq!(
+    first_ack.attempts, 3,
+    "two active-broker partition faults must require the explicitly released retry"
+  );
+  expected_ids.insert(first_id.to_string());
+  produced_partitions.insert(first_ack.virtual_partition_id);
 
-  for message_id in 0 .. 12 {
+  for message_id in 1 .. 12 {
     let id = format!("fit-003-pre-reroute-{message_id}");
     let ack = produce_message(
       &producer,
@@ -318,9 +579,10 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
       &id,
     )
     .await?;
-    if ack.attempts > 1 {
-      seen_retry = true;
-    }
+    assert_eq!(
+      ack.attempts, 1,
+      "pre-reroute request must not retry after the partition-fault budget is consumed"
+    );
     produced_partitions.insert(ack.virtual_partition_id);
     expected_ids.insert(id);
   }
@@ -328,8 +590,32 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
   // Deterministically reroute producer discovery to the standby node after the active-node
   // partition fault has been exercised.
   cluster.set_active_nodes(vec![standby_node.clone()]);
+  let first_post_id = "fit-003-post-reroute-12";
+  let first_post_produce = producer.produce(ProducerRecord::new(
+    TOPIC.into(),
+    b"fit-003-key-post-12".to_vec(),
+    first_post_id.as_bytes().to_vec().into(),
+    framework::now_unix_seconds() * 1_000,
+  ));
+  tokio::pin!(first_post_produce);
+  let first_post_ack = timeout(Duration::from_secs(5), async {
+    tokio::select! {
+      result = &mut first_post_produce => result,
+      () = retry_clock.wait_until_sleeping() => {
+        assert!(
+          retry_clock.advance_to_next_sleep().await,
+          "membership-settlement retry was not registered"
+        );
+        (&mut first_post_produce).await
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("producer did not reroute after active-broker switch"))??;
+  expected_ids.insert(first_post_id.to_string());
+  produced_partitions.insert(first_post_ack.virtual_partition_id);
 
-  for message_id in 12 .. 36 {
+  for message_id in 13 .. 36 {
     let id = format!("fit-003-post-reroute-{message_id}");
     let ack = produce_message(
       &producer,
@@ -337,22 +623,19 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
       &id,
     )
     .await?;
-    if ack.attempts > 1 {
-      seen_retry = true;
-    }
+    assert_eq!(
+      ack.attempts, 1,
+      "post-reroute request must not retry after producer routes settle"
+    );
     produced_partitions.insert(ack.virtual_partition_id);
     expected_ids.insert(id);
   }
-
-  assert!(
-    seen_retry,
-    "expected retries while active broker was partitioned before reroute"
-  );
 
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      metadata_visibility_delay_ms: Some(0),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -365,28 +648,22 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     None,
   )?;
 
-  let mut consumed_ids = HashSet::new();
-  drain_reader_until(
+  let deliveries = drain_reader_until_with_trace(
     &mut reader,
-    &mut consumed_ids,
     expected_ids.len(),
+    framework::now_unix_seconds().saturating_add(3),
     Instant::now() + Duration::from_secs(30),
   )
   .await?;
-
-  assert_eq!(consumed_ids, expected_ids);
-
-  let _active_fault_event = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("transport".to_string()),
-        operation: Some("produce_batch".to_string()),
-        key_contains: Some(active_node.node_id.to_string()),
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(5),
-    )
-    .await?;
+  let delivered_id_counts = reader_delivery_counts(&deliveries);
+  assert_eq!(
+    delivered_id_counts.keys().cloned().collect::<HashSet<_>>(),
+    expected_ids
+  );
+  assert!(
+    delivered_id_counts.values().all(|count| *count == 1),
+    "partitioned broker retries must be read exactly once: {deliveries:?}"
+  );
 
   let _standby_ok_event = cluster
     .wait_for_event(
@@ -405,10 +682,10 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
   Ok(())
 }
 
-// High-level: validates timeout fault retry exhaustion at the configured deadline and verifies
-// deterministic recovery once the fault window is consumed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn broker_response_timeout_retry_deadline_respected() -> Result<()> {
+// High-level: validates retry exhaustion at the configured deadline and deterministic recovery
+// once the transport fault window is consumed.
+#[tokio::test]
+async fn producer_retry_deadline_respected_after_transport_failures() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let mut cluster = ClusterHarness::builder(&resources, 2)
     .in_memory_transport()
@@ -422,29 +699,85 @@ async fn broker_response_timeout_retry_deadline_respected() -> Result<()> {
     .enable_fault(NetworkFaultRule {
       target_node_id: None,
       operation: NetworkOperation::ProduceBatch,
-      fault: NetworkFault::Timeout(Duration::from_millis(200)),
-      // The 500 ms producer deadline expires while the third timeout is in flight.
+      fault: NetworkFault::Drop,
       remaining_hits: Some(3),
     })
     .await;
 
   let mut config = producer_config();
   config.retry_deadline_ms = Some(500);
+  let retry_clock = Arc::new(ManualProducerRetryClock::new(Instant::now()));
   let producer = cluster
-    .create_producer(config, vec![producer_topic()])
+    .producer_builder(config, vec![producer_topic()])
+    .retry_clock(retry_clock.clone())
+    .build()
     .await?;
 
-  let exhausted = producer
-    .produce(ProducerRecord::new(
-      TOPIC.into(),
-      b"fit-004-timeout".to_vec(),
-      b"fit-004-timeout".to_vec().into(),
-      framework::now_unix_seconds() * 1_000,
-    ))
-    .await;
+  let exhausted = producer.produce(ProducerRecord::new(
+    TOPIC.into(),
+    b"fit-004-timeout".to_vec(),
+    b"fit-004-timeout".to_vec().into(),
+    framework::now_unix_seconds() * 1_000,
+  ));
+  tokio::pin!(exhausted);
+  let fault_matcher = TestEventMatcher {
+    category: Some("transport".to_string()),
+    operation: Some("produce_batch".to_string()),
+    key_contains: None,
+    status: Some("fault_applied".to_string()),
+  };
+  let first_fault = timeout(Duration::from_secs(5), async {
+    tokio::select! {
+      event = cluster.wait_for_event_after(&fault_matcher, None, Duration::from_secs(5)) => event,
+      result = &mut exhausted => Err(anyhow::anyhow!(
+        "produce completed before its first transport fault: {result:?}"
+      )),
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("producer did not issue its first transport request"))??;
+  timeout(Duration::from_secs(5), retry_clock.wait_until_sleeping())
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not enter its first retry backoff"))?;
+  assert!(
+    retry_clock.advance_to_next_sleep().await,
+    "first retry backoff was not registered"
+  );
+
+  let second_fault = cluster
+    .wait_for_event_after(
+      &fault_matcher,
+      Some(first_fault.sequence),
+      Duration::from_secs(5),
+    )
+    .await?;
+  timeout(Duration::from_secs(5), retry_clock.wait_until_sleeping())
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not enter its second retry backoff"))?;
+  assert!(
+    retry_clock.advance_to_next_sleep().await,
+    "second retry backoff was not registered"
+  );
+
+  let third_fault = cluster
+    .wait_for_event_after(
+      &fault_matcher,
+      Some(second_fault.sequence),
+      Duration::from_secs(5),
+    )
+    .await?;
+  retry_clock.advance(Duration::from_millis(500));
+
+  let exhausted = timeout(Duration::from_secs(5), &mut exhausted)
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not exhaust retries after deadline advance"))?;
   assert!(
     matches!(exhausted, Err(ProducerError::RetriesExhausted(_))),
-    "expected retries exhausted after timeout fault, got {exhausted:?}"
+    "expected retries exhausted after transport faults, got {exhausted:?}"
+  );
+  assert!(
+    third_fault.sequence > second_fault.sequence,
+    "third transport fault must be distinct from the prior retry"
   );
 
   let recovery_ack = produce_message(
@@ -474,27 +807,18 @@ async fn broker_response_timeout_retry_deadline_respected() -> Result<()> {
     None,
   )?;
 
-  let mut consumed_ids = HashSet::new();
-  drain_reader_until(
+  let deliveries = drain_reader_until_with_trace(
     &mut reader,
-    &mut consumed_ids,
     1,
+    framework::now_unix_seconds().saturating_add(3),
     Instant::now() + Duration::from_secs(15),
   )
   .await?;
-  assert!(consumed_ids.contains("fit-004-recovery-message"));
-
-  let _fault_event = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("transport".to_string()),
-        operation: Some("produce_batch".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(5),
-    )
-    .await?;
+  assert_eq!(
+    reader_delivery_counts(&deliveries),
+    HashMap::from([("fit-004-recovery-message".to_string(), 1)]),
+    "recovery after retry exhaustion must be read exactly once"
+  );
 
   cluster.shutdown().await;
   resources.cleanup().await;
@@ -502,11 +826,12 @@ async fn broker_response_timeout_retry_deadline_respected() -> Result<()> {
 }
 
 // High-level: validates transient blob put failures recover via retries with no final data loss.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let mut cluster = ClusterHarness::builder(&resources, 2)
     .in_memory_transport()
+    .blob_store(resources.s3_blob_store())
     .start()
     .await?;
 
@@ -523,14 +848,65 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
     })
     .await;
 
+  let retry_clock = Arc::new(ManualProducerRetryClock::new(Instant::now()));
   let producer = cluster
-    .create_producer(producer_config(), vec![producer_topic()])
+    .producer_builder(producer_config(), vec![producer_topic()])
+    .retry_clock(retry_clock.clone())
+    .build()
     .await?;
 
   let mut expected_ids = HashSet::new();
-  let mut seen_retry = false;
   let mut produced_partitions = HashSet::new();
-  for message_id in 0 .. 24 {
+  let first_id = "fit-005-0";
+  let first_produce = producer.produce(ProducerRecord::new(
+    TOPIC.into(),
+    b"fit-005-key-0".to_vec(),
+    first_id.as_bytes().to_vec().into(),
+    framework::now_unix_seconds() * 1_000,
+  ));
+  tokio::pin!(first_produce);
+  let fault_matcher = TestEventMatcher {
+    category: Some("store".to_string()),
+    operation: Some("blob_put".to_string()),
+    key_contains: None,
+    status: Some("fault_applied".to_string()),
+  };
+  let mut previous_fault = None;
+  for retry_number in 1 ..= 3 {
+    let fault = timeout(Duration::from_secs(5), async {
+      tokio::select! {
+        event = cluster.wait_for_event_after(
+          &fault_matcher,
+          previous_fault,
+          Duration::from_secs(5),
+        ) => event,
+        result = &mut first_produce => Err(anyhow::anyhow!(
+          "produce completed before blob-put fault {retry_number}: {result:?}"
+        )),
+      }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not reach blob-put fault {retry_number}"))??;
+    previous_fault = Some(fault.sequence);
+    timeout(Duration::from_secs(5), retry_clock.wait_until_sleeping())
+      .await
+      .map_err(|_| anyhow::anyhow!("producer did not enter blob-put retry {retry_number}"))?;
+    assert!(
+      retry_clock.advance_to_next_sleep().await,
+      "blob-put retry {retry_number} was not registered"
+    );
+  }
+  let first_ack = timeout(Duration::from_secs(5), &mut first_produce)
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not recover after blob-put retries"))??;
+  assert_eq!(
+    first_ack.attempts, 4,
+    "three blob-put failures must require three explicit retries"
+  );
+  expected_ids.insert(first_id.to_string());
+  produced_partitions.insert(first_ack.virtual_partition_id);
+
+  for message_id in 1 .. 24 {
     let id = format!("fit-005-{message_id}");
     let ack = produce_message(
       &producer,
@@ -538,27 +914,24 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
       &id,
     )
     .await?;
-    if ack.attempts > 1 {
-      seen_retry = true;
-    }
+    assert_eq!(
+      ack.attempts, 1,
+      "post-fault blob-put request must not retry after the fault budget is consumed"
+    );
     produced_partitions.insert(ack.virtual_partition_id);
     expected_ids.insert(id);
   }
-
-  assert!(
-    seen_retry,
-    "expected retries after transient blob put failures were injected"
-  );
 
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      metadata_visibility_delay_ms: Some(0),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
     HashMap::new(),
-    resources.blob_store(),
+    resources.s3_blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
     1,
@@ -566,27 +939,22 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
     None,
   )?;
 
-  let mut consumed_ids = HashSet::new();
-  drain_reader_until(
+  let deliveries = drain_reader_until_with_trace(
     &mut reader,
-    &mut consumed_ids,
     expected_ids.len(),
+    framework::now_unix_seconds().saturating_add(3),
     Instant::now() + Duration::from_secs(30),
   )
   .await?;
-  assert_eq!(consumed_ids, expected_ids);
-
-  let _store_fault_event = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("store".to_string()),
-        operation: Some("blob_put".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(5),
-    )
-    .await?;
+  let delivered_id_counts = reader_delivery_counts(&deliveries);
+  assert_eq!(
+    delivered_id_counts.keys().cloned().collect::<HashSet<_>>(),
+    expected_ids
+  );
+  assert!(
+    delivered_id_counts.values().all(|count| *count == 1),
+    "transient blob-put retries must be read exactly once: {deliveries:?}"
+  );
 
   cluster.shutdown().await;
   resources.cleanup().await;
@@ -594,11 +962,12 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
 }
 
 // High-level: validates transient blob get failures during consume recover via reader re-scan.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let mut cluster = ClusterHarness::builder(&resources, 2)
     .in_memory_transport()
+    .blob_store(resources.s3_blob_store())
     .start()
     .await?;
 
@@ -637,11 +1006,12 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      metadata_visibility_delay_ms: Some(0),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
     HashMap::new(),
-    resources.blob_store(),
+    resources.s3_blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
     1,
@@ -649,42 +1019,43 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
     None,
   )?;
 
-  let mut consumed_ids = HashSet::new();
-  let mut saw_read_error = false;
-  let deadline = Instant::now() + Duration::from_secs(45);
-  while consumed_ids.len() < expected_ids.len() {
-    if Instant::now() >= deadline {
-      anyhow::bail!(
-        "deadline exceeded while recovering from blob get faults: expected={}, consumed={}",
-        expected_ids.len(),
-        consumed_ids.len()
-      );
+  let mut deliveries = Vec::new();
+  let reader_now = framework::now_unix_seconds().saturating_add(1);
+  for attempt in 0 .. 5 {
+    let mut fault_error = None;
+    for _ in 0 .. 20 {
+      match rescan_reader_with_trace(&mut reader, reader_now, &mut deliveries).await {
+        Ok(0) => {},
+        Ok(batch_count) => {
+          anyhow::bail!(
+            "reader returned {batch_count} batches before scripted blob fault {attempt}"
+          );
+        },
+        Err(error) => {
+          fault_error = Some(error);
+          break;
+        },
+      }
     }
-
-    match reader.read_available(framework::now_unix_seconds()).await {
-      Ok(batches) if batches.is_empty() => {
-        sleep(Duration::from_millis(50)).await;
-      },
-      Ok(batches) => {
-        for batch in batches {
-          for record in batch.records {
-            let id = String::from_utf8(record.payload.to_vec())?;
-            consumed_ids.insert(id);
-          }
-        }
-      },
-      Err(_error) => {
-        saw_read_error = true;
-        sleep(Duration::from_millis(50)).await;
-      },
-    }
+    let error = fault_error.ok_or_else(|| {
+      anyhow::anyhow!("reader did not reach scripted blob fault {attempt} after direct rescans")
+    })?;
+    assert!(
+      error.to_string().contains("transient get failure"),
+      "blob rescan {attempt} failed for an unexpected reason: {error:#}"
+    );
   }
+  rescan_reader_with_trace(&mut reader, reader_now, &mut deliveries).await?;
 
-  assert!(
-    saw_read_error,
-    "expected at least one read error during transient blob get failures"
+  let delivered_id_counts = reader_delivery_counts(&deliveries);
+  assert_eq!(
+    delivered_id_counts.keys().cloned().collect::<HashSet<_>>(),
+    expected_ids
   );
-  assert_eq!(consumed_ids, expected_ids);
+  assert!(
+    delivered_id_counts.values().all(|count| *count == 1),
+    "blob-get rescan must not duplicate reader delivery: {deliveries:?}"
+  );
 
   let _store_fault_event = cluster
     .wait_for_event(
@@ -703,17 +1074,15 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
   Ok(())
 }
 
-// High-level: validates producer acknowledgements are only returned once metadata write succeeds.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// High-level: validates metadata-write retry exhaustion and recovery with a group-level durable
+// acknowledgement oracle.
+#[tokio::test]
 async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
-  let resources = IntegrationResources::create().await?;
-  let mut cluster = ClusterHarness::builder(&resources, 2)
-    .in_memory_transport()
-    .start()
-    .await?;
-
-  resources
+  let mut cluster = ClusterHarness::in_memory(1).start().await?;
+  let fault_controller = cluster
     .store_fault_controller()
+    .expect("in-memory harness should expose a store fault controller");
+  fault_controller
     .enable_fault(StoreFaultRule {
       domain: StoreFaultDomain::Metadata,
       operation: StoreFaultOperation::MetadataWriteSegment,
@@ -721,100 +1090,186 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
       action: StoreFaultAction::Fail {
         message: "transient metadata write failure".to_string(),
       },
-      // The 50 ms producer deadline expires after retrying the three immediate failures.
       remaining_hits: Some(3),
     })
     .await;
 
   let mut config = producer_config();
   config.retry_deadline_ms = Some(50);
+  let retry_clock = Arc::new(ManualProducerRetryClock::new(Instant::now()));
   let producer = cluster
-    .create_producer(config, vec![producer_topic()])
+    .producer_builder(config, vec![producer_topic()])
+    .retry_clock(retry_clock.clone())
+    .build()
     .await?;
 
-  let failed_ack = producer
-    .produce(ProducerRecord::new(
-      TOPIC.into(),
-      b"fit-007-failed-key".to_vec(),
-      b"fit-007-failed".to_vec().into(),
-      framework::now_unix_seconds() * 1_000,
-    ))
-    .await;
+  let failed_produce = producer.produce(ProducerRecord::new(
+    TOPIC.into(),
+    b"fit-007-key".to_vec(),
+    b"fit-007-failed".to_vec().into(),
+    framework::now_unix_seconds() * 1_000,
+  ));
+  tokio::pin!(failed_produce);
+
+  let metadata_fault_matcher = TestEventMatcher {
+    category: Some("store".to_string()),
+    operation: Some("metadata_write_segment".to_string()),
+    key_contains: None,
+    status: Some("fault_applied".to_string()),
+  };
+  let first_fault = timeout(Duration::from_secs(5), async {
+    tokio::select! {
+      event = cluster.wait_for_event_after(
+        &metadata_fault_matcher,
+        None,
+        Duration::from_secs(5),
+      ) => event,
+      result = &mut failed_produce => Err(anyhow::anyhow!(
+        "produce completed before the first metadata write fault: {result:?}"
+      )),
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("producer did not issue its first metadata write"))??;
+  timeout(Duration::from_secs(5), retry_clock.wait_until_sleeping())
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not enter its first metadata retry backoff"))?;
   assert!(
-    failed_ack.is_err(),
-    "expected first produce to fail when metadata writes are faulted"
+    retry_clock.advance_to_next_sleep().await,
+    "first metadata retry backoff was not registered"
   );
 
-  let success_ack = produce_message(
-    &producer,
-    b"fit-007-success-key".to_vec(),
-    "fit-007-success",
-  )
-  .await?;
-
-  let mut reader = ConsumerReaderImpl::new(
-    ConsumerReadConfig {
-      topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      ..Default::default()
-    },
-    vec![success_ack.virtual_partition_id],
-    HashMap::new(),
-    resources.blob_store(),
-    resources.metadata_store(),
-    &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
-    None,
-  )?;
-
-  let mut consumed_ids = HashSet::new();
-  drain_reader_until(
-    &mut reader,
-    &mut consumed_ids,
-    1,
-    Instant::now() + Duration::from_secs(15),
-  )
-  .await?;
-
-  assert!(consumed_ids.contains("fit-007-success"));
-  assert!(
-    !consumed_ids.contains("fit-007-failed"),
-    "failed produce must not have produced a consumable phantom acknowledgement"
-  );
-
-  let _fault_event = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("store".to_string()),
-        operation: Some("metadata_write_segment".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
+  let second_fault = cluster
+    .wait_for_event_after(
+      &metadata_fault_matcher,
+      Some(first_fault.sequence),
       Duration::from_secs(5),
     )
     .await?;
+  timeout(Duration::from_secs(5), retry_clock.wait_until_sleeping())
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not enter its second metadata retry backoff"))?;
+  assert!(
+    retry_clock.advance_to_next_sleep().await,
+    "second metadata retry backoff was not registered"
+  );
 
-  let _success_event = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("store".to_string()),
-        operation: Some("metadata_write_segment".to_string()),
-        key_contains: None,
-        status: Some("ok".to_string()),
-      },
+  let third_fault = cluster
+    .wait_for_event_after(
+      &metadata_fault_matcher,
+      Some(second_fault.sequence),
       Duration::from_secs(5),
     )
     .await?;
+  timeout(Duration::from_secs(5), retry_clock.wait_until_sleeping())
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not enter its final metadata retry backoff"))?;
+  retry_clock.advance(Duration::from_millis(50));
+
+  let failed_ack = timeout(Duration::from_secs(5), &mut failed_produce)
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not exhaust retries after deadline advance"))?;
+  assert!(
+    matches!(failed_ack, Err(ProducerError::RetriesExhausted(_))),
+    "expected retry exhaustion after three metadata write failures, got {failed_ack:?}"
+  );
+  assert!(
+    third_fault.sequence > second_fault.sequence,
+    "third metadata fault must be distinct from the prior retry"
+  );
+
+  let success_id = "fit-007-success";
+  let marker_id = "fit-007-marker";
+  let success_ack = produce_message(&producer, b"fit-007-key".to_vec(), success_id).await?;
+  let marker_ack = produce_message(&producer, b"fit-007-key".to_vec(), marker_id).await?;
+  assert_eq!(
+    marker_ack.virtual_partition_id, success_ack.virtual_partition_id,
+    "same-key recovery marker must remain on the failed request partition"
+  );
+
+  let mut runtime = consumer_runtime_config("fit-007-member");
+  runtime
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow::anyhow!("metadata retry consumer read config missing"))?
+    .metadata_visibility_delay_ms = Some(0);
+  let group = runtime
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow::anyhow!("metadata retry consumer group config missing"))?;
+  let mut consumer = cluster.create_consumer(&runtime).await?;
+  consumer.start()?;
+
+  let (marker_partition, marker_offset, delivery_counts, delivered_ids) =
+    timeout(Duration::from_secs(5), async {
+      let mut delivery_counts = HashMap::new();
+      let mut delivered_ids = Vec::new();
+      loop {
+        match consumer.next().await? {
+          NextResult::Revoked(revoked) => revoked.complete().await,
+          NextResult::Record(record) => {
+            let id = String::from_utf8(record.record.payload.to_vec())?;
+            *delivery_counts.entry(id.clone()).or_insert(0usize) += 1;
+            delivered_ids.push(id.clone());
+            consumer.store_offset(record.virtual_partition_id, record.offset)?;
+            consumer.commit().await?;
+            if id == marker_id {
+              return Ok::<_, anyhow::Error>((
+                record.virtual_partition_id,
+                record.offset,
+                delivery_counts,
+                delivered_ids,
+              ));
+            }
+          },
+        }
+      }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("consumer group did not receive recovery marker"))??;
+  assert_eq!(
+    marker_partition, success_ack.virtual_partition_id,
+    "recovery marker must remain on the original virtual partition"
+  );
+  assert_eq!(
+    delivered_ids,
+    vec![success_id.to_string(), marker_id.to_string()],
+    "failed metadata write became visible before the recovery marker"
+  );
+  assert_eq!(
+    delivery_counts,
+    HashMap::from([(success_id.to_string(), 1), (marker_id.to_string(), 1)]),
+    "recovery traffic must be delivered exactly once through the marker"
+  );
+
+  let leases = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?;
+  let committed_lease = leases
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == success_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow::anyhow!("missing committed recovery consumer lease"))?;
+  assert_eq!(committed_lease.owner_id, group.member_id.as_str());
+  assert!(
+    committed_lease
+      .committed_cursor
+      .as_ref()
+      .is_some_and(|cursor| {
+        cursor.seq_end >= marker_offset && cursor.source_checkpoint.is_some()
+      }),
+    "consumer group must durably commit the recovery marker: {committed_lease:?}"
+  );
+
+  Box::new(consumer).shutdown().await?;
 
   cluster.shutdown().await;
-  resources.cleanup().await;
   Ok(())
 }
 
 // High-level: validates stale metadata scan windows do not regress cursor progress or duplicate
 // terminal consumption.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let mut cluster = ClusterHarness::builder(&resources, 2)
@@ -853,6 +1308,7 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      metadata_visibility_delay_ms: Some(0),
       ..Default::default()
     },
     (0 .. framework::PARTITION_COUNT).collect(),
@@ -865,68 +1321,56 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
     None,
   )?;
 
-  let mut consumed_ids = HashSet::new();
-  let deadline = Instant::now() + Duration::from_secs(45);
-  while consumed_ids.len() < expected_ids.len() {
-    if Instant::now() >= deadline {
-      anyhow::bail!(
-        "deadline exceeded while recovering from stale metadata scans: expected={}, consumed={}",
-        expected_ids.len(),
-        consumed_ids.len()
-      );
-    }
-
-    let batches = reader.read_available(framework::now_unix_seconds()).await?;
-    if batches.is_empty() {
-      sleep(Duration::from_millis(50)).await;
-      continue;
-    }
-
-    for batch in batches {
-      for record in batch.records {
-        let id = String::from_utf8(record.payload.to_vec())?;
-        consumed_ids.insert(id);
-      }
-    }
+  let mut deliveries = Vec::new();
+  let reader_now = framework::now_unix_seconds().saturating_add(1);
+  for _ in 0 .. 8 {
+    rescan_reader_with_trace(&mut reader, reader_now, &mut deliveries).await?;
   }
 
-  assert_eq!(consumed_ids, expected_ids);
+  let fault_events = resources.store_fault_controller().events().await;
+  let stale_scan_fault_count = fault_events
+    .iter()
+    .filter(|event| {
+      event.domain == StoreFaultDomain::Metadata
+        && event.operation == StoreFaultOperation::MetadataScanWindow
+        && matches!(event.action, Some(StoreFaultAction::StaleRead))
+    })
+    .count();
+  assert_eq!(
+    stale_scan_fault_count, 8,
+    "stale metadata scan did not exhaust its scripted fault budget: {fault_events:?}"
+  );
+
+  rescan_reader_with_trace(&mut reader, reader_now, &mut deliveries).await?;
+
+  let delivered_id_counts = reader_delivery_counts(&deliveries);
+  assert_eq!(
+    delivered_id_counts.keys().cloned().collect::<HashSet<_>>(),
+    expected_ids
+  );
+  assert!(
+    delivered_id_counts.values().all(|count| *count == 1),
+    "stale metadata scan duplicated reader delivery before catch-up: {deliveries:?}"
+  );
   let cursors_after_catchup = reader.cursors();
 
   // Re-scan repeatedly after full catch-up to ensure duplicate scans do not regress cursors.
   for _ in 0 .. 6 {
-    let before_count = consumed_ids.len();
+    let before_count = deliveries.len();
     let batches = reader.read_available(framework::now_unix_seconds()).await?;
-    for batch in batches {
-      for record in batch.records {
-        let id = String::from_utf8(record.payload.to_vec())?;
-        consumed_ids.insert(id);
-      }
-    }
+    append_reader_delivery_traces(batches, &mut deliveries)?;
     assert_eq!(
-      consumed_ids.len(),
+      deliveries.len(),
       before_count,
-      "post-catchup scan should not surface additional records"
+      "post-catchup scan should not surface duplicate records"
     );
     assert_eq!(
       reader.cursors(),
       cursors_after_catchup,
       "cursor state regressed after stale metadata scan"
     );
-    sleep(Duration::from_millis(20)).await;
+    tokio::task::yield_now().await;
   }
-
-  let _fault_event = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("store".to_string()),
-        operation: Some("metadata_scan_window".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(5),
-    )
-    .await?;
 
   cluster.shutdown().await;
   resources.cleanup().await;
@@ -934,9 +1378,9 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
 }
 
 // High-level: validates producer lease conflict injection still converges after deterministic
-// reroute, preserving full write progress without accepted split writes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn producer_lease_store_conflict_then_expiry_takeover() -> Result<()> {
+// broker rerouting, preserving full write progress without accepted split writes.
+#[tokio::test]
+async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let mut cluster = ClusterHarness::builder(&resources, 2)
     .in_memory_transport()
@@ -967,47 +1411,89 @@ async fn producer_lease_store_conflict_then_expiry_takeover() -> Result<()> {
     .await?;
 
   let mut expected_ids = HashSet::new();
-  let mut seen_retry = false;
   let mut produced_partitions = HashSet::new();
 
+  let lease_fault_matcher = TestEventMatcher {
+    category: Some("store".to_string()),
+    operation: Some("producer_acquire_lease".to_string()),
+    key_contains: None,
+    status: Some("fault_applied".to_string()),
+  };
+  let mut previous_fault_sequence = None;
+  for conflict_index in 1 ..= 4 {
+    let fault = cluster
+      .wait_for_event_after(
+        &lease_fault_matcher,
+        previous_fault_sequence,
+        Duration::from_secs(5),
+      )
+      .await
+      .map_err(|error| {
+        anyhow::anyhow!("broker did not reach lease conflict {conflict_index}: {error}")
+      })?;
+    previous_fault_sequence = Some(fault.sequence);
+
+    cluster.set_active_nodes(vec![active_node.clone()]);
+  }
+
+  let acquired_event = cluster
+    .wait_for_event_after(
+      &TestEventMatcher {
+        category: Some("store".to_string()),
+        operation: Some("producer_acquire_lease".to_string()),
+        key_contains: None,
+        status: Some("ok".to_string()),
+      },
+      previous_fault_sequence,
+      Duration::from_secs(5),
+    )
+    .await?;
+  assert!(
+    acquired_event.sequence > previous_fault_sequence.unwrap(),
+    "broker lease acquisition did not follow the complete conflict script"
+  );
+
   for message_id in 0 .. 16 {
-    let id = format!("fit-009-pre-takeover-{message_id}");
+    let id = format!("fit-009-pre-reroute-{message_id}");
     let ack = produce_message(
       &producer,
       format!("fit-009-key-pre-{message_id}").into_bytes(),
       &id,
     )
     .await?;
-    if ack.attempts > 1 {
-      seen_retry = true;
-    }
     produced_partitions.insert(ack.virtual_partition_id);
     expected_ids.insert(id);
   }
 
-  // Deterministically transition traffic to standby to exercise takeover behavior once initial
-  // lease-conflict faults have been applied.
+  let lease_fault_events = resources.store_fault_controller().events().await;
+  let injected_conflicts = lease_fault_events
+    .iter()
+    .filter(|event| {
+      event.domain == StoreFaultDomain::ProducerLease
+        && event.operation == StoreFaultOperation::ProducerAcquireLease
+        && matches!(event.action, Some(StoreFaultAction::Fail { .. }))
+    })
+    .count();
+  assert_eq!(
+    injected_conflicts, 4,
+    "expected all scripted producer lease conflicts before rerouting: {lease_fault_events:?}"
+  );
+
+  // Deterministically transition traffic to standby once the complete lease-conflict script has
+  // been applied.
   cluster.set_active_nodes(vec![standby_node.clone()]);
 
   for message_id in 16 .. 40 {
-    let id = format!("fit-009-post-takeover-{message_id}");
+    let id = format!("fit-009-post-reroute-{message_id}");
     let ack = produce_message(
       &producer,
       format!("fit-009-key-post-{message_id}").into_bytes(),
       &id,
     )
     .await?;
-    if ack.attempts > 1 {
-      seen_retry = true;
-    }
     produced_partitions.insert(ack.virtual_partition_id);
     expected_ids.insert(id);
   }
-
-  assert!(
-    seen_retry,
-    "expected retries while producer lease conflicts were injected"
-  );
 
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
@@ -1025,51 +1511,114 @@ async fn producer_lease_store_conflict_then_expiry_takeover() -> Result<()> {
     None,
   )?;
 
-  let mut consumed_ids = HashSet::new();
-  drain_reader_until(
+  let deliveries = drain_reader_until_with_trace(
     &mut reader,
-    &mut consumed_ids,
     expected_ids.len(),
+    framework::now_unix_seconds().saturating_add(3),
     Instant::now() + Duration::from_secs(45),
   )
   .await?;
-  assert_eq!(consumed_ids, expected_ids);
-
-  let _conflict_event = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("store".to_string()),
-        operation: Some("producer_acquire_lease".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(5),
-    )
-    .await?;
-
-  let _acquired_event = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("store".to_string()),
-        operation: Some("producer_acquire_lease".to_string()),
-        key_contains: None,
-        status: Some("ok".to_string()),
-      },
-      Duration::from_secs(5),
-    )
-    .await?;
+  let delivered_id_counts = reader_delivery_counts(&deliveries);
+  assert_eq!(
+    delivered_id_counts.keys().cloned().collect::<HashSet<_>>(),
+    expected_ids
+  );
+  assert!(
+    delivered_id_counts.values().all(|count| *count == 1),
+    "producer lease reroute must be read exactly once: {deliveries:?}"
+  );
 
   cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())
 }
 
-// High-level: validates consumer lease heartbeat failures trigger ownership failover while
-// committed progress remains monotonic across owners.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// High-level: validates a live owner is fenced after heartbeat failures and its replacement
+// recovers normal consumer delivery and cursor commits.
+#[tokio::test]
 async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
   let resources = IntegrationResources::create().await?;
-  let lease_store = resources.consumer_lease_store();
+  let consumer_time = Arc::new(ManualTimeProvider::new(OffsetDateTime::now_utc()));
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .in_memory_transport()
+    .consumer_time_provider(consumer_time.clone())
+    .start()
+    .await?;
+  let producer = cluster
+    .create_producer(producer_config(), vec![producer_topic()])
+    .await?;
+
+  let mut runtime_a = consumer_runtime_config("fit-010-a");
+  let mut runtime_b = consumer_runtime_config("fit-010-b");
+  for runtime in [&mut runtime_a, &mut runtime_b] {
+    runtime
+      .read
+      .as_mut()
+      .ok_or_else(|| anyhow::anyhow!("fit-010 consumer read config missing"))?
+      .metadata_visibility_delay_ms = Some(0);
+  }
+  let group = runtime_a
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow::anyhow!("fit-010 consumer group config missing"))?;
+  let hooks = cluster.lifecycle_hooks();
+  let mut before_prefetch_gate = hooks
+    .arm(framework::LifecycleEvent::ConsumerPrefetchBatchBuffered)
+    .await?;
+  let mut consumer_a = cluster.create_consumer(&runtime_a).await?;
+  consumer_a.start()?;
+  timeout(Duration::from_secs(5), consumer_time.wait_until_sleeping(2))
+    .await
+    .map_err(|_| anyhow::anyhow!("initial owner did not park its driver and prefetch worker"))?;
+
+  let key = b"fit-010-key".to_vec();
+  let before_id = "fit-010-before-failure";
+  let before_ack = produce_message(&producer, key.clone(), before_id).await?;
+  consumer_time.advance(TimeDuration::seconds(1));
+  tokio::task::yield_now().await;
+  timeout(
+    Duration::from_secs(5),
+    before_prefetch_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow::anyhow!("initial owner did not prefetch its pre-failure record"))??;
+  before_prefetch_gate.release()?;
+  let before_delivery = timeout(Duration::from_secs(5), async {
+    loop {
+      match consumer_a.next().await? {
+        NextResult::Revoked(revoked) => revoked.complete().await,
+        NextResult::Record(record) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          consumer_a.store_offset(record.virtual_partition_id, record.offset)?;
+          consumer_a.commit().await?;
+          if id == before_id {
+            return Ok::<_, anyhow::Error>((record.virtual_partition_id, record.offset));
+          }
+        },
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("initial owner did not consume its pre-failure record"))??;
+  assert_eq!(before_delivery.0, before_ack.virtual_partition_id);
+
+  let owner_a_lease = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == before_delivery.0)
+    .ok_or_else(|| anyhow::anyhow!("missing initial owner lease for heartbeat handoff"))?;
+  assert!(
+    owner_a_lease.owner_id == "fit-010-a"
+      && owner_a_lease
+        .committed_cursor
+        .as_ref()
+        .is_some_and(|cursor| {
+          cursor.seq_end >= before_delivery.1 && cursor.source_checkpoint.is_some()
+        }),
+    "initial owner did not durably commit its pre-failure record: {owner_a_lease:?}"
+  );
 
   resources
     .store_fault_controller()
@@ -1078,182 +1627,146 @@ async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
       operation: StoreFaultOperation::ConsumerHeartbeatPartition,
       key_pattern: None,
       action: StoreFaultAction::Fail {
-        message: "drop active owner heartbeat".to_string(),
+        message: "fault active owner partition heartbeat".to_string(),
       },
       remaining_hits: Some(1),
     })
     .await;
-
-  let key = ConsumerGroupLeaseKey {
-    topic: TOPIC.to_string(),
-    group_id: "fit-010-group".to_string(),
-    virtual_partition_id: 3,
-  };
-  let lease_duration_ms = 100_i64;
-  let t0 = 1_000_000_i64;
-
-  let assigned_a = lease_store
-    .assign_partition(
-      key.clone(),
-      "member-a".to_string(),
-      1,
-      t0,
-      lease_duration_ms,
-    )
-    .await?;
-  assert!(matches!(
-    assigned_a,
-    ConsumerGroupAssignmentOutcome::Assigned(_)
-  ));
-
-  // Heartbeats from member-a are faulted; progress should not advance yet.
-  let failed_heartbeat_a = lease_store
-    .heartbeat_partition(
-      &key,
-      "member-a",
-      1,
-      t0 + 10,
-      lease_duration_ms,
-      Some(blob_stream_types::CommittedCursor {
-        virtual_partition_id: key.virtual_partition_id,
-        seq_end: 10,
-        source_checkpoint: None,
-      }),
-    )
-    .await;
   assert!(
-    failed_heartbeat_a.is_err(),
-    "expected heartbeat failure for active owner"
+    consumer_a.commit().await.is_err(),
+    "expected active owner heartbeat to fail"
   );
-
-  let takeover = lease_store
-    .assign_partition(
-      key.clone(),
-      "member-b".to_string(),
-      2,
-      t0 + 250,
-      lease_duration_ms,
-    )
-    .await?;
-  let ConsumerGroupAssignmentOutcome::Assigned(lease_b) = takeover else {
-    anyhow::bail!("expected member-b takeover assignment");
-  };
-  assert_eq!(lease_b.owner_id, "member-b");
-  assert_eq!(lease_b.generation, 2);
-
-  let renewed_b = lease_store
-    .heartbeat_partition(
-      &key,
-      "member-b",
-      2,
-      t0 + 260,
-      lease_duration_ms,
-      Some(blob_stream_types::CommittedCursor {
-        virtual_partition_id: key.virtual_partition_id,
-        seq_end: 25,
-        source_checkpoint: None,
-      }),
-    )
-    .await?;
-  let ConsumerGroupHeartbeatOutcome::Renewed(renewed_lease) = renewed_b else {
-    anyhow::bail!("expected takeover owner heartbeat renewal");
-  };
-  assert_eq!(renewed_lease.owner_id, "member-b");
-  assert_eq!(renewed_lease.generation, 2);
-  assert_eq!(
-    renewed_lease.committed_cursor,
-    Some(blob_stream_types::CommittedCursor {
-      virtual_partition_id: key.virtual_partition_id,
-      seq_end: 25,
-      source_checkpoint: None,
-    })
-  );
-
-  let stale_heartbeat = lease_store
-    .heartbeat_partition(
-      &key,
-      "member-a",
-      1,
-      t0 + 270,
-      lease_duration_ms,
-      Some(blob_stream_types::CommittedCursor {
-        virtual_partition_id: key.virtual_partition_id,
-        seq_end: 999,
-        source_checkpoint: None,
-      }),
-    )
-    .await?;
-  assert!(matches!(
-    stale_heartbeat,
-    ConsumerGroupHeartbeatOutcome::HeldByOther(_)
-  ));
-
-  let commit_b = lease_store
-    .commit_cursor(
-      &key,
-      "member-b",
-      2,
-      t0 + 280,
-      blob_stream_types::CommittedCursor {
-        virtual_partition_id: key.virtual_partition_id,
-        seq_end: 30,
-        source_checkpoint: None,
-      },
-    )
-    .await?;
-  let ConsumerGroupCommitOutcome::Committed(committed) = commit_b else {
-    anyhow::bail!("expected committed cursor from takeover owner");
-  };
-  assert_eq!(committed.owner_id, "member-b");
-  assert_eq!(committed.generation, 2);
-  assert_eq!(
-    committed.committed_cursor,
-    Some(blob_stream_types::CommittedCursor {
-      virtual_partition_id: key.virtual_partition_id,
-      seq_end: 30,
-      source_checkpoint: None,
-    })
-  );
-
-  let stale_commit = lease_store
-    .commit_cursor(
-      &key,
-      "member-a",
-      1,
-      t0 + 290,
-      blob_stream_types::CommittedCursor {
-        virtual_partition_id: key.virtual_partition_id,
-        seq_end: 5,
-        source_checkpoint: None,
-      },
-    )
-    .await?;
-  assert!(matches!(
-    stale_commit,
-    ConsumerGroupCommitOutcome::HeldByOther(_)
-  ));
-
-  let _fault_event = resources
+  let heartbeat_fault_events = resources
     .store_fault_controller()
     .events()
     .await
     .into_iter()
-    .find(|event| {
+    .filter(|event| {
       event.operation == StoreFaultOperation::ConsumerHeartbeatPartition && event.action.is_some()
     })
-    .ok_or_else(|| anyhow::anyhow!("missing consumer heartbeat fault event"))?;
+    .count();
+  assert_eq!(
+    heartbeat_fault_events, 1,
+    "missing active-owner heartbeat fault"
+  );
 
+  let membership_fault_id = resources
+    .store_fault_controller()
+    .enable_fault(StoreFaultRule {
+      domain: StoreFaultDomain::ConsumerLease,
+      operation: StoreFaultOperation::ConsumerMembershipHeartbeat,
+      key_pattern: Some(format!("{}#{}#fit-010-a", group.topic, group.group_id)),
+      action: StoreFaultAction::Fail {
+        message: "fence active owner membership".to_string(),
+      },
+      remaining_hits: None,
+    })
+    .await;
+  assert!(
+    consumer_a.commit().await.is_err(),
+    "expected active owner membership heartbeat to fail after partition heartbeat failure"
+  );
+
+  // A's last successful lease and membership renewal is now fixed in logical time. Advancing past
+  // the lease duration makes the handoff depend on normal expiry rather than a wall-clock delay.
+  consumer_time.advance(TimeDuration::seconds(3));
+  tokio::task::yield_now().await;
+
+  let mut consumer_b = cluster.create_consumer(&runtime_b).await?;
+  consumer_b.start()?;
+  let active_members = cluster
+    .consumer_membership_store()
+    .list_active_members(
+      group.topic.as_str(),
+      group.group_id.as_str(),
+      consumer_time.now().unix_timestamp() * 1_000,
+    )
+    .await?;
+  assert_eq!(active_members, vec!["fit-010-b".to_string()]);
+  let takeover_leases = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?;
+  assert_eq!(takeover_leases.len(), PARTITION_COUNT as usize);
+  assert!(
+    takeover_leases
+      .iter()
+      .all(|lease| lease.owner_id == "fit-010-b" && lease.generation > owner_a_lease.generation),
+    "replacement did not take every expired owner lease: {takeover_leases:?}"
+  );
+
+  let after_id = "fit-010-after-failure";
+  let after_ack = produce_message(&producer, key, after_id).await?;
+  assert_eq!(after_ack.virtual_partition_id, before_delivery.0);
+  let after_delivery = timeout(Duration::from_secs(5), async {
+    loop {
+      consumer_time.advance(TimeDuration::seconds(1));
+      tokio::task::yield_now().await;
+
+      if let Ok(Ok(NextResult::Record(record))) =
+        timeout(Duration::from_millis(50), consumer_a.next()).await
+      {
+        let id = String::from_utf8(record.record.payload.to_vec())?;
+        anyhow::bail!(
+          "former owner delivered {id} after replacement acquired its leases: {takeover_leases:?}"
+        );
+      }
+
+      match timeout(Duration::from_millis(250), consumer_b.next()).await {
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          consumer_b.store_offset(record.virtual_partition_id, record.offset)?;
+          consumer_b.commit().await?;
+          if id == after_id {
+            return Ok::<_, anyhow::Error>((record.virtual_partition_id, record.offset));
+          }
+        },
+        Ok(Err(error)) => return Err(error),
+        Err(_) => {},
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("replacement did not deliver post-fencing work"))??;
+  assert_eq!(after_delivery.0, before_delivery.0);
+
+  let final_lease = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == after_delivery.0)
+    .ok_or_else(|| anyhow::anyhow!("missing replacement lease after post-fencing delivery"))?;
+  assert!(
+    final_lease.owner_id == "fit-010-b"
+      && final_lease.generation > owner_a_lease.generation
+      && final_lease.committed_cursor.as_ref().is_some_and(|cursor| {
+        cursor.seq_end >= after_delivery.1 && cursor.source_checkpoint.is_some()
+      }),
+    "replacement did not retain a durable post-fencing cursor: {final_lease:?}"
+  );
+
+  consumer_a.abort_for_test().await?;
+  resources
+    .store_fault_controller()
+    .disable_fault(membership_fault_id)
+    .await;
+  Box::new(consumer_b).shutdown().await?;
+  cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())
 }
 
 // High-level: validates bootstrap consumer rebalance converges under transient membership and
 // consumer-lease faults while preserving the full consumed record set.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
   let resources = IntegrationResources::create().await?;
+  let consumer_time = Arc::new(ManualTimeProvider::new(OffsetDateTime::now_utc()));
   let mut cluster = ClusterHarness::builder(&resources, 1)
     .in_memory_transport()
+    .consumer_time_provider(consumer_time.clone())
     .start()
     .await?;
 
@@ -1263,62 +1776,12 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
 
   let runtime_a = consumer_runtime_config("fit-015-a");
   let runtime_b = consumer_runtime_config("fit-015-b");
-  let runtime_a_group = runtime_a
+  let group = runtime_a
     .group
     .as_ref()
     .ok_or_else(|| anyhow::anyhow!("fit-015-a group config missing"))?;
-  let runtime_b_group = runtime_b
-    .group
-    .as_ref()
-    .ok_or_else(|| anyhow::anyhow!("fit-015-b group config missing"))?;
-
-  let blob_store = resources.blob_store();
-  let metadata_store = resources.metadata_store();
-  let lease_store = resources.consumer_lease_store();
-  let membership_store = resources.consumer_membership_store();
-
-  let mut consumer_a = Box::new(
-    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
-      &runtime_a,
-      Arc::clone(&blob_store),
-      Arc::clone(&metadata_store),
-      Arc::clone(&lease_store),
-      Arc::clone(&membership_store),
-      Arc::new(MembershipCoordinationSource::new(
-        runtime_a_group.topic.to_string(),
-        runtime_a_group.group_id.to_string(),
-        runtime_a_group.member_id.to_string(),
-        (0 .. PARTITION_COUNT).collect(),
-        Arc::clone(&membership_store),
-      )),
-      metrics_scope("blob_stream_consumer_it"),
-      1,
-      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
-      None,
-    )
-    .await?,
-  );
-  let mut consumer_b = Box::new(
-    ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
-      &runtime_b,
-      Arc::clone(&blob_store),
-      Arc::clone(&metadata_store),
-      Arc::clone(&lease_store),
-      Arc::clone(&membership_store),
-      Arc::new(MembershipCoordinationSource::new(
-        runtime_b_group.topic.to_string(),
-        runtime_b_group.group_id.to_string(),
-        runtime_b_group.member_id.to_string(),
-        (0 .. PARTITION_COUNT).collect(),
-        Arc::clone(&membership_store),
-      )),
-      metrics_scope("blob_stream_consumer_it"),
-      1,
-      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
-      None,
-    )
-    .await?,
-  );
+  let mut consumer_a = Box::new(cluster.create_consumer(&runtime_a).await?);
+  let mut consumer_b = Box::new(cluster.create_consumer(&runtime_b).await?);
 
   resources
     .store_fault_controller()
@@ -1334,6 +1797,18 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
     .await;
   consumer_a.start()?;
   consumer_b.start()?;
+
+  let planner_fault_event = cluster
+    .wait_for_event(
+      &TestEventMatcher {
+        category: Some("store".to_string()),
+        operation: Some("consumer_publish_assignment_plan".to_string()),
+        key_contains: None,
+        status: Some("fault_applied".to_string()),
+      },
+      Duration::from_secs(3),
+    )
+    .await?;
 
   resources
     .store_fault_controller()
@@ -1385,123 +1860,140 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
   }
 
   let mut saw_revocation = false;
-  let deadline = Instant::now() + Duration::from_secs(6);
-  let mut consumed_ids = HashSet::new();
-  while consumed_ids.len() < expected_ids.len() {
-    if Instant::now() >= deadline {
-      break;
-    }
+  let mut delivered_id_counts = HashMap::new();
+  let mut max_offsets = HashMap::<u32, u64>::new();
+  timeout(Duration::from_secs(12), async {
+    while delivered_id_counts.len() < expected_ids.len() {
+      consumer_time.advance(TimeDuration::seconds(1));
+      tokio::task::yield_now().await;
 
-    for consumer in [&mut consumer_a, &mut consumer_b] {
-      let next = tokio::time::timeout(Duration::from_secs(2), consumer.next()).await;
-      let Ok(next) = next else {
-        continue;
-      };
+      for consumer in [&mut consumer_a, &mut consumer_b] {
+        let next = timeout(Duration::from_millis(250), consumer.next()).await;
+        let Ok(Ok(next_result)) = next else {
+          continue;
+        };
 
-      let Ok(next_result) = next else {
-        // Transient injected faults can surface here; retry on next poll.
-        continue;
-      };
+        match next_result {
+          NextResult::Revoked(revoked) => {
+            saw_revocation = true;
+            revoked.complete().await;
+          },
+          NextResult::Record(record) => {
+            let id = String::from_utf8(record.record.payload.to_vec())?;
+            max_offsets
+              .entry(record.virtual_partition_id)
+              .and_modify(|offset| *offset = (*offset).max(record.offset))
+              .or_insert(record.offset);
+            *delivered_id_counts.entry(id).or_insert(0_usize) += 1;
 
-      match next_result {
-        NextResult::Revoked(revoked) => {
-          saw_revocation = true;
-          revoked.complete().await;
-        },
-        NextResult::Record(record) => {
-          let id = String::from_utf8(record.record.payload.to_vec())?;
-          consumed_ids.insert(id);
-
-          consumer.store_offset(record.virtual_partition_id, record.offset)?;
-          let _ = consumer.commit().await;
-        },
+            consumer.store_offset(record.virtual_partition_id, record.offset)?;
+            consumer.commit().await?;
+          },
+        }
       }
     }
-
-    sleep(Duration::from_millis(20)).await;
-  }
-
-  if consumed_ids.len() < expected_ids.len() {
-    let mut reader = ConsumerReaderImpl::new(
-      ConsumerReadConfig {
-        topic: TOPIC.to_string().into(),
-        window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-        ..Default::default()
-      },
-      (0 .. PARTITION_COUNT).collect(),
-      HashMap::new(),
-      resources.blob_store(),
-      resources.metadata_store(),
-      &metrics_scope("blob_stream_consumer_it"),
-      1,
-      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
-      None,
-    )?;
-    drain_reader_until(
-      &mut reader,
-      &mut consumed_ids,
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| {
+    anyhow::anyhow!(
+      "faulted consumers did not drain all records: expected={}, consumed={}",
       expected_ids.len(),
-      Instant::now() + Duration::from_secs(3),
+      delivered_id_counts.len()
     )
-    .await?;
-  }
-  assert_eq!(consumed_ids, expected_ids);
+  })??;
+  let delivered_ids = delivered_id_counts.keys().cloned().collect::<HashSet<_>>();
+  assert_eq!(delivered_ids, expected_ids);
+  assert!(
+    delivered_id_counts.values().all(|count| *count >= 1),
+    "faulted consumer delivery lost an expected ID: {delivered_id_counts:?}"
+  );
 
-  let _assign_fault = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("store".to_string()),
-        operation: Some("consumer_assign_partition".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(3),
+  let fault_events = resources.store_fault_controller().events().await;
+  let fault_count = |operation| {
+    fault_events
+      .iter()
+      .filter(|event| event.operation == operation && event.action.is_some())
+      .count()
+  };
+  assert_eq!(
+    fault_count(StoreFaultOperation::ConsumerPublishAssignmentPlan),
+    1,
+    "unexpected planner fault trace: {fault_events:?}"
+  );
+  assert_eq!(
+    fault_count(StoreFaultOperation::ConsumerAssignPartition),
+    2,
+    "unexpected assignment fault trace: {fault_events:?}"
+  );
+  assert_eq!(
+    fault_count(StoreFaultOperation::ConsumerHeartbeatPartition),
+    2,
+    "unexpected partition-heartbeat fault trace: {fault_events:?}"
+  );
+  assert_eq!(
+    fault_count(StoreFaultOperation::ConsumerMembershipHeartbeat),
+    2,
+    "unexpected membership-heartbeat fault trace: {fault_events:?}"
+  );
+
+  let event_trace = cluster.event_log().snapshot().await;
+  assert!(
+    event_trace.iter().all(|event| {
+      event.status != "fault_applied"
+        || event.sequence <= planner_fault_event.sequence
+        || matches!(
+          event.operation.as_str(),
+          "consumer_assign_partition"
+            | "consumer_heartbeat_partition"
+            | "consumer_membership_heartbeat"
+        )
+    }),
+    "unexpected fault after planner phase: {event_trace:?}"
+  );
+
+  let leases = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?;
+  let active_members = cluster
+    .consumer_membership_store()
+    .list_active_members(
+      group.topic.as_str(),
+      group.group_id.as_str(),
+      consumer_time.now().unix_timestamp() * 1_000,
     )
     .await?;
-  let _heartbeat_fault = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("store".to_string()),
-        operation: Some("consumer_heartbeat_partition".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(3),
-    )
-    .await?;
-  let _membership_fault = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("store".to_string()),
-        operation: Some("consumer_membership_heartbeat".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(3),
-    )
-    .await?;
-  let _planner_publish_fault = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("store".to_string()),
-        operation: Some("consumer_publish_assignment_plan".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(3),
-    )
-    .await?;
-  let _ownership_ok = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("store".to_string()),
-        operation: Some("consumer_assign_partition".to_string()),
-        key_contains: None,
-        status: Some("ok".to_string()),
-      },
-      Duration::from_secs(3),
-    )
-    .await?;
+  assert_eq!(leases.len(), PARTITION_COUNT as usize);
+  assert!(
+    leases
+      .iter()
+      .all(|lease| active_members.contains(&lease.owner_id)),
+    "faulted consumer group has leases outside active membership: members={active_members:?}, \
+     leases={leases:?}"
+  );
+  assert!(
+    leases.iter().any(|lease| lease.committed_cursor.is_some()),
+    "faulted consumer group did not durably commit any consumed records"
+  );
+  for (virtual_partition_id, offset) in max_offsets {
+    let lease = leases
+      .iter()
+      .find(|lease| lease.key.virtual_partition_id == virtual_partition_id)
+      .ok_or_else(|| {
+        anyhow::anyhow!(
+          "missing final lease for consumed partition {virtual_partition_id}: {leases:?}"
+        )
+      })?;
+    assert!(
+      lease
+        .committed_cursor
+        .as_ref()
+        .is_some_and(|cursor| { cursor.seq_end >= offset && cursor.source_checkpoint.is_some() }),
+      "faulted recovery did not retain the committed cursor for partition {virtual_partition_id}: \
+       {lease:?}"
+    );
+  }
 
   let _ = consumer_a.shutdown().await;
   let _ = consumer_b.shutdown().await;
@@ -1514,10 +2006,10 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
   Ok(())
 }
 
-// High-level: validates combined transport and metadata faults converge to complete final
-// consumption with no loss.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn combined_network_and_metadata_faults_end_to_end() -> Result<()> {
+// High-level: validates producer publication retries through combined transport and metadata
+// faults, then uses a direct reader solely to verify durable visibility.
+#[tokio::test]
+async fn combined_network_and_metadata_faults_preserve_producer_publication() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let mut cluster = ClusterHarness::builder(&resources, 2)
     .in_memory_transport()
@@ -1532,7 +2024,7 @@ async fn combined_network_and_metadata_faults_end_to_end() -> Result<()> {
       target_node_id: None,
       operation: NetworkOperation::ProduceBatch,
       fault: NetworkFault::Drop,
-      remaining_hits: Some(2),
+      remaining_hits: Some(1),
     })
     .await;
 
@@ -1542,20 +2034,82 @@ async fn combined_network_and_metadata_faults_end_to_end() -> Result<()> {
       domain: StoreFaultDomain::Metadata,
       operation: StoreFaultOperation::MetadataWriteSegment,
       key_pattern: None,
-      action: StoreFaultAction::Delay(Duration::from_millis(150)),
-      remaining_hits: Some(6),
+      action: StoreFaultAction::Fail {
+        message: "scripted metadata write failure".to_string(),
+      },
+      remaining_hits: Some(1),
     })
     .await;
 
+  let retry_clock = Arc::new(ManualProducerRetryClock::new(Instant::now()));
   let producer = cluster
-    .create_producer(producer_config(), vec![producer_topic()])
+    .producer_builder(producer_config(), vec![producer_topic()])
+    .retry_clock(retry_clock.clone())
+    .build()
     .await?;
 
   let mut expected_ids = HashSet::new();
   let mut produced_partitions = HashSet::new();
-  let mut saw_retry = false;
+  let first_id = "fit-011-0";
+  let first_produce = producer.produce(ProducerRecord::new(
+    TOPIC.into(),
+    b"fit-011-key-0".to_vec(),
+    first_id.as_bytes().to_vec().into(),
+    framework::now_unix_seconds() * 1_000,
+  ));
+  tokio::pin!(first_produce);
+  let transport_fault_matcher = TestEventMatcher {
+    category: Some("transport".to_string()),
+    operation: Some("produce_batch".to_string()),
+    key_contains: None,
+    status: Some("fault_applied".to_string()),
+  };
+  let transport_fault = timeout(Duration::from_secs(5), async {
+    tokio::select! {
+      event = cluster.wait_for_event_after(
+        &transport_fault_matcher,
+        None,
+        Duration::from_secs(5),
+      ) => event,
+      result = &mut first_produce => Err(anyhow::anyhow!(
+        "first produce completed before the scripted transport fault: {result:?}"
+      )),
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("producer did not issue its scripted transport request"))??;
 
-  for message_id in 0 .. 48 {
+  let metadata_fault_matcher = TestEventMatcher {
+    category: Some("store".to_string()),
+    operation: Some("metadata_write_segment".to_string()),
+    key_contains: None,
+    status: Some("fault_applied".to_string()),
+  };
+  let metadata_fault = cluster
+    .wait_for_event_after(&metadata_fault_matcher, None, Duration::from_secs(5))
+    .await?;
+  timeout(Duration::from_secs(5), retry_clock.wait_until_sleeping())
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not enter combined-fault retry backoff"))?;
+  assert!(
+    retry_clock.advance_to_next_sleep().await,
+    "combined-fault retry backoff was not registered"
+  );
+  let first_ack = timeout(Duration::from_secs(5), &mut first_produce)
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not recover from scripted combined faults"))??;
+  assert!(
+    first_ack.attempts > 1,
+    "scripted combined faults must cause at least one retry"
+  );
+  assert!(
+    metadata_fault.sequence > transport_fault.sequence,
+    "metadata fault must follow the scripted transport fault"
+  );
+  produced_partitions.insert(first_ack.virtual_partition_id);
+  expected_ids.insert(first_id.to_string());
+
+  for message_id in 1 .. 48 {
     let id = format!("fit-011-{message_id}");
     let ack = produce_message(
       &producer,
@@ -1563,16 +2117,13 @@ async fn combined_network_and_metadata_faults_end_to_end() -> Result<()> {
       &id,
     )
     .await?;
-    if ack.attempts > 1 {
-      saw_retry = true;
-    }
+    assert_eq!(
+      ack.attempts, 1,
+      "recovery produces must not retry after the scripted fault budget is consumed"
+    );
     produced_partitions.insert(ack.virtual_partition_id);
     expected_ids.insert(id);
   }
-  assert!(
-    saw_retry,
-    "expected retries under combined network and metadata faults"
-  );
 
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
@@ -1590,54 +2141,37 @@ async fn combined_network_and_metadata_faults_end_to_end() -> Result<()> {
     None,
   )?;
 
-  let mut consumed_ids = HashSet::new();
-  drain_reader_until(
+  let deliveries = drain_reader_until_with_trace(
     &mut reader,
-    &mut consumed_ids,
     expected_ids.len(),
+    framework::now_unix_seconds().saturating_add(3),
     Instant::now() + Duration::from_secs(45),
   )
   .await?;
-  assert_eq!(consumed_ids, expected_ids);
-
-  let _transport_fault_event = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("transport".to_string()),
-        operation: Some("produce_batch".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(5),
-    )
-    .await?;
-  let _metadata_fault_event = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("store".to_string()),
-        operation: Some("metadata_write_segment".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(5),
-    )
-    .await?;
+  let delivered_id_counts = reader_delivery_counts(&deliveries);
+  assert_eq!(
+    delivered_id_counts.keys().cloned().collect::<HashSet<_>>(),
+    expected_ids
+  );
+  assert!(
+    delivered_id_counts.values().all(|count| *count == 1),
+    "combined producer faults must be read exactly once: {deliveries:?}"
+  );
 
   cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())
 }
 
-// High-level: validates deterministic replay by running the same scripted transport-fault
-// scenario twice and asserting normalized traces and terminal outcomes are identical.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn deterministic_replay_same_seed_same_event_trace() -> Result<()> {
-  let first = run_fit_012_scenario().await?;
-  let second = run_fit_012_scenario().await?;
+// High-level: validates a scripted transport-fault trace is stable across identical runs.
+#[tokio::test]
+async fn scripted_transport_faults_have_stable_event_trace() -> Result<()> {
+  let first = run_scripted_transport_fault_scenario().await?;
+  let second = run_scripted_transport_fault_scenario().await?;
 
   assert_eq!(
     first.normalized_transport_trace, second.normalized_transport_trace,
-    "normalized transport event traces diverged across identical deterministic runs"
+    "normalized transport event traces diverged across identical scripted runs"
   );
   assert_eq!(
     first.total_produced, second.total_produced,
@@ -1662,12 +2196,8 @@ struct Fit012Outcome {
   max_attempts: u32,
 }
 
-async fn run_fit_012_scenario() -> Result<Fit012Outcome> {
-  let resources = IntegrationResources::create().await?;
-  let mut cluster = ClusterHarness::builder(&resources, 2)
-    .in_memory_transport()
-    .start()
-    .await?;
+async fn run_scripted_transport_fault_scenario() -> Result<Fit012Outcome> {
+  let mut cluster = ClusterHarness::in_memory(2).start().await?;
 
   let controller = cluster
     .network_fault_controller()
@@ -1680,23 +2210,58 @@ async fn run_fit_012_scenario() -> Result<Fit012Outcome> {
       remaining_hits: Some(2),
     })
     .await;
-  controller
-    .enable_fault(NetworkFaultRule {
-      target_node_id: None,
-      operation: NetworkOperation::ProduceBatch,
-      fault: NetworkFault::Delay(Duration::from_millis(20)),
-      remaining_hits: Some(6),
-    })
-    .await;
 
+  let retry_clock = Arc::new(ManualProducerRetryClock::new(Instant::now()));
   let producer = cluster
-    .create_producer(producer_config(), vec![producer_topic()])
+    .producer_builder(producer_config(), vec![producer_topic()])
+    .retry_clock(retry_clock.clone())
+    .build()
     .await?;
 
   let mut expected_ids = HashSet::new();
-  let mut produced_partitions = HashSet::new();
-  let mut max_attempts = 1_u32;
-  for message_id in 0 .. 24 {
+  let first_id = "fit-012-0";
+  let first_produce = producer.produce(ProducerRecord::new(
+    TOPIC.into(),
+    b"fit-012-key-0".to_vec(),
+    first_id.as_bytes().to_vec().into(),
+    framework::now_unix_seconds() * 1_000,
+  ));
+  tokio::pin!(first_produce);
+  let fault_matcher = TestEventMatcher {
+    category: Some("transport".to_string()),
+    operation: Some("produce_batch".to_string()),
+    key_contains: None,
+    status: Some("fault_applied".to_string()),
+  };
+  let _first_fault = timeout(Duration::from_secs(5), async {
+    tokio::select! {
+      event = cluster.wait_for_event_after(&fault_matcher, None, Duration::from_secs(5)) => event,
+      result = &mut first_produce => Err(anyhow::anyhow!(
+        "first produce completed before the first scripted transport fault: {result:?}"
+      )),
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("producer did not issue its first scripted transport request"))??;
+  timeout(Duration::from_secs(5), retry_clock.wait_until_sleeping())
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not enter its first scripted retry backoff"))?;
+  assert!(
+    retry_clock.advance_to_next_sleep().await,
+    "first scripted retry backoff was not registered"
+  );
+
+  let first_ack = timeout(Duration::from_secs(5), &mut first_produce)
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not recover after scripted transport faults"))??;
+  assert!(
+    first_ack.attempts > 1,
+    "scripted transport fault must cause at least one retry"
+  );
+  expected_ids.insert(first_id.to_string());
+
+  let mut max_attempts = first_ack.attempts;
+  for message_id in 1 .. 24 {
     let id = format!("fit-012-{message_id}");
     let ack = produce_message(
       &producer,
@@ -1705,35 +2270,70 @@ async fn run_fit_012_scenario() -> Result<Fit012Outcome> {
     )
     .await?;
     max_attempts = max(max_attempts, ack.attempts);
-    produced_partitions.insert(ack.virtual_partition_id);
     expected_ids.insert(id);
   }
 
-  let mut reader = ConsumerReaderImpl::new(
-    ConsumerReadConfig {
-      topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      ..Default::default()
-    },
-    produced_partitions.into_iter().collect(),
-    HashMap::new(),
-    resources.blob_store(),
-    resources.metadata_store(),
-    &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
-    None,
-  )?;
+  let mut runtime = consumer_runtime_config("fit-012-member");
+  runtime
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow::anyhow!("scripted trace consumer read config missing"))?
+    .metadata_visibility_delay_ms = Some(0);
+  let group = runtime
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow::anyhow!("scripted trace consumer group config missing"))?;
+  let mut consumer = cluster.create_consumer(&runtime).await?;
+  consumer.start()?;
+  let mut delivery_counts = HashMap::new();
+  let mut maximum_offsets = HashMap::<u32, u64>::new();
+  timeout(Duration::from_secs(5), async {
+    while delivery_counts.len() < expected_ids.len() {
+      match consumer.next().await? {
+        NextResult::Revoked(revoked) => revoked.complete().await,
+        NextResult::Record(record) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          *delivery_counts.entry(id).or_insert(0usize) += 1;
+          maximum_offsets
+            .entry(record.virtual_partition_id)
+            .and_modify(|offset| *offset = (*offset).max(record.offset))
+            .or_insert(record.offset);
+          consumer.store_offset(record.virtual_partition_id, record.offset)?;
+        },
+      }
+    }
+    consumer.commit().await?;
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("group consumer did not drain scripted transport records"))??;
+  assert_eq!(
+    delivery_counts.keys().cloned().collect::<HashSet<_>>(),
+    expected_ids
+  );
+  assert!(
+    delivery_counts.values().all(|count| *count == 1),
+    "scripted transport fault duplicated group delivery: {delivery_counts:?}"
+  );
 
-  let mut consumed_ids = HashSet::new();
-  drain_reader_until(
-    &mut reader,
-    &mut consumed_ids,
-    expected_ids.len(),
-    Instant::now() + Duration::from_secs(30),
-  )
-  .await?;
-  assert_eq!(consumed_ids, expected_ids);
+  let leases = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?;
+  for (partition_id, maximum_offset) in maximum_offsets {
+    let lease = leases
+      .iter()
+      .find(|lease| lease.key.virtual_partition_id == partition_id)
+      .ok_or_else(|| {
+        anyhow::anyhow!("missing scripted transport lease for partition {partition_id}")
+      })?;
+    assert!(
+      lease.committed_cursor.as_ref().is_some_and(|cursor| {
+        cursor.seq_end >= maximum_offset && cursor.source_checkpoint.is_some()
+      }),
+      "scripted transport consumer did not durably commit partition {partition_id}: {lease:?}"
+    );
+  }
 
   let trace = cluster
     .event_log()
@@ -1755,11 +2355,11 @@ async fn run_fit_012_scenario() -> Result<Fit012Outcome> {
   let outcome = Fit012Outcome {
     normalized_transport_trace: trace,
     total_produced: expected_ids.len(),
-    total_consumed: consumed_ids.len(),
+    total_consumed: delivery_counts.len(),
     max_attempts,
   };
 
+  Box::new(consumer).shutdown().await?;
   cluster.shutdown().await;
-  resources.cleanup().await;
   Ok(outcome)
 }

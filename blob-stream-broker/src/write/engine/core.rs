@@ -2,7 +2,14 @@ use super::super::flush::FlushContext;
 use super::super::metrics::WriteMetrics;
 use super::super::scheduler::{begin_shutdown_drain, collect_flush_plans, flush_plan_and_notify};
 use super::super::state::WriteState;
-use super::super::{AdmissionController, MAX_IN_FLIGHT_FLUSH_PLANS, TopicInfo, WriteConfig};
+use super::super::{
+  AdmissionController,
+  BrokerLifecycleHooks,
+  MAX_IN_FLIGHT_FLUSH_PLANS,
+  NoopBrokerLifecycleHooks,
+  TopicInfo,
+  WriteConfig,
+};
 use anyhow::Result;
 use bd_server_stats::stats::Scope;
 use bd_shutdown::ComponentShutdownTriggerHandle;
@@ -16,7 +23,7 @@ use parking_lot::Mutex;
 use protobuf::Chars;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
+use time::Duration as TimeDuration;
 use tokio::sync::{Notify, watch};
 
 //
@@ -35,6 +42,7 @@ pub struct WriteEngineImpl {
   pub(in crate::write) state: Arc<Mutex<WriteState>>,
   pub(in crate::write) flush_notifier: Arc<Notify>,
   pub(in crate::write) shutdown_trigger_handle: ComponentShutdownTriggerHandle,
+  pub(in crate::write) lifecycle_hooks: Arc<dyn BrokerLifecycleHooks>,
 }
 
 impl WriteEngineImpl {
@@ -51,6 +59,39 @@ impl WriteEngineImpl {
     shutdown_trigger_handle: ComponentShutdownTriggerHandle,
     time_provider: Arc<dyn TimeProvider>,
     metrics_scope: &Scope,
+  ) -> Result<Self> {
+    Self::new_with_lifecycle_hooks(
+      config,
+      topics,
+      blob_store,
+      metadata_store,
+      lease_store,
+      holder_id,
+      machine_id,
+      membership_rx,
+      admission,
+      shutdown_trigger_handle,
+      time_provider,
+      metrics_scope,
+      Arc::new(NoopBrokerLifecycleHooks),
+    )
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  pub fn new_with_lifecycle_hooks(
+    config: WriteConfig,
+    topics: HashMap<Chars, TopicInfo>,
+    blob_store: Arc<dyn BlobStore>,
+    metadata_store: Arc<dyn MetadataStore>,
+    lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+    holder_id: String,
+    machine_id: Option<u16>,
+    membership_rx: Option<watch::Receiver<BrokerMembership>>,
+    admission: Arc<dyn AdmissionController>,
+    shutdown_trigger_handle: ComponentShutdownTriggerHandle,
+    time_provider: Arc<dyn TimeProvider>,
+    metrics_scope: &Scope,
+    lifecycle_hooks: Arc<dyn BrokerLifecycleHooks>,
   ) -> Result<Self> {
     let snowflake = match machine_id {
       Some(machine_id) => super::super::flush::SnowflakeGenerator::with_machine_id(machine_id)?,
@@ -75,6 +116,7 @@ impl WriteEngineImpl {
       metadata_store,
       snowflake,
       Arc::clone(&time_provider),
+      Arc::clone(&lifecycle_hooks),
     );
     let engine = Self {
       config,
@@ -88,6 +130,7 @@ impl WriteEngineImpl {
       state,
       flush_notifier: Arc::new(Notify::new()),
       shutdown_trigger_handle,
+      lifecycle_hooks,
     };
 
     engine.spawn_flush_loop();
@@ -98,8 +141,7 @@ impl WriteEngineImpl {
   }
 
   fn spawn_flush_loop(&self) {
-    let interval_ms = self.config.flush_max_delay_ms.max(1).cast_unsigned();
-    let interval = StdDuration::from_millis(interval_ms);
+    let flush_delay = TimeDuration::milliseconds(self.config.flush_max_delay_ms.max(1));
     let flush_context = self.flush_context.clone();
     let state = Arc::clone(&self.state);
     let topics = self.topics.clone();
@@ -109,7 +151,7 @@ impl WriteEngineImpl {
     let mut shutdown = self.shutdown_trigger_handle.make_shutdown();
 
     tokio::spawn(async move {
-      let mut ticker = tokio::time::interval(interval);
+      let mut flush_tick = Box::pin(time_provider.sleep(flush_delay));
       let mut flushes = FuturesUnordered::new();
       let mut shutdown_requested = false;
       loop {
@@ -149,7 +191,9 @@ impl WriteEngineImpl {
             flush_notifier.notify_waiters();
             log::info!("broker flush loop draining buffered writes for shutdown");
           },
-          _ = ticker.tick() => {},
+          () = &mut flush_tick => {
+            flush_tick = Box::pin(time_provider.sleep(flush_delay));
+          },
           () = flush_notifier.notified() => {},
           Some(()) = flushes.next(), if !flushes.is_empty() => {},
         }

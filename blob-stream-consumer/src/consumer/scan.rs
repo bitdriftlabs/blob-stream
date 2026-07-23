@@ -593,16 +593,23 @@ impl ConsumerReaderImpl {
 
     // `buffered` preserves segment-plan order while allowing independent object-store requests
     // and decoding work to overlap. Cursor changes occur only after every planned read succeeds.
-    let decoded_batches = stream::iter(
+    let mut decoded_batches = stream::iter(
       segment_read_plans
         .into_iter()
         .map(|plan| async { self.read_segment_plan(plan).await }),
     )
     .buffered(runtime_settings.max_in_flight_batch_reads)
     .try_collect::<Vec<_>>()
-    .await?;
+    .await?
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    // Segment plans retain scan order, but concurrent metadata windows may not be ordered by a
+    // partition's sequence range. Normalize before cursor advancement and delivery.
+    decoded_batches
+      .sort_by_key(|(candidate, batch)| (candidate.virtual_partition_id, batch.seq_range.start));
 
-    for (candidate, batch) in decoded_batches.into_iter().flatten() {
+    for (candidate, batch) in decoded_batches {
       let current_cursor = self
         .virtual_partition_states
         .get(&candidate.virtual_partition_id)

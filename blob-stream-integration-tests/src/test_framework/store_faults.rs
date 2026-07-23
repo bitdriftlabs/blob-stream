@@ -67,6 +67,7 @@ pub enum StoreFaultOperation {
   ConsumerReleasePartition,
   ConsumerListGroupLeases,
   ConsumerMembershipHeartbeat,
+  ConsumerDeregisterMember,
   ConsumerGetAssignmentPlan,
   ConsumerGetPlannerLease,
   ConsumerAcquireOrRenewPlanner,
@@ -434,6 +435,7 @@ fn describe_store_operation(operation: StoreFaultOperation) -> &'static str {
     StoreFaultOperation::ConsumerReleasePartition => "consumer_release_partition",
     StoreFaultOperation::ConsumerListGroupLeases => "consumer_list_group_leases",
     StoreFaultOperation::ConsumerMembershipHeartbeat => "consumer_membership_heartbeat",
+    StoreFaultOperation::ConsumerDeregisterMember => "consumer_deregister_member",
     StoreFaultOperation::ConsumerGetAssignmentPlan => "consumer_get_assignment_plan",
     StoreFaultOperation::ConsumerGetPlannerLease => "consumer_get_planner_lease",
     StoreFaultOperation::ConsumerAcquireOrRenewPlanner => "consumer_acquire_or_renew_planner",
@@ -1125,10 +1127,19 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
   }
 
   async fn deregister_member(&self, topic: &str, group_id: &str, member_id: &str) -> Result<()> {
-    let _ = &self.controller;
+    let key = format!("{topic}#{group_id}#{member_id}");
     self
-      .inner
-      .deregister_member(topic, group_id, member_id)
+      .apply_faults(StoreFaultOperation::ConsumerDeregisterMember, &key)
+      .await?;
+    self
+      .record_outcome(
+        StoreFaultOperation::ConsumerDeregisterMember,
+        key,
+        self
+          .inner
+          .deregister_member(topic, group_id, member_id)
+          .await,
+      )
       .await
   }
 
@@ -1501,6 +1512,29 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
         None,
       )
       .await;
+
+    let effects = self
+      .controller
+      .effects_for_call(
+        StoreFaultDomain::ConsumerLease,
+        StoreFaultOperation::ConsumerReleasePartition,
+        &key_str,
+      )
+      .await;
+    if let Some(delay) = effects.delay {
+      sleep(delay).await;
+    }
+    if let Some(timeout) = effects.timeout {
+      sleep(timeout).await;
+      return Err(anyhow!(
+        "consumer release_partition timed out for key {key_str}"
+      ));
+    }
+    if let Some(message) = effects.fail_message {
+      return Err(anyhow!(
+        "consumer release_partition fault for key {key_str}: {message}"
+      ));
+    }
 
     let result = self
       .inner

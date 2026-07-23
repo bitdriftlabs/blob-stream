@@ -1,8 +1,11 @@
+#[cfg(test)]
+#[path = "./event_log_test.rs"]
+mod tests;
+
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio::time::{Instant, sleep};
+use tokio::sync::{Mutex, Notify};
 
 //
 // TestEvent
@@ -68,6 +71,7 @@ impl TestEventMatcher {
 #[derive(Clone, Default)]
 pub struct TestEventLog {
   inner: Arc<Mutex<TestEventLogState>>,
+  recorded: Arc<Notify>,
 }
 
 //
@@ -104,6 +108,8 @@ impl TestEventLog {
       status: status.into(),
       detail,
     });
+    drop(guard);
+    self.recorded.notify_waiters();
   }
 
   pub async fn snapshot(&self) -> Vec<TestEvent> {
@@ -115,33 +121,53 @@ impl TestEventLog {
     matcher: &TestEventMatcher,
     timeout_duration: Duration,
   ) -> Result<TestEvent> {
-    let started = Instant::now();
-    loop {
-      let maybe_event = {
-        let guard = self.inner.lock().await;
-        guard
-          .events
-          .iter()
-          .find(|event| matcher.matches(event))
-          .cloned()
-      };
+    self
+      .wait_for_event_after(matcher, None, timeout_duration)
+      .await
+  }
 
-      if let Some(event) = maybe_event {
-        return Ok(event);
+  pub async fn wait_for_event_after(
+    &self,
+    matcher: &TestEventMatcher,
+    after_sequence: Option<u64>,
+    timeout_duration: Duration,
+  ) -> Result<TestEvent> {
+    tokio::time::timeout(timeout_duration, async {
+      loop {
+        // Register the waiter before inspecting the event list so a record between the inspection
+        // and await cannot be missed.
+        let notified = self.recorded.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let maybe_event = {
+          let guard = self.inner.lock().await;
+          guard
+            .events
+            .iter()
+            .find(|event| {
+              after_sequence.is_none_or(|sequence| event.sequence > sequence)
+                && matcher.matches(event)
+            })
+            .cloned()
+        };
+
+        if let Some(event) = maybe_event {
+          return event;
+        }
+
+        notified.await;
       }
-
-      if started.elapsed() >= timeout_duration {
-        return Err(anyhow!(
-          "timed out waiting for event: category={:?}, operation={:?}, key_contains={:?}, \
-           status={:?}",
-          matcher.category,
-          matcher.operation,
-          matcher.key_contains,
-          matcher.status
-        ));
-      }
-
-      sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await
+    .map_err(|_| {
+      anyhow!(
+        "timed out waiting for event after sequence {after_sequence:?}: category={:?}, \
+         operation={:?}, key_contains={:?}, status={:?}",
+        matcher.category,
+        matcher.operation,
+        matcher.key_contains,
+        matcher.status
+      )
+    })
   }
 }

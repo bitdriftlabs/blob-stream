@@ -19,7 +19,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bd_server_stats::stats::{Collector, Scope};
 use bd_shutdown::ComponentShutdownTrigger;
-use bd_time::{OffsetDateTimeExt, TestTimeProvider, TimeProvider};
+use bd_time::{OffsetDateTimeExt, TimeProvider};
 use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{
@@ -36,6 +36,7 @@ use blob_stream_metadata_store::{
   SegmentMetadata,
   SequenceReservationOutcome,
 };
+use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::{CompressionCodec, SeqRange, SnowflakeId, Window, new_record};
 use bytes::Bytes;
 use protobuf::Chars;
@@ -408,7 +409,7 @@ fn nonadjacent_reservation_replaces_remaining_capacity() {
 }
 
 fn make_engine(
-  time_provider: Arc<TestTimeProvider>,
+  time_provider: Arc<ManualTimeProvider>,
   config: WriteConfig,
   shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
 ) -> Result<(Arc<WriteEngineImpl>, Arc<InMemoryMetadataStore>)> {
@@ -418,7 +419,7 @@ fn make_engine(
 }
 
 fn make_two_partition_engine(
-  time_provider: Arc<TestTimeProvider>,
+  time_provider: Arc<ManualTimeProvider>,
   config: WriteConfig,
   shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
 ) -> Result<(Arc<WriteEngineImpl>, Arc<InMemoryMetadataStore>)> {
@@ -454,7 +455,7 @@ fn make_two_partition_engine(
 }
 
 fn make_engine_with_lease_store(
-  time_provider: Arc<TestTimeProvider>,
+  time_provider: Arc<ManualTimeProvider>,
   config: WriteConfig,
   shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
 ) -> Result<(
@@ -467,7 +468,7 @@ fn make_engine_with_lease_store(
 }
 
 fn make_engine_with_lease_store_and_scope(
-  time_provider: Arc<TestTimeProvider>,
+  time_provider: Arc<ManualTimeProvider>,
   config: WriteConfig,
   metrics_scope: &Scope,
   shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
@@ -541,7 +542,7 @@ async fn wait_for_partition_draining_start(engine: &WriteEngineImpl) {
 #[tokio::test]
 async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.writer_id = 0;
@@ -628,7 +629,7 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
 #[tokio::test]
 async fn state_snapshot_reports_expired_observed_lease() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.writer_id = 0;
@@ -664,7 +665,7 @@ async fn state_snapshot_reports_expired_observed_lease() -> Result<()> {
 
 #[tokio::test]
 async fn successful_sequence_reservation_records_metrics() -> Result<()> {
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
@@ -704,7 +705,7 @@ async fn successful_sequence_reservation_records_metrics() -> Result<()> {
 #[tokio::test]
 async fn fenced_sequence_reservations_do_not_record_failure_metrics() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let collector = Collector::default();
   let scope = collector.scope("blob_stream_broker_test");
@@ -748,7 +749,7 @@ async fn fenced_sequence_reservations_do_not_record_failure_metrics() -> Result<
 
 #[tokio::test]
 async fn buffers_until_size_rollover() -> Result<()> {
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 10;
@@ -806,7 +807,7 @@ async fn buffers_until_size_rollover() -> Result<()> {
 
 #[tokio::test]
 async fn same_partition_requests_serialize_sequence_reservations() -> Result<()> {
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
@@ -884,7 +885,7 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
 
 #[tokio::test]
 async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
@@ -962,7 +963,7 @@ async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
 
 #[tokio::test(start_paused = true)]
 async fn flushes_on_time_rollover() -> Result<()> {
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1024;
@@ -1010,7 +1011,7 @@ async fn flushes_on_time_rollover() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
@@ -1166,9 +1167,9 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
 }
 
 #[tokio::test(start_paused = true)]
-async fn time_due_byte_flush_coalesces_buffered_topic_peers() -> Result<()> {
+async fn time_due_flush_completes_before_later_byte_flush() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 2;
@@ -1180,6 +1181,7 @@ async fn time_due_byte_flush_coalesces_buffered_topic_peers() -> Result<()> {
     config.clone(),
     shutdown_trigger.make_handle(),
   )?;
+  time_provider.wait_until_sleeping(1).await;
   let first_engine = Arc::clone(&engine);
   let first = tokio::spawn(async move {
     first_engine
@@ -1229,20 +1231,19 @@ async fn time_due_byte_flush_coalesces_buffered_topic_peers() -> Result<()> {
   }
 
   time_provider.advance(TimeDuration::milliseconds(5));
+  first.await??;
+  peer.await??;
+
   let byte_due_engine = Arc::clone(&engine);
   let byte_due = tokio::spawn(async move {
     byte_due_engine
       .produce_batch(WriteRequest {
         topic: "telemetry".into(),
         virtual_partition_id: 0,
-        records: vec![new_record(vec![3], 30)],
+        records: vec![new_record(vec![3; 2], 30)],
       })
       .await
   });
-  tokio::task::yield_now().await;
-
-  first.await??;
-  peer.await??;
   byte_due.await??;
 
   let window = Window::for_timestamp(
@@ -1252,17 +1253,24 @@ async fn time_due_byte_flush_coalesces_buffered_topic_peers() -> Result<()> {
   let segments = metadata_store
     .scan_window_from_snowflake(&window.key("telemetry"), None)
     .await?;
-  assert_eq!(segments.len(), 1);
-  assert_eq!(segments[0].segment_index.len(), 2);
-  assert!(segments[0].segment_index.contains_key(&0));
-  assert!(segments[0].segment_index.contains_key(&1));
+  assert_eq!(segments.len(), 2);
+  assert!(segments.iter().any(|segment| {
+    segment.segment_index.len() == 2
+      && segment.segment_index.contains_key(&0)
+      && segment.segment_index.contains_key(&1)
+  }));
+  assert!(
+    segments.iter().any(|segment| {
+      segment.segment_index.len() == 1 && segment.segment_index.contains_key(&0)
+    })
+  );
   Ok(())
 }
 
 #[tokio::test(start_paused = true)]
 async fn byte_flush_does_not_coalesce_buffered_topic_peers() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 2;
@@ -1332,7 +1340,7 @@ async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> 
   let scope = collector.scope("blob_stream_broker_test");
   let shutdown_trigger = ComponentShutdownTrigger::default();
 
-  let size_time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let size_time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let mut size_config = WriteConfig::with_defaults();
   size_config.flush_max_bytes = 1;
   size_config.flush_max_delay_ms = 60_000;
@@ -1350,7 +1358,7 @@ async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> 
     })
     .await?;
 
-  let delay_time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let delay_time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let mut delay_config = WriteConfig::with_defaults();
   delay_config.flush_max_bytes = 1_024;
   delay_config.flush_max_delay_ms = 10;
@@ -1405,7 +1413,7 @@ async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> 
 async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
   let collector = Collector::default();
   let scope = collector.scope("blob_stream_broker_test");
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
@@ -1471,7 +1479,7 @@ async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
@@ -1564,7 +1572,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
 #[tokio::test(start_paused = true)]
 async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
@@ -1658,7 +1666,7 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
 #[tokio::test]
 async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
@@ -1794,7 +1802,7 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
 #[tokio::test]
 async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
   config.flush_max_delay_ms = 60_000;
@@ -1877,7 +1885,7 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
 #[tokio::test(start_paused = true)]
 async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
@@ -1958,7 +1966,7 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
 #[tokio::test(start_paused = true)]
 async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
@@ -2061,7 +2069,7 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
 #[tokio::test(start_paused = true)]
 async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
@@ -2134,7 +2142,7 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
 
 #[tokio::test]
 async fn assigns_monotonic_sequences() -> Result<()> {
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
@@ -2168,7 +2176,7 @@ async fn assigns_monotonic_sequences() -> Result<()> {
 
 #[tokio::test]
 async fn writes_compressed_metadata() -> Result<()> {
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 5;
@@ -2222,7 +2230,7 @@ impl MetadataStore for FailingMetadataStore {
 
 #[tokio::test]
 async fn returns_error_when_flush_fails() -> Result<()> {
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut topics = HashMap::new();
   topics.insert(

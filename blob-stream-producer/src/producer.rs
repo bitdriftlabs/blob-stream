@@ -52,6 +52,7 @@ use log::{debug, trace};
 use metrics::ProducerMetrics;
 use parking_lot::Mutex;
 use protobuf::Chars;
+pub use retry::ProducerRetryClock;
 use routing::{ProducerRoutes, group_batches_by_broker, record_fits_grouped_request};
 use state::{BufferedRecord, ProducerState};
 use std::collections::HashMap;
@@ -149,6 +150,53 @@ pub trait ProducerClient: Send + Sync {
 }
 
 //
+// ProducerClientBuilder
+//
+
+/// Builder for a producer and its runtime dependencies.
+pub struct ProducerClientBuilder {
+  config: ProducerConfig,
+  topics: Vec<ProducerTopicConfig>,
+  discovery: Arc<dyn BrokerDiscovery>,
+  transport: Arc<dyn BrokerTransport>,
+  metrics_scope: Scope,
+  retry_clock: Arc<dyn ProducerRetryClock>,
+}
+
+impl ProducerClientBuilder {
+  /// Start building a producer with its default Tokio-backed retry clock.
+  #[must_use]
+  pub fn new(
+    config: ProducerConfig,
+    topics: Vec<ProducerTopicConfig>,
+    discovery: Arc<dyn BrokerDiscovery>,
+    transport: Arc<dyn BrokerTransport>,
+    metrics_scope: Scope,
+  ) -> Self {
+    Self {
+      config,
+      topics,
+      discovery,
+      transport,
+      metrics_scope,
+      retry_clock: Arc::new(retry::TokioProducerRetryClock),
+    }
+  }
+
+  /// Use a caller-provided clock for retry deadlines and backoff sleeps.
+  #[must_use]
+  pub fn retry_clock(mut self, retry_clock: Arc<dyn ProducerRetryClock>) -> Self {
+    self.retry_clock = retry_clock;
+    self
+  }
+
+  /// Build the producer and start its background flush loop.
+  pub async fn build(self) -> Result<ProducerClientImpl> {
+    ProducerClientImpl::build(self).await
+  }
+}
+
+//
 // ProducerClientImpl
 //
 
@@ -160,6 +208,7 @@ pub struct ProducerClientImpl {
   transport: Arc<dyn BrokerTransport>,
   metrics: Arc<ProducerMetrics>,
   retry_diagnostics: ProducerRetryDiagnostics,
+  retry_clock: Arc<dyn ProducerRetryClock>,
   routes: ProducerRoutes,
   state: Arc<Mutex<ProducerState>>,
   flush_notify: Arc<Notify>,
@@ -186,7 +235,9 @@ impl ProducerClientImpl {
     let discovery = into_discovery(discovery_config)?;
     let transport: Arc<dyn BrokerTransport> = Arc::new(GrpcBrokerTransport::new(config.clone()));
 
-    Self::new(config, runtime.topics, discovery, transport, metrics_scope).await
+    ProducerClientBuilder::new(config, runtime.topics, discovery, transport, metrics_scope)
+      .build()
+      .await
   }
 
   /// Construct a producer from explicit configuration and runtime dependencies.
@@ -197,6 +248,21 @@ impl ProducerClientImpl {
     transport: Arc<dyn BrokerTransport>,
     metrics_scope: Scope,
   ) -> Result<Self> {
+    ProducerClientBuilder::new(config, topics, discovery, transport, metrics_scope)
+      .build()
+      .await
+  }
+
+  async fn build(builder: ProducerClientBuilder) -> Result<Self> {
+    let ProducerClientBuilder {
+      config,
+      topics,
+      discovery,
+      transport,
+      metrics_scope,
+      retry_clock,
+    } = builder;
+
     validate_producer_config(&config)?;
     let writer_id = producer_writer_id(&config);
 
@@ -260,6 +326,7 @@ impl ProducerClientImpl {
       membership_rx.clone(),
       Arc::clone(&metrics),
       retry_diagnostics.clone(),
+      Arc::clone(&retry_clock),
       routes.clone(),
       Arc::clone(&dispatch_permits),
       Arc::clone(&flush_notify),
@@ -272,6 +339,7 @@ impl ProducerClientImpl {
       transport,
       metrics,
       retry_diagnostics,
+      retry_clock,
       routes,
       state,
       flush_notify,
@@ -288,6 +356,7 @@ impl ProducerClientImpl {
     mut membership_rx: watch::Receiver<BrokerMembership>,
     metrics: Arc<ProducerMetrics>,
     retry_diagnostics: ProducerRetryDiagnostics,
+    retry_clock: Arc<dyn ProducerRetryClock>,
     routes: ProducerRoutes,
     dispatch_permits: Arc<Semaphore>,
     flush_notify: Arc<Notify>,
@@ -366,6 +435,7 @@ impl ProducerClientImpl {
             &transport,
             &metrics,
             &retry_diagnostics,
+            &retry_clock,
             &dispatch_permits,
             group,
           ));
@@ -483,6 +553,7 @@ impl ProducerClient for ProducerClientImpl {
         &self.transport,
         &self.metrics,
         &self.retry_diagnostics,
+        &self.retry_clock,
         &self.dispatch_permits,
         group,
       ));

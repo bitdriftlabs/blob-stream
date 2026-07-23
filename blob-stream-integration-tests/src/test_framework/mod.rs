@@ -7,6 +7,8 @@ mod config;
 mod discovery;
 mod event_log;
 mod helpers;
+mod lifecycle;
+mod manual_time;
 mod resources;
 mod runtime;
 mod store_faults;
@@ -17,7 +19,8 @@ pub const SECOND_TOPIC: &str = "telemetry-secondary";
 pub const PARTITION_COUNT: u32 = 16;
 pub const WINDOW_SIZE_SECONDS: i64 = 300;
 
-pub use cluster::ClusterHarness;
+pub use blob_stream_test_utils::ManualTimeProvider;
+pub use cluster::{ClusterHarness, InMemoryClusterHarnessBuilder};
 pub use config::{
   consumer_bootstrap_config,
   consumer_bootstrap_config_for,
@@ -32,11 +35,18 @@ pub use config::{
 pub use discovery::DynamicBrokerDiscovery;
 pub use event_log::{TestEvent, TestEventLog, TestEventMatcher};
 pub use helpers::{
+  ReaderDeliveryTrace,
   TestConsumerReader,
+  append_reader_delivery_traces,
   drain_reader_until,
+  drain_reader_until_with_trace,
   produce_message,
   produce_message_for_topic,
+  reader_delivery_counts,
+  rescan_reader_with_trace,
 };
+pub use lifecycle::{LifecycleEvent, LifecycleGate, TestLifecycleHooks};
+pub use manual_time::ManualProducerRetryClock;
 pub use resources::IntegrationResources;
 pub use runtime::now_unix_seconds;
 pub use store_faults::{

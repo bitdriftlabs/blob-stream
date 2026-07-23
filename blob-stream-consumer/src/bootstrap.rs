@@ -3,7 +3,14 @@
 mod tests;
 
 use crate::config::{ConsumerRuntimeConfig, validate_runtime_config};
-use crate::iterator::{ConsumerCoordinationSource, ConsumerIteratorImpl, CoordinationSnapshot};
+use crate::iterator::{
+  ConsumerCoordinationSource,
+  ConsumerIteratorBuilder,
+  ConsumerIteratorImpl,
+  ConsumerLifecycleHooks,
+  CoordinationSnapshot,
+  NoopConsumerLifecycleHooks,
+};
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -12,6 +19,7 @@ use aws_types::region::Region;
 use bd_pgv::proto_validate;
 use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
+use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_metadata_store::{
   ConsumerGroupLeaseStore,
@@ -33,7 +41,7 @@ use blob_stream_proto::protos::blobstream::v1::config::{
   MetadataStoreConfig,
   TopicConfig,
 };
-use blob_stream_types::{VirtualPartitionId, now_unix_millis};
+use blob_stream_types::VirtualPartitionId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -55,6 +63,62 @@ pub struct ConsumerBootstrapConfig {
   pub blob_store: BlobStoreConfig,
   /// Metadata/coordination backend configuration.
   pub metadata_store: MetadataStoreConfig,
+}
+
+//
+// ConsumerBootstrapIteratorBuilder
+//
+
+/// Builder for a consumer iterator initialized from bootstrap configuration.
+pub struct ConsumerBootstrapIteratorBuilder {
+  config: ConsumerBootstrapConfig,
+  metrics_scope: Scope,
+  feature_flags: Option<FeatureFlagsWatch>,
+  time_provider: Arc<dyn TimeProvider>,
+  lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>,
+}
+
+impl ConsumerBootstrapIteratorBuilder {
+  #[must_use]
+  pub fn new(
+    config: ConsumerBootstrapConfig,
+    metrics_scope: Scope,
+    feature_flags: Option<FeatureFlagsWatch>,
+  ) -> Self {
+    Self {
+      config,
+      metrics_scope,
+      feature_flags,
+      time_provider: Arc::new(SystemTimeProvider),
+      lifecycle_hooks: Arc::new(NoopConsumerLifecycleHooks),
+    }
+  }
+
+  /// Use an explicit clock for coordination and driver scheduling.
+  #[must_use]
+  pub fn time_provider(mut self, time_provider: Arc<dyn TimeProvider>) -> Self {
+    self.time_provider = time_provider;
+    self
+  }
+
+  /// Use explicit lifecycle hooks for observing iterator transitions.
+  #[must_use]
+  pub fn lifecycle_hooks(mut self, lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>) -> Self {
+    self.lifecycle_hooks = lifecycle_hooks;
+    self
+  }
+
+  /// Build the configured consumer iterator.
+  pub async fn build(self) -> Result<ConsumerIteratorImpl> {
+    ConsumerIteratorImpl::build_from_bootstrap(
+      self.config,
+      self.metrics_scope,
+      self.feature_flags,
+      self.time_provider,
+      self.lifecycle_hooks,
+    )
+    .await
+  }
 }
 
 //
@@ -142,6 +206,18 @@ impl ConsumerIteratorImpl {
     metrics_scope: Scope,
     feature_flags: Option<FeatureFlagsWatch>,
   ) -> Result<Self> {
+    ConsumerBootstrapIteratorBuilder::new(config, metrics_scope, feature_flags)
+      .build()
+      .await
+  }
+
+  async fn build_from_bootstrap(
+    config: ConsumerBootstrapConfig,
+    metrics_scope: Scope,
+    feature_flags: Option<FeatureFlagsWatch>,
+    time_provider: Arc<dyn TimeProvider>,
+    lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>,
+  ) -> Result<Self> {
     validate_runtime_config(&config.runtime)?;
     proto_validate::validate(&config.topic)?;
     proto_validate::validate(&config.blob_store)?;
@@ -173,15 +249,18 @@ impl ConsumerIteratorImpl {
     )
     .await?;
 
-    let coordination = Arc::new(MembershipCoordinationSource::new(
-      group.topic.to_string(),
-      group.group_id.to_string(),
-      group.member_id.to_string(),
-      virtual_partitions,
-      membership_store.clone(),
-    ));
+    let coordination = Arc::new(
+      MembershipCoordinationSource::new(
+        group.topic.to_string(),
+        group.group_id.to_string(),
+        group.member_id.to_string(),
+        virtual_partitions,
+        membership_store.clone(),
+      )
+      .time_provider(Arc::clone(&time_provider)),
+    );
 
-    Self::from_runtime_config_with_retention_and_publication_lag(
+    ConsumerIteratorBuilder::new(
       &config.runtime,
       blob_store,
       metadata_store,
@@ -196,6 +275,9 @@ impl ConsumerIteratorImpl {
         .unwrap_or(crate::config::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS),
       feature_flags,
     )
+    .lifecycle_hooks(lifecycle_hooks)
+    .time_provider(time_provider)
+    .build()
     .await
   }
 }
@@ -327,6 +409,7 @@ pub struct MembershipCoordinationSource {
   local_member_id: String,
   virtual_partitions: Vec<VirtualPartitionId>,
   membership_store: Arc<dyn ConsumerGroupMembershipStore>,
+  time_provider: Arc<dyn TimeProvider>,
 }
 
 impl MembershipCoordinationSource {
@@ -345,14 +428,22 @@ impl MembershipCoordinationSource {
       local_member_id,
       virtual_partitions,
       membership_store,
+      time_provider: Arc::new(SystemTimeProvider),
     }
+  }
+
+  /// Use a shared clock for membership liveness snapshots.
+  #[must_use]
+  pub fn time_provider(mut self, time_provider: Arc<dyn TimeProvider>) -> Self {
+    self.time_provider = time_provider;
+    self
   }
 }
 
 #[async_trait]
 impl ConsumerCoordinationSource for MembershipCoordinationSource {
   async fn snapshot(&self) -> Result<CoordinationSnapshot> {
-    let now_ts_ms = now_unix_millis();
+    let now_ts_ms = self.time_provider.now().unix_timestamp_ms();
     let mut members = self
       .membership_store
       .list_active_members(&self.topic, &self.group_id, now_ts_ms)

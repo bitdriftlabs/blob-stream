@@ -52,7 +52,7 @@ pub(super) async fn send_batch_with_retry(
   retry_diagnostics: &ProducerRetryDiagnostics,
   initial_response: Option<ProduceBatchResponse>,
   completed_attempts: u32,
-  retry_clock: &dyn RetryClock,
+  retry_clock: &dyn ProducerRetryClock,
   retry_started_at: Instant,
 ) -> Result<ProducerAck, ProducerError> {
   let mut retry_backoff = producer_retry_backoff(config);
@@ -255,7 +255,7 @@ pub(super) fn acknowledge_batch(
   batch: &BufferedBatch,
   metrics: &ProducerMetrics,
   attempts: u32,
-  retry_clock: &dyn RetryClock,
+  retry_clock: &dyn ProducerRetryClock,
   retry_started_at: Instant,
 ) -> ProducerAck {
   metrics.batches_sent.inc();
@@ -356,7 +356,7 @@ pub(super) fn next_retry_delay(
 /// Wait for broker routing to change, or for lease ownership to converge without a route update.
 pub(super) async fn wait_for_not_lease_holder_retry(
   membership_rx: &mut watch::Receiver<BrokerMembership>,
-  retry_clock: &dyn RetryClock,
+  retry_clock: &dyn ProducerRetryClock,
   delay: Duration,
   retry_deadline: Instant,
 ) -> bool {
@@ -397,19 +397,20 @@ pub(super) async fn wait_for_not_lease_holder_retry(
 }
 
 //
-// RetryClock
+// ProducerRetryClock
 //
 
 #[async_trait]
-pub(super) trait RetryClock: Send + Sync {
+/// Clock used to evaluate producer retry deadlines and backoff delays.
+pub trait ProducerRetryClock: Send + Sync {
   fn now(&self) -> Instant;
   async fn sleep(&self, duration: Duration);
 }
 
-pub(super) struct TokioRetryClock;
+pub(super) struct TokioProducerRetryClock;
 
 #[async_trait]
-impl RetryClock for TokioRetryClock {
+impl ProducerRetryClock for TokioProducerRetryClock {
   fn now(&self) -> Instant {
     Instant::now()
   }

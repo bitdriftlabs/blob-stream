@@ -1,5 +1,5 @@
 use super::metrics::ProducerMetrics;
-use super::retry::{RetryClock, TokioRetryClock, acknowledge_batch, send_batch_with_retry};
+use super::retry::{ProducerRetryClock, acknowledge_batch, send_batch_with_retry};
 use super::routing::{BrokerBatchGroup, ProducerRoutes, produce_batch_request};
 use super::state::BufferedBatch;
 use super::{BrokerTransport, ProducerAck, ProducerError, ProducerRetryDiagnostics};
@@ -30,6 +30,7 @@ pub(super) async fn dispatch_group_and_notify(
   transport: &Arc<dyn BrokerTransport>,
   metrics: &Arc<ProducerMetrics>,
   retry_diagnostics: &ProducerRetryDiagnostics,
+  retry_clock: &Arc<dyn ProducerRetryClock>,
   dispatch_permits: &Arc<Semaphore>,
   group: BrokerBatchGroup,
 ) -> Result<(), ProducerError> {
@@ -41,6 +42,7 @@ pub(super) async fn dispatch_group_and_notify(
     transport.as_ref(),
     metrics,
     retry_diagnostics,
+    retry_clock.as_ref(),
     dispatch_permits,
     group,
   )
@@ -80,10 +82,10 @@ async fn send_grouped_batches_and_notify(
   transport: &dyn BrokerTransport,
   metrics: &ProducerMetrics,
   retry_diagnostics: &ProducerRetryDiagnostics,
+  retry_clock: &dyn ProducerRetryClock,
   dispatch_permits: &Arc<Semaphore>,
   group: BrokerBatchGroup,
 ) -> Result<(), ProducerError> {
-  let retry_clock = TokioRetryClock;
   let retry_started_at = retry_clock.now();
 
   // The grouped RPC amortizes transport overhead, but each response remains an independent
@@ -158,7 +160,7 @@ async fn send_grouped_batches_and_notify(
           &batch,
           metrics,
           1,
-          &retry_clock,
+          retry_clock,
           retry_started_at,
         ));
         notify_waiters(batch.waiters, &result);
@@ -182,7 +184,7 @@ async fn send_grouped_batches_and_notify(
             retry_diagnostics,
             initial_response,
             1,
-            &retry_clock,
+            retry_clock,
             retry_started_at,
           )
           .await;
