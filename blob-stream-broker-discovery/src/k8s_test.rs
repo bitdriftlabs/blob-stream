@@ -37,8 +37,8 @@ fn membership_uses_pod_name_for_broker_identity() {
   assert_eq!(
     membership,
     BrokerMembership::new(vec![BrokerNode {
-      node_id: "blob-stream-broker-0".to_string(),
-      address: "10.0.0.1:8080".to_string(),
+      node_id: "blob-stream-broker-0".into(),
+      address: "10.0.0.1:8080".into(),
     }])
   );
   assert!(membership.nodes().is_some());

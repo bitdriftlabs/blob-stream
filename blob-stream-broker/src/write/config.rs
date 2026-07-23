@@ -308,8 +308,8 @@ async fn build_membership_watch(
         .nodes
         .iter()
         .map(|node| BrokerNode {
-          node_id: node.node_id.to_string(),
-          address: node.address.to_string(),
+          node_id: node.node_id.clone(),
+          address: node.address.clone(),
         })
         .collect();
       let discovery = StaticBrokerDiscovery::new(nodes);
@@ -326,8 +326,8 @@ async fn build_membership_watch(
   }
 
   let fallback = BrokerMembership::new(vec![BrokerNode {
-    node_id: holder_id.to_string(),
-    address: holder_id.to_string(),
+    node_id: holder_id.to_string().into(),
+    address: holder_id.to_string().into(),
   }]);
   debug!("using fallback single-node broker discovery for holder_id={holder_id}");
   let (tx, rx) = watch::channel(fallback);

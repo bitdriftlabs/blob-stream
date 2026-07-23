@@ -295,7 +295,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     .expect("in-memory transport should expose a fault controller");
   controller
     .enable_fault(NetworkFaultRule {
-      target_node_id: Some(active_node.node_id.clone()),
+      target_node_id: Some(active_node.node_id.to_string()),
       operation: NetworkOperation::ProduceBatch,
       fault: NetworkFault::Partition,
       remaining_hits: Some(2),
@@ -381,7 +381,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
       &TestEventMatcher {
         category: Some("transport".to_string()),
         operation: Some("produce_batch".to_string()),
-        key_contains: Some(active_node.node_id.clone()),
+        key_contains: Some(active_node.node_id.to_string()),
         status: Some("fault_applied".to_string()),
       },
       Duration::from_secs(5),
@@ -393,7 +393,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
       &TestEventMatcher {
         category: Some("transport".to_string()),
         operation: Some("produce_batch".to_string()),
-        key_contains: Some(standby_node.node_id.clone()),
+        key_contains: Some(standby_node.node_id.to_string()),
         status: Some("ok".to_string()),
       },
       Duration::from_secs(5),
@@ -436,9 +436,9 @@ async fn broker_response_timeout_retry_deadline_respected() -> Result<()> {
 
   let exhausted = producer
     .produce(ProducerRecord::new(
-      TOPIC,
+      TOPIC.into(),
       b"fit-004-timeout".to_vec(),
-      b"fit-004-timeout".to_vec(),
+      b"fit-004-timeout".to_vec().into(),
       framework::now_unix_seconds() * 1_000,
     ))
     .await;
@@ -734,9 +734,9 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
 
   let failed_ack = producer
     .produce(ProducerRecord::new(
-      TOPIC,
+      TOPIC.into(),
       b"fit-007-failed-key".to_vec(),
-      b"fit-007-failed".to_vec(),
+      b"fit-007-failed".to_vec().into(),
       framework::now_unix_seconds() * 1_000,
     ))
     .await;

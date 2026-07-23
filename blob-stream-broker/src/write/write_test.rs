@@ -568,8 +568,8 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   assert_eq!(snapshot.holder_id, "test-node");
   assert_eq!(snapshot.writer_id, 0);
   assert_eq!(snapshot.membership.len(), 1);
-  assert_eq!(snapshot.membership[0].node_id, "test-node");
-  assert_eq!(snapshot.membership[0].address, "test-node");
+  assert_eq!(snapshot.membership[0].node_id.as_str(), "test-node");
+  assert_eq!(snapshot.membership[0].address.as_str(), "test-node");
   assert_eq!(snapshot.ownership.len(), 1);
   assert!(snapshot.ownership[0].assignment_is_local);
   assert_eq!(
@@ -1665,8 +1665,8 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   config.flush_max_delay_ms = 60_000;
 
   let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-a".to_string(),
-    address: "10.0.0.1:8080".to_string(),
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
   }]));
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release = Arc::new(Semaphore::new(0));
@@ -1726,8 +1726,8 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   assert!(!buffered.is_finished());
 
   membership_tx.send(BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-b".to_string(),
-    address: "10.0.0.2:8080".to_string(),
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
   }]))?;
   wait_for_partition_draining_start(&engine).await;
 
@@ -1800,8 +1800,8 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
   config.flush_max_delay_ms = 60_000;
 
   let (_membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-a".to_string(),
-    address: "10.0.0.1:8080".to_string(),
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
   }]));
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release = Arc::new(Semaphore::new(0));

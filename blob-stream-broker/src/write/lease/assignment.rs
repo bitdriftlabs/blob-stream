@@ -51,7 +51,8 @@ impl WriteEngineImpl {
     let mut owned: Vec<(Chars, VirtualPartitionId)> = balanced_assignment(partitions, membership)
       .into_iter()
       .filter_map(|(partition, owner)| {
-        (owner.node_id == holder_id).then_some((partition.topic, partition.virtual_partition_id))
+        (owner.node_id.as_str() == holder_id)
+          .then_some((partition.topic, partition.virtual_partition_id))
       })
       .collect();
 
@@ -148,7 +149,7 @@ impl WriteEngineImpl {
             }
             continue;
           };
-          let self_is_member = nodes.iter().any(|node| node.node_id == holder_id);
+          let self_is_member = nodes.iter().any(|node| node.node_id.as_str() == holder_id);
           if !self_is_member {
             if shutting_down {
               break;

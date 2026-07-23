@@ -201,8 +201,8 @@ pub fn into_discovery(discovery: &ProducerDiscoveryConfig) -> Result<Arc<dyn Bro
       .nodes
       .iter()
       .map(|node| BrokerNode {
-        node_id: node.node_id.to_string(),
-        address: node.address.to_string(),
+        node_id: node.node_id.clone(),
+        address: node.address.clone(),
       })
       .collect();
     return Ok(Arc::new(StaticBrokerDiscovery::new(nodes)));

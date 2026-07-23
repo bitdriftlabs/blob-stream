@@ -450,7 +450,7 @@ async fn wait_for_broker_readiness(
                 .as_ref()
                 .zip(ownership.observed_lease.as_ref())
                 .is_some_and(|(assigned, observed)| {
-                  observed.is_active && observed.holder_id == assigned.node_id
+                  observed.is_active && observed.holder_id == assigned.node_id.as_str()
                 })
           })
       });
@@ -770,9 +770,9 @@ async fn run_producer(
     submissions.push(async move {
       producer_client
         .produce(ProducerRecord::new(
-          TOPIC,
+          TOPIC.into(),
           key,
-          identity.encode(payload_size),
+          identity.encode(payload_size).into(),
           now_unix_millis(),
         ))
         .await

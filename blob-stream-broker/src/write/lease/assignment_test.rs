@@ -145,20 +145,20 @@ fn ownership_changes_with_membership() {
   );
 
   let solo_a = BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-a".to_string(),
-    address: "10.0.0.1:8080".to_string(),
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
   }]);
   let owned_solo = WriteEngineImpl::owned_virtual_partitions(&topics, 0, "node-a", &solo_a);
   assert_eq!(owned_solo.len(), 8);
 
   let split = BrokerMembership::new(vec![
     BrokerNode {
-      node_id: "node-a".to_string(),
-      address: "10.0.0.1:8080".to_string(),
+      node_id: "node-a".into(),
+      address: "10.0.0.1:8080".into(),
     },
     BrokerNode {
-      node_id: "node-b".to_string(),
-      address: "10.0.0.2:8080".to_string(),
+      node_id: "node-b".into(),
+      address: "10.0.0.2:8080".into(),
     },
   ]);
 
@@ -175,8 +175,8 @@ fn ownership_changes_with_membership() {
   assert_eq!(owned_a.union(&owned_b).count(), 8);
 
   let solo_b = BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-b".to_string(),
-    address: "10.0.0.2:8080".to_string(),
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
   }]);
   let owned_after_move = WriteEngineImpl::owned_virtual_partitions(&topics, 0, "node-a", &solo_b);
   assert!(owned_after_move.is_empty());
@@ -205,12 +205,12 @@ fn ownership_includes_only_local_producer_writer_virtual_partitions() {
   );
   let membership = BrokerMembership::new(vec![
     BrokerNode {
-      node_id: "node-a".to_string(),
-      address: "10.0.0.1:8080".to_string(),
+      node_id: "node-a".into(),
+      address: "10.0.0.1:8080".into(),
     },
     BrokerNode {
-      node_id: "node-b".to_string(),
-      address: "10.0.0.2:8080".to_string(),
+      node_id: "node-b".into(),
+      address: "10.0.0.2:8080".into(),
     },
   ]);
 
@@ -418,15 +418,15 @@ async fn lease_assignment_waits_for_initialized_self_membership() -> Result<()> 
   assert!(!all_partitions_held_by(&lease_store, "node-a", partition_count, now_ts_ms).await);
 
   membership_tx.send(BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-b".to_string(),
-    address: "10.0.0.2:8080".to_string(),
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
   }]))?;
   tokio::time::sleep(StdDuration::from_millis(50)).await;
   assert!(!all_partitions_held_by(&lease_store, "node-a", partition_count, now_ts_ms).await);
 
   membership_tx.send(BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-a".to_string(),
-    address: "10.0.0.1:8080".to_string(),
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
   }]))?;
   assert!(
     wait_for_all_partitions(|| {
@@ -450,8 +450,8 @@ async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Resul
   let mut config = WriteConfig::with_defaults();
   config.lease_duration_ms = 60_000;
   let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-a".to_string(),
-    address: "10.0.0.1:8080".to_string(),
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
   }]));
   let shutdown_trigger = ComponentShutdownTrigger::default();
 
@@ -482,8 +482,8 @@ async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Resul
   );
 
   membership_tx.send(BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-b".to_string(),
-    address: "10.0.0.2:8080".to_string(),
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
   }]))?;
   assert!(
     wait_for_all_partitions(|| all_partitions_expired(&lease_store, partition_count, now_ts_ms))
@@ -492,8 +492,8 @@ async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Resul
   );
 
   membership_tx.send(BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-a".to_string(),
-    address: "10.0.0.1:8080".to_string(),
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
   }]))?;
   assert!(
     wait_for_all_partitions(|| {
@@ -517,8 +517,8 @@ async fn scale_down_releases_previously_owned_leases() -> Result<()> {
   config.lease_duration_ms = 60_000;
 
   let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-a".to_string(),
-    address: "10.0.0.1:8080".to_string(),
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
   }]));
   let shutdown_trigger = ComponentShutdownTrigger::default();
 
@@ -544,8 +544,8 @@ async fn scale_down_releases_previously_owned_leases() -> Result<()> {
   tokio::time::sleep(StdDuration::from_millis(50)).await;
 
   membership_tx.send(BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-b".to_string(),
-    address: "10.0.0.2:8080".to_string(),
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
   }]))?;
 
   let mut converged = false;
@@ -572,8 +572,8 @@ async fn shutdown_releases_currently_owned_leases() -> Result<()> {
   config.lease_duration_ms = 60_000;
 
   let (_membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
-    node_id: "node-a".to_string(),
-    address: "10.0.0.1:8080".to_string(),
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
   }]));
   let shutdown_trigger = ComponentShutdownTrigger::default();
 

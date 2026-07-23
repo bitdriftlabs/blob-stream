@@ -28,7 +28,13 @@ use blob_stream_broker::write::{
 };
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{MetadataStore, ProducerPartitionLeaseStore};
-use blob_stream_producer::{ProducerClientImpl, ProducerConfig, ProducerTopicConfig};
+use blob_stream_producer::{
+  BrokerTransport as ProducerBrokerTransport,
+  GrpcBrokerTransport,
+  ProducerClientImpl,
+  ProducerConfig,
+  ProducerTopicConfig,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,7 +79,7 @@ impl BrokerHandle {
 
 pub struct ClusterHarness {
   brokers: Vec<BrokerHandle>,
-  machine_ids: HashMap<String, u16>,
+  machine_ids: HashMap<protobuf::Chars, u16>,
   event_log: TestEventLog,
   producer_discovery: DynamicBrokerDiscovery,
   broker_membership_tx: watch::Sender<BrokerMembership>,
@@ -282,7 +288,7 @@ impl ClusterHarness {
       let snapshots = self.broker_state_snapshots().await;
       let initial_broker_ready = snapshots
         .iter()
-        .find(|snapshot| snapshot.holder_id == initial_broker.node.node_id)
+        .find(|snapshot| snapshot.holder_id == initial_broker.node.node_id.as_str())
         .is_some_and(|snapshot| {
           snapshot.ownership.len() == expected_partition_count
             && snapshot.ownership.iter().all(|ownership| {
@@ -329,12 +335,11 @@ impl ClusterHarness {
   ) -> Result<ProducerClientImpl> {
     let discovery: Arc<dyn BrokerDiscovery> = Arc::new(self.producer_discovery());
     let metrics_scope = Collector::default().scope("blob_stream_producer_it");
-    if let Some(transport) = self.transport.producer_transport() {
-      ProducerClientImpl::new_with_transport(config, topics, discovery, transport, metrics_scope)
-        .await
-    } else {
-      ProducerClientImpl::new(config, topics, discovery, metrics_scope).await
-    }
+    let transport: Arc<dyn ProducerBrokerTransport> = self
+      .transport
+      .producer_transport()
+      .unwrap_or_else(|| Arc::new(GrpcBrokerTransport::new(config.clone())));
+    ProducerClientImpl::new(config, topics, discovery, transport, metrics_scope).await
   }
 
   pub fn set_active_nodes(&self, nodes: Vec<BrokerNode>) {
@@ -378,7 +383,7 @@ impl ClusterHarness {
       .ok_or_else(|| anyhow!("missing machine ID for broker {}", node.node_id))?;
     let broker_shutdown_trigger = ComponentShutdownTrigger::default();
     let write_engine = build_write_engine(
-      node.node_id.clone(),
+      node.node_id.to_string(),
       machine_id,
       self.broker_membership_tx.subscribe(),
       Arc::clone(&self.blob_store),
@@ -434,7 +439,7 @@ impl ClusterHarness {
     let index = self
       .brokers
       .iter()
-      .position(|broker| broker.node.node_id == node_id)
+      .position(|broker| broker.node.node_id.as_str() == node_id)
       .ok_or_else(|| anyhow!("broker node not found: {node_id}"))?;
 
     let mut removed = self.brokers.remove(index);
@@ -447,7 +452,7 @@ impl ClusterHarness {
     let index = self
       .brokers
       .iter()
-      .position(|broker| broker.node.node_id == node_id)
+      .position(|broker| broker.node.node_id.as_str() == node_id)
       .ok_or_else(|| anyhow!("broker node not found: {node_id}"))?;
 
     let old_node = self.brokers[index].node.clone();

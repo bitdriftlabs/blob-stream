@@ -27,6 +27,9 @@ pub const DEFAULT_METADATA_WINDOW_SIZE_SECONDS: i64 = 300;
 /// use the same value when deriving their metadata availability horizon.
 pub const DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS: u64 = 15_000;
 
+/// Maximum decoded bytes accepted for one broker produce RPC.
+pub const MAX_PRODUCE_BATCHES_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
 //
 // Serde Helpers
 //
@@ -38,6 +41,21 @@ where
   T: std::fmt::Display + ?Sized,
 {
   serializer.collect_str(value)
+}
+
+/// Serialize an optional displayable string-like value as a JSON string or null.
+pub fn serialize_optional_as_string<S, T>(
+  value: &Option<T>,
+  serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+  S: Serializer,
+  T: std::fmt::Display,
+{
+  match value {
+    Some(value) => serializer.collect_str(value),
+    None => serializer.serialize_none(),
+  }
 }
 
 #[must_use]

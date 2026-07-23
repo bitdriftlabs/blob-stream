@@ -166,13 +166,20 @@ invariant.
 ## Write Path
 
 1. A producer buffers records independently for each `(topic, virtual_partition_id)`.
-2. It flushes a producer batch when record count, payload-byte, or time thresholds are reached.
-   Producer dispatches batches concurrently up to its configured request limit and does not
-   preserve producer submission order, including within one virtual partition. The broker assigns
-   sequence ranges in the order that it accepts requests and preserves that durable order.
-3. It routes `ProduceBatch(topic, virtual_partition_id, records)` to the locally balanced broker
-   selected for its configured writer ID.
-4. The broker validates the topic, validates the virtual partition range, acquires or renews the
+2. A producer drains all currently buffered partition batches on the fixed `flush_max_delay_ms`
+   cadence or when a batch reaches its record-count or payload-byte threshold. It groups drained
+   batches that share a selected broker into byte-bounded `ProduceBatches` RPCs, intentionally
+   bringing younger batches forward to improve packing. Membership updates refresh the cached
+   route map but do not force an early drain; completed dispatches only advance queued work under
+   the request-concurrency limit. The producer dispatches RPCs concurrently up to its configured
+   request limit and does not preserve producer submission order, including within one virtual
+   partition. The broker assigns sequence ranges in the order that it accepts requests and
+   preserves that durable order.
+3. `ProduceBatches` returns one ordered result per submitted partition batch. The producer
+   resolves successful entries independently and retries only entries that were rejected or whose
+   request outcome is ambiguous. It retains the legacy `ProduceBatch` RPC only for a staged
+   broker-first deployment; new producers use `ProduceBatches` exclusively.
+4. The broker validates each topic and virtual partition, acquires or renews the
    producer-partition lease, and reserves sequence space as necessary.
 5. The broker samples jemalloc allocation against its Linux cgroup memory limit and rejects new
    batches with `OVERLOADED` when utilization exceeds its admission threshold. It flushes a
