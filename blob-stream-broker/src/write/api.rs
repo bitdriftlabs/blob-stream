@@ -1,7 +1,13 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use blob_stream_proto::protos::blobstream::v1::broker::ProduceStatus;
-use blob_stream_types::{Record, SeqRange, VirtualPartitionId, serialize_as_string};
+use blob_stream_types::{
+  Record,
+  SeqRange,
+  VirtualPartitionId,
+  serialize_as_string,
+  serialize_optional_as_string,
+};
 use protobuf::Chars;
 use serde::Serialize;
 use std::time::Duration as StdDuration;
@@ -49,8 +55,10 @@ pub struct BrokerStateSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BrokerNodeSnapshot {
-  pub node_id: String,
-  pub address: String,
+  #[serde(serialize_with = "serialize_as_string")]
+  pub node_id: Chars,
+  #[serde(serialize_with = "serialize_as_string")]
+  pub address: Chars,
 }
 
 //
@@ -92,7 +100,8 @@ pub enum BrokerLeaseStatus {
 #[derive(Debug, Serialize)]
 pub struct BrokerLeaseSnapshot {
   pub holder_id: String,
-  pub holder_address: Option<String>,
+  #[serde(serialize_with = "serialize_optional_as_string")]
+  pub holder_address: Option<Chars>,
   pub expires_at: String,
   pub is_active: bool,
 }

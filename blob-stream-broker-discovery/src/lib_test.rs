@@ -25,12 +25,12 @@ fn membership_distinguishes_pending_from_known_empty() {
 async fn static_discovery_emits_membership() -> Result<()> {
   let nodes = vec![
     BrokerNode {
-      node_id: "node-a".to_string(),
-      address: "10.0.0.1:8080".to_string(),
+      node_id: "node-a".into(),
+      address: "10.0.0.1:8080".into(),
     },
     BrokerNode {
-      node_id: "node-b".to_string(),
-      address: "10.0.0.2:8080".to_string(),
+      node_id: "node-b".into(),
+      address: "10.0.0.2:8080".into(),
     },
   ];
 
@@ -49,12 +49,12 @@ async fn static_discovery_emits_membership() -> Result<()> {
 #[test]
 fn balanced_assignment_is_fair_and_independent_of_input_order() {
   let node_a = BrokerNode {
-    node_id: "node-a".to_string(),
-    address: "10.0.0.1:8080".to_string(),
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
   };
   let node_b = BrokerNode {
-    node_id: "node-b".to_string(),
-    address: "10.0.0.2:8080".to_string(),
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
   };
   let partitions = vec![
     BrokerPartition {

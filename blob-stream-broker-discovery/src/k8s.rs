@@ -137,8 +137,8 @@ fn membership_from_endpoints(endpoints: &Endpoints) -> BrokerMembership {
         .unwrap_or_else(|| broker_address.clone());
       if seen.insert(broker_address.clone()) {
         nodes.push(BrokerNode {
-          node_id,
-          address: broker_address,
+          node_id: node_id.into(),
+          address: broker_address.into(),
         });
       }
     }

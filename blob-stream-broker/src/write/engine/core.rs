@@ -59,8 +59,8 @@ impl WriteEngineImpl {
     let initial_membership = membership_rx.as_ref().map_or_else(
       || {
         BrokerMembership::new(vec![BrokerNode {
-          node_id: holder_id.clone(),
-          address: holder_id.clone(),
+          node_id: holder_id.clone().into(),
+          address: holder_id.clone().into(),
         }])
       },
       |membership_rx| membership_rx.borrow().clone(),

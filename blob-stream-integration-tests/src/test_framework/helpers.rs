@@ -48,9 +48,9 @@ pub async fn produce_message_for_topic(
 ) -> Result<blob_stream_producer::ProducerAck> {
   let ack = producer
     .produce(ProducerRecord::new(
-      topic,
+      topic.to_string().into(),
       key,
-      id.as_bytes().to_vec(),
+      id.as_bytes().to_vec().into(),
       now_unix_millis(),
     ))
     .await?;

@@ -26,9 +26,9 @@ use tokio::sync::watch;
 /// A single broker node in membership state.
 pub struct BrokerNode {
   /// Stable broker identity used for rendezvous hashing.
-  pub node_id: String,
+  pub node_id: Chars,
   /// Network address used by producer/broker clients.
-  pub address: String,
+  pub address: Chars,
 }
 
 //

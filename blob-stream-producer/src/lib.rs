@@ -90,6 +90,7 @@ pub use config::{
 };
 pub use producer::{
   BrokerTransport,
+  GrpcBrokerTransport,
   ProducerAck,
   ProducerClient,
   ProducerClientImpl,

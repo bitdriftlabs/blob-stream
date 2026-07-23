@@ -5,10 +5,12 @@ use blob_stream_broker::write::{WriteEngine, WriteError, WriteRequest};
 use blob_stream_broker_discovery::BrokerNode;
 use blob_stream_producer::BrokerTransport as ProducerBrokerTransport;
 use blob_stream_proto::protos::blobstream::v1::broker::{
-  ProduceBatchRequest,
   ProduceBatchResponse,
+  ProduceBatchesRequest,
+  ProduceBatchesResponse,
   ProduceStatus,
 };
+use protobuf::Chars;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -66,8 +68,8 @@ impl BrokerTransport for GrpcTcpTransport {
   async fn bind_endpoint(&self, node_id: &str) -> Result<BrokerEndpoint> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let node = BrokerNode {
-      node_id: node_id.to_string(),
-      address: listener.local_addr()?.to_string(),
+      node_id: node_id.to_string().into(),
+      address: listener.local_addr()?.to_string().into(),
     };
 
     Ok(BrokerEndpoint {
@@ -383,8 +385,8 @@ impl BrokerTransport for InMemoryTestTransport {
   async fn bind_endpoint(&self, node_id: &str) -> Result<BrokerEndpoint> {
     Ok(BrokerEndpoint {
       node: BrokerNode {
-        node_id: node_id.to_string(),
-        address: format!("inmemory://{node_id}"),
+        node_id: node_id.to_string().into(),
+        address: format!("inmemory://{node_id}").into(),
       },
       binding: BrokerEndpointBinding::InMemory,
     })
@@ -457,20 +459,20 @@ impl InMemoryProducerTransport {
 
 #[async_trait]
 impl ProducerBrokerTransport for InMemoryProducerTransport {
-  async fn produce_batch(
+  async fn produce_batches(
     &self,
-    broker_address: &str,
-    request: ProduceBatchRequest,
+    broker_address: &Chars,
+    request: ProduceBatchesRequest,
     request_timeout: Duration,
-  ) -> Result<ProduceBatchResponse> {
+  ) -> Result<ProduceBatchesResponse> {
     let node_id = broker_address
+      .as_str()
       .strip_prefix("inmemory://")
-      .ok_or_else(|| anyhow!("in-memory transport requires inmemory:// address"))?
-      .to_string();
+      .ok_or_else(|| anyhow!("in-memory transport requires inmemory:// address"))?;
 
     let effects = self
       .fault_controller
-      .effects_for_call(&node_id, NetworkOperation::ProduceBatch)
+      .effects_for_call(node_id, NetworkOperation::ProduceBatch)
       .await;
 
     if effects.partition {
@@ -494,39 +496,44 @@ impl ProducerBrokerTransport for InMemoryProducerTransport {
       return Err(anyhow!("in-memory transport timed out for node {node_id}"));
     }
 
-    let write_engine = self.write_engine_for(broker_address)?;
+    let write_engine = self.write_engine_for(broker_address.as_str())?;
     let copies = effects.duplicate_copies.max(1);
     let mut first_response = None;
     for _ in 0 .. copies {
       // Duplicate faults replay the same request into the write engine and return the
       // first response to keep producer semantics stable.
-      let write_request = WriteRequest {
-        topic: request.topic.clone(),
-        virtual_partition_id: request.virtual_partition_id,
-        records: request.records.clone(),
-      };
+      let mut results = Vec::with_capacity(request.batches.len());
+      for batch in &request.batches {
+        let write_request = WriteRequest {
+          topic: batch.topic.clone(),
+          virtual_partition_id: batch.virtual_partition_id,
+          records: batch.records.clone(),
+        };
 
-      let response = match tokio::time::timeout(
-        request_timeout,
-        write_engine.produce_batch(write_request),
-      )
-      .await
-      {
-        Ok(Ok(_write_response)) => ProduceBatchResponse {
-          status: ProduceStatus::PRODUCE_STATUS_OK.into(),
-          error_message: String::new().into(),
-          ..Default::default()
-        },
-        Ok(Err(error)) => ProduceBatchResponse {
-          status: error.status().into(),
-          error_message: write_error_message(&error).into(),
-          ..Default::default()
-        },
-        Err(_) => return Err(anyhow!("in-memory transport timed out for node {node_id}")),
-      };
+        let response =
+          match tokio::time::timeout(request_timeout, write_engine.produce_batch(write_request))
+            .await
+          {
+            Ok(Ok(_write_response)) => ProduceBatchResponse {
+              status: ProduceStatus::PRODUCE_STATUS_OK.into(),
+              error_message: String::new().into(),
+              ..Default::default()
+            },
+            Ok(Err(error)) => ProduceBatchResponse {
+              status: error.status().into(),
+              error_message: write_error_message(&error).into(),
+              ..Default::default()
+            },
+            Err(_) => return Err(anyhow!("in-memory transport timed out for node {node_id}")),
+          };
+        results.push(response);
+      }
 
       if first_response.is_none() {
-        first_response = Some(response);
+        first_response = Some(ProduceBatchesResponse {
+          results,
+          ..Default::default()
+        });
       }
     }
 
@@ -536,7 +543,7 @@ impl ProducerBrokerTransport for InMemoryProducerTransport {
         .record(
           "transport",
           "produce_batch",
-          Some(node_id),
+          Some(node_id.to_string()),
           "ok",
           Some(format!("copies={copies}")),
         )

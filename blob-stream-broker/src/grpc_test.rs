@@ -1,23 +1,29 @@
 use super::{
   BrokerGrpc,
   BrokerGrpcMetrics,
-  MAX_DECODED_PRODUCE_REQUEST_BYTES,
+  MAX_CONCURRENT_BATCHES_PER_GROUPED_REQUEST,
   produce_request_config,
 };
 use crate::write::{AdmissionController, TopicInfo, WriteConfig, WriteEngineImpl};
 use anyhow::Result;
+use async_trait::async_trait;
 use bd_grpc::Handler;
 use bd_server_stats::stats::Collector;
 use bd_shutdown::ComponentShutdownTrigger;
 use bd_time::TestTimeProvider;
 use blob_stream_blob_store::InMemoryBlobStore;
 use blob_stream_metadata_store::{InMemoryMetadataStore, InMemoryProducerPartitionLeaseStore};
-use blob_stream_proto::protos::blobstream::v1::broker::{ProduceBatchRequest, ProduceStatus};
-use blob_stream_types::new_record;
+use blob_stream_proto::protos::blobstream::v1::broker::{
+  ProduceBatchRequest,
+  ProduceBatchesRequest,
+  ProduceStatus,
+};
+use blob_stream_types::{MAX_PRODUCE_BATCHES_REQUEST_BYTES, SeqRange, new_record};
 use http::{Extensions, HeaderMap};
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
+use tokio::sync::{Semaphore, mpsc};
 
 struct OverloadedAdmissionController;
 
@@ -27,11 +33,71 @@ impl AdmissionController for OverloadedAdmissionController {
   }
 }
 
+struct PartialResponseWriteEngine;
+
+#[async_trait]
+impl crate::write::WriteEngine for PartialResponseWriteEngine {
+  async fn produce_batch(
+    &self,
+    request: crate::write::WriteRequest,
+  ) -> Result<crate::write::WriteResponse, crate::write::WriteError> {
+    if request.topic.as_str() == "unknown" {
+      return Err(crate::write::WriteError::UnknownTopic(request.topic));
+    }
+    Ok(crate::write::WriteResponse {
+      seq_range: SeqRange { start: 1, end: 1 },
+    })
+  }
+
+  fn produce_request_timeout(&self) -> std::time::Duration {
+    std::time::Duration::from_secs(1)
+  }
+
+  async fn state_snapshot(&self) -> crate::write::BrokerStateSnapshot {
+    unreachable!("test write engine does not expose state")
+  }
+}
+
+struct GatedWriteEngine {
+  entered_tx: mpsc::UnboundedSender<u32>,
+  release: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl crate::write::WriteEngine for GatedWriteEngine {
+  async fn produce_batch(
+    &self,
+    request: crate::write::WriteRequest,
+  ) -> Result<crate::write::WriteResponse, crate::write::WriteError> {
+    self
+      .entered_tx
+      .send(request.virtual_partition_id)
+      .map_err(|_| crate::write::WriteError::Overloaded("test receiver dropped".to_string()))?;
+    self
+      .release
+      .acquire()
+      .await
+      .map_err(|_| crate::write::WriteError::Overloaded("test gate closed".to_string()))?
+      .forget();
+    Ok(crate::write::WriteResponse {
+      seq_range: SeqRange { start: 1, end: 1 },
+    })
+  }
+
+  fn produce_request_timeout(&self) -> std::time::Duration {
+    std::time::Duration::from_secs(1)
+  }
+
+  async fn state_snapshot(&self) -> crate::write::BrokerStateSnapshot {
+    unreachable!("test write engine does not expose state")
+  }
+}
+
 #[test]
 fn limits_decoded_produce_request_bytes() {
   assert_eq!(
     produce_request_config().max_decoded_request_bytes,
-    MAX_DECODED_PRODUCE_REQUEST_BYTES
+    MAX_PRODUCE_BATCHES_REQUEST_BYTES
   );
 }
 
@@ -93,5 +159,102 @@ async fn returns_overloaded_when_admission_controller_rejects() -> Result<()> {
     ProduceStatus::PRODUCE_STATUS_OVERLOADED.into()
   );
   shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn produces_batched_results_in_request_order() -> Result<()> {
+  let scope = Collector::default().scope("blob_stream_broker_test");
+  let grpc = BrokerGrpc::new(Arc::new(PartialResponseWriteEngine), &scope);
+
+  let response = <BrokerGrpc as Handler<ProduceBatchesRequest, _>>::handle(
+    &grpc,
+    HeaderMap::new(),
+    Extensions::new(),
+    ProduceBatchesRequest {
+      batches: vec![
+        ProduceBatchRequest {
+          topic: "telemetry".into(),
+          virtual_partition_id: 0,
+          records: vec![new_record(vec![1], 1)],
+          ..Default::default()
+        },
+        ProduceBatchRequest {
+          topic: "unknown".into(),
+          virtual_partition_id: 0,
+          records: vec![new_record(vec![2], 2)],
+          ..Default::default()
+        },
+      ],
+      ..Default::default()
+    },
+  )
+  .await?;
+
+  assert_eq!(response.results.len(), 2);
+  assert_eq!(
+    response.results[0].status,
+    ProduceStatus::PRODUCE_STATUS_OK.into()
+  );
+  assert_eq!(
+    response.results[1].status,
+    ProduceStatus::PRODUCE_STATUS_UNKNOWN_TOPIC.into()
+  );
+  Ok(())
+}
+
+#[tokio::test]
+async fn limits_concurrent_batches_per_grouped_request() -> Result<()> {
+  let collector = Collector::default();
+  let scope = collector.scope("blob_stream_broker_test");
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let max_concurrent_batches = u32::try_from(MAX_CONCURRENT_BATCHES_PER_GROUPED_REQUEST)
+    .expect("grouped batch concurrency limit fits in u32");
+  let grpc = Arc::new(BrokerGrpc::new(
+    Arc::new(GatedWriteEngine {
+      entered_tx,
+      release: Arc::clone(&release),
+    }),
+    &scope,
+  ));
+  let request = ProduceBatchesRequest {
+    batches: (0 ..= max_concurrent_batches)
+      .map(|virtual_partition_id| ProduceBatchRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id,
+        records: vec![new_record(vec![1], 1)],
+        ..Default::default()
+      })
+      .collect(),
+    ..Default::default()
+  };
+
+  let grpc_task = Arc::clone(&grpc);
+  let handle = tokio::spawn(async move {
+    <BrokerGrpc as Handler<ProduceBatchesRequest, _>>::handle(
+      grpc_task.as_ref(),
+      HeaderMap::new(),
+      Extensions::new(),
+      request,
+    )
+    .await
+  });
+
+  for virtual_partition_id in 0 .. max_concurrent_batches {
+    assert_eq!(entered_rx.recv().await, Some(virtual_partition_id));
+  }
+  assert!(entered_rx.try_recv().is_err());
+  let metrics = String::from_utf8(collector.prometheus_output())?;
+  assert!(metrics.contains("blob_stream_broker_test:grpc:active_batches 16"));
+
+  release.add_permits(MAX_CONCURRENT_BATCHES_PER_GROUPED_REQUEST);
+  assert_eq!(entered_rx.recv().await, Some(max_concurrent_batches));
+  release.add_permits(1);
+
+  assert_eq!(
+    handle.await??.results.len(),
+    MAX_CONCURRENT_BATCHES_PER_GROUPED_REQUEST + 1
+  );
   Ok(())
 }

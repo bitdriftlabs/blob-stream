@@ -357,7 +357,7 @@ impl WriteEngine for WriteEngineImpl {
         virtual_partition_id: partition.virtual_partition_id,
       };
       let lease = self.lease_store.get_lease(&key).await;
-      let assignment_is_local = assigned_broker.node_id == self.holder_id;
+      let assignment_is_local = assigned_broker.node_id.as_str() == self.holder_id;
       let assigned_broker = BrokerNodeSnapshot {
         node_id: assigned_broker.node_id,
         address: assigned_broker.address,
@@ -370,7 +370,7 @@ impl WriteEngine for WriteEngineImpl {
             .nodes()
             .unwrap_or_default()
             .iter()
-            .find(|node| node.node_id == lease.holder_id)
+            .find(|node| node.node_id.as_str() == lease.holder_id)
             .map(|node| node.address.clone());
           let lease_status = if !is_active {
             BrokerLeaseStatus::UnleasedOrExpired

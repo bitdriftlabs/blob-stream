@@ -1726,6 +1726,7 @@ dependencies = [
  "bd-log",
  "bd-pgv",
  "bd-server-stats",
+ "bd-time",
  "blob-stream-broker-discovery",
  "blob-stream-proto",
  "blob-stream-types",

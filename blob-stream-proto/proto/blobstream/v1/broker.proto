@@ -6,6 +6,8 @@ package blobstream.v1;
 service BrokerService {
   // Append a batch of records to a virtual partition and report persisted acceptance status.
   rpc ProduceBatch(ProduceBatchRequest) returns (ProduceBatchResponse);
+  // Append multiple topic/virtual-partition batches to this broker.
+  rpc ProduceBatches(ProduceBatchesRequest) returns (ProduceBatchesResponse);
 }
 
 // A single record in a producer batch.
@@ -40,6 +42,18 @@ message ProduceBatchResponse {
   ProduceStatus status = 1;
   // Optional error details when status is not OK.
   string error_message = 2;
+}
+
+// Request to append one or more independent producer batches to the same broker.
+message ProduceBatchesRequest {
+  // Non-empty batches to append. Responses preserve this order.
+  repeated ProduceBatchRequest batches = 1;
+}
+
+// Results for a ProduceBatchesRequest.
+message ProduceBatchesResponse {
+  // One result per request batch, in the same order as the request.
+  repeated ProduceBatchResponse results = 1;
 }
 
 // Status codes for broker responses.
