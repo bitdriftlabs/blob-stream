@@ -8,6 +8,7 @@ members = [
 	"blob-stream-integration-tests",
 	"blob-stream-producer",
 	"blob-stream-proto",
+	"blob-stream-test-utils",
 	"blob-stream-types",
 ]
 resolver = "2"

@@ -1,6 +1,6 @@
 use super::buffer::{BufferedBatch, FlushPartition, FlushPlan};
 use super::metrics::WriteMetrics;
-use super::{DEFAULT_ZSTD_LEVEL, WriteConfig, WriteError};
+use super::{BrokerLifecycleHooks, DEFAULT_ZSTD_LEVEL, WriteConfig, WriteError};
 use anyhow::{Context, Result};
 use bd_time::OffsetDateTimeExt;
 use blob_stream_blob_store::{BlobKey, BlobStore};
@@ -109,6 +109,7 @@ pub struct FlushContext {
   metadata_store: Arc<dyn MetadataStore>,
   snowflake: Arc<SnowflakeGenerator>,
   time_provider: Arc<dyn TimeProvider>,
+  lifecycle_hooks: Arc<dyn BrokerLifecycleHooks>,
 }
 
 impl FlushContext {
@@ -118,6 +119,7 @@ impl FlushContext {
     metadata_store: Arc<dyn MetadataStore>,
     snowflake: SnowflakeGenerator,
     time_provider: Arc<dyn TimeProvider>,
+    lifecycle_hooks: Arc<dyn BrokerLifecycleHooks>,
   ) -> Self {
     Self {
       config,
@@ -125,6 +127,7 @@ impl FlushContext {
       metadata_store,
       snowflake: Arc::new(snowflake),
       time_provider,
+      lifecycle_hooks,
     }
   }
 
@@ -299,6 +302,10 @@ impl FlushContext {
   ) -> Result<(), WriteError> {
     let publication_started_at = Instant::now();
     let partitions = std::mem::take(&mut plan.partitions);
+    let virtual_partition_ids = partitions
+      .iter()
+      .map(|partition| partition.virtual_partition_id)
+      .collect::<Vec<_>>();
     let (payload, envelope) = self.build_segment(plan.topic.as_str(), partitions, now)?;
     let payload_bytes = payload.len();
     let record_count = envelope.record_count;
@@ -317,17 +324,30 @@ impl FlushContext {
       })?;
     let persistence_result = timeout(remaining_budget, async {
       self
+        .lifecycle_hooks
+        .before_flush_persist(plan.topic.as_str(), &virtual_partition_ids)
+        .await;
+      self
         .blob_store
         .put(&envelope.blob_key, payload)
         .await
         .context("write segment blob")?;
       metrics.record_uploaded_object(payload_bytes);
+      self
+        .lifecycle_hooks
+        .blob_persisted(plan.topic.as_str(), &virtual_partition_ids)
+        .await;
       let metadata = envelope.into_metadata(self.time_provider.now().unix_timestamp_ms());
       self
         .metadata_store
         .write_segment(metadata)
         .await
-        .context("write segment metadata")
+        .context("write segment metadata")?;
+      self
+        .lifecycle_hooks
+        .metadata_persisted(plan.topic.as_str(), &virtual_partition_ids)
+        .await;
+      Ok::<(), anyhow::Error>(())
     })
     .await;
     metrics.record_metadata_publication_latency(publication_started_at);

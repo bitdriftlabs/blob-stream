@@ -12,6 +12,7 @@
 
 use super::{
   ConsumerIteratorMetrics,
+  ConsumerLifecycleHooks,
   ConsumerSharedState,
   prefetched_batch_bytes,
   update_total_prefetch_bytes,
@@ -42,12 +43,9 @@ use crate::diagnostics::{
 use anyhow::Result;
 use bd_backoff::{ExponentialBackoff, ExponentialBackoffBuilder, InfiniteBackoff as _};
 use bd_log::warn_every;
-use blob_stream_types::{
-  SnowflakeId,
-  VirtualPartitionId,
-  format_unix_timestamp_ms,
-  now_unix_seconds,
-};
+use bd_time::TimeProvider;
+use blob_stream_types::{SnowflakeId, VirtualPartitionId, format_unix_timestamp_ms};
+use log::debug;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -113,6 +111,7 @@ pub(super) enum ConsumerReaderCommand {
     assignment: Vec<VirtualPartitionId>,
     now_unix_seconds: i64,
     handoff_phase: Option<&'static str>,
+    release_delivery_fence: bool,
   },
   Seek {
     virtual_partition_id: VirtualPartitionId,
@@ -151,6 +150,9 @@ pub(super) struct PrefetchWorker {
   base_idle_delay_ms: u64,
   max_idle_delay_ms: Option<u64>,
   recovery_traces: HashMap<VirtualPartitionId, RecoveryTrace>,
+  time_provider: Arc<dyn TimeProvider>,
+  lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>,
+  member_id: String,
 }
 
 impl PrefetchWorker {
@@ -166,6 +168,9 @@ impl PrefetchWorker {
     metrics: ConsumerIteratorMetrics,
     base_idle_delay_ms: u64,
     max_idle_delay_ms: Option<u64>,
+    time_provider: Arc<dyn TimeProvider>,
+    lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>,
+    member_id: String,
   ) -> Self {
     Self {
       reader,
@@ -179,6 +184,9 @@ impl PrefetchWorker {
       base_idle_delay_ms,
       max_idle_delay_ms,
       recovery_traces: HashMap::new(),
+      time_provider,
+      lifecycle_hooks,
+      member_id,
     }
   }
 
@@ -200,6 +208,7 @@ impl PrefetchWorker {
         &mut self.reader_command_rx,
         &self.shared_state,
         &self.diagnostics,
+        &self.delivery_notify,
         &mut pending,
         &mut pending_record_count,
         &mut pending_bytes,
@@ -248,7 +257,12 @@ impl PrefetchWorker {
 
       if batches.is_empty() {
         let idle_delay_ms = idle_poll_backoff.next_delay_ms();
-        tokio::time::sleep(std::time::Duration::from_millis(idle_delay_ms)).await;
+        self
+          .time_provider
+          .sleep(time::Duration::milliseconds(
+            i64::try_from(idle_delay_ms).unwrap_or(i64::MAX),
+          ))
+          .await;
         continue;
       }
 
@@ -496,8 +510,9 @@ impl PrefetchWorker {
     pending_bytes: &mut u64,
     prefetch_max_bytes: u64,
   ) -> bool {
-    let pending_remains = {
+    let (pending_remains, buffered_partitions) = {
       let mut shared_state = self.shared_state.lock();
+      let mut buffered_partitions = Vec::new();
 
       while let Some(batch) = pending.front() {
         let batch_record_count = batch.records.len();
@@ -532,6 +547,7 @@ impl PrefetchWorker {
         *pending_record_count = pending_record_count.saturating_sub(batch_record_count);
         *pending_bytes = pending_bytes.saturating_sub(batch_bytes);
         buffer.buffered_bytes = buffer.buffered_bytes.saturating_add(batch_bytes);
+        buffered_partitions.push(batch.virtual_partition_id);
         buffer.batches.push_back(batch);
       }
 
@@ -556,8 +572,14 @@ impl PrefetchWorker {
         .set(i64::try_from(*pending_bytes).unwrap_or(i64::MAX));
       update_total_prefetch_bytes(&self.metrics, &shared_state.delivery_state, *pending_bytes);
 
-      !pending.is_empty()
+      (!pending.is_empty(), buffered_partitions)
     };
+    for virtual_partition_id in buffered_partitions {
+      self
+        .lifecycle_hooks
+        .prefetch_batch_buffered(&self.member_id, virtual_partition_id)
+        .await;
+    }
     if pending_remains {
       // Wake quickly when callers drain the delivery queue, but periodically retry so a lost
       // notification cannot stall prefetch permanently.
@@ -578,7 +600,7 @@ impl PrefetchWorker {
   ) -> Vec<ConsumerBatch> {
     let mut read_attempt: u8 = 0;
     loop {
-      let now_s = now_unix_seconds();
+      let now_s = self.time_provider.now().unix_timestamp();
       match self
         .reader
         .read_available_with_capacity_and_settings(now_s, capacity, runtime_settings)
@@ -601,7 +623,12 @@ impl PrefetchWorker {
             15.seconds(),
             "consumer prefetch read failed after retry: error={read_error:#}"
           );
-          tokio::time::sleep(std::time::Duration::from_millis(self.base_idle_delay_ms)).await;
+          self
+            .time_provider
+            .sleep(time::Duration::milliseconds(
+              i64::try_from(self.base_idle_delay_ms).unwrap_or(i64::MAX),
+            ))
+            .await;
         },
       }
     }
@@ -703,6 +730,7 @@ fn process_reader_commands(
   reader_command_rx: &mut mpsc::UnboundedReceiver<ConsumerReaderCommand>,
   shared_state: &Arc<Mutex<ConsumerSharedState>>,
   diagnostics: &ConsumerDiagnostics,
+  delivery_notify: &Notify,
   pending: &mut VecDeque<ConsumerBatch>,
   pending_record_count: &mut usize,
   pending_bytes: &mut u64,
@@ -733,10 +761,19 @@ fn process_reader_commands(
         assignment,
         now_unix_seconds,
         handoff_phase,
+        release_delivery_fence,
       } => {
         if let Err(error) = reader.set_assigned_virtual_partitions(&assignment, now_unix_seconds) {
           shared_state.lock().terminal_error = Some(format!("{error:#}"));
           return false;
+        }
+        if release_delivery_fence {
+          let mut shared_state = shared_state.lock();
+          if shared_state.delivery_state.revocation_in_progress {
+            shared_state.delivery_state.revocation_in_progress = false;
+            debug!("consumer delivery fence released after reader assignment update");
+            delivery_notify.notify_waiters();
+          }
         }
         handoff_assignment = handoff_phase.map(|phase| (assignment, phase));
         None

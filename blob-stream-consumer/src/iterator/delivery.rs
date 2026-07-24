@@ -12,6 +12,7 @@
 use super::{ActivePartitionState, ConsumerIteratorMetrics, ConsumerRecord, NextResult};
 use crate::consumer::ConsumerBatch;
 use blob_stream_types::{CommittedSourceCheckpoint, Record, VirtualPartitionId};
+use log::debug;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 //
@@ -50,6 +51,7 @@ pub struct DeliveryState {
   pub buffered_bytes: u64,
   pub current_batch: Option<BufferedBatch>,
   pub pending_revocation: Option<NextResult>,
+  pub revocation_in_progress: bool,
 }
 
 impl DeliveryState {
@@ -72,7 +74,12 @@ impl DeliveryState {
     // A revocation takes precedence over records so callers cannot observe a replacement
     // assignment before acknowledging the ownership loss.
     if let Some(revocation) = self.pending_revocation.take() {
+      debug!("consumer delivery surfaced revocation callback");
       return Some(revocation);
+    }
+    if self.revocation_in_progress {
+      debug!("consumer delivery is fenced while revocation completion is pending");
+      return None;
     }
 
     loop {
@@ -101,6 +108,10 @@ impl DeliveryState {
             current_batch.source_checkpoint.clone(),
           );
           metrics.records_delivered.inc();
+          debug!(
+            "consumer delivery surfaced record: partition={}, offset={offset}",
+            current_batch.virtual_partition_id,
+          );
           return Some(NextResult::Record(ConsumerRecord {
             virtual_partition_id: current_batch.virtual_partition_id,
             offset,
@@ -132,6 +143,7 @@ impl DeliveryState {
 
   /// Discard all local delivery state for revoked partitions before assignment changes.
   pub(super) fn drop_partitions(&mut self, partitions: &HashSet<VirtualPartitionId>) {
+    debug!("consumer delivery dropping revoked partitions: {partitions:?}");
     if self
       .current_batch
       .as_ref()

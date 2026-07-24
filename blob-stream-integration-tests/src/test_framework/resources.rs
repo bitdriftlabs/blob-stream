@@ -126,7 +126,10 @@ impl IntegrationResources {
   }
 
   pub fn s3_blob_store(&self) -> Arc<dyn BlobStore> {
-    Arc::new(S3BlobStore::new(self.s3.clone(), self.bucket.clone()))
+    Arc::new(FaultInjectedBlobStore::new(
+      Arc::new(S3BlobStore::new(self.s3.clone(), self.bucket.clone())),
+      self.store_fault_controller.clone(),
+    ))
   }
 
   pub fn metadata_store(&self) -> Arc<dyn MetadataStore> {

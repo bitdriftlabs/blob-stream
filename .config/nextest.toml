@@ -1,2 +1,10 @@
 [profile.default]
 slow-timeout = { period = "1m", terminate-after = 1 }
+
+[test-groups]
+# S3/Dynamo-backed integration tests create independent resources but share local service capacity.
+integration-services = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = 'package(blob-stream-integration-tests)'
+test-group = 'integration-services'

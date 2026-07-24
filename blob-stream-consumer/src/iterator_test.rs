@@ -7,8 +7,10 @@ use super::{
   ConsumerCoordinationSource,
   ConsumerDeliveryState,
   ConsumerIterator,
+  ConsumerIteratorBuilder,
   ConsumerIteratorImpl,
   ConsumerIteratorMetrics,
+  ConsumerLifecycleHooks,
   CoordinationSnapshot,
   NextResult,
 };
@@ -28,6 +30,7 @@ use crate::diagnostics::{
   ConsumerStateSnapshot,
 };
 use bd_server_stats::stats::Collector;
+use bd_time::SystemTimeProvider;
 use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
@@ -77,6 +80,24 @@ use tokio::time::{Duration, sleep, timeout};
 
 struct MutableCoordinationSource {
   snapshot: Arc<Mutex<CoordinationSnapshot>>,
+}
+
+struct CommitGateHooks {
+  entered: Mutex<Option<oneshot::Sender<()>>>,
+  release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+#[async_trait::async_trait]
+impl ConsumerLifecycleHooks for CommitGateHooks {
+  async fn before_commit(&self, _member_id: &str, _generation: u64) {
+    if let Some(entered) = self.entered.lock().take() {
+      let _ = entered.send(());
+    }
+    let release = { self.release.lock().take() };
+    if let Some(release) = release {
+      let _ = release.await;
+    }
+  }
 }
 
 struct BlockingCoordinationSource {
@@ -648,6 +669,62 @@ fn metrics_scope() -> bd_server_stats::stats::Scope {
 }
 
 #[tokio::test]
+async fn lifecycle_hook_gates_commit_until_released() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![0],
+  }));
+  let (entered_tx, entered_rx) = oneshot::channel();
+  let (release_tx, release_rx) = oneshot::channel();
+  let hooks: Arc<dyn ConsumerLifecycleHooks> = Arc::new(CommitGateHooks {
+    entered: Mutex::new(Some(entered_tx)),
+    release: Mutex::new(Some(release_rx)),
+  });
+
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .time_provider(Arc::new(SystemTimeProvider))
+  .lifecycle_hooks(hooks)
+  .build()
+  .await
+  .unwrap();
+  iterator.start().unwrap();
+
+  let mut commit = Box::pin(iterator.commit());
+  let waker = Waker::noop();
+  let mut context = Context::from_waker(waker);
+  assert!(matches!(commit.as_mut().poll(&mut context), Poll::Pending));
+  timeout(Duration::from_secs(1), entered_rx)
+    .await
+    .expect("commit did not reach the lifecycle hook")
+    .expect("commit lifecycle hook sender was dropped");
+
+  release_tx.send(()).unwrap();
+  timeout(Duration::from_secs(1), commit.as_mut())
+    .await
+    .expect("commit did not finish after lifecycle hook release")
+    .unwrap();
+  drop(commit);
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn diagnostics_report_assignment_and_start_state() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
@@ -660,7 +737,7 @@ async fn diagnostics_report_assignment_and_start_state() {
     virtual_partitions: vec![0, 1],
   }));
 
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime_config(),
     blob_store,
     metadata_store,
@@ -731,7 +808,7 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
     members: vec!["member-a".to_string(), "member-b".to_string()],
     virtual_partitions: vec![0, 1],
   }));
-  let iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let iterator = ConsumerIteratorImpl::from_config(
     &runtime_config(),
     blob_store,
     metadata_store,
@@ -837,7 +914,7 @@ async fn state_response_reports_lease_lookup_failure_without_blocking_local_diag
     members: vec!["member-a".to_string()],
     virtual_partitions: vec![0],
   }));
-  let iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let iterator = ConsumerIteratorImpl::from_config(
     &runtime_config(),
     blob_store,
     metadata_store,
@@ -919,7 +996,7 @@ async fn assignment_callback_replays_active_partitions() {
   }));
   let assigned_partitions = Arc::new(AtomicUsize::new(0));
 
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime_config(),
     blob_store,
     metadata_store,
@@ -981,7 +1058,7 @@ async fn next_returns_revocation_until_completed() {
     virtual_partitions: vec![0, 1],
   }));
 
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime,
     blob_store,
     metadata_store,
@@ -1057,7 +1134,7 @@ async fn next_does_not_lose_notification_between_state_check_and_wait() {
     members: vec!["member-a".to_string()],
     virtual_partitions: vec![0],
   }));
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime_config(),
     blob_store,
     metadata_store,
@@ -1136,7 +1213,7 @@ async fn commit_during_revocation_persists_revoked_partition_cursor() {
     members: vec!["member-a".to_string()],
     virtual_partitions: vec![0, 1],
   }));
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime_config(),
     blob_store,
     metadata_store,
@@ -1239,7 +1316,7 @@ async fn next_delivers_records_and_commit_renews() {
       members: vec!["member-a".to_string()],
       virtual_partitions: vec![3],
     }));
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime,
     blob_store,
     metadata_store,
@@ -1323,7 +1400,7 @@ async fn seek_waits_for_prefetch_scan_without_stalling_heartbeats() {
       members: vec!["member-a".to_string()],
       virtual_partitions: vec![3],
     }));
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime_config(),
     blob_store.clone(),
     metadata_store,
@@ -1397,7 +1474,7 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
       members: vec!["member-a".to_string()],
       virtual_partitions: vec![3],
     }));
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime,
     blob_store,
     metadata_store,
@@ -1487,21 +1564,20 @@ fn shutdown_span_reports_success_after_all_work_completes() {
         members: vec!["member-a".to_string()],
         virtual_partitions: vec![3],
       }));
-    let mut iterator =
-      ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
-        &runtime_config(),
-        blob_store,
-        metadata_store,
-        lease_store,
-        membership_store,
-        source,
-        metrics_scope(),
-        1,
-        DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
-        None,
-      )
-      .await
-      .unwrap();
+    let mut iterator = ConsumerIteratorImpl::from_config(
+      &runtime_config(),
+      blob_store,
+      metadata_store,
+      lease_store,
+      membership_store,
+      source,
+      metrics_scope(),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
+    )
+    .await
+    .unwrap();
 
     let mut driver = iterator
       .driver
@@ -1555,21 +1631,20 @@ fn shutdown_span_reports_best_effort_cleanup_failure() {
         members: vec!["member-a".to_string()],
         virtual_partitions: vec![3],
       }));
-    let mut iterator =
-      ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
-        &runtime_config(),
-        blob_store,
-        metadata_store,
-        lease_store,
-        membership_store,
-        source,
-        metrics_scope(),
-        1,
-        DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
-        None,
-      )
-      .await
-      .unwrap();
+    let mut iterator = ConsumerIteratorImpl::from_config(
+      &runtime_config(),
+      blob_store,
+      metadata_store,
+      lease_store,
+      membership_store,
+      source,
+      metrics_scope(),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
+    )
+    .await
+    .unwrap();
 
     let mut driver = iterator
       .driver
@@ -1617,21 +1692,20 @@ fn revocation_handoff_span_reports_success_after_reassignment() {
       members: vec!["member-a".to_string()],
       virtual_partitions: vec![0, 1],
     }));
-    let mut iterator =
-      ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
-        &runtime_config(),
-        blob_store,
-        metadata_store,
-        lease_store,
-        membership_store,
-        source.clone(),
-        metrics_scope(),
-        1,
-        DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
-        None,
-      )
-      .await
-      .unwrap();
+    let mut iterator = ConsumerIteratorImpl::from_config(
+      &runtime_config(),
+      blob_store,
+      metadata_store,
+      lease_store,
+      membership_store,
+      source.clone(),
+      metrics_scope(),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
+    )
+    .await
+    .unwrap();
 
     let mut driver = iterator
       .driver
@@ -1736,7 +1810,7 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
       virtual_partitions: vec![7],
     }));
 
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime,
     blob_store,
     metadata_store,
@@ -1870,7 +1944,7 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
     virtual_partitions: vec![0, 1],
   }));
 
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime,
     blob_store,
     metadata_store,
@@ -1962,7 +2036,7 @@ async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
       members: vec!["member-a".to_string()],
       virtual_partitions: vec![0],
     }));
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime,
     blob_store,
     metadata_store,
@@ -2031,7 +2105,7 @@ async fn cancelled_next_does_not_restart_rebalance() {
   let mut runtime = runtime_config();
   runtime.group.as_mut().unwrap().heartbeat_interval_ms = Some(60_000);
   runtime.group.as_mut().unwrap().rebalance_interval_ms = Some(60_000);
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime,
     blob_store,
     metadata_store,
@@ -2101,7 +2175,7 @@ async fn cancelled_next_preserves_prefetched_record() {
       members: vec!["member-a".to_string()],
       virtual_partitions: vec![3],
     }));
-  let mut iterator = ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+  let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime_config(),
     blob_store,
     metadata_store,

@@ -5,7 +5,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bd_server_stats::stats::Collector;
 use bd_shutdown::ComponentShutdownTrigger;
-use bd_time::TestTimeProvider;
 use blob_stream_blob_store::InMemoryBlobStore;
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{
@@ -19,6 +18,7 @@ use blob_stream_metadata_store::{
   ProducerPartitionLeaseStore,
   SequenceReservationOutcome,
 };
+use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::{VirtualPartitionId, virtual_partition_for_logical};
 use protobuf::Chars;
 use std::collections::{HashMap, HashSet};
@@ -349,6 +349,8 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
   ));
   let flush_notifier = Arc::new(tokio::sync::Notify::new());
   let metrics = super::super::super::metrics::WriteMetrics::new(&metrics_scope());
+  let lifecycle_hooks: Arc<dyn super::super::super::BrokerLifecycleHooks> =
+    Arc::new(super::super::super::NoopBrokerLifecycleHooks);
   let releases = WriteEngineImpl::release_partition_leases(
     &lease_store,
     &state,
@@ -357,6 +359,7 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
     "node-a",
     vec![("telemetry".into(), 0), ("telemetry".into(), 1)],
     1_000,
+    &lifecycle_hooks,
   );
   tokio::pin!(releases);
 
@@ -390,7 +393,7 @@ async fn lease_assignment_waits_for_initialized_self_membership() -> Result<()> 
   let topics = make_topic(partition_count);
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
   let now_ts_ms = 1_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ts_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ts_ms)));
   let mut config = WriteConfig::with_defaults();
   config.lease_duration_ms = 60_000;
   let (membership_tx, membership_rx) = watch::channel(BrokerMembership::default());
@@ -446,7 +449,7 @@ async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Resul
   let topics = make_topic(partition_count);
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
   let now_ts_ms = 1_000;
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(now_ts_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ts_ms)));
   let mut config = WriteConfig::with_defaults();
   config.lease_duration_ms = 60_000;
   let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
@@ -512,7 +515,7 @@ async fn scale_down_releases_previously_owned_leases() -> Result<()> {
   let partition_count = 4;
   let topics = make_topic(partition_count);
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_000)));
   let mut config = WriteConfig::with_defaults();
   config.lease_duration_ms = 60_000;
 
@@ -567,7 +570,7 @@ async fn shutdown_releases_currently_owned_leases() -> Result<()> {
   let partition_count = 4;
   let topics = make_topic(partition_count);
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
-  let time_provider = Arc::new(TestTimeProvider::new(time_from_ms(1_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_000)));
   let mut config = WriteConfig::with_defaults();
   config.lease_duration_ms = 60_000;
 

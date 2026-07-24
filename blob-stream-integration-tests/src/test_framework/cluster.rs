@@ -1,6 +1,15 @@
 use super::discovery::DynamicBrokerDiscovery;
 use super::event_log::{TestEvent, TestEventLog, TestEventMatcher};
+use super::lifecycle::TestLifecycleHooks;
 use super::resources::IntegrationResources;
+use super::store_faults::{
+  FaultInjectedBlobStore,
+  FaultInjectedConsumerGroupLeaseStore,
+  FaultInjectedConsumerGroupMembershipStore,
+  FaultInjectedMetadataStore,
+  FaultInjectedProducerPartitionLeaseStore,
+  StoreFaultController,
+};
 use super::transport::{
   BrokerEndpoint,
   BrokerEndpointBinding,
@@ -13,8 +22,8 @@ use crate::test_framework::{PARTITION_COUNT, SECOND_TOPIC, TOPIC};
 use anyhow::{Result, anyhow};
 use bd_server_stats::stats::Collector;
 use bd_shutdown::{ComponentShutdownTrigger, ComponentShutdownTriggerHandle};
-use bd_time::SystemTimeProvider;
-use blob_stream_blob_store::BlobStore;
+use bd_time::{SystemTimeProvider, TimeProvider};
+use blob_stream_blob_store::{BlobStore, InMemoryBlobStore};
 use blob_stream_broker::grpc::make_broker_router;
 use blob_stream_broker::metrics::BrokerMetrics;
 use blob_stream_broker::write::{
@@ -27,10 +36,27 @@ use blob_stream_broker::write::{
   WriteEngineImpl,
 };
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode};
-use blob_stream_metadata_store::{MetadataStore, ProducerPartitionLeaseStore};
+use blob_stream_consumer::{
+  ConsumerIteratorBuilder,
+  ConsumerIteratorImpl,
+  ConsumerRuntimeConfig,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  MembershipCoordinationSource,
+};
+use blob_stream_metadata_store::{
+  ConsumerGroupLeaseStore,
+  ConsumerGroupMembershipStore,
+  InMemoryConsumerGroupLeaseStore,
+  InMemoryConsumerGroupMembershipStore,
+  InMemoryMetadataStore,
+  InMemoryProducerPartitionLeaseStore,
+  MetadataStore,
+  ProducerPartitionLeaseStore,
+};
 use blob_stream_producer::{
   BrokerTransport as ProducerBrokerTransport,
   GrpcBrokerTransport,
+  ProducerClientBuilder,
   ProducerClientImpl,
   ProducerConfig,
   ProducerTopicConfig,
@@ -86,10 +112,114 @@ pub struct ClusterHarness {
   blob_store: Arc<dyn BlobStore>,
   metadata_store: Arc<dyn MetadataStore>,
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+  consumer_lease_store: Arc<dyn ConsumerGroupLeaseStore>,
+  consumer_membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   partition_count: u32,
   topic_num_writers: u32,
   broker_flush_max_delay: Duration,
   transport: Arc<dyn BrokerTransport>,
+  lifecycle_hooks: TestLifecycleHooks,
+  broker_time_provider: Arc<dyn TimeProvider>,
+  consumer_time_provider: Arc<dyn TimeProvider>,
+  store_fault_controller: Option<StoreFaultController>,
+}
+
+//
+// InMemoryClusterHarnessBuilder
+//
+
+/// Builds a cluster with no external storage dependencies.
+pub struct InMemoryClusterHarnessBuilder {
+  broker_count: usize,
+  partition_count: u32,
+  topic_num_writers: u32,
+  broker_flush_max_delay: Duration,
+  start_with_all_nodes: bool,
+  broker_time_provider: Arc<dyn TimeProvider>,
+  consumer_time_provider: Arc<dyn TimeProvider>,
+}
+
+impl InMemoryClusterHarnessBuilder {
+  #[must_use]
+  pub fn partition_count(mut self, partition_count: u32) -> Self {
+    self.partition_count = partition_count;
+    self
+  }
+
+  #[must_use]
+  pub fn topic_num_writers(mut self, topic_num_writers: u32) -> Self {
+    self.topic_num_writers = topic_num_writers;
+    self
+  }
+
+  #[must_use]
+  pub fn broker_flush_max_delay(mut self, broker_flush_max_delay: Duration) -> Self {
+    self.broker_flush_max_delay = broker_flush_max_delay;
+    self
+  }
+
+  #[must_use]
+  pub fn start_with_all_nodes(mut self) -> Self {
+    self.start_with_all_nodes = true;
+    self
+  }
+
+  #[must_use]
+  pub fn broker_time_provider(mut self, broker_time_provider: Arc<dyn TimeProvider>) -> Self {
+    self.broker_time_provider = broker_time_provider;
+    self
+  }
+
+  #[must_use]
+  pub fn consumer_time_provider(mut self, consumer_time_provider: Arc<dyn TimeProvider>) -> Self {
+    self.consumer_time_provider = consumer_time_provider;
+    self
+  }
+
+  pub async fn start(self) -> Result<ClusterHarness> {
+    let store_fault_controller = StoreFaultController::default();
+    let blob_store: Arc<dyn BlobStore> = Arc::new(FaultInjectedBlobStore::new(
+      Arc::new(InMemoryBlobStore::new()),
+      store_fault_controller.clone(),
+    ));
+    let metadata_store: Arc<dyn MetadataStore> = Arc::new(FaultInjectedMetadataStore::new(
+      Arc::new(InMemoryMetadataStore::new()),
+      store_fault_controller.clone(),
+    ));
+    let lease_store: Arc<dyn ProducerPartitionLeaseStore> =
+      Arc::new(FaultInjectedProducerPartitionLeaseStore::new(
+        Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+        store_fault_controller.clone(),
+      ));
+    let consumer_lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+      Arc::new(FaultInjectedConsumerGroupLeaseStore::new(
+        Arc::new(InMemoryConsumerGroupLeaseStore::new()),
+        store_fault_controller.clone(),
+      ));
+    let consumer_membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+      Arc::new(FaultInjectedConsumerGroupMembershipStore::new(
+        Arc::new(InMemoryConsumerGroupMembershipStore::new()),
+        store_fault_controller.clone(),
+      ));
+
+    ClusterHarness::start_from_builder(
+      Some(store_fault_controller),
+      self.broker_count,
+      blob_store,
+      metadata_store,
+      lease_store,
+      consumer_lease_store,
+      consumer_membership_store,
+      self.partition_count,
+      self.topic_num_writers,
+      self.broker_flush_max_delay,
+      self.start_with_all_nodes,
+      Arc::new(InMemoryTestTransport::new()),
+      self.broker_time_provider,
+      self.consumer_time_provider,
+    )
+    .await
+  }
 }
 
 //
@@ -106,6 +236,8 @@ pub struct ClusterHarnessBuilder<'a> {
   broker_flush_max_delay: Duration,
   start_with_all_nodes: bool,
   transport: Arc<dyn BrokerTransport>,
+  broker_time_provider: Arc<dyn TimeProvider>,
+  consumer_time_provider: Arc<dyn TimeProvider>,
 }
 
 impl ClusterHarnessBuilder<'_> {
@@ -144,6 +276,18 @@ impl ClusterHarnessBuilder<'_> {
     self
   }
 
+  #[must_use]
+  pub fn broker_time_provider(mut self, broker_time_provider: Arc<dyn TimeProvider>) -> Self {
+    self.broker_time_provider = broker_time_provider;
+    self
+  }
+
+  #[must_use]
+  pub fn consumer_time_provider(mut self, consumer_time_provider: Arc<dyn TimeProvider>) -> Self {
+    self.consumer_time_provider = consumer_time_provider;
+    self
+  }
+
   pub async fn start(self) -> Result<ClusterHarness> {
     let blob_store = self
       .blob_store
@@ -152,17 +296,25 @@ impl ClusterHarnessBuilder<'_> {
     let metadata_store = self
       .metadata_store
       .unwrap_or_else(|| self.resources.metadata_store());
+    let lease_store = self.resources.producer_lease_store();
+    let consumer_lease_store = self.resources.consumer_lease_store();
+    let consumer_membership_store = self.resources.consumer_membership_store();
 
     ClusterHarness::start_from_builder(
-      self.resources,
+      Some(self.resources.store_fault_controller()),
       self.broker_count,
       blob_store,
       metadata_store,
+      lease_store,
+      consumer_lease_store,
+      consumer_membership_store,
       self.partition_count,
       self.topic_num_writers,
       self.broker_flush_max_delay,
       self.start_with_all_nodes,
       self.transport,
+      self.broker_time_provider,
+      self.consumer_time_provider,
     )
     .await
   }
@@ -183,19 +335,39 @@ impl ClusterHarness {
       broker_flush_max_delay: Duration::from_millis(10),
       start_with_all_nodes: false,
       transport: Arc::new(GrpcTcpTransport),
+      broker_time_provider: Arc::new(SystemTimeProvider),
+      consumer_time_provider: Arc::new(SystemTimeProvider),
+    }
+  }
+
+  #[must_use]
+  pub fn in_memory(broker_count: usize) -> InMemoryClusterHarnessBuilder {
+    InMemoryClusterHarnessBuilder {
+      broker_count,
+      partition_count: PARTITION_COUNT,
+      topic_num_writers: 1,
+      broker_flush_max_delay: Duration::from_millis(10),
+      start_with_all_nodes: false,
+      broker_time_provider: Arc::new(SystemTimeProvider),
+      consumer_time_provider: Arc::new(SystemTimeProvider),
     }
   }
 
   async fn start_from_builder(
-    resources: &IntegrationResources,
+    store_fault_controller: Option<StoreFaultController>,
     broker_count: usize,
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
+    lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+    consumer_lease_store: Arc<dyn ConsumerGroupLeaseStore>,
+    consumer_membership_store: Arc<dyn ConsumerGroupMembershipStore>,
     partition_count: u32,
     topic_num_writers: u32,
     broker_flush_max_delay: Duration,
     start_with_all_nodes: bool,
     transport: Arc<dyn BrokerTransport>,
+    broker_time_provider: Arc<dyn TimeProvider>,
+    consumer_time_provider: Arc<dyn TimeProvider>,
   ) -> Result<Self> {
     if partition_count == 0 {
       return Err(anyhow!("partition_count must be greater than zero"));
@@ -209,10 +381,11 @@ impl ClusterHarness {
 
     let event_log = TestEventLog::default();
     transport.install_event_log(event_log.clone()).await?;
-    resources
-      .store_fault_controller()
-      .attach_event_log(event_log.clone())
-      .await;
+    if let Some(store_fault_controller) = &store_fault_controller {
+      store_fault_controller
+        .attach_event_log(event_log.clone())
+        .await;
+    }
 
     let mut endpoints = Vec::with_capacity(broker_count);
     for broker_index in 0 .. broker_count {
@@ -248,7 +421,7 @@ impl ClusterHarness {
     let (broker_membership_tx, _broker_membership_rx) =
       watch::channel(BrokerMembership::new(initial_nodes));
 
-    let lease_store = resources.producer_lease_store();
+    let lifecycle_hooks = TestLifecycleHooks::default();
 
     let mut harness = Self {
       brokers: Vec::with_capacity(broker_count),
@@ -259,10 +432,16 @@ impl ClusterHarness {
       blob_store,
       metadata_store,
       lease_store,
+      consumer_lease_store,
+      consumer_membership_store,
       partition_count,
       topic_num_writers,
       broker_flush_max_delay,
       transport,
+      lifecycle_hooks,
+      broker_time_provider,
+      consumer_time_provider,
+      store_fault_controller,
     };
 
     for endpoint in endpoints {
@@ -316,12 +495,76 @@ impl ClusterHarness {
     self.event_log.clone()
   }
 
+  pub fn lifecycle_hooks(&self) -> TestLifecycleHooks {
+    self.lifecycle_hooks.clone()
+  }
+
+  pub async fn create_consumer(
+    &self,
+    runtime: &ConsumerRuntimeConfig,
+  ) -> Result<ConsumerIteratorImpl> {
+    let group = runtime
+      .group
+      .as_ref()
+      .ok_or_else(|| anyhow!("consumer runtime config requires a group config"))?;
+    let coordination_source = Arc::new(
+      MembershipCoordinationSource::new(
+        group.topic.to_string(),
+        group.group_id.to_string(),
+        group.member_id.to_string(),
+        (0 .. self.partition_count).collect(),
+        Arc::clone(&self.consumer_membership_store),
+      )
+      .time_provider(Arc::clone(&self.consumer_time_provider)),
+    );
+    ConsumerIteratorBuilder::new(
+      runtime,
+      Arc::clone(&self.blob_store),
+      Arc::clone(&self.metadata_store),
+      Arc::clone(&self.consumer_lease_store),
+      Arc::clone(&self.consumer_membership_store),
+      coordination_source,
+      Collector::default().scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
+    )
+    .lifecycle_hooks(Arc::new(self.lifecycle_hooks.clone()))
+    .time_provider(Arc::clone(&self.consumer_time_provider))
+    .build()
+    .await
+  }
+
+  pub fn consumer_lease_store(&self) -> Arc<dyn ConsumerGroupLeaseStore> {
+    Arc::clone(&self.consumer_lease_store)
+  }
+
+  pub fn consumer_membership_store(&self) -> Arc<dyn ConsumerGroupMembershipStore> {
+    Arc::clone(&self.consumer_membership_store)
+  }
+
+  pub fn store_fault_controller(&self) -> Option<StoreFaultController> {
+    self.store_fault_controller.clone()
+  }
+
   pub async fn wait_for_event(
     &self,
     matcher: &TestEventMatcher,
     timeout: Duration,
   ) -> Result<TestEvent> {
     self.event_log.wait_for_event(matcher, timeout).await
+  }
+
+  pub async fn wait_for_event_after(
+    &self,
+    matcher: &TestEventMatcher,
+    after_sequence: Option<u64>,
+    timeout: Duration,
+  ) -> Result<TestEvent> {
+    self
+      .event_log
+      .wait_for_event_after(matcher, after_sequence, timeout)
+      .await
   }
 
   pub fn network_fault_controller(&self) -> Option<NetworkFaultController> {
@@ -333,13 +576,21 @@ impl ClusterHarness {
     config: ProducerConfig,
     topics: Vec<ProducerTopicConfig>,
   ) -> Result<ProducerClientImpl> {
+    self.producer_builder(config, topics).build().await
+  }
+
+  pub fn producer_builder(
+    &self,
+    config: ProducerConfig,
+    topics: Vec<ProducerTopicConfig>,
+  ) -> ProducerClientBuilder {
     let discovery: Arc<dyn BrokerDiscovery> = Arc::new(self.producer_discovery());
     let metrics_scope = Collector::default().scope("blob_stream_producer_it");
     let transport: Arc<dyn ProducerBrokerTransport> = self
       .transport
       .producer_transport()
       .unwrap_or_else(|| Arc::new(GrpcBrokerTransport::new(config.clone())));
-    ProducerClientImpl::new(config, topics, discovery, transport, metrics_scope).await
+    ProducerClientBuilder::new(config, topics, discovery, transport, metrics_scope)
   }
 
   pub fn set_active_nodes(&self, nodes: Vec<BrokerNode>) {
@@ -362,6 +613,15 @@ impl ClusterHarness {
     }
     snapshots.sort_by(|left, right| left.holder_id.cmp(&right.holder_id));
     snapshots
+  }
+
+  pub fn write_engine_by_id(&self, node_id: &str) -> Result<Arc<dyn WriteEngine>> {
+    self
+      .brokers
+      .iter()
+      .find(|broker| broker.node.node_id.as_str() == node_id)
+      .map(|broker| Arc::clone(&broker.write_engine))
+      .ok_or_else(|| anyhow!("broker node not found: {node_id}"))
   }
 
   fn sync_membership(&self) {
@@ -393,6 +653,8 @@ impl ClusterHarness {
       topic_num_writers,
       self.broker_flush_max_delay,
       broker_shutdown_trigger.make_handle(),
+      Arc::new(self.lifecycle_hooks.clone()),
+      Arc::clone(&self.broker_time_provider),
     )?;
 
     self
@@ -491,6 +753,8 @@ fn build_write_engine(
   topic_num_writers: u32,
   broker_flush_max_delay: Duration,
   shutdown_trigger_handle: ComponentShutdownTriggerHandle,
+  lifecycle_hooks: Arc<dyn blob_stream_broker::write::BrokerLifecycleHooks>,
+  time_provider: Arc<dyn TimeProvider>,
 ) -> Result<Arc<dyn WriteEngine>> {
   let mut topics = HashMap::new();
   for topic in [TOPIC, SECOND_TOPIC] {
@@ -518,7 +782,7 @@ fn build_write_engine(
     &metrics_scope.scope("write"),
   ));
 
-  let engine = WriteEngineImpl::new(
+  let engine = WriteEngineImpl::new_with_lifecycle_hooks(
     config,
     topics,
     blob_store,
@@ -529,8 +793,9 @@ fn build_write_engine(
     Some(membership_rx),
     admission,
     shutdown_trigger_handle,
-    Arc::new(SystemTimeProvider),
+    time_provider,
     &metrics_scope,
+    lifecycle_hooks,
   )?;
 
   Ok(Arc::new(engine))

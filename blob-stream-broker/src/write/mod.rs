@@ -8,6 +8,7 @@ mod buffer;
 mod config;
 mod engine;
 mod flush;
+mod hooks;
 mod lease;
 mod memory_pressure;
 mod metrics;
@@ -30,5 +31,6 @@ pub use api::{
 };
 pub use config::{TopicInfo, WriteConfig, build_write_engine};
 pub use engine::{AdmissionController, MemoryPressureAdmissionController, WriteEngineImpl};
+pub use hooks::{BrokerLifecycleHooks, NoopBrokerLifecycleHooks};
 pub(super) const DEFAULT_ZSTD_LEVEL: i32 = 3;
 pub(super) const MAX_IN_FLIGHT_FLUSH_PLANS: usize = 4;

@@ -9,7 +9,7 @@ use super::super::allocation::{
 };
 use super::super::metrics::WriteMetrics;
 use super::super::state::WriteState;
-use super::super::{TopicInfo, WriteEngineImpl};
+use super::super::{BrokerLifecycleHooks, TopicInfo, WriteEngineImpl};
 use super::acquire_lease_and_reserve_sequences;
 use bd_log::warn_every;
 use bd_time::OffsetDateTimeExt;
@@ -26,7 +26,7 @@ use blob_stream_metadata_store::{
 use blob_stream_types::VirtualPartitionId;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use log::{debug, info};
+use log::{debug, info, trace};
 use protobuf::Chars;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -78,6 +78,7 @@ impl WriteEngineImpl {
     let time_provider = Arc::clone(&self.time_provider);
     let metrics = self.metrics.clone();
     let flush_notifier = Arc::clone(&self.flush_notifier);
+    let lifecycle_hooks = Arc::clone(&self.lifecycle_hooks);
     let mut shutdown = self.shutdown_trigger_handle.make_shutdown();
 
     tokio::spawn(async move {
@@ -134,6 +135,7 @@ impl WriteEngineImpl {
             &holder_id,
             partitions,
             time_provider.now().unix_timestamp_ms(),
+            &lifecycle_hooks,
           )
           .await;
           return;
@@ -188,6 +190,7 @@ impl WriteEngineImpl {
           &holder_id,
           lost_partitions,
           time_provider.now().unix_timestamp_ms(),
+          &lifecycle_hooks,
         )
         .await;
 
@@ -297,6 +300,7 @@ impl WriteEngineImpl {
     topic: &Chars,
     virtual_partition_id: VirtualPartitionId,
     now_ts_ms: i64,
+    lifecycle_hooks: &Arc<dyn BrokerLifecycleHooks>,
   ) {
     let key = ProducerPartitionLeaseKey {
       topic: topic.clone(),
@@ -313,6 +317,9 @@ impl WriteEngineImpl {
       "broker partition drain started: holder_id={holder_id}, topic={topic}, \
        virtual_partition_id={virtual_partition_id}"
     );
+    lifecycle_hooks
+      .lease_drain_started(topic.as_str(), virtual_partition_id)
+      .await;
     flush_notifier.notify_one();
 
     // TODO(mattklein123): Renew the producer lease while waiting for a drain that can approach
@@ -324,6 +331,12 @@ impl WriteEngineImpl {
       "broker partition drain complete: holder_id={holder_id}, topic={topic}, \
        virtual_partition_id={virtual_partition_id}"
     );
+    lifecycle_hooks
+      .partition_drained(topic.as_str(), virtual_partition_id)
+      .await;
+    lifecycle_hooks
+      .before_lease_release(topic.as_str(), virtual_partition_id)
+      .await;
 
     match lease_store.release_lease(&key, holder_id, now_ts_ms).await {
       Ok(
@@ -333,13 +346,18 @@ impl WriteEngineImpl {
       ) => {
         // Clear local lease/allocator state immediately to avoid accepting writes based on stale
         // in-memory lease data after ownership moved away.
-        let mut state = state.lock();
-        if let Some(partition_state) =
-          state.partition_state_mut_if_present(topic, virtual_partition_id)
         {
-          partition_state.lease_expiration_ts_ms = None;
-          partition_state.reset_sequence_allocation();
+          let mut state = state.lock();
+          if let Some(partition_state) =
+            state.partition_state_mut_if_present(topic, virtual_partition_id)
+          {
+            partition_state.lease_expiration_ts_ms = None;
+            partition_state.reset_sequence_allocation();
+          }
         }
+        lifecycle_hooks
+          .lease_released(topic.as_str(), virtual_partition_id)
+          .await;
       },
       Err(error) => {
         warn_every!(
@@ -358,6 +376,7 @@ impl WriteEngineImpl {
     holder_id: &str,
     partitions: Vec<(Chars, VirtualPartitionId)>,
     now_ts_ms: i64,
+    lifecycle_hooks: &Arc<dyn BrokerLifecycleHooks>,
   ) {
     let mut releases = FuturesUnordered::new();
     for (topic, virtual_partition_id) in partitions {
@@ -371,6 +390,7 @@ impl WriteEngineImpl {
           &topic,
           virtual_partition_id,
           now_ts_ms,
+          lifecycle_hooks,
         )
         .await;
       });
@@ -385,17 +405,45 @@ impl WriteEngineImpl {
     virtual_partition_id: VirtualPartitionId,
   ) {
     loop {
-      let notified = {
+      let notified = state
+        .lock()
+        .partition_state(topic, virtual_partition_id)
+        .map(|partition_state| partition_state.drain_notify.clone().notified_owned());
+      let Some(notified) = notified else {
+        return;
+      };
+      tokio::pin!(notified);
+      notified.as_mut().enable();
+      let is_drained = {
         let state = state.lock();
         let Some(partition_state) = state.partition_state(topic, virtual_partition_id) else {
           return;
         };
-        if partition_state.is_drained() {
-          return;
-        }
-        partition_state.drain_notify.clone().notified_owned()
+        // Register before checking state so a flush completion cannot notify between the check
+        // and the await below.
+        trace!(
+          "broker partition drain state: topic={topic}, \
+           virtual_partition_id={virtual_partition_id}, flush_in_flight={}, \
+           allocation_in_flight={}, buffered_batches={}, draining={}",
+          partition_state.flush_in_flight,
+          partition_state.allocation_in_flight,
+          partition_state.buffer.batches.len(),
+          partition_state.draining,
+        );
+        partition_state.is_drained()
       };
+      if is_drained {
+        return;
+      }
+      trace!(
+        "broker partition drain waiting: topic={topic}, \
+         virtual_partition_id={virtual_partition_id}"
+      );
       notified.await;
+      trace!(
+        "broker partition drain notified: topic={topic}, \
+         virtual_partition_id={virtual_partition_id}"
+      );
     }
   }
 }

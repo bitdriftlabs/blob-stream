@@ -49,6 +49,20 @@ impl AllocationTransition {
       return;
     }
 
+    trace!(
+      "broker allocation transition finishing: topic={}, virtual_partition_id={}, \
+       lease_expiration_update={}, reservation={}, reset_sequence_allocation={}",
+      self.topic,
+      self.virtual_partition_id,
+      match lease_expiration_update {
+        LeaseExpirationUpdate::Preserve => "preserve",
+        LeaseExpirationUpdate::Set(None) => "clear",
+        LeaseExpirationUpdate::Set(Some(_)) => "set",
+      },
+      reservation.is_some(),
+      self.reset_sequence_allocation_on_finish,
+    );
+
     let (allocation_notify, drain_notify) = {
       let mut state = self.state.lock();
       let partition_state = state.partition_state_mut(&self.topic, self.virtual_partition_id);
@@ -82,6 +96,11 @@ impl AllocationTransition {
       )
     };
     self.finished = true;
+    trace!(
+      "broker allocation transition notifying partition drain waiter: topic={}, \
+       virtual_partition_id={}",
+      self.topic, self.virtual_partition_id,
+    );
     allocation_notify.notify_waiters();
     drain_notify.notify_waiters();
   }
@@ -213,6 +232,11 @@ pub(super) fn begin_allocation_transition(
 
   partition_state.allocation_in_flight = true;
   partition_state.allocation_started_ts_ms = Some(now_ts_ms);
+  trace!(
+    "broker allocation transition claimed: topic={topic}, \
+     virtual_partition_id={virtual_partition_id}, renew_lease={renew_lease}, \
+     needs_lease={needs_lease}, reservation={reservation:?}"
+  );
   AllocationTransitionDecision::Claimed(AllocationTransitionWork {
     transition: AllocationTransition {
       state: Arc::clone(state),

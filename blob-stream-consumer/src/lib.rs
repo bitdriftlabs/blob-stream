@@ -84,7 +84,12 @@ mod coordination;
 mod diagnostics;
 mod iterator;
 
-pub use bootstrap::{ConsumerBootstrapConfig, ConsumerConfigFactory, MembershipCoordinationSource};
+pub use bootstrap::{
+  ConsumerBootstrapConfig,
+  ConsumerBootstrapIteratorBuilder,
+  ConsumerConfigFactory,
+  MembershipCoordinationSource,
+};
 pub use config::{
   ConsumerGroupConfig,
   ConsumerReadConfig,
@@ -119,9 +124,12 @@ pub use iterator::{
   ConsumerCoordinationSource,
   ConsumerDeliveryState,
   ConsumerIterator,
+  ConsumerIteratorBuilder,
   ConsumerIteratorImpl,
+  ConsumerLifecycleHooks,
   ConsumerRecord,
   CoordinationSnapshot,
   NextResult,
+  NoopConsumerLifecycleHooks,
   RevokedPartitions,
 };

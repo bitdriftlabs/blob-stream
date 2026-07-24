@@ -303,9 +303,12 @@ query still apply their own frontier filters after the result is returned.
 
 ### Reader Modes and Progress
 
-1. **Fresh:** A partition with no durable cursor scans only the current aligned window, with no
-   snowflake lower bound. It becomes Fast only after that window is fully scanned without a
-   visibility deferral or prefetch-capacity exhaustion.
+1. **Fresh:** A partition with no durable cursor or source checkpoint scans only the current
+  aligned window, with no snowflake lower bound. It becomes Fast only after that window is fully
+  scanned without a visibility deferral or prefetch-capacity exhaustion. This is the intended
+  start position for a new group, but it also applies to a partition that has never delivered a
+  record for an existing group: without a delivered record, that partition has no durable
+  recovery origin.
 2. **Recovering:** A resumed partition starts at the checkpoint's window, clamped to the topic
   retention floor, and captures the current aligned window as its cutover. A legacy cursor without
   a checkpoint starts from its committed timestamp's window; if that is also absent, it starts at
@@ -328,6 +331,14 @@ row older than the overlap that becomes visible only after the reader leaves the
 is not automatically rediscovered. Legacy checkpoints, retention-clamped checkpoints, malformed
 checkpoint IDs, and explicit seeks retain the conservative full-window behavior. Neither path uses
 the source checkpoint as a correctness ordering certificate.
+
+Recovery cost is proportional to the gap from the durable source checkpoint to the captured
+cutover, not to current partition activity. A sparse partition with an old committed cursor still
+recovers from that cursor's source window through retention in chronological slices of up to 32
+windows per pass. The first source window uses the bounded overlap; every later recovery window is
+a full-window query. This intentionally finds retained records written while the group was down,
+at the cost of scanning a long downtime interval. It is distinct from a cursorless partition,
+which has no retained recovery origin and starts Fresh in its current window.
 
 The visibility delay applies in every mode. When an eligible metadata row has
 `metadata_published_ts_ms > now_ms - metadata_visibility_delay_ms`, the reader defers it. In
@@ -412,6 +423,16 @@ Fast only after it has fully scanned the `[1,200, 1,500)` cutover window in a re
 visibility deferral or prefetch-capacity limit blocks that window, it remains Recovering and retries
 that window on a later pass.
 
+**Sparse partition after downtime.** Assume topic `telemetry` has seven-day retention and
+300-second windows. Partition 7 last delivered sequence 10 from window `W0`, then remains idle
+while the consumer group is down for six days. Its replacement owner restores cursor 10 and the
+source checkpoint in `W0`, then scans every retained window from `W0` through its captured current
+cutover in chronological slices of at most 32 windows. This can require many scan passes, but it
+discovers records written to partition 7 while the group was down. In contrast, a partition that
+has never delivered a record has no durable cursor or source checkpoint. On reassignment it is
+Fresh and scans only the new current window, just as a newly created group does; it has no durable
+origin from which to recover earlier retained windows.
+
 **Recovery waits for a visibility gap.** Assume topic `telemetry` uses 300-second windows and a
 2-second visibility delay. At `now = 1,230`, a partition with cursor 1 performs legacy recovery
 from window `[900, 1,200)` through its cutover window `[1,200, 1,500)`; legacy recovery has no
@@ -473,6 +494,23 @@ reader replica may not observe that row immediately. `metadata_visibility_delay_
 accepting metadata whose publication timestamp is too recent. It defaults to two seconds and is a
 best-effort staleness margin, not a correctness guarantee: DynamoDB supplies no bounded
 replication-delay contract, and the delay does not solve stale-writer publication.
+
+The delay is needed even though Fast retains a per-partition observed snowflake frontier. That
+frontier records only metadata returned by a prior query; it is not evidence that the query returned
+every lower snowflake. For example, one partition can publish row `A` at snowflake 100 with sequence
+range `[1, 1]`, then row `B` at snowflake 101 with range `[2, 2]`, including when both rows come
+from the same broker lease in quick succession. An eventually consistent query can omit `A` while
+returning `B`. With no delay, accepting `B` advances the cursor to 2 and the observed frontier to
+101. Later Fast queries use the inclusive frontier and time floor as their lower bound, so they do
+not select `A`; even if another query later found it, its sequence end is already behind cursor 2
+and it is skipped. Deferring recent `B` leaves both values unchanged until a later retry can
+normally observe `A` and `B` together and deliver them in sequence order.
+
+Fast does not continuously scan backward from the last observed snowflake. Its frontier is an
+observed lower bound, retained per partition and metadata window, and is pruned once that window
+leaves the bounded availability horizon. The visibility delay reduces the chance that a query
+advances this bound during ordinary replica lag; it does not turn the frontier into a completeness
+watermark or establish a DynamoDB visibility guarantee.
 
 A Fast or checkpoint-overlap recovery scan can miss a row that becomes visible outside its bounded
 availability horizon. Strongly consistent metadata reads remove the read-replica component, but

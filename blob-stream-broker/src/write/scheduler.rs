@@ -3,6 +3,7 @@ use super::flush::FlushContext;
 use super::metrics::WriteMetrics;
 use super::state::{PartitionState, WriteState};
 use super::{TopicInfo, WriteConfig};
+use log::trace;
 use parking_lot::Mutex;
 use protobuf::Chars;
 use std::collections::HashMap;
@@ -65,10 +66,19 @@ fn mark_flush_complete(
         continue;
       };
       partition_state.flush_in_flight = false;
+      trace!(
+        "broker flush completion updated partition state: topic={topic}, \
+         virtual_partition_id={virtual_partition_id}, allocation_in_flight={}, \
+         buffered_batches={}, draining={}",
+        partition_state.allocation_in_flight,
+        partition_state.buffer.batches.len(),
+        partition_state.draining,
+      );
       drain_notifiers.push(Arc::clone(&partition_state.drain_notify));
     }
   }
   for drain_notify in drain_notifiers {
+    trace!("broker flush completion notifying partition drain waiter: topic={topic}");
     drain_notify.notify_waiters();
   }
 }

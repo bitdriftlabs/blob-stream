@@ -2,7 +2,7 @@
 
 use super::diagnostics::ProducerBrokerSnapshot;
 use super::retry::{
-  RetryClock,
+  ProducerRetryClock,
   next_retry_delay,
   producer_retry_backoff,
   send_batch_with_retry,
@@ -19,6 +19,7 @@ use super::{
   BrokerTransport,
   GrpcBrokerTransport,
   ProducerClient,
+  ProducerClientBuilder,
   ProducerClientImpl,
   ProducerError,
   ProducerRecord,
@@ -796,13 +797,15 @@ async fn not_lease_holder_membership_update_refreshes_cached_route_for_retry() {
     membership_tx,
     updated_membership,
   });
-  let producer = ProducerClientImpl::new(
+  let producer = ProducerClientBuilder::new(
     default_config(),
     vec![topic_config()],
     Arc::new(discovery),
     transport.clone(),
     metrics_scope(),
   )
+  .retry_clock(Arc::new(FixedRetryClock::new(Instant::now())))
+  .build()
   .await
   .unwrap();
 
@@ -1933,7 +1936,7 @@ impl MembershipUpdateRetryClock {
 }
 
 #[async_trait]
-impl RetryClock for MembershipUpdateRetryClock {
+impl ProducerRetryClock for MembershipUpdateRetryClock {
   fn now(&self) -> Instant {
     self.now
   }
@@ -1957,7 +1960,7 @@ impl FixedRetryClock {
 }
 
 #[async_trait]
-impl RetryClock for FixedRetryClock {
+impl ProducerRetryClock for FixedRetryClock {
   fn now(&self) -> Instant {
     *self.now.lock()
   }

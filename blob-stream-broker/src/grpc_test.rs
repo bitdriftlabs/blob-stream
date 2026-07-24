@@ -10,7 +10,6 @@ use async_trait::async_trait;
 use bd_grpc::Handler;
 use bd_server_stats::stats::Collector;
 use bd_shutdown::ComponentShutdownTrigger;
-use bd_time::TestTimeProvider;
 use blob_stream_blob_store::InMemoryBlobStore;
 use blob_stream_metadata_store::{InMemoryMetadataStore, InMemoryProducerPartitionLeaseStore};
 use blob_stream_proto::protos::blobstream::v1::broker::{
@@ -18,6 +17,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchesRequest,
   ProduceStatus,
 };
+use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::{MAX_PRODUCE_BATCHES_REQUEST_BYTES, SeqRange, new_record};
 use http::{Extensions, HeaderMap};
 use std::collections::HashMap;
@@ -136,7 +136,7 @@ async fn returns_overloaded_when_admission_controller_rejects() -> Result<()> {
     None,
     Arc::new(OverloadedAdmissionController),
     shutdown_trigger.make_handle(),
-    Arc::new(TestTimeProvider::new(OffsetDateTime::UNIX_EPOCH)),
+    Arc::new(ManualTimeProvider::new(OffsetDateTime::UNIX_EPOCH)),
     &scope,
   )?);
   let grpc = BrokerGrpc::new(engine, &scope);

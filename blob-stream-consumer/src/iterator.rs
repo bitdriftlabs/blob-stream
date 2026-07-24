@@ -37,6 +37,7 @@ use async_trait::async_trait;
 use bd_log::warn_every;
 use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
+use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::BlobStore;
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentPlan,
@@ -50,8 +51,6 @@ use blob_stream_types::{
   Record,
   VirtualPartitionId,
   format_unix_timestamp_ms,
-  now_unix_millis,
-  now_unix_seconds,
 };
 use delivery::{
   DeliveredSourceRange,
@@ -306,6 +305,66 @@ pub struct ConsumerSharedState {
 /// Callback invoked when virtual partitions become active for this iterator.
 pub type AssignmentCallback = Arc<dyn Fn(&[VirtualPartitionId]) + Send + Sync>;
 
+//
+// ConsumerLifecycleHooks
+//
+
+/// Test-oriented lifecycle observation points for consumer coordination transitions.
+#[async_trait]
+pub trait ConsumerLifecycleHooks: Send + Sync {
+  /// Runs after a revocation becomes visible to the iterator caller.
+  async fn revocation_emitted(
+    &self,
+    _member_id: &str,
+    _generation: u64,
+    _partitions: &[VirtualPartitionId],
+  ) {
+  }
+
+  /// Runs after a prefetched batch becomes visible to the iterator caller.
+  async fn prefetch_batch_buffered(
+    &self,
+    _member_id: &str,
+    _virtual_partition_id: VirtualPartitionId,
+  ) {
+  }
+
+  /// Runs immediately before the driver begins a consumer-group rebalance.
+  async fn before_rebalance(&self, _member_id: &str, _generation: u64) {}
+
+  /// Runs after a rebalance applies a new active assignment.
+  async fn rebalance_applied(
+    &self,
+    _member_id: &str,
+    _generation: u64,
+    _partitions: &[VirtualPartitionId],
+  ) {
+  }
+
+  /// Runs immediately before an explicit commit starts its heartbeat.
+  async fn before_commit(&self, _member_id: &str, _generation: u64) {}
+
+  /// Runs after shutdown's final commit attempt completes.
+  async fn shutdown_commit_finished(&self, _member_id: &str, _generation: u64) {}
+
+  /// Runs immediately before shutdown releases owned partition leases.
+  async fn before_release_owned(&self, _member_id: &str, _generation: u64) {}
+
+  /// Runs immediately before shutdown deregisters consumer membership.
+  async fn before_deregister_member(&self, _member_id: &str, _generation: u64) {}
+}
+
+//
+// NoopConsumerLifecycleHooks
+//
+
+/// Production lifecycle hooks that preserve normal consumer behavior.
+#[derive(Default)]
+pub struct NoopConsumerLifecycleHooks;
+
+#[async_trait]
+impl ConsumerLifecycleHooks for NoopConsumerLifecycleHooks {}
+
 #[async_trait]
 /// High-level pull API used by applications.
 pub trait ConsumerIterator: Send + Sync {
@@ -367,6 +426,9 @@ struct ConsumerDriver {
   pending_revocation_snapshot: Option<ConsumerStateSnapshot>,
   pending_revocation_span: Option<Span>,
   revocation_notify: Arc<Notify>,
+  lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>,
+  time_provider: Arc<dyn TimeProvider>,
+  membership_lease_expires_at_ms: i64,
   next_heartbeat_at_ms: i64,
   next_rebalance_at_ms: i64,
   diagnostics: ConsumerDiagnostics,
@@ -379,6 +441,9 @@ struct ConsumerDriver {
 enum ConsumerDriverCommand {
   Commit {
     response: oneshot::Sender<Result<HeartbeatReport>>,
+  },
+  AbortForTest {
+    response: oneshot::Sender<()>,
   },
   Seek {
     virtual_partition_id: VirtualPartitionId,
@@ -410,6 +475,69 @@ pub struct ConsumerIteratorImpl {
   next_after_delivery_state_check_hook: Option<NextAfterDeliveryStateCheckHook>,
 }
 
+//
+// ConsumerIteratorBuilder
+//
+
+/// Configures a consumer iterator and optional test-only runtime dependencies.
+pub struct ConsumerIteratorBuilder<'a> {
+  runtime: &'a ConsumerRuntimeConfig,
+  blob_store: Arc<dyn BlobStore>,
+  metadata_store: Arc<dyn MetadataStore>,
+  lease_store: Arc<dyn ConsumerGroupLeaseStore>,
+  membership_store: Arc<dyn ConsumerGroupMembershipStore>,
+  coordination_source: Arc<dyn ConsumerCoordinationSource>,
+  metrics_scope: Scope,
+  retention_days: u32,
+  maximum_metadata_publication_lag_ms: u64,
+  feature_flags: Option<FeatureFlagsWatch>,
+  time_provider: Arc<dyn TimeProvider>,
+  lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>,
+}
+
+impl<'a> ConsumerIteratorBuilder<'a> {
+  #[allow(clippy::too_many_arguments)]
+  pub fn new(
+    runtime: &'a ConsumerRuntimeConfig,
+    blob_store: Arc<dyn BlobStore>,
+    metadata_store: Arc<dyn MetadataStore>,
+    lease_store: Arc<dyn ConsumerGroupLeaseStore>,
+    membership_store: Arc<dyn ConsumerGroupMembershipStore>,
+    coordination_source: Arc<dyn ConsumerCoordinationSource>,
+    metrics_scope: Scope,
+    retention_days: u32,
+    maximum_metadata_publication_lag_ms: u64,
+    feature_flags: Option<FeatureFlagsWatch>,
+  ) -> Self {
+    Self {
+      runtime,
+      blob_store,
+      metadata_store,
+      lease_store,
+      membership_store,
+      coordination_source,
+      metrics_scope,
+      retention_days,
+      maximum_metadata_publication_lag_ms,
+      feature_flags,
+      time_provider: Arc::new(SystemTimeProvider),
+      lifecycle_hooks: Arc::new(NoopConsumerLifecycleHooks),
+    }
+  }
+
+  #[must_use]
+  pub fn time_provider(mut self, time_provider: Arc<dyn TimeProvider>) -> Self {
+    self.time_provider = time_provider;
+    self
+  }
+
+  #[must_use]
+  pub fn lifecycle_hooks(mut self, lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>) -> Self {
+    self.lifecycle_hooks = lifecycle_hooks;
+    self
+  }
+}
+
 #[cfg(test)]
 struct NextAfterDeliveryStateCheckHook {
   state_checked: oneshot::Sender<()>,
@@ -417,8 +545,39 @@ struct NextAfterDeliveryStateCheckHook {
 }
 
 impl ConsumerIteratorImpl {
+  /// Stops local consumer work without committing offsets or releasing group state.
+  ///
+  /// This intentionally models a process crash for integration tests. Production callers must
+  /// use [`ConsumerIterator::shutdown`] to release ownership gracefully.
+  pub async fn abort_for_test(&mut self) -> Result<()> {
+    ensure!(
+      self.started,
+      "consumer iterator must be started before aborting"
+    );
+
+    let (response_tx, response_rx) = oneshot::channel();
+    self
+      .command_tx
+      .as_ref()
+      .ok_or_else(|| anyhow!("consumer iterator command queue is unavailable"))?
+      .send(ConsumerDriverCommand::AbortForTest {
+        response: response_tx,
+      })
+      .map_err(|_| anyhow!("consumer driver stopped before test abort could be queued"))?;
+    response_rx
+      .await
+      .map_err(|_| anyhow!("consumer driver stopped before test abort completed"))?;
+    if let Some(driver_task) = self.driver_task.take() {
+      let _ = driver_task.await;
+    }
+    self.started = false;
+    self.command_tx = None;
+    Ok(())
+  }
+
   /// Build an iterator with recovery retention and an explicit metadata publication bound.
-  pub async fn from_runtime_config_with_retention_and_publication_lag(
+  #[allow(clippy::too_many_arguments)]
+  pub async fn from_config(
     runtime: &ConsumerRuntimeConfig,
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
@@ -430,6 +589,40 @@ impl ConsumerIteratorImpl {
     maximum_metadata_publication_lag_ms: u64,
     feature_flags: Option<FeatureFlagsWatch>,
   ) -> Result<Self> {
+    ConsumerIteratorBuilder::new(
+      runtime,
+      blob_store,
+      metadata_store,
+      lease_store,
+      membership_store,
+      coordination_source,
+      metrics_scope,
+      retention_days,
+      maximum_metadata_publication_lag_ms,
+      feature_flags,
+    )
+    .build()
+    .await
+  }
+}
+
+impl ConsumerIteratorBuilder<'_> {
+  /// Build an iterator from this configuration.
+  pub async fn build(self) -> Result<ConsumerIteratorImpl> {
+    let Self {
+      runtime,
+      blob_store,
+      metadata_store,
+      lease_store,
+      membership_store,
+      coordination_source,
+      metrics_scope,
+      retention_days,
+      maximum_metadata_publication_lag_ms,
+      feature_flags,
+      time_provider,
+      lifecycle_hooks,
+    } = self;
     validate_runtime_config(runtime)?;
     ensure!(
       retention_days > 0,
@@ -468,7 +661,8 @@ impl ConsumerIteratorImpl {
       Arc::clone(&lease_store),
       Arc::clone(&membership_store),
     )?;
-    let now_ts_ms = now_unix_millis();
+    let now_ts_ms = time_provider.now().unix_timestamp_ms();
+    let membership_lease_duration_ms = consumer_lease_duration_ms(&group_config);
     let delivery_notify = Arc::new(Notify::new());
     let prefetch_space_notify = Arc::new(Notify::new());
     let revocation_notify = Arc::new(Notify::new());
@@ -509,6 +703,9 @@ impl ConsumerIteratorImpl {
       pending_revocation_snapshot: None,
       pending_revocation_span: None,
       revocation_notify,
+      lifecycle_hooks,
+      time_provider,
+      membership_lease_expires_at_ms: now_ts_ms.saturating_add(membership_lease_duration_ms),
       next_heartbeat_at_ms: now_ts_ms,
       next_rebalance_at_ms: now_ts_ms,
       diagnostics,
@@ -548,7 +745,7 @@ impl ConsumerIteratorImpl {
       owned.len()
     );
 
-    Ok(Self {
+    Ok(ConsumerIteratorImpl {
       started: false,
       diagnostics: driver.diagnostics.clone(),
       shared_state,
@@ -563,7 +760,9 @@ impl ConsumerIteratorImpl {
       next_after_delivery_state_check_hook: None,
     })
   }
+}
 
+impl ConsumerIteratorImpl {
   #[cfg(test)]
   fn set_next_after_delivery_state_check_hook(
     &mut self,
@@ -578,6 +777,14 @@ impl ConsumerIteratorImpl {
 }
 
 impl ConsumerDriver {
+  fn now_unix_millis(&self) -> i64 {
+    self.time_provider.now().unix_timestamp_ms()
+  }
+
+  fn now_unix_seconds(&self) -> i64 {
+    self.time_provider.now().unix_timestamp()
+  }
+
   fn record_accepted_assignment_plan(&self, plan: Option<ConsumerGroupAssignmentPlan>) {
     {
       let mut shared_state = self.shared_state.lock();
@@ -612,7 +819,7 @@ impl ConsumerDriver {
       ..
     } = report;
     self.record_accepted_assignment_plan(accepted_assignment_plan);
-    self.hydrate_cursors(recovered_cursors, now_unix_millis() / 1_000)?;
+    self.hydrate_cursors(recovered_cursors, self.now_unix_seconds())?;
 
     self.apply_assignment(&owned_partitions)?;
     Ok(owned_partitions)
@@ -670,10 +877,19 @@ impl ConsumerDriver {
     assignment: Vec<VirtualPartitionId>,
     now_unix_seconds: i64,
     handoff_phase: Option<&'static str>,
+    release_delivery_fence: bool,
   ) -> Result<()> {
     if let Some(reader) = &mut self.reader {
       reader.set_assigned_virtual_partitions(&assignment, now_unix_seconds)?;
       record_reader_diagnostics(reader, &self.shared_state);
+      if release_delivery_fence {
+        self
+          .shared_state
+          .lock()
+          .delivery_state
+          .revocation_in_progress = false;
+        self.delivery_notify.notify_waiters();
+      }
       return Ok(());
     }
 
@@ -685,6 +901,7 @@ impl ConsumerDriver {
         assignment,
         now_unix_seconds,
         handoff_phase,
+        release_delivery_fence,
       })
       .map_err(|_| anyhow!("consumer reader worker stopped"))
   }
@@ -769,13 +986,19 @@ impl ConsumerDriver {
 
   fn apply_assignment(&mut self, assignment: &[VirtualPartitionId]) -> Result<()> {
     let active_assignment = assignment.iter().copied().collect();
-    self.apply_assignment_with_active_set(assignment, active_assignment)
+    self.apply_assignment_with_active_set(assignment, active_assignment, false)
+  }
+
+  fn apply_assignment_after_revocation(&mut self, assignment: &[VirtualPartitionId]) -> Result<()> {
+    let active_assignment = assignment.iter().copied().collect();
+    self.apply_assignment_with_active_set(assignment, active_assignment, true)
   }
 
   fn apply_assignment_with_active_set(
     &mut self,
     assignment: &[VirtualPartitionId],
     active_assignment: HashSet<VirtualPartitionId>,
+    release_delivery_fence: bool,
   ) -> Result<()> {
     let assignment_changed = self.active_assignment != active_assignment;
     let handoff_phase = assignment_changed.then_some(
@@ -793,12 +1016,13 @@ impl ConsumerDriver {
     newly_assigned.sort_unstable();
     self.set_reader_assignment(
       assignment.to_owned(),
-      now_unix_millis() / 1_000,
+      self.now_unix_seconds(),
       if reader_owned_by_driver {
         None
       } else {
         handoff_phase
       },
+      release_delivery_fence,
     )?;
     self.active_assignment = active_assignment;
     self
@@ -858,6 +1082,65 @@ impl ConsumerDriver {
     Ok(())
   }
 
+  async fn fence_active_partitions_after_membership_failure(
+    &mut self,
+    now_ts_ms: i64,
+  ) -> Result<()> {
+    if self.pending_revocation_completion.is_some() {
+      return Ok(());
+    }
+
+    let mut fenced = self.active_assignment.iter().copied().collect::<Vec<_>>();
+    fenced.sort_unstable();
+    if fenced.is_empty() {
+      return Ok(());
+    }
+
+    let fenced_set = fenced.iter().copied().collect::<HashSet<_>>();
+    self.metrics.revocations.inc();
+    self.metrics.active_partitions.set(0);
+    let (completion_tx, completion_rx) = oneshot::channel();
+    {
+      let mut shared_state = self.shared_state.lock();
+      let pending_bytes = shared_state.diagnostics.prefetch_pending_bytes;
+      shared_state.delivery_state.drop_partitions(&fenced_set);
+      shared_state.delivery_state.pending_revocation =
+        Some(NextResult::Revoked(Box::new(RevokedPartitionsImpl {
+          revoked: fenced.clone(),
+          completion_tx: Some(completion_tx),
+          completion_notify: Arc::clone(&self.revocation_notify),
+        })));
+      shared_state.delivery_state.revocation_in_progress = true;
+      update_worker_prefetch_metrics(&self.metrics, &shared_state.delivery_state);
+      update_total_prefetch_bytes(&self.metrics, &shared_state.delivery_state, pending_bytes);
+      self.refresh_diagnostics_locked(&mut shared_state);
+    }
+    self.set_reader_assignment(Vec::new(), now_ts_ms / 1_000, None, false)?;
+    self.prefetch_space_notify.notify_waiters();
+    self.pending_assignment = Some(Vec::new());
+    self.pending_revocation_completion = Some(completion_rx);
+    self.pending_revocation_partitions = Some(fenced.clone());
+    self.refresh_diagnostics();
+    self.delivery_notify.notify_waiters();
+    self
+      .lifecycle_hooks
+      .revocation_emitted(
+        &self.group_config.member_id,
+        self.coordinator.generation(),
+        &fenced,
+      )
+      .await;
+    info!(
+      "consumer active partitions fenced after membership heartbeat failure: topic={}, \
+       group_id={}, member_id={}, generation={}, fenced={fenced:?}",
+      self.group_config.topic,
+      self.group_config.group_id,
+      self.group_config.member_id,
+      self.coordinator.generation(),
+    );
+    Ok(())
+  }
+
   fn refresh_diagnostics(&self) {
     let mut shared_state = self.shared_state.lock();
     self.refresh_diagnostics_locked(&mut shared_state);
@@ -908,7 +1191,7 @@ impl ConsumerDriver {
           .unwrap_or_else(Span::none);
         let release_result = self
           .coordinator
-          .release_partitions(&revoked, now_unix_millis())
+          .release_partitions(&revoked, self.now_unix_millis())
           .await;
         match &release_result {
           Ok(released_partitions) => {
@@ -963,7 +1246,7 @@ impl ConsumerDriver {
         }
         let assignment = self.pending_assignment.take().unwrap_or_default();
         self.pending_revocation_completion = None;
-        match self.apply_assignment(&assignment) {
+        match self.apply_assignment_after_revocation(&assignment) {
           Ok(()) => {
             handoff_span.record("handoff.assignment_outcome", "succeeded");
             handoff_span.record("otel.status_code", "OK");
@@ -986,6 +1269,10 @@ impl ConsumerDriver {
       return Ok(());
     }
 
+    self
+      .lifecycle_hooks
+      .before_rebalance(&self.group_config.member_id, self.coordinator.generation())
+      .await;
     let snapshot = self.coordination_source.snapshot().await?;
     self.record_coordination_snapshot(&snapshot);
     self.metrics.rebalances_total.inc();
@@ -1027,7 +1314,15 @@ impl ConsumerDriver {
       .collect::<Vec<_>>();
 
     if revoked.is_empty() {
-      self.apply_assignment_with_active_set(&next_assignment, next_assignment_set)?;
+      self.apply_assignment_with_active_set(&next_assignment, next_assignment_set, false)?;
+      self
+        .lifecycle_hooks
+        .rebalance_applied(
+          &self.group_config.member_id,
+          self.coordinator.generation(),
+          &next_assignment,
+        )
+        .await;
       return Ok(());
     }
 
@@ -1045,6 +1340,7 @@ impl ConsumerDriver {
           completion_tx: Some(completion_tx),
           completion_notify: Arc::clone(&self.revocation_notify),
         })));
+      delivery_state.revocation_in_progress = true;
       update_worker_prefetch_metrics(&self.metrics, delivery_state);
       update_total_prefetch_bytes(&self.metrics, delivery_state, pending_bytes);
     }
@@ -1079,6 +1375,14 @@ impl ConsumerDriver {
     self.pending_revocation_snapshot = Some(handoff_snapshot);
     self.pending_revocation_span = Some(handoff_span);
     self.delivery_notify.notify_waiters();
+    self
+      .lifecycle_hooks
+      .revocation_emitted(
+        &self.group_config.member_id,
+        self.coordinator.generation(),
+        &revoked,
+      )
+      .await;
 
     info!(
       "consumer revocation requested: topic={}, group_id={}, member_id={}, revoked={:?}",
@@ -1109,6 +1413,9 @@ impl ConsumerDriver {
     let diagnostics = self.diagnostics.clone();
     let base_idle_delay_ms = self.prefetch_idle_base_delay_ms;
     let max_idle_delay_ms = self.prefetch_idle_max_delay_ms;
+    let time_provider = Arc::clone(&self.time_provider);
+    let lifecycle_hooks = Arc::clone(&self.lifecycle_hooks);
+    let member_id = self.group_config.member_id.to_string();
 
     self.prefetch_task = Some(tokio::spawn(async move {
       PrefetchWorker::new(
@@ -1122,6 +1429,9 @@ impl ConsumerDriver {
         metrics,
         base_idle_delay_ms,
         max_idle_delay_ms,
+        time_provider,
+        lifecycle_hooks,
+        member_id,
       )
       .run()
       .await;
@@ -1258,8 +1568,25 @@ impl ConsumerDriver {
         started_at.elapsed().as_millis()
       );
       self.record_heartbeat_failure(started_at);
+      if now_ts_ms >= self.membership_lease_expires_at_ms {
+        self
+          .fence_active_partitions_after_membership_failure(now_ts_ms)
+          .await?;
+      } else {
+        debug!(
+          "consumer retaining active partitions until membership lease expires: topic={}, \
+           group_id={}, member_id={}, generation={}, expires_at={}",
+          self.group_config.topic,
+          self.group_config.group_id,
+          self.group_config.member_id,
+          self.coordinator.generation(),
+          format_unix_timestamp_ms(self.membership_lease_expires_at_ms),
+        );
+      }
       return Err(error);
     }
+    self.membership_lease_expires_at_ms =
+      now_ts_ms.saturating_add(consumer_lease_duration_ms(&self.group_config));
 
     let committed_cursors = pending_commits
       .iter()
@@ -1313,6 +1640,7 @@ impl ConsumerDriver {
         self.active_assignment.iter().copied().collect(),
         now_ts_ms / 1_000,
         None,
+        false,
       )?;
       info!(
         "consumer heartbeat fenced partitions: topic={}, group_id={}, member_id={}, fenced={:?}",
@@ -1384,23 +1712,9 @@ impl ConsumerDriver {
           return;
         },
       };
-      let now_ts_ms = now_unix_millis();
+      let now_ts_ms = self.now_unix_millis();
 
-      if revocation_completed && now_ts_ms >= self.next_rebalance_at_ms {
-        match self.maybe_rebalance(now_ts_ms).await {
-          Ok(()) => {},
-          Err(error) => {
-            warn_every!(
-              15.seconds(),
-              "consumer rebalance retrying after error: error={error:#}"
-            );
-            self.next_rebalance_at_ms = now_ts_ms.saturating_add(1_000);
-            self.refresh_rebalance_diagnostics();
-          },
-        }
-      }
-
-      if now_ts_ms >= self.next_heartbeat_at_ms {
+      let heartbeat_failed = if now_ts_ms >= self.next_heartbeat_at_ms {
         trace!(
           "consumer scheduled heartbeat due: topic={}, group_id={}, member_id={}, generation={}, \
            now={}, due_at={}, overdue_ms={}, active_partitions={:?}, pending_commits={}",
@@ -1427,6 +1741,36 @@ impl ConsumerDriver {
           );
           self.next_heartbeat_at_ms = now_ts_ms.saturating_add(1_000);
           self.refresh_diagnostics();
+          true
+        } else {
+          false
+        }
+      } else {
+        false
+      };
+
+      if revocation_completed && now_ts_ms >= self.next_rebalance_at_ms {
+        if heartbeat_failed {
+          debug!(
+            "consumer rebalance deferred after heartbeat failure: topic={}, group_id={}, \
+             member_id={}, generation={}",
+            self.group_config.topic,
+            self.group_config.group_id,
+            self.group_config.member_id,
+            self.coordinator.generation(),
+          );
+        } else {
+          match self.maybe_rebalance(now_ts_ms).await {
+            Ok(()) => {},
+            Err(error) => {
+              warn_every!(
+                15.seconds(),
+                "consumer rebalance retrying after error: error={error:#}"
+              );
+              self.next_rebalance_at_ms = now_ts_ms.saturating_add(1_000);
+              self.refresh_rebalance_diagnostics();
+            },
+          }
         }
       }
 
@@ -1437,6 +1781,8 @@ impl ConsumerDriver {
       } else {
         until_heartbeat_ms.clamp(1, 100).cast_unsigned()
       };
+      let time_provider = Arc::clone(&self.time_provider);
+      let wait_duration = time::Duration::milliseconds(i64::try_from(wait_ms).unwrap_or(i64::MAX));
       tokio::select! {
         command = command_rx.recv() => {
           let Some(command) = command else {
@@ -1450,6 +1796,14 @@ impl ConsumerDriver {
               let result = self.commit().await;
               self.metrics.commit_latency_seconds.observe(started_at.elapsed().as_secs_f64());
               let _ = response.send(result);
+            },
+            ConsumerDriverCommand::AbortForTest { response } => {
+              self.stop_prefetch_task().await;
+              self.started = false;
+              self.refresh_diagnostics();
+              let _ = response.send(());
+              self.delivery_notify.notify_waiters();
+              return;
             },
             ConsumerDriverCommand::Seek {
               virtual_partition_id,
@@ -1466,7 +1820,7 @@ impl ConsumerDriver {
           }
         },
         () = self.revocation_notify.notified(), if !revocation_completed => {},
-        () = tokio::time::sleep(std::time::Duration::from_millis(wait_ms)) => {},
+        () = time_provider.sleep(wait_duration) => {},
       }
     }
   }
@@ -1493,7 +1847,11 @@ impl ConsumerDriver {
         .count()
     );
     self
-      .heartbeat(now_unix_millis(), HeartbeatTrigger::Commit)
+      .lifecycle_hooks
+      .before_commit(&self.group_config.member_id, self.coordinator.generation())
+      .await;
+    self
+      .heartbeat(self.now_unix_millis(), HeartbeatTrigger::Commit)
       .await
   }
 
@@ -1516,6 +1874,10 @@ impl ConsumerDriver {
         otel.status_code = field::Empty,
       );
       let commit_result = self.commit().await;
+      self
+        .lifecycle_hooks
+        .shutdown_commit_finished(&self.group_config.member_id, self.coordinator.generation())
+        .await;
       self.refresh_diagnostics();
       let mut handoff_partitions = self.coordinator.owned_partitions();
       handoff_partitions.extend(self.active_assignment.iter().copied());
@@ -1534,7 +1896,11 @@ impl ConsumerDriver {
         },
         &shutdown_span,
       );
-      let release_result = self.coordinator.release_owned(now_unix_millis()).await;
+      self
+        .lifecycle_hooks
+        .before_release_owned(&self.group_config.member_id, self.coordinator.generation())
+        .await;
+      let release_result = self.coordinator.release_owned(self.now_unix_millis()).await;
       match &release_result {
         Ok(released_partitions) => {
           let released_partitions = released_partitions.iter().copied().collect::<HashSet<_>>();
@@ -1584,6 +1950,10 @@ impl ConsumerDriver {
           &shutdown_span,
         ),
       }
+      self
+        .lifecycle_hooks
+        .before_deregister_member(&self.group_config.member_id, self.coordinator.generation())
+        .await;
       let deregistration_result = self
         .membership_store
         .deregister_member(
@@ -1723,7 +2093,12 @@ impl ConsumerDriver {
     }
     self.prefetch_space_notify.notify_waiters();
     self.refresh_diagnostics();
-    self.seek_reader(virtual_partition_id, offset, now_unix_seconds(), response);
+    self.seek_reader(
+      virtual_partition_id,
+      offset,
+      self.now_unix_seconds(),
+      response,
+    );
     trace!(
       "consumer seek: topic={}, partition={}, offset={}",
       self.group_config.topic, virtual_partition_id, offset

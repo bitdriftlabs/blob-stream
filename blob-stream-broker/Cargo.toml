@@ -54,4 +54,5 @@ zstd.workspace                    = true
 cgroups-rs.workspace = true
 
 [dev-dependencies]
-mockall.workspace = true
+blob-stream-test-utils.path = "../blob-stream-test-utils"
+mockall.workspace           = true
