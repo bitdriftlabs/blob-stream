@@ -81,12 +81,13 @@ reference immediately. In-flight requests retain their own reference and can fin
 the producer does not force-close an active connection.
 
 Broker discovery distinguishes a pending initial watch value from an initialized membership
-snapshot. A broker starts its listener while discovery is pending so Kubernetes can mark the pod
-ready and include it in Endpoints, but it performs no lease acquisition, renewal, release, or
-assignment reconciliation until an initialized membership contains its own node ID. An initialized
-membership without the local node after that activation is a real ownership loss; an initialized
-empty membership owns no partitions. This prevents a pod from temporarily claiming every
-partition while Kubernetes publishes its initial Endpoint set.
+snapshot. A producer waits up to 10 seconds for an initialized snapshot before creating routes;
+otherwise construction fails. A broker starts its listener while discovery is pending so Kubernetes
+can mark the pod ready and include it in Endpoints, but it performs no lease acquisition, renewal,
+release, or assignment reconciliation until an initialized membership contains its own node ID. An
+initialized membership without the local node after that activation is a real ownership loss; an
+initialized empty membership owns no partitions and has no producer route. This prevents a pod from
+temporarily claiming every partition while Kubernetes publishes its initial Endpoint set.
 
 Each broker fences writes through a producer-partition lease. A lease key contains topic, the
 virtual partition ID. The virtual partition calculation already includes writer identity, so the
