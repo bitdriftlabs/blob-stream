@@ -264,9 +264,6 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> anyhow::Result<()> {
-    if self.fail_deregistration.load(Ordering::SeqCst) {
-      return Err(anyhow::anyhow!("injected deregistration failure"));
-    }
     self
       .inner
       .register_member(topic, group_id, member_id, now_ts_ms, ttl_ms)
@@ -298,6 +295,9 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     group_id: &str,
     member_id: &str,
   ) -> anyhow::Result<()> {
+    if self.fail_deregistration.load(Ordering::SeqCst) {
+      return Err(anyhow::anyhow!("injected deregistration failure"));
+    }
     self
       .inner
       .deregister_member(topic, group_id, member_id)
@@ -1285,6 +1285,8 @@ async fn next_delivers_records_and_commit_renews() {
   let partition = local_partition(&state, 3);
   assert_eq!(partition.pending_commit_offset, Some(2));
   assert_eq!(partition.last_committed_offset, Some(2));
+  assert!(partition.last_committed_source_checkpoint.is_some());
+  assert!(partition.last_committed_at.is_some());
   assert!(state.local.last_successful_heartbeat_at.is_some());
 }
 
@@ -1469,6 +1471,222 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
     reassigned,
     ConsumerGroupAssignmentOutcome::Assigned(_)
   ));
+}
+
+#[test]
+fn shutdown_span_reports_success_after_all_work_completes() {
+  let (spans, ()) = bd_log::test::with_two_phase_test_otel("blob-stream-consumer-test", async {
+    let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+    let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+    let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+      Arc::new(InMemoryConsumerGroupLeaseStore::new());
+    let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+      Arc::new(InMemoryConsumerGroupMembershipStore::new());
+    let source: Arc<dyn ConsumerCoordinationSource> =
+      Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+        members: vec!["member-a".to_string()],
+        virtual_partitions: vec![3],
+      }));
+    let mut iterator =
+      ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+        &runtime_config(),
+        blob_store,
+        metadata_store,
+        lease_store,
+        membership_store,
+        source,
+        metrics_scope(),
+        1,
+        DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+        None,
+      )
+      .await
+      .unwrap();
+
+    let mut driver = iterator
+      .driver
+      .take()
+      .expect("iterator should own a driver");
+    driver.start().unwrap();
+    driver.shutdown().await.unwrap();
+  });
+
+  let shutdown_span = spans
+    .iter()
+    .find(|span| span.name == "blob_stream.consumer.shutdown")
+    .expect("shutdown span should be exported");
+  let attribute = |key: &str| {
+    shutdown_span
+      .attributes
+      .iter()
+      .find(|attribute| attribute.key.as_str() == key)
+      .map(|attribute| attribute.value.as_str())
+  };
+  assert_eq!(
+    attribute("shutdown.commit_outcome").as_deref(),
+    Some("succeeded")
+  );
+  assert_eq!(
+    attribute("shutdown.lease_release_outcome").as_deref(),
+    Some("succeeded")
+  );
+  assert_eq!(
+    attribute("shutdown.deregistration_outcome").as_deref(),
+    Some("succeeded")
+  );
+  assert_eq!(
+    attribute("shutdown.planner_release_outcome").as_deref(),
+    Some("succeeded")
+  );
+  assert_eq!(format!("{:?}", shutdown_span.status), "Ok");
+}
+
+#[test]
+fn shutdown_span_reports_best_effort_cleanup_failure() {
+  let (spans, ()) = bd_log::test::with_two_phase_test_otel("blob-stream-consumer-test", async {
+    let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+    let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+    let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+      Arc::new(InMemoryConsumerGroupLeaseStore::new());
+    let concrete_membership_store = Arc::new(BlockingMembershipStore::new());
+    let membership_store: Arc<dyn ConsumerGroupMembershipStore> = concrete_membership_store.clone();
+    let source: Arc<dyn ConsumerCoordinationSource> =
+      Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+        members: vec!["member-a".to_string()],
+        virtual_partitions: vec![3],
+      }));
+    let mut iterator =
+      ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+        &runtime_config(),
+        blob_store,
+        metadata_store,
+        lease_store,
+        membership_store,
+        source,
+        metrics_scope(),
+        1,
+        DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+        None,
+      )
+      .await
+      .unwrap();
+
+    let mut driver = iterator
+      .driver
+      .take()
+      .expect("iterator should own a driver");
+    driver.start().unwrap();
+    concrete_membership_store
+      .fail_deregistration
+      .store(true, Ordering::SeqCst);
+    driver.shutdown().await.unwrap();
+  });
+
+  let shutdown_span = spans
+    .iter()
+    .find(|span| span.name == "blob_stream.consumer.shutdown")
+    .expect("shutdown span should be exported");
+  let attribute = |key: &str| {
+    shutdown_span
+      .attributes
+      .iter()
+      .find(|attribute| attribute.key.as_str() == key)
+      .map(|attribute| attribute.value.as_str())
+  };
+  assert_eq!(
+    attribute("shutdown.deregistration_outcome").as_deref(),
+    Some("failed")
+  );
+  assert!(format!("{:?}", shutdown_span.status).starts_with("Error"));
+  assert!(
+    attribute("error.message")
+      .is_some_and(|message| { message.contains("membership deregistration") })
+  );
+}
+
+#[test]
+fn revocation_handoff_span_reports_success_after_reassignment() {
+  let (spans, ()) = bd_log::test::with_two_phase_test_otel("blob-stream-consumer-test", async {
+    let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+    let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+    let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+      Arc::new(InMemoryConsumerGroupLeaseStore::new());
+    let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+      Arc::new(InMemoryConsumerGroupMembershipStore::new());
+    let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![0, 1],
+    }));
+    let mut iterator =
+      ConsumerIteratorImpl::from_runtime_config_with_retention_and_publication_lag(
+        &runtime_config(),
+        blob_store,
+        metadata_store,
+        lease_store,
+        membership_store,
+        source.clone(),
+        metrics_scope(),
+        1,
+        DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+        None,
+      )
+      .await
+      .unwrap();
+
+    let mut driver = iterator
+      .driver
+      .take()
+      .expect("iterator should own a driver");
+    driver.start().unwrap();
+    source.update(CoordinationSnapshot {
+      members: vec!["member-a".to_string(), "member-b".to_string()],
+      virtual_partitions: vec![0, 1],
+    });
+    driver
+      .maybe_rebalance(now_unix_millis().saturating_add(1_000))
+      .await
+      .unwrap();
+
+    let revocation = driver
+      .shared_state
+      .lock()
+      .delivery_state
+      .pending_revocation
+      .take()
+      .expect("rebalance should request partition revocation");
+    let NextResult::Revoked(revocation) = revocation else {
+      panic!("expected revocation callback");
+    };
+    revocation.complete().await;
+    assert!(
+      driver
+        .finish_pending_revocation_if_completed()
+        .await
+        .unwrap()
+    );
+    driver.shutdown().await.unwrap();
+  });
+
+  let handoff_span = spans
+    .iter()
+    .find(|span| span.name == "blob_stream.consumer.revocation_handoff")
+    .expect("revocation handoff span should be exported");
+  let attribute = |key: &str| {
+    handoff_span
+      .attributes
+      .iter()
+      .find(|attribute| attribute.key.as_str() == key)
+      .map(|attribute| attribute.value.as_str())
+  };
+  assert_eq!(
+    attribute("handoff.lease_release_outcome").as_deref(),
+    Some("succeeded")
+  );
+  assert_eq!(
+    attribute("handoff.assignment_outcome").as_deref(),
+    Some("succeeded")
+  );
+  assert_eq!(format!("{:?}", handoff_span.status), "Ok");
 }
 
 #[tokio::test]
