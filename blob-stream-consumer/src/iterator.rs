@@ -25,9 +25,12 @@ use crate::coordination::{
   RecoveredCursor,
 };
 use crate::diagnostics::{
+  ConsumerCommittedCursorSnapshot,
   ConsumerDiagnostics,
   ConsumerDiagnosticsRuntimeState,
+  ConsumerStateSnapshot,
   assignment_plan_snapshot,
+  emit_partition_handoff_snapshots,
 };
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
@@ -70,6 +73,7 @@ use std::time::Instant;
 use time::ext::NumericalDuration;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tracing::{Span, field};
 
 //
 // ConsumerIteratorMetrics
@@ -360,6 +364,8 @@ struct ConsumerDriver {
   pending_assignment: Option<Vec<VirtualPartitionId>>,
   pending_revocation_completion: Option<oneshot::Receiver<()>>,
   pending_revocation_partitions: Option<Vec<VirtualPartitionId>>,
+  pending_revocation_snapshot: Option<ConsumerStateSnapshot>,
+  pending_revocation_span: Option<Span>,
   revocation_notify: Arc<Notify>,
   next_heartbeat_at_ms: i64,
   next_rebalance_at_ms: i64,
@@ -500,6 +506,8 @@ impl ConsumerIteratorImpl {
       pending_assignment: None,
       pending_revocation_completion: None,
       pending_revocation_partitions: None,
+      pending_revocation_snapshot: None,
+      pending_revocation_span: None,
       revocation_notify,
       next_heartbeat_at_ms: now_ts_ms,
       next_rebalance_at_ms: now_ts_ms,
@@ -619,6 +627,20 @@ impl ConsumerDriver {
       return Ok(());
     }
 
+    {
+      let mut shared_state = self.shared_state.lock();
+      for (partition_id, recovered_cursor) in &recovered_cursors {
+        shared_state.diagnostics.last_committed_cursors.insert(
+          *partition_id,
+          ConsumerCommittedCursorSnapshot {
+            offset: recovered_cursor.committed_cursor.seq_end,
+            source_checkpoint: recovered_cursor.committed_cursor.source_checkpoint.clone(),
+            committed_at_ms: recovered_cursor.committed_ts_ms,
+          },
+        );
+      }
+    }
+
     if let Some(reader) = &mut self.reader {
       for (partition_id, recovered_cursor) in recovered_cursors {
         reader.hydrate_cursor_with_source(
@@ -647,6 +669,7 @@ impl ConsumerDriver {
     &mut self,
     assignment: Vec<VirtualPartitionId>,
     now_unix_seconds: i64,
+    handoff_phase: Option<&'static str>,
   ) -> Result<()> {
     if let Some(reader) = &mut self.reader {
       reader.set_assigned_virtual_partitions(&assignment, now_unix_seconds)?;
@@ -661,6 +684,7 @@ impl ConsumerDriver {
       .send(ConsumerReaderCommand::SetAssignment {
         assignment,
         now_unix_seconds,
+        handoff_phase,
       })
       .map_err(|_| anyhow!("consumer reader worker stopped"))
   }
@@ -754,12 +778,28 @@ impl ConsumerDriver {
     active_assignment: HashSet<VirtualPartitionId>,
   ) -> Result<()> {
     let assignment_changed = self.active_assignment != active_assignment;
+    let handoff_phase = assignment_changed.then_some(
+      if self.active_assignment.is_empty() {
+        "startup_assigned"
+      } else {
+        "rebalance_assigned"
+      },
+    );
+    let reader_owned_by_driver = self.reader.is_some();
     let mut newly_assigned = active_assignment
       .difference(&self.active_assignment)
       .copied()
       .collect::<Vec<_>>();
     newly_assigned.sort_unstable();
-    self.set_reader_assignment(assignment.to_owned(), now_unix_millis() / 1_000)?;
+    self.set_reader_assignment(
+      assignment.to_owned(),
+      now_unix_millis() / 1_000,
+      if reader_owned_by_driver {
+        None
+      } else {
+        handoff_phase
+      },
+    )?;
     self.active_assignment = active_assignment;
     self
       .metrics
@@ -777,6 +817,28 @@ impl ConsumerDriver {
           .or_default();
       }
       self.refresh_diagnostics_locked(&mut shared_state);
+    }
+    if reader_owned_by_driver && let Some(handoff_phase) = handoff_phase {
+      let assignment_span = bd_log::otel_info_span!(
+        "blob_stream.consumer.assignment",
+        otel.kind = "internal",
+        consumer.topic = %self.group_config.topic,
+        consumer.group_id = %self.group_config.group_id,
+        consumer.member_id = %self.group_config.member_id,
+        consumer.generation = self.coordinator.generation(),
+        assignment.phase = handoff_phase,
+        assignment.partition_count = assignment.len(),
+        otel.status_code = field::Empty,
+      );
+      emit_partition_handoff_snapshots(
+        &self.diagnostics.state_snapshot(),
+        assignment,
+        handoff_phase,
+        "assigned",
+        "not_applicable",
+        &assignment_span,
+      );
+      assignment_span.record("otel.status_code", "OK");
     }
     if assignment_changed {
       self.metrics.assignment_applications_total.inc();
@@ -836,14 +898,84 @@ impl ConsumerDriver {
           .pending_revocation_partitions
           .take()
           .unwrap_or_default();
-        self
+        let handoff_snapshot = self
+          .pending_revocation_snapshot
+          .take()
+          .unwrap_or_else(|| self.diagnostics.state_snapshot());
+        let handoff_span = self
+          .pending_revocation_span
+          .take()
+          .unwrap_or_else(Span::none);
+        let release_result = self
           .coordinator
           .release_partitions(&revoked, now_unix_millis())
-          .await?;
+          .await;
+        match &release_result {
+          Ok(released_partitions) => {
+            let released_partitions = released_partitions.iter().copied().collect::<HashSet<_>>();
+            let (released, not_released): (Vec<_>, Vec<_>) = revoked
+              .iter()
+              .copied()
+              .partition(|partition_id| released_partitions.contains(partition_id));
+            if !released.is_empty() {
+              emit_partition_handoff_snapshots(
+                &handoff_snapshot,
+                &released,
+                "revocation_release_result",
+                "released",
+                "not_attempted",
+                &handoff_span,
+              );
+            }
+            if !not_released.is_empty() {
+              emit_partition_handoff_snapshots(
+                &handoff_snapshot,
+                &not_released,
+                "revocation_release_result",
+                "not_released",
+                "not_attempted",
+                &handoff_span,
+              );
+            }
+          },
+          Err(_) => emit_partition_handoff_snapshots(
+            &handoff_snapshot,
+            &revoked,
+            "revocation_release_result",
+            "failed",
+            "not_attempted",
+            &handoff_span,
+          ),
+        }
+        handoff_span.record(
+          "handoff.lease_release_outcome",
+          if release_result.is_ok() {
+            "succeeded"
+          } else {
+            "failed"
+          },
+        );
+        if let Err(error) = release_result {
+          handoff_span.record("handoff.assignment_outcome", "not_attempted");
+          handoff_span.record("error.message", format!("lease release: {error:#}"));
+          handoff_span.record("otel.status_code", "ERROR");
+          return Err(error);
+        }
         let assignment = self.pending_assignment.take().unwrap_or_default();
         self.pending_revocation_completion = None;
-        self.apply_assignment(&assignment)?;
-        Ok(true)
+        match self.apply_assignment(&assignment) {
+          Ok(()) => {
+            handoff_span.record("handoff.assignment_outcome", "succeeded");
+            handoff_span.record("otel.status_code", "OK");
+            Ok(true)
+          },
+          Err(error) => {
+            handoff_span.record("handoff.assignment_outcome", "failed");
+            handoff_span.record("error.message", format!("assignment: {error:#}"));
+            handoff_span.record("otel.status_code", "ERROR");
+            Err(error)
+          },
+        }
       },
       Err(oneshot::error::TryRecvError::Empty) => Ok(false),
     }
@@ -922,6 +1054,30 @@ impl ConsumerDriver {
     self.pending_revocation_completion = Some(completion_rx);
     self.pending_revocation_partitions = Some(revoked.clone());
     self.refresh_diagnostics();
+    let handoff_snapshot = self.diagnostics.state_snapshot();
+    let handoff_span = bd_log::otel_info_span!(
+      "blob_stream.consumer.revocation_handoff",
+      otel.kind = "internal",
+      consumer.topic = %self.group_config.topic,
+      consumer.group_id = %self.group_config.group_id,
+      consumer.member_id = %self.group_config.member_id,
+      consumer.generation = self.coordinator.generation(),
+      handoff.revoked_partition_count = revoked.len(),
+      handoff.lease_release_outcome = field::Empty,
+      handoff.assignment_outcome = field::Empty,
+      error.message = field::Empty,
+      otel.status_code = field::Empty,
+    );
+    emit_partition_handoff_snapshots(
+      &handoff_snapshot,
+      &revoked,
+      "revocation_pre_release",
+      "awaiting_application_ack",
+      "not_attempted",
+      &handoff_span,
+    );
+    self.pending_revocation_snapshot = Some(handoff_snapshot);
+    self.pending_revocation_span = Some(handoff_span);
     self.delivery_notify.notify_waiters();
 
     info!(
@@ -950,6 +1106,7 @@ impl ConsumerDriver {
     let space_notify = Arc::clone(&self.prefetch_space_notify);
     let shutdown = Arc::clone(&self.prefetch_shutdown);
     let metrics = self.metrics.clone();
+    let diagnostics = self.diagnostics.clone();
     let base_idle_delay_ms = self.prefetch_idle_base_delay_ms;
     let max_idle_delay_ms = self.prefetch_idle_max_delay_ms;
 
@@ -958,6 +1115,7 @@ impl ConsumerDriver {
         reader,
         reader_command_rx,
         shared_state,
+        diagnostics,
         delivery_notify,
         space_notify,
         shutdown,
@@ -1006,34 +1164,38 @@ impl ConsumerDriver {
       .heartbeat_fenced_partitions
       .inc_by(u64::try_from(report.fenced_partitions.len()).unwrap_or(u64::MAX));
 
-    let committed_offsets = report
+    let committed_cursors = report
       .renewed_partitions
       .iter()
       .filter_map(|partition_id| {
         pending_commits
           .get(partition_id)
-          .map(|commit| (*partition_id, commit.offset))
+          .map(|commit| (*partition_id, commit.clone()))
       })
       .collect::<Vec<_>>();
     self
       .metrics
       .heartbeat_committed_offsets
-      .inc_by(u64::try_from(committed_offsets.len()).unwrap_or(u64::MAX));
+      .inc_by(u64::try_from(committed_cursors.len()).unwrap_or(u64::MAX));
     self
       .metrics
       .heartbeat_latency_seconds
       .observe(started_at.elapsed().as_secs_f64());
 
     let mut shared_state = self.shared_state.lock();
-    for (partition_id, offset) in committed_offsets {
-      shared_state
-        .diagnostics
-        .last_committed_offsets
-        .insert(partition_id, offset);
+    for (partition_id, committed_cursor) in committed_cursors {
+      shared_state.diagnostics.last_committed_cursors.insert(
+        partition_id,
+        ConsumerCommittedCursorSnapshot {
+          offset: committed_cursor.offset,
+          source_checkpoint: Some(committed_cursor.source_checkpoint),
+          committed_at_ms: Some(now_ts_ms),
+        },
+      );
       if let Some(partition_state) = shared_state.active_partitions.get_mut(&partition_id) {
         partition_state
           .delivered_source_ranges
-          .retain(|range| range.end_offset > offset);
+          .retain(|range| range.end_offset > committed_cursor.offset);
       }
     }
     shared_state.diagnostics.last_successful_heartbeat_at_ms = Some(now_ts_ms);
@@ -1150,6 +1312,7 @@ impl ConsumerDriver {
       self.set_reader_assignment(
         self.active_assignment.iter().copied().collect(),
         now_ts_ms / 1_000,
+        None,
       )?;
       info!(
         "consumer heartbeat fenced partitions: topic={}, group_id={}, member_id={}, fenced={:?}",
@@ -1338,8 +1501,89 @@ impl ConsumerDriver {
     if self.started {
       // Attempt commit and explicit lease release before membership deregistration.
       // Releasing leases proactively shortens rebalance convergence on graceful shutdown.
+      let shutdown_span = bd_log::otel_info_span!(
+        "blob_stream.consumer.shutdown",
+        otel.kind = "internal",
+        consumer.topic = %self.group_config.topic,
+        consumer.group_id = %self.group_config.group_id,
+        consumer.member_id = %self.group_config.member_id,
+        consumer.generation = self.coordinator.generation(),
+        shutdown.commit_outcome = field::Empty,
+        shutdown.lease_release_outcome = field::Empty,
+        shutdown.deregistration_outcome = field::Empty,
+        shutdown.planner_release_outcome = field::Empty,
+        error.message = field::Empty,
+        otel.status_code = field::Empty,
+      );
       let commit_result = self.commit().await;
+      self.refresh_diagnostics();
+      let mut handoff_partitions = self.coordinator.owned_partitions();
+      handoff_partitions.extend(self.active_assignment.iter().copied());
+      handoff_partitions.sort_unstable();
+      handoff_partitions.dedup();
+      let handoff_snapshot = self.diagnostics.state_snapshot();
+      emit_partition_handoff_snapshots(
+        &handoff_snapshot,
+        &handoff_partitions,
+        "shutdown_pre_release",
+        "pending_release",
+        if commit_result.is_ok() {
+          "succeeded"
+        } else {
+          "failed"
+        },
+        &shutdown_span,
+      );
       let release_result = self.coordinator.release_owned(now_unix_millis()).await;
+      match &release_result {
+        Ok(released_partitions) => {
+          let released_partitions = released_partitions.iter().copied().collect::<HashSet<_>>();
+          let (released, not_released): (Vec<_>, Vec<_>) = handoff_partitions
+            .iter()
+            .copied()
+            .partition(|partition_id| released_partitions.contains(partition_id));
+          if !released.is_empty() {
+            emit_partition_handoff_snapshots(
+              &handoff_snapshot,
+              &released,
+              "shutdown_release_result",
+              "released",
+              if commit_result.is_ok() {
+                "succeeded"
+              } else {
+                "failed"
+              },
+              &shutdown_span,
+            );
+          }
+          if !not_released.is_empty() {
+            emit_partition_handoff_snapshots(
+              &handoff_snapshot,
+              &not_released,
+              "shutdown_release_result",
+              "not_released",
+              if commit_result.is_ok() {
+                "succeeded"
+              } else {
+                "failed"
+              },
+              &shutdown_span,
+            );
+          }
+        },
+        Err(_) => emit_partition_handoff_snapshots(
+          &handoff_snapshot,
+          &handoff_partitions,
+          "shutdown_release_result",
+          "failed",
+          if commit_result.is_ok() {
+            "succeeded"
+          } else {
+            "failed"
+          },
+          &shutdown_span,
+        ),
+      }
       let deregistration_result = self
         .membership_store
         .deregister_member(
@@ -1348,7 +1592,7 @@ impl ConsumerDriver {
           &self.group_config.member_id,
         )
         .await;
-      if let Err(error) = self
+      let planner_release_result = self
         .membership_store
         .release_planner(
           &self.group_config.topic,
@@ -1356,15 +1600,15 @@ impl ConsumerDriver {
           &self.group_config.member_id,
           self.coordinator.planner_session_id(),
         )
-        .await
-      {
+        .await;
+      if let Err(error) = &planner_release_result {
         debug!(
           "consumer planner release failed during shutdown: topic={}, group_id={}, member_id={}, \
            error={error:#}",
           self.group_config.topic, self.group_config.group_id, self.group_config.member_id
         );
       }
-      if let Err(error) = deregistration_result {
+      if let Err(error) = &deregistration_result {
         debug!(
           "consumer membership deregistration failed during shutdown: topic={}, group_id={}, \
            member_id={}, error={error:#}",
@@ -1374,6 +1618,66 @@ impl ConsumerDriver {
       self.stop_prefetch_task().await;
       self.started = false;
       self.refresh_diagnostics();
+      shutdown_span.record(
+        "shutdown.commit_outcome",
+        if commit_result.is_ok() {
+          "succeeded"
+        } else {
+          "failed"
+        },
+      );
+      shutdown_span.record(
+        "shutdown.lease_release_outcome",
+        if release_result.is_ok() {
+          "succeeded"
+        } else {
+          "failed"
+        },
+      );
+      shutdown_span.record(
+        "shutdown.deregistration_outcome",
+        if deregistration_result.is_ok() {
+          "succeeded"
+        } else {
+          "failed"
+        },
+      );
+      shutdown_span.record(
+        "shutdown.planner_release_outcome",
+        if planner_release_result.is_ok() {
+          "succeeded"
+        } else {
+          "failed"
+        },
+      );
+      let error_message = [
+        ("commit", commit_result.as_ref().err()),
+        ("lease release", release_result.as_ref().err()),
+        (
+          "membership deregistration",
+          deregistration_result.as_ref().err(),
+        ),
+        ("planner release", planner_release_result.as_ref().err()),
+      ]
+      .into_iter()
+      .filter_map(|(operation, error)| error.map(|error| format!("{operation}: {error:#}")))
+      .collect::<Vec<_>>()
+      .join("; ");
+      if !error_message.is_empty() {
+        shutdown_span.record("error.message", error_message);
+      }
+      shutdown_span.record(
+        "otel.status_code",
+        if commit_result.is_ok()
+          && release_result.is_ok()
+          && deregistration_result.is_ok()
+          && planner_release_result.is_ok()
+        {
+          "OK"
+        } else {
+          "ERROR"
+        },
+      );
       info!(
         "consumer iterator shutdown: topic={}, group_id={}, member_id={}",
         self.group_config.topic, self.group_config.group_id, self.group_config.member_id

@@ -1649,6 +1649,7 @@ dependencies = [
  "serde_json",
  "time",
  "tokio",
+ "tracing",
  "uuid",
  "zstd",
 ]

@@ -398,3 +398,35 @@ returned new batches. Compare them with `metadata_recovery_scan_requests`,
 `metadata_recovery_scan_segments`, and
 `metadata_recovery_scan_failures` when tuning the recovery interval and scan horizon.
 
+Consumer lifecycle handoffs emit structured `blob_stream.consumer.partition_handoff` OTEL spans
+for each virtual partition. Query by `consumer.topic`, `consumer.group_id`,
+`messaging.partition`, `handoff.cursor_key`, `handoff.phase`, and `handoff.outcome` to connect an
+outgoing shutdown or revocation span with the incoming startup or rebalance assignment. Individual
+attributes include the committed offset, reader mode, and recovery bounds. The complete
+per-partition state, including source checkpoint, pending cursor state, scan counters, and retained
+fast frontiers, is captured in `handoff.snapshot_json`. The handoff phases are
+`startup_assigned`, `rebalance_assigned`, `revocation_pre_release`,
+`revocation_release_result`, `shutdown_pre_release`, and `shutdown_release_result`. Release
+outcomes are `pending_release`, `awaiting_application_ack`, `released`, `not_released`, and
+`failed`; assignment outcomes are `assigned` or `not_applicable`.
+
+To bound allocation and attribute size, each scan-detail collection in `handoff.snapshot_json` is
+limited to 64 entries. The corresponding `*_truncated` field is true when additional scan windows,
+fast-scan bounds, or fast frontiers were omitted; scalar scan counters always retain their complete
+values.
+
+Each partition that enters bounded recovery also emits a
+`blob_stream.consumer.partition_recovery` span from assignment until it enters the Fast path or
+loses assignment. Its queryable attributes include starting and committed cursors, recovery bounds,
+duration, scan-pass count, and outcome. `recovery.summary_json` contains aggregate cursor-skip,
+visibility-deferral, frontier-skip, accepted-batch, and accepted-record counters that explain both
+recovery time and why a handoff reread more metadata than expected.
+
+Graceful shutdown emits a `blob_stream.consumer.shutdown` root span covering the final commit,
+lease release, membership deregistration, planner release, and prefetch termination. Its per-step
+outcome attributes show which operation failed; its OTEL span status is `OK` only when every
+fallible shutdown operation succeeds. Failed shutdown and revocation-handoff spans include
+`error.message` with the failed operation and error text. Revocation roots also expose
+`handoff.lease_release_outcome` and `handoff.assignment_outcome`, and report success only after
+the replacement assignment is active.
+

@@ -5,13 +5,19 @@ use blob_stream_metadata_store::{
   ConsumerGroupLease,
   ConsumerGroupLeaseStore,
 };
-use blob_stream_types::{VirtualPartitionId, format_unix_timestamp_ms, now_unix_millis};
+use blob_stream_types::{
+  CommittedSourceCheckpoint,
+  VirtualPartitionId,
+  format_unix_timestamp_ms,
+  now_unix_millis,
+};
 use log::debug;
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Span;
 
 //
 // ConsumerStateResponse
@@ -78,6 +84,8 @@ pub struct ConsumerLocalPartitionSnapshot {
   pub pending_assignment: bool,
   pub pending_commit_offset: Option<u64>,
   pub last_committed_offset: Option<u64>,
+  pub last_committed_source_checkpoint: Option<ConsumerSourceCheckpointSnapshot>,
+  pub last_committed_at: Option<String>,
   pub cursor: Option<u64>,
   pub reader: Option<ConsumerReaderStateSnapshot>,
   pub last_scan: Option<ConsumerReaderScanSnapshot>,
@@ -106,8 +114,11 @@ pub struct ConsumerReaderStateSnapshot {
 pub struct ConsumerReaderScanSnapshot {
   pub completed_at: String,
   pub scanned_window_starts: Vec<String>,
+  pub scanned_window_starts_truncated: bool,
   pub fast_scan_bounds: Vec<ConsumerReaderFastScanBoundSnapshot>,
+  pub fast_scan_bounds_truncated: bool,
   pub fast_frontiers: Vec<ConsumerReaderFastFrontierSnapshot>,
+  pub fast_frontiers_truncated: bool,
   pub cursor_before: Option<u64>,
   pub cursor_after: Option<u64>,
   pub metadata_segments_seen: usize,
@@ -170,10 +181,17 @@ pub enum ConsumerGroupLeaseObservation {
 //
 
 // Human-readable source checkpoint attached to a committed group lease.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConsumerSourceCheckpointSnapshot {
   pub window_start: String,
   pub snowflake_id: u64,
+}
+
+#[derive(Clone)]
+pub struct ConsumerCommittedCursorSnapshot {
+  pub offset: u64,
+  pub source_checkpoint: Option<CommittedSourceCheckpoint>,
+  pub committed_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -251,7 +269,7 @@ pub struct ConsumerDiagnosticsRuntimeState {
   pub active_assignment: Vec<VirtualPartitionId>,
   pub pending_assignment: Option<Vec<VirtualPartitionId>>,
   pub pending_revocation: bool,
-  pub last_committed_offsets: HashMap<VirtualPartitionId, u64>,
+  pub last_committed_cursors: HashMap<VirtualPartitionId, ConsumerCommittedCursorSnapshot>,
   pub cursors: Vec<ConsumerOffsetSnapshot>,
   pub reader_partitions: Vec<ConsumerReaderPartitionSnapshot>,
   pub reader_partition_scans: Vec<(VirtualPartitionId, ConsumerReaderScanSnapshot)>,
@@ -347,9 +365,16 @@ impl ConsumerDiagnostics {
       local_partition_snapshot(&mut local_partitions, partition_id).pending_commit_offset =
         Some(commit.offset);
     }
-    for (partition_id, offset) in runtime_state.last_committed_offsets {
-      local_partition_snapshot(&mut local_partitions, partition_id).last_committed_offset =
-        Some(offset);
+    for (partition_id, committed_cursor) in runtime_state.last_committed_cursors {
+      let partition = local_partition_snapshot(&mut local_partitions, partition_id);
+      partition.last_committed_offset = Some(committed_cursor.offset);
+      partition.last_committed_source_checkpoint = committed_cursor
+        .source_checkpoint
+        .as_ref()
+        .map(source_checkpoint_snapshot);
+      partition.last_committed_at = committed_cursor
+        .committed_at_ms
+        .map(format_unix_timestamp_ms);
     }
     for cursor in runtime_state.cursors {
       local_partition_snapshot(&mut local_partitions, cursor.virtual_partition_id).cursor =
@@ -575,6 +600,17 @@ fn group_partition_lease_snapshot(
   }
 }
 
+fn source_checkpoint_snapshot(
+  checkpoint: &CommittedSourceCheckpoint,
+) -> ConsumerSourceCheckpointSnapshot {
+  ConsumerSourceCheckpointSnapshot {
+    window_start: format_unix_timestamp_ms(
+      checkpoint.window_start_unix_seconds.saturating_mul(1_000),
+    ),
+    snowflake_id: checkpoint.snowflake_id,
+  }
+}
+
 fn local_partition_snapshot(
   snapshots: &mut BTreeMap<VirtualPartitionId, ConsumerLocalPartitionSnapshot>,
   virtual_partition_id: VirtualPartitionId,
@@ -588,6 +624,8 @@ fn local_partition_snapshot(
       pending_assignment: false,
       pending_commit_offset: None,
       last_committed_offset: None,
+      last_committed_source_checkpoint: None,
+      last_committed_at: None,
       cursor: None,
       reader: None,
       last_scan: None,
@@ -606,4 +644,80 @@ pub fn offsets_from_map(offsets: &HashMap<VirtualPartitionId, u64>) -> Vec<Consu
     .collect::<Vec<_>>();
   snapshots.sort_by_key(|snapshot| snapshot.virtual_partition_id);
   snapshots
+}
+
+pub fn emit_partition_handoff_snapshots(
+  snapshot: &ConsumerStateSnapshot,
+  partition_ids: &[VirtualPartitionId],
+  phase: &str,
+  outcome: &str,
+  commit_outcome: &str,
+  parent_span: &Span,
+) {
+  let partition_ids = partition_ids.iter().copied().collect::<HashSet<_>>();
+  for partition in &snapshot.local.partitions {
+    if !partition_ids.contains(&partition.virtual_partition_id) {
+      continue;
+    }
+    let handoff_snapshot_json = match serde_json::to_string(partition) {
+      Ok(snapshot) => snapshot,
+      Err(error) => format!(r#"{{"serialization_error":"{error}"}}"#),
+    };
+    let cursor_key = handoff_cursor_key(snapshot, partition);
+    let reader_mode = partition.reader.as_ref().map(|reader| &reader.mode);
+    let recovery_next_window_start = partition
+      .reader
+      .as_ref()
+      .and_then(|reader| reader.recovery_next_window_start.as_ref());
+    let recovery_cutover_window_start = partition
+      .reader
+      .as_ref()
+      .and_then(|reader| reader.recovery_cutover_window_start.as_ref());
+    parent_span.in_scope(|| {
+      // bd-log exports at most 16 attributes per span by default. Keep the scalar fields useful
+      // for trace queries here and retain the complete per-partition state in the JSON attribute.
+      let _handoff_span = bd_log::otel_info_span_if_parent!(
+        "blob_stream.consumer.partition_handoff",
+        otel.kind = "internal",
+        handoff.phase = phase,
+        handoff.outcome = outcome,
+        handoff.commit_outcome = commit_outcome,
+        handoff.cursor_key = %cursor_key,
+        consumer.topic = %snapshot.topic,
+        consumer.group_id = %snapshot.group_id,
+        consumer.member_id = %snapshot.member_id,
+        consumer.generation = snapshot.accepted_assignment_plan_version,
+        messaging.partition = partition.virtual_partition_id,
+        handoff.last_committed_offset = ?partition.last_committed_offset,
+        handoff.reader_mode = ?reader_mode,
+        handoff.recovery_next_window_start = ?recovery_next_window_start,
+        handoff.recovery_cutover_window_start = ?recovery_cutover_window_start,
+        handoff.snapshot_json = %handoff_snapshot_json,
+      );
+    });
+  }
+}
+
+pub fn handoff_cursor_key(
+  snapshot: &ConsumerStateSnapshot,
+  partition: &ConsumerLocalPartitionSnapshot,
+) -> String {
+  let checkpoint = partition
+    .last_committed_source_checkpoint
+    .as_ref()
+    .map_or_else(
+      || "none".to_string(),
+      |checkpoint| format!("{}:{}", checkpoint.window_start, checkpoint.snowflake_id),
+    );
+  format!(
+    "{}:{}:{}:{}:{}",
+    snapshot.topic,
+    snapshot.group_id,
+    partition.virtual_partition_id,
+    partition
+      .last_committed_offset
+      .or(partition.cursor)
+      .map_or_else(|| "none".to_string(), |offset| offset.to_string()),
+    checkpoint
+  )
 }

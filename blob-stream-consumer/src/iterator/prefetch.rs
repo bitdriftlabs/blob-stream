@@ -29,11 +29,14 @@ use crate::consumer::{
 };
 use crate::coordination::RecoveredCursor;
 use crate::diagnostics::{
+  ConsumerDiagnostics,
   ConsumerPartitionReadMode,
   ConsumerReaderFastFrontierSnapshot,
   ConsumerReaderFastScanBoundSnapshot,
   ConsumerReaderPartitionSnapshot,
   ConsumerReaderScanSnapshot,
+  emit_partition_handoff_snapshots,
+  handoff_cursor_key,
   offsets_from_map,
 };
 use anyhow::Result;
@@ -52,6 +55,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use time::ext::NumericalDuration;
 use tokio::sync::{Notify, mpsc, oneshot};
+use tracing::{Span, field};
+
+const MAX_SCAN_DETAIL_ENTRIES: usize = 64;
 
 //
 // IdlePollBackoff
@@ -106,6 +112,7 @@ pub(super) enum ConsumerReaderCommand {
   SetAssignment {
     assignment: Vec<VirtualPartitionId>,
     now_unix_seconds: i64,
+    handoff_phase: Option<&'static str>,
   },
   Seek {
     virtual_partition_id: VirtualPartitionId,
@@ -113,6 +120,18 @@ pub(super) enum ConsumerReaderCommand {
     now_unix_seconds: i64,
     response: oneshot::Sender<Result<()>>,
   },
+}
+
+struct RecoveryTrace {
+  span: Span,
+  started_at: Instant,
+  scan_passes: usize,
+  metadata_batches_seen: usize,
+  batches_skipped_by_cursor: usize,
+  segments_skipped_by_frontier: usize,
+  segments_deferred_by_visibility: usize,
+  batches_accepted: usize,
+  records_accepted: usize,
 }
 
 //
@@ -124,12 +143,14 @@ pub(super) struct PrefetchWorker {
   reader: ConsumerReaderImpl,
   reader_command_rx: mpsc::UnboundedReceiver<ConsumerReaderCommand>,
   shared_state: Arc<Mutex<ConsumerSharedState>>,
+  diagnostics: ConsumerDiagnostics,
   delivery_notify: Arc<Notify>,
   prefetch_space_notify: Arc<Notify>,
   prefetch_shutdown: Arc<AtomicBool>,
   metrics: ConsumerIteratorMetrics,
   base_idle_delay_ms: u64,
   max_idle_delay_ms: Option<u64>,
+  recovery_traces: HashMap<VirtualPartitionId, RecoveryTrace>,
 }
 
 impl PrefetchWorker {
@@ -138,6 +159,7 @@ impl PrefetchWorker {
     reader: ConsumerReaderImpl,
     reader_command_rx: mpsc::UnboundedReceiver<ConsumerReaderCommand>,
     shared_state: Arc<Mutex<ConsumerSharedState>>,
+    diagnostics: ConsumerDiagnostics,
     delivery_notify: Arc<Notify>,
     prefetch_space_notify: Arc<Notify>,
     prefetch_shutdown: Arc<AtomicBool>,
@@ -149,12 +171,14 @@ impl PrefetchWorker {
       reader,
       reader_command_rx,
       shared_state,
+      diagnostics,
       delivery_notify,
       prefetch_space_notify,
       prefetch_shutdown,
       metrics,
       base_idle_delay_ms,
       max_idle_delay_ms,
+      recovery_traces: HashMap::new(),
     }
   }
 
@@ -168,18 +192,22 @@ impl PrefetchWorker {
 
     loop {
       if self.prefetch_shutdown.load(Ordering::Acquire) {
+        self.finish_recovery_traces("worker_stopped");
         return;
       }
       if !process_reader_commands(
         &mut self.reader,
         &mut self.reader_command_rx,
         &self.shared_state,
+        &self.diagnostics,
         &mut pending,
         &mut pending_record_count,
         &mut pending_bytes,
       ) {
+        self.finish_recovery_traces("worker_stopped");
         return;
       }
+      self.start_recovery_traces();
 
       let runtime_settings = self.reader.runtime_settings();
 
@@ -211,6 +239,7 @@ impl PrefetchWorker {
         .read_available_with_retry(capacity, runtime_settings)
         .await;
       record_reader_diagnostics(&self.reader, &self.shared_state);
+      self.record_recovery_progress();
 
       self
         .metrics
@@ -236,6 +265,190 @@ impl PrefetchWorker {
       pending.extend(batches);
       self.record_pending_diagnostics(&pending, pending_record_count, pending_bytes);
     }
+  }
+
+  fn start_recovery_traces(&mut self) {
+    let new_recoveries = self
+      .reader
+      .partition_read_states()
+      .into_iter()
+      .filter_map(|state| {
+        let ConsumerReaderPartitionMode::Recovering {
+          next_window_start_unix_seconds,
+          cutover_window_start_unix_seconds,
+        } = state.mode
+        else {
+          return None;
+        };
+        (!self
+          .recovery_traces
+          .contains_key(&state.virtual_partition_id))
+        .then_some((
+          state.virtual_partition_id,
+          next_window_start_unix_seconds,
+          cutover_window_start_unix_seconds,
+        ))
+      })
+      .collect::<Vec<_>>();
+    if new_recoveries.is_empty() {
+      return;
+    }
+
+    let snapshot = self.diagnostics.state_snapshot();
+    for (partition_id, next_window_start_unix_seconds, cutover_window_start_unix_seconds) in
+      new_recoveries
+    {
+      let partition = snapshot
+        .local
+        .partitions
+        .iter()
+        .find(|partition| partition.virtual_partition_id == partition_id);
+      let cursor_key = partition.map_or_else(
+        || {
+          format!(
+            "{}:{}:{}:none:none",
+            snapshot.topic, snapshot.group_id, partition_id
+          )
+        },
+        |partition| handoff_cursor_key(&snapshot, partition),
+      );
+      let recovery_start_cursor = partition.and_then(|partition| partition.cursor);
+      let recovery_committed_cursor =
+        partition.and_then(|partition| partition.last_committed_offset);
+      let span = bd_log::otel_info_span!(
+        "blob_stream.consumer.partition_recovery",
+        otel.kind = "consumer",
+        consumer.topic = %snapshot.topic,
+        consumer.group_id = %snapshot.group_id,
+        consumer.generation = snapshot.accepted_assignment_plan_version,
+        messaging.partition = partition_id,
+        handoff.cursor_key = %cursor_key,
+        recovery.start_cursor = ?recovery_start_cursor,
+        recovery.committed_cursor = ?recovery_committed_cursor,
+        recovery.next_window_start = next_window_start_unix_seconds,
+        recovery.cutover_window_start = cutover_window_start_unix_seconds,
+        recovery.scan_passes = field::Empty,
+        recovery.duration_ms = field::Empty,
+        recovery.outcome = field::Empty,
+        recovery.summary_json = field::Empty,
+        otel.status_code = field::Empty,
+      );
+      self.recovery_traces.insert(
+        partition_id,
+        RecoveryTrace {
+          span,
+          started_at: Instant::now(),
+          scan_passes: 0,
+          metadata_batches_seen: 0,
+          batches_skipped_by_cursor: 0,
+          segments_skipped_by_frontier: 0,
+          segments_deferred_by_visibility: 0,
+          batches_accepted: 0,
+          records_accepted: 0,
+        },
+      );
+    }
+  }
+
+  fn record_recovery_progress(&mut self) {
+    if self.recovery_traces.is_empty() {
+      return;
+    }
+
+    let modes = self
+      .reader
+      .partition_read_states()
+      .into_iter()
+      .map(|state| (state.virtual_partition_id, state.mode))
+      .collect::<HashMap<_, _>>();
+    let scans = self
+      .reader
+      .partition_scan_states()
+      .into_iter()
+      .map(|state| (state.virtual_partition_id, state))
+      .collect::<HashMap<_, _>>();
+    let mut completed = Vec::new();
+    for (partition_id, recovery) in &mut self.recovery_traces {
+      recovery.scan_passes = recovery.scan_passes.saturating_add(1);
+      if let Some(scan) = scans.get(partition_id) {
+        recovery.metadata_batches_seen = recovery
+          .metadata_batches_seen
+          .saturating_add(scan.metadata_batches_seen);
+        recovery.batches_skipped_by_cursor = recovery
+          .batches_skipped_by_cursor
+          .saturating_add(scan.metadata_batches_skipped_by_cursor);
+        recovery.segments_skipped_by_frontier = recovery
+          .segments_skipped_by_frontier
+          .saturating_add(scan.metadata_segments_skipped_by_frontier);
+        recovery.segments_deferred_by_visibility = recovery
+          .segments_deferred_by_visibility
+          .saturating_add(scan.metadata_segments_deferred_by_visibility);
+        recovery.batches_accepted = recovery
+          .batches_accepted
+          .saturating_add(scan.batches_accepted);
+        recovery.records_accepted = recovery
+          .records_accepted
+          .saturating_add(scan.records_accepted);
+      }
+      if matches!(
+        modes.get(partition_id),
+        Some(ConsumerReaderPartitionMode::Recovering { .. })
+      ) {
+        continue;
+      }
+      let completed_normally = matches!(
+        modes.get(partition_id),
+        Some(ConsumerReaderPartitionMode::Fast)
+      );
+      Self::finish_recovery_trace(
+        recovery,
+        if completed_normally {
+          "fast_path_active"
+        } else {
+          "cancelled"
+        },
+      );
+      completed.push(*partition_id);
+    }
+    for partition_id in completed {
+      self.recovery_traces.remove(&partition_id);
+    }
+  }
+
+  fn finish_recovery_traces(&mut self, outcome: &str) {
+    for recovery in self.recovery_traces.values() {
+      Self::finish_recovery_trace(recovery, outcome);
+    }
+    self.recovery_traces.clear();
+  }
+
+  fn finish_recovery_trace(recovery: &RecoveryTrace, outcome: &str) {
+    let summary_json = serde_json::json!({
+      "metadata_batches_seen": recovery.metadata_batches_seen,
+      "batches_skipped_by_cursor": recovery.batches_skipped_by_cursor,
+      "segments_skipped_by_frontier": recovery.segments_skipped_by_frontier,
+      "segments_deferred_by_visibility": recovery.segments_deferred_by_visibility,
+      "batches_accepted": recovery.batches_accepted,
+      "records_accepted": recovery.records_accepted,
+    })
+    .to_string();
+    recovery
+      .span
+      .record("recovery.scan_passes", recovery.scan_passes);
+    recovery.span.record(
+      "recovery.duration_ms",
+      u64::try_from(recovery.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+    recovery.span.record("recovery.outcome", outcome);
+    recovery.span.record("recovery.summary_json", summary_json);
+    recovery.span.record(
+      "otel.status_code",
+      if outcome == "fast_path_active" {
+        "OK"
+      } else {
+        "UNSET"
+      },
+    );
   }
 
   /// Return capacity remaining after queued, pending, and partially delivered records.
@@ -427,18 +640,24 @@ fn reader_partition_scan_snapshot(
     scanned_window_starts: state
       .scanned_window_starts
       .iter()
+      .take(MAX_SCAN_DETAIL_ENTRIES)
       .map(|window_start| format_unix_timestamp_ms(window_start.saturating_mul(1_000)))
       .collect(),
+    scanned_window_starts_truncated: state.scanned_window_starts.len() > MAX_SCAN_DETAIL_ENTRIES,
     fast_scan_bounds: state
       .fast_scan_bounds
       .iter()
+      .take(MAX_SCAN_DETAIL_ENTRIES)
       .map(reader_fast_scan_bound_snapshot)
       .collect(),
+    fast_scan_bounds_truncated: state.fast_scan_bounds.len() > MAX_SCAN_DETAIL_ENTRIES,
     fast_frontiers: state
       .fast_frontiers
       .iter()
+      .take(MAX_SCAN_DETAIL_ENTRIES)
       .map(reader_fast_frontier_snapshot)
       .collect(),
+    fast_frontiers_truncated: state.fast_frontiers.len() > MAX_SCAN_DETAIL_ENTRIES,
     cursor_before: state.cursor_before,
     cursor_after: state.cursor_after,
     metadata_segments_seen: state.metadata_segments_seen,
@@ -483,6 +702,7 @@ fn process_reader_commands(
   reader: &mut ConsumerReaderImpl,
   reader_command_rx: &mut mpsc::UnboundedReceiver<ConsumerReaderCommand>,
   shared_state: &Arc<Mutex<ConsumerSharedState>>,
+  diagnostics: &ConsumerDiagnostics,
   pending: &mut VecDeque<ConsumerBatch>,
   pending_record_count: &mut usize,
   pending_bytes: &mut u64,
@@ -493,6 +713,7 @@ fn process_reader_commands(
       Err(mpsc::error::TryRecvError::Empty) => return true,
       Err(mpsc::error::TryRecvError::Disconnected) => return false,
     };
+    let mut handoff_assignment = None;
     let seek_response = match command {
       ConsumerReaderCommand::HydrateCursors {
         recovered_cursors,
@@ -511,11 +732,13 @@ fn process_reader_commands(
       ConsumerReaderCommand::SetAssignment {
         assignment,
         now_unix_seconds,
+        handoff_phase,
       } => {
         if let Err(error) = reader.set_assigned_virtual_partitions(&assignment, now_unix_seconds) {
           shared_state.lock().terminal_error = Some(format!("{error:#}"));
           return false;
         }
+        handoff_assignment = handoff_phase.map(|phase| (assignment, phase));
         None
       },
       ConsumerReaderCommand::Seek {
@@ -539,6 +762,40 @@ fn process_reader_commands(
       },
     };
     record_reader_diagnostics(reader, shared_state);
+    if let Some((assignment, handoff_phase)) = handoff_assignment {
+      {
+        let mut shared_state = shared_state.lock();
+        shared_state
+          .diagnostics
+          .active_assignment
+          .clone_from(&assignment);
+        shared_state
+          .diagnostics
+          .owned_partitions
+          .clone_from(&assignment);
+      }
+      let handoff_snapshot = diagnostics.state_snapshot();
+      let assignment_span = bd_log::otel_info_span!(
+        "blob_stream.consumer.assignment",
+        otel.kind = "internal",
+        consumer.topic = %handoff_snapshot.topic,
+        consumer.group_id = %handoff_snapshot.group_id,
+        consumer.member_id = %handoff_snapshot.member_id,
+        consumer.generation = handoff_snapshot.accepted_assignment_plan_version,
+        assignment.phase = handoff_phase,
+        assignment.partition_count = assignment.len(),
+        otel.status_code = field::Empty,
+      );
+      emit_partition_handoff_snapshots(
+        &handoff_snapshot,
+        &assignment,
+        handoff_phase,
+        "assigned",
+        "not_applicable",
+        &assignment_span,
+      );
+      assignment_span.record("otel.status_code", "OK");
+    }
     if let Some(response) = seek_response {
       let _ = response.send(Ok(()));
     }
