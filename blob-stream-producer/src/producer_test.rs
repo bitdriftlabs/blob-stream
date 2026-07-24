@@ -379,6 +379,86 @@ fn single_broker_membership() -> BrokerMembership {
   }])
 }
 
+#[tokio::test]
+async fn producer_waits_for_initialized_membership() {
+  let (discovery, membership_tx) = TestBrokerDiscovery::with_updates(BrokerMembership::Pending);
+  let construction = tokio::spawn(ProducerClientImpl::new(
+    default_config(),
+    vec![topic_config()],
+    Arc::new(discovery),
+    Arc::new(FakeBrokerTransport::default()),
+    metrics_scope(),
+  ));
+
+  tokio::task::yield_now().await;
+  assert!(!construction.is_finished());
+
+  membership_tx.send(single_broker_membership()).unwrap();
+  let producer = timeout(Duration::from_secs(1), construction)
+    .await
+    .expect("producer construction should complete after membership initializes")
+    .unwrap()
+    .unwrap();
+  let snapshot = producer.diagnostics().unwrap().state_snapshot();
+  assert_eq!(snapshot.brokers.len(), 1);
+  assert!(snapshot.route_map.iter().all(|route| {
+    route
+      .selected_broker
+      .as_ref()
+      .is_some_and(|broker| broker.address.as_str() == "a:8080")
+  }));
+}
+
+#[tokio::test]
+async fn producer_construction_fails_when_pending_membership_closes() {
+  let error = ProducerClientImpl::new(
+    default_config(),
+    vec![topic_config()],
+    Arc::new(TestBrokerDiscovery::new(BrokerMembership::Pending)),
+    Arc::new(FakeBrokerTransport::default()),
+    metrics_scope(),
+  )
+  .await
+  .err()
+  .expect("producer construction should fail when pending discovery closes");
+
+  assert_eq!(
+    error.to_string(),
+    "broker discovery closed before initial membership was available"
+  );
+}
+
+#[tokio::test(start_paused = true)]
+async fn producer_construction_times_out_when_membership_stays_pending() {
+  let (discovery, _membership_tx) = TestBrokerDiscovery::with_updates(BrokerMembership::Pending);
+  let construction = tokio::spawn(ProducerClientImpl::new(
+    default_config(),
+    vec![topic_config()],
+    Arc::new(discovery),
+    Arc::new(FakeBrokerTransport::default()),
+    metrics_scope(),
+  ));
+
+  tokio::task::yield_now().await;
+  let just_before_timeout = super::INITIAL_MEMBERSHIP_TIMEOUT
+    .checked_sub(Duration::from_millis(1))
+    .unwrap();
+  tokio::time::advance(just_before_timeout).await;
+  tokio::task::yield_now().await;
+  assert!(!construction.is_finished());
+
+  tokio::time::advance(Duration::from_millis(1)).await;
+  let error = construction
+    .await
+    .unwrap()
+    .err()
+    .expect("producer construction should time out");
+  assert_eq!(
+    error.to_string(),
+    "producer initial broker membership timed out after 10 seconds"
+  );
+}
+
 fn metrics_scope() -> bd_server_stats::stats::Scope {
   Collector::default().scope("blob_stream_producer_test")
 }
@@ -944,6 +1024,89 @@ async fn batches_by_partition_and_acks_waiters() {
   let sent = transport.sent.lock().await;
   assert_eq!(sent.len(), 1);
   assert_eq!(sent[0].batches[0].records.len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn max_size_flush_resets_the_max_delay_timer() {
+  let mut config = default_config();
+  config.max_batch_records = Some(2);
+  config.flush_max_delay_ms = Some(10);
+
+  let collector = Collector::default();
+  let transport = Arc::new(FakeBrokerTransport::default());
+  let producer = Arc::new(
+    ProducerClientImpl::new(
+      config,
+      vec![topic_config()],
+      Arc::new(TestBrokerDiscovery::new(single_broker_membership())),
+      transport.clone(),
+      collector.scope("blob_stream_producer_test"),
+    )
+    .await
+    .unwrap(),
+  );
+
+  tokio::task::yield_now().await;
+  tokio::time::advance(Duration::from_millis(5)).await;
+
+  let first_producer = Arc::clone(&producer);
+  let first = tokio::spawn(async move {
+    first_producer
+      .produce(ProducerRecord::new(
+        "telemetry".into(),
+        b"size-flush-key".to_vec(),
+        vec![1].into(),
+        100,
+      ))
+      .await
+  });
+  let second_producer = Arc::clone(&producer);
+  let second = tokio::spawn(async move {
+    second_producer
+      .produce(ProducerRecord::new(
+        "telemetry".into(),
+        b"size-flush-key".to_vec(),
+        vec![2].into(),
+        101,
+      ))
+      .await
+  });
+  first.await.unwrap().unwrap();
+  second.await.unwrap().unwrap();
+
+  let later_producer = Arc::clone(&producer);
+  let later = tokio::spawn(async move {
+    later_producer
+      .produce(ProducerRecord::new(
+        "telemetry".into(),
+        b"time-flush-key".to_vec(),
+        vec![3].into(),
+        102,
+      ))
+      .await
+  });
+  tokio::task::yield_now().await;
+
+  tokio::time::advance(Duration::from_millis(5)).await;
+  tokio::task::yield_now().await;
+  assert!(
+    !later.is_finished(),
+    "max-size flush should reset the maximum-delay timer"
+  );
+
+  tokio::time::advance(Duration::from_millis(5)).await;
+  later.await.unwrap().unwrap();
+
+  let metrics = String::from_utf8(collector.prometheus_output()).unwrap();
+  assert!(
+    metrics.contains("blob_stream_producer_test:producer:flushes_max_size 1"),
+    "{metrics}"
+  );
+  assert!(
+    metrics.contains("blob_stream_producer_test:producer:flushes_max_delay 1"),
+    "{metrics}"
+  );
+  assert_eq!(transport.sent.lock().await.len(), 2);
 }
 
 #[test]

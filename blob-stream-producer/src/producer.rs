@@ -27,7 +27,6 @@ use crate::config::{
 use anyhow::{Result, anyhow, bail, ensure};
 use async_trait::async_trait;
 use bd_server_stats::stats::Scope;
-use bd_time::TimeDurationExt;
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership};
 use blob_stream_proto::protos::blobstream::v1::broker::Record;
 use blob_stream_types::{
@@ -57,14 +56,16 @@ use routing::{ProducerRoutes, group_batches_by_broker, record_fits_grouped_reque
 use state::{BufferedRecord, ProducerState};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use thiserror::Error;
-use time::Duration;
 use tokio::sync::{Notify, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, timeout};
 pub use transport::{BrokerTransport, GrpcBrokerTransport};
 
 // TODO(mattklein123): Consider adding disk buffering of segments.
+
+const INITIAL_MEMBERSHIP_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
 //
 // ProducerRecord
@@ -220,8 +221,13 @@ impl ProducerClientImpl {
       "at least one topic must be configured"
     );
 
-    let membership_rx = discovery.watch_membership().await?;
-    let initial_membership = membership_rx.borrow().clone();
+    let mut membership_rx = discovery.watch_membership().await?;
+    let initial_membership = timeout(
+      INITIAL_MEMBERSHIP_TIMEOUT,
+      wait_for_initialized_membership(&mut membership_rx),
+    )
+    .await
+    .map_err(|_| anyhow!("producer initial broker membership timed out after 10 seconds"))??;
     transport.reconcile_membership(&initial_membership);
     let routes = ProducerRoutes::new(&config, &topic_map, &initial_membership);
     let state = Arc::new(Mutex::new(ProducerState::default()));
@@ -291,9 +297,9 @@ impl ProducerClientImpl {
     tokio::spawn(async move {
       // Dispatches share this read-only receiver while the loop keeps its receiver for updates.
       let dispatch_membership_rx = membership_rx.clone();
-      let flush_cadence =
-        Duration::milliseconds(producer_flush_max_delay_ms(&config).try_into().unwrap());
-      let mut ticker = flush_cadence.interval_at(MissedTickBehavior::Delay);
+      let flush_delay = StdDuration::from_millis(producer_flush_max_delay_ms(&config));
+      let flush_sleep = tokio::time::sleep(flush_delay);
+      tokio::pin!(flush_sleep);
       // Keep dispatches owned by the flush task so producer shutdown cancels queued permit waits,
       // RPCs, and retries. Their completions still need polling to advance semaphore waiters, but
       // must not define a new batching boundary.
@@ -301,7 +307,7 @@ impl ProducerClientImpl {
       let mut membership_closed = false;
 
       loop {
-        let flush_requested = tokio::select! {
+        let flush_triggered_by_size = tokio::select! {
           changed = membership_rx.changed(), if !membership_closed => {
             if changed.is_ok() {
               let membership = membership_rx.borrow_and_update().clone();
@@ -311,20 +317,24 @@ impl ProducerClientImpl {
               membership_closed = true;
             }
             // Membership affects the next route selection, not when buffered work is sent.
-            false
+            None
           },
-          _ = ticker.tick() => true,
-          () = flush_notify.notified() => true,
+          () = &mut flush_sleep => Some(false),
+          () = flush_notify.notified() => Some(true),
           Some(_) = dispatches.next(), if !dispatches.is_empty() => {
             // Polling this completion lets another dispatch acquire a released permit. Its
             // waiters have already been notified, and it must not flush partial new batches.
-            false
+            None
           },
         };
 
-        if !flush_requested {
+        let Some(flush_triggered_by_size) = flush_triggered_by_size else {
           continue;
-        }
+        };
+
+        // Each trigger-driven drain starts a new maximum-delay window for subsequent partial
+        // batches.
+        flush_sleep.as_mut().reset(Instant::now() + flush_delay);
 
         // Only this task owns batches after they leave shared state. A caller dropping its
         // `produce` future cannot cancel dispatch, and all batches present at this wake can pack
@@ -335,6 +345,11 @@ impl ProducerClientImpl {
         };
 
         if !batches.is_empty() {
+          if flush_triggered_by_size {
+            metrics.flushes_max_size.inc();
+          } else {
+            metrics.flushes_max_delay.inc();
+          }
           trace!("producer flush loop drained {} batch(es)", batches.len());
         }
 
@@ -357,6 +372,23 @@ impl ProducerClientImpl {
         }
       }
     })
+  }
+}
+
+async fn wait_for_initialized_membership(
+  membership_rx: &mut watch::Receiver<BrokerMembership>,
+) -> Result<BrokerMembership> {
+  loop {
+    // Pending is not an authoritative empty membership, so routes must not be created from it.
+    let membership = membership_rx.borrow_and_update().clone();
+    if matches!(membership, BrokerMembership::Initialized(_)) {
+      return Ok(membership);
+    }
+
+    membership_rx
+      .changed()
+      .await
+      .map_err(|_| anyhow!("broker discovery closed before initial membership was available"))?;
   }
 }
 
