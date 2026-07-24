@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
-use crate::write::{MemoryPressureAdmissionController, TopicInfo, WriteConfig, WriteEngineImpl};
+use crate::write::{TopicInfo, WriteConfig, WriteEngineBuilder, WriteEngineImpl};
 use anyhow::Result;
 use async_trait::async_trait;
 use bd_server_stats::stats::Collector;
@@ -349,8 +349,8 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
   ));
   let flush_notifier = Arc::new(tokio::sync::Notify::new());
   let metrics = super::super::super::metrics::WriteMetrics::new(&metrics_scope());
-  let lifecycle_hooks: Arc<dyn super::super::super::BrokerLifecycleHooks> =
-    Arc::new(super::super::super::NoopBrokerLifecycleHooks);
+  let lifecycle_hooks: Option<Arc<dyn super::super::super::BrokerLifecycleHooks>> =
+    Some(Arc::new(super::super::super::NoopBrokerLifecycleHooks));
   let releases = WriteEngineImpl::release_partition_leases(
     &lease_store,
     &state,
@@ -359,7 +359,7 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
     "node-a",
     vec![("telemetry".into(), 0), ("telemetry".into(), 1)],
     1_000,
-    &lifecycle_hooks,
+    lifecycle_hooks.as_ref(),
   );
   tokio::pin!(releases);
 
@@ -399,23 +399,19 @@ async fn lease_assignment_waits_for_initialized_self_membership() -> Result<()> 
   let (membership_tx, membership_rx) = watch::channel(BrokerMembership::default());
   let shutdown_trigger = ComponentShutdownTrigger::default();
 
-  let _engine = WriteEngineImpl::new(
+  let _engine = WriteEngineBuilder::new(
     config,
     topics,
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
     lease_store.clone(),
     "node-a".to_string(),
-    None,
-    Some(membership_rx),
-    Arc::new(MemoryPressureAdmissionController::new(
-      &shutdown_trigger.make_handle(),
-      &metrics_scope().scope("write"),
-    )),
     shutdown_trigger.make_handle(),
-    time_provider,
     &metrics_scope(),
-  )?;
+  )
+  .membership_rx(membership_rx)
+  .time_provider(time_provider)
+  .build()?;
 
   tokio::time::sleep(StdDuration::from_millis(50)).await;
   assert!(!all_partitions_held_by(&lease_store, "node-a", partition_count, now_ts_ms).await);
@@ -458,23 +454,19 @@ async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Resul
   }]));
   let shutdown_trigger = ComponentShutdownTrigger::default();
 
-  let _engine = WriteEngineImpl::new(
+  let _engine = WriteEngineBuilder::new(
     config,
     topics,
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
     lease_store.clone(),
     "node-a".to_string(),
-    None,
-    Some(membership_rx),
-    Arc::new(MemoryPressureAdmissionController::new(
-      &shutdown_trigger.make_handle(),
-      &metrics_scope().scope("write"),
-    )),
     shutdown_trigger.make_handle(),
-    time_provider,
     &metrics_scope(),
-  )?;
+  )
+  .membership_rx(membership_rx)
+  .time_provider(time_provider)
+  .build()?;
 
   assert!(
     wait_for_all_partitions(|| {
@@ -525,23 +517,19 @@ async fn scale_down_releases_previously_owned_leases() -> Result<()> {
   }]));
   let shutdown_trigger = ComponentShutdownTrigger::default();
 
-  let _engine = WriteEngineImpl::new(
+  let _engine = WriteEngineBuilder::new(
     config,
     topics,
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
     lease_store.clone(),
     "node-a".to_string(),
-    None,
-    Some(membership_rx),
-    Arc::new(MemoryPressureAdmissionController::new(
-      &shutdown_trigger.make_handle(),
-      &metrics_scope().scope("write"),
-    )),
     shutdown_trigger.make_handle(),
-    time_provider,
     &metrics_scope(),
-  )?;
+  )
+  .membership_rx(membership_rx)
+  .time_provider(time_provider)
+  .build()?;
 
   acquire_all_partitions(&lease_store, "node-a", partition_count).await;
   tokio::time::sleep(StdDuration::from_millis(50)).await;
@@ -580,23 +568,19 @@ async fn shutdown_releases_currently_owned_leases() -> Result<()> {
   }]));
   let shutdown_trigger = ComponentShutdownTrigger::default();
 
-  let _engine = WriteEngineImpl::new(
+  let _engine = WriteEngineBuilder::new(
     config,
     topics,
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
     lease_store.clone(),
     "node-a".to_string(),
-    None,
-    Some(membership_rx),
-    Arc::new(MemoryPressureAdmissionController::new(
-      &shutdown_trigger.make_handle(),
-      &metrics_scope().scope("write"),
-    )),
     shutdown_trigger.make_handle(),
-    time_provider,
     &metrics_scope(),
-  )?;
+  )
+  .membership_rx(membership_rx)
+  .time_provider(time_provider)
+  .build()?;
 
   acquire_all_partitions(&lease_store, "node-a", partition_count).await;
 

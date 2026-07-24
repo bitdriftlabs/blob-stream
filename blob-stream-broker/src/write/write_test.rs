@@ -7,11 +7,10 @@ use super::allocation::{
 };
 use super::state::WriteState;
 use super::{
-  AdmissionController,
-  MemoryPressureAdmissionController,
   TopicInfo,
   WriteConfig,
   WriteEngine,
+  WriteEngineBuilder,
   WriteEngineImpl,
   WriteRequest,
 };
@@ -249,16 +248,6 @@ fn metrics_scope() -> bd_server_stats::stats::Scope {
   Collector::default().scope("blob_stream_broker_test")
 }
 
-fn default_admission(
-  shutdown_trigger_handle: &bd_shutdown::ComponentShutdownTriggerHandle,
-  metrics_scope: &Scope,
-) -> Arc<dyn AdmissionController> {
-  Arc::new(MemoryPressureAdmissionController::new(
-    shutdown_trigger_handle,
-    &metrics_scope.scope("write"),
-  ))
-}
-
 #[test]
 fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
   let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
@@ -436,20 +425,18 @@ fn make_two_partition_engine(
   );
 
   let metadata_store = Arc::new(InMemoryMetadataStore::new());
-  let engine = WriteEngineImpl::new(
+  let engine = WriteEngineBuilder::new(
     config,
     topics,
     Arc::new(InMemoryBlobStore::new()),
     metadata_store.clone(),
     Arc::new(InMemoryProducerPartitionLeaseStore::new()),
     "test-node".to_string(),
-    None,
-    None,
-    default_admission(&shutdown_trigger_handle, &metrics_scope()),
     shutdown_trigger_handle,
-    time_provider,
     &metrics_scope(),
-  )?;
+  )
+  .time_provider(time_provider)
+  .build()?;
 
   Ok((Arc::new(engine), metadata_store))
 }
@@ -493,20 +480,18 @@ fn make_engine_with_lease_store_and_scope(
   let metadata_store = Arc::new(InMemoryMetadataStore::new());
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
 
-  let engine = WriteEngineImpl::new(
+  let engine = WriteEngineBuilder::new(
     config,
     topics,
     blob_store,
     metadata_store.clone(),
     lease_store.clone(),
     "test-node".to_string(),
-    None,
-    None,
-    default_admission(&shutdown_trigger_handle, metrics_scope),
     shutdown_trigger_handle,
-    time_provider,
     metrics_scope,
-  )?;
+  )
+  .time_provider(time_provider)
+  .build()?;
 
   Ok((Arc::new(engine), metadata_store, lease_store))
 }
@@ -821,29 +806,29 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
     release_first: Arc::clone(&release_first),
     first_reservation: AtomicBool::new(true),
   });
-  let engine = Arc::new(WriteEngineImpl::new(
-    config,
-    HashMap::from([(
-      "telemetry".into(),
-      TopicInfo {
-        name: "telemetry".into(),
-        partition_count: 1,
-        num_writers: 1,
-        retention_days: 7,
-        max_metadata_publication_lag_ms: 30_000,
-      },
-    )]),
-    Arc::new(InMemoryBlobStore::new()),
-    Arc::new(InMemoryMetadataStore::new()),
-    lease_store,
-    "test-node".to_string(),
-    None,
-    None,
-    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
-    shutdown_trigger.make_handle(),
-    time_provider,
-    &metrics_scope(),
-  )?);
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config,
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention_days: 7,
+          max_metadata_publication_lag_ms: 30_000,
+        },
+      )]),
+      Arc::new(InMemoryBlobStore::new()),
+      Arc::new(InMemoryMetadataStore::new()),
+      lease_store,
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider)
+    .build()?,
+  );
 
   let first_engine = Arc::clone(&engine);
   let first = tokio::spawn(async move {
@@ -898,29 +883,29 @@ async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
     release_first: Arc::new(Semaphore::new(0)),
     first_reservation: AtomicBool::new(true),
   });
-  let engine = Arc::new(WriteEngineImpl::new(
-    config,
-    HashMap::from([(
-      "telemetry".into(),
-      TopicInfo {
-        name: "telemetry".into(),
-        partition_count: 1,
-        num_writers: 1,
-        retention_days: 7,
-        max_metadata_publication_lag_ms: 30_000,
-      },
-    )]),
-    Arc::new(InMemoryBlobStore::new()),
-    Arc::new(InMemoryMetadataStore::new()),
-    lease_store,
-    "test-node".to_string(),
-    None,
-    None,
-    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
-    shutdown_trigger.make_handle(),
-    time_provider,
-    &metrics_scope(),
-  )?);
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config,
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention_days: 7,
+          max_metadata_publication_lag_ms: 30_000,
+        },
+      )]),
+      Arc::new(InMemoryBlobStore::new()),
+      Arc::new(InMemoryMetadataStore::new()),
+      lease_store,
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider)
+    .build()?,
+  );
 
   let first_engine = Arc::clone(&engine);
   let first = tokio::spawn(async move {
@@ -1421,32 +1406,32 @@ async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
 
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release = Arc::new(Semaphore::new(0));
-  let engine = Arc::new(WriteEngineImpl::new(
-    config,
-    HashMap::from([(
-      "telemetry".into(),
-      TopicInfo {
-        name: "telemetry".into(),
-        partition_count: 1,
-        num_writers: 1,
-        retention_days: 7,
-        max_metadata_publication_lag_ms: 1,
-      },
-    )]),
-    Arc::new(BlockingBlobStore {
-      entered_tx,
-      release,
-    }),
-    Arc::new(InMemoryMetadataStore::new()),
-    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
-    "test-node".to_string(),
-    None,
-    None,
-    default_admission(&shutdown_trigger.make_handle(), &scope),
-    shutdown_trigger.make_handle(),
-    time_provider,
-    &scope,
-  )?);
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config,
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention_days: 7,
+          max_metadata_publication_lag_ms: 1,
+        },
+      )]),
+      Arc::new(BlockingBlobStore {
+        entered_tx,
+        release,
+      }),
+      Arc::new(InMemoryMetadataStore::new()),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &scope,
+    )
+    .time_provider(time_provider)
+    .build()?,
+  );
 
   let pending = tokio::spawn(async move {
     engine
@@ -1501,24 +1486,24 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
 
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release_first = Arc::new(Semaphore::new(0));
-  let engine = Arc::new(WriteEngineImpl::new(
-    config.clone(),
-    topics,
-    Arc::new(GatedBlobStore {
-      entered_tx,
-      release_first: Arc::clone(&release_first),
-      first_write: AtomicBool::new(true),
-    }),
-    Arc::new(InMemoryMetadataStore::new()),
-    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
-    "test-node".to_string(),
-    None,
-    None,
-    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
-    shutdown_trigger.make_handle(),
-    time_provider.clone(),
-    &metrics_scope(),
-  )?);
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config.clone(),
+      topics,
+      Arc::new(GatedBlobStore {
+        entered_tx,
+        release_first: Arc::clone(&release_first),
+        first_write: AtomicBool::new(true),
+      }),
+      Arc::new(InMemoryMetadataStore::new()),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider.clone())
+    .build()?,
+  );
 
   let first_engine = Arc::clone(&engine);
   let first = tokio::spawn(async move {
@@ -1581,33 +1566,33 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release_first = Arc::new(Semaphore::new(0));
   let metadata_store = Arc::new(InMemoryMetadataStore::new());
-  let engine = Arc::new(WriteEngineImpl::new(
-    config.clone(),
-    HashMap::from([(
-      "telemetry".into(),
-      TopicInfo {
-        name: "telemetry".into(),
-        partition_count: 1,
-        num_writers: 1,
-        retention_days: 7,
-        max_metadata_publication_lag_ms: 30_000,
-      },
-    )]),
-    Arc::new(GatedBlobStore {
-      entered_tx,
-      release_first: Arc::clone(&release_first),
-      first_write: AtomicBool::new(true),
-    }),
-    metadata_store.clone(),
-    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
-    "test-node".to_string(),
-    None,
-    None,
-    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
-    shutdown_trigger.make_handle(),
-    time_provider.clone(),
-    &metrics_scope(),
-  )?);
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config.clone(),
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention_days: 7,
+          max_metadata_publication_lag_ms: 30_000,
+        },
+      )]),
+      Arc::new(GatedBlobStore {
+        entered_tx,
+        release_first: Arc::clone(&release_first),
+        first_write: AtomicBool::new(true),
+      }),
+      metadata_store.clone(),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider.clone())
+    .build()?,
+  );
 
   let first_engine = Arc::clone(&engine);
   let first = tokio::spawn(async move {
@@ -1680,32 +1665,33 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   let release = Arc::new(Semaphore::new(0));
   let metadata_store = Arc::new(InMemoryMetadataStore::new());
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
-  let engine = Arc::new(WriteEngineImpl::new(
-    config,
-    HashMap::from([(
-      "telemetry".into(),
-      TopicInfo {
-        name: "telemetry".into(),
-        partition_count: 1,
-        num_writers: 1,
-        retention_days: 7,
-        max_metadata_publication_lag_ms: 30_000,
-      },
-    )]),
-    Arc::new(BlockingBlobStore {
-      entered_tx,
-      release: Arc::clone(&release),
-    }),
-    metadata_store.clone(),
-    lease_store.clone(),
-    "node-a".to_string(),
-    None,
-    Some(membership_rx),
-    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
-    shutdown_trigger.make_handle(),
-    time_provider.clone(),
-    &metrics_scope(),
-  )?);
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config,
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention_days: 7,
+          max_metadata_publication_lag_ms: 30_000,
+        },
+      )]),
+      Arc::new(BlockingBlobStore {
+        entered_tx,
+        release: Arc::clone(&release),
+      }),
+      metadata_store.clone(),
+      lease_store.clone(),
+      "node-a".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .membership_rx(membership_rx)
+    .time_provider(time_provider.clone())
+    .build()?,
+  );
 
   let first_engine = Arc::clone(&engine);
   let first = tokio::spawn(async move {
@@ -1815,32 +1801,33 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
   let release = Arc::new(Semaphore::new(0));
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
   let shutdown_trigger = ComponentShutdownTrigger::default();
-  let engine = Arc::new(WriteEngineImpl::new(
-    config,
-    HashMap::from([(
-      "telemetry".into(),
-      TopicInfo {
-        name: "telemetry".into(),
-        partition_count: 1,
-        num_writers: 1,
-        retention_days: 7,
-        max_metadata_publication_lag_ms: 30_000,
-      },
-    )]),
-    Arc::new(BlockingBlobStore {
-      entered_tx,
-      release: Arc::clone(&release),
-    }),
-    Arc::new(InMemoryMetadataStore::new()),
-    lease_store.clone(),
-    "node-a".to_string(),
-    None,
-    Some(membership_rx),
-    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
-    shutdown_trigger.make_handle(),
-    time_provider,
-    &metrics_scope(),
-  )?);
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config,
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention_days: 7,
+          max_metadata_publication_lag_ms: 30_000,
+        },
+      )]),
+      Arc::new(BlockingBlobStore {
+        entered_tx,
+        release: Arc::clone(&release),
+      }),
+      Arc::new(InMemoryMetadataStore::new()),
+      lease_store.clone(),
+      "node-a".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .membership_rx(membership_rx)
+    .time_provider(time_provider)
+    .build()?,
+  );
 
   let produce_engine = Arc::clone(&engine);
   let produce = tokio::spawn(async move {
@@ -1907,24 +1894,24 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
 
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release_first = Arc::new(Semaphore::new(0));
-  let engine = Arc::new(WriteEngineImpl::new(
-    config.clone(),
-    topics,
-    Arc::new(GatedBlobStore {
-      entered_tx,
-      release_first: Arc::clone(&release_first),
-      first_write: AtomicBool::new(true),
-    }),
-    Arc::new(InMemoryMetadataStore::new()),
-    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
-    "test-node".to_string(),
-    None,
-    None,
-    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
-    shutdown_trigger.make_handle(),
-    time_provider.clone(),
-    &metrics_scope(),
-  )?);
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config.clone(),
+      topics,
+      Arc::new(GatedBlobStore {
+        entered_tx,
+        release_first: Arc::clone(&release_first),
+        first_write: AtomicBool::new(true),
+      }),
+      Arc::new(InMemoryMetadataStore::new()),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider.clone())
+    .build()?,
+  );
 
   let first_engine = Arc::clone(&engine);
   let first = tokio::spawn(async move {
@@ -1989,23 +1976,23 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
     .collect();
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release = Arc::new(Semaphore::new(0));
-  let engine = Arc::new(WriteEngineImpl::new(
-    config.clone(),
-    topics,
-    Arc::new(BlockingBlobStore {
-      entered_tx,
-      release: Arc::clone(&release),
-    }),
-    Arc::new(InMemoryMetadataStore::new()),
-    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
-    "test-node".to_string(),
-    None,
-    None,
-    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
-    shutdown_trigger.make_handle(),
-    time_provider.clone(),
-    &metrics_scope(),
-  )?);
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config.clone(),
+      topics,
+      Arc::new(BlockingBlobStore {
+        entered_tx,
+        release: Arc::clone(&release),
+      }),
+      Arc::new(InMemoryMetadataStore::new()),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider.clone())
+    .build()?,
+  );
 
   let mut writes = Vec::new();
   for index in 0 .. 5 {
@@ -2089,23 +2076,23 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
     );
   }
 
-  let engine = Arc::new(WriteEngineImpl::new(
-    config.clone(),
-    topics,
-    Arc::new(InMemoryBlobStore::new()),
-    Arc::new(FailsTopicMetadataStore {
-      failed_topic: "second".to_string(),
-      inner: Arc::new(InMemoryMetadataStore::new()),
-    }),
-    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
-    "test-node".to_string(),
-    None,
-    None,
-    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
-    shutdown_trigger.make_handle(),
-    time_provider.clone(),
-    &metrics_scope(),
-  )?);
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config.clone(),
+      topics,
+      Arc::new(InMemoryBlobStore::new()),
+      Arc::new(FailsTopicMetadataStore {
+        failed_topic: "second".to_string(),
+        inner: Arc::new(InMemoryMetadataStore::new()),
+      }),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider.clone())
+    .build()?,
+  );
 
   let first_engine = Arc::clone(&engine);
   let first = tokio::spawn(async move {
@@ -2248,20 +2235,18 @@ async fn returns_error_when_flush_fails() -> Result<()> {
   config.flush_max_bytes = 1;
   config.flush_max_delay_ms = 60_000;
 
-  let engine = WriteEngineImpl::new(
+  let engine = WriteEngineBuilder::new(
     config,
     topics,
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(FailingMetadataStore),
     Arc::new(InMemoryProducerPartitionLeaseStore::new()),
     "test-node".to_string(),
-    None,
-    None,
-    default_admission(&shutdown_trigger.make_handle(), &metrics_scope()),
     shutdown_trigger.make_handle(),
-    time_provider,
     &metrics_scope(),
-  )?;
+  )
+  .time_provider(time_provider)
+  .build()?;
 
   let request = WriteRequest {
     topic: "telemetry".into(),

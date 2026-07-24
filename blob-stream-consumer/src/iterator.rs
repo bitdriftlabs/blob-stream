@@ -414,6 +414,7 @@ struct ConsumerDriver {
   shared_state: Arc<Mutex<ConsumerSharedState>>,
   delivery_notify: Arc<Notify>,
   prefetch_space_notify: Arc<Notify>,
+  reader_command_notify: Arc<Notify>,
   prefetch_shutdown: Arc<AtomicBool>,
   prefetch_task: Option<JoinHandle<()>>,
   prefetch_idle_base_delay_ms: u64,
@@ -426,7 +427,7 @@ struct ConsumerDriver {
   pending_revocation_snapshot: Option<ConsumerStateSnapshot>,
   pending_revocation_span: Option<Span>,
   revocation_notify: Arc<Notify>,
-  lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>,
+  lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
   time_provider: Arc<dyn TimeProvider>,
   membership_lease_expires_at_ms: i64,
   next_heartbeat_at_ms: i64,
@@ -492,7 +493,7 @@ pub struct ConsumerIteratorBuilder<'a> {
   maximum_metadata_publication_lag_ms: u64,
   feature_flags: Option<FeatureFlagsWatch>,
   time_provider: Arc<dyn TimeProvider>,
-  lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>,
+  lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
 }
 
 impl<'a> ConsumerIteratorBuilder<'a> {
@@ -521,7 +522,7 @@ impl<'a> ConsumerIteratorBuilder<'a> {
       maximum_metadata_publication_lag_ms,
       feature_flags,
       time_provider: Arc::new(SystemTimeProvider),
-      lifecycle_hooks: Arc::new(NoopConsumerLifecycleHooks),
+      lifecycle_hooks: None,
     }
   }
 
@@ -533,7 +534,7 @@ impl<'a> ConsumerIteratorBuilder<'a> {
 
   #[must_use]
   pub fn lifecycle_hooks(mut self, lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>) -> Self {
-    self.lifecycle_hooks = lifecycle_hooks;
+    self.lifecycle_hooks = Some(lifecycle_hooks);
     self
   }
 }
@@ -665,6 +666,7 @@ impl ConsumerIteratorBuilder<'_> {
     let membership_lease_duration_ms = consumer_lease_duration_ms(&group_config);
     let delivery_notify = Arc::new(Notify::new());
     let prefetch_space_notify = Arc::new(Notify::new());
+    let reader_command_notify = Arc::new(Notify::new());
     let revocation_notify = Arc::new(Notify::new());
     let prefetch_shutdown = Arc::new(AtomicBool::new(false));
     let diagnostics = ConsumerDiagnostics::new(
@@ -691,6 +693,7 @@ impl ConsumerIteratorBuilder<'_> {
       shared_state: Arc::clone(&shared_state),
       delivery_notify: Arc::clone(&delivery_notify),
       prefetch_space_notify: Arc::clone(&prefetch_space_notify),
+      reader_command_notify: Arc::clone(&reader_command_notify),
       prefetch_shutdown,
       prefetch_task: None,
       prefetch_idle_base_delay_ms: idle_poll_delay_ms,
@@ -869,7 +872,9 @@ impl ConsumerDriver {
         recovered_cursors,
         now_unix_seconds,
       })
-      .map_err(|_| anyhow!("consumer reader worker stopped"))
+      .map_err(|_| anyhow!("consumer reader worker stopped"))?;
+    self.reader_command_notify.notify_one();
+    Ok(())
   }
 
   fn set_reader_assignment(
@@ -903,7 +908,9 @@ impl ConsumerDriver {
         handoff_phase,
         release_delivery_fence,
       })
-      .map_err(|_| anyhow!("consumer reader worker stopped"))
+      .map_err(|_| anyhow!("consumer reader worker stopped"))?;
+    self.reader_command_notify.notify_one();
+    Ok(())
   }
 
   fn seek_reader(
@@ -935,6 +942,8 @@ impl ConsumerDriver {
         unreachable!("only seek commands are sent through this path");
       };
       let _ = response.send(Err(anyhow!("consumer reader worker stopped")));
+    } else {
+      self.reader_command_notify.notify_one();
     }
   }
 
@@ -1122,14 +1131,15 @@ impl ConsumerDriver {
     self.pending_revocation_partitions = Some(fenced.clone());
     self.refresh_diagnostics();
     self.delivery_notify.notify_waiters();
-    self
-      .lifecycle_hooks
-      .revocation_emitted(
-        &self.group_config.member_id,
-        self.coordinator.generation(),
-        &fenced,
-      )
-      .await;
+    if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+      lifecycle_hooks
+        .revocation_emitted(
+          &self.group_config.member_id,
+          self.coordinator.generation(),
+          &fenced,
+        )
+        .await;
+    }
     info!(
       "consumer active partitions fenced after membership heartbeat failure: topic={}, \
        group_id={}, member_id={}, generation={}, fenced={fenced:?}",
@@ -1248,6 +1258,15 @@ impl ConsumerDriver {
         self.pending_revocation_completion = None;
         match self.apply_assignment_after_revocation(&assignment) {
           Ok(()) => {
+            if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+              lifecycle_hooks
+                .rebalance_applied(
+                  &self.group_config.member_id,
+                  self.coordinator.generation(),
+                  &assignment,
+                )
+                .await;
+            }
             handoff_span.record("handoff.assignment_outcome", "succeeded");
             handoff_span.record("otel.status_code", "OK");
             Ok(true)
@@ -1269,10 +1288,11 @@ impl ConsumerDriver {
       return Ok(());
     }
 
-    self
-      .lifecycle_hooks
-      .before_rebalance(&self.group_config.member_id, self.coordinator.generation())
-      .await;
+    if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+      lifecycle_hooks
+        .before_rebalance(&self.group_config.member_id, self.coordinator.generation())
+        .await;
+    }
     let snapshot = self.coordination_source.snapshot().await?;
     self.record_coordination_snapshot(&snapshot);
     self.metrics.rebalances_total.inc();
@@ -1315,14 +1335,15 @@ impl ConsumerDriver {
 
     if revoked.is_empty() {
       self.apply_assignment_with_active_set(&next_assignment, next_assignment_set, false)?;
-      self
-        .lifecycle_hooks
-        .rebalance_applied(
-          &self.group_config.member_id,
-          self.coordinator.generation(),
-          &next_assignment,
-        )
-        .await;
+      if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+        lifecycle_hooks
+          .rebalance_applied(
+            &self.group_config.member_id,
+            self.coordinator.generation(),
+            &next_assignment,
+          )
+          .await;
+      }
       return Ok(());
     }
 
@@ -1375,14 +1396,15 @@ impl ConsumerDriver {
     self.pending_revocation_snapshot = Some(handoff_snapshot);
     self.pending_revocation_span = Some(handoff_span);
     self.delivery_notify.notify_waiters();
-    self
-      .lifecycle_hooks
-      .revocation_emitted(
-        &self.group_config.member_id,
-        self.coordinator.generation(),
-        &revoked,
-      )
-      .await;
+    if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+      lifecycle_hooks
+        .revocation_emitted(
+          &self.group_config.member_id,
+          self.coordinator.generation(),
+          &revoked,
+        )
+        .await;
+    }
 
     info!(
       "consumer revocation requested: topic={}, group_id={}, member_id={}, revoked={:?}",
@@ -1408,13 +1430,14 @@ impl ConsumerDriver {
     let shared_state = Arc::clone(&self.shared_state);
     let delivery_notify = Arc::clone(&self.delivery_notify);
     let space_notify = Arc::clone(&self.prefetch_space_notify);
+    let reader_command_notify = Arc::clone(&self.reader_command_notify);
     let shutdown = Arc::clone(&self.prefetch_shutdown);
     let metrics = self.metrics.clone();
     let diagnostics = self.diagnostics.clone();
     let base_idle_delay_ms = self.prefetch_idle_base_delay_ms;
     let max_idle_delay_ms = self.prefetch_idle_max_delay_ms;
     let time_provider = Arc::clone(&self.time_provider);
-    let lifecycle_hooks = Arc::clone(&self.lifecycle_hooks);
+    let lifecycle_hooks = self.lifecycle_hooks.clone();
     let member_id = self.group_config.member_id.to_string();
 
     self.prefetch_task = Some(tokio::spawn(async move {
@@ -1425,6 +1448,7 @@ impl ConsumerDriver {
         diagnostics,
         delivery_notify,
         space_notify,
+        reader_command_notify,
         shutdown,
         metrics,
         base_idle_delay_ms,
@@ -1846,10 +1870,11 @@ impl ConsumerDriver {
         .filter(|state| state.pending_commit.is_some())
         .count()
     );
-    self
-      .lifecycle_hooks
-      .before_commit(&self.group_config.member_id, self.coordinator.generation())
-      .await;
+    if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+      lifecycle_hooks
+        .before_commit(&self.group_config.member_id, self.coordinator.generation())
+        .await;
+    }
     self
       .heartbeat(self.now_unix_millis(), HeartbeatTrigger::Commit)
       .await
@@ -1874,10 +1899,11 @@ impl ConsumerDriver {
         otel.status_code = field::Empty,
       );
       let commit_result = self.commit().await;
-      self
-        .lifecycle_hooks
-        .shutdown_commit_finished(&self.group_config.member_id, self.coordinator.generation())
-        .await;
+      if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+        lifecycle_hooks
+          .shutdown_commit_finished(&self.group_config.member_id, self.coordinator.generation())
+          .await;
+      }
       self.refresh_diagnostics();
       let mut handoff_partitions = self.coordinator.owned_partitions();
       handoff_partitions.extend(self.active_assignment.iter().copied());
@@ -1896,10 +1922,11 @@ impl ConsumerDriver {
         },
         &shutdown_span,
       );
-      self
-        .lifecycle_hooks
-        .before_release_owned(&self.group_config.member_id, self.coordinator.generation())
-        .await;
+      if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+        lifecycle_hooks
+          .before_release_owned(&self.group_config.member_id, self.coordinator.generation())
+          .await;
+      }
       let release_result = self.coordinator.release_owned(self.now_unix_millis()).await;
       match &release_result {
         Ok(released_partitions) => {
@@ -1950,10 +1977,11 @@ impl ConsumerDriver {
           &shutdown_span,
         ),
       }
-      self
-        .lifecycle_hooks
-        .before_deregister_member(&self.group_config.member_id, self.coordinator.generation())
-        .await;
+      if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+        lifecycle_hooks
+          .before_deregister_member(&self.group_config.member_id, self.coordinator.generation())
+          .await;
+      }
       let deregistration_result = self
         .membership_store
         .deregister_member(

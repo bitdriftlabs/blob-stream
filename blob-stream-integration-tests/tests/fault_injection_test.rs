@@ -112,7 +112,7 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter retry backoff after transport drop"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "transport-drop retry backoff was not registered"
   );
   let first_ack = timeout(Duration::from_secs(5), &mut first_produce)
@@ -558,7 +558,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter backoff after partition faults"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "partition-fault retry backoff was not registered"
   );
   let first_ack = timeout(Duration::from_secs(5), &mut first_produce)
@@ -603,7 +603,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
       result = &mut first_post_produce => result,
       () = retry_clock.wait_until_sleeping() => {
         assert!(
-          retry_clock.advance_to_next_sleep().await,
+          retry_clock.advance_to_next_sleep(),
           "membership-settlement retry was not registered"
         );
         (&mut first_post_produce).await
@@ -740,7 +740,7 @@ async fn producer_retry_deadline_respected_after_transport_failures() -> Result<
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter its first retry backoff"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "first retry backoff was not registered"
   );
 
@@ -755,7 +755,7 @@ async fn producer_retry_deadline_respected_after_transport_failures() -> Result<
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter its second retry backoff"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "second retry backoff was not registered"
   );
 
@@ -892,7 +892,7 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
       .await
       .map_err(|_| anyhow::anyhow!("producer did not enter blob-put retry {retry_number}"))?;
     assert!(
-      retry_clock.advance_to_next_sleep().await,
+      retry_clock.advance_to_next_sleep(),
       "blob-put retry {retry_number} was not registered"
     );
   }
@@ -1135,7 +1135,7 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter its first metadata retry backoff"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "first metadata retry backoff was not registered"
   );
 
@@ -1150,7 +1150,7 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter its second metadata retry backoff"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "second metadata retry backoff was not registered"
   );
 
@@ -2092,7 +2092,7 @@ async fn combined_network_and_metadata_faults_preserve_producer_publication() ->
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter combined-fault retry backoff"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "combined-fault retry backoff was not registered"
   );
   let first_ack = timeout(Duration::from_secs(5), &mut first_produce)
@@ -2247,7 +2247,7 @@ async fn run_scripted_transport_fault_scenario() -> Result<Fit012Outcome> {
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter its first scripted retry backoff"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "first scripted retry backoff was not registered"
   );
 

@@ -6,14 +6,14 @@ use super::super::{
   AdmissionController,
   BrokerLifecycleHooks,
   MAX_IN_FLIGHT_FLUSH_PLANS,
-  NoopBrokerLifecycleHooks,
   TopicInfo,
   WriteConfig,
 };
+use super::MemoryPressureAdmissionController;
 use anyhow::Result;
 use bd_server_stats::stats::Scope;
 use bd_shutdown::ComponentShutdownTriggerHandle;
-use bd_time::{OffsetDateTimeExt, TimeProvider};
+use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::BlobStore;
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{MetadataStore, ProducerPartitionLeaseStore};
@@ -42,10 +42,31 @@ pub struct WriteEngineImpl {
   pub(in crate::write) state: Arc<Mutex<WriteState>>,
   pub(in crate::write) flush_notifier: Arc<Notify>,
   pub(in crate::write) shutdown_trigger_handle: ComponentShutdownTriggerHandle,
-  pub(in crate::write) lifecycle_hooks: Arc<dyn BrokerLifecycleHooks>,
+  pub(in crate::write) lifecycle_hooks: Option<Arc<dyn BrokerLifecycleHooks>>,
 }
 
-impl WriteEngineImpl {
+//
+// WriteEngineBuilder
+//
+
+/// Configures a write engine and its optional runtime and test dependencies.
+pub struct WriteEngineBuilder<'a> {
+  config: WriteConfig,
+  topics: HashMap<Chars, TopicInfo>,
+  blob_store: Arc<dyn BlobStore>,
+  metadata_store: Arc<dyn MetadataStore>,
+  lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+  holder_id: String,
+  shutdown_trigger_handle: ComponentShutdownTriggerHandle,
+  metrics_scope: &'a Scope,
+  machine_id: Option<u16>,
+  membership_rx: Option<watch::Receiver<BrokerMembership>>,
+  admission: Option<Arc<dyn AdmissionController>>,
+  time_provider: Arc<dyn TimeProvider>,
+  lifecycle_hooks: Option<Arc<dyn BrokerLifecycleHooks>>,
+}
+
+impl<'a> WriteEngineBuilder<'a> {
   pub fn new(
     config: WriteConfig,
     topics: HashMap<Chars, TopicInfo>,
@@ -53,46 +74,72 @@ impl WriteEngineImpl {
     metadata_store: Arc<dyn MetadataStore>,
     lease_store: Arc<dyn ProducerPartitionLeaseStore>,
     holder_id: String,
-    machine_id: Option<u16>,
-    membership_rx: Option<watch::Receiver<BrokerMembership>>,
-    admission: Arc<dyn AdmissionController>,
     shutdown_trigger_handle: ComponentShutdownTriggerHandle,
-    time_provider: Arc<dyn TimeProvider>,
-    metrics_scope: &Scope,
-  ) -> Result<Self> {
-    Self::new_with_lifecycle_hooks(
+    metrics_scope: &'a Scope,
+  ) -> Self {
+    Self {
       config,
       topics,
       blob_store,
       metadata_store,
       lease_store,
       holder_id,
+      shutdown_trigger_handle,
+      metrics_scope,
+      machine_id: None,
+      membership_rx: None,
+      admission: None,
+      time_provider: Arc::new(SystemTimeProvider),
+      lifecycle_hooks: None,
+    }
+  }
+
+  #[must_use]
+  pub fn machine_id(mut self, machine_id: u16) -> Self {
+    self.machine_id = Some(machine_id);
+    self
+  }
+
+  #[must_use]
+  pub fn membership_rx(mut self, membership_rx: watch::Receiver<BrokerMembership>) -> Self {
+    self.membership_rx = Some(membership_rx);
+    self
+  }
+
+  #[must_use]
+  pub fn admission(mut self, admission: Arc<dyn AdmissionController>) -> Self {
+    self.admission = Some(admission);
+    self
+  }
+
+  #[must_use]
+  pub fn time_provider(mut self, time_provider: Arc<dyn TimeProvider>) -> Self {
+    self.time_provider = time_provider;
+    self
+  }
+
+  #[must_use]
+  pub fn lifecycle_hooks(mut self, lifecycle_hooks: Arc<dyn BrokerLifecycleHooks>) -> Self {
+    self.lifecycle_hooks = Some(lifecycle_hooks);
+    self
+  }
+
+  pub fn build(self) -> Result<WriteEngineImpl> {
+    let Self {
+      config,
+      topics,
+      blob_store,
+      metadata_store,
+      lease_store,
+      holder_id,
+      shutdown_trigger_handle,
+      metrics_scope,
       machine_id,
       membership_rx,
       admission,
-      shutdown_trigger_handle,
       time_provider,
-      metrics_scope,
-      Arc::new(NoopBrokerLifecycleHooks),
-    )
-  }
-
-  #[allow(clippy::too_many_arguments)]
-  pub fn new_with_lifecycle_hooks(
-    config: WriteConfig,
-    topics: HashMap<Chars, TopicInfo>,
-    blob_store: Arc<dyn BlobStore>,
-    metadata_store: Arc<dyn MetadataStore>,
-    lease_store: Arc<dyn ProducerPartitionLeaseStore>,
-    holder_id: String,
-    machine_id: Option<u16>,
-    membership_rx: Option<watch::Receiver<BrokerMembership>>,
-    admission: Arc<dyn AdmissionController>,
-    shutdown_trigger_handle: ComponentShutdownTriggerHandle,
-    time_provider: Arc<dyn TimeProvider>,
-    metrics_scope: &Scope,
-    lifecycle_hooks: Arc<dyn BrokerLifecycleHooks>,
-  ) -> Result<Self> {
+      lifecycle_hooks,
+    } = self;
     let snowflake = match machine_id {
       Some(machine_id) => super::super::flush::SnowflakeGenerator::with_machine_id(machine_id)?,
       None => super::super::flush::SnowflakeGenerator::new()?,
@@ -116,9 +163,15 @@ impl WriteEngineImpl {
       metadata_store,
       snowflake,
       Arc::clone(&time_provider),
-      Arc::clone(&lifecycle_hooks),
+      lifecycle_hooks.clone(),
     );
-    let engine = Self {
+    let admission = admission.unwrap_or_else(|| {
+      Arc::new(MemoryPressureAdmissionController::new(
+        &shutdown_trigger_handle,
+        &metrics_scope.scope("write"),
+      ))
+    });
+    let engine = WriteEngineImpl {
       config,
       admission,
       topics,
@@ -139,7 +192,9 @@ impl WriteEngineImpl {
     }
     Ok(engine)
   }
+}
 
+impl WriteEngineImpl {
   fn spawn_flush_loop(&self) {
     let flush_delay = TimeDuration::milliseconds(self.config.flush_max_delay_ms.max(1));
     let flush_context = self.flush_context.clone();

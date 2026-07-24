@@ -29,11 +29,10 @@ use blob_stream_broker::metrics::BrokerMetrics;
 use blob_stream_broker::write::{
   BrokerLeaseStatus,
   BrokerStateSnapshot,
-  MemoryPressureAdmissionController,
   TopicInfo,
   WriteConfig,
   WriteEngine,
-  WriteEngineImpl,
+  WriteEngineBuilder,
 };
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode};
 use blob_stream_consumer::{
@@ -777,26 +776,21 @@ fn build_write_engine(
   config.flush_max_bytes = 1024;
   config.reservation_size = 64;
   let metrics_scope = Collector::default().scope("blob_stream_broker_it");
-  let admission = Arc::new(MemoryPressureAdmissionController::new(
-    &shutdown_trigger_handle,
-    &metrics_scope.scope("write"),
-  ));
-
-  let engine = WriteEngineImpl::new_with_lifecycle_hooks(
+  let engine = WriteEngineBuilder::new(
     config,
     topics,
     blob_store,
     metadata_store,
     lease_store,
     holder_id,
-    Some(machine_id),
-    Some(membership_rx),
-    admission,
     shutdown_trigger_handle,
-    time_provider,
     &metrics_scope,
-    lifecycle_hooks,
-  )?;
+  )
+  .machine_id(machine_id)
+  .membership_rx(membership_rx)
+  .time_provider(time_provider)
+  .lifecycle_hooks(lifecycle_hooks)
+  .build()?;
 
   Ok(Arc::new(engine))
 }

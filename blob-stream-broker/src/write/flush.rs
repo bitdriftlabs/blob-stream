@@ -109,7 +109,7 @@ pub struct FlushContext {
   metadata_store: Arc<dyn MetadataStore>,
   snowflake: Arc<SnowflakeGenerator>,
   time_provider: Arc<dyn TimeProvider>,
-  lifecycle_hooks: Arc<dyn BrokerLifecycleHooks>,
+  lifecycle_hooks: Option<Arc<dyn BrokerLifecycleHooks>>,
 }
 
 impl FlushContext {
@@ -119,7 +119,7 @@ impl FlushContext {
     metadata_store: Arc<dyn MetadataStore>,
     snowflake: SnowflakeGenerator,
     time_provider: Arc<dyn TimeProvider>,
-    lifecycle_hooks: Arc<dyn BrokerLifecycleHooks>,
+    lifecycle_hooks: Option<Arc<dyn BrokerLifecycleHooks>>,
   ) -> Self {
     Self {
       config,
@@ -323,30 +323,33 @@ impl FlushContext {
         )
       })?;
     let persistence_result = timeout(remaining_budget, async {
-      self
-        .lifecycle_hooks
-        .before_flush_persist(plan.topic.as_str(), &virtual_partition_ids)
-        .await;
+      if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+        lifecycle_hooks
+          .before_flush_persist(plan.topic.as_str(), &virtual_partition_ids)
+          .await;
+      }
       self
         .blob_store
         .put(&envelope.blob_key, payload)
         .await
         .context("write segment blob")?;
       metrics.record_uploaded_object(payload_bytes);
-      self
-        .lifecycle_hooks
-        .blob_persisted(plan.topic.as_str(), &virtual_partition_ids)
-        .await;
+      if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+        lifecycle_hooks
+          .blob_persisted(plan.topic.as_str(), &virtual_partition_ids)
+          .await;
+      }
       let metadata = envelope.into_metadata(self.time_provider.now().unix_timestamp_ms());
       self
         .metadata_store
         .write_segment(metadata)
         .await
         .context("write segment metadata")?;
-      self
-        .lifecycle_hooks
-        .metadata_persisted(plan.topic.as_str(), &virtual_partition_ids)
-        .await;
+      if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+        lifecycle_hooks
+          .metadata_persisted(plan.topic.as_str(), &virtual_partition_ids)
+          .await;
+      }
       Ok::<(), anyhow::Error>(())
     })
     .await;

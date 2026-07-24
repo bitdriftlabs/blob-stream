@@ -133,6 +133,11 @@ struct RecoveryTrace {
   records_accepted: usize,
 }
 
+enum ReadAvailableOutcome {
+  Batches(Vec<ConsumerBatch>),
+  CommandPending,
+}
+
 //
 // PrefetchWorker
 //
@@ -145,13 +150,14 @@ pub(super) struct PrefetchWorker {
   diagnostics: ConsumerDiagnostics,
   delivery_notify: Arc<Notify>,
   prefetch_space_notify: Arc<Notify>,
+  reader_command_notify: Arc<Notify>,
   prefetch_shutdown: Arc<AtomicBool>,
   metrics: ConsumerIteratorMetrics,
   base_idle_delay_ms: u64,
   max_idle_delay_ms: Option<u64>,
   recovery_traces: HashMap<VirtualPartitionId, RecoveryTrace>,
   time_provider: Arc<dyn TimeProvider>,
-  lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>,
+  lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
   member_id: String,
 }
 
@@ -164,12 +170,13 @@ impl PrefetchWorker {
     diagnostics: ConsumerDiagnostics,
     delivery_notify: Arc<Notify>,
     prefetch_space_notify: Arc<Notify>,
+    reader_command_notify: Arc<Notify>,
     prefetch_shutdown: Arc<AtomicBool>,
     metrics: ConsumerIteratorMetrics,
     base_idle_delay_ms: u64,
     max_idle_delay_ms: Option<u64>,
     time_provider: Arc<dyn TimeProvider>,
-    lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>,
+    lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
     member_id: String,
   ) -> Self {
     Self {
@@ -179,6 +186,7 @@ impl PrefetchWorker {
       diagnostics,
       delivery_notify,
       prefetch_space_notify,
+      reader_command_notify,
       prefetch_shutdown,
       metrics,
       base_idle_delay_ms,
@@ -244,9 +252,13 @@ impl PrefetchWorker {
       };
 
       let read_started_at = Instant::now();
-      let batches = self
+      let batches = match self
         .read_available_with_retry(capacity, runtime_settings)
-        .await;
+        .await
+      {
+        ReadAvailableOutcome::Batches(batches) => batches,
+        ReadAvailableOutcome::CommandPending => continue,
+      };
       record_reader_diagnostics(&self.reader, &self.shared_state);
       self.record_recovery_progress();
 
@@ -257,12 +269,12 @@ impl PrefetchWorker {
 
       if batches.is_empty() {
         let idle_delay_ms = idle_poll_backoff.next_delay_ms();
-        self
-          .time_provider
-          .sleep(time::Duration::milliseconds(
+        tokio::select! {
+          () = self.time_provider.sleep(time::Duration::milliseconds(
             i64::try_from(idle_delay_ms).unwrap_or(i64::MAX),
-          ))
-          .await;
+          )) => {},
+          () = self.reader_command_notify.notified() => {},
+        }
         continue;
       }
 
@@ -575,10 +587,11 @@ impl PrefetchWorker {
       (!pending.is_empty(), buffered_partitions)
     };
     for virtual_partition_id in buffered_partitions {
-      self
-        .lifecycle_hooks
-        .prefetch_batch_buffered(&self.member_id, virtual_partition_id)
-        .await;
+      if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+        lifecycle_hooks
+          .prefetch_batch_buffered(&self.member_id, virtual_partition_id)
+          .await;
+      }
     }
     if pending_remains {
       // Wake quickly when callers drain the delivery queue, but periodically retry so a lost
@@ -597,7 +610,7 @@ impl PrefetchWorker {
     &mut self,
     capacity: ReadCapacity,
     runtime_settings: crate::config::ConsumerReadRuntimeSettings,
-  ) -> Vec<ConsumerBatch> {
+  ) -> ReadAvailableOutcome {
     let mut read_attempt: u8 = 0;
     loop {
       let now_s = self.time_provider.now().unix_timestamp();
@@ -606,7 +619,7 @@ impl PrefetchWorker {
         .read_available_with_capacity_and_settings(now_s, capacity, runtime_settings)
         .await
       {
-        Ok(batches) => return batches,
+        Ok(batches) => return ReadAvailableOutcome::Batches(batches),
         Err(read_error) => {
           if read_attempt == 0 {
             read_attempt = 1;
@@ -623,12 +636,14 @@ impl PrefetchWorker {
             15.seconds(),
             "consumer prefetch read failed after retry: error={read_error:#}"
           );
-          self
-            .time_provider
-            .sleep(time::Duration::milliseconds(
+          tokio::select! {
+            () = self.time_provider.sleep(time::Duration::milliseconds(
               i64::try_from(self.base_idle_delay_ms).unwrap_or(i64::MAX),
-            ))
-            .await;
+            )) => {},
+            () = self.reader_command_notify.notified() => {
+              return ReadAvailableOutcome::CommandPending;
+            },
+          }
         },
       }
     }

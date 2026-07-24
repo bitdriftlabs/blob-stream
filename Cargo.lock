@@ -1640,6 +1640,7 @@ dependencies = [
  "blob-stream-blob-store",
  "blob-stream-metadata-store",
  "blob-stream-proto",
+ "blob-stream-test-utils",
  "blob-stream-types",
  "bytes",
  "futures",

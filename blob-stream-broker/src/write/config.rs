@@ -1,9 +1,4 @@
-use crate::write::{
-  DEFAULT_ZSTD_LEVEL,
-  MemoryPressureAdmissionController,
-  WriteEngine,
-  WriteEngineImpl,
-};
+use crate::write::{DEFAULT_ZSTD_LEVEL, WriteEngine, WriteEngineBuilder};
 use anyhow::{Context, Result, anyhow, ensure};
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
@@ -11,7 +6,6 @@ use aws_types::region::Region;
 use bd_pgv::proto_validate;
 use bd_server_stats::stats::Scope;
 use bd_shutdown::ComponentShutdownTriggerHandle;
-use bd_time::SystemTimeProvider;
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_broker_discovery::k8s::K8sServiceBrokerDiscovery;
 use blob_stream_broker_discovery::r#static::StaticBrokerDiscovery;
@@ -223,25 +217,18 @@ pub async fn build_write_engine(
   let topics_count = topics.len();
   let holder_id_for_log = holder_id.clone();
   let writer_id = write_config.writer_id;
-  let admission = Arc::new(MemoryPressureAdmissionController::new(
-    &shutdown_trigger_handle,
-    &metrics_scope.scope("write"),
-  ));
-
-  let engine = WriteEngineImpl::new(
+  let engine = WriteEngineBuilder::new(
     write_config,
     topics,
     blob_store,
     metadata_store,
     lease_store,
     holder_id,
-    None,
-    Some(membership_rx),
-    admission,
     shutdown_trigger_handle,
-    Arc::new(SystemTimeProvider),
     metrics_scope,
-  )?;
+  )
+  .membership_rx(membership_rx)
+  .build()?;
 
   debug!(
     "broker write engine built: holder_id={holder_id_for_log}, topics={topics_count}, \

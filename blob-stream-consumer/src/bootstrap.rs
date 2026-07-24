@@ -9,7 +9,6 @@ use crate::iterator::{
   ConsumerIteratorImpl,
   ConsumerLifecycleHooks,
   CoordinationSnapshot,
-  NoopConsumerLifecycleHooks,
 };
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
@@ -75,7 +74,7 @@ pub struct ConsumerBootstrapIteratorBuilder {
   metrics_scope: Scope,
   feature_flags: Option<FeatureFlagsWatch>,
   time_provider: Arc<dyn TimeProvider>,
-  lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>,
+  lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
 }
 
 impl ConsumerBootstrapIteratorBuilder {
@@ -90,7 +89,7 @@ impl ConsumerBootstrapIteratorBuilder {
       metrics_scope,
       feature_flags,
       time_provider: Arc::new(SystemTimeProvider),
-      lifecycle_hooks: Arc::new(NoopConsumerLifecycleHooks),
+      lifecycle_hooks: None,
     }
   }
 
@@ -104,7 +103,7 @@ impl ConsumerBootstrapIteratorBuilder {
   /// Use explicit lifecycle hooks for observing iterator transitions.
   #[must_use]
   pub fn lifecycle_hooks(mut self, lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>) -> Self {
-    self.lifecycle_hooks = lifecycle_hooks;
+    self.lifecycle_hooks = Some(lifecycle_hooks);
     self
   }
 
@@ -216,7 +215,7 @@ impl ConsumerIteratorImpl {
     metrics_scope: Scope,
     feature_flags: Option<FeatureFlagsWatch>,
     time_provider: Arc<dyn TimeProvider>,
-    lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>,
+    lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
   ) -> Result<Self> {
     validate_runtime_config(&config.runtime)?;
     proto_validate::validate(&config.topic)?;
@@ -260,7 +259,7 @@ impl ConsumerIteratorImpl {
       .time_provider(Arc::clone(&time_provider)),
     );
 
-    ConsumerIteratorBuilder::new(
+    let builder = ConsumerIteratorBuilder::new(
       &config.runtime,
       blob_store,
       metadata_store,
@@ -275,10 +274,13 @@ impl ConsumerIteratorImpl {
         .unwrap_or(crate::config::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS),
       feature_flags,
     )
-    .lifecycle_hooks(lifecycle_hooks)
-    .time_provider(time_provider)
-    .build()
-    .await
+    .time_provider(time_provider);
+    let builder = if let Some(lifecycle_hooks) = lifecycle_hooks {
+      builder.lifecycle_hooks(lifecycle_hooks)
+    } else {
+      builder
+    };
+    builder.build().await
   }
 }
 
