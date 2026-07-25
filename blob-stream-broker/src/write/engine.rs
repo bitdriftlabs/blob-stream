@@ -30,7 +30,7 @@ use bd_time::OffsetDateTimeExt;
 use blob_stream_broker_discovery::{balanced_assignment, writer_virtual_partitions};
 use blob_stream_metadata_store::ProducerPartitionLeaseKey;
 use blob_stream_types::{RecordBatch, format_unix_timestamp_ms};
-pub use core::WriteEngineImpl;
+pub use core::{WriteEngineBuilder, WriteEngineImpl};
 use log::trace;
 use std::collections::HashMap;
 use std::time::{Duration as StdDuration, Instant};

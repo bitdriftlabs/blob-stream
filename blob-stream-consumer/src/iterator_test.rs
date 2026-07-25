@@ -51,6 +51,7 @@ use blob_stream_metadata_store::{
   SegmentMetadata,
 };
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
+use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::{
   BatchMetadata,
   CommittedCursor,
@@ -87,6 +88,10 @@ struct CommitGateHooks {
   release: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
+struct RebalanceRecordingHooks {
+  rebalance_applied_calls: AtomicUsize,
+}
+
 #[async_trait::async_trait]
 impl ConsumerLifecycleHooks for CommitGateHooks {
   async fn before_commit(&self, _member_id: &str, _generation: u64) {
@@ -97,6 +102,18 @@ impl ConsumerLifecycleHooks for CommitGateHooks {
     if let Some(release) = release {
       let _ = release.await;
     }
+  }
+}
+
+#[async_trait::async_trait]
+impl ConsumerLifecycleHooks for RebalanceRecordingHooks {
+  async fn rebalance_applied(
+    &self,
+    _member_id: &str,
+    _generation: u64,
+    _partitions: &[VirtualPartitionId],
+  ) {
+    self.rebalance_applied_calls.fetch_add(1, Ordering::Relaxed);
   }
 }
 
@@ -146,6 +163,11 @@ struct BlockingBlobStore {
   block_reads: AtomicBool,
   read_started: tokio::sync::Notify,
   read_release: tokio::sync::Notify,
+}
+
+struct FailingReadBlobStore {
+  inner: InMemoryBlobStore,
+  failed_reads: AtomicUsize,
 }
 
 struct FailingLeaseStore {
@@ -247,6 +269,15 @@ impl BlockingBlobStore {
   }
 }
 
+impl FailingReadBlobStore {
+  fn new() -> Self {
+    Self {
+      inner: InMemoryBlobStore::new(),
+      failed_reads: AtomicUsize::new(0),
+    }
+  }
+}
+
 #[async_trait::async_trait]
 impl BlobStore for BlockingBlobStore {
   async fn put(&self, key: &BlobKey, payload: Bytes) -> anyhow::Result<()> {
@@ -259,6 +290,20 @@ impl BlobStore for BlockingBlobStore {
       self.read_release.notified().await;
     }
     self.inner.get_range(key, range).await
+  }
+}
+
+#[async_trait::async_trait]
+impl BlobStore for FailingReadBlobStore {
+  async fn put(&self, key: &BlobKey, payload: Bytes) -> anyhow::Result<()> {
+    self.inner.put(key, payload).await
+  }
+
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> anyhow::Result<Bytes> {
+    self.failed_reads.fetch_add(1, Ordering::SeqCst);
+    Err(anyhow::anyhow!(
+      "injected blob read failure for {key:?} at {range:?}"
+    ))
   }
 }
 
@@ -561,6 +606,83 @@ fn runtime_config_with_prefetch_max_bytes(
   runtime.read = Some(read).into();
   runtime.group = Some(group).into();
   runtime
+}
+
+#[tokio::test]
+async fn idle_prefetch_worker_processes_hydration_command_without_clock_advance() {
+  let time_provider = Arc::new(ManualTimeProvider::new(time::OffsetDateTime::UNIX_EPOCH));
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let concrete_lease_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> = concrete_lease_store.clone();
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![3],
+    }));
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .time_provider(time_provider.clone())
+  .build()
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  time_provider.wait_until_sleeping(2).await;
+
+  let key = ConsumerGroupLeaseKey {
+    topic: "telemetry".to_string(),
+    group_id: "group-a".to_string(),
+    virtual_partition_id: 3,
+  };
+  concrete_lease_store
+    .heartbeat_partition(
+      &key,
+      "member-a",
+      1,
+      0,
+      1_000,
+      Some(CommittedCursor {
+        virtual_partition_id: 3,
+        seq_end: 42,
+        source_checkpoint: Some(CommittedSourceCheckpoint {
+          window_start_unix_seconds: 0,
+          snowflake_id: 1,
+        }),
+      }),
+    )
+    .await
+    .unwrap();
+
+  time_provider.advance(time::Duration::milliseconds(10));
+  timeout(Duration::from_secs(1), async {
+    loop {
+      let snapshot = iterator
+        .diagnostics()
+        .expect("consumer implementation provides diagnostics")
+        .state_snapshot();
+      if local_partition(&snapshot, 3).cursor == Some(42) {
+        return;
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("idle prefetch worker did not process the hydration command");
+
+  Box::new(iterator).shutdown().await.unwrap();
 }
 
 async fn wait_for_prefetch_buffer_len(iterator: &ConsumerIteratorImpl, expected_min: usize) {
@@ -1503,7 +1625,6 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
     .fail_deregistration
     .store(true, Ordering::SeqCst);
   Box::new(iterator).shutdown().await.unwrap();
-
   assert!(
     concrete_membership_store
       .inner
@@ -1548,6 +1669,67 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
     reassigned,
     ConsumerGroupAssignmentOutcome::Assigned(_)
   ));
+}
+
+#[tokio::test]
+async fn seek_interrupts_prefetch_read_retries_without_clock_advance() {
+  let time_provider = Arc::new(ManualTimeProvider::new(
+    time::OffsetDateTime::from_unix_timestamp(305).unwrap(),
+  ));
+  let blob_store = Arc::new(FailingReadBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    300,
+    1,
+    3,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![1], 300_000)],
+  )
+  .await;
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![3],
+    }));
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime_config(),
+    blob_store.clone(),
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .time_provider(time_provider.clone())
+  .build()
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  timeout(Duration::from_secs(1), async {
+    while blob_store.failed_reads.load(Ordering::SeqCst) < 2 {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("prefetch worker did not retry the injected read failure");
+  time_provider.wait_until_sleeping(2).await;
+
+  timeout(Duration::from_secs(1), iterator.seek(3, 0))
+    .await
+    .expect("seek did not interrupt the prefetch retry backoff")
+    .unwrap();
+  Box::new(iterator).shutdown().await.unwrap();
 }
 
 #[test]
@@ -1692,7 +1874,10 @@ fn revocation_handoff_span_reports_success_after_reassignment() {
       members: vec!["member-a".to_string()],
       virtual_partitions: vec![0, 1],
     }));
-    let mut iterator = ConsumerIteratorImpl::from_config(
+    let hooks = Arc::new(RebalanceRecordingHooks {
+      rebalance_applied_calls: AtomicUsize::new(0),
+    });
+    let mut iterator = ConsumerIteratorBuilder::new(
       &runtime_config(),
       blob_store,
       metadata_store,
@@ -1704,6 +1889,8 @@ fn revocation_handoff_span_reports_success_after_reassignment() {
       DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
       None,
     )
+    .lifecycle_hooks(hooks.clone())
+    .build()
     .await
     .unwrap();
 
@@ -1738,6 +1925,7 @@ fn revocation_handoff_span_reports_success_after_reassignment() {
         .await
         .unwrap()
     );
+    assert_eq!(hooks.rebalance_applied_calls.load(Ordering::Relaxed), 1);
     driver.shutdown().await.unwrap();
   });
 

@@ -4,7 +4,7 @@ use super::{
   MAX_CONCURRENT_BATCHES_PER_GROUPED_REQUEST,
   produce_request_config,
 };
-use crate::write::{AdmissionController, TopicInfo, WriteConfig, WriteEngineImpl};
+use crate::write::{AdmissionController, TopicInfo, WriteConfig, WriteEngineBuilder};
 use anyhow::Result;
 use async_trait::async_trait;
 use bd_grpc::Handler;
@@ -116,29 +116,32 @@ fn records_produce_request_timeouts() {
 async fn returns_overloaded_when_admission_controller_rejects() -> Result<()> {
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let scope = Collector::default().scope("blob_stream_broker_test");
-  let engine = Arc::new(WriteEngineImpl::new(
-    WriteConfig::with_defaults(),
-    HashMap::from([(
-      "telemetry".into(),
-      TopicInfo {
-        name: "telemetry".into(),
-        partition_count: 1,
-        num_writers: 1,
-        retention_days: 7,
-        max_metadata_publication_lag_ms: 30_000,
-      },
-    )]),
-    Arc::new(InMemoryBlobStore::new()),
-    Arc::new(InMemoryMetadataStore::new()),
-    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
-    "test-node".to_string(),
-    None,
-    None,
-    Arc::new(OverloadedAdmissionController),
-    shutdown_trigger.make_handle(),
-    Arc::new(ManualTimeProvider::new(OffsetDateTime::UNIX_EPOCH)),
-    &scope,
-  )?);
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      WriteConfig::with_defaults(),
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention_days: 7,
+          max_metadata_publication_lag_ms: 30_000,
+        },
+      )]),
+      Arc::new(InMemoryBlobStore::new()),
+      Arc::new(InMemoryMetadataStore::new()),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &scope,
+    )
+    .admission(Arc::new(OverloadedAdmissionController))
+    .time_provider(Arc::new(ManualTimeProvider::new(
+      OffsetDateTime::UNIX_EPOCH,
+    )))
+    .build()?,
+  );
   let grpc = BrokerGrpc::new(engine, &scope);
 
   let response = grpc

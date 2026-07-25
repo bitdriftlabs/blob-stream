@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "./lifecycle_test.rs"]
+mod tests;
+
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use blob_stream_broker::write::BrokerLifecycleHooks;
@@ -145,18 +149,19 @@ impl TestLifecycleHooks {
   }
 
   async fn arm_key(&self, key: LifecycleGateKey) -> Result<LifecycleGate> {
+    let mut gates = self.gates.lock().await;
+    if gates.contains_key(&key) {
+      return Err(anyhow!("lifecycle gate {key:?} already has an armed gate"));
+    }
     let (entered_tx, entered_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
-    let previous = self.gates.lock().await.insert(
+    gates.insert(
       key.clone(),
       ArmedLifecycleGate {
         entered: entered_tx,
         release: release_rx,
       },
     );
-    if previous.is_some() {
-      return Err(anyhow!("lifecycle gate {key:?} already has an armed gate"));
-    }
     Ok(LifecycleGate {
       entered: Some(entered_rx),
       release: Some(release_tx),
@@ -214,7 +219,7 @@ impl TestLifecycleHooks {
   ) -> Option<ArmedLifecycleGate> {
     let key = gates
       .keys()
-      .find(|key| {
+      .filter_map(|key| {
         let LifecycleGateKey::Consumer {
           event: armed_event,
           member_id: armed_member_id,
@@ -222,13 +227,23 @@ impl TestLifecycleHooks {
           generation: armed_generation,
         } = key
         else {
-          return false;
+          return None;
         };
-        *armed_event == event
+        (*armed_event == event
           && armed_member_id == member_id
           && armed_generation.is_none_or(|armed_generation| Some(armed_generation) == generation)
-          && virtual_partition_id.is_none_or(|partition_id| partitions.contains(&partition_id))
+          && virtual_partition_id.is_none_or(|partition_id| partitions.contains(&partition_id)))
+        .then_some((
+          (
+            armed_generation.is_some() && virtual_partition_id.is_some(),
+            armed_generation.is_some(),
+            virtual_partition_id.is_some(),
+          ),
+          key,
+        ))
       })
+      .max_by_key(|(specificity, _)| *specificity)
+      .map(|(_, key)| key)
       .cloned()?;
     gates.remove(&key)
   }

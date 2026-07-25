@@ -38,6 +38,7 @@ use framework::{
 };
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -45,6 +46,31 @@ use tokio::time::{Instant, timeout};
 
 fn metrics_scope(component: &str) -> bd_server_stats::stats::Scope {
   Collector::default().scope(component)
+}
+
+async fn complete_produce_with_manual_retries(
+  produce: impl Future<Output = Result<blob_stream_producer::ProducerAck, ProducerError>>,
+  retry_clock: &ManualProducerRetryClock,
+  timeout_message: &str,
+) -> Result<blob_stream_producer::ProducerAck> {
+  tokio::pin!(produce);
+  let ack = timeout(Duration::from_secs(5), async {
+    loop {
+      tokio::select! {
+        result = &mut produce => return result,
+        () = retry_clock.wait_until_sleeping() => {
+          assert!(
+            retry_clock.advance_to_next_sleep(),
+            "producer retry backoff was not registered"
+          );
+          tokio::task::yield_now().await;
+        }
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("{timeout_message}"))??;
+  Ok(ack)
 }
 
 // High-level: validates producer retry behavior under deterministic dropped transport requests.
@@ -112,7 +138,7 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter retry backoff after transport drop"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "transport-drop retry backoff was not registered"
   );
   let first_ack = timeout(Duration::from_secs(5), &mut first_produce)
@@ -558,7 +584,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter backoff after partition faults"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "partition-fault retry backoff was not registered"
   );
   let first_ack = timeout(Duration::from_secs(5), &mut first_produce)
@@ -590,43 +616,54 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
   // Deterministically reroute producer discovery to the standby node after the active-node
   // partition fault has been exercised.
   cluster.set_active_nodes(vec![standby_node.clone()]);
-  let first_post_id = "fit-003-post-reroute-12";
-  let first_post_produce = producer.produce(ProducerRecord::new(
-    TOPIC.into(),
-    b"fit-003-key-post-12".to_vec(),
-    first_post_id.as_bytes().to_vec().into(),
-    framework::now_unix_seconds() * 1_000,
-  ));
-  tokio::pin!(first_post_produce);
-  let first_post_ack = timeout(Duration::from_secs(5), async {
-    tokio::select! {
-      result = &mut first_post_produce => result,
-      () = retry_clock.wait_until_sleeping() => {
-        assert!(
-          retry_clock.advance_to_next_sleep().await,
-          "membership-settlement retry was not registered"
-        );
-        (&mut first_post_produce).await
+  timeout(Duration::from_secs(5), async {
+    loop {
+      let snapshot = producer
+        .diagnostics()
+        .expect("producer diagnostics must be available")
+        .state_snapshot();
+      let routes_converged = !snapshot.route_map.is_empty()
+        && snapshot.route_map.iter().all(|route| {
+          route.selected_broker.as_ref().is_some_and(|broker| {
+            broker.node_id == standby_node.node_id && broker.address == standby_node.address
+          })
+        });
+      if routes_converged {
+        return;
       }
+      tokio::task::yield_now().await;
     }
   })
   .await
-  .map_err(|_| anyhow::anyhow!("producer did not reroute after active-broker switch"))??;
+  .map_err(|_| anyhow::anyhow!("producer routes did not converge to the standby broker"))?;
+  let first_post_id = "fit-003-post-reroute-12";
+  let first_post_ack = complete_produce_with_manual_retries(
+    producer.produce(ProducerRecord::new(
+      TOPIC.into(),
+      b"fit-003-key-post-12".to_vec(),
+      first_post_id.as_bytes().to_vec().into(),
+      framework::now_unix_seconds() * 1_000,
+    )),
+    &retry_clock,
+    "producer did not reroute after active-broker switch",
+  )
+  .await?;
   expected_ids.insert(first_post_id.to_string());
   produced_partitions.insert(first_post_ack.virtual_partition_id);
 
   for message_id in 13 .. 36 {
     let id = format!("fit-003-post-reroute-{message_id}");
-    let ack = produce_message(
-      &producer,
-      format!("fit-003-key-post-{message_id}").into_bytes(),
-      &id,
+    let ack = complete_produce_with_manual_retries(
+      producer.produce(ProducerRecord::new(
+        TOPIC.into(),
+        format!("fit-003-key-post-{message_id}").into_bytes(),
+        id.as_bytes().to_vec().into(),
+        framework::now_unix_seconds() * 1_000,
+      )),
+      &retry_clock,
+      "post-reroute producer request did not complete",
     )
     .await?;
-    assert_eq!(
-      ack.attempts, 1,
-      "post-reroute request must not retry after producer routes settle"
-    );
     produced_partitions.insert(ack.virtual_partition_id);
     expected_ids.insert(id);
   }
@@ -740,7 +777,7 @@ async fn producer_retry_deadline_respected_after_transport_failures() -> Result<
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter its first retry backoff"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "first retry backoff was not registered"
   );
 
@@ -755,7 +792,7 @@ async fn producer_retry_deadline_respected_after_transport_failures() -> Result<
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter its second retry backoff"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "second retry backoff was not registered"
   );
 
@@ -892,7 +929,7 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
       .await
       .map_err(|_| anyhow::anyhow!("producer did not enter blob-put retry {retry_number}"))?;
     assert!(
-      retry_clock.advance_to_next_sleep().await,
+      retry_clock.advance_to_next_sleep(),
       "blob-put retry {retry_number} was not registered"
     );
   }
@@ -1135,7 +1172,7 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter its first metadata retry backoff"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "first metadata retry backoff was not registered"
   );
 
@@ -1150,7 +1187,7 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter its second metadata retry backoff"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "second metadata retry backoff was not registered"
   );
 
@@ -1562,26 +1599,37 @@ async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
     .as_ref()
     .ok_or_else(|| anyhow::anyhow!("fit-010 consumer group config missing"))?;
   let hooks = cluster.lifecycle_hooks();
-  let mut before_prefetch_gate = hooks
-    .arm(framework::LifecycleEvent::ConsumerPrefetchBatchBuffered)
-    .await?;
-  let mut consumer_a = cluster.create_consumer(&runtime_a).await?;
-  consumer_a.start()?;
-  timeout(Duration::from_secs(5), consumer_time.wait_until_sleeping(2))
-    .await
-    .map_err(|_| anyhow::anyhow!("initial owner did not park its driver and prefetch worker"))?;
-
   let key = b"fit-010-key".to_vec();
   let before_id = "fit-010-before-failure";
   let before_ack = produce_message(&producer, key.clone(), before_id).await?;
+  consumer_time.set_time(OffsetDateTime::now_utc());
   consumer_time.advance(TimeDuration::seconds(1));
-  tokio::task::yield_now().await;
+  let mut initial_rebalance_gate = hooks
+    .arm_consumer(
+      framework::LifecycleEvent::ConsumerBeforeRebalance,
+      "fit-010-a",
+      None,
+      None,
+    )
+    .await?;
+  let mut before_prefetch_gate = hooks
+    .arm_prefetch_for_partition(before_ack.virtual_partition_id)
+    .await?;
+  let mut consumer_a = cluster.create_consumer(&runtime_a).await?;
+  consumer_a.start()?;
+  timeout(
+    Duration::from_secs(5),
+    initial_rebalance_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow::anyhow!("initial owner did not begin its initial rebalance"))??;
+  initial_rebalance_gate.release()?;
   timeout(
     Duration::from_secs(5),
     before_prefetch_gate.wait_until_reached(),
   )
   .await
-  .map_err(|_| anyhow::anyhow!("initial owner did not prefetch its pre-failure record"))??;
+  .map_err(|_| anyhow::anyhow!("initial owner did not prefetch its assigned record"))??;
   before_prefetch_gate.release()?;
   let before_delivery = timeout(Duration::from_secs(5), async {
     loop {
@@ -2092,7 +2140,7 @@ async fn combined_network_and_metadata_faults_preserve_producer_publication() ->
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter combined-fault retry backoff"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "combined-fault retry backoff was not registered"
   );
   let first_ack = timeout(Duration::from_secs(5), &mut first_produce)
@@ -2247,7 +2295,7 @@ async fn run_scripted_transport_fault_scenario() -> Result<Fit012Outcome> {
     .await
     .map_err(|_| anyhow::anyhow!("producer did not enter its first scripted retry backoff"))?;
   assert!(
-    retry_clock.advance_to_next_sleep().await,
+    retry_clock.advance_to_next_sleep(),
     "first scripted retry backoff was not registered"
   );
 

@@ -40,4 +40,5 @@ uuid.workspace                  = true
 zstd.workspace                  = true
 
 [dev-dependencies]
-bd-test-helpers.workspace = true
+bd-test-helpers.workspace   = true
+blob-stream-test-utils.path = "../blob-stream-test-utils"

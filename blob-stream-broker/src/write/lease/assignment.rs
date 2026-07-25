@@ -78,7 +78,7 @@ impl WriteEngineImpl {
     let time_provider = Arc::clone(&self.time_provider);
     let metrics = self.metrics.clone();
     let flush_notifier = Arc::clone(&self.flush_notifier);
-    let lifecycle_hooks = Arc::clone(&self.lifecycle_hooks);
+    let lifecycle_hooks = self.lifecycle_hooks.clone();
     let mut shutdown = self.shutdown_trigger_handle.make_shutdown();
 
     tokio::spawn(async move {
@@ -135,7 +135,7 @@ impl WriteEngineImpl {
             &holder_id,
             partitions,
             time_provider.now().unix_timestamp_ms(),
-            &lifecycle_hooks,
+            lifecycle_hooks.as_ref(),
           )
           .await;
           return;
@@ -190,7 +190,7 @@ impl WriteEngineImpl {
           &holder_id,
           lost_partitions,
           time_provider.now().unix_timestamp_ms(),
-          &lifecycle_hooks,
+          lifecycle_hooks.as_ref(),
         )
         .await;
 
@@ -300,7 +300,7 @@ impl WriteEngineImpl {
     topic: &Chars,
     virtual_partition_id: VirtualPartitionId,
     now_ts_ms: i64,
-    lifecycle_hooks: &Arc<dyn BrokerLifecycleHooks>,
+    lifecycle_hooks: Option<&Arc<dyn BrokerLifecycleHooks>>,
   ) {
     let key = ProducerPartitionLeaseKey {
       topic: topic.clone(),
@@ -317,9 +317,11 @@ impl WriteEngineImpl {
       "broker partition drain started: holder_id={holder_id}, topic={topic}, \
        virtual_partition_id={virtual_partition_id}"
     );
-    lifecycle_hooks
-      .lease_drain_started(topic.as_str(), virtual_partition_id)
-      .await;
+    if let Some(lifecycle_hooks) = lifecycle_hooks {
+      lifecycle_hooks
+        .lease_drain_started(topic.as_str(), virtual_partition_id)
+        .await;
+    }
     flush_notifier.notify_one();
 
     // TODO(mattklein123): Renew the producer lease while waiting for a drain that can approach
@@ -331,12 +333,14 @@ impl WriteEngineImpl {
       "broker partition drain complete: holder_id={holder_id}, topic={topic}, \
        virtual_partition_id={virtual_partition_id}"
     );
-    lifecycle_hooks
-      .partition_drained(topic.as_str(), virtual_partition_id)
-      .await;
-    lifecycle_hooks
-      .before_lease_release(topic.as_str(), virtual_partition_id)
-      .await;
+    if let Some(lifecycle_hooks) = lifecycle_hooks {
+      lifecycle_hooks
+        .partition_drained(topic.as_str(), virtual_partition_id)
+        .await;
+      lifecycle_hooks
+        .before_lease_release(topic.as_str(), virtual_partition_id)
+        .await;
+    }
 
     match lease_store.release_lease(&key, holder_id, now_ts_ms).await {
       Ok(
@@ -355,9 +359,11 @@ impl WriteEngineImpl {
             partition_state.reset_sequence_allocation();
           }
         }
-        lifecycle_hooks
-          .lease_released(topic.as_str(), virtual_partition_id)
-          .await;
+        if let Some(lifecycle_hooks) = lifecycle_hooks {
+          lifecycle_hooks
+            .lease_released(topic.as_str(), virtual_partition_id)
+            .await;
+        }
       },
       Err(error) => {
         warn_every!(
@@ -376,7 +382,7 @@ impl WriteEngineImpl {
     holder_id: &str,
     partitions: Vec<(Chars, VirtualPartitionId)>,
     now_ts_ms: i64,
-    lifecycle_hooks: &Arc<dyn BrokerLifecycleHooks>,
+    lifecycle_hooks: Option<&Arc<dyn BrokerLifecycleHooks>>,
   ) {
     let mut releases = FuturesUnordered::new();
     for (topic, virtual_partition_id) in partitions {

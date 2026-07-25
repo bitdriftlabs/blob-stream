@@ -1,20 +1,45 @@
+#[cfg(test)]
+#[path = "./manual_time_test.rs"]
+mod tests;
+
 use async_trait::async_trait;
 use blob_stream_producer::ProducerRetryClock;
+use parking_lot::Mutex;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
 //
 // ManualProducerRetryClock
 //
 
-/// A retry clock that advances only when the test releases its currently registered sleep.
+/// A retry clock that advances only when the test advances its earliest registered sleep.
 #[derive(Clone)]
 pub struct ManualProducerRetryClock {
   now: watch::Sender<Instant>,
-  next_sleep_deadline: Arc<Mutex<Option<Instant>>>,
+  sleep_deadlines: Arc<Mutex<BTreeMap<Instant, usize>>>,
   sleep_registered: Arc<Notify>,
+}
+
+struct SleepRegistration {
+  sleep_deadlines: Arc<Mutex<BTreeMap<Instant, usize>>>,
+  deadline: Instant,
+}
+
+impl Drop for SleepRegistration {
+  fn drop(&mut self) {
+    let mut sleep_deadlines = self.sleep_deadlines.lock();
+    let Some(count) = sleep_deadlines.get_mut(&self.deadline) else {
+      return;
+    };
+    if *count == 1 {
+      sleep_deadlines.remove(&self.deadline);
+    } else {
+      *count -= 1;
+    }
+  }
 }
 
 impl ManualProducerRetryClock {
@@ -23,25 +48,30 @@ impl ManualProducerRetryClock {
     let (now, _receiver) = watch::channel(now);
     Self {
       now,
-      next_sleep_deadline: Arc::new(Mutex::new(None)),
+      sleep_deadlines: Arc::new(Mutex::new(BTreeMap::new())),
       sleep_registered: Arc::new(Notify::new()),
     }
   }
 
   pub async fn wait_until_sleeping(&self) {
+    self.wait_until_sleepers(1).await;
+  }
+
+  pub async fn wait_until_sleepers(&self, expected_sleepers: usize) {
     loop {
       let notified = self.sleep_registered.notified();
       tokio::pin!(notified);
       notified.as_mut().enable();
-      if self.next_sleep_deadline.lock().await.is_some() {
+      let registered_sleepers = self.sleep_deadlines.lock().values().sum::<usize>();
+      if registered_sleepers >= expected_sleepers {
         return;
       }
       notified.await;
     }
   }
 
-  pub async fn advance_to_next_sleep(&self) -> bool {
-    let Some(deadline) = self.next_sleep_deadline.lock().await.take() else {
+  pub fn advance_to_next_sleep(&self) -> bool {
+    let Some(deadline) = self.sleep_deadlines.lock().keys().next().copied() else {
       return false;
     };
     self.now.send_replace(deadline);
@@ -61,7 +91,14 @@ impl ProducerRetryClock for ManualProducerRetryClock {
 
   async fn sleep(&self, duration: StdDuration) {
     let deadline = self.now() + duration;
-    *self.next_sleep_deadline.lock().await = Some(deadline);
+    {
+      let mut sleep_deadlines = self.sleep_deadlines.lock();
+      *sleep_deadlines.entry(deadline).or_default() += 1;
+    }
+    let _registration = SleepRegistration {
+      sleep_deadlines: Arc::clone(&self.sleep_deadlines),
+      deadline,
+    };
     self.sleep_registered.notify_waiters();
 
     let mut updates = self.now.subscribe();

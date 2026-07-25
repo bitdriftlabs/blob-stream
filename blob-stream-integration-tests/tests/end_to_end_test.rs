@@ -2193,15 +2193,40 @@ async fn active_broker_restart_continuity() -> Result<()> {
 
   for message_id in 0 .. total_messages {
     if message_id == restart_at {
-      // Gate a partition owned by the active broker so unrelated broker lifecycle work cannot
-      // satisfy this restart boundary.
-      let mut drain_gate = cluster
-        .lifecycle_hooks()
+      let in_flight_id = "restart-active-in-flight";
+      let in_flight_partition = restart_partitions[0];
+      let write_engine = cluster.write_engine_by_id(&active_node.node_id)?;
+      let hooks = cluster.lifecycle_hooks();
+      let mut before_flush_gate = hooks
         .arm_broker_for_partition(
-          framework::LifecycleEvent::BrokerLeaseDrainStarted,
-          restart_partitions[0],
+          LifecycleEvent::BrokerBeforeFlushPersist,
+          in_flight_partition,
         )
         .await?;
+      // Gate a partition owned by the active broker so unrelated broker lifecycle work cannot
+      // satisfy this restart boundary.
+      let mut drain_gate = hooks
+        .arm_broker_for_partition(LifecycleEvent::BrokerLeaseDrainStarted, in_flight_partition)
+        .await?;
+      let in_flight_produce = write_engine.produce_batch(WriteRequest {
+        topic: TOPIC.into(),
+        virtual_partition_id: in_flight_partition,
+        records: vec![new_record(
+          in_flight_id.as_bytes().to_vec(),
+          now_unix_seconds() * 1_000,
+        )],
+      });
+      tokio::pin!(in_flight_produce);
+      timeout(Duration::from_secs(5), async {
+        tokio::select! {
+          result = &mut in_flight_produce => Err(anyhow!(
+            "accepted in-flight produce completed before the flush persistence boundary: {result:?}"
+          )),
+          reached = before_flush_gate.wait_until_reached() => reached,
+        }
+      })
+      .await
+      .map_err(|_| anyhow!("accepted in-flight produce did not reach the flush boundary"))??;
       let restarting_node_id = active_node.node_id.clone();
       let mut restart = Box::pin(cluster.restart_broker_by_id(&restarting_node_id));
       timeout(Duration::from_secs(5), async {
@@ -2215,6 +2240,20 @@ async fn active_broker_restart_continuity() -> Result<()> {
       .await
       .map_err(|_| anyhow!("active broker did not begin draining before restart"))??;
       drain_gate.release()?;
+      before_flush_gate.release()?;
+      let in_flight_ack = timeout(Duration::from_secs(5), async {
+        tokio::select! {
+          result = &mut restart => Err(anyhow!(
+            "active broker restart completed before its accepted in-flight write persisted: {result:?}"
+          )),
+          result = &mut in_flight_produce => result.map_err(anyhow::Error::from),
+        }
+      })
+      .await
+      .map_err(|_| anyhow!("accepted in-flight produce did not complete during broker drain"))??;
+      assert!(!in_flight_ack.seq_range.is_empty());
+      expected_ids.insert(in_flight_id.to_string());
+      produced_partitions.insert(in_flight_partition);
       let restarted_node = timeout(Duration::from_secs(10), &mut restart)
         .await
         .map_err(|_| anyhow!("active broker restart did not complete after drain release"))??;
@@ -4826,12 +4865,8 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
   .map_err(|_| anyhow!("surviving bootstrap member did not apply its expiry assignment"))??;
   recovery_assignment_gate.release()?;
 
-  // The prefetch worker received its new assignment after it had already completed the expiry
-  // tick. Wake it once more, then require a buffered batch from every reclaimed partition.
-  timeout(Duration::from_secs(5), consumer_time.wait_until_sleeping(2))
-    .await
-    .map_err(|_| anyhow!("surviving bootstrap member did not park after reassignment"))?;
-  consumer_time.advance(TimeDuration::seconds(1));
+  // Assignment commands wake the prefetch worker directly. Each scoped gate proves the worker
+  // processed the assignment and found data for the reclaimed partition.
   for mut prefetch_gate in recovery_prefetch_gates {
     timeout(Duration::from_secs(5), prefetch_gate.wait_until_reached())
       .await
