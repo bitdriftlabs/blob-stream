@@ -344,9 +344,13 @@ The visibility delay applies in every mode. When an eligible metadata row has
 `metadata_published_ts_ms > now_ms - metadata_visibility_delay_ms`, the reader defers it. In
 Recovery, deferring a window blocks later recovery windows for that partition in the same pass, so
 the cursor cannot advance past a missing earlier sequence range. The recovery pointer remains at
-the deferred window for the next pass. In Fast, a deferral blocks later snowflakes for that
-partition/window during the pass; a later pass retries from an inclusive frontier. A failed metadata
-or blob read restores the pass's cursor and frontier state, so an undelivered batch is retried.
+the deferred window for the next pass when that window is outside Fast's bounded scan horizon. A
+deferred window inside that horizon instead completes recovery and is handed to Fast: Fast retains
+the same visibility check, blocks later snowflakes in that partition/window during the pass, and
+retries from its inclusive time floor and frontier. This prevents recovery from tail-chasing a busy
+active window while preserving the historical recovery barrier that protects cursor order. A failed
+metadata or blob read restores the pass's cursor and frontier state, so an undelivered batch is
+retried.
 
 ### Fast Query Bounds
 
@@ -444,6 +448,14 @@ and retains cursor 1, because the deferred earlier window blocks recovery progre
 `now = 1,232`, the `[2, 2]` row becomes eligible; the next pass delivers `[2, 2]` followed by
 `[3, 3]`. This prevents cursor 3 from hiding sequence 2 and is covered by
 `recovery_does_not_advance_cursor_past_visibility_deferred_window`.
+
+**Active-window visibility handoff.** Assume a graceful replacement starts in the same 300-second
+window as its committed source checkpoint. A newer row in that window is still inside the reader's
+visibility delay. Recovery leaves the durable cursor at the checkpoint and enters Fast because the
+deferred window is in Fast's bounded availability horizon. After the row becomes visible, Fast
+rescans it from its inclusive lower bound and delivers it. This avoids waiting for the active window
+to close while preserving the normal visibility and cursor protections; it is covered by
+`consumer_restart_hands_active_window_visibility_deferral_to_fast`.
 
 **Fast time floor and frontiers.** Assume topic `telemetry` uses 300-second windows, the default
 15-second publication deadline, and the default 2-second visibility delay. At `now = 1,020`, the

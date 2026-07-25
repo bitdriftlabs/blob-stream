@@ -3351,9 +3351,11 @@ async fn prefetch_rebalance_revocation_fences_buffered_record() -> Result<()> {
     .consumer_time_provider(consumer_time.clone())
     .start()
     .await?;
-  let producer = cluster
-    .create_producer(producer_config(), vec![producer_topic()])
-    .await?;
+  let producer = Arc::new(
+    cluster
+      .create_producer(producer_config(), vec![producer_topic()])
+      .await?,
+  );
 
   let target_partition = 0;
   let target_key = (0 .. 1_024)
@@ -4236,13 +4238,42 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
   owner_a.abort_for_test().await?;
   drop(owner_a);
 
+  // Expire A's membership and partition leases before B observes the group. Gate B after it has
+  // admitted its first replacement batch, so delivery assertions do not race the prefetch worker.
+  consumer_time.advance(TimeDuration::seconds(3));
+  let hooks = cluster.lifecycle_hooks();
+  let mut replacement_prefetch_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerPrefetchBatchBuffered,
+      "expiry-replacement",
+      None,
+      None,
+    )
+    .await?;
   let mut owner_b = cluster.create_consumer(&runtime_b).await?;
   owner_b.start()?;
+  {
+    let replacement_prefetch_wait = replacement_prefetch_gate.wait_until_reached();
+    tokio::pin!(replacement_prefetch_wait);
+    timeout(Duration::from_secs(5), async {
+      loop {
+        tokio::select! {
+          result = &mut replacement_prefetch_wait => return result,
+          () = tokio::task::yield_now() => {
+            consumer_time.advance(TimeDuration::seconds(1));
+          },
+        }
+      }
+    })
+    .await
+    .map_err(|_| anyhow!("replacement owner did not buffer a post-crash batch"))??;
+  }
+  replacement_prefetch_gate.release()?;
+
   let mut replacement_counts = HashMap::new();
   let mut recovered_offsets = HashMap::new();
   timeout(Duration::from_secs(5), async {
     while replacement_counts.len() < recovery_ids.len() {
-      consumer_time.advance(TimeDuration::seconds(1));
       tokio::task::yield_now().await;
 
       match timeout(Duration::from_millis(250), owner_b.next()).await {
@@ -4510,6 +4541,296 @@ async fn consumer_crash_recovery_redelivers_only_uncommitted_record() -> Result<
   );
 
   Box::new(owner_b).shutdown().await?;
+  cluster.shutdown().await;
+  Ok(())
+}
+
+// High-level: verifies recovery hands an active-window visibility deferral to Fast instead of
+// tail-chasing it until the metadata window closes.
+#[tokio::test]
+async fn consumer_restart_hands_active_window_visibility_deferral_to_fast() -> Result<()> {
+  let broker_start = OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
+  let broker_time = Arc::new(framework::ManualTimeProvider::new(broker_start));
+  let consumer_time = Arc::new(framework::ManualTimeProvider::new(
+    broker_start + TimeDuration::seconds(10),
+  ));
+  let mut cluster = ClusterHarness::in_memory(1)
+    .broker_flush_max_delay(Duration::from_secs(1))
+    .broker_time_provider(broker_time.clone())
+    .consumer_time_provider(consumer_time.clone())
+    .start()
+    .await?;
+  let producer = Arc::new(
+    cluster
+      .create_producer(producer_config(), vec![producer_topic()])
+      .await?,
+  );
+
+  let mut owner_runtime = consumer_runtime_config("visibility-owner");
+  let mut replacement_runtime = consumer_runtime_config("visibility-replacement");
+  for runtime in [&mut owner_runtime, &mut replacement_runtime] {
+    runtime
+      .read
+      .as_mut()
+      .ok_or_else(|| anyhow!("visibility recovery read config missing"))?
+      .metadata_visibility_delay_ms = Some(5_000);
+    runtime
+      .group
+      .as_mut()
+      .ok_or_else(|| anyhow!("visibility recovery group config missing"))?
+      .lease_duration_ms = Some(20_000);
+  }
+  let group = owner_runtime
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("visibility recovery group config missing"))?;
+  let key = b"visibility-recovery-key".to_vec();
+  let hooks = cluster.lifecycle_hooks();
+
+  let virtual_partition_id = virtual_partition_for_logical(
+    logical_partition_for_key(&key, PARTITION_COUNT),
+    PARTITION_COUNT,
+    0,
+  );
+  let mut first_flush = hooks
+    .arm_broker_for_partition(
+      LifecycleEvent::BrokerBeforeFlushPersist,
+      virtual_partition_id,
+    )
+    .await?;
+  let first_producer = producer.clone();
+  let first_key = key.clone();
+  let first_publish = tokio::spawn(async move {
+    produce_message(&first_producer, first_key, "visibility-checkpoint").await
+  });
+  timeout(Duration::from_secs(5), async {
+    loop {
+      let buffered = cluster
+        .broker_state_snapshots()
+        .await
+        .iter()
+        .any(|snapshot| {
+          snapshot
+            .topics
+            .iter()
+            .flat_map(|topic| &topic.local_partitions)
+            .any(|partition| {
+              partition.virtual_partition_id == virtual_partition_id
+                && partition.buffered_batch_count == 1
+            })
+        });
+      if buffered {
+        return;
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("checkpoint record did not enter the broker buffer"))?;
+  broker_time.advance(TimeDuration::seconds(1));
+  timeout(Duration::from_secs(5), first_flush.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("checkpoint record did not reach the broker flush boundary"))??;
+  first_flush.release()?;
+  let checkpoint_ack = first_publish
+    .await
+    .map_err(|error| anyhow!("checkpoint producer task failed: {error}"))??;
+  assert_eq!(checkpoint_ack.virtual_partition_id, virtual_partition_id);
+
+  let mut owner = cluster.create_consumer(&owner_runtime).await?;
+  owner.start()?;
+  let mut owner_counts = HashMap::new();
+  let mut checkpoint_offset = None;
+  timeout(Duration::from_secs(5), async {
+    while checkpoint_offset.is_none() {
+      tokio::task::yield_now().await;
+      match timeout(Duration::from_millis(250), owner.next()).await {
+        Err(_) => {},
+        Ok(Err(error)) => return Err(anyhow!("checkpoint owner next failed: {error}")),
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          *owner_counts.entry(id.clone()).or_insert(0usize) += 1;
+          if id != "visibility-checkpoint" {
+            return Err(anyhow!("unexpected checkpoint owner record: {id}"));
+          }
+          owner.store_offset(record.virtual_partition_id, record.offset)?;
+          owner.commit().await?;
+          checkpoint_offset = Some(record.offset);
+        },
+      }
+    }
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| anyhow!("checkpoint owner did not deliver its record"))??;
+  assert_eq!(
+    owner_counts,
+    HashMap::from([("visibility-checkpoint".to_string(), 1)])
+  );
+  let checkpoint_offset = checkpoint_offset.ok_or_else(|| anyhow!("missing checkpoint offset"))?;
+
+  let owner_leases = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?;
+  let owner_lease = owner_leases
+    .iter()
+    .find(|lease| lease.key.virtual_partition_id == virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing checkpoint owner lease"))?;
+  let owner_generation = owner_lease.generation;
+  assert!(
+    owner_lease.committed_cursor.as_ref().is_some_and(|cursor| {
+      cursor.seq_end >= checkpoint_offset && cursor.source_checkpoint.is_some()
+    }),
+    "checkpoint owner did not durably persist its source checkpoint: {owner_lease:?}"
+  );
+  Box::new(owner).shutdown().await?;
+
+  // Keep the post-checkpoint row in the same metadata window, but later than the replacement's
+  // visibility cutoff. Recovery must hand it to Fast instead of waiting for the window to close.
+  let mut deferred_flush = hooks
+    .arm_broker_for_partition(
+      LifecycleEvent::BrokerBeforeFlushPersist,
+      virtual_partition_id,
+    )
+    .await?;
+  let deferred_producer = producer.clone();
+  let deferred_key = key.clone();
+  let deferred_publish = tokio::spawn(async move {
+    produce_message(&deferred_producer, deferred_key, "visibility-deferred").await
+  });
+  timeout(Duration::from_secs(5), async {
+    loop {
+      let buffered = cluster
+        .broker_state_snapshots()
+        .await
+        .iter()
+        .any(|snapshot| {
+          snapshot
+            .topics
+            .iter()
+            .flat_map(|topic| &topic.local_partitions)
+            .any(|partition| {
+              partition.virtual_partition_id == virtual_partition_id
+                && partition.buffered_batch_count == 1
+            })
+        });
+      if buffered {
+        return;
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("deferred record did not enter the broker buffer"))?;
+  broker_time.advance(TimeDuration::seconds(11));
+  timeout(Duration::from_secs(5), deferred_flush.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("deferred record did not reach the broker flush boundary"))??;
+  deferred_flush.release()?;
+  let deferred_ack = deferred_publish
+    .await
+    .map_err(|error| anyhow!("deferred producer task failed: {error}"))??;
+  assert_eq!(deferred_ack.virtual_partition_id, virtual_partition_id);
+
+  let mut fast_path_active = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerRecoveryFastPathActive,
+      "visibility-replacement",
+      Some(virtual_partition_id),
+      None,
+    )
+    .await?;
+  let mut replacement = cluster.create_consumer(&replacement_runtime).await?;
+  replacement.start()?;
+  consumer_time.advance(TimeDuration::seconds(1));
+  timeout(
+    Duration::from_secs(5),
+    fast_path_active.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("replacement recovery did not activate Fast before visibility"))??;
+  fast_path_active.release()?;
+
+  let replacement_leases = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?;
+  let replacement_lease = replacement_leases
+    .iter()
+    .find(|lease| lease.key.virtual_partition_id == virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing replacement visibility lease"))?;
+  assert_eq!(
+    replacement_lease.owner_id,
+    replacement_runtime
+      .group
+      .as_ref()
+      .unwrap()
+      .member_id
+      .as_str()
+  );
+  assert!(
+    replacement_lease.generation > owner_generation,
+    "replacement must hold a newer generation"
+  );
+  assert_eq!(
+    replacement_lease
+      .committed_cursor
+      .as_ref()
+      .map(|cursor| cursor.seq_end),
+    Some(checkpoint_offset),
+    "Fast handoff must not advance the durable cursor past deferred metadata"
+  );
+
+  consumer_time.advance(TimeDuration::seconds(7));
+  let mut replacement_counts = HashMap::new();
+  let mut deferred_offset = None;
+  timeout(Duration::from_secs(5), async {
+    while deferred_offset.is_none() {
+      tokio::task::yield_now().await;
+      match timeout(Duration::from_millis(250), replacement.next()).await {
+        Err(_) => {},
+        Ok(Err(error)) => return Err(anyhow!("replacement next failed: {error}")),
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          *replacement_counts.entry(id.clone()).or_insert(0usize) += 1;
+          if id != "visibility-deferred" {
+            return Err(anyhow!("unexpected replacement record: {id}"));
+          }
+          replacement.store_offset(record.virtual_partition_id, record.offset)?;
+          replacement.commit().await?;
+          deferred_offset = Some(record.offset);
+        },
+      }
+    }
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| anyhow!("Fast path did not deliver the deferred record after visibility"))??;
+  assert_eq!(
+    replacement_counts,
+    HashMap::from([("visibility-deferred".to_string(), 1)])
+  );
+  let deferred_offset = deferred_offset.ok_or_else(|| anyhow!("missing deferred offset"))?;
+
+  let final_leases = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?;
+  let final_lease = final_leases
+    .iter()
+    .find(|lease| lease.key.virtual_partition_id == virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing final visibility lease"))?;
+  assert!(
+    final_lease.committed_cursor.as_ref().is_some_and(|cursor| {
+      cursor.seq_end >= deferred_offset && cursor.source_checkpoint.is_some()
+    }),
+    "replacement did not durably commit the deferred record: {final_lease:?}"
+  );
+
+  Box::new(replacement).shutdown().await?;
   cluster.shutdown().await;
   Ok(())
 }

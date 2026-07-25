@@ -27,6 +27,7 @@ pub enum LifecycleEvent {
   BrokerLeaseReleased,
   ConsumerRevocationEmitted,
   ConsumerPrefetchBatchBuffered,
+  ConsumerRecoveryFastPathActive,
   ConsumerBeforeRebalance,
   ConsumerRebalanceApplied,
   ConsumerBeforeCommit,
@@ -359,6 +360,22 @@ impl ConsumerLifecycleHooks for TestLifecycleHooks {
     virtual_partition_id: VirtualPartitionId,
   ) {
     self.reach_prefetch(member_id, virtual_partition_id).await;
+  }
+
+  async fn recovery_fast_path_active(
+    &self,
+    member_id: &str,
+    generation: u64,
+    virtual_partition_id: VirtualPartitionId,
+  ) {
+    self
+      .reach_consumer(
+        LifecycleEvent::ConsumerRecoveryFastPathActive,
+        member_id,
+        generation,
+        &[virtual_partition_id],
+      )
+      .await;
   }
 
   async fn before_rebalance(&self, member_id: &str, generation: u64) {

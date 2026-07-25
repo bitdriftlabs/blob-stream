@@ -349,6 +349,13 @@ impl ConsumerReaderImpl {
     // later sequence could advance the cursor and make the deferred batch permanently ineligible.
     let mut blocked_recovering_partitions = HashSet::new();
     let mut deferred_recovery_windows = HashSet::new();
+    // Recovery can hand an active publication-horizon window to Fast. Fast retains the same
+    // visibility safety check and replays its inclusive time floor once the row becomes eligible.
+    let fast_horizon_windows = self
+      .eligible_fast_scan_windows(now_unix_seconds)?
+      .into_iter()
+      .map(|(window, _)| window.window_start_unix_seconds)
+      .collect::<HashSet<_>>();
     let mut deferred_fresh_partitions = HashSet::new();
     let mut segment_read_plans = Vec::new();
     let mut capacity_exhausted = false;
@@ -486,7 +493,14 @@ impl ConsumerReaderImpl {
               blocked_fast_sources.insert(frontier_key);
             } else if matches!(partition_state, Some(VirtualPartitionState::Fresh { .. })) {
               deferred_fresh_partitions.insert(partition_id);
+            } else if fast_horizon_windows.contains(&window.window_start_unix_seconds) {
+              scan_state.recovery_segments_handed_to_fast_by_visibility = scan_state
+                .recovery_segments_handed_to_fast_by_visibility
+                .saturating_add(1);
             } else {
+              scan_state.recovery_segments_blocked_by_visibility = scan_state
+                .recovery_segments_blocked_by_visibility
+                .saturating_add(1);
               deferred_recovery_windows.insert(window.window_start_unix_seconds);
               blocked_recovering_partitions.insert(partition_id);
             }
@@ -771,8 +785,9 @@ impl ConsumerReaderImpl {
          metadata_segments_without_partition_batches={}, metadata_batches_seen={}, \
          metadata_batches_skipped_by_cursor={}, metadata_segments_skipped_by_frontier={}, \
          metadata_segments_deferred_by_visibility={}, metadata_segments_blocked_by_visibility={}, \
-         metadata_batches_deferred_by_capacity={}, batches_accepted={}, records_accepted={}, \
-         fast_scan_bounds={:?}, fast_frontiers={:?}",
+         recovery_segments_handed_to_fast_by_visibility={}, \
+         recovery_segments_blocked_by_visibility={}, metadata_batches_deferred_by_capacity={}, \
+         batches_accepted={}, records_accepted={}, fast_scan_bounds={:?}, fast_frontiers={:?}",
         self.config.topic,
         partition_id,
         scan_state.scanned_window_starts,
@@ -785,6 +800,8 @@ impl ConsumerReaderImpl {
         scan_state.metadata_segments_skipped_by_frontier,
         scan_state.metadata_segments_deferred_by_visibility,
         scan_state.metadata_segments_blocked_by_visibility,
+        scan_state.recovery_segments_handed_to_fast_by_visibility,
+        scan_state.recovery_segments_blocked_by_visibility,
         scan_state.metadata_batches_deferred_by_capacity,
         scan_state.batches_accepted,
         scan_state.records_accepted,

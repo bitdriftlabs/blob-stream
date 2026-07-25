@@ -329,6 +329,15 @@ pub trait ConsumerLifecycleHooks: Send + Sync {
   ) {
   }
 
+  /// Runs after the prefetch worker observes a partition leave recovery for the Fast path.
+  async fn recovery_fast_path_active(
+    &self,
+    _member_id: &str,
+    _generation: u64,
+    _virtual_partition_id: VirtualPartitionId,
+  ) {
+  }
+
   /// Runs immediately before the driver begins a consumer-group rebalance.
   async fn before_rebalance(&self, _member_id: &str, _generation: u64) {}
 

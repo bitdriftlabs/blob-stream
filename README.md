@@ -419,8 +419,13 @@ Each partition that enters bounded recovery also emits a
 `blob_stream.consumer.partition_recovery` span from assignment until it enters the Fast path or
 loses assignment. Its queryable attributes include starting and committed cursors, recovery bounds,
 duration, scan-pass count, and outcome. `recovery.summary_json` contains aggregate cursor-skip,
-visibility-deferral, frontier-skip, accepted-batch, and accepted-record counters that explain both
-recovery time and why a handoff reread more metadata than expected.
+visibility-deferral, frontier-skip, capacity-deferral, accepted-batch, and accepted-record counters
+that explain both recovery time and why a handoff reread more metadata than expected. Its
+`recovery_segments_handed_to_fast_by_visibility` and
+`recovery_segments_blocked_by_visibility` counters distinguish active Fast-horizon deferrals from
+historical recovery barriers. This is intentional: active-horizon deferrals hand off to Fast for a
+later bounded rescan, while older deferred windows keep recovery blocked to preserve cursor order.
+Recovery detail remains in this JSON attribute because exported spans are limited to 16 attributes.
 
 Graceful shutdown emits a `blob_stream.consumer.shutdown` root span covering the final commit,
 lease release, membership deregistration, planner release, and prefetch termination. Its per-step
