@@ -1,0 +1,3 @@
+# TLC writes fingerprints and queued states here while model-checking.
+# They are reproducible runtime output, not model source.
+states/
