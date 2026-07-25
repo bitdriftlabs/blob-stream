@@ -129,6 +129,9 @@ struct RecoveryTrace {
   batches_skipped_by_cursor: usize,
   segments_skipped_by_frontier: usize,
   segments_deferred_by_visibility: usize,
+  recovery_segments_handed_to_fast_by_visibility: usize,
+  recovery_segments_blocked_by_visibility: usize,
+  batches_deferred_by_capacity: usize,
   batches_accepted: usize,
   records_accepted: usize,
 }
@@ -260,7 +263,7 @@ impl PrefetchWorker {
         ReadAvailableOutcome::CommandPending => continue,
       };
       record_reader_diagnostics(&self.reader, &self.shared_state);
-      self.record_recovery_progress();
+      self.record_recovery_progress().await;
 
       self
         .metrics
@@ -369,6 +372,9 @@ impl PrefetchWorker {
           batches_skipped_by_cursor: 0,
           segments_skipped_by_frontier: 0,
           segments_deferred_by_visibility: 0,
+          recovery_segments_handed_to_fast_by_visibility: 0,
+          recovery_segments_blocked_by_visibility: 0,
+          batches_deferred_by_capacity: 0,
           batches_accepted: 0,
           records_accepted: 0,
         },
@@ -376,7 +382,7 @@ impl PrefetchWorker {
     }
   }
 
-  fn record_recovery_progress(&mut self) {
+  async fn record_recovery_progress(&mut self) {
     if self.recovery_traces.is_empty() {
       return;
     }
@@ -394,6 +400,7 @@ impl PrefetchWorker {
       .map(|state| (state.virtual_partition_id, state))
       .collect::<HashMap<_, _>>();
     let mut completed = Vec::new();
+    let mut fast_path_active = Vec::new();
     for (partition_id, recovery) in &mut self.recovery_traces {
       recovery.scan_passes = recovery.scan_passes.saturating_add(1);
       if let Some(scan) = scans.get(partition_id) {
@@ -409,6 +416,15 @@ impl PrefetchWorker {
         recovery.segments_deferred_by_visibility = recovery
           .segments_deferred_by_visibility
           .saturating_add(scan.metadata_segments_deferred_by_visibility);
+        recovery.recovery_segments_handed_to_fast_by_visibility = recovery
+          .recovery_segments_handed_to_fast_by_visibility
+          .saturating_add(scan.recovery_segments_handed_to_fast_by_visibility);
+        recovery.recovery_segments_blocked_by_visibility = recovery
+          .recovery_segments_blocked_by_visibility
+          .saturating_add(scan.recovery_segments_blocked_by_visibility);
+        recovery.batches_deferred_by_capacity = recovery
+          .batches_deferred_by_capacity
+          .saturating_add(scan.metadata_batches_deferred_by_capacity);
         recovery.batches_accepted = recovery
           .batches_accepted
           .saturating_add(scan.batches_accepted);
@@ -434,10 +450,26 @@ impl PrefetchWorker {
           "cancelled"
         },
       );
+      if completed_normally {
+        fast_path_active.push(*partition_id);
+      }
       completed.push(*partition_id);
     }
     for partition_id in completed {
       self.recovery_traces.remove(&partition_id);
+    }
+    if !fast_path_active.is_empty()
+      && let Some(lifecycle_hooks) = &self.lifecycle_hooks
+    {
+      let generation = self
+        .diagnostics
+        .state_snapshot()
+        .accepted_assignment_plan_version;
+      for partition_id in fast_path_active {
+        lifecycle_hooks
+          .recovery_fast_path_active(&self.member_id, generation, partition_id)
+          .await;
+      }
     }
   }
 
@@ -454,6 +486,9 @@ impl PrefetchWorker {
       "batches_skipped_by_cursor": recovery.batches_skipped_by_cursor,
       "segments_skipped_by_frontier": recovery.segments_skipped_by_frontier,
       "segments_deferred_by_visibility": recovery.segments_deferred_by_visibility,
+      "recovery_segments_handed_to_fast_by_visibility": recovery.recovery_segments_handed_to_fast_by_visibility,
+      "recovery_segments_blocked_by_visibility": recovery.recovery_segments_blocked_by_visibility,
+      "batches_deferred_by_capacity": recovery.batches_deferred_by_capacity,
       "batches_accepted": recovery.batches_accepted,
       "records_accepted": recovery.records_accepted,
     })
@@ -709,6 +744,9 @@ fn reader_partition_scan_snapshot(
     metadata_segments_skipped_by_frontier: state.metadata_segments_skipped_by_frontier,
     metadata_segments_deferred_by_visibility: state.metadata_segments_deferred_by_visibility,
     metadata_segments_blocked_by_visibility: state.metadata_segments_blocked_by_visibility,
+    recovery_segments_handed_to_fast_by_visibility: state
+      .recovery_segments_handed_to_fast_by_visibility,
+    recovery_segments_blocked_by_visibility: state.recovery_segments_blocked_by_visibility,
     metadata_batches_deferred_by_capacity: state.metadata_batches_deferred_by_capacity,
     batches_accepted: state.batches_accepted,
     records_accepted: state.records_accepted,

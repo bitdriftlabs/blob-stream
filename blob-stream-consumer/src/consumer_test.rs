@@ -1175,6 +1175,80 @@ async fn recovery_does_not_advance_cursor_past_visibility_deferred_window() {
 }
 
 #[tokio::test]
+async fn recovery_hands_active_window_visibility_deferral_to_fast() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let window_start = 900;
+  let snowflake_id =
+    SnowflakeId::minimum_for_timestamp(OffsetDateTime::from_unix_timestamp(window_start).unwrap());
+
+  write_segment_with_publication_time(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    window_start,
+    snowflake_id.as_u64(),
+    7,
+    SeqRange { start: 2, end: 2 },
+    vec![new_record(vec![2], window_start * 1_000)],
+    Compression::none(),
+    window_start * 1_000,
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      metadata_visibility_delay_ms: Some(1_000),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    Arc::clone(&blob_store),
+    Arc::clone(&metadata_store),
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .unwrap();
+  reader.hydrate_cursor_with_source(
+    7,
+    &CommittedCursor {
+      virtual_partition_id: 7,
+      seq_end: 1,
+      source_checkpoint: Some(CommittedSourceCheckpoint {
+        window_start_unix_seconds: window_start,
+        snowflake_id: snowflake_id.as_u64(),
+      }),
+    },
+    Some(window_start * 1_000),
+    window_start,
+  );
+  reader
+    .set_assigned_virtual_partitions(&[7], window_start)
+    .unwrap();
+
+  assert!(
+    reader
+      .read_available(window_start)
+      .await
+      .unwrap()
+      .is_empty()
+  );
+  assert!(matches!(
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::Fast { .. })
+  ));
+  assert_eq!(reader.cursor(7), Some(1));
+
+  let batches = reader.read_available(window_start + 1).await.unwrap();
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].seq_range, SeqRange { start: 2, end: 2 });
+}
+
+#[tokio::test]
 async fn advances_cursor_and_dedupes_on_rescan() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
