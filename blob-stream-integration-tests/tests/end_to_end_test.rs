@@ -4238,13 +4238,42 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
   owner_a.abort_for_test().await?;
   drop(owner_a);
 
+  // Expire A's membership and partition leases before B observes the group. Gate B after it has
+  // admitted its first replacement batch, so delivery assertions do not race the prefetch worker.
+  consumer_time.advance(TimeDuration::seconds(3));
+  let hooks = cluster.lifecycle_hooks();
+  let mut replacement_prefetch_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerPrefetchBatchBuffered,
+      "expiry-replacement",
+      None,
+      None,
+    )
+    .await?;
   let mut owner_b = cluster.create_consumer(&runtime_b).await?;
   owner_b.start()?;
+  {
+    let replacement_prefetch_wait = replacement_prefetch_gate.wait_until_reached();
+    tokio::pin!(replacement_prefetch_wait);
+    timeout(Duration::from_secs(5), async {
+      loop {
+        tokio::select! {
+          result = &mut replacement_prefetch_wait => return result,
+          () = tokio::task::yield_now() => {
+            consumer_time.advance(TimeDuration::seconds(1));
+          },
+        }
+      }
+    })
+    .await
+    .map_err(|_| anyhow!("replacement owner did not buffer a post-crash batch"))??;
+  }
+  replacement_prefetch_gate.release()?;
+
   let mut replacement_counts = HashMap::new();
   let mut recovered_offsets = HashMap::new();
   timeout(Duration::from_secs(5), async {
     while replacement_counts.len() < recovery_ids.len() {
-      consumer_time.advance(TimeDuration::seconds(1));
       tokio::task::yield_now().await;
 
       match timeout(Duration::from_millis(250), owner_b.next()).await {
