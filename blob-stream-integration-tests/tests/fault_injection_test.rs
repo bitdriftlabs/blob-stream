@@ -1,15 +1,18 @@
 use anyhow::Result;
 use bd_server_stats::stats::Collector;
 use bd_time::TimeProvider;
+use blob_stream_broker::write::BrokerLeaseStatus;
 use blob_stream_consumer::{
   ConsumerIterator,
+  ConsumerIteratorImpl,
   ConsumerReadConfig,
   ConsumerReaderImpl,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   NextResult,
 };
 use blob_stream_integration_tests::test_framework as framework;
-use blob_stream_producer::{ProducerClient, ProducerError, ProducerRecord};
+use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerError, ProducerRecord};
+use blob_stream_types::{logical_partition_for_key, virtual_partition_for_logical};
 use framework::{
   ClusterHarness,
   IntegrationResources,
@@ -33,6 +36,7 @@ use framework::{
   produce_message,
   producer_config,
   producer_topic,
+  producer_topic_named_with_partition_count,
   reader_delivery_counts,
   rescan_reader_with_trace,
 };
@@ -71,6 +75,156 @@ async fn complete_produce_with_manual_retries(
   .await
   .map_err(|_| anyhow::anyhow!("{timeout_message}"))??;
   Ok(ack)
+}
+
+async fn wait_for_producer_route(
+  producer: &ProducerClientImpl,
+  node_id: &str,
+  address: &str,
+  deadline: Instant,
+) -> Result<()> {
+  loop {
+    let snapshot = producer
+      .diagnostics()
+      .expect("producer diagnostics must be available")
+      .state_snapshot();
+    let routes_converged = !snapshot.route_map.is_empty()
+      && snapshot.route_map.iter().all(|route| {
+        route.selected_broker.as_ref().is_some_and(|broker| {
+          broker.node_id.as_str() == node_id && broker.address.as_str() == address
+        })
+      });
+    if routes_converged {
+      return Ok(());
+    }
+    if Instant::now() >= deadline {
+      return Err(anyhow::anyhow!(
+        "producer route did not converge to {node_id} at {address}: {snapshot:#?}"
+      ));
+    }
+    tokio::task::yield_now().await;
+  }
+}
+
+async fn wait_for_broker_lease_ownership(
+  cluster: &ClusterHarness,
+  node_id: &str,
+  topic: &str,
+  virtual_partition_ids: &[u32],
+  deadline: Instant,
+) -> Result<()> {
+  loop {
+    let snapshots = cluster.broker_state_snapshots().await;
+    let broker_owns_partitions = snapshots
+      .iter()
+      .find(|snapshot| snapshot.holder_id == node_id)
+      .is_some_and(|snapshot| {
+        virtual_partition_ids.iter().all(|virtual_partition_id| {
+          snapshot.ownership.iter().any(|ownership| {
+            ownership.topic.as_str() == topic
+              && ownership.virtual_partition_id == *virtual_partition_id
+              && ownership.assignment_is_local
+              && ownership.lease_status == BrokerLeaseStatus::LocalActive
+          })
+        })
+      });
+    if broker_owns_partitions {
+      return Ok(());
+    }
+    if Instant::now() >= deadline {
+      return Err(anyhow::anyhow!(
+        "broker {node_id} did not acquire producer leases for {topic} partitions \
+         {virtual_partition_ids:?}: {snapshots:#?}"
+      ));
+    }
+    tokio::task::yield_now().await;
+  }
+}
+
+async fn wait_for_group_offsets_committed(
+  cluster: &ClusterHarness,
+  group_id: &str,
+  maximum_offsets: &HashMap<u32, u64>,
+  boundary: &str,
+) -> Result<()> {
+  timeout(Duration::from_secs(5), async {
+    loop {
+      let leases = cluster
+        .consumer_lease_store()
+        .list_group_leases(TOPIC, group_id)
+        .await?;
+      if maximum_offsets
+        .iter()
+        .all(|(partition_id, maximum_offset)| {
+          leases
+            .iter()
+            .find(|lease| lease.key.virtual_partition_id == *partition_id)
+            .is_some_and(|lease| {
+              lease.committed_cursor.as_ref().is_some_and(|cursor| {
+                cursor.seq_end >= *maximum_offset && cursor.source_checkpoint.is_some()
+              })
+            })
+        })
+      {
+        return Ok::<_, anyhow::Error>(());
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("{boundary}"))??;
+  Ok(())
+}
+
+async fn wait_for_member_to_own_group_leases(
+  cluster: &ClusterHarness,
+  group_id: &str,
+  member_id: &str,
+  expected_lease_count: usize,
+  boundary: &str,
+) -> Result<()> {
+  timeout(Duration::from_secs(5), async {
+    loop {
+      let leases = cluster
+        .consumer_lease_store()
+        .list_group_leases(TOPIC, group_id)
+        .await?;
+      if leases.len() == expected_lease_count
+        && leases.iter().all(|lease| lease.owner_id == member_id)
+      {
+        return Ok::<_, anyhow::Error>(());
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("{boundary}"))??;
+  Ok(())
+}
+
+async fn start_consumer_after_rebalance(
+  cluster: &ClusterHarness,
+  runtime: &blob_stream_consumer::ConsumerRuntimeConfig,
+  member_id: &str,
+  consumer_time: &ManualTimeProvider,
+) -> Result<ConsumerIteratorImpl> {
+  let mut rebalance_gate = cluster
+    .lifecycle_hooks()
+    .arm_consumer(
+      framework::LifecycleEvent::ConsumerBeforeRebalance,
+      member_id,
+      None,
+      None,
+    )
+    .await?;
+  let mut consumer = cluster.create_consumer(runtime).await?;
+  consumer.start()?;
+  consumer_time.advance(TimeDuration::seconds(1));
+  timeout(Duration::from_secs(5), rebalance_gate.wait_until_reached())
+    .await
+    .map_err(|_| anyhow::anyhow!("{member_id} did not begin its initial rebalance"))??;
+  rebalance_gate.release()?;
+  Ok(consumer)
 }
 
 // High-level: validates producer retry behavior under deterministic dropped transport requests.
@@ -232,8 +386,11 @@ async fn network_response_loss_after_persistence_retries_with_duplicate_batch() 
     })
     .await;
 
+  let retry_clock = Arc::new(ManualProducerRetryClock::new(Instant::now()));
   let producer = cluster
-    .create_producer(producer_config(), vec![producer_topic()])
+    .producer_builder(producer_config(), vec![producer_topic()])
+    .retry_clock(retry_clock.clone())
+    .build()
     .await?;
   let hooks = cluster.lifecycle_hooks();
   let mut persisted_gate = hooks
@@ -353,6 +510,220 @@ async fn network_response_loss_after_persistence_retries_with_duplicate_batch() 
       .iter()
       .any(|event| event.status == "response_dropped"),
     "expected transport event log to record post-persistence response loss"
+  );
+
+  Box::new(consumer).shutdown().await?;
+  cluster.shutdown().await;
+  Ok(())
+}
+
+// High-level: validates a post-persistence response loss remains an explicit exactly-twice
+// producer contract when the retry crosses a deterministic broker ownership handoff.
+#[tokio::test]
+async fn response_loss_retry_during_broker_handoff_preserves_group_delivery_contract() -> Result<()>
+{
+  let mut cluster = ClusterHarness::in_memory(2).start().await?;
+  let nodes = cluster.live_nodes();
+  assert_eq!(
+    nodes.len(),
+    2,
+    "expected two brokers for the handoff scenario"
+  );
+  let active_node = nodes[0].clone();
+  let standby_node = nodes[1].clone();
+  cluster.set_active_nodes(vec![active_node.clone()]);
+
+  let controller = cluster
+    .network_fault_controller()
+    .ok_or_else(|| anyhow::anyhow!("in-memory transport missing fault controller"))?;
+  controller
+    .enable_fault(NetworkFaultRule {
+      target_node_id: Some(active_node.node_id.to_string()),
+      operation: NetworkOperation::ProduceBatch,
+      fault: NetworkFault::DropResponse,
+      remaining_hits: Some(1),
+    })
+    .await;
+
+  let retry_clock = Arc::new(ManualProducerRetryClock::new(Instant::now()));
+  let producer = cluster
+    .producer_builder(producer_config(), vec![producer_topic()])
+    .retry_clock(retry_clock.clone())
+    .build()
+    .await?;
+  wait_for_producer_route(
+    &producer,
+    &active_node.node_id,
+    &active_node.address,
+    Instant::now() + Duration::from_secs(5),
+  )
+  .await?;
+
+  let id = "fit-response-loss-handoff";
+  let key = b"fit-response-loss-handoff-key".to_vec();
+  let virtual_partition_id = virtual_partition_for_logical(
+    logical_partition_for_key(&key, PARTITION_COUNT),
+    PARTITION_COUNT,
+    0,
+  );
+  let hooks = cluster.lifecycle_hooks();
+  let mut metadata_persisted = hooks
+    .arm_broker_for_partition(
+      framework::LifecycleEvent::BrokerMetadataPersisted,
+      virtual_partition_id,
+    )
+    .await?;
+  let produce = producer.produce(ProducerRecord::new(
+    TOPIC.into(),
+    key,
+    id.as_bytes().to_vec().into(),
+    framework::now_unix_seconds() * 1_000,
+  ));
+  tokio::pin!(produce);
+
+  timeout(Duration::from_secs(5), async {
+    tokio::select! {
+      result = &mut produce => Err(anyhow::anyhow!(
+        "produce completed before the active broker metadata-persisted boundary: {result:?}"
+      )),
+      reached = metadata_persisted.wait_until_reached() => reached,
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("active broker did not durably persist the first request"))??;
+
+  // Move discovery before releasing A's persisted request, but hold A's lease release. The
+  // producer's immediate response-loss retry is then routed to B and waits for B's ownership.
+  let mut lease_released = hooks
+    .arm_broker_for_partition(
+      framework::LifecycleEvent::BrokerLeaseReleased,
+      virtual_partition_id,
+    )
+    .await?;
+  cluster.set_active_nodes(vec![standby_node.clone()]);
+  wait_for_producer_route(
+    &producer,
+    &standby_node.node_id,
+    &standby_node.address,
+    Instant::now() + Duration::from_secs(5),
+  )
+  .await?;
+  metadata_persisted.release()?;
+  let response_dropped = cluster
+    .wait_for_event(
+      &TestEventMatcher {
+        category: Some("transport".to_string()),
+        operation: Some("produce_batch".to_string()),
+        key_contains: Some(active_node.node_id.to_string()),
+        status: Some("response_dropped".to_string()),
+      },
+      Duration::from_secs(5),
+    )
+    .await?;
+  assert!(
+    response_dropped
+      .detail
+      .as_deref()
+      .is_some_and(|detail| detail.contains("broker_completed=true")),
+    "response-loss event did not prove broker persistence: {response_dropped:?}"
+  );
+
+  timeout(Duration::from_secs(5), lease_released.wait_until_reached())
+    .await
+    .map_err(|_| anyhow::anyhow!("former broker did not release the response-loss partition"))??;
+  lease_released.release()?;
+  wait_for_broker_lease_ownership(
+    &cluster,
+    &standby_node.node_id,
+    TOPIC,
+    &[virtual_partition_id],
+    Instant::now() + Duration::from_secs(5),
+  )
+  .await?;
+
+  let ack = timeout(Duration::from_secs(5), &mut produce)
+    .await
+    .map_err(|_| anyhow::anyhow!("producer did not complete after broker handoff"))??;
+  assert_eq!(
+    ack.attempts, 2,
+    "response loss across broker ownership handoff must take exactly two producer attempts"
+  );
+  assert_eq!(ack.virtual_partition_id, virtual_partition_id);
+
+  let mut runtime = consumer_runtime_config("fit-response-loss-handoff-member");
+  runtime
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow::anyhow!("handoff consumer read config missing"))?
+    .metadata_visibility_delay_ms = Some(0);
+  let group = runtime
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow::anyhow!("handoff consumer group config missing"))?;
+  let mut prefetch_gate = hooks
+    .arm_prefetch_for_partition(virtual_partition_id)
+    .await?;
+  let mut consumer = cluster.create_consumer(&runtime).await?;
+  consumer.start()?;
+  timeout(Duration::from_secs(5), prefetch_gate.wait_until_reached())
+    .await
+    .map_err(|_| anyhow::anyhow!("group consumer did not prefetch the handoff records"))??;
+  prefetch_gate.release()?;
+
+  let mut delivered_offsets = Vec::new();
+  let mut delivered_id_counts = HashMap::new();
+  while delivered_offsets.len() < 2 {
+    match timeout(Duration::from_secs(5), consumer.next())
+      .await
+      .map_err(|_| anyhow::anyhow!("group consumer did not deliver the next handoff record"))??
+    {
+      NextResult::Revoked(revoked) => revoked.complete().await,
+      NextResult::Record(record) => {
+        let delivered_id = String::from_utf8(record.record.payload.to_vec())?;
+        *delivered_id_counts.entry(delivered_id).or_insert(0_usize) += 1;
+        delivered_offsets.push((record.virtual_partition_id, record.offset));
+        consumer.store_offset(record.virtual_partition_id, record.offset)?;
+        consumer.commit().await?;
+      },
+    }
+  }
+  assert_eq!(
+    delivered_id_counts,
+    HashMap::from([(id.to_string(), 2)]),
+    "response loss across broker handoff must retain the exactly-twice delivery contract"
+  );
+  assert!(
+    delivered_offsets
+      .iter()
+      .all(|(partition_id, _)| *partition_id == virtual_partition_id),
+    "handoff retry changed the acknowledged virtual partition: {delivered_offsets:?}"
+  );
+  assert!(
+    delivered_offsets[0].1 < delivered_offsets[1].1,
+    "handoff retry must preserve increasing delivery offsets: {delivered_offsets:?}"
+  );
+  let maximum_offset = delivered_offsets
+    .iter()
+    .map(|(_, offset)| *offset)
+    .max()
+    .ok_or_else(|| anyhow::anyhow!("handoff test did not retain delivery offsets"))?;
+
+  let committed_lease = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == virtual_partition_id)
+    .ok_or_else(|| anyhow::anyhow!("missing handoff consumer lease"))?;
+  assert!(
+    committed_lease.owner_id == group.member_id.as_str()
+      && committed_lease
+        .committed_cursor
+        .as_ref()
+        .is_some_and(|cursor| {
+          cursor.seq_end >= maximum_offset && cursor.source_checkpoint.is_some()
+        }),
+    "group did not durably commit the maximum handoff delivery offset: {committed_lease:?}"
   );
 
   Box::new(consumer).shutdown().await?;
@@ -1443,8 +1814,11 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
     .await;
 
   cluster.set_active_nodes(vec![active_node.clone()]);
+  let retry_clock = Arc::new(ManualProducerRetryClock::new(Instant::now()));
   let producer = cluster
-    .create_producer(producer_config(), vec![producer_topic()])
+    .producer_builder(producer_config(), vec![producer_topic()])
+    .retry_clock(retry_clock.clone())
+    .build()
     .await?;
 
   let mut expected_ids = HashSet::new();
@@ -1492,10 +1866,15 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
 
   for message_id in 0 .. 16 {
     let id = format!("fit-009-pre-reroute-{message_id}");
-    let ack = produce_message(
-      &producer,
-      format!("fit-009-key-pre-{message_id}").into_bytes(),
-      &id,
+    let ack = complete_produce_with_manual_retries(
+      producer.produce(ProducerRecord::new(
+        TOPIC.into(),
+        format!("fit-009-key-pre-{message_id}").into_bytes(),
+        id.as_bytes().to_vec().into(),
+        framework::now_unix_seconds() * 1_000,
+      )),
+      &retry_clock,
+      "pre-reroute producer request did not complete",
     )
     .await?;
     produced_partitions.insert(ack.virtual_partition_id);
@@ -1516,16 +1895,57 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
     "expected all scripted producer lease conflicts before rerouting: {lease_fault_events:?}"
   );
 
-  // Deterministically transition traffic to standby once the complete lease-conflict script has
-  // been applied.
+  // First converge discovery and broker ownership, then explicitly drive any producer retry that
+  // arises while the standby takes over the complete partition set.
+  // The former broker releases telemetry partitions in sorted order. Gate the final release so
+  // the successor's reconciliation happens only after the entire target topic is available.
+  let handoff_partition = PARTITION_COUNT - 1;
+  let mut lease_released_gate = cluster
+    .lifecycle_hooks()
+    .arm_broker_for_partition(
+      framework::LifecycleEvent::BrokerLeaseReleased,
+      handoff_partition,
+    )
+    .await?;
   cluster.set_active_nodes(vec![standby_node.clone()]);
+  wait_for_producer_route(
+    &producer,
+    &standby_node.node_id,
+    &standby_node.address,
+    Instant::now() + Duration::from_secs(5),
+  )
+  .await?;
+  timeout(
+    Duration::from_secs(5),
+    lease_released_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow::anyhow!("former broker did not release the final handoff partition"))??;
+  // A membership update while the old leases were still held can make the successor observe
+  // `HeldByOther`; publish the stable membership again to drive its post-release reconciliation.
+  cluster.set_active_nodes(vec![standby_node.clone()]);
+  let all_partitions = (0 .. PARTITION_COUNT).collect::<Vec<_>>();
+  wait_for_broker_lease_ownership(
+    &cluster,
+    &standby_node.node_id,
+    TOPIC,
+    &all_partitions,
+    Instant::now() + Duration::from_secs(5),
+  )
+  .await?;
+  lease_released_gate.release()?;
 
   for message_id in 16 .. 40 {
     let id = format!("fit-009-post-reroute-{message_id}");
-    let ack = produce_message(
-      &producer,
-      format!("fit-009-key-post-{message_id}").into_bytes(),
-      &id,
+    let ack = complete_produce_with_manual_retries(
+      producer.produce(ProducerRecord::new(
+        TOPIC.into(),
+        format!("fit-009-key-post-{message_id}").into_bytes(),
+        id.as_bytes().to_vec().into(),
+        framework::now_unix_seconds() * 1_000,
+      )),
+      &retry_clock,
+      "post-reroute producer request did not complete",
     )
     .await?;
     produced_partitions.insert(ack.virtual_partition_id);
@@ -1806,15 +2226,616 @@ async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
   Ok(())
 }
 
+// High-level: validates a failed final shutdown checkpoint releases ownership and preserves the
+// staged record for exactly-once replacement delivery.
+#[tokio::test]
+async fn graceful_shutdown_final_commit_failure_redelivers_staged_record() -> Result<()> {
+  let consumer_time = Arc::new(ManualTimeProvider::new(OffsetDateTime::now_utc()));
+  let mut cluster = ClusterHarness::in_memory(1)
+    .partition_count(1)
+    .consumer_time_provider(consumer_time.clone())
+    .start()
+    .await?;
+  let producer = cluster
+    .create_producer(
+      producer_config(),
+      vec![producer_topic_named_with_partition_count(TOPIC, 1, 1)],
+    )
+    .await?;
+  let runtime_a = consumer_runtime_config("fit-shutdown-commit-a");
+  let runtime_b = consumer_runtime_config("fit-shutdown-commit-b");
+  let group = runtime_a
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow::anyhow!("shutdown commit group config missing"))?;
+  let group_id = group.group_id.to_string();
+  let topic = group.topic.to_string();
+  let hooks = cluster.lifecycle_hooks();
+  let staged_id = "fit-shutdown-commit-staged";
+  let key = b"fit-shutdown-commit-key".to_vec();
+  let staged_ack = produce_message(&producer, key.clone(), staged_id).await?;
+
+  let mut consumer_a = start_consumer_after_rebalance(
+    &cluster,
+    &runtime_a,
+    "fit-shutdown-commit-a",
+    &consumer_time,
+  )
+  .await?;
+  let staged_offset = timeout(Duration::from_secs(5), async {
+    loop {
+      match timeout(Duration::from_millis(250), consumer_a.next()).await {
+        Err(_) => {
+          consumer_time.advance(TimeDuration::seconds(1));
+          tokio::task::yield_now().await;
+        },
+        Ok(Err(error)) => return Err(anyhow::anyhow!("initial consumer next failed: {error}")),
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          assert_eq!(record.virtual_partition_id, staged_ack.virtual_partition_id);
+          assert_eq!(
+            String::from_utf8(record.record.payload.to_vec())?,
+            staged_id
+          );
+          consumer_a.store_offset(record.virtual_partition_id, record.offset)?;
+          return Ok::<_, anyhow::Error>(record.offset);
+        },
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("initial consumer did not stage the shutdown record"))??;
+
+  let lease_before_shutdown = cluster
+    .consumer_lease_store()
+    .list_group_leases(&topic, &group_id)
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == staged_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow::anyhow!("missing initial shutdown lease"))?;
+  assert!(
+    lease_before_shutdown.committed_cursor.is_none(),
+    "staged record became durable before shutdown: {lease_before_shutdown:?}"
+  );
+
+  let controller = cluster
+    .store_fault_controller()
+    .ok_or_else(|| anyhow::anyhow!("in-memory cluster missing store fault controller"))?;
+  controller
+    .enable_fault(StoreFaultRule {
+      domain: StoreFaultDomain::ConsumerLease,
+      operation: StoreFaultOperation::ConsumerHeartbeatPartition,
+      key_pattern: None,
+      action: StoreFaultAction::Fail {
+        message: "fail shutdown final checkpoint".to_string(),
+      },
+      remaining_hits: Some(1),
+    })
+    .await;
+
+  let mut before_commit = hooks
+    .arm_consumer(
+      framework::LifecycleEvent::ConsumerBeforeCommit,
+      "fit-shutdown-commit-a",
+      None,
+      None,
+    )
+    .await?;
+  let mut commit_finished = hooks
+    .arm_consumer(
+      framework::LifecycleEvent::ConsumerShutdownCommitFinished,
+      "fit-shutdown-commit-a",
+      None,
+      None,
+    )
+    .await?;
+  let mut before_release = hooks
+    .arm_consumer(
+      framework::LifecycleEvent::ConsumerBeforeReleaseOwned,
+      "fit-shutdown-commit-a",
+      None,
+      None,
+    )
+    .await?;
+  let mut before_deregister = hooks
+    .arm_consumer(
+      framework::LifecycleEvent::ConsumerBeforeDeregisterMember,
+      "fit-shutdown-commit-a",
+      None,
+      None,
+    )
+    .await?;
+  let shutdown_task = tokio::spawn(async move { Box::new(consumer_a).shutdown().await });
+
+  timeout(Duration::from_secs(5), before_commit.wait_until_reached())
+    .await
+    .map_err(|_| anyhow::anyhow!("shutdown did not reach the final commit boundary"))??;
+  before_commit.release()?;
+  timeout(Duration::from_secs(5), commit_finished.wait_until_reached())
+    .await
+    .map_err(|_| anyhow::anyhow!("shutdown did not complete its failed final commit"))??;
+  let lease_after_failed_commit = cluster
+    .consumer_lease_store()
+    .list_group_leases(&topic, &group_id)
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == staged_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow::anyhow!("missing lease after failed final commit"))?;
+  assert!(
+    lease_after_failed_commit.committed_cursor.is_none(),
+    "failed shutdown commit advanced the durable cursor: {lease_after_failed_commit:?}"
+  );
+  commit_finished.release()?;
+
+  timeout(Duration::from_secs(5), before_release.wait_until_reached())
+    .await
+    .map_err(|_| {
+      anyhow::anyhow!("shutdown did not continue to lease release after commit failure")
+    })??;
+  let lease_before_release = cluster
+    .consumer_lease_store()
+    .list_group_leases(&topic, &group_id)
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == staged_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow::anyhow!("missing lease before shutdown release"))?;
+  assert_eq!(lease_before_release.owner_id, "fit-shutdown-commit-a");
+  assert!(lease_before_release.committed_cursor.is_none());
+  before_release.release()?;
+
+  timeout(
+    Duration::from_secs(5),
+    before_deregister.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow::anyhow!("shutdown did not continue to deregistration after release"))??;
+  let logical_now_ms = i64::try_from(consumer_time.now().unix_timestamp_nanos() / 1_000_000)?;
+  let released_lease = cluster
+    .consumer_lease_store()
+    .list_group_leases(&topic, &group_id)
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == staged_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow::anyhow!("missing released lease after failed final commit"))?;
+  assert!(
+    released_lease.lease_expiration_ts_ms <= logical_now_ms,
+    "shutdown did not release the lease after final commit failure: {released_lease:?}"
+  );
+  before_deregister.release()?;
+  let shutdown_error = shutdown_task
+    .await
+    .map_err(|error| anyhow::anyhow!("shutdown task failed: {error}"))?
+    .expect_err("shutdown must return the failed final checkpoint");
+  assert!(
+    shutdown_error
+      .to_string()
+      .contains("fail shutdown final checkpoint"),
+    "shutdown returned an unexpected final checkpoint error: {shutdown_error:#}"
+  );
+  assert_eq!(
+    controller
+      .events()
+      .await
+      .iter()
+      .filter(|event| {
+        event.operation == StoreFaultOperation::ConsumerHeartbeatPartition && event.action.is_some()
+      })
+      .count(),
+    1,
+    "shutdown did not consume exactly one final-checkpoint fault"
+  );
+  assert!(
+    cluster
+      .consumer_membership_store()
+      .list_active_members(&topic, &group_id, logical_now_ms)
+      .await?
+      .is_empty(),
+    "shutdown must deregister the member despite a failed final checkpoint"
+  );
+
+  let mut consumer_b = start_consumer_after_rebalance(
+    &cluster,
+    &runtime_b,
+    "fit-shutdown-commit-b",
+    &consumer_time,
+  )
+  .await?;
+  wait_for_member_to_own_group_leases(
+    &cluster,
+    &group_id,
+    "fit-shutdown-commit-b",
+    1,
+    "replacement did not acquire the released lease",
+  )
+  .await?;
+  let marker_id = "fit-shutdown-commit-marker";
+  let marker_ack = produce_message(&producer, key, marker_id).await?;
+  assert_eq!(
+    marker_ack.virtual_partition_id,
+    staged_ack.virtual_partition_id
+  );
+
+  let mut replacement_counts = HashMap::new();
+  let marker_offset = timeout(Duration::from_secs(5), async {
+    loop {
+      match timeout(Duration::from_millis(250), consumer_b.next()).await {
+        Err(_) => {
+          consumer_time.advance(TimeDuration::seconds(1));
+          tokio::task::yield_now().await;
+        },
+        Ok(Err(error)) => return Err(anyhow::anyhow!("replacement consumer next failed: {error}")),
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          *replacement_counts.entry(id.clone()).or_insert(0_usize) += 1;
+          if id != staged_id && id != marker_id {
+            return Err(anyhow::anyhow!(
+              "replacement delivered unexpected record: {id}"
+            ));
+          }
+          if id == staged_id {
+            assert_eq!(record.offset, staged_offset);
+          }
+          consumer_b.store_offset(record.virtual_partition_id, record.offset)?;
+          consumer_b.commit().await?;
+          if id == marker_id {
+            if replacement_counts.get(staged_id) != Some(&1) {
+              return Err(anyhow::anyhow!(
+                "replacement reached marker before exactly one staged-record recovery: \
+                 {replacement_counts:?}"
+              ));
+            }
+            return Ok::<_, anyhow::Error>(record.offset);
+          }
+        },
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("replacement did not drain the staged recovery and marker"))??;
+  assert_eq!(
+    replacement_counts,
+    HashMap::from([(staged_id.to_string(), 1), (marker_id.to_string(), 1)]),
+    "replacement must deliver the failed-checkpoint record exactly once: {replacement_counts:?}"
+  );
+
+  let replacement_lease = cluster
+    .consumer_lease_store()
+    .list_group_leases(&topic, &group_id)
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == marker_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow::anyhow!("missing replacement lease"))?;
+  assert!(
+    replacement_lease.owner_id == "fit-shutdown-commit-b"
+      && replacement_lease
+        .committed_cursor
+        .as_ref()
+        .is_some_and(|cursor| {
+          cursor.seq_end >= marker_offset && cursor.source_checkpoint.is_some()
+        }),
+    "replacement did not durably checkpoint recovered work: {replacement_lease:?}"
+  );
+
+  Box::new(consumer_b).shutdown().await?;
+  cluster.shutdown().await;
+  Ok(())
+}
+
+// High-level: validates a graceful shutdown release failure retains only the failed lease and
+// prevents a replacement from acquiring it until the original lease expires in logical time.
+#[tokio::test]
+async fn graceful_shutdown_release_fault_fences_replacement_until_expiry() -> Result<()> {
+  let consumer_time = Arc::new(ManualTimeProvider::new(OffsetDateTime::now_utc()));
+  let mut cluster = ClusterHarness::in_memory(1)
+    .partition_count(1)
+    .consumer_time_provider(consumer_time.clone())
+    .start()
+    .await?;
+  let runtime_a = consumer_runtime_config("fit-015-release-a");
+  let runtime_b = consumer_runtime_config("fit-015-release-b");
+  let group = runtime_a
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow::anyhow!("release-fault consumer group config missing"))?;
+  let group_id = group.group_id.to_string();
+  let topic = group.topic.to_string();
+  let hooks = cluster.lifecycle_hooks();
+
+  let consumer_a =
+    start_consumer_after_rebalance(&cluster, &runtime_a, "fit-015-release-a", &consumer_time)
+      .await?;
+  wait_for_member_to_own_group_leases(
+    &cluster,
+    &group_id,
+    "fit-015-release-a",
+    1,
+    "initial member did not acquire all group leases",
+  )
+  .await?;
+
+  let controller = cluster
+    .store_fault_controller()
+    .ok_or_else(|| anyhow::anyhow!("in-memory cluster missing store fault controller"))?;
+  controller
+    .enable_fault(StoreFaultRule {
+      domain: StoreFaultDomain::ConsumerLease,
+      operation: StoreFaultOperation::ConsumerReleasePartition,
+      key_pattern: None,
+      action: StoreFaultAction::Fail {
+        message: "release shutdown lease".to_string(),
+      },
+      remaining_hits: Some(1),
+    })
+    .await;
+
+  let mut before_release = hooks
+    .arm_consumer(
+      framework::LifecycleEvent::ConsumerBeforeReleaseOwned,
+      "fit-015-release-a",
+      None,
+      None,
+    )
+    .await?;
+  let shutdown_task = tokio::spawn(async move { Box::new(consumer_a).shutdown().await });
+  timeout(Duration::from_secs(5), before_release.wait_until_reached())
+    .await
+    .map_err(|_| anyhow::anyhow!("shutdown did not reach the release boundary"))??;
+
+  let leases_before_release = cluster
+    .consumer_lease_store()
+    .list_group_leases(&topic, &group_id)
+    .await?;
+  assert!(
+    leases_before_release
+      .iter()
+      .all(|lease| lease.owner_id == "fit-015-release-a"),
+    "release began before the shutdown boundary was released: {leases_before_release:?}"
+  );
+  before_release.release()?;
+  let shutdown_error = shutdown_task
+    .await
+    .map_err(|error| anyhow::anyhow!("release-fault shutdown task failed: {error}"))?
+    .expect_err("shutdown must report the injected release failure");
+  assert!(
+    shutdown_error
+      .to_string()
+      .contains("release shutdown lease"),
+    "shutdown returned an unexpected release failure: {shutdown_error:#}"
+  );
+
+  let logical_now_ms = i64::try_from(consumer_time.now().unix_timestamp_nanos() / 1_000_000)?;
+  let residual_leases = cluster
+    .consumer_lease_store()
+    .list_group_leases(&topic, &group_id)
+    .await?;
+  let held_leases = residual_leases
+    .iter()
+    .filter(|lease| {
+      lease.owner_id == "fit-015-release-a" && lease.lease_expiration_ts_ms > logical_now_ms
+    })
+    .collect::<Vec<_>>();
+  assert_eq!(
+    held_leases.len(),
+    1,
+    "one-shot release failure must retain exactly one unexpired A lease: {residual_leases:?}"
+  );
+  assert!(
+    cluster
+      .consumer_membership_store()
+      .list_active_members(&topic, &group_id, logical_now_ms)
+      .await?
+      .is_empty(),
+    "successful deregistration must remove A despite its release failure"
+  );
+  assert_eq!(
+    controller
+      .events()
+      .await
+      .iter()
+      .filter(|event| {
+        event.operation == StoreFaultOperation::ConsumerReleasePartition && event.action.is_some()
+      })
+      .count(),
+    1,
+    "shutdown did not consume exactly one release fault"
+  );
+
+  let mut consumer_b =
+    start_consumer_after_rebalance(&cluster, &runtime_b, "fit-015-release-b", &consumer_time)
+      .await?;
+  let held_partition = held_leases[0].key.virtual_partition_id;
+  let pre_expiry_lease = cluster
+    .consumer_lease_store()
+    .list_group_leases(&topic, &group_id)
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == held_partition)
+    .ok_or_else(|| anyhow::anyhow!("missing held lease before logical expiry"))?;
+  assert_eq!(
+    pre_expiry_lease.owner_id, "fit-015-release-a",
+    "replacement acquired the failed-release lease before logical expiry: {pre_expiry_lease:?}"
+  );
+
+  let mut post_expiry_rebalance = hooks
+    .arm_consumer(
+      framework::LifecycleEvent::ConsumerBeforeRebalance,
+      "fit-015-release-b",
+      None,
+      None,
+    )
+    .await?;
+  consumer_time.advance(TimeDuration::seconds(3));
+  consumer_b.commit().await?;
+  timeout(
+    Duration::from_secs(5),
+    post_expiry_rebalance.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow::anyhow!("replacement did not begin a post-expiry rebalance"))??;
+  post_expiry_rebalance.release()?;
+  wait_for_member_to_own_group_leases(
+    &cluster,
+    &group_id,
+    "fit-015-release-b",
+    1,
+    "replacement did not recover the failed-release lease after logical expiry",
+  )
+  .await?;
+  Box::new(consumer_b).shutdown().await?;
+  cluster.shutdown().await;
+  Ok(())
+}
+
+// High-level: validates a graceful shutdown deregistration failure preserves the active member
+// until logical expiry, so a replacement cannot take the whole group prematurely.
+#[tokio::test]
+async fn graceful_shutdown_deregistration_fault_requires_expiry_before_full_replacement_ownership()
+-> Result<()> {
+  let consumer_time = Arc::new(ManualTimeProvider::new(OffsetDateTime::now_utc()));
+  let mut cluster = ClusterHarness::in_memory(1)
+    .partition_count(1)
+    .consumer_time_provider(consumer_time.clone())
+    .start()
+    .await?;
+  let runtime_a = consumer_runtime_config("fit-015-deregister-a");
+  let runtime_b = consumer_runtime_config("fit-015-deregister-b");
+  let group = runtime_a
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow::anyhow!("deregistration-fault consumer group config missing"))?;
+  let group_id = group.group_id.to_string();
+  let topic = group.topic.to_string();
+  let hooks = cluster.lifecycle_hooks();
+
+  let consumer_a =
+    start_consumer_after_rebalance(&cluster, &runtime_a, "fit-015-deregister-a", &consumer_time)
+      .await?;
+  wait_for_member_to_own_group_leases(
+    &cluster,
+    &group_id,
+    "fit-015-deregister-a",
+    1,
+    "initial member did not acquire all group leases",
+  )
+  .await?;
+
+  let controller = cluster
+    .store_fault_controller()
+    .ok_or_else(|| anyhow::anyhow!("in-memory cluster missing store fault controller"))?;
+  controller
+    .enable_fault(StoreFaultRule {
+      domain: StoreFaultDomain::ConsumerLease,
+      operation: StoreFaultOperation::ConsumerDeregisterMember,
+      key_pattern: Some(format!("{topic}#{group_id}#fit-015-deregister-a")),
+      action: StoreFaultAction::Fail {
+        message: "deregister shutdown member".to_string(),
+      },
+      remaining_hits: Some(1),
+    })
+    .await;
+
+  let mut before_deregister = hooks
+    .arm_consumer(
+      framework::LifecycleEvent::ConsumerBeforeDeregisterMember,
+      "fit-015-deregister-a",
+      None,
+      None,
+    )
+    .await?;
+  let shutdown_task = tokio::spawn(async move { Box::new(consumer_a).shutdown().await });
+  timeout(
+    Duration::from_secs(5),
+    before_deregister.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow::anyhow!("shutdown did not reach the deregistration boundary"))??;
+
+  let logical_now_ms = i64::try_from(consumer_time.now().unix_timestamp_nanos() / 1_000_000)?;
+  let leases_before_deregister = cluster
+    .consumer_lease_store()
+    .list_group_leases(&topic, &group_id)
+    .await?;
+  assert!(
+    leases_before_deregister
+      .iter()
+      .all(|lease| lease.lease_expiration_ts_ms <= logical_now_ms),
+    "all leases must release before deregistration begins: {leases_before_deregister:?}"
+  );
+  before_deregister.release()?;
+  shutdown_task
+    .await
+    .map_err(|error| anyhow::anyhow!("deregistration-fault shutdown task failed: {error}"))??;
+
+  assert_eq!(
+    cluster
+      .consumer_membership_store()
+      .list_active_members(&topic, &group_id, logical_now_ms)
+      .await?,
+    vec!["fit-015-deregister-a".to_string()],
+    "one-shot deregistration failure must leave A active until its lease expires"
+  );
+  assert_eq!(
+    controller
+      .events()
+      .await
+      .iter()
+      .filter(|event| {
+        event.operation == StoreFaultOperation::ConsumerDeregisterMember && event.action.is_some()
+      })
+      .count(),
+    1,
+    "shutdown did not consume exactly one deregistration fault"
+  );
+
+  let consumer_b =
+    start_consumer_after_rebalance(&cluster, &runtime_b, "fit-015-deregister-b", &consumer_time)
+      .await?;
+  let members_before_expiry = cluster
+    .consumer_membership_store()
+    .list_active_members(&topic, &group_id, logical_now_ms)
+    .await?;
+  assert_eq!(
+    members_before_expiry,
+    vec![
+      "fit-015-deregister-a".to_string(),
+      "fit-015-deregister-b".to_string(),
+    ],
+    "replacement must observe the residual member before logical expiry"
+  );
+  let leases_before_expiry = cluster
+    .consumer_lease_store()
+    .list_group_leases(&topic, &group_id)
+    .await?;
+  assert!(
+    leases_before_expiry
+      .iter()
+      .any(|lease| lease.owner_id != "fit-015-deregister-b"),
+    "replacement took the complete group while the failed deregistration remained active: \
+     {leases_before_expiry:?}"
+  );
+
+  consumer_time.advance(TimeDuration::seconds(3));
+  wait_for_member_to_own_group_leases(
+    &cluster,
+    &group_id,
+    "fit-015-deregister-b",
+    1,
+    "replacement did not recover complete group ownership after member expiry",
+  )
+  .await?;
+  Box::new(consumer_b).shutdown().await?;
+  cluster.shutdown().await;
+  Ok(())
+}
+
 // High-level: validates bootstrap consumer rebalance converges under transient membership and
 // consumer-lease faults while preserving the full consumed record set.
 #[tokio::test]
 async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
   let resources = IntegrationResources::create().await?;
-  let consumer_time = Arc::new(ManualTimeProvider::new(OffsetDateTime::now_utc()));
   let mut cluster = ClusterHarness::builder(&resources, 1)
     .in_memory_transport()
-    .consumer_time_provider(consumer_time.clone())
     .start()
     .await?;
 
@@ -1822,8 +2843,17 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
     .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
-  let runtime_a = consumer_runtime_config("fit-015-a");
-  let runtime_b = consumer_runtime_config("fit-015-b");
+  let mut runtime_a = consumer_runtime_config("fit-015-a");
+  let mut runtime_b = consumer_runtime_config("fit-015-b");
+  // Keep the lease horizon above the complete transient-failure script so all seven faults
+  // exercise retry convergence rather than escalating into unintended member expiry.
+  for runtime in [&mut runtime_a, &mut runtime_b] {
+    let group = runtime
+      .group
+      .as_mut()
+      .ok_or_else(|| anyhow::anyhow!("fit-015 consumer group config missing"))?;
+    group.lease_duration_ms = Some(10_000);
+  }
   let group = runtime_a
     .group
     .as_ref()
@@ -1836,34 +2866,44 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
     .enable_fault(StoreFaultRule {
       domain: StoreFaultDomain::ConsumerLease,
       operation: StoreFaultOperation::ConsumerPublishAssignmentPlan,
-      key_pattern: None,
+      key_pattern: Some(format!("{TOPIC}#integration-group#fit-015-a")),
       action: StoreFaultAction::Fail {
         message: "transient planner publication failure".to_string(),
       },
       remaining_hits: Some(1),
     })
     .await;
+  let fault_matcher = TestEventMatcher {
+    category: Some("store".to_string()),
+    operation: None,
+    key_contains: None,
+    status: Some("fault_applied".to_string()),
+  };
+  let expected_fault_counts = HashMap::from([
+    ("consumer_publish_assignment_plan".to_string(), 1_usize),
+    ("consumer_assign_partition".to_string(), 2_usize),
+    ("consumer_heartbeat_partition".to_string(), 2_usize),
+    ("consumer_membership_heartbeat".to_string(), 2_usize),
+  ]);
+
+  // The planner failure establishes the rebalance retry before the lease and heartbeat failures
+  // become eligible. This keeps the recovery path causal rather than scheduler-dependent.
   consumer_a.start()?;
   consumer_b.start()?;
-
-  let planner_fault_event = cluster
-    .wait_for_event(
-      &TestEventMatcher {
-        category: Some("store".to_string()),
-        operation: Some("consumer_publish_assignment_plan".to_string()),
-        key_contains: None,
-        status: Some("fault_applied".to_string()),
-      },
-      Duration::from_secs(3),
-    )
+  let planner_fault = cluster
+    .wait_for_event_after(&fault_matcher, None, Duration::from_secs(10))
     .await?;
+  assert_eq!(
+    planner_fault.operation, "consumer_publish_assignment_plan",
+    "expected the planner fault before enabling later recovery faults: {planner_fault:?}"
+  );
 
   resources
     .store_fault_controller()
     .enable_fault(StoreFaultRule {
       domain: StoreFaultDomain::ConsumerLease,
       operation: StoreFaultOperation::ConsumerAssignPartition,
-      key_pattern: None,
+      key_pattern: Some(format!("{TOPIC}#integration-group#8")),
       action: StoreFaultAction::Fail {
         message: "transient assign failure".to_string(),
       },
@@ -1875,7 +2915,7 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
     .enable_fault(StoreFaultRule {
       domain: StoreFaultDomain::ConsumerLease,
       operation: StoreFaultOperation::ConsumerHeartbeatPartition,
-      key_pattern: None,
+      key_pattern: Some(format!("{TOPIC}#integration-group#8")),
       action: StoreFaultAction::Fail {
         message: "transient heartbeat failure".to_string(),
       },
@@ -1887,13 +2927,40 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
     .enable_fault(StoreFaultRule {
       domain: StoreFaultDomain::ConsumerLease,
       operation: StoreFaultOperation::ConsumerMembershipHeartbeat,
-      key_pattern: None,
+      key_pattern: Some(format!("{TOPIC}#integration-group#fit-015-a")),
       action: StoreFaultAction::Fail {
         message: "transient membership heartbeat failure".to_string(),
       },
       remaining_hits: Some(2),
     })
     .await;
+
+  let mut observed_fault_counts =
+    HashMap::from([("consumer_publish_assignment_plan".to_string(), 1_usize)]);
+  let mut previous_fault_sequence = Some(planner_fault.sequence);
+  while observed_fault_counts != expected_fault_counts {
+    let fault = cluster
+      .wait_for_event_after(
+        &fault_matcher,
+        previous_fault_sequence,
+        Duration::from_secs(10),
+      )
+      .await?;
+    let Some(expected_count) = expected_fault_counts.get(&fault.operation) else {
+      return Err(anyhow::anyhow!(
+        "unexpected store fault during consumer recovery: {fault:?}"
+      ));
+    };
+    let observed_count = observed_fault_counts
+      .entry(fault.operation.clone())
+      .or_insert(0_usize);
+    *observed_count += 1;
+    assert!(
+      *observed_count <= *expected_count,
+      "consumer fault exceeded its scripted budget: {fault:?}"
+    );
+    previous_fault_sequence = Some(fault.sequence);
+  }
 
   let mut expected_ids = HashSet::new();
   for message_id in 0 .. 24 {
@@ -1912,32 +2979,27 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
   let mut max_offsets = HashMap::<u32, u64>::new();
   timeout(Duration::from_secs(12), async {
     while delivered_id_counts.len() < expected_ids.len() {
-      consumer_time.advance(TimeDuration::seconds(1));
-      tokio::task::yield_now().await;
+      let (consumer, next_result) = tokio::select! {
+        result = consumer_a.next() => (&mut consumer_a, result),
+        result = consumer_b.next() => (&mut consumer_b, result),
+      };
 
-      for consumer in [&mut consumer_a, &mut consumer_b] {
-        let next = timeout(Duration::from_millis(250), consumer.next()).await;
-        let Ok(Ok(next_result)) = next else {
-          continue;
-        };
+      match next_result? {
+        NextResult::Revoked(revoked) => {
+          saw_revocation = true;
+          revoked.complete().await;
+        },
+        NextResult::Record(record) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          max_offsets
+            .entry(record.virtual_partition_id)
+            .and_modify(|offset| *offset = (*offset).max(record.offset))
+            .or_insert(record.offset);
+          *delivered_id_counts.entry(id).or_insert(0_usize) += 1;
 
-        match next_result {
-          NextResult::Revoked(revoked) => {
-            saw_revocation = true;
-            revoked.complete().await;
-          },
-          NextResult::Record(record) => {
-            let id = String::from_utf8(record.record.payload.to_vec())?;
-            max_offsets
-              .entry(record.virtual_partition_id)
-              .and_modify(|offset| *offset = (*offset).max(record.offset))
-              .or_insert(record.offset);
-            *delivered_id_counts.entry(id).or_insert(0_usize) += 1;
-
-            consumer.store_offset(record.virtual_partition_id, record.offset)?;
-            consumer.commit().await?;
-          },
-        }
+          consumer.store_offset(record.virtual_partition_id, record.offset)?;
+          consumer.commit().await?;
+        },
       }
     }
     Ok::<_, anyhow::Error>(())
@@ -1989,16 +3051,24 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
   assert!(
     event_trace.iter().all(|event| {
       event.status != "fault_applied"
-        || event.sequence <= planner_fault_event.sequence
         || matches!(
           event.operation.as_str(),
-          "consumer_assign_partition"
+          "consumer_publish_assignment_plan"
+            | "consumer_assign_partition"
             | "consumer_heartbeat_partition"
             | "consumer_membership_heartbeat"
         )
     }),
     "unexpected fault after planner phase: {event_trace:?}"
   );
+
+  wait_for_group_offsets_committed(
+    &cluster,
+    group.group_id.as_str(),
+    &max_offsets,
+    "faulted consumers did not durably commit every observed delivery",
+  )
+  .await?;
 
   let leases = cluster
     .consumer_lease_store()
@@ -2009,7 +3079,7 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
     .list_active_members(
       group.topic.as_str(),
       group.group_id.as_str(),
-      consumer_time.now().unix_timestamp() * 1_000,
+      OffsetDateTime::now_utc().unix_timestamp() * 1_000,
     )
     .await?;
   assert_eq!(leases.len(), PARTITION_COUNT as usize);
