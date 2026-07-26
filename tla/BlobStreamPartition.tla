@@ -6,12 +6,13 @@ EXTENDS Naturals, TLC
   partition. It is a learning model, not a line-for-line implementation of the
   Rust services.
 
-  Stage 1 models the producer-side safety boundary:
+  Stage 2 models the producer-side safety boundary:
 
     acquire producer lease -> reserve a Hi-Lo block -> accept one batch
+      -> persist blob -> publish metadata -> acknowledge producer
 
-  It leaves out blob/metadata publication and readers for now. Those stages
-  will be added only after TLC exhaustively checks this smaller state machine.
+  It leaves out readers for now. The next stage will add a deliberately small
+  reader model after TLC exhaustively checks this producer state machine.
 
   A TLA+ module describes all permitted states and transitions. TLC starts at
   Init and explores every possible Next transition within the finite constants
@@ -68,6 +69,10 @@ RangeValues(range) == range[1] .. range[2]
   reservedBy          broker that durably reserved this batch's sequence range.
   reservedRange       the durable sequence range, or Null before reservation.
   acceptedLeaseTerm   lease term observed when the batch was accepted.
+  blobPhase           NotUploaded or Uploaded for each accepted batch's blob.
+  metadataPhase       NotPublished or Published for each batch's metadata row.
+  metadataPublishedBy broker that wrote the metadata row, or Null before it.
+  acknowledgementPhase NotAcknowledged or Acknowledged for the producer reply.
 
   A real broker can allocate many batches from one large reservation. This
   introductory model assigns one symbolic batch per reservation so the first
@@ -86,7 +91,11 @@ VARIABLES
   batchPhase,
   reservedBy,
   reservedRange,
-  acceptedLeaseTerm
+  acceptedLeaseTerm,
+  blobPhase,
+  metadataPhase,
+  metadataPublishedBy,
+  acknowledgementPhase
 
 vars == <<
   now,
@@ -100,7 +109,11 @@ vars == <<
   batchPhase,
   reservedBy,
   reservedRange,
-  acceptedLeaseTerm
+  acceptedLeaseTerm,
+  blobPhase,
+  metadataPhase,
+  metadataPublishedBy,
+  acknowledgementPhase
 >>
 
 (*******************************************************************************
@@ -134,6 +147,10 @@ Init ==
   /\ reservedBy = [batch \in Batches |-> Null]
   /\ reservedRange = [batch \in Batches |-> Null]
   /\ acceptedLeaseTerm = [batch \in Batches |-> Null]
+  /\ blobPhase = [batch \in Batches |-> "NotUploaded"]
+  /\ metadataPhase = [batch \in Batches |-> "NotPublished"]
+  /\ metadataPublishedBy = [batch \in Batches |-> Null]
+  /\ acknowledgementPhase = [batch \in Batches |-> "NotAcknowledged"]
 
 (*******************************************************************************
   AcquireOrRenewLease models the conditional durable lease mutation.
@@ -155,7 +172,8 @@ AcquireOrRenewLease(broker) ==
   /\ leaseExpiresAt' = now + LeaseDuration
   /\ leaseTerm' = NextLeaseTerm(broker)
   /\ UNCHANGED <<now, highWater, previousHighWater, brokerAlive, brokerIncarnation, batchPhase,
-                 reservedBy, reservedRange, acceptedLeaseTerm>>
+                 reservedBy, reservedRange, acceptedLeaseTerm, blobPhase, metadataPhase,
+                 metadataPublishedBy, acknowledgementPhase>>
 
 (*******************************************************************************
   ReserveRange models the atomic lease-store operation that advances the durable
@@ -179,7 +197,8 @@ ReserveRange(broker, batch) ==
   /\ reservedBy' = [reservedBy EXCEPT ![batch] = broker]
   /\ reservedRange' = [reservedRange EXCEPT ![batch] = <<highWater + 1, highWater + ReservationSize>>]
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, brokerAlive, brokerIncarnation,
-                 acceptedLeaseTerm>>
+                 acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy,
+                 acknowledgementPhase>>
 
 (*******************************************************************************
   AcceptBatch models the broker's in-memory transition from an allocated range
@@ -199,7 +218,64 @@ AcceptBatch(broker, batch) ==
   /\ batchPhase' = [batchPhase EXCEPT ![batch] = "Accepted"]
   /\ acceptedLeaseTerm' = [acceptedLeaseTerm EXCEPT ![batch] = leaseTerm]
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
-                 brokerAlive, brokerIncarnation, reservedBy, reservedRange>>
+                 brokerAlive, brokerIncarnation, reservedBy, reservedRange, blobPhase,
+                 metadataPhase, metadataPublishedBy, acknowledgementPhase>>
+
+(*******************************************************************************
+  UploadBlob is the first durable publication step. A broker may persist work
+  only after it accepted the work while holding a valid lease. Requiring the
+  original accepting broker keeps this model's initial publication path narrow;
+  a future retry/handoff refinement can introduce explicit transfer semantics.
+*******************************************************************************)
+UploadBlob(broker, batch) ==
+  /\ broker \in Brokers
+  /\ batch \in Batches
+  /\ brokerAlive[broker]
+  /\ batchPhase[batch] = "Accepted"
+  /\ reservedBy[batch] = broker
+  /\ blobPhase[batch] = "NotUploaded"
+  /\ blobPhase' = [blobPhase EXCEPT ![batch] = "Uploaded"]
+  /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
+                 brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
+                 acceptedLeaseTerm, metadataPhase, metadataPublishedBy, acknowledgementPhase>>
+
+(*******************************************************************************
+  PublishMetadata records the second durable publication step. Its intentionally
+  absent ValidLease guard models the documented limitation: an alive broker that
+  accepted and uploaded work before losing its lease may later write metadata.
+  The stale-writer witness will make this permitted ordering visible to a reader.
+*******************************************************************************)
+PublishMetadata(broker, batch) ==
+  /\ broker \in Brokers
+  /\ batch \in Batches
+  /\ brokerAlive[broker]
+  /\ batchPhase[batch] = "Accepted"
+  /\ reservedBy[batch] = broker
+  /\ blobPhase[batch] = "Uploaded"
+  /\ metadataPhase[batch] = "NotPublished"
+  /\ metadataPhase' = [metadataPhase EXCEPT ![batch] = "Published"]
+  /\ metadataPublishedBy' = [metadataPublishedBy EXCEPT ![batch] = broker]
+  /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
+                 brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
+                 acceptedLeaseTerm, blobPhase, acknowledgementPhase>>
+
+(*******************************************************************************
+  AcknowledgeProducer models successful completion of the broker's flush path.
+  It happens only after the metadata row is durable. The acknowledgement is
+  tracked separately because a future reader can observe metadata before the
+  producer receives its RPC response.
+*******************************************************************************)
+AcknowledgeProducer(broker, batch) ==
+  /\ broker \in Brokers
+  /\ batch \in Batches
+  /\ brokerAlive[broker]
+  /\ metadataPhase[batch] = "Published"
+  /\ metadataPublishedBy[batch] = broker
+  /\ acknowledgementPhase[batch] = "NotAcknowledged"
+  /\ acknowledgementPhase' = [acknowledgementPhase EXCEPT ![batch] = "Acknowledged"]
+  /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
+                 brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
+                 acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy>>
 
 (*******************************************************************************
   AdvanceTime is the only action that changes logical time. It never changes a
@@ -212,7 +288,8 @@ AdvanceTime ==
   /\ now' = now + 1
   /\ previousHighWater' = highWater
   /\ UNCHANGED <<leaseHolder, leaseExpiresAt, leaseTerm, highWater, brokerAlive,
-                 brokerIncarnation, batchPhase, reservedBy, reservedRange, acceptedLeaseTerm>>
+                 brokerIncarnation, batchPhase, reservedBy, reservedRange, acceptedLeaseTerm,
+                 blobPhase, metadataPhase, metadataPublishedBy, acknowledgementPhase>>
 
 (*******************************************************************************
   CrashBroker and RestartBroker are process-local events. A crash does not erase
@@ -225,7 +302,8 @@ CrashBroker(broker) ==
   /\ brokerAlive' = [brokerAlive EXCEPT ![broker] = FALSE]
   /\ previousHighWater' = highWater
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, brokerIncarnation,
-                 batchPhase, reservedBy, reservedRange, acceptedLeaseTerm>>
+                 batchPhase, reservedBy, reservedRange, acceptedLeaseTerm, blobPhase,
+                 metadataPhase, metadataPublishedBy, acknowledgementPhase>>
 
 RestartBroker(broker) ==
   /\ broker \in Brokers
@@ -235,7 +313,8 @@ RestartBroker(broker) ==
   /\ brokerIncarnation' = [brokerIncarnation EXCEPT ![broker] = @ + 1]
   /\ previousHighWater' = highWater
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, batchPhase, reservedBy,
-                 reservedRange, acceptedLeaseTerm>>
+                 reservedRange, acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy,
+                 acknowledgementPhase>>
 
 (*******************************************************************************
   ReleaseLease represents a graceful producer handoff. It can only be performed
@@ -250,7 +329,8 @@ ReleaseLease(broker) ==
   /\ leaseExpiresAt' = now
   /\ previousHighWater' = highWater
   /\ UNCHANGED <<now, leaseTerm, highWater, brokerAlive, brokerIncarnation, batchPhase,
-                 reservedBy, reservedRange, acceptedLeaseTerm>>
+                 reservedBy, reservedRange, acceptedLeaseTerm, blobPhase, metadataPhase,
+                 metadataPublishedBy, acknowledgementPhase>>
 
 (*******************************************************************************
   BoundedScenarioIsComplete is a test-model condition, not a blob-stream
@@ -279,6 +359,9 @@ Next ==
   \/ \E broker \in Brokers : AcquireOrRenewLease(broker)
   \/ \E broker \in Brokers : \E batch \in Batches : ReserveRange(broker, batch)
   \/ \E broker \in Brokers : \E batch \in Batches : AcceptBatch(broker, batch)
+  \/ \E broker \in Brokers : \E batch \in Batches : UploadBlob(broker, batch)
+  \/ \E broker \in Brokers : \E batch \in Batches : PublishMetadata(broker, batch)
+  \/ \E broker \in Brokers : \E batch \in Batches : AcknowledgeProducer(broker, batch)
   \/ AdvanceTime
   \/ \E broker \in Brokers : CrashBroker(broker)
   \/ \E broker \in Brokers : RestartBroker(broker)
@@ -316,6 +399,10 @@ TypeOK ==
   /\ reservedBy \in [Batches -> (Brokers \cup {Null})]
   /\ reservedRange \in [Batches -> (SequenceRange \cup {Null})]
   /\ acceptedLeaseTerm \in [Batches -> (Nat \cup {Null})]
+  /\ blobPhase \in [Batches -> {"NotUploaded", "Uploaded"}]
+  /\ metadataPhase \in [Batches -> {"NotPublished", "Published"}]
+  /\ metadataPublishedBy \in [Batches -> (Brokers \cup {Null})]
+  /\ acknowledgementPhase \in [Batches -> {"NotAcknowledged", "Acknowledged"}]
 
 (*******************************************************************************
   LeaseFencing states the key producer-side rule: every Reserved or Accepted
@@ -355,6 +442,38 @@ AcceptedBatchesWereReserved ==
   \A batch \in Batches :
     batchPhase[batch] = "Accepted" =>
       /\ reservedRange[batch] \in SequenceRange
+      /\ acceptedLeaseTerm[batch] \in Nat \ {0}
+
+(*******************************************************************************
+  BlobBeforeMetadata captures the first production ordering edge: a metadata
+  row cannot name a segment until the segment blob is durable. It is independent
+  of whether the producer reply has been sent.
+*******************************************************************************)
+BlobBeforeMetadata ==
+  \A batch \in Batches :
+    metadataPhase[batch] = "Published" =>
+      blobPhase[batch] = "Uploaded"
+
+(*******************************************************************************
+  MetadataBeforeAcknowledgement captures the second production ordering edge.
+  A successful producer acknowledgement means the metadata row already exists.
+*******************************************************************************)
+MetadataBeforeAcknowledgement ==
+  \A batch \in Batches :
+    acknowledgementPhase[batch] = "Acknowledged" =>
+      metadataPhase[batch] = "Published"
+
+(*******************************************************************************
+  PublishedMetadataHasAcceptanceProvenance makes the publisher and original
+  accepted range explicit. This does not require the publisher to still own the
+  lease: that missing publication fence is intentionally modeled for the later
+  stale-writer witness.
+*******************************************************************************)
+PublishedMetadataHasAcceptanceProvenance ==
+  \A batch \in Batches :
+    metadataPhase[batch] = "Published" =>
+      /\ batchPhase[batch] = "Accepted"
+      /\ metadataPublishedBy[batch] = reservedBy[batch]
       /\ acceptedLeaseTerm[batch] \in Nat \ {0}
 
 =============================================================================

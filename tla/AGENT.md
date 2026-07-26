@@ -9,8 +9,9 @@ not as a transcription of Rust control flow.
 - Read `README.md`, the comments around the action or invariant you will touch,
   and the relevant product contract in `../DESIGN.md`.
 - Preserve the current model boundary unless the task explicitly expands it:
-  one virtual partition, bounded brokers/batches/time, and producer lease plus
-  Hi-Lo safety before publication or reader behavior.
+  one virtual partition, bounded brokers/batches/time, producer lease and
+  Hi-Lo safety, and blob-to-metadata-to-acknowledgement publication ordering.
+  Reader behavior remains outside the current model.
 - Keep documented limitations explicit. The planned stale-writer publication and
   eventually-consistent metadata-loss paths are expected witness behaviors, not
   invariants to disprove.

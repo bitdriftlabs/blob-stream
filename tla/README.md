@@ -14,12 +14,13 @@ The first model is deliberately narrower than the service:
 - Up to two broker identities.
 - A small number of symbolic batches.
 - Producer lease acquisition, Hi-Lo reservation, batch acceptance, crash,
-  restart, release, and logical time.
+   restart, release, blob persistence, metadata publication, producer
+   acknowledgement, and logical time.
 
-It does **not** initially model producer batching, compression, S3 range reads,
-consumer coordination, partition assignment, retries, or multiple partitions.
-Each omitted area can be added later only if it changes an invariant we want to
-check.
+It does **not** yet model reader observation, producer batching, compression,
+S3 range reads, consumer coordination, partition assignment, retries, or
+multiple partitions. Each omitted area can be added later only if it changes an
+invariant we want to check.
 
 The configuration also bounds logical time, lease terms, and process
 incarnations. Those bounds are not production limits. They make the state space
@@ -95,6 +96,31 @@ contract as the producer lease store and broker allocation path:
 - A crash does not erase durable state; restart changes only process-local state.
 - Sequence gaps are legal. Sequence reuse is not.
 
+## Stage 2: Producer Publication Ordering
+
+Stage 2 extends each accepted batch through the broker's durable flush order:
+
+```text
+Accepted -> blob uploaded -> metadata published -> producer acknowledged
+```
+
+This reflects the order in
+[blob-stream-broker/src/write/flush.rs](../blob-stream-broker/src/write/flush.rs):
+the broker stores the segment blob, writes the metadata row naming that blob,
+then completes the successful flush that permits a producer response.
+
+The model uses four separate per-batch state values instead of replacing
+`Accepted` with one larger phase enum. Keeping acceptance and each publication
+step separate makes their distinct causal roles visible in an invariant and will
+let the next reader stage observe metadata before a producer acknowledgement.
+
+`PublishMetadata` intentionally does **not** require `ValidLease(broker)`. The
+broker did hold a valid lease when it accepted the batch, but the production
+design does not transactionally fence the later metadata write. An alive former
+holder may therefore publish its already uploaded batch after its lease expires.
+This is the precisely scoped behavior needed for the documented stale-writer
+witness; it is not a claim that accepting new work without a lease is allowed.
+
 The model maps most directly to
 [blob-stream-metadata-store/src/lib.rs](../blob-stream-metadata-store/src/lib.rs)
 and [blob-stream-broker/src/write/engine.rs](../blob-stream-broker/src/write/engine.rs).
@@ -110,6 +136,9 @@ and [blob-stream-broker/src/write/engine.rs](../blob-stream-broker/src/write/eng
 | `CrashBroker` | Broker is alive. | Broker stops initiating work; durable state remains. | Process crash or long pause. |
 | `RestartBroker` | Broker is stopped. | Broker becomes alive with a new process incarnation. | Restart after crash. |
 | `ReleaseLease` | Current valid holder releases gracefully. | Lease becomes unowned immediately. | Drained handoff/shutdown. |
+| `UploadBlob` | Accepting broker is alive and its batch is not uploaded. | The batch's blob becomes durable. | Segment blob-store write. |
+| `PublishMetadata` | Accepting broker is alive and its blob is uploaded. | Durable metadata is written with publisher provenance. | Metadata-store write; deliberately not publication-fenced. |
+| `AcknowledgeProducer` | Publishing broker is alive and metadata exists. | Batch receives successful acknowledgement. | Successful flush permits the producer RPC response. |
 | `Quiescent` | Logical time reached the bounded model horizon. | No model variable changes. | Completed test scenario, not a production operation. |
 
 ### Invariants
@@ -120,14 +149,20 @@ and [blob-stream-broker/src/write/engine.rs](../blob-stream-broker/src/write/eng
 - `HighWaterNeverRegresses`: a future action cannot silently decrease high-water.
 - `ReservationsDoNotOverlap`: no two durable allocations reuse a sequence value.
 - `AcceptedBatchesWereReserved`: accepted work has a durable range and lease term.
+- `BlobBeforeMetadata`: published metadata always names a durable blob.
+- `MetadataBeforeAcknowledgement`: an acknowledged batch already has metadata.
+- `PublishedMetadataHasAcceptanceProvenance`: published metadata belongs to an
+   accepted batch and retains its accepting broker and lease-term evidence.
 
 ## What Comes Next
 
-The next refinement adds blob persistence, metadata publication, and producer
-acknowledgement. It will preserve `blob before metadata before acknowledgement`.
+The next refinement adds a minimal reader cursor. It will first make the
+stale-writer publication limitation concrete: a former holder publishes a lower
+range after the reader already advances through a higher range.
 
-After that, the model will deliberately add the two accepted loss conditions from
-the design:
+After that, the model will add the Fast reader's bounded metadata-observation
+horizon and deliberately reproduce the two accepted loss conditions from the
+design:
 
 1. A broker can publish metadata for already accepted work after its producer
    lease has expired and a successor has published higher sequences.
@@ -135,10 +170,11 @@ the design:
    metadata scan omits an earlier row, then cursor/frontier advancement prevents
    recovery of that earlier row.
 
-Those paths will be separate TLC witness configurations. They are expected to be
-reachable and will not be treated as invariant failures. The model will still
-check the residual guarantees, such as non-overlapping reservations,
-blob-before-metadata, and non-regressing cursors.
+Those paths will use separate TLC witness configurations. Each witness will
+first pass residual invariants, then intentionally fail one named no-loss
+invariant so TLC prints a trace. Ordinary configurations will continue to check
+residual guarantees and reject any permanent loss that is not explicitly
+classified as one of these two accepted causes.
 
 ## Deadlock And Stuttering
 
