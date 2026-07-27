@@ -7,9 +7,9 @@ use blob_stream_broker_discovery::BrokerDiscovery;
 use blob_stream_consumer::{
   ConsumerBootstrapConfig,
   ConsumerBootstrapIteratorBuilder,
-  ConsumerConfigFactory,
   ConsumerIterator,
   ConsumerIteratorImpl,
+  ConsumerPartitionReadMode,
   ConsumerReadConfig,
   ConsumerReaderImpl,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
@@ -24,6 +24,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupCommitOutcome,
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
+  InMemoryMetadataStore,
   MetadataStore,
   SegmentMetadata,
 };
@@ -63,7 +64,6 @@ use framework::{
   append_reader_delivery_traces,
   consumer_bootstrap_config,
   consumer_runtime_config,
-  drain_reader_until,
   drain_reader_until_with_trace,
   now_unix_seconds,
   produce_message,
@@ -72,16 +72,17 @@ use framework::{
   producer_config_with_writer_id,
   producer_topic,
   producer_topic_named,
+  producer_topic_named_with_partition_count,
   producer_topic_named_with_writers,
   reader_delivery_counts,
 };
 use protobuf::Message;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::sync::{Barrier, Mutex, mpsc, oneshot, watch};
+use tokio::sync::{Barrier, Mutex, Notify, mpsc, oneshot, watch};
 use tokio::time::{Instant, timeout};
 
 fn metrics_scope(component: &str) -> bd_server_stats::stats::Scope {
@@ -96,6 +97,58 @@ async fn new_producer(
 ) -> Result<ProducerClientImpl> {
   let transport = Arc::new(GrpcBrokerTransport::new(config.clone()));
   ProducerClientImpl::new(config, topics, discovery, transport, metrics_scope).await
+}
+
+async fn produce_message_at_manual_time(
+  cluster: &ClusterHarness,
+  producer: &Arc<ProducerClientImpl>,
+  manual_time: &framework::ManualTimeProvider,
+  key: Vec<u8>,
+  id: &str,
+) -> Result<blob_stream_producer::ProducerAck> {
+  let event_timestamp_ms = manual_time.now().unix_timestamp_ms();
+  let payload = id.as_bytes().to_vec();
+  let producer = Arc::clone(producer);
+  let produce_task = tokio::spawn(async move {
+    producer
+      .produce(ProducerRecord::new(
+        TOPIC.into(),
+        key,
+        payload.into(),
+        event_timestamp_ms,
+      ))
+      .await
+  });
+
+  timeout(Duration::from_secs(5), async {
+    loop {
+      let buffered = cluster
+        .broker_state_snapshots()
+        .await
+        .iter()
+        .any(|snapshot| {
+          snapshot.topics.iter().any(|topic| {
+            topic
+              .local_partitions
+              .iter()
+              .any(|partition| partition.buffered_batch_count > 0)
+          })
+        });
+      if buffered {
+        return Ok::<_, anyhow::Error>(());
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("producer request did not enter the broker buffer"))??;
+  manual_time.advance(TimeDuration::seconds(60));
+
+  Ok(
+    produce_task
+      .await
+      .map_err(|error| anyhow!("manual-time producer task join error: {error}"))??,
+  )
 }
 
 async fn write_recovery_segment(
@@ -223,6 +276,74 @@ impl MetadataStore for DelayedVisibilityMetadataStore {
       .inner
       .scan_window_from_snowflake(window, min_snowflake)
       .await
+  }
+}
+
+struct DeferredWindowVisibilityMetadataStore {
+  inner: Arc<dyn MetadataStore>,
+  deferred_window_start: Arc<AtomicI64>,
+  held_visibility_timestamp_ms: i64,
+  visibility_held: AtomicBool,
+  deferred_window_scanned: AtomicBool,
+  deferred_window_scan: Notify,
+}
+
+impl DeferredWindowVisibilityMetadataStore {
+  fn new(
+    inner: Arc<dyn MetadataStore>,
+    deferred_window_start: Arc<AtomicI64>,
+    held_visibility_timestamp_ms: i64,
+  ) -> Self {
+    Self {
+      inner,
+      deferred_window_start,
+      held_visibility_timestamp_ms,
+      visibility_held: AtomicBool::new(true),
+      deferred_window_scanned: AtomicBool::new(false),
+      deferred_window_scan: Notify::new(),
+    }
+  }
+
+  fn release_visibility(&self) {
+    self.visibility_held.store(false, Ordering::Release);
+  }
+
+  async fn wait_until_deferred_window_scanned(&self) {
+    loop {
+      let notified = self.deferred_window_scan.notified();
+      if self.deferred_window_scanned.load(Ordering::Acquire) {
+        return;
+      }
+      notified.await;
+    }
+  }
+}
+
+#[async_trait::async_trait]
+impl MetadataStore for DeferredWindowVisibilityMetadataStore {
+  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
+    self.inner.write_segment(metadata).await
+  }
+
+  async fn scan_window_from_snowflake(
+    &self,
+    window: &TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
+  ) -> Result<Vec<SegmentMetadata>> {
+    let mut segments = self
+      .inner
+      .scan_window_from_snowflake(window, min_snowflake)
+      .await?;
+    if self.visibility_held.load(Ordering::Acquire)
+      && window.window_start_unix_seconds == self.deferred_window_start.load(Ordering::Acquire)
+    {
+      for segment in &mut segments {
+        segment.metadata_published_ts_ms = self.held_visibility_timestamp_ms;
+      }
+      self.deferred_window_scanned.store(true, Ordering::Release);
+      self.deferred_window_scan.notify_waiters();
+    }
+    Ok(segments)
   }
 }
 
@@ -682,17 +803,19 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
     None,
   )?;
 
-  let mut observed_ids = HashSet::new();
   let deadline = Instant::now() + Duration::from_secs(30);
-  drain_reader_until(
+  let initial_deliveries = drain_reader_until_with_trace(
     &mut reader,
-    &mut observed_ids,
     1,
     now_unix_seconds().saturating_add(3),
     deadline,
   )
   .await?;
-  assert!(observed_ids.contains("smoke-0"));
+  assert_eq!(
+    reader_delivery_counts(&initial_deliveries),
+    HashMap::from([("smoke-0".to_string(), 1_usize)]),
+    "initial reader delivery must contain exactly one smoke record: {initial_deliveries:?}"
+  );
 
   // Step 5: Re-scan to verify dedupe behavior after cursor advancement.
   let duplicate_scan = reader.read_available(now_unix_seconds()).await?;
@@ -1232,16 +1355,19 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
     None,
   )?;
 
-  let mut observed_ids = HashSet::new();
   let deadline = Instant::now() + Duration::from_secs(30);
-  drain_reader_until(
+  let initial_deliveries = drain_reader_until_with_trace(
     &mut reader,
-    &mut observed_ids,
     1,
     now_unix_seconds().saturating_add(3),
     deadline,
   )
   .await?;
+  assert_eq!(
+    reader_delivery_counts(&initial_deliveries),
+    HashMap::from([("fault-0".to_string(), 1_usize)]),
+    "initial reader delivery must contain exactly one fault record: {initial_deliveries:?}"
+  );
 
   let duplicate_scan = reader.read_available(now_unix_seconds()).await?;
   assert!(duplicate_scan.is_empty());
@@ -1249,9 +1375,6 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
   let duplicate_scan_again = reader.read_available(now_unix_seconds()).await?;
   assert!(duplicate_scan_again.is_empty());
   assert_eq!(reader.cursors(), cursors_after_duplicate_scan);
-
-  assert_eq!(observed_ids.len(), 1);
-  assert!(observed_ids.contains("fault-0"));
 
   // Step 4: Clean up resources.
   cluster.shutdown().await;
@@ -1561,6 +1684,279 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
   Ok(())
 }
 
+// High-level: verifies graceful shutdown durably commits a staged offset before releasing its
+// lease, so a restarted group member does not replay the record.
+#[tokio::test]
+async fn graceful_shutdown_final_checkpoint_commits_staged_record_before_release() -> Result<()> {
+  let consumer_time = Arc::new(framework::ManualTimeProvider::new(OffsetDateTime::now_utc()));
+  let mut cluster = ClusterHarness::in_memory(1)
+    .partition_count(1)
+    .consumer_time_provider(consumer_time.clone())
+    .start()
+    .await?;
+  let producer = cluster
+    .create_producer(
+      producer_config(),
+      vec![producer_topic_named_with_partition_count(TOPIC, 1, 1)],
+    )
+    .await?;
+
+  let mut runtime_a = consumer_runtime_config("shutdown-final-commit-a");
+  let mut runtime_b = consumer_runtime_config("shutdown-final-commit-b");
+  for runtime in [&mut runtime_a, &mut runtime_b] {
+    runtime
+      .read
+      .as_mut()
+      .ok_or_else(|| anyhow!("shutdown final-commit read config missing"))?
+      .metadata_visibility_delay_ms = Some(0);
+  }
+  let group = runtime_a
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("shutdown final-commit group config missing"))?;
+  let hooks = cluster.lifecycle_hooks();
+  let staged_id = "shutdown-final-commit-staged";
+  let staged_key = b"shutdown-final-commit-key".to_vec();
+  let staged_ack = produce_message(&producer, staged_key.clone(), staged_id).await?;
+
+  let mut initial_rebalance = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "shutdown-final-commit-a",
+      None,
+      None,
+    )
+    .await?;
+  let mut consumer_a = Box::new(cluster.create_consumer(&runtime_a).await?);
+  consumer_a.start()?;
+  consumer_time.advance(TimeDuration::seconds(1));
+  timeout(
+    Duration::from_secs(5),
+    initial_rebalance.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("initial consumer did not reach its rebalance boundary"))??;
+  initial_rebalance.release()?;
+
+  let staged_offset = timeout(Duration::from_secs(5), async {
+    loop {
+      match timeout(Duration::from_millis(250), consumer_a.next()).await {
+        Err(_) => {
+          consumer_time.advance(TimeDuration::seconds(1));
+          tokio::task::yield_now().await;
+        },
+        Ok(Err(error)) => return Err(anyhow!("initial consumer next failed: {error}")),
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          assert_eq!(record.virtual_partition_id, staged_ack.virtual_partition_id);
+          assert_eq!(
+            String::from_utf8(record.record.payload.to_vec())?,
+            staged_id
+          );
+          consumer_a.store_offset(record.virtual_partition_id, record.offset)?;
+          return Ok::<_, anyhow::Error>(record.offset);
+        },
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("initial consumer did not stage the shutdown record"))??;
+
+  let lease_before_shutdown = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == staged_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing initial consumer lease"))?;
+  assert_eq!(lease_before_shutdown.owner_id, group.member_id.as_str());
+  assert!(
+    lease_before_shutdown.committed_cursor.is_none(),
+    "staging an offset must not persist it before shutdown's final commit: \
+     {lease_before_shutdown:?}"
+  );
+
+  let mut before_commit = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeCommit,
+      "shutdown-final-commit-a",
+      None,
+      None,
+    )
+    .await?;
+  let mut commit_finished = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerShutdownCommitFinished,
+      "shutdown-final-commit-a",
+      None,
+      None,
+    )
+    .await?;
+  let mut before_release = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeReleaseOwned,
+      "shutdown-final-commit-a",
+      None,
+      None,
+    )
+    .await?;
+  let shutdown_task = tokio::spawn(async move { consumer_a.shutdown().await });
+
+  timeout(Duration::from_secs(5), before_commit.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("shutdown did not reach its final commit boundary"))??;
+  let lease_before_final_commit = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == staged_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing lease before shutdown final commit"))?;
+  assert!(lease_before_final_commit.committed_cursor.is_none());
+  before_commit.release()?;
+
+  timeout(Duration::from_secs(5), commit_finished.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("shutdown did not finish its final commit"))??;
+  let lease_after_final_commit = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == staged_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing lease after shutdown final commit"))?;
+  assert!(
+    lease_after_final_commit
+      .committed_cursor
+      .as_ref()
+      .is_some_and(|cursor| {
+        cursor.seq_end == staged_offset && cursor.source_checkpoint.is_some()
+      }),
+    "shutdown final commit did not persist the staged offset: {lease_after_final_commit:?}"
+  );
+  assert_eq!(lease_after_final_commit.owner_id, group.member_id.as_str());
+  commit_finished.release()?;
+
+  timeout(Duration::from_secs(5), before_release.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("shutdown did not reach its release boundary"))??;
+  let lease_before_release = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == staged_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing lease before shutdown release"))?;
+  assert!(
+    lease_before_release
+      .committed_cursor
+      .as_ref()
+      .is_some_and(|cursor| {
+        cursor.seq_end == staged_offset && cursor.source_checkpoint.is_some()
+      }),
+    "shutdown release began before the staged offset was durable: {lease_before_release:?}"
+  );
+  before_release.release()?;
+  shutdown_task
+    .await
+    .map_err(|error| anyhow!("shutdown task failed: {error}"))??;
+
+  let logical_now_ms = i64::try_from(consumer_time.now().unix_timestamp_nanos() / 1_000_000)?;
+  assert!(
+    cluster
+      .consumer_membership_store()
+      .list_active_members(
+        group.topic.as_str(),
+        group.group_id.as_str(),
+        logical_now_ms
+      )
+      .await?
+      .is_empty(),
+    "successful shutdown must deregister the original member"
+  );
+
+  let mut restart_rebalance = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "shutdown-final-commit-b",
+      None,
+      None,
+    )
+    .await?;
+  let mut consumer_b = Box::new(cluster.create_consumer(&runtime_b).await?);
+  consumer_b.start()?;
+  consumer_time.advance(TimeDuration::seconds(1));
+  timeout(
+    Duration::from_secs(5),
+    restart_rebalance.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("restarted consumer did not reach its rebalance boundary"))??;
+  restart_rebalance.release()?;
+
+  let marker_id = "shutdown-final-commit-marker";
+  let marker_ack = produce_message(&producer, staged_key, marker_id).await?;
+  assert_eq!(
+    marker_ack.virtual_partition_id,
+    staged_ack.virtual_partition_id
+  );
+  let mut restarted_counts = HashMap::new();
+  let marker_offset = timeout(Duration::from_secs(5), async {
+    loop {
+      match timeout(Duration::from_millis(250), consumer_b.next()).await {
+        Err(_) => {
+          consumer_time.advance(TimeDuration::seconds(1));
+          tokio::task::yield_now().await;
+        },
+        Ok(Err(error)) => return Err(anyhow!("restarted consumer next failed: {error}")),
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          *restarted_counts.entry(id.clone()).or_insert(0_usize) += 1;
+          if id == staged_id {
+            return Err(anyhow!(
+              "restarted consumer replayed staged shutdown record"
+            ));
+          }
+          if id != marker_id {
+            return Err(anyhow!(
+              "restarted consumer delivered unexpected record: {id}"
+            ));
+          }
+          consumer_b.store_offset(record.virtual_partition_id, record.offset)?;
+          consumer_b.commit().await?;
+          return Ok::<_, anyhow::Error>(record.offset);
+        },
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("restarted consumer did not receive the marker record"))??;
+  assert_eq!(
+    restarted_counts,
+    HashMap::from([(marker_id.to_string(), 1)]),
+    "restarted consumer delivery contract changed: {restarted_counts:?}"
+  );
+
+  let final_lease = cluster
+    .consumer_lease_store()
+    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == marker_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing restarted consumer lease"))?;
+  assert!(
+    final_lease.committed_cursor.as_ref().is_some_and(|cursor| {
+      cursor.seq_end >= marker_offset && cursor.source_checkpoint.is_some()
+    }),
+    "restarted consumer did not durably commit its marker: {final_lease:?}"
+  );
+
+  Box::new(consumer_b).shutdown().await?;
+  cluster.shutdown().await;
+  Ok(())
+}
+
 // High-level: verifies a persisted source checkpoint drives iterator recovery through more than
 // two bounded scan slices before current-window delivery begins.
 #[tokio::test]
@@ -1772,6 +2168,596 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
   Ok(())
 }
 
+// High-level: verifies a live group restart recovers retained downtime windows before entering
+// Fast mode, without replaying its durable source checkpoint.
+#[tokio::test]
+async fn live_group_restart_recovers_retained_history_before_fast_path() -> Result<()> {
+  let consumer_time = Arc::new(framework::ManualTimeProvider::new(
+    OffsetDateTime::from_unix_timestamp(1_700_000_000)?,
+  ));
+  let mut cluster = ClusterHarness::in_memory(1)
+    .partition_count(1)
+    .broker_flush_max_delay(Duration::from_mins(1))
+    .broker_time_provider(consumer_time.clone())
+    .consumer_time_provider(consumer_time.clone())
+    .start()
+    .await?;
+  let producer = Arc::new(
+    cluster
+      .create_producer(
+        producer_config(),
+        vec![producer_topic_named_with_partition_count(TOPIC, 1, 1)],
+      )
+      .await?,
+  );
+
+  let mut runtime_a = consumer_runtime_config("retained-history-a");
+  let mut runtime_b = consumer_runtime_config("retained-history-b");
+  for runtime in [&mut runtime_a, &mut runtime_b] {
+    runtime
+      .read
+      .as_mut()
+      .ok_or_else(|| anyhow!("retained-history read config missing"))?
+      .metadata_visibility_delay_ms = Some(0);
+  }
+  let group = runtime_a
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("retained-history group config missing"))?;
+  let group_topic = group.topic.to_string();
+  let group_id = group.group_id.to_string();
+  let hooks = cluster.lifecycle_hooks();
+
+  let phase1_id = "retained-history-checkpoint";
+  let phase1_ack = produce_message_at_manual_time(
+    &cluster,
+    &producer,
+    consumer_time.as_ref(),
+    b"retained-history-key".to_vec(),
+    phase1_id,
+  )
+  .await?;
+
+  let mut initial_rebalance = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "retained-history-a",
+      None,
+      None,
+    )
+    .await?;
+  let mut consumer_a = ControlledConsumer::new(
+    "retained-history-a",
+    cluster.create_consumer(&runtime_a).await?,
+  );
+  consumer_a.start()?;
+  consumer_time.advance(TimeDuration::milliseconds(200));
+  timeout(
+    Duration::from_secs(5),
+    initial_rebalance.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("initial retained-history member did not rebalance"))??;
+  initial_rebalance.release()?;
+
+  let phase1_offset = timeout(Duration::from_secs(5), async {
+    loop {
+      match timeout(Duration::from_millis(250), consumer_a.next()).await {
+        Err(_) => {
+          consumer_time.advance(TimeDuration::seconds(1));
+          tokio::task::yield_now().await;
+        },
+        Ok(Err(error)) => return Err(anyhow!("initial retained-history next failed: {error}")),
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          assert_eq!(
+            String::from_utf8(record.record.payload.to_vec())?,
+            phase1_id
+          );
+          assert_eq!(record.virtual_partition_id, phase1_ack.virtual_partition_id);
+          consumer_a.store_offset(record.virtual_partition_id, record.offset)?;
+          consumer_a.commit().await?;
+          return Ok::<_, anyhow::Error>(record.offset);
+        },
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("initial member did not commit its source checkpoint"))??;
+
+  let checkpoint_lease = cluster
+    .consumer_lease_store()
+    .list_group_leases(group_topic.as_str(), group_id.as_str())
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == phase1_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing retained-history checkpoint lease"))?;
+  assert!(
+    checkpoint_lease
+      .committed_cursor
+      .as_ref()
+      .is_some_and(|cursor| {
+        cursor.seq_end == phase1_offset && cursor.source_checkpoint.is_some()
+      }),
+    "initial member did not durably persist its source checkpoint: {checkpoint_lease:?}"
+  );
+
+  consumer_a.shutdown().await?;
+  let logical_now_ms = consumer_time.now().unix_timestamp_ms();
+  assert!(
+    cluster
+      .consumer_membership_store()
+      .list_active_members(group_topic.as_str(), group_id.as_str(), logical_now_ms)
+      .await?
+      .is_empty(),
+    "graceful shutdown must leave the group before retained history is published"
+  );
+
+  let mut downtime_ids = HashSet::new();
+  for window_index in 1 ..= 3 {
+    consumer_time.advance(TimeDuration::seconds(WINDOW_SIZE_SECONDS + 1));
+    let id = format!("retained-history-downtime-{window_index}");
+    produce_message_at_manual_time(
+      &cluster,
+      &producer,
+      consumer_time.as_ref(),
+      b"retained-history-key".to_vec(),
+      &id,
+    )
+    .await?;
+    downtime_ids.insert(id);
+  }
+
+  let mut restart_rebalance = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "retained-history-b",
+      None,
+      None,
+    )
+    .await?;
+  let mut fast_path_active = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerRecoveryFastPathActive,
+      "retained-history-b",
+      Some(0),
+      None,
+    )
+    .await?;
+  let mut consumer_b = ControlledConsumer::new(
+    "retained-history-b",
+    cluster.create_consumer(&runtime_b).await?,
+  );
+  consumer_b.start()?;
+  consumer_time.advance(TimeDuration::milliseconds(200));
+  timeout(
+    Duration::from_secs(5),
+    restart_rebalance.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("replacement retained-history member did not rebalance"))??;
+  restart_rebalance.release()?;
+
+  let mut downtime_delivery_counts = HashMap::new();
+  let mut downtime_max_offsets = HashMap::<VirtualPartitionId, u64>::new();
+  {
+    let fast_wait = fast_path_active.wait_until_reached();
+    tokio::pin!(fast_wait);
+    timeout(Duration::from_secs(10), async {
+      loop {
+        tokio::select! {
+          result = &mut fast_wait => return result,
+          next_result = consumer_b.next() => match next_result? {
+            NextResult::Revoked(revoked) => revoked.complete().await,
+            NextResult::Record(record) => {
+              let id = String::from_utf8(record.record.payload.to_vec())?;
+              if id == phase1_id {
+                return Err(anyhow!("replacement member replayed its committed source checkpoint"));
+              }
+              if !downtime_ids.contains(&id) {
+                return Err(anyhow!("replacement member delivered unexpected retained record: {id}"));
+              }
+              *downtime_delivery_counts.entry(id).or_insert(0_usize) += 1;
+              downtime_max_offsets
+                .entry(record.virtual_partition_id)
+                .and_modify(|offset| *offset = (*offset).max(record.offset))
+                .or_insert(record.offset);
+              consumer_b.store_offset(record.virtual_partition_id, record.offset)?;
+              consumer_b.commit().await?;
+            },
+          },
+          () = tokio::task::yield_now() => {
+            consumer_time.advance(TimeDuration::seconds(1));
+          },
+        }
+      }
+    })
+    .await
+    .map_err(|_| anyhow!("replacement member did not reach the Fast recovery boundary"))??;
+  }
+  fast_path_active.release()?;
+
+  timeout(Duration::from_secs(10), async {
+    while downtime_delivery_counts.len() < downtime_ids.len() {
+      match timeout(Duration::from_millis(250), consumer_b.next()).await {
+        Err(_) => {
+          consumer_time.advance(TimeDuration::seconds(1));
+          tokio::task::yield_now().await;
+        },
+        Ok(Err(error)) => return Err(anyhow!("replacement retained-history next failed: {error}")),
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          if id == phase1_id {
+            return Err(anyhow!(
+              "replacement member replayed its committed source checkpoint"
+            ));
+          }
+          if !downtime_ids.contains(&id) {
+            return Err(anyhow!(
+              "replacement member delivered unexpected retained record: {id}"
+            ));
+          }
+          *downtime_delivery_counts.entry(id).or_insert(0_usize) += 1;
+          downtime_max_offsets
+            .entry(record.virtual_partition_id)
+            .and_modify(|offset| *offset = (*offset).max(record.offset))
+            .or_insert(record.offset);
+          consumer_b.store_offset(record.virtual_partition_id, record.offset)?;
+          consumer_b.commit().await?;
+        },
+      }
+    }
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| anyhow!("replacement member did not drain retained history"))??;
+
+  assert_eq!(
+    downtime_delivery_counts
+      .keys()
+      .cloned()
+      .collect::<HashSet<_>>(),
+    downtime_ids
+  );
+  assert!(
+    downtime_delivery_counts.values().all(|count| *count == 1),
+    "retained-history restart must deliver every downtime record exactly once: \
+     {downtime_delivery_counts:?}"
+  );
+  wait_for_group_offsets_committed(
+    &cluster,
+    &downtime_max_offsets,
+    "replacement member did not durably checkpoint retained history",
+  )
+  .await?;
+
+  consumer_b.shutdown().await?;
+  cluster.shutdown().await;
+  Ok(())
+}
+
+// High-level: verifies a deferred historical metadata window holds recovery before a visible
+// later window until the named visibility boundary is released.
+#[tokio::test]
+async fn live_group_recovery_waits_for_deferred_historical_visibility() -> Result<()> {
+  let consumer_time = Arc::new(framework::ManualTimeProvider::new(
+    OffsetDateTime::from_unix_timestamp(1_700_100_000)?,
+  ));
+  let deferred_window_start = Arc::new(AtomicI64::new(i64::MIN));
+  let base_metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let held_visibility_duration_ms = i64::try_from(TimeDuration::hours(24).whole_milliseconds())?;
+  let deferred_metadata_store = Arc::new(DeferredWindowVisibilityMetadataStore::new(
+    base_metadata_store,
+    deferred_window_start.clone(),
+    consumer_time
+      .now()
+      .unix_timestamp_ms()
+      .saturating_add(held_visibility_duration_ms),
+  ));
+  let metadata_store: Arc<dyn MetadataStore> = deferred_metadata_store.clone();
+  let mut cluster = ClusterHarness::in_memory(1)
+    .metadata_store(metadata_store)
+    .partition_count(1)
+    .broker_flush_max_delay(Duration::from_mins(1))
+    .broker_time_provider(consumer_time.clone())
+    .consumer_time_provider(consumer_time.clone())
+    .start()
+    .await?;
+  let producer = Arc::new(
+    cluster
+      .create_producer(
+        producer_config(),
+        vec![producer_topic_named_with_partition_count(TOPIC, 1, 1)],
+      )
+      .await?,
+  );
+
+  let mut runtime_a = consumer_runtime_config("deferred-history-a");
+  let mut runtime_b = consumer_runtime_config("deferred-history-b");
+  for runtime in [&mut runtime_a, &mut runtime_b] {
+    runtime
+      .read
+      .as_mut()
+      .ok_or_else(|| anyhow!("deferred-history read config missing"))?
+      .metadata_visibility_delay_ms = Some(0);
+  }
+  let group = runtime_a
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("deferred-history group config missing"))?;
+  let group_topic = group.topic.to_string();
+  let group_id = group.group_id.to_string();
+  let hooks = cluster.lifecycle_hooks();
+
+  let checkpoint_id = "deferred-history-checkpoint";
+  let checkpoint_ack = produce_message_at_manual_time(
+    &cluster,
+    &producer,
+    consumer_time.as_ref(),
+    b"deferred-history-key".to_vec(),
+    checkpoint_id,
+  )
+  .await?;
+  let mut initial_rebalance = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "deferred-history-a",
+      None,
+      None,
+    )
+    .await?;
+  let mut consumer_a = ControlledConsumer::new(
+    "deferred-history-a",
+    cluster.create_consumer(&runtime_a).await?,
+  );
+  consumer_a.start()?;
+  consumer_time.advance(TimeDuration::milliseconds(200));
+  timeout(
+    Duration::from_secs(5),
+    initial_rebalance.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("initial deferred-history member did not rebalance"))??;
+  initial_rebalance.release()?;
+
+  let checkpoint_offset = timeout(Duration::from_secs(5), async {
+    loop {
+      match timeout(Duration::from_millis(250), consumer_a.next()).await {
+        Err(_) => {
+          consumer_time.advance(TimeDuration::seconds(1));
+          tokio::task::yield_now().await;
+        },
+        Ok(Err(error)) => return Err(anyhow!("initial deferred-history next failed: {error}")),
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          assert_eq!(
+            String::from_utf8(record.record.payload.to_vec())?,
+            checkpoint_id
+          );
+          assert_eq!(
+            record.virtual_partition_id,
+            checkpoint_ack.virtual_partition_id
+          );
+          consumer_a.store_offset(record.virtual_partition_id, record.offset)?;
+          consumer_a.commit().await?;
+          return Ok::<_, anyhow::Error>(record.offset);
+        },
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("initial member did not commit the deferred-history checkpoint"))??;
+  consumer_a.shutdown().await?;
+
+  let before_id = "deferred-history-before";
+  let deferred_id = "deferred-history-middle";
+  let after_id = "deferred-history-after";
+  consumer_time.advance(TimeDuration::seconds(WINDOW_SIZE_SECONDS + 1));
+  produce_message_at_manual_time(
+    &cluster,
+    &producer,
+    consumer_time.as_ref(),
+    b"deferred-history-key".to_vec(),
+    before_id,
+  )
+  .await?;
+  consumer_time.advance(TimeDuration::seconds(WINDOW_SIZE_SECONDS + 1));
+  deferred_window_start.store(
+    Window::for_timestamp(consumer_time.now().unix_timestamp(), WINDOW_SIZE_SECONDS)
+      .start_unix_seconds,
+    Ordering::Release,
+  );
+  produce_message_at_manual_time(
+    &cluster,
+    &producer,
+    consumer_time.as_ref(),
+    b"deferred-history-key".to_vec(),
+    deferred_id,
+  )
+  .await?;
+  consumer_time.advance(TimeDuration::seconds(WINDOW_SIZE_SECONDS + 1));
+  produce_message_at_manual_time(
+    &cluster,
+    &producer,
+    consumer_time.as_ref(),
+    b"deferred-history-key".to_vec(),
+    after_id,
+  )
+  .await?;
+
+  let mut restart_rebalance = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "deferred-history-b",
+      None,
+      None,
+    )
+    .await?;
+  let mut consumer_b = ControlledConsumer::new(
+    "deferred-history-b",
+    cluster.create_consumer(&runtime_b).await?,
+  );
+  consumer_b.start()?;
+  consumer_time.advance(TimeDuration::milliseconds(200));
+  timeout(
+    Duration::from_secs(5),
+    restart_rebalance.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("replacement deferred-history member did not rebalance"))??;
+  restart_rebalance.release()?;
+
+  let mut delivery_order = Vec::new();
+  let mut delivery_counts = HashMap::new();
+  let mut staged_before_release = Vec::new();
+  {
+    let deferred_scan = deferred_metadata_store.wait_until_deferred_window_scanned();
+    tokio::pin!(deferred_scan);
+    timeout(Duration::from_secs(10), async {
+      loop {
+        tokio::select! {
+          result = &mut deferred_scan => {
+            let () = result;
+            return Ok::<_, anyhow::Error>(());
+          },
+          next_result = consumer_b.next() => match next_result? {
+            NextResult::Revoked(revoked) => revoked.complete().await,
+            NextResult::Record(record) => {
+              let id = String::from_utf8(record.record.payload.to_vec())?;
+              if id == checkpoint_id || id == deferred_id || id == after_id {
+                return Err(anyhow!(
+                  "deferred recovery delivered {id} before its visibility boundary"
+                ));
+              }
+              if id != before_id {
+                return Err(anyhow!("unexpected deferred-history record before release: {id}"));
+              }
+              *delivery_counts.entry(id.clone()).or_insert(0_usize) += 1;
+              delivery_order.push(id);
+              staged_before_release.push((record.virtual_partition_id, record.offset));
+            },
+          },
+          () = tokio::task::yield_now() => {
+            consumer_time.advance(TimeDuration::seconds(1));
+          },
+        }
+      }
+    })
+    .await
+    .map_err(|_| anyhow!("consumer did not scan the deferred historical window"))??;
+  }
+
+  let deferred_snapshot = consumer_b
+    .iterator
+    .diagnostics()
+    .ok_or_else(|| anyhow!("concrete consumer did not provide diagnostics"))?
+    .state_snapshot();
+  let deferred_partition = deferred_snapshot
+    .local
+    .partitions
+    .iter()
+    .find(|partition| partition.virtual_partition_id == checkpoint_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing deferred-history diagnostics partition"))?;
+  assert_eq!(
+    deferred_partition
+      .reader
+      .as_ref()
+      .map(|reader| &reader.mode),
+    Some(&ConsumerPartitionReadMode::Recovering),
+    "deferred historical metadata must keep the partition in recovery: {deferred_snapshot:?}"
+  );
+  let cursor_while_deferred = cluster
+    .consumer_lease_store()
+    .list_group_leases(group_topic.as_str(), group_id.as_str())
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == checkpoint_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing deferred-history lease"))?;
+  assert!(
+    cursor_while_deferred
+      .committed_cursor
+      .as_ref()
+      .is_some_and(|cursor| {
+        cursor.seq_end == checkpoint_offset && cursor.source_checkpoint.is_some()
+      }),
+    "deferred historical recovery advanced the durable cursor: {cursor_while_deferred:?}"
+  );
+  assert!(
+    !delivery_counts.contains_key(deferred_id) && !delivery_counts.contains_key(after_id),
+    "a deferred window must block all later recovery delivery: {delivery_counts:?}"
+  );
+
+  deferred_metadata_store.release_visibility();
+  for (partition_id, offset) in staged_before_release {
+    consumer_b.store_offset(partition_id, offset)?;
+  }
+  if delivery_counts.contains_key(before_id) {
+    consumer_b.commit().await?;
+  }
+
+  let expected_ids = HashSet::from([
+    before_id.to_string(),
+    deferred_id.to_string(),
+    after_id.to_string(),
+  ]);
+  let mut maximum_offsets = HashMap::<VirtualPartitionId, u64>::new();
+  timeout(Duration::from_secs(10), async {
+    while delivery_counts.len() < expected_ids.len() {
+      match timeout(Duration::from_millis(250), consumer_b.next()).await {
+        Err(_) => {
+          consumer_time.advance(TimeDuration::seconds(1));
+          tokio::task::yield_now().await;
+        },
+        Ok(Err(error)) => return Err(anyhow!("replacement deferred-history next failed: {error}")),
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          if !expected_ids.contains(&id) {
+            return Err(anyhow!(
+              "unexpected deferred-history record after release: {id}"
+            ));
+          }
+          *delivery_counts.entry(id.clone()).or_insert(0_usize) += 1;
+          delivery_order.push(id);
+          maximum_offsets
+            .entry(record.virtual_partition_id)
+            .and_modify(|offset| *offset = (*offset).max(record.offset))
+            .or_insert(record.offset);
+          consumer_b.store_offset(record.virtual_partition_id, record.offset)?;
+          consumer_b.commit().await?;
+        },
+      }
+    }
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| anyhow!("deferred recovery did not drain after visibility release"))??;
+
+  assert_eq!(delivery_order, vec![before_id, deferred_id, after_id]);
+  assert_eq!(
+    delivery_counts,
+    HashMap::from([
+      (before_id.to_string(), 1_usize),
+      (deferred_id.to_string(), 1_usize),
+      (after_id.to_string(), 1_usize),
+    ])
+  );
+  if maximum_offsets.is_empty() {
+    maximum_offsets.insert(checkpoint_ack.virtual_partition_id, checkpoint_offset);
+  }
+  wait_for_group_offsets_committed(
+    &cluster,
+    &maximum_offsets,
+    "deferred recovery did not durably checkpoint the released windows",
+  )
+  .await?;
+
+  consumer_b.shutdown().await?;
+  cluster.shutdown().await;
+  Ok(())
+}
+
 // High-level: verifies no data loss while consumer-group membership changes from 2 -> 3 -> 1.
 #[tokio::test]
 async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
@@ -1806,10 +2792,26 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
   }
 
   let consumer_lease_store = resources.consumer_lease_store();
-  let consumer_membership_store = resources.consumer_membership_store();
+  let hooks = cluster.lifecycle_hooks();
 
   let consumer_0 = Box::new(cluster.create_consumer(&runtime_0).await?);
   let consumer_1 = Box::new(cluster.create_consumer(&runtime_1).await?);
+  let mut initial_rebalance_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "consumer-0",
+      None,
+      None,
+    )
+    .await?;
+  let mut initial_revocation_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerRevocationEmitted,
+      "consumer-0",
+      None,
+      None,
+    )
+    .await?;
 
   let (event_tx, mut event_rx) = mpsc::unbounded_channel();
   let (stop_tx_0, stop_rx_0) = watch::channel(false);
@@ -1819,7 +2821,72 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
   let consumer_0_task = tokio::spawn(run_consumer_task(consumer_0, stop_rx_0, event_tx.clone()));
   let consumer_1_task = tokio::spawn(run_consumer_task(consumer_1, stop_rx_1, event_tx.clone()));
 
-  // Step 3: Produce in phases and gate phase transitions on revocation barriers.
+  // Establish the advertised two-member state before adding C2. C0 owns the initial bootstrap
+  // assignment; C1's construction plans the first split, which C0 must explicitly hand off.
+  timeout(
+    Duration::from_secs(10),
+    initial_rebalance_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("consumer-0 did not begin the initial two-member rebalance"))??;
+  initial_rebalance_gate.release()?;
+  timeout(
+    Duration::from_secs(10),
+    initial_revocation_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("consumer-0 did not revoke partitions for consumer-1"))??;
+  let mut initial_consumer_1_assignment_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerRebalanceApplied,
+      "consumer-1",
+      None,
+      None,
+    )
+    .await?;
+  initial_revocation_gate.release()?;
+  let initial_revocation_event = timeout(Duration::from_secs(10), event_rx.recv())
+    .await
+    .map_err(|_| anyhow!("consumer-0 did not surface its initial revocation"))?
+    .ok_or_else(|| anyhow!("consumer tasks stopped before the initial revocation"))?;
+  let ConsumerTaskEvent::Revoked {
+    ack: initial_revocation_ack,
+  } = initial_revocation_event
+  else {
+    return Err(anyhow!(
+      "consumer-0 did not surface a revocation before the initial handoff"
+    ));
+  };
+  initial_revocation_ack
+    .send(())
+    .map_err(|()| anyhow!("consumer-0 stopped before acknowledging its initial revocation"))?;
+  timeout(
+    Duration::from_secs(10),
+    initial_consumer_1_assignment_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("consumer-1 did not apply the initial partition handoff"))??;
+  initial_consumer_1_assignment_gate.release()?;
+  timeout(Duration::from_secs(10), async {
+    loop {
+      let leases = consumer_lease_store
+        .list_group_leases(TOPIC, "integration-group")
+        .await?;
+      let owners = leases
+        .iter()
+        .map(|lease| lease.owner_id.as_str())
+        .collect::<HashSet<_>>();
+      if owners.contains("consumer-0") && owners.contains("consumer-1") {
+        return Ok::<_, anyhow::Error>(());
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("initial consumers did not both own partitions before scale-out"))??;
+
+  // Step 3: Produce in phases and require the joining member's persisted assignment before
+  // publishing phase two.
   let mut expected_ids = HashSet::new();
   let mut delivery_traces = ConsumerDeliveryTraces::new();
   let mut revocation_count = 0usize;
@@ -1835,41 +2902,28 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
     expected_ids.insert(id);
   }
 
-  let phase1_start_consumed = delivery_traces.len();
-  let phase1_deadline = Instant::now() + Duration::from_secs(10);
-  while delivery_traces.len() == phase1_start_consumed {
-    if Instant::now() >= phase1_deadline {
-      return Err(anyhow!(
-        "deadline exceeded waiting for phase1 consumption progress: consumed={}",
-        delivery_traces.len()
-      ));
-    }
-
-    let event = timeout(Duration::from_millis(500), event_rx.recv()).await;
-    let Ok(Some(event)) = event else {
-      continue;
-    };
-    handle_consumer_event_with_trace(event, &mut delivery_traces, &mut revocation_count);
-  }
-
   let consumer_2 = Box::new(cluster.create_consumer(&runtime_2).await?);
   let consumer_2_task = tokio::spawn(run_consumer_task(consumer_2, stop_rx_2, event_tx.clone()));
 
-  let scale_out_target = revocation_count + 1;
-  let scale_out_deadline = Instant::now() + Duration::from_secs(10);
-  while revocation_count < scale_out_target {
-    if Instant::now() >= scale_out_deadline {
-      return Err(anyhow!(
-        "deadline exceeded waiting for scale-out revocation: revocations={revocation_count}"
-      ));
+  timeout(Duration::from_secs(10), async {
+    loop {
+      let scale_out_leases = consumer_lease_store
+        .list_group_leases(TOPIC, "integration-group")
+        .await?;
+      if scale_out_leases
+        .iter()
+        .any(|lease| lease.owner_id == "consumer-2")
+      {
+        return Ok::<_, anyhow::Error>(());
+      }
+      let event = event_rx.recv().await.ok_or_else(|| {
+        anyhow!("all consumer tasks stopped before consumer-2 acquired a partition")
+      })?;
+      handle_consumer_event_with_trace(event, &mut delivery_traces, &mut revocation_count);
     }
-
-    let event = timeout(Duration::from_millis(500), event_rx.recv()).await;
-    let Ok(Some(event)) = event else {
-      continue;
-    };
-    handle_consumer_event_with_trace(event, &mut delivery_traces, &mut revocation_count);
-  }
+  })
+  .await
+  .map_err(|_| anyhow!("joining consumer did not own a partition after scale-out"))??;
 
   for message_id in 24 .. 48 {
     let id = format!("rebalance-{message_id}");
@@ -1880,23 +2934,6 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
     )
     .await?;
     expected_ids.insert(id);
-  }
-
-  let phase2_start_consumed = delivery_traces.len();
-  let phase2_deadline = Instant::now() + Duration::from_secs(10);
-  while delivery_traces.len() == phase2_start_consumed {
-    if Instant::now() >= phase2_deadline {
-      return Err(anyhow!(
-        "deadline exceeded waiting for phase2 consumption progress: consumed={}",
-        delivery_traces.len()
-      ));
-    }
-
-    let event = timeout(Duration::from_millis(500), event_rx.recv()).await;
-    let Ok(Some(event)) = event else {
-      continue;
-    };
-    handle_consumer_event_with_trace(event, &mut delivery_traces, &mut revocation_count);
   }
 
   let _ = stop_tx_1.send(true);
@@ -1911,45 +2948,21 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
     .map_err(|error| anyhow!("consumer-2 task join error: {error}"))?;
   consumer_2_result?;
 
-  let scale_in_deadline = Instant::now() + Duration::from_secs(20);
-  loop {
-    if Instant::now() >= scale_in_deadline {
-      let now_ts_ms = i64::try_from(
-        std::time::SystemTime::now()
-          .duration_since(std::time::UNIX_EPOCH)
-          .expect("clock is before unix epoch")
-          .as_millis(),
-      )
-      .expect("unix millis exceeds i64");
-      let active_members = consumer_membership_store
-        .list_active_members(TOPIC, "integration-group", now_ts_ms)
+  timeout(Duration::from_secs(20), async {
+    loop {
+      let leases = consumer_lease_store
+        .list_group_leases(TOPIC, "integration-group")
         .await?;
-      return Err(anyhow!(
-        "deadline exceeded waiting for scale-in membership convergence: \
-         active_members={active_members:?}, consumed={}",
-        delivery_traces.len()
-      ));
+      if leases.len() == PARTITION_COUNT as usize
+        && leases.iter().all(|lease| lease.owner_id == "consumer-0")
+      {
+        return Ok::<_, anyhow::Error>(());
+      }
+      tokio::task::yield_now().await;
     }
-
-    let now_ts_ms = i64::try_from(
-      std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock is before unix epoch")
-        .as_millis(),
-    )
-    .expect("unix millis exceeds i64");
-    let active_members = consumer_membership_store
-      .list_active_members(TOPIC, "integration-group", now_ts_ms)
-      .await?;
-    if active_members == vec!["consumer-0".to_string()] {
-      break;
-    }
-
-    let event = timeout(Duration::from_millis(500), event_rx.recv()).await;
-    if let Ok(Some(event)) = event {
-      handle_consumer_event_with_trace(event, &mut delivery_traces, &mut revocation_count);
-    }
-  }
+  })
+  .await
+  .map_err(|_| anyhow!("consumer-0 did not acquire every partition after scale-in"))??;
 
   for message_id in 48 .. 72 {
     let id = format!("rebalance-{message_id}");
@@ -2032,7 +3045,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
 
   // Ensure rebalance revocations were observed and acknowledged.
   assert!(
-    revocation_count >= scale_out_target,
+    revocation_count >= 1,
     "expected at least one revocation after scale-out, observed={revocation_count}"
   );
 
@@ -2115,8 +3128,9 @@ async fn wait_for_broker_lease_ownership(
 #[tokio::test]
 async fn active_broker_restart_continuity() -> Result<()> {
   // Step 1: Start two brokers and pin producer traffic to a single active broker.
-  let resources = IntegrationResources::create().await?;
-  let mut cluster = ClusterHarness::builder(&resources, 2).start().await?;
+  // This scenario validates broker/group coordination, so it does not need shared external
+  // storage services that can perturb its lifecycle timing.
+  let mut cluster = ClusterHarness::in_memory(2).start().await?;
 
   let live_nodes = cluster.live_nodes();
   let mut active_node = live_nodes
@@ -2125,14 +3139,9 @@ async fn active_broker_restart_continuity() -> Result<()> {
     .ok_or_else(|| anyhow!("expected active broker"))?;
   cluster.set_active_nodes(vec![active_node.clone()]);
 
-  let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
-  let producer = new_producer(
-    producer_config(),
-    vec![producer_topic()],
-    Arc::clone(&discovery),
-    metrics_scope("blob_stream_producer_it"),
-  )
-  .await?;
+  let producer = cluster
+    .create_producer(producer_config(), vec![producer_topic()])
+    .await?;
   wait_for_producer_route(
     &producer,
     &active_node.node_id,
@@ -2143,7 +3152,8 @@ async fn active_broker_restart_continuity() -> Result<()> {
 
   let mut runtime_0 = consumer_runtime_config("restart-consumer-0");
   let mut runtime_1 = consumer_runtime_config("restart-consumer-1");
-  for runtime in [&mut runtime_0, &mut runtime_1] {
+  let mut runtime_2 = consumer_runtime_config("restart-consumer-2");
+  for runtime in [&mut runtime_0, &mut runtime_1, &mut runtime_2] {
     runtime
       .read
       .as_mut()
@@ -2153,6 +3163,7 @@ async fn active_broker_restart_continuity() -> Result<()> {
   let (event_tx, mut event_rx) = mpsc::unbounded_channel();
   let (stop_tx_0, stop_rx_0) = watch::channel(false);
   let (stop_tx_1, stop_rx_1) = watch::channel(false);
+  let (stop_tx_2, stop_rx_2) = watch::channel(false);
   let consumer_0_task = tokio::spawn(run_consumer_task(
     Box::new(cluster.create_consumer(&runtime_0).await?),
     stop_rx_0,
@@ -2163,6 +3174,7 @@ async fn active_broker_restart_continuity() -> Result<()> {
     stop_rx_1,
     event_tx.clone(),
   ));
+  let mut consumer_2_task = None;
 
   // Step 2: Produce continuously, restart the active broker mid-stream, and continue producing.
   let total_messages = 64;
@@ -2203,10 +3215,21 @@ async fn active_broker_restart_continuity() -> Result<()> {
           in_flight_partition,
         )
         .await?;
+      let mut metadata_persisted_gate = hooks
+        .arm_broker_for_partition(LifecycleEvent::BrokerMetadataPersisted, in_flight_partition)
+        .await?;
       // Gate a partition owned by the active broker so unrelated broker lifecycle work cannot
       // satisfy this restart boundary.
       let mut drain_gate = hooks
         .arm_broker_for_partition(LifecycleEvent::BrokerLeaseDrainStarted, in_flight_partition)
+        .await?;
+      let mut joining_rebalance_gate = hooks
+        .arm_consumer(
+          LifecycleEvent::ConsumerBeforeRebalance,
+          "restart-consumer-2",
+          None,
+          None,
+        )
         .await?;
       let in_flight_produce = write_engine.produce_batch(WriteRequest {
         topic: TOPIC.into(),
@@ -2227,6 +3250,7 @@ async fn active_broker_restart_continuity() -> Result<()> {
       })
       .await
       .map_err(|_| anyhow!("accepted in-flight produce did not reach the flush boundary"))??;
+      let joining_consumer = Box::new(cluster.create_consumer(&runtime_2).await?);
       let restarting_node_id = active_node.node_id.clone();
       let mut restart = Box::pin(cluster.restart_broker_by_id(&restarting_node_id));
       timeout(Duration::from_secs(5), async {
@@ -2239,21 +3263,33 @@ async fn active_broker_restart_continuity() -> Result<()> {
       })
       .await
       .map_err(|_| anyhow!("active broker did not begin draining before restart"))??;
-      drain_gate.release()?;
-      before_flush_gate.release()?;
-      let in_flight_ack = timeout(Duration::from_secs(5), async {
-        tokio::select! {
-          result = &mut restart => Err(anyhow!(
-            "active broker restart completed before its accepted in-flight write persisted: {result:?}"
-          )),
-          result = &mut in_flight_produce => result.map_err(anyhow::Error::from),
-        }
-      })
+      consumer_2_task = Some(tokio::spawn(run_consumer_task(
+        joining_consumer,
+        stop_rx_2.clone(),
+        event_tx.clone(),
+      )));
+      timeout(
+        Duration::from_secs(5),
+        joining_rebalance_gate.wait_until_reached(),
+      )
       .await
-      .map_err(|_| anyhow!("accepted in-flight produce did not complete during broker drain"))??;
+      .map_err(|_| anyhow!("joining consumer did not begin rebalancing during broker drain"))??;
+      joining_rebalance_gate.release()?;
+      before_flush_gate.release()?;
+      timeout(
+        Duration::from_secs(5),
+        metadata_persisted_gate.wait_until_reached(),
+      )
+      .await
+      .map_err(|_| anyhow!("accepted in-flight produce did not persist metadata during drain"))??;
+      metadata_persisted_gate.release()?;
+      let in_flight_ack = timeout(Duration::from_secs(5), &mut in_flight_produce)
+        .await
+        .map_err(|_| anyhow!("accepted in-flight produce did not complete after persistence"))??;
       assert!(!in_flight_ack.seq_range.is_empty());
       expected_ids.insert(in_flight_id.to_string());
       produced_partitions.insert(in_flight_partition);
+      drain_gate.release()?;
       let restarted_node = timeout(Duration::from_secs(10), &mut restart)
         .await
         .map_err(|_| anyhow!("active broker restart did not complete after drain release"))??;
@@ -2331,8 +3367,8 @@ async fn active_broker_restart_continuity() -> Result<()> {
     "broker restart unexpectedly duplicated group deliveries: {delivered_id_counts:?}"
   );
   assert!(
-    revocation_count <= 1,
-    "unexpected consumer rebalance churn during broker restart"
+    revocation_count >= 1,
+    "expected membership movement to revoke at least one active consumer during broker restart"
   );
 
   wait_for_group_offsets_committed(
@@ -2346,7 +3382,9 @@ async fn active_broker_restart_continuity() -> Result<()> {
     .list_group_leases(TOPIC, "integration-group")
     .await?;
   assert!(leases.iter().all(|lease| {
-    lease.owner_id == "restart-consumer-0" || lease.owner_id == "restart-consumer-1"
+    lease.owner_id == "restart-consumer-0"
+      || lease.owner_id == "restart-consumer-1"
+      || lease.owner_id == "restart-consumer-2"
   }));
   for partition_id in produced_partitions {
     let lease = leases
@@ -2367,14 +3405,18 @@ async fn active_broker_restart_continuity() -> Result<()> {
   // Step 4: Clean up all resources.
   let _ = stop_tx_0.send(true);
   let _ = stop_tx_1.send(true);
+  let _ = stop_tx_2.send(true);
   consumer_0_task
     .await
     .map_err(|error| anyhow!("restart consumer-0 task join error: {error}"))??;
   consumer_1_task
     .await
     .map_err(|error| anyhow!("restart consumer-1 task join error: {error}"))??;
+  consumer_2_task
+    .ok_or_else(|| anyhow!("joining consumer task was not started"))?
+    .await
+    .map_err(|error| anyhow!("restart consumer-2 task join error: {error}"))??;
   cluster.shutdown().await;
-  resources.cleanup().await;
   Ok(())
 }
 
@@ -3175,11 +4217,36 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
   let (stop_tx_0, stop_rx_0) = watch::channel(false);
   let (stop_tx_1, stop_rx_1) = watch::channel(false);
 
-  let mut prefetch_buffered = cluster
-    .lifecycle_hooks()
-    .arm(LifecycleEvent::ConsumerPrefetchBatchBuffered)
+  let hooks = cluster.lifecycle_hooks();
+  let mut prefetch_buffered = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerPrefetchBatchBuffered,
+      "prefetch-consumer-0",
+      None,
+      None,
+    )
     .await?;
   let consumer_0_task = tokio::spawn(run_consumer_task(consumer_0, stop_rx_0, event_tx.clone()));
+
+  // C0 receives its bootstrap assignment during construction, before runtime lifecycle hooks run.
+  // Prove that durable starting state before making C1's join the scale-out boundary.
+  timeout(Duration::from_secs(6), async {
+    loop {
+      let leases = consumer_lease_store
+        .list_group_leases(TOPIC, "integration-group")
+        .await?;
+      if leases.len() == PARTITION_COUNT as usize
+        && leases
+          .iter()
+          .all(|lease| lease.owner_id == "prefetch-consumer-0")
+      {
+        return Ok::<_, anyhow::Error>(());
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("prefetch consumer-0 did not own the bootstrap assignment"))??;
 
   // Step 3: Produce phase 1 and wait for initial consumption progress.
   let mut expected_ids = HashSet::new();
@@ -3206,39 +4273,25 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
   .map_err(|_| anyhow!("consumer did not buffer a prefetched phase 1 batch"))??;
   prefetch_buffered.release()?;
 
-  let initial_progress_deadline = Instant::now() + Duration::from_secs(6);
-  while delivery_traces.is_empty() {
-    if Instant::now() >= initial_progress_deadline {
-      return Err(anyhow!(
-        "deadline exceeded waiting for initial prefetch consumer progress"
-      ));
-    }
-
-    let event = timeout(Duration::from_millis(500), event_rx.recv()).await;
-    let Ok(Some(event)) = event else {
-      continue;
-    };
-    handle_consumer_event_with_trace(event, &mut delivery_traces, &mut revocation_count);
-  }
-
-  // Step 4: Scale out to trigger rebalance and continue producing under delay.
+  // Step 4: Scale out from C0's verified bootstrap assignment and continue producing under delay.
+  let mut scale_out_rebalance_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "prefetch-consumer-0",
+      None,
+      None,
+    )
+    .await?;
   let consumer_1 = Box::new(cluster.create_consumer(&runtime_1).await?);
   let consumer_1_task = tokio::spawn(run_consumer_task(consumer_1, stop_rx_1, event_tx.clone()));
 
-  let scale_out_deadline = Instant::now() + Duration::from_secs(6);
-  while revocation_count < 1 {
-    if Instant::now() >= scale_out_deadline {
-      return Err(anyhow!(
-        "deadline exceeded waiting for revocation after prefetch scale-out"
-      ));
-    }
-
-    let event = timeout(Duration::from_millis(500), event_rx.recv()).await;
-    let Ok(Some(event)) = event else {
-      continue;
-    };
-    handle_consumer_event_with_trace(event, &mut delivery_traces, &mut revocation_count);
-  }
+  timeout(
+    Duration::from_secs(6),
+    scale_out_rebalance_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("prefetch group did not reach the scale-out rebalance boundary"))??;
+  scale_out_rebalance_gate.release()?;
 
   for message_id in PREFETCH_DELAYED_PHASE1_MESSAGES
     .. (PREFETCH_DELAYED_PHASE1_MESSAGES + PREFETCH_DELAYED_PHASE2_MESSAGES)
@@ -3342,6 +4395,209 @@ async fn prefetch_rebalance_delayed_metadata_no_loss() -> Result<()> {
   Ok(())
 }
 
+// High-level: verifies graceful shutdown drops prefetched work that was never application
+// delivered, allowing a restarted group member to deliver and durably commit it once.
+#[tokio::test]
+async fn graceful_shutdown_recovers_prefetched_undelivered_record() -> Result<()> {
+  let consumer_time = Arc::new(framework::ManualTimeProvider::new(OffsetDateTime::now_utc()));
+  let mut cluster = ClusterHarness::in_memory(1)
+    .partition_count(1)
+    .consumer_time_provider(consumer_time.clone())
+    .start()
+    .await?;
+  let producer = cluster
+    .create_producer(
+      producer_config(),
+      vec![producer_topic_named_with_partition_count(TOPIC, 1, 1)],
+    )
+    .await?;
+  let mut runtime_a = consumer_runtime_config("prefetch-shutdown-a");
+  let mut runtime_b = consumer_runtime_config("prefetch-shutdown-b");
+  for runtime in [&mut runtime_a, &mut runtime_b] {
+    let read = runtime
+      .read
+      .as_mut()
+      .ok_or_else(|| anyhow!("prefetch-shutdown read config missing"))?;
+    read.metadata_visibility_delay_ms = Some(0);
+    read.prefetch_max_bytes = Some(1_024);
+  }
+  let group = runtime_a
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("prefetch-shutdown group config missing"))?;
+  let group_topic = group.topic.to_string();
+  let group_id = group.group_id.to_string();
+  let hooks = cluster.lifecycle_hooks();
+
+  let mut prefetch_gate = hooks.arm_prefetch_for_partition(0).await?;
+  let mut initial_rebalance = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "prefetch-shutdown-a",
+      None,
+      None,
+    )
+    .await?;
+  let mut consumer_a = cluster.create_consumer(&runtime_a).await?;
+  consumer_a.start()?;
+  consumer_time.advance(TimeDuration::milliseconds(200));
+  timeout(
+    Duration::from_secs(5),
+    initial_rebalance.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("initial prefetch-shutdown member did not rebalance"))??;
+  initial_rebalance.release()?;
+
+  let target_id = "prefetch-shutdown-undelivered";
+  let target_ack = produce_message(&producer, b"prefetch-shutdown-key".to_vec(), target_id).await?;
+  assert_eq!(target_ack.virtual_partition_id, 0);
+  {
+    let prefetch_wait = prefetch_gate.wait_until_reached();
+    tokio::pin!(prefetch_wait);
+    timeout(Duration::from_secs(5), async {
+      loop {
+        tokio::select! {
+          result = &mut prefetch_wait => return result,
+          () = tokio::task::yield_now() => {
+            consumer_time.advance(TimeDuration::milliseconds(200));
+          },
+        }
+      }
+    })
+    .await
+    .map_err(|_| anyhow!("consumer did not buffer the undispatched record"))??;
+  }
+  let prefetch_snapshot = consumer_a
+    .diagnostics()
+    .ok_or_else(|| anyhow!("concrete consumer did not provide diagnostics"))?
+    .state_snapshot();
+  assert!(
+    prefetch_snapshot.prefetch_buffered_record_count >= 1,
+    "prefetch gate must pause only after buffering the record: {prefetch_snapshot:?}"
+  );
+  prefetch_gate.release()?;
+
+  let mut before_release = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeReleaseOwned,
+      "prefetch-shutdown-a",
+      None,
+      None,
+    )
+    .await?;
+  let shutdown_task = tokio::spawn(async move { Box::new(consumer_a).shutdown().await });
+  timeout(Duration::from_secs(5), before_release.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("shutdown did not reach the lease-release boundary"))??;
+  let lease_before_release = cluster
+    .consumer_lease_store()
+    .list_group_leases(group_topic.as_str(), group_id.as_str())
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == target_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing prefetch-shutdown lease"))?;
+  assert_eq!(lease_before_release.owner_id, "prefetch-shutdown-a");
+  assert!(
+    lease_before_release.committed_cursor.is_none(),
+    "application-undelivered prefetched work must not create a durable cursor: \
+     {lease_before_release:?}"
+  );
+  before_release.release()?;
+  shutdown_task
+    .await
+    .map_err(|error| anyhow!("prefetch-shutdown task join error: {error}"))??;
+  assert!(
+    cluster
+      .consumer_membership_store()
+      .list_active_members(
+        group_topic.as_str(),
+        group_id.as_str(),
+        consumer_time.now().unix_timestamp_ms(),
+      )
+      .await?
+      .is_empty(),
+    "graceful shutdown must deregister the original member"
+  );
+
+  let mut restart_rebalance = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "prefetch-shutdown-b",
+      None,
+      None,
+    )
+    .await?;
+  let mut consumer_b = cluster.create_consumer(&runtime_b).await?;
+  consumer_b.start()?;
+  consumer_time.advance(TimeDuration::milliseconds(200));
+  timeout(
+    Duration::from_secs(5),
+    restart_rebalance.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("replacement prefetch-shutdown member did not rebalance"))??;
+  restart_rebalance.release()?;
+
+  let mut delivery_counts = HashMap::new();
+  let recovered_offset = timeout(Duration::from_secs(5), async {
+    loop {
+      match timeout(Duration::from_millis(250), consumer_b.next()).await {
+        Err(_) => {
+          consumer_time.advance(TimeDuration::seconds(1));
+          tokio::task::yield_now().await;
+        },
+        Ok(Err(error)) => {
+          return Err(anyhow!(
+            "replacement prefetch-shutdown next failed: {error}"
+          ));
+        },
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          if id != target_id {
+            return Err(anyhow!(
+              "replacement member delivered unexpected record: {id}"
+            ));
+          }
+          *delivery_counts.entry(id).or_insert(0_usize) += 1;
+          consumer_b.store_offset(record.virtual_partition_id, record.offset)?;
+          consumer_b.commit().await?;
+          return Ok::<_, anyhow::Error>(record.offset);
+        },
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("replacement member did not deliver prefetched work"))??;
+  assert_eq!(
+    delivery_counts,
+    HashMap::from([(target_id.to_string(), 1_usize)]),
+    "prefetched work must be application-delivered exactly once after restart"
+  );
+
+  let recovered_lease = cluster
+    .consumer_lease_store()
+    .list_group_leases(group_topic.as_str(), group_id.as_str())
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == target_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing recovered prefetch-shutdown lease"))?;
+  assert!(
+    recovered_lease
+      .committed_cursor
+      .as_ref()
+      .is_some_and(|cursor| {
+        cursor.seq_end == recovered_offset && cursor.source_checkpoint.is_some()
+      }),
+    "replacement member did not durably checkpoint recovered prefetched work: {recovered_lease:?}"
+  );
+
+  Box::new(consumer_b).shutdown().await?;
+  cluster.shutdown().await;
+  Ok(())
+}
+
 // High-level: verifies that a record buffered by the former owner cannot escape after its
 // partition is revoked, and the replacement owner becomes the only post-revocation deliverer.
 #[tokio::test]
@@ -3387,44 +4643,119 @@ async fn prefetch_rebalance_revocation_fences_buffered_record() -> Result<()> {
 
   let hooks = cluster.lifecycle_hooks();
   let mut prefetch_gate = hooks.arm_prefetch_for_partition(target_partition).await?;
+  let mut initial_rebalance_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "prefetch-fence-a",
+      None,
+      None,
+    )
+    .await?;
   let mut owner_a = cluster.create_consumer(&runtime_a).await?;
   owner_a.start()?;
-  timeout(Duration::from_secs(5), consumer_time.wait_until_sleeping(2))
-    .await
-    .map_err(|_| anyhow!("former owner did not park its driver and prefetch worker"))?;
+  consumer_time.advance(TimeDuration::milliseconds(200));
+  timeout(
+    Duration::from_secs(5),
+    initial_rebalance_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("former owner did not reach its initial rebalance boundary"))??;
+  initial_rebalance_gate.release()?;
+  let initial_lease = timeout(Duration::from_secs(5), async {
+    loop {
+      let lease = cluster
+        .consumer_lease_store()
+        .list_group_leases(group.topic.as_str(), group.group_id.as_str())
+        .await?
+        .into_iter()
+        .find(|lease| lease.key.virtual_partition_id == target_partition);
+      if let Some(lease) = lease.filter(|lease| lease.owner_id == "prefetch-fence-a") {
+        return Ok::<_, anyhow::Error>(lease);
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("former owner did not acquire the target-partition lease"))??;
 
   let target_id = "prefetch-fence-record";
   let target_ack = produce_message(&producer, target_key, target_id).await?;
   assert_eq!(target_ack.virtual_partition_id, target_partition);
 
-  consumer_time.advance(TimeDuration::seconds(1));
-  timeout(Duration::from_secs(5), prefetch_gate.wait_until_reached())
+  {
+    let prefetch_wait = prefetch_gate.wait_until_reached();
+    tokio::pin!(prefetch_wait);
+    timeout(Duration::from_secs(5), async {
+      loop {
+        tokio::select! {
+          result = &mut prefetch_wait => return result,
+          () = tokio::task::yield_now() => {
+            consumer_time.advance(TimeDuration::milliseconds(200));
+          },
+        }
+      }
+    })
     .await
     .map_err(|_| anyhow!("former owner did not buffer the target partition"))??;
-
-  let initial_lease = cluster
-    .consumer_lease_store()
-    .list_group_leases(group.topic.as_str(), group.group_id.as_str())
-    .await?
-    .into_iter()
-    .find(|lease| lease.key.virtual_partition_id == target_partition)
-    .ok_or_else(|| anyhow!("missing former-owner lease for target partition"))?;
-  assert_eq!(initial_lease.owner_id, "prefetch-fence-a");
-  let revocation_generation = initial_lease.generation + 1;
+  }
 
   let mut revocation_gate = hooks
     .arm_consumer(
       LifecycleEvent::ConsumerRevocationEmitted,
       "prefetch-fence-a",
       Some(target_partition),
-      Some(revocation_generation),
+      None,
+    )
+    .await?;
+  let mut scale_out_rebalance_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "prefetch-fence-a",
+      None,
+      None,
     )
     .await?;
   let mut owner_b = cluster.create_consumer(&runtime_b).await?;
   owner_b.start()?;
-  tokio::task::yield_now().await;
-  consumer_time.advance(TimeDuration::seconds(1));
-  tokio::task::yield_now().await;
+  timeout(Duration::from_secs(5), async {
+    loop {
+      let active_members = cluster
+        .consumer_membership_store()
+        .list_active_members(
+          group.topic.as_str(),
+          group.group_id.as_str(),
+          consumer_time.now().unix_timestamp_ms(),
+        )
+        .await?;
+      if active_members.contains(&"prefetch-fence-a".to_string())
+        && active_members.contains(&"prefetch-fence-b".to_string())
+      {
+        return Ok::<_, anyhow::Error>(());
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("both prefetch-fence members did not become active"))??;
+  {
+    let scale_out_rebalance_wait = scale_out_rebalance_gate.wait_until_reached();
+    tokio::pin!(scale_out_rebalance_wait);
+    timeout(Duration::from_secs(5), async {
+      for _ in 0 .. 5 {
+        consumer_time.advance(TimeDuration::milliseconds(200));
+        tokio::select! {
+          result = &mut scale_out_rebalance_wait => return result,
+          () = tokio::task::yield_now() => {},
+        }
+      }
+      Err(anyhow!(
+        "former owner did not begin its scale-out rebalance"
+      ))
+    })
+    .await
+    .map_err(|_| anyhow!("former owner did not begin its scale-out rebalance"))??;
+  }
+  scale_out_rebalance_gate.release()?;
   timeout(Duration::from_secs(5), revocation_gate.wait_until_reached())
     .await
     .map_err(|_| anyhow!("former owner did not emit a revocation after scale-out"))??;
@@ -3514,7 +4845,7 @@ async fn prefetch_rebalance_revocation_fences_buffered_record() -> Result<()> {
             NextResult::Record(record) => return Ok(record),
           }
         },
-        () = tokio::time::sleep(Duration::from_millis(250)) => {},
+        () = tokio::task::yield_now() => {},
       }
     }
   })
@@ -4835,26 +6166,20 @@ async fn consumer_restart_hands_active_window_visibility_deferral_to_fast() -> R
   Ok(())
 }
 
-// High-level: validates production bootstrap path discovers new members and rebalances on
-// scale-out.
+// High-level: validates group membership discovers new members and rebalances on scale-out.
 #[tokio::test]
-async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
-  // Run broker + producer against S3/Dynamo-backed stores so bootstrap consumers exercise the
-  // same production storage path used by ConsumerConfigFactory.
-  let resources = IntegrationResources::create().await?;
-  let mut cluster = ClusterHarness::builder(&resources, 1)
-    .blob_store(resources.s3_blob_store())
-    .start()
-    .await?;
+async fn dynamic_membership_scale_out_rebalances() -> Result<()> {
+  // This exercises group coordination rather than backend serialization; keep all participants
+  // on the harness's shared in-memory stores to make membership convergence deterministic.
+  let mut cluster = ClusterHarness::in_memory(1).start().await?;
 
   let producer = cluster
     .create_producer(producer_config(), vec![producer_topic()])
     .await?;
-  let consumer_lease_store = resources.consumer_lease_store();
+  let consumer_lease_store = cluster.consumer_lease_store();
 
-  // Build two independent bootstrap consumers for the same group.
-  let config_a = consumer_bootstrap_config("bootstrap-a", &resources);
-  let config_b = consumer_bootstrap_config("bootstrap-b", &resources);
+  let runtime_a = consumer_runtime_config("bootstrap-a");
+  let runtime_b = consumer_runtime_config("bootstrap-b");
 
   // Produce upfront so rebalance happens while data is already available to consume.
   let mut expected_ids = HashSet::new();
@@ -4869,22 +6194,8 @@ async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
     expected_ids.insert(id);
   }
 
-  let mut consumer_a = Box::new(
-    ConsumerConfigFactory::build_iterator_from_proto_config(
-      config_a,
-      metrics_scope("blob_stream_consumer_it"),
-      None,
-    )
-    .await?,
-  );
-  let mut consumer_b = Box::new(
-    ConsumerConfigFactory::build_iterator_from_proto_config(
-      config_b,
-      metrics_scope("blob_stream_consumer_it"),
-      None,
-    )
-    .await?,
-  );
+  let mut consumer_a = cluster.create_consumer(&runtime_a).await?;
+  let mut consumer_b = cluster.create_consumer(&runtime_b).await?;
   consumer_a.start()?;
   consumer_b.start()?;
 
@@ -4933,16 +6244,13 @@ async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
     consumer_b_renewed |= !report_b.renewed_partitions.is_empty();
   }
 
-  assert!(
-    saw_revocation,
-    "expected revocation during bootstrap scale-out"
-  );
+  assert!(saw_revocation, "expected revocation during scale-out");
   assert!(
     (consumer_a_progress || consumer_a_renewed) && (consumer_b_progress || consumer_b_renewed),
-    "expected both bootstrap consumers to make forward progress"
+    "expected both consumers to make forward progress"
   );
 
-  // Only the bootstrapped group members may establish the final no-loss result.
+  // Only the active group members may establish the final no-loss result.
   let drain_deadline = Instant::now() + Duration::from_secs(12);
   while delivery_traces_a
     .keys()
@@ -4953,15 +6261,14 @@ async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
   {
     if Instant::now() >= drain_deadline {
       return Err(anyhow!(
-        "bootstrap members did not drain scale-out traffic: expected={}, consumed_by_a={}, \
-         consumed_by_b={}",
+        "members did not drain scale-out traffic: expected={}, consumed_by_a={}, consumed_by_b={}",
         expected_ids.len(),
         delivery_traces_a.len(),
         delivery_traces_b.len()
       ));
     }
 
-    // Await whichever already-started bootstrap member has work instead of spending up to two
+    // Await whichever already-started member has work instead of spending up to two
     // seconds polling an idle member before polling the other.
     tokio::select! {
       result = poll_consumer_once(&mut consumer_a, "bootstrap-a", &mut delivery_traces_a) => {
@@ -4983,14 +6290,14 @@ async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
   );
   assert!(
     delivered_id_counts.values().all(|count| *count >= 1),
-    "bootstrap scale-out requires at-least-once delivery: counts={delivered_id_counts:?}, \
+    "scale-out requires at-least-once delivery: counts={delivered_id_counts:?}, \
      traces={delivery_traces:?}"
   );
   assert!(
     delivery_members(&delivery_traces)
       .iter()
       .all(|member_id| ["bootstrap-a", "bootstrap-b"].contains(&member_id.as_str())),
-    "bootstrap scale-out delivery came from a non-group member: {delivery_traces:?}"
+    "scale-out delivery came from a non-group member: {delivery_traces:?}"
   );
 
   let leases = consumer_lease_store
@@ -5000,18 +6307,268 @@ async fn bootstrap_dynamic_membership_scale_out_rebalances() -> Result<()> {
     let lease = leases
       .iter()
       .find(|lease| lease.key.virtual_partition_id == partition_id)
-      .ok_or_else(|| anyhow!("missing bootstrap lease for partition {partition_id}"))?;
+      .ok_or_else(|| anyhow!("missing lease for partition {partition_id}"))?;
     assert!(
       lease.committed_cursor.as_ref().is_some_and(|cursor| {
         cursor.seq_end >= maximum_offset && cursor.source_checkpoint.is_some()
       }),
-      "bootstrap scale-out did not durably commit partition {partition_id}: {lease:?}"
+      "scale-out did not durably commit partition {partition_id}: {lease:?}"
     );
   }
 
-  // Clean shutdown to avoid dangling members/resources across tests.
-  let _ = consumer_a.shutdown().await;
-  let _ = consumer_b.shutdown().await;
+  // Clean shutdown to avoid dangling members across tests.
+  let _ = Box::new(consumer_a).shutdown().await;
+  let _ = Box::new(consumer_b).shutdown().await;
+  cluster.shutdown().await;
+  Ok(())
+}
+
+// High-level: validates a bootstrap consumer gracefully restarts through the production S3 and
+// Dynamo configuration path without replaying committed data.
+#[tokio::test]
+async fn bootstrap_graceful_restart_resumes_durable_s3_dynamo_progress() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .blob_store(resources.s3_blob_store())
+    .start()
+    .await?;
+  let producer = cluster
+    .create_producer(producer_config(), vec![producer_topic()])
+    .await?;
+  let config = consumer_bootstrap_config("bootstrap-restart", &resources);
+  let hooks = cluster.lifecycle_hooks();
+
+  let mut phase1_expected = HashSet::new();
+  for message_id in 0 .. 12 {
+    let id = format!("bootstrap-restart-phase1-{message_id}");
+    produce_message(
+      &producer,
+      format!("bootstrap-restart-key-{}", message_id % 4).into_bytes(),
+      &id,
+    )
+    .await?;
+    phase1_expected.insert(id);
+  }
+
+  let mut initial_rebalance = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "bootstrap-restart",
+      None,
+      None,
+    )
+    .await?;
+  let mut consumer = ConsumerBootstrapIteratorBuilder::new(
+    ConsumerBootstrapConfig::from_proto_config(&config)?,
+    metrics_scope("blob_stream_consumer_it"),
+    None,
+  )
+  .lifecycle_hooks(Arc::new(hooks.clone()))
+  .build()
+  .await?;
+  consumer.start()?;
+  timeout(
+    Duration::from_secs(5),
+    initial_rebalance.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("bootstrap consumer did not reach its initial rebalance boundary"))??;
+  initial_rebalance.release()?;
+
+  let mut phase1_traces = ConsumerDeliveryTraces::new();
+  let phase1_deadline = Instant::now() + Duration::from_secs(20);
+  while phase1_traces.len() < phase1_expected.len() {
+    if Instant::now() >= phase1_deadline {
+      return Err(anyhow!(
+        "bootstrap consumer did not drain phase 1: expected={}, received={}",
+        phase1_expected.len(),
+        phase1_traces.len()
+      ));
+    }
+    let _ = poll_consumer_once(&mut consumer, "bootstrap-restart", &mut phase1_traces).await?;
+  }
+  assert_eq!(
+    phase1_traces.keys().cloned().collect::<HashSet<_>>(),
+    phase1_expected
+  );
+  assert!(
+    delivery_counts(&phase1_traces)
+      .values()
+      .all(|count| *count == 1),
+    "bootstrap restart phase 1 must be exactly once: {phase1_traces:?}"
+  );
+  let phase1_offsets = maximum_delivery_offsets(&phase1_traces);
+  wait_for_group_offsets_committed(
+    &cluster,
+    &phase1_offsets,
+    "bootstrap phase 1 cursors did not durably commit",
+  )
+  .await?;
+
+  let mut before_commit = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeCommit,
+      "bootstrap-restart",
+      None,
+      None,
+    )
+    .await?;
+  let mut commit_finished = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerShutdownCommitFinished,
+      "bootstrap-restart",
+      None,
+      None,
+    )
+    .await?;
+  let mut before_release = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeReleaseOwned,
+      "bootstrap-restart",
+      None,
+      None,
+    )
+    .await?;
+  let mut before_deregister = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeDeregisterMember,
+      "bootstrap-restart",
+      None,
+      None,
+    )
+    .await?;
+  let shutdown_task = tokio::spawn(async move { Box::new(consumer).shutdown().await });
+  timeout(Duration::from_secs(5), before_commit.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("bootstrap shutdown did not reach its final commit boundary"))??;
+  before_commit.release()?;
+  timeout(Duration::from_secs(5), commit_finished.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("bootstrap shutdown did not complete its final commit"))??;
+  commit_finished.release()?;
+  timeout(Duration::from_secs(5), before_release.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("bootstrap shutdown did not reach its release boundary"))??;
+  before_release.release()?;
+  timeout(
+    Duration::from_secs(5),
+    before_deregister.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("bootstrap shutdown did not reach its deregistration boundary"))??;
+  before_deregister.release()?;
+  shutdown_task
+    .await
+    .map_err(|error| anyhow!("bootstrap shutdown task failed: {error}"))??;
+
+  assert!(
+    resources
+      .consumer_membership_store()
+      .list_active_members(TOPIC, "integration-group", now_unix_millis())
+      .await?
+      .is_empty(),
+    "bootstrap member remained registered after graceful shutdown"
+  );
+
+  let mut phase2_expected = HashSet::new();
+  for message_id in 0 .. 12 {
+    let id = format!("bootstrap-restart-phase2-{message_id}");
+    produce_message(
+      &producer,
+      format!("bootstrap-restart-key-{}", message_id % 4).into_bytes(),
+      &id,
+    )
+    .await?;
+    phase2_expected.insert(id);
+  }
+
+  let mut restart_rebalance = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "bootstrap-restart",
+      None,
+      None,
+    )
+    .await?;
+  let mut restarted_consumer = ConsumerBootstrapIteratorBuilder::new(
+    ConsumerBootstrapConfig::from_proto_config(&config)?,
+    metrics_scope("blob_stream_consumer_it"),
+    None,
+  )
+  .lifecycle_hooks(Arc::new(hooks))
+  .build()
+  .await?;
+  restarted_consumer.start()?;
+  timeout(
+    Duration::from_secs(5),
+    restart_rebalance.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("restarted bootstrap consumer did not reach its rebalance boundary"))??;
+  restart_rebalance.release()?;
+
+  let mut phase2_traces = ConsumerDeliveryTraces::new();
+  let mut replayed_phase1 = ConsumerDeliveryTraces::new();
+  let phase2_deadline = Instant::now() + Duration::from_secs(20);
+  while phase2_traces.len() < phase2_expected.len() {
+    if Instant::now() >= phase2_deadline {
+      return Err(anyhow!(
+        "restarted bootstrap consumer did not drain phase 2: expected={}, received={}",
+        phase2_expected.len(),
+        phase2_traces.len()
+      ));
+    }
+    match timeout(Duration::from_secs(2), restarted_consumer.next()).await {
+      Err(_) => {},
+      Ok(Err(error)) => return Err(anyhow!("restarted bootstrap next failed: {error}")),
+      Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+      Ok(Ok(NextResult::Record(record))) => {
+        let id = String::from_utf8(record.record.payload.to_vec())?;
+        let target_traces = if phase1_expected.contains(&id) {
+          &mut replayed_phase1
+        } else if phase2_expected.contains(&id) {
+          &mut phase2_traces
+        } else {
+          return Err(anyhow!(
+            "restarted bootstrap consumer delivered unexpected record: {id}"
+          ));
+        };
+        target_traces
+          .entry(id)
+          .or_default()
+          .push(ConsumerDeliveryTrace {
+            member_id: "bootstrap-restart".to_string(),
+            virtual_partition_id: record.virtual_partition_id,
+            offset: record.offset,
+          });
+        restarted_consumer.store_offset(record.virtual_partition_id, record.offset)?;
+        restarted_consumer.commit().await?;
+      },
+    }
+  }
+  assert!(
+    replayed_phase1.is_empty(),
+    "restarted bootstrap consumer replayed committed phase 1 data: {replayed_phase1:?}"
+  );
+  assert_eq!(
+    phase2_traces.keys().cloned().collect::<HashSet<_>>(),
+    phase2_expected
+  );
+  assert!(
+    delivery_counts(&phase2_traces)
+      .values()
+      .all(|count| *count == 1),
+    "bootstrap restart phase 2 must be exactly once: {phase2_traces:?}"
+  );
+  let phase2_offsets = maximum_delivery_offsets(&phase2_traces);
+  wait_for_group_offsets_committed(
+    &cluster,
+    &phase2_offsets,
+    "bootstrap phase 2 cursors did not durably commit",
+  )
+  .await?;
+
+  Box::new(restarted_consumer).shutdown().await?;
   cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())
@@ -5033,6 +6590,35 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
     .await?;
   let membership_store = resources.consumer_membership_store();
   let hooks = cluster.lifecycle_hooks();
+  let config_a = consumer_bootstrap_config("bootstrap-a", &resources);
+  let config_b = consumer_bootstrap_config("bootstrap-b", &resources);
+
+  // Bootstrap construction performs an initial rebalance, so A must be fully assigned before B
+  // exists. Otherwise, concurrent bootstrap can make A's scale-out revocation scheduler-dependent.
+  let mut consumer_a = Box::new(
+    ConsumerBootstrapIteratorBuilder::new(
+      ConsumerBootstrapConfig::from_proto_config(&config_a)?,
+      metrics_scope("blob_stream_consumer_it"),
+      None,
+    )
+    .time_provider(consumer_time.clone())
+    .lifecycle_hooks(Arc::new(hooks.clone()))
+    .build()
+    .await?,
+  );
+
+  let initial_leases = resources
+    .consumer_lease_store()
+    .list_group_leases(TOPIC, "integration-group")
+    .await?;
+  assert_eq!(initial_leases.len(), PARTITION_COUNT as usize);
+  assert!(
+    initial_leases
+      .iter()
+      .all(|lease| lease.owner_id == "bootstrap-a"),
+    "bootstrap member A did not own every initial partition: {initial_leases:?}"
+  );
+
   let mut initial_revocation_gate = hooks
     .arm_consumer(
       LifecycleEvent::ConsumerRevocationEmitted,
@@ -5049,20 +6635,6 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
       None,
     )
     .await?;
-
-  let config_a = consumer_bootstrap_config("bootstrap-a", &resources);
-  let config_b = consumer_bootstrap_config("bootstrap-b", &resources);
-  let mut consumer_a = Box::new(
-    ConsumerBootstrapIteratorBuilder::new(
-      ConsumerBootstrapConfig::from_proto_config(&config_a)?,
-      metrics_scope("blob_stream_consumer_it"),
-      None,
-    )
-    .time_provider(consumer_time.clone())
-    .lifecycle_hooks(Arc::new(hooks.clone()))
-    .build()
-    .await?,
-  );
   let mut consumer_b = Box::new(
     ConsumerBootstrapIteratorBuilder::new(
       ConsumerBootstrapConfig::from_proto_config(&config_b)?,
@@ -5076,7 +6648,7 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
   );
   consumer_a.start()?;
   consumer_b.start()?;
-
+  consumer_time.advance(TimeDuration::seconds(1));
   timeout(
     Duration::from_secs(5),
     initial_revocation_gate.wait_until_reached(),
@@ -5098,10 +6670,7 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
   consumer_b.commit().await?;
 
   // A's revocation is applied immediately, while B's next rebalance is scheduled against the
-  // manual clock. Wait for the worker loops to park before advancing that shared clock.
-  timeout(Duration::from_secs(5), consumer_time.wait_until_sleeping(2))
-    .await
-    .map_err(|_| anyhow!("bootstrap consumers did not park before B's scale-out rebalance"))?;
+  // manual clock and held at the member-scoped assignment boundary.
   consumer_time.advance(TimeDuration::seconds(1));
   timeout(
     Duration::from_secs(5),
@@ -5167,9 +6736,6 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
   consumer_b.abort_for_test().await?;
   drop(consumer_b);
 
-  timeout(Duration::from_secs(5), consumer_time.wait_until_sleeping(2))
-    .await
-    .map_err(|_| anyhow!("surviving bootstrap member did not park after the crash"))?;
   consumer_time.advance(TimeDuration::seconds(3));
   timeout(
     Duration::from_secs(5),

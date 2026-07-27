@@ -4,17 +4,35 @@ This is the working checklist for hardening the broker and consumer lifecycle te
 the integration scenarios in `blob-stream-integration-tests/tests/end_to_end_test.rs` and
 `blob-stream-integration-tests/tests/fault_injection_test.rs`.
 
-## Status And Rules
+## Rules
 
-- [x] A test checks a named causal boundary, its required durable state, and its final outcome.
-- [ ] A test uses a wall-clock delay as a success mechanism. Replace it with manual time, a
-  lifecycle gate, or an observable test-framework event.
-- [ ] A consumer-group, membership, or rebalance test lets a standalone `ConsumerReaderImpl`
-  establish the final outcome. Only the live group consumers may do that.
-- [ ] A `HashSet` alone establishes duplicate policy. Record per-ID counts whenever the scenario
-  has a duplicate or redelivery contract.
-- [ ] A timeout diagnoses a missing named event or progress boundary; it is not the reason the
+- Every test must check a named causal boundary, its required durable state, and its final outcome.
+- Never use a wall-clock delay as a success mechanism. Use manual time, a lifecycle gate, or an
+  observable test-framework event. New lifecycle gates may be added as needed in aid of
+  deterministic tests.
+- A consumer-group, membership, or rebalance test must establish its final outcome through live
+  group consumers, never a standalone `ConsumerReaderImpl`.
+- Never use a `HashSet` alone to establish duplicate policy. Record per-ID counts whenever a
+  scenario has a duplicate or redelivery contract.
+- A timeout may diagnose a missing named event or progress boundary; it must not be the reason a
   test succeeds.
+- Do not paper over dubious product behavior. When a deterministic test exposes a likely product
+  problem, stop that test effort, report the evidence and the expected contract, and request
+  guidance on whether the product behavior should change.
+
+## Deflaking Help
+
+Use `scripts/deflake.sh` to reproduce an intermittently failing nextest filter under CPU-capped
+parallel load. It runs each requested iteration in a separate `.tmp/deflake-*/run-####/` directory
+and reports every failed run directory, which contains `test.log` and `exit-status`.
+
+```sh
+scripts/deflake.sh 100 -- -p blob-stream-integration-tests -E 'test(the_flaky_test)'
+```
+
+The script accepts the arguments after `--` as `cargo nextest run` arguments. Use the failed run's
+`test.log` as evidence for the missing causal boundary; do not treat a higher iteration count as a
+substitute for deterministic synchronization.
 
 ## Already Hardened
 
@@ -24,9 +42,11 @@ the integration scenarios in `blob-stream-integration-tests/tests/end_to_end_tes
   live group consumers across scale-out and broker failover.
 - [x] `prefetch_rebalance_delayed_metadata_no_loss`: requires an actual prefetch-buffer event and
   drains through the group after rebalance.
-- [x] `bootstrap_dynamic_membership_scale_out_rebalances`: uses live bootstrap consumers for its
-  final no-loss result, concurrently polls both members, and records its at-least-once delivery
-  trace and durable cursors.
+  - Covered: the phase-one prefetch gate is scoped to `prefetch-consumer-0`, and the next group
+    rebalance is held at its lifecycle boundary before phase-two publication.
+- [x] `dynamic_membership_scale_out_rebalances`: uses live group consumers over shared memory
+  stores for its final no-loss result, concurrently polls both members, and records its
+  at-least-once delivery trace and durable cursors.
 - [x] `metadata_write_fail_then_retry_ack_semantics` and
   `combined_network_and_metadata_faults_preserve_producer_publication`: drive producer retries with a manual retry
   clock and assert the scripted fault ordering.
@@ -54,9 +74,10 @@ the integration scenarios in `blob-stream-integration-tests/tests/end_to_end_tes
     `network_delay_and_reorder_preserves_cursor_monotonicity` waits for both manually scheduled
     transport delays before advancing them into the explicit paired reorder rendezvous.
   - Completed: `network_delay_and_reorder_preserves_cursor_monotonicity` uses a fixed reader
-    horizon and cooperative yielding. The producer lease-conflict/reroute test observes each
-    broker-side conflict before releasing its matching retry boundary and verifies reroute
-    progress without treating producer retry timing as lease expiry.
+    horizon and cooperative yielding.
+  - Covered: `producer_lease_store_conflicts_then_broker_reroute_preserves_progress` waits for
+    both producer-route and standby broker-lease convergence after discovery changes, then drives
+    every pre- and post-reroute producer retry with a manual retry clock.
   - Acceptance: wait for the named fault, buffered-work, or visibility boundary before advancing
     a manual retry/scheduler clock or releasing a lifecycle gate. No fixed delay may create the
     success condition.
@@ -86,17 +107,21 @@ the integration scenarios in `blob-stream-integration-tests/tests/end_to_end_tes
     checkpoint. A stale heartbeat is separately fenced on one explicitly selected touched lease.
 
 - [x] `prefetch_rebalance_revocation_fences_buffered_record` is a deterministic fencing oracle.
-  - Covered: the revocation gate is scoped to A, the target partition, and the post-scale-out
-    coordinator generation. A completes the callback before the prefetch worker is released; B
-    acquires a newer lease, and A is held before a later rebalance while B prefetches. An A record
-    then fails immediately, while B's replacement delivery and durable source checkpoint provide
-    the positive completion boundary.
+  - Covered: the revocation gate is scoped to A and the target partition. A completes the callback
+    before the prefetch worker is released; B acquires a newer lease, and A is held before a later
+    rebalance while B prefetches. An A record then fails immediately, while B's replacement
+    delivery and durable source checkpoint provide the positive completion boundary.
+  - Completed: A reaches a member-scoped rebalance boundary before publication, then proves
+    target-partition ownership through its durable lease. The replacement-delivery loop yields
+    cooperatively rather than sleeping.
 
 - [x] Strengthen `bootstrap_dynamic_membership_scale_in_after_expiry` with a phase-scoped oracle.
   - Covered: bootstrap B first acquires concrete partitions, its per-partition post-ownership phase
     is published without being polled, B aborts without graceful cleanup, and shared manual time
     drives membership/lease expiry. A alone drains each post-crash ID once, B is absent from active
     membership and final leases, and recovered partitions retain durable source checkpoints.
+  - Completed: member-scoped rebalance and assignment gates identify both the scale-out and
+    post-expiry phases before the test releases dependent work.
 
 - [x] Harden `consumer_restart_resume_from_committed_offsets` and
   `iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices` with complete
@@ -118,9 +143,9 @@ the integration scenarios in `blob-stream-integration-tests/tests/end_to_end_tes
 
 - [x] `active_broker_restart_continuity` uses two live group consumers throughout the restart.
   - Covered: traffic is produced before and after restart, the active broker's drain start is
-    gated, every ID is delivered exactly once by the group with per-partition monotonic offsets,
-    final ownership converges, and durable group cursor offsets advance through every produced
-    partition.
+    gated, accepted in-flight metadata persists while the drain remains held, every ID is
+    delivered exactly once by the group with per-partition monotonic offsets, final ownership
+    converges, and durable group cursor offsets advance through every produced partition.
 
 - [x] `active_broker_restart_continuity` requires a source checkpoint for every asserted cursor.
   - Covered: every partition with produced traffic has a cursor at or beyond its observed delivery
@@ -143,6 +168,8 @@ the integration scenarios in `blob-stream-integration-tests/tests/end_to_end_tes
     partition's maximum observed offset retained for the durable cursor oracle.
   - Completed: final lease owners are queried against `list_active_members` at final logical time;
     every owner is active while durable cursors and revocation evidence remain required.
+  - Completed: each logical-time advance follows an observed scripted store fault or a concrete
+    consumer delivery/revocation, and the post-fault rebalance is held at a lifecycle boundary.
 
 - [x] `consumer_lease_store_heartbeat_failover` uses a live iterator handoff.
   - Covered: A commits a pre-failure record, its partition heartbeat fault makes the commit fail,
@@ -163,17 +190,19 @@ the integration scenarios in `blob-stream-integration-tests/tests/end_to_end_tes
   - Verified coverage: `autoscaling_rebalance_and_failover_preserves_progress`,
     `group_rebalance_continuous_traffic_no_loss`,
     `prefetch_rebalance_delayed_metadata_no_loss`, and
-    `bootstrap_dynamic_membership_scale_out_rebalances` all use at-least-once delivery.
+    `dynamic_membership_scale_out_rebalances` all use at-least-once delivery.
   - Completed: `run_consumer_task` emits `Batch` before `store_offset` and commit, emits a
     separate commit-success event, and each task-driven scenario independently waits for durable
     source checkpoints.
+  - Completed: the existing group scenarios retain their per-ID and durable-cursor assertions,
+    while lifecycle gates now control their membership transition boundaries.
 
-- [x] `bootstrap_dynamic_membership_scale_out_rebalances` observes convergence concurrently.
+- [x] `dynamic_membership_scale_out_rebalances` observes convergence concurrently.
   - Covered: both bootstrap member polls are started together during convergence, so an idle
     member's poll timeout cannot delay a concrete event from its peer.
-  - Completed: its commit cadence uses ownership and completed-poll boundaries. The prefetch
-    revocation test advances logical time after a cooperative driver boundary and waits directly
-    for its prefetch and rebalance lifecycle gates.
+  - Completed: its commit cadence uses ownership and completed-poll boundaries.
+  - Completed: the related prefetch revocation test confirms target-partition ownership through a
+    durable lease and yields cooperatively while scoped lifecycle gates control the handoff.
 
 ### P2: Scope Existing Fault Tests Precisely
 
@@ -199,7 +228,7 @@ the integration scenarios in `blob-stream-integration-tests/tests/end_to_end_tes
     partition, and optional generation. The prefetch revocation fencing test verifies that the
     exact A handoff reaches its gate.
 
-- [ ] Add a test helper for explicit consumer delivery control.
+- [x] Add a local test helper for explicit consumer delivery control.
   - Why: `run_consumer_task` and `poll_consumer_once` store and commit every record, hiding the
     crash, delayed-commit, and revocation boundaries the lifecycle tests need. The task helper
     also emits its delivery trace only after commit, so it cannot represent failed-commit
@@ -207,6 +236,9 @@ the integration scenarios in `blob-stream-integration-tests/tests/end_to_end_tes
   - Acceptance: tests can receive one record or revocation, choose whether to `store_offset`,
     `commit`, complete revocation, graceful-shutdown, or use the explicit crash primitive, while
     recording member/partition/offset/ID delivery traces.
+  - Covered locally: `ControlledConsumer` supports those operations and traces in
+    `end_to_end_test.rs`. Promote it to shared test-framework support only if a second test module
+    needs the same control surface.
 
 - [x] Add a direct-reader delivery-trace and controlled-rescan helper.
   - Why: `drain_reader_until` ends on unique-ID cardinality and sleeps on wall time, so direct
@@ -221,11 +253,9 @@ the integration scenarios in `blob-stream-integration-tests/tests/end_to_end_tes
     declare exact-once or at-least-once multiplicity, and drive each retry/rescan from an explicit
     event or supplied test clock rather than `runtime_sleep`.
 
-- [ ] Complete explicit direct-reader fault-script boundaries.
-  - Remaining: `metadata_scan_stale_visibility_no_duplicate_progress` may stop after all records
-    appear while only proving that one stale-read fault occurred. Require all eight scripted
-    `metadata_scan_window` faults before its clean no-duplicate rescans, and remove the remaining
-    elapsed pacing sleep.
+- [x] Complete explicit direct-reader fault-script boundaries.
+  - Covered: `metadata_scan_stale_visibility_no_duplicate_progress` exhausts and asserts all
+    eight scripted `metadata_scan_window` stale-read faults before its clean no-duplicate rescans.
 
 - [x] Add manually scheduled transport delay/reorder support.
   - Covered: `ManualNetworkScheduler` replaces elapsed delay and reorder fallback waits when
@@ -233,6 +263,29 @@ the integration scenarios in `blob-stream-integration-tests/tests/end_to_end_tes
     verifies the paired reorder trace.
 
 ### P0: Consumer Lifecycle Scenarios
+
+- [x] Prove graceful shutdown's final checkpoint commits staged work before lease release.
+  - Gap: `consumer_restart_resume_from_committed_offsets` commits phase-one work before
+    shutdown, so its lifecycle gates prove ordering but not the final-commit data path.
+  - Acceptance: a live group consumer calls `store_offset` without `commit`; a shutdown commit
+    gate proves the durable cursor and source checkpoint reach that exact offset before the
+    release gate opens; a restarted consumer does not replay the record.
+  - Covered by `graceful_shutdown_final_checkpoint_commits_staged_record_before_release`: the
+    test observes the unstored cursor before shutdown, holds final commit completion and lease
+    release independently, then proves a restarted member only receives a post-restart marker.
+
+- [x] Prove a final-checkpoint failure retains at-least-once recovery semantics.
+  - Gap: shutdown release and deregistration faults are covered, but no test injects a
+    `ConsumerHeartbeatPartition` failure into shutdown's final commit. The implementation
+    releases leases and deregisters membership before returning the commit error.
+  - Acceptance: stage a record, fault the shutdown commit, and require shutdown to report the
+    error while its membership and leases are released. A replacement live consumer must then
+    redeliver the record exactly once and durably commit its source checkpoint.
+  - Covered by `graceful_shutdown_final_commit_failure_redelivers_staged_record`: a one-shot
+    final heartbeat failure leaves the cursor unchanged, while shutdown still releases and
+    deregisters. The replacement redelivers the exact staged offset once and durably commits it.
+  - Current assessment: the observed behavior matches the intended at-least-once contract; no
+    product defect was found.
 
 - [x] Crash-like handoff of an uncommitted record.
   - Covered by `consumer_crash_recovery_redelivers_only_uncommitted_record`.
@@ -242,46 +295,87 @@ the integration scenarios in `blob-stream-integration-tests/tests/end_to_end_tes
     gated commit, B takes ownership after manual expiry, the stale commit is fenced, and B
     redelivers and durably commits the record from the prior cursor.
 
-- [ ] Shutdown fault matrix for release and deregistration.
-  - Acceptance: independently fail release and deregistration during graceful shutdown; prove the
-    resulting residual state, retry/recovery behavior, and prevention of premature replacement
-    ownership for each case.
+- [x] Shutdown fault matrix for release and deregistration.
+  - Covered: one-partition graceful shutdown faults make the residual state deterministic.
+    Release failure is returned from shutdown, retains the unexpired lease while membership is
+    removed, and fences replacement ownership until logical expiry. Deregistration failure is
+    reported to telemetry but does not fail shutdown; released leases remain available while the
+    residual member prevents complete replacement ownership until logical expiry.
+
+### P1: Consumer Restart, Recovery, And Prefetch
+
+- [x] `live_group_restart_recovers_retained_history_before_fast_path` reaches Fast through normal
+  group coordination after retained recovery.
+  - Covered: A commits a live source checkpoint and gracefully leaves the group. A real producer
+    then publishes one ID in each of three manually advanced windows; B skips the checkpoint,
+    reaches the gated `ConsumerRecoveryFastPathActive` boundary, exactly-once delivers every
+    downtime ID, and durably checkpoints the recovered partition.
+
+- [x] `live_group_recovery_waits_for_deferred_historical_visibility` blocks later recovery at a
+  deferred historical window.
+  - Covered: a live B restart sees a named middle-window visibility hold while a later window is
+    visible. Its diagnostics remain `Recovering`, its durable cursor stays at A's checkpoint, and
+    any deferred/later application delivery fails immediately. Releasing the named boundary
+    delivers the historical IDs in order and durably checkpoints the partition.
+
+- [x] `graceful_shutdown_recovers_prefetched_undelivered_record` preserves application delivery
+  semantics for buffered work.
+  - Covered: A reaches `ConsumerPrefetchBatchBuffered` with no caller `next()` and no durable
+    cursor, then gracefully releases its lease. B alone application-delivers the buffered ID once
+    and durably commits its source checkpoint.
 
 ### P1: Broker And Consumer Interaction
 
-- [ ] Broker restart combined with consumer membership movement.
-  - Acceptance: restart the active writer while one consumer joins or another expires; keep
-    producers active; prove group delivery, ownership, and cursor correctness without a reader
-    fallback.
+- [x] Broker restart combined with consumer membership movement.
+  - Covered: `active_broker_restart_continuity` starts a third live group consumer after the
+    active writer reaches its partition-scoped drain gate, holds the joining member at its
+    rebalance boundary, then releases it while accepted in-flight and continuous producer traffic
+    cross the restart. The live group proves exact-once delivery, membership-driven revocation,
+    final ownership, and durable cursor/source-checkpoint coverage without a reader fallback.
 
-- [ ] Ambiguous producer response during broker membership movement.
-  - Acceptance: persist a request, lose its response, move the broker route or ownership, retry,
-    and prove producer acknowledgement, durable metadata, and group delivery have the intended
-    duplicate policy.
+- [x] Ambiguous producer response during broker membership movement.
+  - Covered: `response_loss_retry_during_broker_handoff_preserves_group_delivery_contract`
+    persists on A, drops A's response, routes the already-retrying producer to B while A's lease
+    release is held, then releases A and waits for B ownership. Producer acknowledgement has two
+    attempts; the live group observes the application ID exactly twice on one partition with
+    increasing offsets, and its durable cursor/source checkpoint covers the maximum observed
+    offset. A broker handoff may reserve a new sequence range, so offset contiguity is not part of
+    the duplicate contract.
 
-- [ ] S3/Dynamo graceful-restart lifecycle smoke path.
-  - Current coverage: bootstrap scale-out and crash/expiry already exercise the production
-    bootstrap/configuration path.
-  - Acceptance: add a graceful consumer or broker restart against that path and verify the same
-    lease, membership, and cursor invariants as the in-memory deterministic tests.
+- [x] S3/Dynamo graceful-restart lifecycle smoke path.
+  - Covered: `bootstrap_graceful_restart_resumes_durable_s3_dynamo_progress` builds both
+    iterators from the production bootstrap configuration. Each iterator first reaches its
+    member-scoped initial rebalance boundary. The first iterator exactly-once commits phase 1,
+    reaches gated shutdown commit/release/deregistration boundaries, and removes its membership.
+    The rebuilt iterator does not replay phase 1, exactly-once commits phase 2, and leaves durable
+    cursor/source-checkpoint coverage in Dynamo for every observed partition.
+
+### P2: Direct-Reader Oracle Cleanup
+
+- [x] Replace remaining set-only initial-delivery checks with exact traces.
+  - Covered: `single_broker_single_record_end_to_end` and
+    `single_broker_cursor_monotonicity_and_dedup` now use `drain_reader_until_with_trace` and
+    require an exact one-delivery-per-ID map before retaining their existing re-scan/cursor
+    assertions.
 
 ## Suggested Implementation Order
 
 - [x] Deterministic crash-like consumer handoff.
 - [x] Partition-scoped prefetch lifecycle gate.
 - [x] Member/generation-scoped consumer gates.
-- [ ] Explicit-delivery helper.
+- [x] Explicit-delivery helper.
 - [x] Complete direct-reader controlled-rescan helper.
 - [x] Manual transport delay/reorder scheduler.
-- [x] Harden deterministic fault timing.
+- [x] Harden deterministic fault timing, including the producer lease-conflict/reroute transition.
 - [x] Complete deterministic prefetch revocation fencing.
-- [x] Rebuild lease-expiry and bootstrap scale-in around manual time.
-- [x] Explicit duplicate policy for existing group tests.
+- [x] Complete bootstrap scale-in with named phase boundaries.
+- [x] Complete scoped phase boundaries for existing group tests.
+- [x] Explicit duplicate policy for existing group-test terminal assertions.
 - [x] Harden restart/recovery durable cursor oracles.
 - [x] Commit-race test.
 - [x] In-flight broker drain with live group consumers.
-- [ ] Broker restart plus member movement and ambiguous-response movement.
-- [ ] S3/Dynamo graceful-restart lifecycle smoke coverage.
+- [x] Broker restart plus member movement and ambiguous-response movement.
+- [x] S3/Dynamo graceful-restart lifecycle smoke coverage.
 
 ## Verification Standard For Each Checked Item
 

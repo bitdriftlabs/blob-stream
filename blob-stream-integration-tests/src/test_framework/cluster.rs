@@ -130,6 +130,7 @@ pub struct ClusterHarness {
 /// Builds a cluster with no external storage dependencies.
 pub struct InMemoryClusterHarnessBuilder {
   broker_count: usize,
+  metadata_store: Option<Arc<dyn MetadataStore>>,
   partition_count: u32,
   topic_num_writers: u32,
   broker_flush_max_delay: Duration,
@@ -139,6 +140,12 @@ pub struct InMemoryClusterHarnessBuilder {
 }
 
 impl InMemoryClusterHarnessBuilder {
+  #[must_use]
+  pub fn metadata_store(mut self, metadata_store: Arc<dyn MetadataStore>) -> Self {
+    self.metadata_store = Some(metadata_store);
+    self
+  }
+
   #[must_use]
   pub fn partition_count(mut self, partition_count: u32) -> Self {
     self.partition_count = partition_count;
@@ -182,7 +189,9 @@ impl InMemoryClusterHarnessBuilder {
       store_fault_controller.clone(),
     ));
     let metadata_store: Arc<dyn MetadataStore> = Arc::new(FaultInjectedMetadataStore::new(
-      Arc::new(InMemoryMetadataStore::new()),
+      self
+        .metadata_store
+        .unwrap_or_else(|| Arc::new(InMemoryMetadataStore::new())),
       store_fault_controller.clone(),
     ));
     let lease_store: Arc<dyn ProducerPartitionLeaseStore> =
@@ -343,6 +352,7 @@ impl ClusterHarness {
   pub fn in_memory(broker_count: usize) -> InMemoryClusterHarnessBuilder {
     InMemoryClusterHarnessBuilder {
       broker_count,
+      metadata_store: None,
       partition_count: PARTITION_COUNT,
       topic_num_writers: 1,
       broker_flush_max_delay: Duration::from_millis(10),
