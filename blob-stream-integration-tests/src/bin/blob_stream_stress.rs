@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
     progress_interval: Duration::from_secs(cli.progress_interval_seconds),
     ..Default::default()
   };
-  let summary = run(config).await?;
+  let summary = Box::pin(run(config)).await?;
 
   println!(
     "run_id={} acknowledged={} unique={} duplicates={} missing={} retries={} retry_reasons={:?} \

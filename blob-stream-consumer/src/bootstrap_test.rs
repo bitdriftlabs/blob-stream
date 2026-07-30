@@ -1,10 +1,10 @@
 #![allow(clippy::unwrap_used)]
 
 use crate::bootstrap::{ConsumerBootstrapConfig, consumer_group_lease_ttl_buffer_seconds};
+use crate::iterator::ConsumerIterator;
 use crate::{
   ConsumerConfigFactory,
   ConsumerGroupConfig,
-  ConsumerIterator,
   ConsumerReadConfig,
   ConsumerRuntimeConfig,
 };

@@ -5,7 +5,7 @@ mod tests;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use blob_stream_broker::write::BrokerLifecycleHooks;
-use blob_stream_consumer::ConsumerLifecycleHooks;
+use blob_stream_consumer::iterator::ConsumerLifecycleHooks;
 use blob_stream_types::VirtualPartitionId;
 use std::collections::HashMap;
 use std::sync::Arc;

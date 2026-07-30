@@ -8,7 +8,8 @@
 //! ```no_run
 //! use anyhow::Result;
 //! use bd_server_stats::stats::Collector;
-//! use blob_stream_consumer::{ConsumerConfigFactory, ConsumerIterator, NextResult};
+//! use blob_stream_consumer::ConsumerConfigFactory;
+//! use blob_stream_consumer::iterator::{ConsumerIterator, NextResult};
 //! use blob_stream_proto::protos::blobstream::v1::config::{
 //!   BlobStoreConfig,
 //!   ConsumerGroupConfig,
@@ -79,10 +80,10 @@
 mod admin;
 mod bootstrap;
 mod config;
-mod consumer;
+pub mod consumer;
 mod coordination;
 mod diagnostics;
-mod iterator;
+pub mod iterator;
 
 pub use bootstrap::{
   ConsumerBootstrapConfig,
@@ -96,7 +97,6 @@ pub use config::{
   ConsumerRuntimeConfig,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
 };
-pub use consumer::{ConsumerBatch, ConsumerReader, ConsumerReaderImpl, ReadCapacity};
 pub use coordination::{
   ConsumerGroupCoordinator,
   ConsumerGroupCoordinatorImpl,
@@ -118,18 +118,4 @@ pub use diagnostics::{
   ConsumerSourceCheckpointSnapshot,
   ConsumerStateResponse,
   ConsumerStateSnapshot,
-};
-pub use iterator::{
-  AssignmentCallback,
-  ConsumerCoordinationSource,
-  ConsumerDeliveryState,
-  ConsumerIterator,
-  ConsumerIteratorBuilder,
-  ConsumerIteratorImpl,
-  ConsumerLifecycleHooks,
-  ConsumerRecord,
-  CoordinationSnapshot,
-  NextResult,
-  NoopConsumerLifecycleHooks,
-  RevokedPartitions,
 };

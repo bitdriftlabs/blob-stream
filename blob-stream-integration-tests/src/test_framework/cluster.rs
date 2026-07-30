@@ -35,9 +35,8 @@ use blob_stream_broker::write::{
   WriteEngineBuilder,
 };
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode};
+use blob_stream_consumer::iterator::{ConsumerIteratorBuilder, ConsumerIteratorImpl};
 use blob_stream_consumer::{
-  ConsumerIteratorBuilder,
-  ConsumerIteratorImpl,
   ConsumerRuntimeConfig,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   MembershipCoordinationSource,

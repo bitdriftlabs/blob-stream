@@ -1,7 +1,12 @@
 use crate::test_framework::runtime::now_unix_millis;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use blob_stream_consumer::{ConsumerBatch, ConsumerReader, ConsumerReaderImpl, ReadCapacity};
+use blob_stream_consumer::consumer::{
+  ConsumerBatch,
+  ConsumerReader,
+  ConsumerReaderImpl,
+  ReadCapacity,
+};
 use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerRecord};
 use blob_stream_types::VirtualPartitionId;
 use std::collections::{HashMap, HashSet};
