@@ -26,6 +26,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupCommitOutcome,
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
+  ConsumerGroupLeaseTransition,
   InMemoryMetadataStore,
   MetadataStore,
   SegmentMetadata,
@@ -4917,7 +4918,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
     .await?;
   assert!(matches!(
     initial_assignment,
-    ConsumerGroupAssignmentOutcome::Assigned(_)
+    ConsumerGroupAssignmentOutcome::Assigned { .. }
   ));
 
   let initial_heartbeat = lease_store
@@ -4958,11 +4959,24 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       lease_duration_ms,
     )
     .await?;
-  let ConsumerGroupAssignmentOutcome::Assigned(takeover_lease) = takeover_assignment else {
+  let ConsumerGroupAssignmentOutcome::Assigned {
+    lease: takeover_lease,
+    transition,
+    ..
+  } = takeover_assignment
+  else {
     return Err(anyhow!("expected takeover assignment by new generation"));
   };
   assert_eq!(takeover_lease.owner_id, "member-b");
   assert_eq!(takeover_lease.generation, takeover_generation);
+  assert!(matches!(
+    transition,
+    ConsumerGroupLeaseTransition::ExpiryTakeover {
+      previous_owner_id,
+      previous_generation,
+      ..
+    } if previous_owner_id == "member-a" && previous_generation == initial_generation
+  ));
 
   let takeover_heartbeat = lease_store
     .heartbeat_partition(
@@ -5610,7 +5624,10 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
       tokio::task::yield_now().await;
 
       match timeout(Duration::from_millis(250), owner_b.next()).await {
-        Err(_) => {},
+        Err(_) => {
+          consumer_time.advance(TimeDuration::seconds(1));
+          tokio::task::yield_now().await;
+        },
         Ok(Err(error)) => return Err(anyhow!("replacement owner next failed: {error}")),
         Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
         Ok(Ok(NextResult::Record(record))) => {
@@ -6123,7 +6140,10 @@ async fn consumer_restart_hands_active_window_visibility_deferral_to_fast() -> R
     while deferred_offset.is_none() {
       tokio::task::yield_now().await;
       match timeout(Duration::from_millis(250), replacement.next()).await {
-        Err(_) => {},
+        Err(_) => {
+          consumer_time.advance(TimeDuration::seconds(1));
+          tokio::task::yield_now().await;
+        },
         Ok(Err(error)) => return Err(anyhow!("replacement next failed: {error}")),
         Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
         Ok(Ok(NextResult::Record(record))) => {

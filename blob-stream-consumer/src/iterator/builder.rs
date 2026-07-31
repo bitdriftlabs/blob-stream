@@ -1,4 +1,4 @@
-use super::driver::ConsumerDriver;
+use super::driver::{ConsumerDriver, retry_backoff};
 use super::shared::ConsumerIteratorMetrics;
 use super::{
   ConsumerCoordinationSource,
@@ -233,6 +233,8 @@ impl ConsumerIteratorBuilder<'_> {
       membership_lease_expires_at_ms: now_ts_ms.saturating_add(membership_lease_duration_ms),
       next_heartbeat_at_ms: now_ts_ms,
       next_rebalance_at_ms: now_ts_ms,
+      heartbeat_retry_backoff: retry_backoff(),
+      rebalance_retry_backoff: retry_backoff(),
       diagnostics,
     };
 

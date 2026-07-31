@@ -346,13 +346,93 @@ pub struct ConsumerGroupLease {
 }
 
 //
+// ConsumerGroupLeaseTransition
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Ownership transition applied by a successful consumer partition claim.
+pub enum ConsumerGroupLeaseTransition {
+  /// The lease row did not exist before this claim.
+  Initial,
+  /// The existing owner renewed or advanced its own assignment generation.
+  Retained,
+  /// A previous owner explicitly released the lease before this claim.
+  GracefulHandoff {
+    /// Previous owner member id.
+    previous_owner_id: String,
+    /// Previous assignment generation.
+    previous_generation: u64,
+    /// Previous owner heartbeat timestamp in milliseconds.
+    previous_last_heartbeat_ts_ms: i64,
+    /// Timestamp of the explicit release in milliseconds.
+    graceful_release_ts_ms: i64,
+  },
+  /// A previous owner did not release before its lease expired.
+  ExpiryTakeover {
+    /// Previous owner member id.
+    previous_owner_id: String,
+    /// Previous assignment generation.
+    previous_generation: u64,
+    /// Previous owner heartbeat timestamp in milliseconds.
+    previous_last_heartbeat_ts_ms: i64,
+  },
+}
+
+//
+// ConsumerGroupLeasePredecessor
+//
+
+/// Lease fields needed to classify a successful consumer lease claim.
+pub(crate) struct ConsumerGroupLeasePredecessor<'a> {
+  pub(crate) owner_id: &'a str,
+  pub(crate) generation: u64,
+  pub(crate) last_heartbeat_ts_ms: i64,
+  pub(crate) graceful_release_ts_ms: Option<i64>,
+}
+
+pub(crate) fn consumer_group_lease_transition(
+  previous: Option<ConsumerGroupLeasePredecessor<'_>>,
+  owner_id: &str,
+) -> ConsumerGroupLeaseTransition {
+  let Some(previous) = previous else {
+    return ConsumerGroupLeaseTransition::Initial;
+  };
+  if previous.owner_id == owner_id {
+    return ConsumerGroupLeaseTransition::Retained;
+  }
+  if let Some(graceful_release_ts_ms) = previous.graceful_release_ts_ms {
+    return ConsumerGroupLeaseTransition::GracefulHandoff {
+      previous_owner_id: previous.owner_id.to_string(),
+      previous_generation: previous.generation,
+      previous_last_heartbeat_ts_ms: previous.last_heartbeat_ts_ms,
+      graceful_release_ts_ms,
+    };
+  }
+
+  ConsumerGroupLeaseTransition::ExpiryTakeover {
+    previous_owner_id: previous.owner_id.to_string(),
+    previous_generation: previous.generation,
+    previous_last_heartbeat_ts_ms: previous.last_heartbeat_ts_ms,
+  }
+}
+
+//
 // ConsumerGroupAssignmentOutcome
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Result of assigning a consumer partition lease.
 pub enum ConsumerGroupAssignmentOutcome {
-  Assigned(ConsumerGroupLease),
+  /// This member now owns the lease, with its prior state classified when retained.
+  Assigned {
+    /// Newly assigned lease state.
+    lease: ConsumerGroupLease,
+    /// Previous lease state, when a retained row was claimed.
+    previous_lease: Option<Box<ConsumerGroupLease>>,
+    /// How ownership changed.
+    transition: ConsumerGroupLeaseTransition,
+  },
+  /// Another member currently owns an unexpired lease.
   HeldByOther(ConsumerGroupLease),
 }
 

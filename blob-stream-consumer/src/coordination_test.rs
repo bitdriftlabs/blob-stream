@@ -5,7 +5,7 @@ use crate::coordination::{
   AssignmentPlanValidationError,
   ConsumerGroupCoordinator,
   ConsumerGroupCoordinatorImpl,
-  RecoveredCursor,
+  LeaseClaimCounts,
   assignment_plan_validation_error,
   cooperative_sticky_assignment,
 };
@@ -535,6 +535,60 @@ async fn heartbeat_commit_renews_and_commits_cursor() {
 }
 
 #[tokio::test]
+async fn commit_cursors_does_not_renew_partition_leases() {
+  let concrete_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let store: Arc<dyn ConsumerGroupLeaseStore> = concrete_store.clone();
+  let mut coordinator = ConsumerGroupCoordinatorImpl::new(
+    ConsumerGroupConfig {
+      topic: "topic-a".to_string().into(),
+      group_id: "group-a".to_string().into(),
+      member_id: "member-a".to_string().into(),
+      lease_duration_ms: Some(100),
+      heartbeat_interval_ms: Some(50),
+      rebalance_interval_ms: Some(50),
+      ..Default::default()
+    },
+    store,
+    membership_store(),
+  )
+  .unwrap();
+
+  coordinator
+    .rebalance(vec!["member-a".to_string()], vec![7, 8], 1_000)
+    .await
+    .unwrap();
+
+  let report = coordinator
+    .commit_cursors(1_010, &HashMap::from([(7_u32, committed_cursor(7, 10))]))
+    .await
+    .unwrap();
+  assert_eq!(report.renewed_partitions, vec![7]);
+  assert!(report.fenced_partitions.is_empty());
+
+  let leases = concrete_store
+    .list_group_leases("topic-a", "group-a")
+    .await
+    .unwrap();
+  let committed_lease = leases
+    .iter()
+    .find(|lease| lease.key.virtual_partition_id == 7)
+    .unwrap();
+  let untouched_lease = leases
+    .iter()
+    .find(|lease| lease.key.virtual_partition_id == 8)
+    .unwrap();
+  assert_eq!(
+    committed_lease
+      .committed_cursor
+      .as_ref()
+      .map(|cursor| cursor.seq_end),
+    Some(10)
+  );
+  assert_eq!(committed_lease.lease_expiration_ts_ms, 1_100);
+  assert_eq!(untouched_lease.lease_expiration_ts_ms, 1_100);
+}
+
+#[tokio::test]
 async fn rebalance_acquires_partition_leases_concurrently() {
   let concrete_store = Arc::new(BlockingAssignmentLeaseStore {
     inner: InMemoryConsumerGroupLeaseStore::new(),
@@ -615,16 +669,8 @@ async fn stable_rebalance_preserves_owned_partitions_and_committed_cursor() {
     .unwrap();
 
   assert_eq!(report.owned_partitions, vec![7]);
-  assert_eq!(
-    report.recovered_cursors,
-    HashMap::from([(
-      7_u32,
-      RecoveredCursor {
-        committed_cursor: committed_cursor(7, 10),
-        committed_ts_ms: Some(1_010),
-      },
-    )])
-  );
+  assert!(report.recovered_cursors.is_empty());
+  assert_eq!(report.lease_claim_counts, LeaseClaimCounts::default());
 }
 
 #[tokio::test]
@@ -773,6 +819,6 @@ async fn release_owned_releases_partitions_for_fast_takeover() {
     .unwrap();
   assert!(matches!(
     reassigned,
-    ConsumerGroupAssignmentOutcome::Assigned(_)
+    ConsumerGroupAssignmentOutcome::Assigned { .. }
   ));
 }

@@ -578,11 +578,31 @@ the corresponding consumer IAM read permissions.
 An assignment is only intent. A consumer becomes an active owner after the lease store grants its
 lease for the plan version, which is also its per-partition lease generation. Partition leases
 continue to fence actual ownership and preserve committed cursors; they do not determine desired
-coverage. Heartbeat and commit operations include the generation so stale owners cannot renew or
-advance the cursor after replacement. Consumers include their latest cursors in lease heartbeats to
-avoid a separate steady-state commit write. On shutdown they release owned leases best-effort,
-deregister membership, and conditionally release their planner lease so a remaining member can
-elect immediately without discarding the sticky assignment plan.
+coverage. A stable accepted plan generation does not re-claim leases that this member already owns;
+the coordinator claims only newly assigned partitions or partitions whose plan generation changed.
+This prevents periodic rebalances from generating an assignment write for every owned partition.
+
+Lease heartbeats and cursor commits include the generation so stale owners cannot renew or advance
+the cursor after replacement. Scheduled maintenance renews every owned partition lease and flushes
+any staged cursors. An explicit `commit()` writes only the staged cursor partitions through the
+conditional cursor operation: it does not renew unrelated partition leases, extend lease expiry, or
+heartbeat membership. This keeps frequent application checkpointing from amplifying steady-state
+lease traffic while retaining generation fencing on every durable cursor advance.
+
+An orderly release writes a durable `graceful_release_ts` marker while expiring the lease. The next
+successful claim removes that marker and classifies its predecessor as either a graceful handoff or
+an expiry takeover. Initial claims and same-owner generation advances are classified separately.
+These transition counts, scheduled renewals, cursor commits, heartbeat failure domain, and retry
+count are emitted without topic, group, member, or partition labels so they can be correlated with
+aggregate DynamoDB capacity without unbounded cardinality.
+
+Scheduled heartbeat and rebalance failures use independent infinite exponential backoffs with a
+500 ms initial delay, $2.0$ multiplier, 50% jitter, and 30-second maximum. A successful operation
+resets its own backoff. A failed scheduled heartbeat still defers a due rebalance for that driver
+iteration, preventing a membership or lease-store outage from causing concurrent retry storms.
+On shutdown consumers release owned leases best-effort, deregister membership, and conditionally
+release their planner lease so a remaining member can elect immediately without discarding the
+sticky assignment plan.
 
 During rebalance, an iterator stops delivering revoked partitions, discards their prefetched
 records, invokes the configured revocation callback, and waits for callback completion before

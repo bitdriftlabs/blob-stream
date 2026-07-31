@@ -1985,8 +1985,8 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
   Ok(())
 }
 
-// High-level: validates a live owner is fenced after heartbeat failures and its replacement
-// recovers normal consumer delivery and cursor commits.
+// High-level: validates a live owner is fenced after cursor and heartbeat failures and its
+// replacement recovers normal consumer delivery and cursor commits.
 #[tokio::test]
 async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
   let resources = IntegrationResources::create().await?;
@@ -2087,17 +2087,17 @@ async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
     .store_fault_controller()
     .enable_fault(StoreFaultRule {
       domain: StoreFaultDomain::ConsumerLease,
-      operation: StoreFaultOperation::ConsumerHeartbeatPartition,
+      operation: StoreFaultOperation::ConsumerCommitCursor,
       key_pattern: None,
       action: StoreFaultAction::Fail {
-        message: "fault active owner partition heartbeat".to_string(),
+        message: "fault active owner cursor commit".to_string(),
       },
       remaining_hits: Some(1),
     })
     .await;
   assert!(
     consumer_a.commit().await.is_err(),
-    "expected active owner heartbeat to fail"
+    "expected active owner cursor commit to fail"
   );
   let heartbeat_fault_events = resources
     .store_fault_controller()
@@ -2105,12 +2105,12 @@ async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
     .await
     .into_iter()
     .filter(|event| {
-      event.operation == StoreFaultOperation::ConsumerHeartbeatPartition && event.action.is_some()
+      event.operation == StoreFaultOperation::ConsumerCommitCursor && event.action.is_some()
     })
     .count();
   assert_eq!(
     heartbeat_fault_events, 1,
-    "missing active-owner heartbeat fault"
+    "missing active-owner cursor commit fault"
   );
 
   let membership_fault_id = resources
@@ -2125,10 +2125,26 @@ async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
       remaining_hits: None,
     })
     .await;
-  assert!(
-    consumer_a.commit().await.is_err(),
-    "expected active owner membership heartbeat to fail after partition heartbeat failure"
-  );
+  timeout(Duration::from_secs(5), async {
+    loop {
+      consumer_time.advance(TimeDuration::seconds(1));
+      tokio::task::yield_now().await;
+      let membership_fault_applied = resources
+        .store_fault_controller()
+        .events()
+        .await
+        .iter()
+        .any(|event| {
+          event.operation == StoreFaultOperation::ConsumerMembershipHeartbeat
+            && event.action.is_some()
+        });
+      if membership_fault_applied {
+        return;
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow::anyhow!("scheduled membership heartbeat did not consume the fault"))?;
 
   // A's last successful lease and membership renewal is now fixed in logical time. Advancing past
   // the lease duration makes the handoff depend on normal expiry rather than a wall-clock delay.
@@ -2299,10 +2315,10 @@ async fn graceful_shutdown_final_commit_failure_redelivers_staged_record() -> Re
   controller
     .enable_fault(StoreFaultRule {
       domain: StoreFaultDomain::ConsumerLease,
-      operation: StoreFaultOperation::ConsumerHeartbeatPartition,
+      operation: StoreFaultOperation::ConsumerCommitCursor,
       key_pattern: None,
       action: StoreFaultAction::Fail {
-        message: "fail shutdown final checkpoint".to_string(),
+        message: "fail shutdown final cursor commit".to_string(),
       },
       remaining_hits: Some(1),
     })
@@ -2404,7 +2420,7 @@ async fn graceful_shutdown_final_commit_failure_redelivers_staged_record() -> Re
   assert!(
     shutdown_error
       .to_string()
-      .contains("fail shutdown final checkpoint"),
+      .contains("fail shutdown final cursor commit"),
     "shutdown returned an unexpected final checkpoint error: {shutdown_error:#}"
   );
   assert_eq!(
@@ -2413,7 +2429,7 @@ async fn graceful_shutdown_final_commit_failure_redelivers_staged_record() -> Re
       .await
       .iter()
       .filter(|event| {
-        event.operation == StoreFaultOperation::ConsumerHeartbeatPartition && event.action.is_some()
+        event.operation == StoreFaultOperation::ConsumerCommitCursor && event.action.is_some()
       })
       .count(),
     1,
@@ -3448,7 +3464,7 @@ async fn run_scripted_transport_fault_scenario() -> Result<Fit012Outcome> {
     );
   }
 
-  let trace = cluster
+  let mut trace: Vec<String> = cluster
     .event_log()
     .snapshot()
     .await
@@ -3464,6 +3480,7 @@ async fn run_scripted_transport_fault_scenario() -> Result<Fit012Outcome> {
       )
     })
     .collect();
+  trace.sort_unstable();
 
   let outcome = Fit012Outcome {
     normalized_transport_trace: trace,

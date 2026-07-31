@@ -47,6 +47,22 @@ impl ConsumerDriver {
       .metrics
       .owned_partitions
       .set(i64::try_from(report.owned_partitions.len()).unwrap_or(i64::MAX));
+    self
+      .metrics
+      .lease_claims_initial
+      .inc_by(u64::try_from(report.lease_claim_counts.initial).unwrap_or(u64::MAX));
+    self
+      .metrics
+      .lease_claims_retained
+      .inc_by(u64::try_from(report.lease_claim_counts.retained).unwrap_or(u64::MAX));
+    self
+      .metrics
+      .lease_claims_graceful_handoff
+      .inc_by(u64::try_from(report.lease_claim_counts.graceful_handoffs).unwrap_or(u64::MAX));
+    self
+      .metrics
+      .lease_claims_expiry_takeover
+      .inc_by(u64::try_from(report.lease_claim_counts.expiry_takeovers).unwrap_or(u64::MAX));
   }
 
   pub(in crate::iterator) fn apply_rebalance_report(

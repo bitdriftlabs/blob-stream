@@ -174,7 +174,7 @@ pub trait ConsumerIterator: Send + Sync {
   async fn next(&mut self) -> Result<NextResult>;
   /// Stage an offset for commit on the next `commit`/heartbeat.
   fn store_offset(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()>;
-  /// Flush staged offsets and heartbeat owned partitions.
+  /// Flush staged offsets without renewing unrelated partition leases.
   async fn commit(&mut self) -> Result<HeartbeatReport>;
   /// Shutdown iterator and release owned partitions.
   async fn shutdown(self: Box<Self>) -> Result<()>;

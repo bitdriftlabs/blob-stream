@@ -616,18 +616,18 @@ async fn idle_prefetch_worker_processes_hydration_command_without_clock_advance(
   let lease_store: Arc<dyn ConsumerGroupLeaseStore> = concrete_lease_store.clone();
   let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
     Arc::new(InMemoryConsumerGroupMembershipStore::new());
-  let source: Arc<dyn ConsumerCoordinationSource> =
-    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
-      members: vec!["member-a".to_string()],
-      virtual_partitions: vec![3],
-    }));
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![3],
+  }));
+  let coordination_source: Arc<dyn ConsumerCoordinationSource> = source.clone();
   let mut iterator = ConsumerIteratorBuilder::new(
     &runtime_config(),
     blob_store,
     metadata_store,
     lease_store,
     membership_store,
-    source,
+    coordination_source,
     metrics_scope(),
     1,
     DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
@@ -665,6 +665,10 @@ async fn idle_prefetch_worker_processes_hydration_command_without_clock_advance(
     .await
     .unwrap();
 
+  source.update(CoordinationSnapshot {
+    members: vec!["member-a".to_string(), "member-b".to_string()],
+    virtual_partitions: vec![3],
+  });
   time_provider.advance(time::Duration::milliseconds(10));
   timeout(Duration::from_secs(1), async {
     loop {
@@ -1728,7 +1732,7 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
     .unwrap();
   assert!(matches!(
     reassigned,
-    ConsumerGroupAssignmentOutcome::Assigned(_)
+    ConsumerGroupAssignmentOutcome::Assigned { .. }
   ));
 }
 

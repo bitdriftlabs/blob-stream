@@ -1,5 +1,6 @@
-use super::{ConsumerDriver, ConsumerDriverCommand, HeartbeatTrigger};
+use super::{ConsumerDriver, ConsumerDriverCommand, HeartbeatTrigger, RETRY_MAX_DELAY_MS};
 use anyhow::{Result, ensure};
+use bd_backoff::InfiniteBackoff;
 use bd_log::warn_every;
 use blob_stream_types::format_unix_timestamp_ms;
 use log::{debug, info, trace};
@@ -74,10 +75,21 @@ impl ConsumerDriver {
             15.seconds(),
             "consumer scheduled heartbeat retrying after error: error={error:#}"
           );
-          self.next_heartbeat_at_ms = now_ts_ms.saturating_add(1_000);
+          let retry_delay_ms = i64::try_from(
+            self
+              .heartbeat_retry_backoff
+              .next_backoff()
+              .whole_milliseconds()
+              .max(0),
+          )
+          .unwrap_or(RETRY_MAX_DELAY_MS)
+          .min(RETRY_MAX_DELAY_MS);
+          self.metrics.heartbeat_retry_attempts.inc();
+          self.next_heartbeat_at_ms = now_ts_ms.saturating_add(retry_delay_ms);
           self.refresh_diagnostics();
           true
         } else {
+          self.heartbeat_retry_backoff.reset();
           false
         }
       } else {
@@ -96,13 +108,23 @@ impl ConsumerDriver {
           );
         } else {
           match self.maybe_rebalance(now_ts_ms).await {
-            Ok(()) => {},
+            Ok(()) => self.rebalance_retry_backoff.reset(),
             Err(error) => {
               warn_every!(
                 15.seconds(),
                 "consumer rebalance retrying after error: error={error:#}"
               );
-              self.next_rebalance_at_ms = now_ts_ms.saturating_add(1_000);
+              let retry_delay_ms = i64::try_from(
+                self
+                  .rebalance_retry_backoff
+                  .next_backoff()
+                  .whole_milliseconds()
+                  .max(0),
+              )
+              .unwrap_or(RETRY_MAX_DELAY_MS)
+              .min(RETRY_MAX_DELAY_MS);
+              self.metrics.rebalance_retry_attempts.inc();
+              self.next_rebalance_at_ms = now_ts_ms.saturating_add(retry_delay_ms);
               self.refresh_rebalance_diagnostics();
             },
           }

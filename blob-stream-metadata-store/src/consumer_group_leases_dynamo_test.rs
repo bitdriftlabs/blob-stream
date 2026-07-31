@@ -4,6 +4,7 @@ use crate::{
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupLeaseTransition,
   ConsumerGroupReleaseOutcome,
   DynamoConsumerGroupLeaseStore,
 };
@@ -189,7 +190,10 @@ async fn fences_assignment() -> Result<()> {
 
   assert!(matches!(
     outcome,
-    ConsumerGroupAssignmentOutcome::Assigned(_)
+    ConsumerGroupAssignmentOutcome::Assigned {
+      transition: ConsumerGroupLeaseTransition::Initial,
+      ..
+    }
   ));
 
   let outcome = store
@@ -207,7 +211,14 @@ async fn fences_assignment() -> Result<()> {
 
   assert!(matches!(
     outcome,
-    ConsumerGroupAssignmentOutcome::Assigned(_)
+    ConsumerGroupAssignmentOutcome::Assigned {
+      transition: ConsumerGroupLeaseTransition::ExpiryTakeover {
+        previous_owner_id,
+        previous_generation: 1,
+        ..
+      },
+      ..
+    } if previous_owner_id == "member-a"
   ));
 
   client.delete_table().table_name(table_name).send().await?;
@@ -325,7 +336,15 @@ async fn release_partition_allows_immediate_takeover() -> Result<()> {
     .await?;
   assert!(matches!(
     reassigned,
-    ConsumerGroupAssignmentOutcome::Assigned(_)
+    ConsumerGroupAssignmentOutcome::Assigned {
+      transition: ConsumerGroupLeaseTransition::GracefulHandoff {
+        previous_owner_id,
+        previous_generation: 2,
+        graceful_release_ts_ms: 1_010,
+        ..
+      },
+      ..
+    } if previous_owner_id == "member-a"
   ));
 
   client.delete_table().table_name(table_name).send().await?;

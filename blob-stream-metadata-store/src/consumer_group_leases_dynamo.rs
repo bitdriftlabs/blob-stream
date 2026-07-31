@@ -8,9 +8,11 @@ use crate::{
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLease,
   ConsumerGroupLeaseKey,
+  ConsumerGroupLeasePredecessor,
   ConsumerGroupLeaseStore,
   ConsumerGroupReleaseOutcome,
   DynamoCapacityMetrics,
+  consumer_group_lease_transition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -30,6 +32,7 @@ const ATTR_GENERATION: &str = "generation";
 const ATTR_LAST_HEARTBEAT: &str = "last_heartbeat_ts";
 const ATTR_COMMITTED_CURSOR: &str = "committed_cursor";
 const ATTR_COMMITTED_TS: &str = "committed_ts";
+const ATTR_GRACEFUL_RELEASE_TS: &str = "graceful_release_ts";
 const ATTR_TTL: &str = "ttl_epoch_seconds";
 
 //
@@ -209,7 +212,8 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
     let update = format!(
       "SET {ATTR_OWNER} = :owner, {ATTR_LEASE_EXPIRES} = :expires, {ATTR_GENERATION} = \
-       :generation, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl"
+       :generation, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl REMOVE \
+       {ATTR_GRACEFUL_RELEASE_TS}"
     );
     let condition = format!(
       "attribute_not_exists({ATTR_PK}) OR {ATTR_LEASE_EXPIRES} <= :now OR {ATTR_OWNER} = :owner"
@@ -224,7 +228,7 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       .update_expression(update)
       .condition_expression(condition)
       .set_expression_attribute_values(Some(values))
-      .return_values(ReturnValue::AllNew)
+      .return_values(ReturnValue::AllOld)
       .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
       .await;
@@ -232,12 +236,46 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     match response {
       Ok(output) => {
         self.record_write_capacity(output.consumed_capacity.as_ref());
-        let attributes = output
-          .attributes
-          .ok_or_else(|| anyhow!("lease attributes missing"))?;
-        let lease = Self::lease_from_item(attributes, key.clone())?;
-        debug!("consumer lease(dynamo) assign result: assigned");
-        Ok(ConsumerGroupAssignmentOutcome::Assigned(lease))
+        let previous_entry = output.attributes.map(serde_dynamo::from_item).transpose()?;
+        let previous_lease = previous_entry
+          .as_ref()
+          .map(|entry: &DynamoLeaseItem| Box::new(entry.clone().into_lease(key.clone())));
+        let lease = ConsumerGroupLease {
+          key,
+          owner_id,
+          generation,
+          lease_expiration_ts_ms: expires_at,
+          last_heartbeat_ts_ms: now_ts_ms,
+          committed_cursor: previous_lease
+            .as_ref()
+            .and_then(|previous| previous.committed_cursor.clone()),
+          committed_ts_ms: previous_lease
+            .as_ref()
+            .and_then(|previous| previous.committed_ts_ms),
+        };
+        if let Some(previous) = previous_entry.as_ref()
+          && previous.owner_id != lease.owner_id
+          && previous.graceful_release_ts.is_none()
+        {
+          debug_assert!(previous.lease_expiration_ts_ms <= now_ts_ms);
+        }
+        let transition = consumer_group_lease_transition(
+          previous_entry
+            .as_ref()
+            .map(|previous| ConsumerGroupLeasePredecessor {
+              owner_id: &previous.owner_id,
+              generation: previous.generation,
+              last_heartbeat_ts_ms: previous.last_heartbeat_ts_ms,
+              graceful_release_ts_ms: previous.graceful_release_ts,
+            }),
+          &lease.owner_id,
+        );
+        debug!("consumer lease(dynamo) assign result: assigned, transition={transition:?}");
+        Ok(ConsumerGroupAssignmentOutcome::Assigned {
+          lease,
+          previous_lease,
+          transition,
+        })
       },
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
@@ -462,8 +500,10 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       ":ttl".to_string(),
       AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer_seconds)?.to_string()),
     );
-    let update =
-      format!("SET {ATTR_LEASE_EXPIRES} = :now, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl");
+    let update = format!(
+      "SET {ATTR_LEASE_EXPIRES} = :now, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_GRACEFUL_RELEASE_TS} \
+       = :now, {ATTR_TTL} = :ttl"
+    );
     let condition = format!(
       "{ATTR_OWNER} = :owner AND {ATTR_GENERATION} = :generation AND {ATTR_LEASE_EXPIRES} > :now"
     );
@@ -523,6 +563,7 @@ struct DynamoLeaseItem {
   last_heartbeat_ts_ms: i64,
   committed_cursor: Option<CommittedCursor>,
   committed_ts: Option<i64>,
+  graceful_release_ts: Option<i64>,
 }
 
 impl DynamoLeaseItem {
