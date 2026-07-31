@@ -4781,7 +4781,7 @@ async fn prefetch_rebalance_revocation_fences_buffered_record() -> Result<()> {
 
   timeout(Duration::from_secs(5), async {
     loop {
-      consumer_time.advance(TimeDuration::seconds(1));
+      consumer_time.advance(TimeDuration::milliseconds(200));
       tokio::task::yield_now().await;
       let replacement_lease = cluster
         .consumer_lease_store()
@@ -5607,7 +5607,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
         tokio::select! {
           result = &mut replacement_prefetch_wait => return result,
           () = tokio::task::yield_now() => {
-            consumer_time.advance(TimeDuration::seconds(1));
+            consumer_time.advance(TimeDuration::milliseconds(200));
           },
         }
       }
@@ -5625,7 +5625,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
 
       match timeout(Duration::from_millis(250), owner_b.next()).await {
         Err(_) => {
-          consumer_time.advance(TimeDuration::seconds(1));
+          consumer_time.advance(TimeDuration::milliseconds(200));
           tokio::task::yield_now().await;
         },
         Ok(Err(error)) => return Err(anyhow!("replacement owner next failed: {error}")),

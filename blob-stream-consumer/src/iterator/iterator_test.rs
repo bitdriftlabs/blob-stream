@@ -151,6 +151,7 @@ impl ConsumerCoordinationSource for BlockingCoordinationSource {
 struct BlockingMembershipStore {
   inner: InMemoryConsumerGroupMembershipStore,
   block_heartbeats: AtomicBool,
+  fail_heartbeats: AtomicBool,
   fail_deregistration: AtomicBool,
   heartbeat_calls: AtomicUsize,
   heartbeat_started: Arc<tokio::sync::Notify>,
@@ -173,10 +174,24 @@ struct FailingLeaseStore {
   inner: InMemoryConsumerGroupLeaseStore,
 }
 
+struct PartiallyFailingLeaseStore {
+  inner: InMemoryConsumerGroupLeaseStore,
+  failures_enabled: AtomicBool,
+}
+
 impl FailingLeaseStore {
   fn new() -> Self {
     Self {
       inner: InMemoryConsumerGroupLeaseStore::new(),
+    }
+  }
+}
+
+impl PartiallyFailingLeaseStore {
+  fn new() -> Self {
+    Self {
+      inner: InMemoryConsumerGroupLeaseStore::new(),
+      failures_enabled: AtomicBool::new(false),
     }
   }
 }
@@ -216,6 +231,98 @@ impl ConsumerGroupLeaseStore for FailingLeaseStore {
     lease_duration_ms: i64,
     committed_cursor: Option<CommittedCursor>,
   ) -> anyhow::Result<ConsumerGroupHeartbeatOutcome> {
+    self
+      .inner
+      .heartbeat_partition(
+        key,
+        owner_id,
+        generation,
+        now_ts_ms,
+        lease_duration_ms,
+        committed_cursor,
+      )
+      .await
+  }
+
+  async fn commit_cursor(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+    committed_cursor: CommittedCursor,
+  ) -> anyhow::Result<ConsumerGroupCommitOutcome> {
+    self
+      .inner
+      .commit_cursor(key, owner_id, generation, now_ts_ms, committed_cursor)
+      .await
+  }
+
+  async fn release_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+  ) -> anyhow::Result<ConsumerGroupReleaseOutcome> {
+    self
+      .inner
+      .release_partition(key, owner_id, generation, now_ts_ms)
+      .await
+  }
+}
+
+#[async_trait::async_trait]
+impl ConsumerGroupLeaseStore for PartiallyFailingLeaseStore {
+  async fn list_group_leases(
+    &self,
+    topic: &str,
+    group_id: &str,
+  ) -> anyhow::Result<Vec<ConsumerGroupLease>> {
+    self.inner.list_group_leases(topic, group_id).await
+  }
+
+  async fn assign_partition(
+    &self,
+    key: ConsumerGroupLeaseKey,
+    owner_id: String,
+    generation: u64,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+  ) -> anyhow::Result<ConsumerGroupAssignmentOutcome> {
+    self
+      .inner
+      .assign_partition(key, owner_id, generation, now_ts_ms, lease_duration_ms)
+      .await
+  }
+
+  async fn heartbeat_partition(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now_ts_ms: i64,
+    lease_duration_ms: i64,
+    committed_cursor: Option<CommittedCursor>,
+  ) -> anyhow::Result<ConsumerGroupHeartbeatOutcome> {
+    if self.failures_enabled.load(Ordering::SeqCst) {
+      if key.virtual_partition_id == 0 {
+        return Ok(ConsumerGroupHeartbeatOutcome::HeldByOther(
+          ConsumerGroupLease {
+            key: key.clone(),
+            owner_id: "member-b".to_string(),
+            generation: generation.saturating_add(1),
+            lease_expiration_ts_ms: now_ts_ms.saturating_add(lease_duration_ms),
+            last_heartbeat_ts_ms: now_ts_ms,
+            committed_cursor: None,
+            committed_ts_ms: None,
+          },
+        ));
+      }
+      if key.virtual_partition_id == 1 {
+        return Err(anyhow::anyhow!("injected heartbeat failure"));
+      }
+    }
     self
       .inner
       .heartbeat_partition(
@@ -311,6 +418,7 @@ impl BlockingMembershipStore {
     Self {
       inner: InMemoryConsumerGroupMembershipStore::new(),
       block_heartbeats: AtomicBool::new(false),
+      fail_heartbeats: AtomicBool::new(false),
       fail_deregistration: AtomicBool::new(false),
       heartbeat_calls: AtomicUsize::new(0),
       heartbeat_started: Arc::new(tokio::sync::Notify::new()),
@@ -344,6 +452,9 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     ttl_ms: i64,
   ) -> anyhow::Result<()> {
     self.heartbeat_calls.fetch_add(1, Ordering::SeqCst);
+    if self.fail_heartbeats.load(Ordering::SeqCst) {
+      return Err(anyhow::anyhow!("injected membership heartbeat failure"));
+    }
     if self.block_heartbeats.load(Ordering::SeqCst) {
       self.heartbeat_started.notify_waiters();
       self.heartbeat_release.notified().await;
@@ -765,6 +876,134 @@ async fn wait_for_reader_mode(
       .map(|reader| reader.mode.clone()),
     Some(expected_mode)
   );
+}
+
+async fn wait_for_pending_revocation(iterator: &ConsumerIteratorImpl) {
+  timeout(Duration::from_secs(1), async {
+    loop {
+      if iterator
+        .diagnostics()
+        .expect("consumer implementation provides diagnostics")
+        .state_snapshot()
+        .local
+        .pending_revocation
+      {
+        return;
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("expected pending revocation");
+}
+
+#[tokio::test]
+async fn failed_membership_heartbeats_fence_at_lease_deadline() {
+  let time_provider = Arc::new(ManualTimeProvider::new(time::OffsetDateTime::UNIX_EPOCH));
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store = Arc::new(BlockingMembershipStore::new());
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![0],
+    }));
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store.clone(),
+    source,
+    metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .time_provider(time_provider.clone())
+  .build()
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[0]).await;
+  time_provider.wait_until_sleeping(2).await;
+  membership_store
+    .fail_heartbeats
+    .store(true, Ordering::SeqCst);
+
+  time_provider.advance(time::Duration::milliseconds(999));
+  timeout(Duration::from_secs(1), async {
+    while membership_store.heartbeat_calls.load(Ordering::SeqCst) < 2 {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("expected membership heartbeat failure before lease expiry");
+  assert!(
+    !iterator
+      .diagnostics()
+      .expect("consumer implementation provides diagnostics")
+      .state_snapshot()
+      .local
+      .pending_revocation
+  );
+
+  time_provider.advance(time::Duration::milliseconds(1));
+  wait_for_pending_revocation(&iterator).await;
+  let NextResult::Revoked(revoked) = iterator.next().await.unwrap() else {
+    panic!("expected revocation at membership lease deadline");
+  };
+  assert_eq!(revoked.partitions(), &[0]);
+  revoked.complete().await;
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn partial_heartbeat_failure_revokes_fenced_partition() {
+  let time_provider = Arc::new(ManualTimeProvider::new(time::OffsetDateTime::UNIX_EPOCH));
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store = Arc::new(PartiallyFailingLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![0, 1],
+    }));
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    lease_store.clone(),
+    membership_store,
+    source,
+    metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .time_provider(time_provider.clone())
+  .build()
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[0, 1]).await;
+  time_provider.wait_until_sleeping(2).await;
+  lease_store.failures_enabled.store(true, Ordering::SeqCst);
+
+  time_provider.advance(time::Duration::milliseconds(10));
+  wait_for_pending_revocation(&iterator).await;
+  let NextResult::Revoked(revoked) = iterator.next().await.unwrap() else {
+    panic!("expected fenced partition revocation");
+  };
+  assert_eq!(revoked.partitions(), &[0]);
+  revoked.complete().await;
+  Box::new(iterator).shutdown().await.unwrap();
 }
 
 fn active_partition_ids(snapshot: &ConsumerStateSnapshot) -> Vec<VirtualPartitionId> {

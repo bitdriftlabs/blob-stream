@@ -9,6 +9,7 @@ use super::{
   Span,
   VirtualPartitionId,
   assignment_plan_snapshot,
+  consumer_lease_duration_ms,
   consumer_rebalance_interval_ms,
   emit_partition_handoff_snapshots,
   field,
@@ -186,15 +187,73 @@ impl ConsumerDriver {
     Ok(())
   }
 
-  pub(in crate::iterator) async fn fence_active_partitions_after_membership_failure(
+  pub(in crate::iterator) async fn fence_active_partitions_after_heartbeat_failure(
     &mut self,
+    now_ts_ms: i64,
+  ) -> Result<()> {
+    let fenced = self.active_assignment.iter().copied().collect();
+    self
+      .begin_fenced_partition_revocation(fenced, now_ts_ms)
+      .await
+  }
+
+  pub(in crate::iterator) async fn reconcile_fenced_partitions(
+    &mut self,
+    now_ts_ms: i64,
+  ) -> Result<()> {
+    let owned = self
+      .coordinator
+      .owned_partitions()
+      .into_iter()
+      .collect::<HashSet<_>>();
+    let fenced = self.active_assignment.difference(&owned).copied().collect();
+    self
+      .begin_fenced_partition_revocation(fenced, now_ts_ms)
+      .await
+  }
+
+  pub(in crate::iterator) fn remove_fenced_partitions(
+    &mut self,
+    fenced_partitions: &[VirtualPartitionId],
+    now_ts_ms: i64,
+  ) -> Result<()> {
+    if fenced_partitions.is_empty() {
+      return Ok(());
+    }
+
+    for partition_id in fenced_partitions {
+      self.active_assignment.remove(partition_id);
+    }
+    {
+      let mut shared_state = self.shared_state.lock();
+      for partition_id in fenced_partitions {
+        shared_state.active_partitions.remove(partition_id);
+      }
+      self.refresh_diagnostics_locked(&mut shared_state);
+    }
+    self.set_reader_assignment(
+      self.active_assignment.iter().copied().collect(),
+      now_ts_ms / 1_000,
+      None,
+      false,
+    )?;
+    info!(
+      "consumer heartbeat fenced partitions: topic={}, group_id={}, member_id={}, \
+       fenced={fenced_partitions:?}",
+      self.group_config.topic, self.group_config.group_id, self.group_config.member_id,
+    );
+    Ok(())
+  }
+
+  async fn begin_fenced_partition_revocation(
+    &mut self,
+    mut fenced: Vec<VirtualPartitionId>,
     now_ts_ms: i64,
   ) -> Result<()> {
     if self.pending_revocation_completion.is_some() {
       return Ok(());
     }
 
-    let mut fenced = self.active_assignment.iter().copied().collect::<Vec<_>>();
     fenced.sort_unstable();
     if fenced.is_empty() {
       return Ok(());
@@ -202,7 +261,6 @@ impl ConsumerDriver {
 
     let fenced_set = fenced.iter().copied().collect::<HashSet<_>>();
     self.metrics.revocations.inc();
-    self.metrics.active_partitions.set(0);
     let (completion_tx, completion_rx) = oneshot::channel();
     {
       let mut shared_state = self.shared_state.lock();
@@ -219,9 +277,14 @@ impl ConsumerDriver {
       update_total_prefetch_bytes(&self.metrics, &shared_state.delivery_state, pending_bytes);
       self.refresh_diagnostics_locked(&mut shared_state);
     }
-    self.set_reader_assignment(Vec::new(), now_ts_ms / 1_000, None, false)?;
+    let pending_assignment = self
+      .active_assignment
+      .difference(&fenced_set)
+      .copied()
+      .collect::<Vec<_>>();
+    self.set_reader_assignment(pending_assignment.clone(), now_ts_ms / 1_000, None, false)?;
     self.prefetch_space_notify.notify_waiters();
-    self.pending_assignment = Some(Vec::new());
+    self.pending_assignment = Some(pending_assignment);
     self.pending_revocation_completion = Some(completion_rx);
     self.pending_revocation_partitions = Some(fenced.clone());
     self.refresh_diagnostics();
@@ -236,8 +299,8 @@ impl ConsumerDriver {
         .await;
     }
     info!(
-      "consumer active partitions fenced after membership heartbeat failure: topic={}, \
-       group_id={}, member_id={}, generation={}, fenced={fenced:?}",
+      "consumer active partitions fenced after heartbeat renewal failure: topic={}, group_id={}, \
+       member_id={}, generation={}, fenced={fenced:?}",
       self.group_config.topic,
       self.group_config.group_id,
       self.group_config.member_id,
@@ -388,6 +451,10 @@ impl ConsumerDriver {
 
     let next_assignment_set = next_assignment.iter().copied().collect::<HashSet<_>>();
     let assignment_changed = self.active_assignment != next_assignment_set;
+    if assignment_changed {
+      self.active_partition_lease_expiration_deadline_ms =
+        now_ts_ms.saturating_add(consumer_lease_duration_ms(&self.group_config));
+    }
     self.hydrate_cursors(recovered_cursors, now_ts_ms / 1_000)?;
 
     if !assignment_changed {

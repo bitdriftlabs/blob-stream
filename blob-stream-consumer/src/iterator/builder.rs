@@ -231,6 +231,8 @@ impl ConsumerIteratorBuilder<'_> {
       lifecycle_hooks,
       time_provider,
       membership_lease_expires_at_ms: now_ts_ms.saturating_add(membership_lease_duration_ms),
+      active_partition_lease_expiration_deadline_ms: now_ts_ms
+        .saturating_add(membership_lease_duration_ms),
       next_heartbeat_at_ms: now_ts_ms,
       next_rebalance_at_ms: now_ts_ms,
       heartbeat_retry_backoff: retry_backoff(),

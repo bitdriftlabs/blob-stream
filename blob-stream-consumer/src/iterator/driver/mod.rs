@@ -117,6 +117,11 @@ pub(in crate::iterator) struct ConsumerDriver {
   pub(in crate::iterator) lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
   pub(in crate::iterator) time_provider: Arc<dyn TimeProvider>,
   pub(in crate::iterator) membership_lease_expires_at_ms: i64,
+  /// Earliest expiration among this driver's active partition leases.
+  ///
+  /// This driver-wide safety deadline bounds heartbeat retries so it never continues delivery
+  /// beyond a lease that may no longer be valid.
+  pub(in crate::iterator) active_partition_lease_expiration_deadline_ms: i64,
   pub(in crate::iterator) next_heartbeat_at_ms: i64,
   pub(in crate::iterator) next_rebalance_at_ms: i64,
   pub(in crate::iterator) heartbeat_retry_backoff: ExponentialBackoff,

@@ -176,6 +176,44 @@ async fn heartbeats_and_commits() {
 }
 
 #[tokio::test]
+async fn retained_assignment_preserves_committed_cursor() {
+  let store = InMemoryConsumerGroupLeaseStore::new();
+  let key = lease_key();
+  let committed_cursor = cursor(key.virtual_partition_id, 10);
+
+  store
+    .assign_partition(key.clone(), "member-a".to_string(), 1, 1_000, 100)
+    .await
+    .expect("assign lease");
+  store
+    .heartbeat_partition(
+      &key,
+      "member-a",
+      1,
+      1_010,
+      100,
+      Some(committed_cursor.clone()),
+    )
+    .await
+    .expect("commit cursor");
+
+  let outcome = store
+    .assign_partition(key, "member-a".to_string(), 2, 1_020, 100)
+    .await
+    .expect("retain lease");
+
+  assert!(matches!(
+    outcome,
+    ConsumerGroupAssignmentOutcome::Assigned {
+      lease,
+      previous_lease: Some(previous_lease),
+      transition: ConsumerGroupLeaseTransition::Retained,
+    } if lease.committed_cursor == Some(committed_cursor.clone())
+      && previous_lease.committed_cursor == Some(committed_cursor)
+  ));
+}
+
+#[tokio::test]
 async fn heartbeat_fences_other_members() {
   let store = InMemoryConsumerGroupLeaseStore::new();
   let key = lease_key();
