@@ -2,14 +2,17 @@
 
 use super::state::{RecoveryState, VirtualPartitionState};
 use super::{
-  ConsumerReadConfig,
   ConsumerReader as BoundedConsumerReader,
   ConsumerReaderFastFrontierState,
   ConsumerReaderFastScanBoundState,
   ConsumerReaderImpl,
   ReadCapacity,
 };
-use crate::config::{ConsumerReadRuntimeSettings, DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS};
+use crate::config::{
+  ConsumerReadConfig,
+  ConsumerReadRuntimeSettings,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use bd_runtime_config::loader::Loader;

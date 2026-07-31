@@ -9,7 +9,8 @@
 //! activate. This avoids delivering records from a partition after its consumer-group lease has
 //! been fenced, while leaving durable cursor recovery to the next owner.
 
-use super::{ActivePartitionState, ConsumerIteratorMetrics, ConsumerRecord, NextResult};
+use super::shared::{ActivePartitionState, ConsumerIteratorMetrics};
+use super::{ConsumerRecord, NextResult};
 use crate::consumer::ConsumerBatch;
 use blob_stream_types::{CommittedSourceCheckpoint, Record, VirtualPartitionId};
 use log::debug;

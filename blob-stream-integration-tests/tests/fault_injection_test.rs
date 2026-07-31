@@ -2,14 +2,9 @@ use anyhow::Result;
 use bd_server_stats::stats::Collector;
 use bd_time::TimeProvider;
 use blob_stream_broker::write::BrokerLeaseStatus;
-use blob_stream_consumer::{
-  ConsumerIterator,
-  ConsumerIteratorImpl,
-  ConsumerReadConfig,
-  ConsumerReaderImpl,
-  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
-  NextResult,
-};
+use blob_stream_consumer::consumer::ConsumerReaderImpl;
+use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, NextResult};
+use blob_stream_consumer::{ConsumerReadConfig, DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS};
 use blob_stream_integration_tests::test_framework as framework;
 use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerError, ProducerRecord};
 use blob_stream_types::{logical_partition_for_key, virtual_partition_for_logical};

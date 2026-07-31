@@ -10,15 +10,12 @@ use crate::test_framework::{
 use anyhow::{Result, anyhow};
 use bd_server_stats::stats::Collector;
 use blob_stream_broker::write::BrokerLeaseStatus;
+use blob_stream_consumer::consumer::{ConsumerReader, ConsumerReaderImpl, ReadCapacity};
+use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, NextResult};
 use blob_stream_consumer::{
   ConsumerConfigFactory,
-  ConsumerIterator,
   ConsumerReadConfig,
-  ConsumerReader,
-  ConsumerReaderImpl,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
-  NextResult,
-  ReadCapacity,
 };
 use blob_stream_producer::{
   ProducerAck,
@@ -882,7 +879,7 @@ fn record_producer_ack(
 }
 
 async fn run_consumer(
-  mut consumer: Box<blob_stream_consumer::ConsumerIteratorImpl>,
+  mut consumer: Box<ConsumerIteratorImpl>,
   mut stop_rx: watch::Receiver<bool>,
   event_tx: mpsc::Sender<ConsumerEvent>,
   commit_interval_records: u64,

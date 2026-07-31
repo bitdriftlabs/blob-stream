@@ -10,14 +10,13 @@
 //! awaits. The local pending queue holds reader output that cannot yet enter the delivery queue
 //! because doing so would exceed the soft byte budget.
 
-use super::{
-  ConsumerIteratorMetrics,
-  ConsumerLifecycleHooks,
-  ConsumerSharedState,
+use super::delivery::{
   prefetched_batch_bytes,
   update_total_prefetch_bytes,
   update_worker_prefetch_metrics,
 };
+use super::shared::ConsumerIteratorMetrics;
+use super::{ConsumerLifecycleHooks, ConsumerSharedState};
 use crate::consumer::{
   ConsumerBatch,
   ConsumerReader,

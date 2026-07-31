@@ -2,14 +2,13 @@
 
 use super::delivery::{BufferedBatch, DeliveryState};
 use super::prefetch::IdlePollBackoff;
+use super::shared::{ActivePartitionState, ConsumerIteratorMetrics};
 use super::{
-  ActivePartitionState,
   ConsumerCoordinationSource,
   ConsumerDeliveryState,
   ConsumerIterator,
   ConsumerIteratorBuilder,
   ConsumerIteratorImpl,
-  ConsumerIteratorMetrics,
   ConsumerLifecycleHooks,
   CoordinationSnapshot,
   NextResult,
@@ -1487,6 +1486,68 @@ async fn next_delivers_records_and_commit_renews() {
   assert!(partition.last_committed_source_checkpoint.is_some());
   assert!(partition.last_committed_at.is_some());
   assert!(state.local.last_successful_heartbeat_at.is_some());
+}
+
+#[tokio::test]
+async fn scheduled_heartbeats_do_not_depend_on_next_polling() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let concrete_membership_store = Arc::new(BlockingMembershipStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> = concrete_membership_store.clone();
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![0],
+    }));
+  let mut runtime = runtime_config();
+  runtime.group.as_mut().unwrap().heartbeat_interval_ms = Some(25);
+  runtime.group.as_mut().unwrap().rebalance_interval_ms = Some(60_000);
+  let mut iterator = ConsumerIteratorImpl::from_config(
+    &runtime,
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  timeout(Duration::from_secs(1), async {
+    while concrete_membership_store
+      .heartbeat_calls
+      .load(Ordering::SeqCst)
+      == 0
+    {
+      sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .unwrap();
+  let heartbeat_calls_before = concrete_membership_store
+    .heartbeat_calls
+    .load(Ordering::SeqCst);
+
+  timeout(Duration::from_secs(1), async {
+    while concrete_membership_store
+      .heartbeat_calls
+      .load(Ordering::SeqCst)
+      <= heartbeat_calls_before
+    {
+      sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .unwrap();
+
+  Box::new(iterator).shutdown().await.unwrap();
 }
 
 #[tokio::test]

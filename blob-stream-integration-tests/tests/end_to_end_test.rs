@@ -4,19 +4,21 @@ use bd_time::{OffsetDateTimeExt, TimeProvider};
 use blob_stream_blob_store::{BlobKey, BlobStore};
 use blob_stream_broker::write::{BrokerLeaseStatus, WriteRequest};
 use blob_stream_broker_discovery::BrokerDiscovery;
+use blob_stream_consumer::consumer::ConsumerReaderImpl;
+use blob_stream_consumer::iterator::{
+  ConsumerIterator,
+  ConsumerIteratorImpl,
+  NextResult,
+  RevokedPartitions,
+};
 use blob_stream_consumer::{
   ConsumerBootstrapConfig,
   ConsumerBootstrapIteratorBuilder,
-  ConsumerIterator,
-  ConsumerIteratorImpl,
   ConsumerPartitionReadMode,
   ConsumerReadConfig,
-  ConsumerReaderImpl,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
   HeartbeatReport,
   MembershipCoordinationSource,
-  NextResult,
-  RevokedPartitions,
 };
 use blob_stream_integration_tests::test_framework::{self as framework, TestConsumerReader};
 use blob_stream_metadata_store::{

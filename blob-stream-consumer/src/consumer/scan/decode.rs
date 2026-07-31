@@ -1,0 +1,136 @@
+use super::{
+  BatchMetadata,
+  BatchReadCandidate,
+  CommittedSourceCheckpoint,
+  CompressionCodec,
+  ConsumerBatch,
+  ConsumerReaderImpl,
+  Result,
+  SegmentMetadata,
+  SegmentReadPlan,
+  StoredRecordBatch,
+  VirtualPartitionId,
+  trace,
+};
+use anyhow::{anyhow, ensure};
+use protobuf::Message;
+use std::io::Cursor;
+use std::time::Instant;
+
+impl ConsumerReaderImpl {
+  /// Fetch one segment range and decode all of its selected batches in planning order.
+  pub(in crate::consumer) async fn read_segment_plan(
+    &self,
+    plan: SegmentReadPlan,
+  ) -> Result<Vec<(BatchReadCandidate, ConsumerBatch)>> {
+    trace!(
+      "consumer read segment range start: topic={}, blob_key={}, start={}, end={}, batches={}",
+      self.config.topic,
+      plan.metadata.blob_key.as_str(),
+      plan.byte_range.start,
+      plan.byte_range.end,
+      plan.candidates.len()
+    );
+
+    let blob_read_started_at = Instant::now();
+    let payload = self
+      .blob_store
+      .get_range(&plan.metadata.blob_key, plan.byte_range.clone())
+      .await?;
+    self
+      .metrics
+      .record_blob_range(blob_read_started_at, payload.len());
+    let selected_bytes = plan.candidates.iter().fold(0_u64, |total, candidate| {
+      total.saturating_add(candidate.batch_metadata.byte_range.len())
+    });
+    self
+      .metrics
+      .record_blob_batch_ranges(plan.candidates.len(), selected_bytes);
+
+    let mut decoded_batches = Vec::with_capacity(plan.candidates.len());
+    for candidate in plan.candidates {
+      let batch_range = &candidate.batch_metadata.byte_range;
+      let start = batch_range
+        .start
+        .checked_sub(plan.byte_range.start)
+        .ok_or_else(|| anyhow!("batch range starts before its segment read range"))?;
+      let end = batch_range
+        .end
+        .checked_sub(plan.byte_range.start)
+        .ok_or_else(|| anyhow!("batch range ends before its segment read range"))?;
+      let start =
+        usize::try_from(start).map_err(|_| anyhow!("batch range start does not fit in memory"))?;
+      let end =
+        usize::try_from(end).map_err(|_| anyhow!("batch range end does not fit in memory"))?;
+      ensure!(
+        start < end && end <= payload.len(),
+        "batch range is outside fetched segment range: start={start}, end={end}, fetched_bytes={}",
+        payload.len()
+      );
+      let batch_payload = payload.slice(start .. end);
+      let batch = self.decode_batch(
+        &plan.metadata,
+        &candidate.batch_metadata,
+        candidate.virtual_partition_id,
+        batch_payload,
+      )?;
+      decoded_batches.push((candidate, batch));
+    }
+
+    Ok(decoded_batches)
+  }
+
+  /// Decompress, validate, and decode one batch payload supplied by a segment range read.
+  pub(in crate::consumer) fn decode_batch(
+    &self,
+    metadata: &SegmentMetadata,
+    batch_metadata: &BatchMetadata,
+    virtual_partition_id: VirtualPartitionId,
+    payload: bytes::Bytes,
+  ) -> Result<ConsumerBatch> {
+    trace!(
+      "consumer decode batch: topic={}, partition={}, blob_key={}, seq_start={}, seq_end={}",
+      self.config.topic,
+      virtual_partition_id,
+      metadata.blob_key.as_str(),
+      batch_metadata.seq_range.start,
+      batch_metadata.seq_range.end
+    );
+
+    // Decode in two stages: transport/storage compression first, then logical RecordBatch format.
+    let decoded = match metadata.compression.codec {
+      CompressionCodec::None => payload,
+      CompressionCodec::Zstd => zstd::stream::decode_all(Cursor::new(payload))
+        .map(bytes::Bytes::from)
+        .map_err(|error| anyhow!("failed to decode zstd batch: {error}"))?,
+    };
+
+    let record_batch = StoredRecordBatch::parse_from_tokio_bytes(&decoded)
+      .map_err(|error| anyhow!("failed to decode record batch protobuf: {error}"))?;
+
+    // Defensive integrity check: segment index entry and decoded payload must agree on partition.
+    ensure!(
+      record_batch.virtual_partition_id == virtual_partition_id,
+      "decoded batch partition {} does not match expected {}",
+      record_batch.virtual_partition_id,
+      virtual_partition_id
+    );
+
+    let payload_bytes = record_batch.records.iter().fold(0_usize, |total, record| {
+      total.saturating_add(record.payload.len())
+    });
+    self
+      .metrics
+      .record_batch(record_batch.records.len(), payload_bytes);
+
+    Ok(ConsumerBatch {
+      virtual_partition_id,
+      seq_range: batch_metadata.seq_range.clone(),
+      source_checkpoint: CommittedSourceCheckpoint {
+        window_start_unix_seconds: metadata.window.window_start_unix_seconds,
+        snowflake_id: metadata.snowflake_id.as_u64(),
+      },
+      records: record_batch.records,
+    })
+  }
+}
