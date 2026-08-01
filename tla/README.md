@@ -15,12 +15,13 @@ The first model is deliberately narrower than the service:
 - A small number of symbolic batches.
 - Producer lease acquisition, Hi-Lo reservation, batch acceptance, crash,
    restart, release, blob persistence, metadata publication, producer
-   acknowledgement, and logical time.
+   acknowledgement, a monotonic reader cursor, and logical time.
 
-It does **not** yet model reader observation, producer batching, compression,
-S3 range reads, consumer coordination, partition assignment, retries, or
-multiple partitions. Each omitted area can be added later only if it changes an
-invariant we want to check.
+It does **not** yet model eventually consistent metadata observation, Fast
+frontiers, producer batching, compression, S3 range reads, consumer
+coordination, partition assignment, retries, or multiple partitions. Each
+omitted area can be added later only if it changes an invariant we want to
+check.
 
 The configuration also bounds logical time, lease terms, and process
 incarnations. Those bounds are not production limits. They make the state space
@@ -44,7 +45,7 @@ brew install --cask tla+-toolbox
 
 The Toolbox is also a useful editor and trace viewer when learning. The
 Makefile automatically finds its checker JAR in the standard macOS location, so
-run the bounded Stage 1 model with:
+run the bounded Stage 3 model with:
 
 ```sh
 cd tla
@@ -121,6 +122,32 @@ holder may therefore publish its already uploaded batch after its lease expires.
 This is the precisely scoped behavior needed for the documented stale-writer
 witness; it is not a claim that accepting new work without a lease is allowed.
 
+## Stage 3: Minimal Cursor Reader
+
+Stage 3 adds one reader with a monotonic `readerCursor`, the greatest sequence
+end it has processed. This first reader abstraction assumes a complete view of
+published metadata: whenever metadata has been published, the reader can select
+it. That deliberately postpones DynamoDB replica staleness and Fast-frontier
+logic to the next stage.
+
+For each published batch, the reader records one result:
+
+```text
+Unseen -> Delivered  when seq_start is above readerCursor
+Unseen -> Skipped    when seq_end is already covered by readerCursor
+```
+
+The `Delivered` transition moves the cursor to the batch's inclusive `seq_end`.
+It permits gaps because a new producer lease can leave unused values in a Hi-Lo
+reservation. `Skipped` models normal replay filtering: a metadata row seen more
+than once must not be delivered again when its whole range is already covered.
+
+At this stage a skipped row is not automatically considered data loss. With a
+complete metadata view, it normally represents a safe duplicate observation.
+The next stale-writer witness will constrain the order so an older row is first
+published only after a newer row advanced the cursor; that is the accepted loss
+case described in the design.
+
 The model maps most directly to
 [blob-stream-metadata-store/src/lib.rs](../blob-stream-metadata-store/src/lib.rs)
 and [blob-stream-broker/src/write/engine.rs](../blob-stream-broker/src/write/engine.rs).
@@ -139,6 +166,8 @@ and [blob-stream-broker/src/write/engine.rs](../blob-stream-broker/src/write/eng
 | `UploadBlob` | Accepting broker is alive and its batch is not uploaded. | The batch's blob becomes durable. | Segment blob-store write. |
 | `PublishMetadata` | Accepting broker is alive and its blob is uploaded. | Durable metadata is written with publisher provenance. | Metadata-store write; deliberately not publication-fenced. |
 | `AcknowledgeProducer` | Publishing broker is alive and metadata exists. | Batch receives successful acknowledgement. | Successful flush permits the producer RPC response. |
+| `DeliverPublishedBatch` | Published blob-backed range begins above the cursor. | Batch is delivered and cursor advances to its sequence end. | Reader decodes newly observed metadata. |
+| `SkipCoveredBatch` | Published range is fully at or below the cursor. | Batch is marked skipped without changing the cursor. | Cursor filtering for duplicate metadata observation. |
 | `Quiescent` | Logical time reached the bounded model horizon. | No model variable changes. | Completed test scenario, not a production operation. |
 
 ### Invariants
@@ -153,20 +182,22 @@ and [blob-stream-broker/src/write/engine.rs](../blob-stream-broker/src/write/eng
 - `MetadataBeforeAcknowledgement`: an acknowledged batch already has metadata.
 - `PublishedMetadataHasAcceptanceProvenance`: published metadata belongs to an
    accepted batch and retains its accepting broker and lease-term evidence.
+- `ReaderCursorNeverRegresses`: a reader transition cannot move its cursor back.
+- `DeliveredBatchesWerePublished`: a delivered batch has durable metadata and
+   blob state; the reader cannot invent data.
+- `SkippedBatchesAreCovered`: cursor filtering skips only a range fully covered
+   by the current monotonic cursor.
 
 ## What Comes Next
 
-The next refinement adds a minimal reader cursor. It will first make the
-stale-writer publication limitation concrete: a former holder publishes a lower
-range after the reader already advances through a higher range.
+The next refinement constrains a stale-writer publication trace and runs it as
+an expected TLC counterexample: a former holder publishes a lower range after
+the reader already advances through a higher range.
 
 After that, the model will add the Fast reader's bounded metadata-observation
-horizon and deliberately reproduce the two accepted loss conditions from the
-design:
+horizon and reproduce the second accepted loss condition from the design:
 
-1. A broker can publish metadata for already accepted work after its producer
-   lease has expired and a successor has published higher sequences.
-2. A Fast reader can observe later metadata while an eventually-consistent
+1. A Fast reader can observe later metadata while an eventually-consistent
    metadata scan omits an earlier row, then cursor/frontier advancement prevents
    recovery of that earlier row.
 

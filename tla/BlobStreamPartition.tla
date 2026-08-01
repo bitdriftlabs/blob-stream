@@ -6,13 +6,14 @@ EXTENDS Naturals, TLC
   partition. It is a learning model, not a line-for-line implementation of the
   Rust services.
 
-  Stage 2 models the producer-side safety boundary:
+  Stage 3 models the producer-side safety boundary:
 
     acquire producer lease -> reserve a Hi-Lo block -> accept one batch
       -> persist blob -> publish metadata -> acknowledge producer
+      -> reader delivers or safely skips covered metadata
 
-  It leaves out readers for now. The next stage will add a deliberately small
-  reader model after TLC exhaustively checks this producer state machine.
+  The reader currently has a complete metadata view. A later stage will make
+  metadata observation incomplete to model the Fast reader's bounded horizon.
 
   A TLA+ module describes all permitted states and transitions. TLC starts at
   Init and explores every possible Next transition within the finite constants
@@ -73,6 +74,9 @@ RangeValues(range) == range[1] .. range[2]
   metadataPhase       NotPublished or Published for each batch's metadata row.
   metadataPublishedBy broker that wrote the metadata row, or Null before it.
   acknowledgementPhase NotAcknowledged or Acknowledged for the producer reply.
+  readerCursor        greatest sequence end the reader has processed.
+  previousReaderCursor readerCursor from the preceding transition.
+  readerResult        Unseen, Delivered, or Skipped for each published batch.
 
   A real broker can allocate many batches from one large reservation. This
   introductory model assigns one symbolic batch per reservation so the first
@@ -95,7 +99,10 @@ VARIABLES
   blobPhase,
   metadataPhase,
   metadataPublishedBy,
-  acknowledgementPhase
+  acknowledgementPhase,
+  readerCursor,
+  previousReaderCursor,
+  readerResult
 
 vars == <<
   now,
@@ -113,7 +120,10 @@ vars == <<
   blobPhase,
   metadataPhase,
   metadataPublishedBy,
-  acknowledgementPhase
+  acknowledgementPhase,
+  readerCursor,
+  previousReaderCursor,
+  readerResult
 >>
 
 (*******************************************************************************
@@ -151,6 +161,9 @@ Init ==
   /\ metadataPhase = [batch \in Batches |-> "NotPublished"]
   /\ metadataPublishedBy = [batch \in Batches |-> Null]
   /\ acknowledgementPhase = [batch \in Batches |-> "NotAcknowledged"]
+  /\ readerCursor = 0
+  /\ previousReaderCursor = 0
+  /\ readerResult = [batch \in Batches |-> "Unseen"]
 
 (*******************************************************************************
   AcquireOrRenewLease models the conditional durable lease mutation.
@@ -171,9 +184,10 @@ AcquireOrRenewLease(broker) ==
   /\ leaseHolder' = broker
   /\ leaseExpiresAt' = now + LeaseDuration
   /\ leaseTerm' = NextLeaseTerm(broker)
+  /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, highWater, previousHighWater, brokerAlive, brokerIncarnation, batchPhase,
                  reservedBy, reservedRange, acceptedLeaseTerm, blobPhase, metadataPhase,
-                 metadataPublishedBy, acknowledgementPhase>>
+                 metadataPublishedBy, acknowledgementPhase, readerCursor, readerResult>>
 
 (*******************************************************************************
   ReserveRange models the atomic lease-store operation that advances the durable
@@ -196,9 +210,10 @@ ReserveRange(broker, batch) ==
   /\ batchPhase' = [batchPhase EXCEPT ![batch] = "Reserved"]
   /\ reservedBy' = [reservedBy EXCEPT ![batch] = broker]
   /\ reservedRange' = [reservedRange EXCEPT ![batch] = <<highWater + 1, highWater + ReservationSize>>]
+  /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, brokerAlive, brokerIncarnation,
                  acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy,
-                 acknowledgementPhase>>
+                 acknowledgementPhase, readerCursor, readerResult>>
 
 (*******************************************************************************
   AcceptBatch models the broker's in-memory transition from an allocated range
@@ -217,9 +232,11 @@ AcceptBatch(broker, batch) ==
   /\ reservedBy[batch] = broker
   /\ batchPhase' = [batchPhase EXCEPT ![batch] = "Accepted"]
   /\ acceptedLeaseTerm' = [acceptedLeaseTerm EXCEPT ![batch] = leaseTerm]
+  /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
                  brokerAlive, brokerIncarnation, reservedBy, reservedRange, blobPhase,
-                 metadataPhase, metadataPublishedBy, acknowledgementPhase>>
+                 metadataPhase, metadataPublishedBy, acknowledgementPhase, readerCursor,
+                 readerResult>>
 
 (*******************************************************************************
   UploadBlob is the first durable publication step. A broker may persist work
@@ -235,9 +252,11 @@ UploadBlob(broker, batch) ==
   /\ reservedBy[batch] = broker
   /\ blobPhase[batch] = "NotUploaded"
   /\ blobPhase' = [blobPhase EXCEPT ![batch] = "Uploaded"]
+  /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
                  brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
-                 acceptedLeaseTerm, metadataPhase, metadataPublishedBy, acknowledgementPhase>>
+                 acceptedLeaseTerm, metadataPhase, metadataPublishedBy, acknowledgementPhase,
+                 readerCursor, readerResult>>
 
 (*******************************************************************************
   PublishMetadata records the second durable publication step. Its intentionally
@@ -255,9 +274,11 @@ PublishMetadata(broker, batch) ==
   /\ metadataPhase[batch] = "NotPublished"
   /\ metadataPhase' = [metadataPhase EXCEPT ![batch] = "Published"]
   /\ metadataPublishedBy' = [metadataPublishedBy EXCEPT ![batch] = broker]
+  /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
                  brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
-                 acceptedLeaseTerm, blobPhase, acknowledgementPhase>>
+                 acceptedLeaseTerm, blobPhase, acknowledgementPhase, readerCursor,
+                 readerResult>>
 
 (*******************************************************************************
   AcknowledgeProducer models successful completion of the broker's flush path.
@@ -273,9 +294,55 @@ AcknowledgeProducer(broker, batch) ==
   /\ metadataPublishedBy[batch] = broker
   /\ acknowledgementPhase[batch] = "NotAcknowledged"
   /\ acknowledgementPhase' = [acknowledgementPhase EXCEPT ![batch] = "Acknowledged"]
+  /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
                  brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
-                 acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy>>
+                 acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy, readerCursor,
+                 readerResult>>
+
+(*******************************************************************************
+  DeliverPublishedBatch is the minimal reader transition for this stage. The
+  reader has a complete view of all published metadata, so it may select any
+  unseen batch above its cursor. A later stage will replace that assumption with
+  an explicit eventually consistent metadata scan and Fast frontier.
+
+  The guard uses the range start rather than requiring contiguity: Hi-Lo gaps
+  are valid, and a cursor can advance from one delivered range to a later one.
+*******************************************************************************)
+DeliverPublishedBatch(batch) ==
+  /\ batch \in Batches
+  /\ metadataPhase[batch] = "Published"
+  /\ blobPhase[batch] = "Uploaded"
+  /\ readerResult[batch] = "Unseen"
+  /\ reservedRange[batch] \in SequenceRange
+  /\ readerCursor < reservedRange[batch][1]
+  /\ readerCursor' = reservedRange[batch][2]
+  /\ previousReaderCursor' = readerCursor
+  /\ readerResult' = [readerResult EXCEPT ![batch] = "Delivered"]
+  /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
+                 brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
+                 acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy,
+                 acknowledgementPhase>>
+
+(*******************************************************************************
+  SkipCoveredBatch models cursor filtering during a later metadata observation.
+  A metadata row whose entire range is at or below the cursor is not delivered
+  again. In the normal complete-view model this is harmless replay handling; in
+  the later stale-writer witness, the same transition will reveal an accepted
+  loss when late lower metadata is first published after higher delivery.
+*******************************************************************************)
+SkipCoveredBatch(batch) ==
+  /\ batch \in Batches
+  /\ metadataPhase[batch] = "Published"
+  /\ readerResult[batch] = "Unseen"
+  /\ reservedRange[batch] \in SequenceRange
+  /\ reservedRange[batch][2] <= readerCursor
+  /\ previousReaderCursor' = readerCursor
+  /\ readerResult' = [readerResult EXCEPT ![batch] = "Skipped"]
+  /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
+                 brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
+                 acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy,
+                 acknowledgementPhase, readerCursor>>
 
 (*******************************************************************************
   AdvanceTime is the only action that changes logical time. It never changes a
@@ -287,9 +354,11 @@ AdvanceTime ==
   /\ now < MaxTime
   /\ now' = now + 1
   /\ previousHighWater' = highWater
+  /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<leaseHolder, leaseExpiresAt, leaseTerm, highWater, brokerAlive,
                  brokerIncarnation, batchPhase, reservedBy, reservedRange, acceptedLeaseTerm,
-                 blobPhase, metadataPhase, metadataPublishedBy, acknowledgementPhase>>
+                 blobPhase, metadataPhase, metadataPublishedBy, acknowledgementPhase,
+                 readerCursor, readerResult>>
 
 (*******************************************************************************
   CrashBroker and RestartBroker are process-local events. A crash does not erase
@@ -301,9 +370,11 @@ CrashBroker(broker) ==
   /\ brokerAlive[broker]
   /\ brokerAlive' = [brokerAlive EXCEPT ![broker] = FALSE]
   /\ previousHighWater' = highWater
+  /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, brokerIncarnation,
                  batchPhase, reservedBy, reservedRange, acceptedLeaseTerm, blobPhase,
-                 metadataPhase, metadataPublishedBy, acknowledgementPhase>>
+                 metadataPhase, metadataPublishedBy, acknowledgementPhase, readerCursor,
+                 readerResult>>
 
 RestartBroker(broker) ==
   /\ broker \in Brokers
@@ -312,9 +383,10 @@ RestartBroker(broker) ==
   /\ brokerAlive' = [brokerAlive EXCEPT ![broker] = TRUE]
   /\ brokerIncarnation' = [brokerIncarnation EXCEPT ![broker] = @ + 1]
   /\ previousHighWater' = highWater
+  /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, batchPhase, reservedBy,
                  reservedRange, acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy,
-                 acknowledgementPhase>>
+                 acknowledgementPhase, readerCursor, readerResult>>
 
 (*******************************************************************************
   ReleaseLease represents a graceful producer handoff. It can only be performed
@@ -328,13 +400,14 @@ ReleaseLease(broker) ==
   /\ leaseHolder' = Null
   /\ leaseExpiresAt' = now
   /\ previousHighWater' = highWater
+  /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseTerm, highWater, brokerAlive, brokerIncarnation, batchPhase,
                  reservedBy, reservedRange, acceptedLeaseTerm, blobPhase, metadataPhase,
-                 metadataPublishedBy, acknowledgementPhase>>
+                 metadataPublishedBy, acknowledgementPhase, readerCursor, readerResult>>
 
 (*******************************************************************************
   BoundedScenarioIsComplete is a test-model condition, not a blob-stream
-  protocol condition. This Stage 1 configuration treats MaxTime as its intended
+  protocol condition. This Stage 3 configuration treats MaxTime as its intended
   horizon. Reaching that horizon permits the scenario to remain idle, while a
   state that gets stuck before it remains a TLC-reported deadlock.
 *******************************************************************************)
@@ -362,6 +435,8 @@ Next ==
   \/ \E broker \in Brokers : \E batch \in Batches : UploadBlob(broker, batch)
   \/ \E broker \in Brokers : \E batch \in Batches : PublishMetadata(broker, batch)
   \/ \E broker \in Brokers : \E batch \in Batches : AcknowledgeProducer(broker, batch)
+  \/ \E batch \in Batches : DeliverPublishedBatch(batch)
+  \/ \E batch \in Batches : SkipCoveredBatch(batch)
   \/ AdvanceTime
   \/ \E broker \in Brokers : CrashBroker(broker)
   \/ \E broker \in Brokers : RestartBroker(broker)
@@ -403,6 +478,9 @@ TypeOK ==
   /\ metadataPhase \in [Batches -> {"NotPublished", "Published"}]
   /\ metadataPublishedBy \in [Batches -> (Brokers \cup {Null})]
   /\ acknowledgementPhase \in [Batches -> {"NotAcknowledged", "Acknowledged"}]
+  /\ readerCursor \in 0 .. MaxSequence
+  /\ previousReaderCursor \in 0 .. MaxSequence
+  /\ readerResult \in [Batches -> {"Unseen", "Delivered", "Skipped"}]
 
 (*******************************************************************************
   LeaseFencing states the key producer-side rule: every Reserved or Accepted
@@ -475,5 +553,35 @@ PublishedMetadataHasAcceptanceProvenance ==
       /\ batchPhase[batch] = "Accepted"
       /\ metadataPublishedBy[batch] = reservedBy[batch]
       /\ acceptedLeaseTerm[batch] \in Nat \ {0}
+
+(*******************************************************************************
+  ReaderCursorNeverRegresses is the reader counterpart to high-water safety.
+  The history variable records the cursor before every real transition, so this
+  invariant detects a future action that accidentally moves the cursor backward.
+*******************************************************************************)
+ReaderCursorNeverRegresses == readerCursor >= previousReaderCursor
+
+(*******************************************************************************
+  DeliveredBatchesWerePublished says the reader cannot fabricate a batch from a
+  metadata result: delivery requires a published metadata row and durable blob.
+*******************************************************************************)
+DeliveredBatchesWerePublished ==
+  \A batch \in Batches :
+    readerResult[batch] = "Delivered" =>
+      /\ metadataPhase[batch] = "Published"
+      /\ blobPhase[batch] = "Uploaded"
+      /\ reservedRange[batch] \in SequenceRange
+
+(*******************************************************************************
+  SkippedBatchesAreCovered captures normal cursor-based replay filtering. A
+  batch is skipped only after the reader's monotonic cursor covers its complete
+  sequence range.
+*******************************************************************************)
+SkippedBatchesAreCovered ==
+  \A batch \in Batches :
+    readerResult[batch] = "Skipped" =>
+      /\ metadataPhase[batch] = "Published"
+      /\ reservedRange[batch] \in SequenceRange
+      /\ reservedRange[batch][2] <= readerCursor
 
 =============================================================================

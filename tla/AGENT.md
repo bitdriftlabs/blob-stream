@@ -11,7 +11,8 @@ not as a transcription of Rust control flow.
 - Preserve the current model boundary unless the task explicitly expands it:
   one virtual partition, bounded brokers/batches/time, producer lease and
   Hi-Lo safety, and blob-to-metadata-to-acknowledgement publication ordering.
-  Reader behavior remains outside the current model.
+  The model also includes one complete-view reader with a monotonic cursor;
+  eventually consistent observation and Fast frontiers remain outside it.
 - Keep documented limitations explicit. The planned stale-writer publication and
   eventually-consistent metadata-loss paths are expected witness behaviors, not
   invariants to disprove.
