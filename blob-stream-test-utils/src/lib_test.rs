@@ -66,3 +66,30 @@ async fn set_time_wakes_registered_sleepers() {
     .await
     .expect("sleeper should complete after set_time reaches its deadline");
 }
+
+#[tokio::test]
+async fn reports_each_new_sleep_registration() {
+  let time_provider = Arc::new(ManualTimeProvider::new(OffsetDateTime::UNIX_EPOCH));
+  let initial_registration_count = time_provider.sleep_registration_count();
+  let sleeper = {
+    let time_provider = Arc::clone(&time_provider);
+    tokio::spawn(async move {
+      time_provider.sleep(Duration::seconds(1)).await;
+      time_provider.sleep(Duration::seconds(1)).await;
+    })
+  };
+
+  let first_registration_count = time_provider
+    .wait_for_sleep_registration_after(initial_registration_count)
+    .await;
+  time_provider.advance(Duration::seconds(1));
+  let second_registration_count = time_provider
+    .wait_for_sleep_registration_after(first_registration_count)
+    .await;
+  assert_eq!(second_registration_count, first_registration_count + 1);
+
+  time_provider.advance(Duration::seconds(1));
+  sleeper
+    .await
+    .expect("manual clock sleeper should complete after the second advance");
+}

@@ -4740,24 +4740,12 @@ async fn prefetch_rebalance_revocation_fences_buffered_record() -> Result<()> {
   })
   .await
   .map_err(|_| anyhow!("both prefetch-fence members did not become active"))??;
-  {
-    let scale_out_rebalance_wait = scale_out_rebalance_gate.wait_until_reached();
-    tokio::pin!(scale_out_rebalance_wait);
-    timeout(Duration::from_secs(5), async {
-      for _ in 0 .. 5 {
-        consumer_time.advance(TimeDuration::milliseconds(200));
-        tokio::select! {
-          result = &mut scale_out_rebalance_wait => return result,
-          () = tokio::task::yield_now() => {},
-        }
-      }
-      Err(anyhow!(
-        "former owner did not begin its scale-out rebalance"
-      ))
-    })
-    .await
-    .map_err(|_| anyhow!("former owner did not begin its scale-out rebalance"))??;
-  }
+  framework::advance_manual_time_until_lifecycle_gate(
+    &consumer_time,
+    &mut scale_out_rebalance_gate,
+    "former owner did not begin its scale-out rebalance",
+  )
+  .await?;
   scale_out_rebalance_gate.release()?;
   timeout(Duration::from_secs(5), revocation_gate.wait_until_reached())
     .await
@@ -5599,22 +5587,12 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
     .await?;
   let mut owner_b = cluster.create_consumer(&runtime_b).await?;
   owner_b.start()?;
-  {
-    let replacement_prefetch_wait = replacement_prefetch_gate.wait_until_reached();
-    tokio::pin!(replacement_prefetch_wait);
-    timeout(Duration::from_secs(5), async {
-      loop {
-        tokio::select! {
-          result = &mut replacement_prefetch_wait => return result,
-          () = tokio::task::yield_now() => {
-            consumer_time.advance(TimeDuration::milliseconds(200));
-          },
-        }
-      }
-    })
-    .await
-    .map_err(|_| anyhow!("replacement owner did not buffer a post-crash batch"))??;
-  }
+  framework::advance_manual_time_until_lifecycle_gate(
+    &consumer_time,
+    &mut replacement_prefetch_gate,
+    "replacement owner did not buffer a post-crash batch",
+  )
+  .await?;
   replacement_prefetch_gate.release()?;
 
   let mut replacement_counts = HashMap::new();
@@ -5625,8 +5603,9 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
 
       match timeout(Duration::from_millis(250), owner_b.next()).await {
         Err(_) => {
-          consumer_time.advance(TimeDuration::milliseconds(200));
-          tokio::task::yield_now().await;
+          return Err(anyhow!(
+            "replacement owner did not deliver a buffered record"
+          ));
         },
         Ok(Err(error)) => return Err(anyhow!("replacement owner next failed: {error}")),
         Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
@@ -6133,7 +6112,22 @@ async fn consumer_restart_hands_active_window_visibility_deferral_to_fast() -> R
     "Fast handoff must not advance the durable cursor past deferred metadata"
   );
 
+  let mut deferred_prefetch_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerPrefetchBatchBuffered,
+      "visibility-replacement",
+      Some(virtual_partition_id),
+      None,
+    )
+    .await?;
   consumer_time.advance(TimeDuration::seconds(7));
+  framework::advance_manual_time_until_lifecycle_gate(
+    &consumer_time,
+    &mut deferred_prefetch_gate,
+    "Fast path did not buffer the deferred record after visibility",
+  )
+  .await?;
+  deferred_prefetch_gate.release()?;
   let mut replacement_counts = HashMap::new();
   let mut deferred_offset = None;
   timeout(Duration::from_secs(5), async {
@@ -6141,8 +6135,9 @@ async fn consumer_restart_hands_active_window_visibility_deferral_to_fast() -> R
       tokio::task::yield_now().await;
       match timeout(Duration::from_millis(250), replacement.next()).await {
         Err(_) => {
-          consumer_time.advance(TimeDuration::seconds(1));
-          tokio::task::yield_now().await;
+          return Err(anyhow!(
+            "Fast path did not deliver its buffered deferred record"
+          ));
         },
         Ok(Err(error)) => return Err(anyhow!("replacement next failed: {error}")),
         Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
@@ -6758,30 +6753,30 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
   consumer_b.abort_for_test().await?;
   drop(consumer_b);
 
-  consumer_time.advance(TimeDuration::seconds(3));
-  timeout(
-    Duration::from_secs(5),
-    recovery_rebalance_gate.wait_until_reached(),
+  framework::advance_manual_time_until_lifecycle_gate(
+    &consumer_time,
+    &mut recovery_rebalance_gate,
+    "surviving bootstrap member did not rebalance after membership expiry",
   )
-  .await
-  .map_err(|_| anyhow!("surviving bootstrap member did not rebalance after membership expiry"))??;
+  .await?;
   recovery_rebalance_gate.release()?;
-  timeout(
-    Duration::from_secs(5),
-    recovery_assignment_gate.wait_until_reached(),
+  framework::advance_manual_time_until_lifecycle_gate(
+    &consumer_time,
+    &mut recovery_assignment_gate,
+    "surviving bootstrap member did not apply its expiry assignment",
   )
-  .await
-  .map_err(|_| anyhow!("surviving bootstrap member did not apply its expiry assignment"))??;
+  .await?;
   recovery_assignment_gate.release()?;
 
   // Assignment commands wake the prefetch worker directly. Each scoped gate proves the worker
   // processed the assignment and found data for the reclaimed partition.
   for mut prefetch_gate in recovery_prefetch_gates {
-    timeout(Duration::from_secs(5), prefetch_gate.wait_until_reached())
-      .await
-      .map_err(|_| {
-        anyhow!("surviving bootstrap member did not prefetch a reclaimed partition")
-      })??;
+    framework::advance_manual_time_until_lifecycle_gate(
+      &consumer_time,
+      &mut prefetch_gate,
+      "surviving bootstrap member did not prefetch a reclaimed partition",
+    )
+    .await?;
     prefetch_gate.release()?;
   }
 

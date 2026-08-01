@@ -118,6 +118,11 @@ impl ConsumerDriver {
           match self.maybe_rebalance(now_ts_ms).await {
             Ok(()) => self.rebalance_retry_backoff.reset(),
             Err(error) => {
+              if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+                lifecycle_hooks
+                  .rebalance_failed(&self.group_config.member_id, self.coordinator.generation())
+                  .await;
+              }
               warn_every!(
                 15.seconds(),
                 "consumer rebalance retrying after error: error={error:#}"

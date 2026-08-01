@@ -45,6 +45,7 @@ fn committed_cursor(virtual_partition_id: u32, seq_end: u64) -> CommittedCursor 
 struct PartialHeartbeatFailureLeaseStore {
   inner: InMemoryConsumerGroupLeaseStore,
   failing_partition: u32,
+  failing_assignment_partition: Option<u32>,
 }
 
 struct BlockingAssignmentLeaseStore {
@@ -73,6 +74,9 @@ impl ConsumerGroupLeaseStore for PartialHeartbeatFailureLeaseStore {
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> anyhow::Result<ConsumerGroupAssignmentOutcome> {
+    if self.failing_assignment_partition == Some(key.virtual_partition_id) {
+      return Err(anyhow::anyhow!("injected assignment failure"));
+    }
     self
       .inner
       .assign_partition(key, owner_id, generation, now_ts_ms, lease_duration_ms)
@@ -729,6 +733,7 @@ async fn heartbeat_reconciles_fencing_when_another_partition_errors() {
   let concrete_store = Arc::new(PartialHeartbeatFailureLeaseStore {
     inner: InMemoryConsumerGroupLeaseStore::new(),
     failing_partition: 8,
+    failing_assignment_partition: None,
   });
   let store: Arc<dyn ConsumerGroupLeaseStore> = concrete_store.clone();
   let membership_store = membership_store();
@@ -776,6 +781,74 @@ async fn heartbeat_reconciles_fencing_when_another_partition_errors() {
       .is_err()
   );
   assert_eq!(coordinator.owned_partitions(), vec![8]);
+}
+
+#[tokio::test]
+async fn rebalance_preserves_successful_claims_when_a_sibling_claim_fails() {
+  let concrete_store = Arc::new(PartialHeartbeatFailureLeaseStore {
+    inner: InMemoryConsumerGroupLeaseStore::new(),
+    failing_partition: u32::MAX,
+    failing_assignment_partition: Some(8),
+  });
+  let key = ConsumerGroupLeaseKey {
+    topic: "topic-a".to_string(),
+    group_id: "group-a".to_string(),
+    virtual_partition_id: 7,
+  };
+  concrete_store
+    .inner
+    .assign_partition(key.clone(), "member-b".to_string(), 1, 1_000, 100)
+    .await
+    .unwrap();
+  concrete_store
+    .inner
+    .heartbeat_partition(
+      &key,
+      "member-b",
+      1,
+      1_010,
+      100,
+      Some(committed_cursor(7, 42)),
+    )
+    .await
+    .unwrap();
+
+  let store: Arc<dyn ConsumerGroupLeaseStore> = concrete_store;
+  let mut coordinator = ConsumerGroupCoordinatorImpl::new(
+    ConsumerGroupConfig {
+      topic: "topic-a".to_string().into(),
+      group_id: "group-a".to_string().into(),
+      member_id: "member-a".to_string().into(),
+      lease_duration_ms: Some(100),
+      heartbeat_interval_ms: Some(50),
+      rebalance_interval_ms: Some(50),
+      ..Default::default()
+    },
+    store,
+    membership_store(),
+  )
+  .unwrap();
+
+  let report = coordinator
+    .rebalance(vec!["member-a".to_string()], vec![7, 8], 1_120)
+    .await
+    .unwrap();
+
+  assert_eq!(report.owned_partitions, vec![7]);
+  assert_eq!(report.lease_claim_counts.expiry_takeovers, 1);
+  assert_eq!(
+    report.recovered_cursors.get(&7),
+    Some(&crate::coordination::RecoveredCursor {
+      committed_cursor: committed_cursor(7, 42),
+      committed_ts_ms: Some(1_010),
+    })
+  );
+  assert_eq!(
+    report.active_partition_lease_expiration_deadline_ms,
+    Some(1_220)
+  );
+  assert!(report.retry_error.is_some());
+  assert_eq!(coordinator.owned_partitions(), vec![7]);
 }
 
 #[tokio::test]

@@ -100,7 +100,9 @@ impl ConsumerDriver {
           .retain(|range| range.end_offset > committed_cursor.offset);
       }
     }
-    shared_state.diagnostics.last_successful_heartbeat_at_ms = Some(now_ts_ms);
+    if matches!(trigger, HeartbeatTrigger::Scheduled) {
+      shared_state.diagnostics.last_successful_heartbeat_at_ms = Some(now_ts_ms);
+    }
   }
 
   pub(in crate::iterator) async fn heartbeat(
@@ -137,6 +139,14 @@ impl ConsumerDriver {
       self.active_assignment,
       pending_commits.len()
     );
+
+    if matches!(trigger, HeartbeatTrigger::Scheduled)
+      && let Some(lifecycle_hooks) = &self.lifecycle_hooks
+    {
+      lifecycle_hooks
+        .before_scheduled_heartbeat(&self.group_config.member_id, self.coordinator.generation())
+        .await;
+    }
 
     if matches!(trigger, HeartbeatTrigger::Scheduled)
       && let Err(error) = self

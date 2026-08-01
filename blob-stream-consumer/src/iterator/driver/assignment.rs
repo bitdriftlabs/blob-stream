@@ -9,7 +9,6 @@ use super::{
   Span,
   VirtualPartitionId,
   assignment_plan_snapshot,
-  consumer_lease_duration_ms,
   consumer_rebalance_interval_ms,
   emit_partition_handoff_snapshots,
   field,
@@ -441,8 +440,10 @@ impl ConsumerDriver {
     self.record_rebalance_metrics(&report);
     let RebalanceReport {
       owned_partitions: next_assignment,
+      active_partition_lease_expiration_deadline_ms,
       recovered_cursors,
       accepted_assignment_plan,
+      retry_error,
       ..
     } = report;
     self.record_accepted_assignment_plan(accepted_assignment_plan);
@@ -451,15 +452,17 @@ impl ConsumerDriver {
 
     let next_assignment_set = next_assignment.iter().copied().collect::<HashSet<_>>();
     let assignment_changed = self.active_assignment != next_assignment_set;
-    if assignment_changed {
+    if let Some(active_partition_lease_expiration_deadline_ms) =
+      active_partition_lease_expiration_deadline_ms
+    {
       self.active_partition_lease_expiration_deadline_ms =
-        now_ts_ms.saturating_add(consumer_lease_duration_ms(&self.group_config));
+        active_partition_lease_expiration_deadline_ms;
     }
     self.hydrate_cursors(recovered_cursors, now_ts_ms / 1_000)?;
 
     if !assignment_changed {
       self.refresh_rebalance_diagnostics();
-      return Ok(());
+      return retry_error.map_or_else(|| Ok(()), |error| Err(anyhow::Error::msg(error)));
     }
 
     let revoked = self
@@ -479,7 +482,7 @@ impl ConsumerDriver {
           )
           .await;
       }
-      return Ok(());
+      return retry_error.map_or_else(|| Ok(()), |error| Err(anyhow::Error::msg(error)));
     }
 
     self.metrics.revocations.inc();
@@ -546,6 +549,6 @@ impl ConsumerDriver {
       self.group_config.topic, self.group_config.group_id, self.group_config.member_id, revoked
     );
 
-    Ok(())
+    retry_error.map_or_else(|| Ok(()), |error| Err(anyhow::Error::msg(error)))
   }
 }

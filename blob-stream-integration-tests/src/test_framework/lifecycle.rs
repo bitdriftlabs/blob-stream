@@ -6,9 +6,11 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use blob_stream_broker::write::BrokerLifecycleHooks;
 use blob_stream_consumer::iterator::ConsumerLifecycleHooks;
+use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::VirtualPartitionId;
 use std::collections::HashMap;
 use std::sync::Arc;
+use time::Duration as TimeDuration;
 use tokio::sync::{Mutex, oneshot};
 
 //
@@ -28,7 +30,9 @@ pub enum LifecycleEvent {
   ConsumerRevocationEmitted,
   ConsumerPrefetchBatchBuffered,
   ConsumerRecoveryFastPathActive,
+  ConsumerBeforeScheduledHeartbeat,
   ConsumerBeforeRebalance,
+  ConsumerRebalanceFailed,
   ConsumerRebalanceApplied,
   ConsumerBeforeCommit,
   ConsumerShutdownCommitFinished,
@@ -82,6 +86,31 @@ impl LifecycleGate {
       .send(())
       .map_err(|()| anyhow!("lifecycle operation stopped before gate release"))
   }
+}
+
+/// Advance manual time one driver sleep cycle at a time until `gate` is reached.
+pub async fn advance_manual_time_until_lifecycle_gate(
+  manual_time: &ManualTimeProvider,
+  gate: &mut LifecycleGate,
+  failure_message: &str,
+) -> Result<()> {
+  manual_time.wait_until_sleeping(1).await;
+  let mut sleep_registration_count = manual_time.sleep_registration_count();
+  let gate_wait = gate.wait_until_reached();
+  tokio::pin!(gate_wait);
+
+  for _ in 0 .. 25 {
+    manual_time.advance(TimeDuration::milliseconds(200));
+    tokio::select! {
+      result = &mut gate_wait => return result,
+      next_registration_count = manual_time
+        .wait_for_sleep_registration_after(sleep_registration_count) => {
+        sleep_registration_count = next_registration_count;
+      },
+    }
+  }
+
+  Err(anyhow!("{failure_message}"))
 }
 
 //
@@ -378,10 +407,32 @@ impl ConsumerLifecycleHooks for TestLifecycleHooks {
       .await;
   }
 
+  async fn before_scheduled_heartbeat(&self, member_id: &str, generation: u64) {
+    self
+      .reach_consumer(
+        LifecycleEvent::ConsumerBeforeScheduledHeartbeat,
+        member_id,
+        generation,
+        &[],
+      )
+      .await;
+  }
+
   async fn before_rebalance(&self, member_id: &str, generation: u64) {
     self
       .reach_consumer(
         LifecycleEvent::ConsumerBeforeRebalance,
+        member_id,
+        generation,
+        &[],
+      )
+      .await;
+  }
+
+  async fn rebalance_failed(&self, member_id: &str, generation: u64) {
+    self
+      .reach_consumer(
+        LifecycleEvent::ConsumerRebalanceFailed,
         member_id,
         generation,
         &[],

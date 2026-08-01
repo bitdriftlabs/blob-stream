@@ -2113,6 +2113,14 @@ async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
     "missing active-owner cursor commit fault"
   );
 
+  let mut scheduled_heartbeat_gate = hooks
+    .arm_consumer(
+      framework::LifecycleEvent::ConsumerBeforeScheduledHeartbeat,
+      "fit-010-a",
+      None,
+      None,
+    )
+    .await?;
   let membership_fault_id = resources
     .store_fault_controller()
     .enable_fault(StoreFaultRule {
@@ -2125,9 +2133,15 @@ async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
       remaining_hits: None,
     })
     .await;
+  framework::advance_manual_time_until_lifecycle_gate(
+    &consumer_time,
+    &mut scheduled_heartbeat_gate,
+    "scheduled membership heartbeat did not reach its lifecycle boundary",
+  )
+  .await?;
+  scheduled_heartbeat_gate.release()?;
   timeout(Duration::from_secs(5), async {
     loop {
-      consumer_time.advance(TimeDuration::seconds(1));
       tokio::task::yield_now().await;
       let membership_fault_applied = resources
         .store_fault_controller()
@@ -2899,6 +2913,15 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
 
   // The planner failure establishes the rebalance retry before the lease and heartbeat failures
   // become eligible. This keeps the recovery path causal rather than scheduler-dependent.
+  let hooks = cluster.lifecycle_hooks();
+  let mut planner_failure_gate = hooks
+    .arm_consumer(
+      framework::LifecycleEvent::ConsumerRebalanceFailed,
+      "fit-015-a",
+      None,
+      None,
+    )
+    .await?;
   consumer_a.start()?;
   consumer_b.start()?;
   let planner_fault = cluster
@@ -2908,6 +2931,12 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
     planner_fault.operation, "consumer_publish_assignment_plan",
     "expected the planner fault before enabling later recovery faults: {planner_fault:?}"
   );
+  timeout(
+    Duration::from_secs(5),
+    planner_failure_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow::anyhow!("planner failure did not reach the rebalance retry boundary"))??;
 
   resources
     .store_fault_controller()
@@ -2945,18 +2974,42 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
       remaining_hits: Some(2),
     })
     .await;
+  planner_failure_gate.release()?;
 
   let mut observed_fault_counts =
     HashMap::from([("consumer_publish_assignment_plan".to_string(), 1_usize)]);
   let mut previous_fault_sequence = Some(planner_fault.sequence);
+  let mut saw_revocation = false;
   while observed_fault_counts != expected_fault_counts {
-    let fault = cluster
-      .wait_for_event_after(
-        &fault_matcher,
-        previous_fault_sequence,
-        Duration::from_secs(10),
-      )
-      .await?;
+    let fault_wait = cluster.wait_for_event_after(
+      &fault_matcher,
+      previous_fault_sequence,
+      Duration::from_secs(10),
+    );
+    tokio::pin!(fault_wait);
+    let fault = tokio::select! {
+      fault = &mut fault_wait => fault?,
+      next_result = consumer_a.next() => {
+        let NextResult::Revoked(revoked) = next_result? else {
+          return Err(anyhow::anyhow!(
+            "consumer A delivered a record before the fault script completed"
+          ));
+        };
+        saw_revocation = true;
+        revoked.complete().await;
+        continue;
+      },
+      next_result = consumer_b.next() => {
+        let NextResult::Revoked(revoked) = next_result? else {
+          return Err(anyhow::anyhow!(
+            "consumer B delivered a record before the fault script completed"
+          ));
+        };
+        saw_revocation = true;
+        revoked.complete().await;
+        continue;
+      },
+    };
     let Some(expected_count) = expected_fault_counts.get(&fault.operation) else {
       return Err(anyhow::anyhow!(
         "unexpected store fault during consumer recovery: {fault:?}"
@@ -2985,7 +3038,6 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
     expected_ids.insert(id);
   }
 
-  let mut saw_revocation = false;
   let mut delivered_id_counts = HashMap::new();
   let mut max_offsets = HashMap::<u32, u64>::new();
   timeout(Duration::from_secs(12), async {

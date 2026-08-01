@@ -16,3 +16,6 @@
 - Do not run `cargo nextest list` in its default paging mode; it can page and hang the session. If
   listing is necessary, disable paging and constrain the output first, otherwise run a targeted
   `cargo nextest run` command directly.
+- When working on integration tests, follow the general guidelines in plans/TEST_AUDIT.md. DO NOT
+  add any sleep hacks whatsoever. All tests MUST be deterministic. Add new test lifecycle hooks as
+  needed.

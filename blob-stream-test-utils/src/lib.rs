@@ -25,6 +25,7 @@ use tokio::sync::{Notify, watch};
 pub struct ManualTimeProvider {
   now: watch::Sender<OffsetDateTime>,
   active_sleeps: Arc<AtomicUsize>,
+  sleep_registrations: Arc<AtomicUsize>,
   sleep_registered: Arc<Notify>,
 }
 
@@ -33,8 +34,13 @@ struct ManualTimeSleepRegistration {
 }
 
 impl ManualTimeSleepRegistration {
-  fn register(active_sleeps: Arc<AtomicUsize>, sleep_registered: &Notify) -> Self {
+  fn register(
+    active_sleeps: Arc<AtomicUsize>,
+    sleep_registrations: &AtomicUsize,
+    sleep_registered: &Notify,
+  ) -> Self {
     active_sleeps.fetch_add(1, Ordering::Release);
+    sleep_registrations.fetch_add(1, Ordering::Release);
     sleep_registered.notify_waiters();
     Self { active_sleeps }
   }
@@ -53,6 +59,7 @@ impl ManualTimeProvider {
     Self {
       now,
       active_sleeps: Arc::new(AtomicUsize::new(0)),
+      sleep_registrations: Arc::new(AtomicUsize::new(0)),
       sleep_registered: Arc::new(Notify::new()),
     }
   }
@@ -65,6 +72,26 @@ impl ManualTimeProvider {
       notified.as_mut().enable();
       if self.active_sleeps.load(Ordering::Acquire) >= expected_sleepers {
         return;
+      }
+      notified.await;
+    }
+  }
+
+  #[must_use]
+  /// Return the number of logical-clock sleeps registered since construction.
+  pub fn sleep_registration_count(&self) -> usize {
+    self.sleep_registrations.load(Ordering::Acquire)
+  }
+
+  /// Wait for a task to register a logical-clock sleep after `previous_count`.
+  pub async fn wait_for_sleep_registration_after(&self, previous_count: usize) -> usize {
+    loop {
+      let notified = self.sleep_registered.notified();
+      tokio::pin!(notified);
+      notified.as_mut().enable();
+      let registration_count = self.sleep_registration_count();
+      if registration_count > previous_count {
+        return registration_count;
       }
       notified.await;
     }
@@ -89,6 +116,7 @@ impl TimeProvider for ManualTimeProvider {
     let deadline = self.now() + duration;
     let _registration = ManualTimeSleepRegistration::register(
       Arc::clone(&self.active_sleeps),
+      &self.sleep_registrations,
       &self.sleep_registered,
     );
     let mut updates = self.now.subscribe();

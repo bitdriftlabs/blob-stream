@@ -129,8 +129,14 @@ pub trait ConsumerLifecycleHooks: Send + Sync {
   ) {
   }
 
+  /// Runs immediately before a scheduled heartbeat renews membership and partition leases.
+  async fn before_scheduled_heartbeat(&self, _member_id: &str, _generation: u64) {}
+
   /// Runs immediately before the driver begins a consumer-group rebalance.
   async fn before_rebalance(&self, _member_id: &str, _generation: u64) {}
+
+  /// Runs after a rebalance fails and before the driver schedules its retry.
+  async fn rebalance_failed(&self, _member_id: &str, _generation: u64) {}
 
   /// Runs after a rebalance applies a new active assignment.
   async fn rebalance_applied(

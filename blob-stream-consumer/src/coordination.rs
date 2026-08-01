@@ -55,7 +55,7 @@ enum LeaseMaintenanceOperation {
 }
 
 enum LeaseMaintenanceOutcome {
-  Renewed,
+  Renewed(ConsumerGroupLease),
   HeldByOther(ConsumerGroupLease),
   Expired,
 }
@@ -140,6 +140,8 @@ pub struct RecoveredCursor {
 pub struct RebalanceReport {
   /// Partitions currently owned after rebalance.
   pub owned_partitions: Vec<VirtualPartitionId>,
+  /// Earliest expiration among leases in the current assignment.
+  pub active_partition_lease_expiration_deadline_ms: Option<i64>,
   /// Last committed cursor state per owned partition, when present in lease store.
   pub recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
   /// Valid persisted assignment plan accepted during this rebalance.
@@ -154,6 +156,11 @@ pub struct RebalanceReport {
   pub desired_partitions: usize,
   /// Successful lease claim transitions observed during this rebalance.
   pub lease_claim_counts: LeaseClaimCounts,
+  /// Claim failure observed after other concurrent claims completed successfully.
+  ///
+  /// The successful work remains in this report and must be applied before retrying only the
+  /// failed claim on the next rebalance.
+  pub retry_error: Option<String>,
 }
 
 //
@@ -251,7 +258,7 @@ pub struct ConsumerGroupCoordinatorImpl {
   membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   planner_session_id: String,
   generation: u64,
-  owned: HashMap<VirtualPartitionId, u64>,
+  owned: HashMap<VirtualPartitionId, ConsumerGroupLease>,
 }
 
 impl ConsumerGroupCoordinatorImpl {
@@ -513,7 +520,9 @@ impl ConsumerGroupCoordinatorImpl {
             )
             .await?
           {
-            ConsumerGroupHeartbeatOutcome::Renewed(_) => LeaseMaintenanceOutcome::Renewed,
+            ConsumerGroupHeartbeatOutcome::Renewed(lease) => {
+              LeaseMaintenanceOutcome::Renewed(lease)
+            },
             ConsumerGroupHeartbeatOutcome::HeldByOther(lease) => {
               LeaseMaintenanceOutcome::HeldByOther(lease)
             },
@@ -529,7 +538,7 @@ impl ConsumerGroupCoordinatorImpl {
             )
             .await?
           {
-            ConsumerGroupCommitOutcome::Committed(_) => LeaseMaintenanceOutcome::Renewed,
+            ConsumerGroupCommitOutcome::Committed(lease) => LeaseMaintenanceOutcome::Renewed(lease),
             ConsumerGroupCommitOutcome::HeldByOther(lease) => {
               LeaseMaintenanceOutcome::HeldByOther(lease)
             },
@@ -555,7 +564,10 @@ impl ConsumerGroupCoordinatorImpl {
         },
       };
       match outcome {
-        LeaseMaintenanceOutcome::Renewed => renewed.push(partition_id),
+        LeaseMaintenanceOutcome::Renewed(lease) => {
+          self.owned.insert(partition_id, lease);
+          renewed.push(partition_id);
+        },
         LeaseMaintenanceOutcome::HeldByOther(lease) => {
           self.owned.remove(&partition_id);
           fenced.push(partition_id);
@@ -677,7 +689,10 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
         desired_assignment
           .get(partition_id)
           .is_some_and(|owner_id| owner_id == &member_id)
-          && self.owned.get(partition_id) == Some(&self.generation)
+          && self
+            .owned
+            .get(partition_id)
+            .is_some_and(|lease| lease.generation == self.generation)
       })
       .copied()
       .collect::<HashSet<_>>();
@@ -692,7 +707,10 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
         desired_assignment
           .get(partition_id)
           .is_some_and(|owner_id| owner_id == &member_id)
-          && self.owned.get(partition_id) != Some(&generation)
+          && self
+            .owned
+            .get(partition_id)
+            .is_none_or(|lease| lease.generation != generation)
       })
       .collect::<Vec<_>>();
     let outcomes = stream::iter(partitions_to_claim)
@@ -761,7 +779,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
             },
           }
           assignment_changed |= owned_partitions.insert(partition_id);
-          self.owned.insert(partition_id, lease.generation);
+          self.owned.insert(partition_id, lease.clone());
           if let Some(committed_cursor) = lease.committed_cursor {
             recovered_cursors.insert(
               partition_id,
@@ -793,13 +811,18 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       }
     }
 
-    if let Some(error) = assignment_error {
-      return Err(error);
-    }
-
     // Stable ordering helps deterministic tests and predictable downstream behavior.
     let mut owned = owned_partitions.into_iter().collect::<Vec<_>>();
     owned.sort_unstable();
+    let active_partition_lease_expiration_deadline_ms = owned
+      .iter()
+      .filter_map(|partition_id| {
+        self
+          .owned
+          .get(partition_id)
+          .map(|lease| lease.lease_expiration_ts_ms)
+      })
+      .min();
     if assignment_changed {
       info!(
         "consumer rebalance applied: topic={}, group_id={}, member_id={}, \
@@ -824,6 +847,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     );
     Ok(RebalanceReport {
       owned_partitions: owned,
+      active_partition_lease_expiration_deadline_ms,
       recovered_cursors,
       accepted_assignment_plan: shared_plan,
       accepted_assignment_plan_version,
@@ -831,6 +855,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       assignment_plan_applied,
       desired_partitions,
       lease_claim_counts,
+      retry_error: assignment_error.map(|error| format!("{error:#}")),
     })
   }
 
@@ -842,7 +867,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     let owned = self
       .owned
       .iter()
-      .map(|(partition_id, generation)| (*partition_id, *generation))
+      .map(|(partition_id, lease)| (*partition_id, lease.generation))
       .collect::<Vec<_>>();
     self
       .maintain_partitions(
@@ -865,7 +890,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
         self
           .owned
           .get(partition_id)
-          .map(|generation| (*partition_id, *generation))
+          .map(|lease| (*partition_id, lease.generation))
       })
       .collect::<Vec<_>>();
     self
@@ -886,7 +911,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     let mut released = Vec::new();
 
     for partition_id in partitions {
-      let Some(generation) = self.owned.get(partition_id).copied() else {
+      let Some(lease) = self.owned.get(partition_id) else {
         continue;
       };
       let key = ConsumerGroupLeaseKey {
@@ -897,7 +922,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
 
       let outcome = self
         .lease_store
-        .release_partition(&key, &self.config.member_id, generation, now_ts_ms)
+        .release_partition(&key, &self.config.member_id, lease.generation, now_ts_ms)
         .await?;
 
       match outcome {
