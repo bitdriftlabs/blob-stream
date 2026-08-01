@@ -4,6 +4,7 @@ use crate::{
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupLeaseTransition,
   ConsumerGroupReleaseOutcome,
   InMemoryConsumerGroupLeaseStore,
 };
@@ -88,7 +89,10 @@ async fn fences_assignment() {
 
   assert!(matches!(
     outcome,
-    ConsumerGroupAssignmentOutcome::Assigned(_)
+    ConsumerGroupAssignmentOutcome::Assigned {
+      transition: ConsumerGroupLeaseTransition::Initial,
+      ..
+    }
   ));
 
   let outcome = store
@@ -108,7 +112,14 @@ async fn fences_assignment() {
 
   assert!(matches!(
     outcome,
-    ConsumerGroupAssignmentOutcome::Assigned(_)
+    ConsumerGroupAssignmentOutcome::Assigned {
+      transition: ConsumerGroupLeaseTransition::ExpiryTakeover {
+        previous_owner_id,
+        previous_generation: 1,
+        ..
+      },
+      ..
+    } if previous_owner_id == "member-a"
   ));
 }
 
@@ -165,6 +176,44 @@ async fn heartbeats_and_commits() {
 }
 
 #[tokio::test]
+async fn retained_assignment_preserves_committed_cursor() {
+  let store = InMemoryConsumerGroupLeaseStore::new();
+  let key = lease_key();
+  let committed_cursor = cursor(key.virtual_partition_id, 10);
+
+  store
+    .assign_partition(key.clone(), "member-a".to_string(), 1, 1_000, 100)
+    .await
+    .expect("assign lease");
+  store
+    .heartbeat_partition(
+      &key,
+      "member-a",
+      1,
+      1_010,
+      100,
+      Some(committed_cursor.clone()),
+    )
+    .await
+    .expect("commit cursor");
+
+  let outcome = store
+    .assign_partition(key, "member-a".to_string(), 2, 1_020, 100)
+    .await
+    .expect("retain lease");
+
+  assert!(matches!(
+    outcome,
+    ConsumerGroupAssignmentOutcome::Assigned {
+      lease,
+      previous_lease: Some(previous_lease),
+      transition: ConsumerGroupLeaseTransition::Retained,
+    } if lease.committed_cursor == Some(committed_cursor.clone())
+      && previous_lease.committed_cursor == Some(committed_cursor)
+  ));
+}
+
+#[tokio::test]
 async fn heartbeat_fences_other_members() {
   let store = InMemoryConsumerGroupLeaseStore::new();
   let key = lease_key();
@@ -212,7 +261,15 @@ async fn release_partition_allows_immediate_takeover() {
     .expect("assign lease after release");
   assert!(matches!(
     reassigned,
-    ConsumerGroupAssignmentOutcome::Assigned(_)
+    ConsumerGroupAssignmentOutcome::Assigned {
+      transition: ConsumerGroupLeaseTransition::GracefulHandoff {
+        previous_owner_id,
+        previous_generation: 2,
+        graceful_release_ts_ms: 1_010,
+        ..
+      },
+      ..
+    } if previous_owner_id == "member-a"
   ));
 }
 

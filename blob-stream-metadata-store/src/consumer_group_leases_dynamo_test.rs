@@ -4,6 +4,7 @@ use crate::{
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupLeaseTransition,
   ConsumerGroupReleaseOutcome,
   DynamoConsumerGroupLeaseStore,
 };
@@ -189,7 +190,10 @@ async fn fences_assignment() -> Result<()> {
 
   assert!(matches!(
     outcome,
-    ConsumerGroupAssignmentOutcome::Assigned(_)
+    ConsumerGroupAssignmentOutcome::Assigned {
+      transition: ConsumerGroupLeaseTransition::Initial,
+      ..
+    }
   ));
 
   let outcome = store
@@ -207,7 +211,14 @@ async fn fences_assignment() -> Result<()> {
 
   assert!(matches!(
     outcome,
-    ConsumerGroupAssignmentOutcome::Assigned(_)
+    ConsumerGroupAssignmentOutcome::Assigned {
+      transition: ConsumerGroupLeaseTransition::ExpiryTakeover {
+        previous_owner_id,
+        previous_generation: 1,
+        ..
+      },
+      ..
+    } if previous_owner_id == "member-a"
   ));
 
   client.delete_table().table_name(table_name).send().await?;
@@ -273,6 +284,48 @@ async fn heartbeats_and_commits() -> Result<()> {
 }
 
 #[tokio::test]
+async fn retained_assignment_preserves_committed_cursor() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
+  create_leases_table(&client, &table_name).await?;
+
+  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let key = lease_key();
+  let committed_cursor = cursor_with_source(key.virtual_partition_id, 10);
+
+  store
+    .assign_partition(key.clone(), "member-a".to_string(), 1, 1_000, 100)
+    .await?;
+  store
+    .heartbeat_partition(
+      &key,
+      "member-a",
+      1,
+      1_010,
+      100,
+      Some(committed_cursor.clone()),
+    )
+    .await?;
+
+  let outcome = store
+    .assign_partition(key, "member-a".to_string(), 2, 1_020, 100)
+    .await?;
+
+  assert!(matches!(
+    outcome,
+    ConsumerGroupAssignmentOutcome::Assigned {
+      lease,
+      previous_lease: Some(previous_lease),
+      transition: ConsumerGroupLeaseTransition::Retained,
+    } if lease.committed_cursor == Some(committed_cursor.clone())
+      && previous_lease.committed_cursor == Some(committed_cursor)
+  ));
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[tokio::test]
 async fn heartbeat_fences_other_members() -> Result<()> {
   let client = dynamo_client().await?;
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
@@ -325,7 +378,15 @@ async fn release_partition_allows_immediate_takeover() -> Result<()> {
     .await?;
   assert!(matches!(
     reassigned,
-    ConsumerGroupAssignmentOutcome::Assigned(_)
+    ConsumerGroupAssignmentOutcome::Assigned {
+      transition: ConsumerGroupLeaseTransition::GracefulHandoff {
+        previous_owner_id,
+        previous_generation: 2,
+        graceful_release_ts_ms: 1_010,
+        ..
+      },
+      ..
+    } if previous_owner_id == "member-a"
   ));
 
   client.delete_table().table_name(table_name).send().await?;

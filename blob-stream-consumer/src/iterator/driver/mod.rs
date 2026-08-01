@@ -30,6 +30,7 @@ use crate::diagnostics::{
   emit_partition_handoff_snapshots,
 };
 use anyhow::{Result, anyhow, ensure};
+use bd_backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
 use bd_time::{OffsetDateTimeExt, TimeProvider};
 use blob_stream_metadata_store::{ConsumerGroupAssignmentPlan, ConsumerGroupMembershipStore};
 use blob_stream_types::{CommittedCursor, VirtualPartitionId, format_unix_timestamp_ms};
@@ -39,6 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+use time::Duration as TimeDuration;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{Span, field};
@@ -49,6 +51,18 @@ mod heartbeat;
 mod lifecycle;
 mod reader;
 mod runtime;
+
+const RETRY_INITIAL_DELAY_MS: i64 = 500;
+const RETRY_MAX_DELAY_MS: i64 = 30_000;
+
+pub(in crate::iterator) fn retry_backoff() -> ExponentialBackoff {
+  ExponentialBackoffBuilder::new_infinite()
+    .with_initial_interval(TimeDuration::milliseconds(RETRY_INITIAL_DELAY_MS))
+    .with_randomization_factor(0.5)
+    .with_multiplier(2.0)
+    .with_max_interval(TimeDuration::milliseconds(RETRY_MAX_DELAY_MS))
+    .build()
+}
 
 //
 // HeartbeatTrigger
@@ -103,8 +117,15 @@ pub(in crate::iterator) struct ConsumerDriver {
   pub(in crate::iterator) lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
   pub(in crate::iterator) time_provider: Arc<dyn TimeProvider>,
   pub(in crate::iterator) membership_lease_expires_at_ms: i64,
+  /// Earliest expiration among this driver's active partition leases.
+  ///
+  /// This driver-wide safety deadline bounds heartbeat retries so it never continues delivery
+  /// beyond a lease that may no longer be valid.
+  pub(in crate::iterator) active_partition_lease_expiration_deadline_ms: i64,
   pub(in crate::iterator) next_heartbeat_at_ms: i64,
   pub(in crate::iterator) next_rebalance_at_ms: i64,
+  pub(in crate::iterator) heartbeat_retry_backoff: ExponentialBackoff,
+  pub(in crate::iterator) rebalance_retry_backoff: ExponentialBackoff,
   pub(in crate::iterator) diagnostics: ConsumerDiagnostics,
 }
 

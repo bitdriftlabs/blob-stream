@@ -1373,7 +1373,7 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
         key_str,
         if result.is_ok() { "ok" } else { "error" },
         result.as_ref().ok().map(|outcome| match outcome {
-          ConsumerGroupAssignmentOutcome::Assigned(_) => "assigned".to_string(),
+          ConsumerGroupAssignmentOutcome::Assigned { .. } => "assigned".to_string(),
           ConsumerGroupAssignmentOutcome::HeldByOther(_) => "held_by_other".to_string(),
         }),
       )

@@ -45,7 +45,12 @@ pub use helpers::{
   reader_delivery_counts,
   rescan_reader_with_trace,
 };
-pub use lifecycle::{LifecycleEvent, LifecycleGate, TestLifecycleHooks};
+pub use lifecycle::{
+  LifecycleEvent,
+  LifecycleGate,
+  TestLifecycleHooks,
+  advance_manual_time_until_lifecycle_gate,
+};
 pub use manual_time::ManualProducerRetryClock;
 pub use resources::IntegrationResources;
 pub use runtime::now_unix_seconds;

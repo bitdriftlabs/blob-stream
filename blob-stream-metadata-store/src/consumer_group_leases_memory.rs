@@ -8,8 +8,11 @@ use crate::{
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLease,
   ConsumerGroupLeaseKey,
+  ConsumerGroupLeasePredecessor,
   ConsumerGroupLeaseStore,
+  ConsumerGroupLeaseTransition,
   ConsumerGroupReleaseOutcome,
+  consumer_group_lease_transition,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -76,21 +79,37 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
           last_heartbeat_ts_ms: now_ts_ms,
           committed_cursor: None,
           committed_ts_ms: None,
+          graceful_release_ts_ms: None,
         };
         guard.insert(key.clone(), lease.clone());
-        Ok(ConsumerGroupAssignmentOutcome::Assigned(
-          lease.to_lease(key),
-        ))
+        Ok(ConsumerGroupAssignmentOutcome::Assigned {
+          lease: lease.to_lease(key),
+          previous_lease: None,
+          transition: ConsumerGroupLeaseTransition::Initial,
+        })
       },
       Some(state) => {
         if state.is_expired(now_ts_ms) {
+          let previous = state.clone();
+          let transition = consumer_group_lease_transition(
+            Some(ConsumerGroupLeasePredecessor {
+              owner_id: &previous.owner_id,
+              generation: previous.generation,
+              last_heartbeat_ts_ms: previous.last_heartbeat_ts_ms,
+              graceful_release_ts_ms: previous.graceful_release_ts_ms,
+            }),
+            &owner_id,
+          );
           state.owner_id = owner_id;
           state.generation = generation;
           state.lease_expiration_ts_ms = expires_at;
           state.last_heartbeat_ts_ms = now_ts_ms;
-          return Ok(ConsumerGroupAssignmentOutcome::Assigned(
-            state.to_lease(key),
-          ));
+          state.graceful_release_ts_ms = None;
+          return Ok(ConsumerGroupAssignmentOutcome::Assigned {
+            lease: state.to_lease(key.clone()),
+            previous_lease: Some(Box::new(previous.to_lease(key))),
+            transition,
+          });
         }
 
         if state.owner_id == owner_id {
@@ -100,12 +119,16 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
             ));
           }
 
+          let previous = state.clone();
           state.generation = generation;
           state.lease_expiration_ts_ms = expires_at;
           state.last_heartbeat_ts_ms = now_ts_ms;
-          return Ok(ConsumerGroupAssignmentOutcome::Assigned(
-            state.to_lease(key),
-          ));
+          state.graceful_release_ts_ms = None;
+          return Ok(ConsumerGroupAssignmentOutcome::Assigned {
+            lease: state.to_lease(key.clone()),
+            previous_lease: Some(Box::new(previous.to_lease(key))),
+            transition: ConsumerGroupLeaseTransition::Retained,
+          });
         }
 
         Ok(ConsumerGroupAssignmentOutcome::HeldByOther(
@@ -235,6 +258,7 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     // Expire in place so the committed cursor remains available for the next owner.
     state.lease_expiration_ts_ms = now_ts_ms;
     state.last_heartbeat_ts_ms = now_ts_ms;
+    state.graceful_release_ts_ms = Some(now_ts_ms);
     Ok(ConsumerGroupReleaseOutcome::Released)
   }
 }
@@ -251,6 +275,7 @@ struct LeaseState {
   last_heartbeat_ts_ms: i64,
   committed_cursor: Option<CommittedCursor>,
   committed_ts_ms: Option<i64>,
+  graceful_release_ts_ms: Option<i64>,
 }
 
 impl LeaseState {
