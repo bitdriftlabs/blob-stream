@@ -115,7 +115,8 @@ fn records_produce_request_timeouts() {
 #[tokio::test]
 async fn returns_overloaded_when_admission_controller_rejects() -> Result<()> {
   let shutdown_trigger = ComponentShutdownTrigger::default();
-  let scope = Collector::default().scope("blob_stream_broker_test");
+  let collector = Collector::default();
+  let scope = collector.scope("blob_stream_broker_test");
   let engine = Arc::new(
     WriteEngineBuilder::new(
       WriteConfig::with_defaults(),
@@ -161,6 +162,132 @@ async fn returns_overloaded_when_admission_controller_rejects() -> Result<()> {
     response.status,
     ProduceStatus::PRODUCE_STATUS_OVERLOADED.into()
   );
+  let metrics = String::from_utf8(collector.prometheus_output())?;
+  assert!(metrics.contains("blob_stream_broker_test:write:produce_rejected_records_total 1"));
+  assert!(metrics.contains("blob_stream_broker_test:write:produce_rejected_payload_bytes_total 1"));
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn successful_batches_record_accepted_write_volume() -> Result<()> {
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let collector = Collector::default();
+  let scope = collector.scope("blob_stream_broker_test");
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  config.flush_max_delay_ms = 60_000;
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config,
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention_days: 7,
+          max_metadata_publication_lag_ms: 30_000,
+        },
+      )]),
+      Arc::new(InMemoryBlobStore::new()),
+      Arc::new(InMemoryMetadataStore::new()),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &scope,
+    )
+    .time_provider(Arc::new(ManualTimeProvider::new(
+      OffsetDateTime::UNIX_EPOCH,
+    )))
+    .build()?,
+  );
+  let grpc = BrokerGrpc::new(engine, &scope);
+
+  let response = grpc
+    .handle(
+      HeaderMap::new(),
+      Extensions::new(),
+      ProduceBatchRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1, 2, 3], 1)],
+        ..Default::default()
+      },
+    )
+    .await?;
+
+  assert_eq!(response.status, ProduceStatus::PRODUCE_STATUS_OK.into());
+  let metrics = String::from_utf8(collector.prometheus_output())?;
+  assert!(metrics.contains("blob_stream_broker_test:write:produce_records_total 1"));
+  assert!(metrics.contains("blob_stream_broker_test:write:produce_payload_bytes_total 3"));
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn empty_logical_batches_return_bad_request() -> Result<()> {
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let collector = Collector::default();
+  let scope = collector.scope("blob_stream_broker_test");
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      WriteConfig::with_defaults(),
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention_days: 7,
+          max_metadata_publication_lag_ms: 30_000,
+        },
+      )]),
+      Arc::new(InMemoryBlobStore::new()),
+      Arc::new(InMemoryMetadataStore::new()),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &scope,
+    )
+    .time_provider(Arc::new(ManualTimeProvider::new(
+      OffsetDateTime::UNIX_EPOCH,
+    )))
+    .build()?,
+  );
+  let grpc = BrokerGrpc::new(engine, &scope);
+  let empty_batch = ProduceBatchRequest {
+    topic: "telemetry".into(),
+    virtual_partition_id: 0,
+    ..Default::default()
+  };
+
+  let response = grpc
+    .handle(HeaderMap::new(), Extensions::new(), empty_batch.clone())
+    .await?;
+  assert_eq!(
+    response.status,
+    ProduceStatus::PRODUCE_STATUS_BAD_REQUEST.into()
+  );
+
+  let response = <BrokerGrpc as Handler<ProduceBatchesRequest, _>>::handle(
+    &grpc,
+    HeaderMap::new(),
+    Extensions::new(),
+    ProduceBatchesRequest {
+      batches: vec![empty_batch],
+      ..Default::default()
+    },
+  )
+  .await?;
+  assert_eq!(response.results.len(), 1);
+  assert_eq!(
+    response.results[0].status,
+    ProduceStatus::PRODUCE_STATUS_BAD_REQUEST.into()
+  );
+
+  let metrics = String::from_utf8(collector.prometheus_output())?;
+  assert!(metrics.contains("blob_stream_broker_test:grpc:responses_bad_request_total 2"));
   shutdown_trigger.shutdown().await;
   Ok(())
 }

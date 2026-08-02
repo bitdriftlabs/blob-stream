@@ -862,6 +862,8 @@ pub enum ProduceStatus {
     PRODUCE_STATUS_UNKNOWN_TOPIC = 2,
     // @@protoc_insertion_point(enum_value:blobstream.v1.ProduceStatus.PRODUCE_STATUS_OVERLOADED)
     PRODUCE_STATUS_OVERLOADED = 3,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.ProduceStatus.PRODUCE_STATUS_BAD_REQUEST)
+    PRODUCE_STATUS_BAD_REQUEST = 4,
 }
 
 impl ::protobuf::Enum for ProduceStatus {
@@ -877,6 +879,7 @@ impl ::protobuf::Enum for ProduceStatus {
             1 => ::std::option::Option::Some(ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER),
             2 => ::std::option::Option::Some(ProduceStatus::PRODUCE_STATUS_UNKNOWN_TOPIC),
             3 => ::std::option::Option::Some(ProduceStatus::PRODUCE_STATUS_OVERLOADED),
+            4 => ::std::option::Option::Some(ProduceStatus::PRODUCE_STATUS_BAD_REQUEST),
             _ => ::std::option::Option::None
         }
     }
@@ -887,6 +890,7 @@ impl ::protobuf::Enum for ProduceStatus {
             "PRODUCE_STATUS_NOT_LEASE_HOLDER" => ::std::option::Option::Some(ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER),
             "PRODUCE_STATUS_UNKNOWN_TOPIC" => ::std::option::Option::Some(ProduceStatus::PRODUCE_STATUS_UNKNOWN_TOPIC),
             "PRODUCE_STATUS_OVERLOADED" => ::std::option::Option::Some(ProduceStatus::PRODUCE_STATUS_OVERLOADED),
+            "PRODUCE_STATUS_BAD_REQUEST" => ::std::option::Option::Some(ProduceStatus::PRODUCE_STATUS_BAD_REQUEST),
             _ => ::std::option::Option::None
         }
     }
@@ -896,6 +900,7 @@ impl ::protobuf::Enum for ProduceStatus {
         ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER,
         ProduceStatus::PRODUCE_STATUS_UNKNOWN_TOPIC,
         ProduceStatus::PRODUCE_STATUS_OVERLOADED,
+        ProduceStatus::PRODUCE_STATUS_BAD_REQUEST,
     ];
 }
 
@@ -937,14 +942,14 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     message\x18\x02\x20\x01(\tR\x0cerrorMessage\"U\n\x15ProduceBatchesReques\
     t\x12<\n\x07batches\x18\x01\x20\x03(\x0b2\".blobstream.v1.ProduceBatchRe\
     questR\x07batches\"W\n\x16ProduceBatchesResponse\x12=\n\x07results\x18\
-    \x01\x20\x03(\x0b2#.blobstream.v1.ProduceBatchResponseR\x07results*\x8c\
+    \x01\x20\x03(\x0b2#.blobstream.v1.ProduceBatchResponseR\x07results*\xac\
     \x01\n\rProduceStatus\x12\x15\n\x11PRODUCE_STATUS_OK\x10\0\x12#\n\x1fPRO\
     DUCE_STATUS_NOT_LEASE_HOLDER\x10\x01\x12\x20\n\x1cPRODUCE_STATUS_UNKNOWN\
-    _TOPIC\x10\x02\x12\x1d\n\x19PRODUCE_STATUS_OVERLOADED\x10\x032\xc7\x01\n\
-    \rBrokerService\x12W\n\x0cProduceBatch\x12\".blobstream.v1.ProduceBatchR\
-    equest\x1a#.blobstream.v1.ProduceBatchResponse\x12]\n\x0eProduceBatches\
-    \x12$.blobstream.v1.ProduceBatchesRequest\x1a%.blobstream.v1.ProduceBatc\
-    hesResponseb\x06proto3\
+    _TOPIC\x10\x02\x12\x1d\n\x19PRODUCE_STATUS_OVERLOADED\x10\x03\x12\x1e\n\
+    \x1aPRODUCE_STATUS_BAD_REQUEST\x10\x042\xc7\x01\n\rBrokerService\x12W\n\
+    \x0cProduceBatch\x12\".blobstream.v1.ProduceBatchRequest\x1a#.blobstream\
+    .v1.ProduceBatchResponse\x12]\n\x0eProduceBatches\x12$.blobstream.v1.Pro\
+    duceBatchesRequest\x1a%.blobstream.v1.ProduceBatchesResponseb\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

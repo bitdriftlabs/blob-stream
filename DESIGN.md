@@ -125,9 +125,13 @@ foreground write exhausts its current range before the next lease-maintenance cy
 doubles that partition's target, saturating at the maximum configuration value. At lease
 maintenance, the broker compares its remaining sequence capacity with the records allocated in
 the previous cycle. If that consumption would exhaust the current range before the next cycle,
-it reserves another target-sized range inline with the lease renewal and appends it to the local
-range. This normally makes a renewal plus proactive refill one conditional lease-store mutation
-rather than two writes. The adaptive target is process-local and has no decay policy.
+it reserves another range inline with the lease renewal and appends it to the local range. When
+the previous cycle allocated at least 75% of the current target, the new range uses a doubled
+target; otherwise it uses the current target. This gives the next cycle headroom for ordinary
+traffic variation without requiring a foreground exhaustion to land before maintenance. This
+normally makes a renewal plus proactive refill one conditional lease-store mutation rather than
+two writes. The adaptive target is process-local and has no decay policy: low traffic simply
+stops refills until the current range is consumed.
 
 Broker metrics expose aggregate refill behavior without topic or partition labels:
 `sequence_reservations_total` counts successful durable block refills,
@@ -137,6 +141,14 @@ Broker metrics expose aggregate refill behavior without topic or partition label
 traffic, the ratio of reservation rate to record rate should be close to one divided by the
 reservation size. A materially higher ratio indicates allocation waste from ownership churn,
 restarts, or unexpectedly small batches.
+
+Write metrics distinguish attempts from definitive outcomes. `produce_requests_total` counts
+write-engine attempts. `produce_records_total` and `produce_payload_bytes_total` count only
+records and payload bytes whose batch completed with a durable `OK`. The corresponding
+`produce_rejected_records_total` and `produce_rejected_payload_bytes_total` counters count
+definitive write-engine errors. A gRPC timeout is intentionally excluded from both pairs because
+the cancelled caller may have already handed the batch to a flush that later persists; operators
+use `grpc:request_timeouts_total` for those ambiguous outcomes.
 
 The broker coalesces all accepted producer batches for one virtual partition in a flush plan into
 one stored batch and one metadata index entry. The stored sequence range spans the contiguous
@@ -211,14 +223,15 @@ Sequence ranges are internal durable metadata used by consumers. The protocol st
 - `OK`: Blob and segment metadata were persisted for the accepted batch.
 - `NOT_LEASE_HOLDER`: The broker cannot currently accept that virtual partition.
 - `UNKNOWN_TOPIC`: The topic is absent from broker configuration.
-- `OVERLOADED`: The broker rejected the request for an invalid partition, empty batch, exhausted
-  sequence reservation, or another internal write-path failure.
+- `BAD_REQUEST`: The batch is invalid, such as one containing no records.
+- `OVERLOADED`: The broker rejected the request for an invalid partition, exhausted sequence
+  reservation, or another transient internal write-path failure.
 
 The producer treats `NOT_LEASE_HOLDER`, `OVERLOADED`, and transport errors as retryable until its
-total retry deadline is exhausted. Transport and overload failures use capped exponential backoff;
-`NOT_LEASE_HOLDER` uses a slower, membership-aware backoff. Each RPC and delay is clipped to the
-remaining deadline. Retrying after an ambiguous failure can produce a duplicate batch, which is
-part of the at-least-once contract.
+total retry deadline is exhausted. `UNKNOWN_TOPIC` and `BAD_REQUEST` are terminal. Transport and
+overload failures use capped exponential backoff; `NOT_LEASE_HOLDER` uses a slower,
+membership-aware backoff. Each RPC and delay is clipped to the remaining deadline. Retrying after
+an ambiguous failure can produce a duplicate batch, which is part of the at-least-once contract.
 
 ## Persistent Data Layout
 

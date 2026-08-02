@@ -66,4 +66,6 @@ enum ProduceStatus {
   PRODUCE_STATUS_UNKNOWN_TOPIC = 2;
   // Broker is overloaded; producer should retry with backoff.
   PRODUCE_STATUS_OVERLOADED = 3;
+  // Request is invalid; producer should not retry it.
+  PRODUCE_STATUS_BAD_REQUEST = 4;
 }

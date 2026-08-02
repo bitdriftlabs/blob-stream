@@ -274,7 +274,6 @@ fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
       Some(SeqRange { start: 0, end: 3 })
     );
   }
-
   let refill = begin_allocation_transition(&state, "telemetry", 0, 1, 1_001, false, 4);
   let AllocationTransitionDecision::Claimed(refill) = refill else {
     panic!("expected foreground refill transition");
@@ -290,13 +289,13 @@ fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
 #[test]
 fn maintenance_top_up_extends_the_current_reservation() {
   let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
-  let initial = begin_allocation_transition(&state, "telemetry", 0, 1, 1_000, true, 10);
+  let initial = begin_allocation_transition(&state, "telemetry", 0, 1, 1_000, true, 100);
   let AllocationTransitionDecision::Claimed(initial) = initial else {
     panic!("expected initial reservation transition");
   };
   initial.transition.finish_lease_maintenance(
     LeaseExpirationUpdate::Set(Some(2_000)),
-    Some(SeqRange { start: 0, end: 9 }),
+    Some(SeqRange { start: 0, end: 99 }),
     0,
   );
 
@@ -304,25 +303,28 @@ fn maintenance_top_up_extends_the_current_reservation() {
     let mut state = state.lock();
     let partition = state.partition_state_mut("telemetry", 0);
     assert_eq!(
-      partition.seq_allocator.allocate(6),
-      Some(SeqRange { start: 0, end: 5 })
+      partition.seq_allocator.allocate(74),
+      Some(SeqRange { start: 0, end: 73 })
     );
-    partition.records_allocated_since_lease_maintenance = 6;
+    partition.records_allocated_since_lease_maintenance = 74;
   }
 
-  let top_up = begin_allocation_transition(&state, "telemetry", 0, 1, 1_100, true, 10);
+  let top_up = begin_allocation_transition(&state, "telemetry", 0, 1, 1_100, true, 100);
   let AllocationTransitionDecision::Claimed(top_up) = top_up else {
     panic!("expected maintenance top-up transition");
   };
   let request = top_up.reservation.expect("maintenance top-up request");
-  assert_eq!(request.size, 10);
+  assert_eq!(request.size, 100);
   assert!(matches!(
     request.reason,
     super::allocation::ReservationReason::MaintenanceTopUp
   ));
   top_up.transition.finish_lease_maintenance(
     LeaseExpirationUpdate::Set(Some(2_100)),
-    Some(SeqRange { start: 10, end: 19 }),
+    Some(SeqRange {
+      start: 100,
+      end: 199,
+    }),
     top_up
       .records_allocated_since_last_maintenance
       .unwrap_or_default(),
@@ -330,11 +332,89 @@ fn maintenance_top_up_extends_the_current_reservation() {
 
   let mut state = state.lock();
   let partition = state.partition_state_mut("telemetry", 0);
-  assert_eq!(partition.seq_allocator.remaining_capacity(), 14);
+  assert_eq!(partition.seq_allocator.remaining_capacity(), 126);
   assert_eq!(partition.records_allocated_since_lease_maintenance, 0);
   assert_eq!(
-    partition.seq_allocator.allocate(14),
-    Some(SeqRange { start: 6, end: 19 })
+    partition.seq_allocator.allocate(126),
+    Some(SeqRange {
+      start: 74,
+      end: 199
+    })
+  );
+}
+
+#[test]
+fn maintenance_high_utilization_doubles_the_adaptive_reservation_target() {
+  let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
+  let initial = begin_allocation_transition(&state, "telemetry", 0, 1, 1_000, true, 100);
+  let AllocationTransitionDecision::Claimed(initial) = initial else {
+    panic!("expected initial reservation transition");
+  };
+  initial.transition.finish_lease_maintenance(
+    LeaseExpirationUpdate::Set(Some(2_000)),
+    Some(SeqRange { start: 0, end: 99 }),
+    0,
+  );
+
+  {
+    let mut state = state.lock();
+    let partition = state.partition_state_mut("telemetry", 0);
+    assert_eq!(
+      partition.seq_allocator.allocate(75),
+      Some(SeqRange { start: 0, end: 74 })
+    );
+    partition.records_allocated_since_lease_maintenance = 75;
+  }
+
+  let refill = begin_allocation_transition(&state, "telemetry", 0, 1, 1_100, true, 100);
+  let AllocationTransitionDecision::Claimed(refill) = refill else {
+    panic!("expected maintenance refill transition");
+  };
+  let request = refill
+    .reservation
+    .expect("maintenance high-utilization refill request");
+  assert_eq!(request.size, 200);
+  assert!(matches!(
+    request.reason,
+    super::allocation::ReservationReason::MaintenanceHighUtilization
+  ));
+}
+
+#[test]
+fn maintenance_high_utilization_waits_until_another_window_is_needed() {
+  let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
+  let initial = begin_allocation_transition(&state, "telemetry", 0, 1, 1_000, true, 100);
+  let AllocationTransitionDecision::Claimed(initial) = initial else {
+    panic!("expected initial reservation transition");
+  };
+  initial.transition.finish_lease_maintenance(
+    LeaseExpirationUpdate::Set(Some(2_000)),
+    Some(SeqRange { start: 0, end: 199 }),
+    0,
+  );
+
+  {
+    let mut state = state.lock();
+    let partition = state.partition_state_mut("telemetry", 0);
+    assert_eq!(
+      partition.seq_allocator.allocate(75),
+      Some(SeqRange { start: 0, end: 74 })
+    );
+    partition.records_allocated_since_lease_maintenance = 75;
+  }
+
+  let maintenance = begin_allocation_transition(&state, "telemetry", 0, 1, 1_100, true, 100);
+  let AllocationTransitionDecision::Claimed(maintenance) = maintenance else {
+    panic!("expected lease-maintenance transition");
+  };
+  assert!(maintenance.reservation.is_none());
+  assert_eq!(
+    state
+      .lock()
+      .partition_state("telemetry", 0)
+      .expect("partition state")
+      .adaptive_reservation_size,
+    Some(100)
   );
 }
 
@@ -683,7 +763,10 @@ async fn successful_sequence_reservation_records_metrics() -> Result<()> {
   assert!(
     metrics.contains("blob_stream_broker_test:write:sequence_reservation_latency_seconds_count 1")
   );
-
+  assert!(
+    metrics.contains("blob_stream_broker_test:write:produce_requests_total 1"),
+    "{metrics}"
+  );
   Ok(())
 }
 

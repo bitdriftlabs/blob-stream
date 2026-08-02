@@ -5,6 +5,8 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::sync::futures::OwnedNotified;
 
+const MAINTENANCE_TARGET_HIGH_UTILIZATION_PERCENT: u64 = 75;
+
 //
 // AllocationTransition
 //
@@ -152,6 +154,14 @@ pub(super) enum ReservationReason {
   Initial,
   ForegroundExhaustion,
   MaintenanceTopUp,
+  MaintenanceHighUtilization,
+}
+
+fn maintenance_high_utilization_threshold(target_size: u64) -> u64 {
+  target_size
+    .saturating_mul(MAINTENANCE_TARGET_HIGH_UTILIZATION_PERCENT)
+    .saturating_add(99)
+    / 100
 }
 
 //
@@ -190,16 +200,24 @@ pub(super) fn begin_allocation_transition(
   let remaining_capacity = partition_state.seq_allocator.remaining_capacity();
   let records_allocated_since_last_maintenance =
     partition_state.records_allocated_since_lease_maintenance;
+  let maintenance_high_utilization = renew_lease
+    && partition_state.seq_allocator.has_reservation()
+    && records_allocated_since_last_maintenance
+      >= maintenance_high_utilization_threshold(
+        partition_state.reservation_target(base_reservation_size),
+      );
   let reservation = if !partition_state.seq_allocator.can_allocate(record_count) {
     let reason = if !partition_state.seq_allocator.has_reservation() {
       ReservationReason::Initial
+    } else if maintenance_high_utilization {
+      ReservationReason::MaintenanceHighUtilization
     } else if renew_lease {
       ReservationReason::MaintenanceTopUp
     } else {
       ReservationReason::ForegroundExhaustion
     };
     let size = match reason {
-      ReservationReason::ForegroundExhaustion => {
+      ReservationReason::ForegroundExhaustion | ReservationReason::MaintenanceHighUtilization => {
         partition_state.double_reservation_target(base_reservation_size)
       },
       ReservationReason::Initial | ReservationReason::MaintenanceTopUp => {
@@ -208,10 +226,20 @@ pub(super) fn begin_allocation_transition(
     };
     Some(ReservationRequest { size, reason })
   } else if renew_lease && remaining_capacity < records_allocated_since_last_maintenance {
-    Some(ReservationRequest {
-      size: partition_state.reservation_target(base_reservation_size),
-      reason: ReservationReason::MaintenanceTopUp,
-    })
+    // Grow only when a new window is needed. High utilization then doubles the next window so
+    // normal burst timing relative to maintenance cannot delay convergence indefinitely.
+    let (size, reason) = if maintenance_high_utilization {
+      (
+        partition_state.double_reservation_target(base_reservation_size),
+        ReservationReason::MaintenanceHighUtilization,
+      )
+    } else {
+      (
+        partition_state.reservation_target(base_reservation_size),
+        ReservationReason::MaintenanceTopUp,
+      )
+    };
+    Some(ReservationRequest { size, reason })
   } else {
     None
   };

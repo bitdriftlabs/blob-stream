@@ -176,6 +176,14 @@ pub(super) async fn send_batch_with_retry(
           ProduceStatus::PRODUCE_STATUS_UNKNOWN_TOPIC => {
             return Err(ProducerError::UnknownTopic(batch.topic.clone()));
           },
+          ProduceStatus::PRODUCE_STATUS_BAD_REQUEST => {
+            let error = if response.error_message.is_empty() {
+              format!("broker status: {status:?}")
+            } else {
+              response.error_message.to_string()
+            };
+            return Err(ProducerError::Rejected(error));
+          },
           ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER
           | ProduceStatus::PRODUCE_STATUS_OVERLOADED => {
             let error = if response.error_message.is_empty() {

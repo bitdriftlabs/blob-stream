@@ -3,7 +3,7 @@
 mod tests;
 
 use crate::metrics::BrokerMetrics;
-use crate::write::{WriteEngine, WriteError, WriteRequest};
+use crate::write::{ProduceOutcomeMetrics, WriteEngine, WriteError, WriteRequest};
 use axum::extract::Query;
 use axum::http::header::CONTENT_TYPE;
 use axum::routing::{get, post};
@@ -42,6 +42,7 @@ struct BrokerGrpcMetrics {
   responses_not_lease_holder_total: prometheus::IntCounter,
   responses_unknown_topic_total: prometheus::IntCounter,
   responses_overloaded_total: prometheus::IntCounter,
+  responses_bad_request_total: prometheus::IntCounter,
   request_timeouts_total: prometheus::IntCounter,
   active_batches: prometheus::IntGauge,
   request_latency_seconds: prometheus::Histogram,
@@ -58,6 +59,7 @@ impl BrokerGrpcMetrics {
       responses_not_lease_holder_total: scope.counter("responses_not_lease_holder_total"),
       responses_unknown_topic_total: scope.counter("responses_unknown_topic_total"),
       responses_overloaded_total: scope.counter("responses_overloaded_total"),
+      responses_bad_request_total: scope.counter("responses_bad_request_total"),
       request_timeouts_total: scope.counter("request_timeouts_total"),
       active_batches: scope.gauge("active_batches"),
       request_latency_seconds: scope.histogram("request_latency_seconds"),
@@ -81,6 +83,9 @@ impl BrokerGrpcMetrics {
       ProduceStatus::PRODUCE_STATUS_OVERLOADED => {
         self.responses_overloaded_total.inc();
       },
+      ProduceStatus::PRODUCE_STATUS_BAD_REQUEST => {
+        self.responses_bad_request_total.inc();
+      },
     }
   }
 
@@ -93,6 +98,7 @@ pub struct BrokerGrpc {
   write_engine: Arc<dyn WriteEngine>,
   produce_request_timeout: Duration,
   metrics: BrokerGrpcMetrics,
+  produce_outcomes: ProduceOutcomeMetrics,
 }
 
 impl BrokerGrpc {
@@ -103,6 +109,7 @@ impl BrokerGrpc {
       write_engine,
       produce_request_timeout,
       metrics: BrokerGrpcMetrics::new(metrics_scope),
+      produce_outcomes: ProduceOutcomeMetrics::new(metrics_scope),
     }
   }
 
@@ -110,6 +117,11 @@ impl BrokerGrpc {
     let _active_batch = bd_server_stats::stats::StackAutoGauge::new(&self.metrics.active_batches);
     let started = Instant::now();
     let record_count = request.records.len();
+    let payload_bytes = request
+      .records
+      .iter()
+      .map(|record| record.payload.len() as u64)
+      .sum::<u64>();
     self.metrics.record_batch(record_count);
     trace!(
       "broker received produce batch: topic={}, virtual_partition_id={}, records={}",
@@ -128,6 +140,7 @@ impl BrokerGrpc {
 
     // A stalled backend must not keep an incoming RPC (and its allocation transition) alive
     // indefinitely. Dropping this future releases the transition through its cancellation cleanup.
+    let write_started = Instant::now();
     let result = match tokio::time::timeout(
       self.produce_request_timeout,
       self.write_engine.produce_batch(write_request),
@@ -143,12 +156,30 @@ impl BrokerGrpc {
            virtual_partition_id={virtual_partition_id}, records={record_count}, timeout_ms={}",
           self.produce_request_timeout.as_millis(),
         );
-        Err(WriteError::Overloaded(format!(
+        let error = WriteError::Overloaded(format!(
           "produce request timed out after {} ms",
           self.produce_request_timeout.as_millis()
-        )))
+        ));
+        let status = error.status();
+        self.metrics.record_response(status);
+        self
+          .metrics
+          .request_latency_seconds
+          .observe(started.elapsed().as_secs_f64());
+        return ProduceBatchResponse {
+          status: status.into(),
+          error_message: error_message(&error).into(),
+          ..Default::default()
+        };
       },
     };
+
+    self.produce_outcomes.record_result(
+      &result,
+      record_count as u64,
+      payload_bytes,
+      write_started.elapsed(),
+    );
 
     let status = match &result {
       Ok(_) => ProduceStatus::PRODUCE_STATUS_OK,
