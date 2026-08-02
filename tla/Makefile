@@ -12,12 +12,15 @@ CONFIG ?= BlobStreamPartition.cfg
 MODULE ?= BlobStreamPartition
 JAVA_FLAGS ?= -XX:+UseParallelGC
 
-.PHONY: check check-stale-writer-safety witness-stale-writer help
+.PHONY: check check-stale-writer-safety witness-stale-writer check-eventual-metadata-safety \
+	witness-eventual-metadata help
 
 help:
 	@echo "Run: make check"
 	@echo "Run the stale-writer residual-safety scenario: make check-stale-writer-safety"
 	@echo "Print the expected stale-writer loss trace: make witness-stale-writer"
+	@echo "Run the eventual-metadata residual-safety scenario: make check-eventual-metadata-safety"
+	@echo "Print the expected eventual-metadata loss trace: make witness-eventual-metadata"
 	@echo "Override the detected JAR: make check TLA_TOOLS_JAR=/absolute/path/to/tla2tools.jar"
 
 check:
@@ -55,3 +58,25 @@ witness-stale-writer: check-stale-writer-safety
 	}; \
 	rm -f "$$output"; \
 	echo "Observed the expected NoStaleWriterPublicationLoss counterexample."
+
+check-eventual-metadata-safety:
+	$(MAKE) --no-print-directory check MODULE=EventualMetadataWitness CONFIG=EventualMetadataWitness.cfg
+
+# This target mirrors witness-stale-writer: safety must pass first, then TLC
+# must fail specifically at the named accepted eventually-consistent loss.
+witness-eventual-metadata: check-eventual-metadata-safety
+	@output="states/eventual-metadata-witness.out"; \
+	if $(MAKE) --no-print-directory check MODULE=EventualMetadataWitness CONFIG=EventualMetadataWitnessExpectedFailure.cfg > "$$output" 2>&1; then \
+		cat "$$output"; \
+		rm -f "$$output"; \
+		echo "Expected NoEventualMetadataLoss to fail, but TLC passed."; \
+		exit 1; \
+	fi; \
+	cat "$$output"; \
+	grep -Fq "Error: Invariant NoEventualMetadataLoss is violated." "$$output" || { \
+		rm -f "$$output"; \
+		echo "TLC failed, but not at NoEventualMetadataLoss."; \
+		exit 1; \
+	}; \
+	rm -f "$$output"; \
+	echo "Observed the expected NoEventualMetadataLoss counterexample."

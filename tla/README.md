@@ -17,11 +17,12 @@ The first model is deliberately narrower than the service:
    restart, release, blob persistence, metadata publication, producer
    acknowledgement, a monotonic reader cursor, and logical time.
 
-It does **not** yet model eventually consistent metadata observation, Fast
-frontiers, producer batching, compression, S3 range reads, consumer
-coordination, partition assignment, retries, or multiple partitions. Each
-omitted area can be added later only if it changes an invariant we want to
-check.
+The base model does **not** add eventual-consistency state to every ordinary
+execution. Instead, [EventualMetadataWitness.tla](EventualMetadataWitness.tla)
+adds the explicit replica visibility, Fast-horizon, and frontier state needed
+to demonstrate the documented accepted loss. Producer batching, compression,
+S3 range reads, consumer coordination, partition assignment, retries, and
+multiple partitions remain deliberately outside the basic model.
 
 The configuration also bounds logical time, lease terms, and process
 incarnations. Those bounds are not production limits. They make the state space
@@ -188,6 +189,50 @@ row has a blob, acknowledgements follow metadata, and the cursor never moves
 backward. A transactional publication fence should intentionally make this
 witness unreachable and turn the no-loss assertion into a normal passing check.
 
+## Eventually Consistent Metadata-Loss Witness
+
+[EventualMetadataWitness.tla](EventualMetadataWitness.tla) is the second
+phase-gated witness. It keeps one writer and two ordered metadata rows so the
+loss comes only from Fast's incomplete metadata observation, not from a stale
+producer. It adds finite witness-local state for:
+
+- metadata publication time and abstract metadata order, standing in for a
+  source window and Snowflake ordering;
+- whether each row is visible at the eventually consistent replica;
+- what the Fast scan returned, omitted, or excluded by its horizon; and
+- the observed Fast frontier.
+
+Run its paired checks from this directory:
+
+```sh
+make check-eventual-metadata-safety
+make witness-eventual-metadata
+```
+
+The safety configuration passes 21 distinct states at depth 21. It uses a
+one-tick visibility delay and a two-tick Fast horizon. The expected-failure
+target runs that safety check first, then requires TLC to violate exactly
+`NoEventualMetadataLoss` and print the trace.
+
+The trace is deliberately causal rather than a magical metadata deletion:
+
+1. One broker publishes and acknowledges lower A with sequence range `[1, 1]`.
+2. One logical tick later it publishes and acknowledges higher B with `[2, 2]`.
+3. After B has waited through the visibility delay, the replica makes B visible
+   but still omits durable A even though A remains inside the Fast horizon.
+4. The Fast scan returns B, the reader delivers it, and its cursor and observed
+   frontier advance through B.
+5. A becomes replica-visible only after its publication time is older than the
+   Fast horizon. Fast excludes A's source window, and even a hypothetical later
+   rediscovery is cursor-skipped because the cursor is already `2`.
+
+This is also an accepted product limitation. The witness preserves sequence
+allocation safety, blob-before-metadata, acknowledgement ordering, cursor
+monotonicity, and the rule that every delivered batch came from metadata and a
+blob. Strongly consistent metadata reads or an unbounded/recovery scan policy
+should intentionally make this witness unreachable and promote its no-loss
+assertion to a normal passing check.
+
 The model maps most directly to
 [blob-stream-metadata-store/src/lib.rs](../blob-stream-metadata-store/src/lib.rs)
 and [blob-stream-broker/src/write/engine.rs](../blob-stream-broker/src/write/engine.rs).
@@ -228,20 +273,59 @@ and [blob-stream-broker/src/write/engine.rs](../blob-stream-broker/src/write/eng
 - `SkippedBatchesAreCovered`: cursor filtering skips only a range fully covered
    by the current monotonic cursor.
 
+## Basic Model Complete
+
+The basic one-partition model is complete for its original goal. It checks the
+producer lease and Hi-Lo safety boundary, blob-to-metadata-to-acknowledgement
+causality, and monotonic cursor filtering. It also produces named TLC traces for
+both documented accepted losses:
+
+1. A stale former writer publishes lower metadata after a successor's higher
+   range advanced the cursor.
+2. An eventually consistent Fast scan returns higher metadata while omitting a
+   lower row until that row leaves the bounded availability horizon.
+
+Neither witness weakens the residual safety checks. Each first runs a passing
+scenario, then intentionally falsifies only its named no-loss invariant. A new
+permanent-loss path should remain a normal model failure until it is understood
+and explicitly classified.
+
 ## What Comes Next
 
-The next refinement adds the Fast reader's bounded metadata-observation horizon
-and reproduces the second accepted loss condition from the design:
+The following refinements would make the model more representative of the
+actual system. They should be added as small, independently checked stages or
+separate focused modules rather than all at once.
 
-1. A Fast reader can observe later metadata while an eventually-consistent
-   metadata scan omits an earlier row, then cursor/frontier advancement prevents
-   recovery of that earlier row.
-
-That path will use the same paired configuration pattern: first pass residual
-invariants, then intentionally fail one named no-loss invariant so TLC prints a
-trace. Ordinary configurations will continue to check residual guarantees and
-reject any permanent loss that is not explicitly classified as an accepted
-cause.
+1. **Multiple partitions and metadata windows:** Model partition-local leases,
+   per-window metadata rows, shared scan query bounds, sparse partitions, and
+   independent concurrent publication. Preserve the rule that sequence and
+   cursor ordering are partition-local.
+2. **Consumer groups and ownership fencing:** Add two or more consumer members,
+   lease generations, assignment loss, durable cursor/source-checkpoint commits,
+   and proof that a stale generation cannot commit or regress a cursor.
+3. **Full Fresh, Recovery, and Fast reader modes:** Replace the abstract
+   horizon with source windows, recovery barriers, visibility deferral, retries
+   from inclusive frontiers, frontier pruning, retention-clamped checkpoints,
+   and handoff from recovery into Fast.
+4. **Producer retries and ambiguous responses:** Model request retries,
+   response loss after durable publication, application duplicate policy, and
+   idempotency behavior separately from sequence allocation.
+5. **Flush batching and failures:** Let one flush coalesce several contiguous
+   accepted batches; add blob-write, metadata-write, and acknowledgement
+   failures, restart recovery, in-flight flushes, and the broker's local drain
+   ordering across handoff.
+6. **Storage and publication strengthening:** Model a transactional producer
+   publication fence and strongly consistent metadata reads as alternative
+   designs. Their key success condition is that the two current no-loss witness
+   assertions become ordinary passing properties.
+7. **Liveness and fairness:** After the safety abstraction remains stable, add
+   explicit assumptions for a live lease holder, available storage, and a
+   scheduled reader, then check conditional eventual publication and delivery.
+8. **Larger bounds and complementary testing:** Increase bounded TLC
+   configurations only after each smaller model remains repeatable. Consider
+   Apalache for symbolic checks and use integration/property/fault tests for
+   concrete storage, networking, and timing behavior that this finite model
+   intentionally abstracts.
 
 ## Deadlock And Stuttering
 

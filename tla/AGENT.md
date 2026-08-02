@@ -54,6 +54,18 @@ The witness Make target succeeds only after the residual-safety configuration
 passes and TLC then fails specifically at `NoStaleWriterPublicationLoss`. Do
 not treat an arbitrary nonzero TLC exit as an expected witness.
 
+When changing the eventually consistent metadata witness, also run:
+
+```sh
+make check-eventual-metadata-safety
+make witness-eventual-metadata
+```
+
+This target similarly requires its residual-safety configuration to pass before
+TLC fails specifically at `NoEventualMetadataLoss`. The witness must model an
+incomplete replica observation and bounded Fast eligibility; do not represent
+the loss as deleting durable metadata or as merely dropping a deferred row.
+
 `make check` automatically finds the macOS TLA+ Toolbox JAR. Override it only
 when the Toolbox is installed elsewhere:
 
