@@ -1,5 +1,5 @@
-use super::WriteError;
 use super::buffer::{FlushPlan, FlushTrigger};
+use super::{WriteError, WriteResponse};
 use bd_server_stats::stats::Scope;
 use blob_stream_types::SeqRange;
 use std::time::Instant;
@@ -25,14 +25,7 @@ const UPLOADED_OBJECT_SIZE_BUCKETS_BYTES: &[f64] = &[
 #[derive(Clone)]
 pub(super) struct WriteMetrics {
   pub(super) produce_requests_total: prometheus::IntCounter,
-  pub(super) produce_records_total: prometheus::IntCounter,
-  pub(super) produce_payload_bytes_total: prometheus::IntCounter,
-  pub(super) produce_ok_total: prometheus::IntCounter,
-  pub(super) produce_not_lease_holder_total: prometheus::IntCounter,
-  pub(super) produce_overloaded_total: prometheus::IntCounter,
-  pub(super) produce_unknown_topic_total: prometheus::IntCounter,
   pub(super) admission_rejections_total: prometheus::IntCounter,
-  pub(super) produce_latency_seconds: prometheus::Histogram,
   pub(super) sequence_reservations_total: prometheus::IntCounter,
   pub(super) sequence_reservation_records_total: prometheus::IntCounter,
   pub(super) sequence_reservation_failures_total: prometheus::IntCounter,
@@ -60,14 +53,7 @@ impl WriteMetrics {
     let scope = scope.scope("write");
     Self {
       produce_requests_total: scope.counter("produce_requests_total"),
-      produce_records_total: scope.counter("produce_records_total"),
-      produce_payload_bytes_total: scope.counter("produce_payload_bytes_total"),
-      produce_ok_total: scope.counter("produce_ok_total"),
-      produce_not_lease_holder_total: scope.counter("produce_not_lease_holder_total"),
-      produce_overloaded_total: scope.counter("produce_overloaded_total"),
-      produce_unknown_topic_total: scope.counter("produce_unknown_topic_total"),
       admission_rejections_total: scope.counter("admission_rejections_total"),
-      produce_latency_seconds: scope.histogram("produce_latency_seconds"),
       sequence_reservations_total: scope.counter("sequence_reservations_total"),
       sequence_reservation_records_total: scope.counter("sequence_reservation_records_total"),
       sequence_reservation_failures_total: scope.counter("sequence_reservation_failures_total"),
@@ -95,16 +81,6 @@ impl WriteMetrics {
     }
   }
 
-  pub(super) fn record_produce_error(&self, error: &WriteError) {
-    match error {
-      WriteError::UnknownTopic(_) => self.produce_unknown_topic_total.inc(),
-      WriteError::NotLeaseHolder { .. } => self.produce_not_lease_holder_total.inc(),
-      WriteError::InvalidPartition { .. } | WriteError::Overloaded(_) | WriteError::Internal(_) => {
-        self.produce_overloaded_total.inc();
-      },
-    }
-  }
-
   pub(super) fn record_flush_plan_summary(&self, plans: &[FlushPlan]) {
     self.flush_plans_total.inc_by(plans.len() as u64);
     for plan in plans {
@@ -129,7 +105,75 @@ impl WriteMetrics {
       }
     }
   }
+}
 
+//
+// ProduceOutcomeMetrics
+//
+
+pub struct ProduceOutcomeMetrics {
+  produce_records_total: prometheus::IntCounter,
+  produce_payload_bytes_total: prometheus::IntCounter,
+  produce_rejected_records_total: prometheus::IntCounter,
+  produce_rejected_payload_bytes_total: prometheus::IntCounter,
+  produce_ok_total: prometheus::IntCounter,
+  produce_not_lease_holder_total: prometheus::IntCounter,
+  produce_overloaded_total: prometheus::IntCounter,
+  produce_unknown_topic_total: prometheus::IntCounter,
+  produce_latency_seconds: prometheus::Histogram,
+}
+
+impl ProduceOutcomeMetrics {
+  pub fn new(scope: &Scope) -> Self {
+    let scope = scope.scope("write");
+    Self {
+      produce_records_total: scope.counter("produce_records_total"),
+      produce_payload_bytes_total: scope.counter("produce_payload_bytes_total"),
+      produce_rejected_records_total: scope.counter("produce_rejected_records_total"),
+      produce_rejected_payload_bytes_total: scope.counter("produce_rejected_payload_bytes_total"),
+      produce_ok_total: scope.counter("produce_ok_total"),
+      produce_not_lease_holder_total: scope.counter("produce_not_lease_holder_total"),
+      produce_overloaded_total: scope.counter("produce_overloaded_total"),
+      produce_unknown_topic_total: scope.counter("produce_unknown_topic_total"),
+      produce_latency_seconds: scope.histogram("produce_latency_seconds"),
+    }
+  }
+
+  fn record_error(&self, error: &WriteError, record_count: u64, payload_bytes: u64) {
+    self.produce_rejected_records_total.inc_by(record_count);
+    self
+      .produce_rejected_payload_bytes_total
+      .inc_by(payload_bytes);
+    match error {
+      WriteError::UnknownTopic(_) => self.produce_unknown_topic_total.inc(),
+      WriteError::NotLeaseHolder { .. } => self.produce_not_lease_holder_total.inc(),
+      WriteError::InvalidRequest(_) => {},
+      WriteError::InvalidPartition { .. } | WriteError::Overloaded(_) | WriteError::Internal(_) => {
+        self.produce_overloaded_total.inc();
+      },
+    }
+  }
+
+  pub fn record_result(
+    &self,
+    result: &std::result::Result<WriteResponse, WriteError>,
+    record_count: u64,
+    payload_bytes: u64,
+    elapsed: std::time::Duration,
+  ) {
+    self.produce_latency_seconds.observe(elapsed.as_secs_f64());
+    match result {
+      Ok(_) => {
+        self.produce_ok_total.inc();
+        self.produce_records_total.inc_by(record_count);
+        self.produce_payload_bytes_total.inc_by(payload_bytes);
+      },
+      Err(error) => self.record_error(error, record_count, payload_bytes),
+    }
+  }
+}
+
+impl WriteMetrics {
   #[allow(clippy::cast_precision_loss)] // Prometheus histograms require f64 observations.
   pub(super) fn record_uploaded_object(&self, payload_bytes: usize) {
     self

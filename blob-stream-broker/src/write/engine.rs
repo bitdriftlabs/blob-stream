@@ -33,26 +33,15 @@ use blob_stream_types::{RecordBatch, format_unix_timestamp_ms};
 pub use core::{WriteEngineBuilder, WriteEngineImpl};
 use log::trace;
 use std::collections::HashMap;
-use std::time::{Duration as StdDuration, Instant};
+use std::time::Duration as StdDuration;
 use time::ext::NumericalDuration;
 use tokio::sync::oneshot;
 
 #[async_trait]
 impl WriteEngine for WriteEngineImpl {
   async fn produce_batch(&self, request: WriteRequest) -> Result<WriteResponse, WriteError> {
-    let started = Instant::now();
     self.metrics.produce_requests_total.inc();
-    self
-      .metrics
-      .produce_records_total
-      .inc_by(request.records.len() as u64);
-    self.metrics.produce_payload_bytes_total.inc_by(
-      request
-        .records
-        .iter()
-        .map(|record| record.payload.len() as u64)
-        .sum::<u64>(),
-    );
+    let record_count = request.records.len() as u64;
 
     trace!(
       "broker write request accepted: topic={}, virtual_partition_id={}, records={}",
@@ -61,38 +50,37 @@ impl WriteEngine for WriteEngineImpl {
       request.records.len()
     );
 
-    let topic_info = self
-      .topics
-      .get(request.topic.as_str())
-      .ok_or_else(|| WriteError::UnknownTopic(request.topic.clone()))?;
+    let Some(topic_info) = self.topics.get(request.topic.as_str()) else {
+      let error = WriteError::UnknownTopic(request.topic.clone());
+      return Err(error);
+    };
 
     if !topic_info.is_valid_partition(request.virtual_partition_id) {
-      return Err(WriteError::InvalidPartition {
+      let error = WriteError::InvalidPartition {
         topic: request.topic.clone(),
         virtual_partition_id: request.virtual_partition_id,
-      });
+      };
+      return Err(error);
     }
 
     if request.records.is_empty() {
-      return Err(WriteError::Overloaded("record batch is empty".to_string()));
+      let error = WriteError::InvalidRequest("record batch is empty".to_string());
+      return Err(error);
     }
 
-    let summary = RecordBatch::summary_from_records(&request.records)
-      .ok_or_else(|| anyhow!("failed to summarize record batch"))?;
+    let Some(summary) = RecordBatch::summary_from_records(&request.records) else {
+      let error = WriteError::Internal(anyhow!("failed to summarize record batch"));
+      return Err(error);
+    };
     if self.admission.is_overloaded() {
       self.metrics.admission_rejections_total.inc();
-      return Err(WriteError::Overloaded(
-        "broker admission controller is overloaded".to_string(),
-      ));
+      let error = WriteError::Overloaded("broker admission controller is overloaded".to_string());
+      return Err(error);
     }
     let topic = request.topic;
     let virtual_partition_id = request.virtual_partition_id;
     let mut records = Some(request.records);
     let mut summary = Some(summary);
-    let record_count = records
-      .as_ref()
-      .map(|records| records.len() as u64)
-      .unwrap_or_default();
 
     let (completion_rx, seq_range) = loop {
       let now_ts_ms = self.time_provider.now().unix_timestamp_ms();
@@ -100,10 +88,11 @@ impl WriteEngine for WriteEngineImpl {
         let mut state = self.state.lock();
         let partition_state = state.partition_state_mut(topic.as_str(), virtual_partition_id);
         if partition_state.draining {
-          return Err(WriteError::NotLeaseHolder {
+          let error = WriteError::NotLeaseHolder {
             topic: topic.clone(),
             virtual_partition_id,
-          });
+          };
+          return Err(error);
         }
 
         if partition_state.allocation_in_flight
@@ -113,10 +102,10 @@ impl WriteEngine for WriteEngineImpl {
           None
         } else {
           let (completion_tx, completion_rx) = oneshot::channel();
-          let seq_range = partition_state
-            .seq_allocator
-            .allocate(record_count)
-            .ok_or_else(|| WriteError::Overloaded("sequence reservation exhausted".to_string()))?;
+          let Some(seq_range) = partition_state.seq_allocator.allocate(record_count) else {
+            let error = WriteError::Overloaded("sequence reservation exhausted".to_string());
+            return Err(error);
+          };
           partition_state.records_allocated_since_lease_maintenance = partition_state
             .records_allocated_since_lease_maintenance
             .saturating_add(record_count);
@@ -155,10 +144,11 @@ impl WriteEngine for WriteEngineImpl {
       );
       match decision {
         AllocationTransitionDecision::Draining => {
-          return Err(WriteError::NotLeaseHolder {
+          let error = WriteError::NotLeaseHolder {
             topic: topic.clone(),
             virtual_partition_id,
-          });
+          };
+          return Err(error);
         },
         AllocationTransitionDecision::Ready => {},
         AllocationTransitionDecision::Waiting(notified) => notified.await,
@@ -224,31 +214,15 @@ impl WriteEngine for WriteEngineImpl {
       Ok(Ok(())) => {},
       Ok(Err(error)) => {
         let write_error = WriteError::Internal(anyhow!(error));
-        self.metrics.record_produce_error(&write_error);
-        self
-          .metrics
-          .produce_latency_seconds
-          .observe(started.elapsed().as_secs_f64());
         return Err(write_error);
       },
       Err(_closed) => {
         let write_error = WriteError::Internal(anyhow!(
           "flush completion channel closed before acknowledgment"
         ));
-        self.metrics.record_produce_error(&write_error);
-        self
-          .metrics
-          .produce_latency_seconds
-          .observe(started.elapsed().as_secs_f64());
         return Err(write_error);
       },
     }
-
-    self.metrics.produce_ok_total.inc();
-    self
-      .metrics
-      .produce_latency_seconds
-      .observe(started.elapsed().as_secs_f64());
 
     Ok(WriteResponse { seq_range })
   }

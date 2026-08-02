@@ -166,6 +166,8 @@ pub enum WriteError {
     topic: Chars,
     virtual_partition_id: VirtualPartitionId,
   },
+  #[error("invalid write request: {0}")]
+  InvalidRequest(String),
   #[error("broker overloaded: {0}")]
   Overloaded(String),
   #[error("write failure: {0}")]
@@ -178,6 +180,7 @@ impl WriteError {
     match self {
       Self::UnknownTopic(_) => ProduceStatus::PRODUCE_STATUS_UNKNOWN_TOPIC,
       Self::NotLeaseHolder { .. } => ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER,
+      Self::InvalidRequest(_) => ProduceStatus::PRODUCE_STATUS_BAD_REQUEST,
       Self::InvalidPartition { .. } | Self::Overloaded(_) | Self::Internal(_) => {
         ProduceStatus::PRODUCE_STATUS_OVERLOADED
       },

@@ -170,6 +170,16 @@ async fn send_grouped_batches_and_notify(
         notify_waiters(batch.waiters, &result);
         remember_first_error(&mut first_error, result);
       },
+      Some(ProduceStatus::PRODUCE_STATUS_BAD_REQUEST) => {
+        let result = Err(ProducerError::Rejected(
+          initial_response
+            .expect("bad request response must be present")
+            .error_message
+            .to_string(),
+        ));
+        notify_waiters(batch.waiters, &result);
+        remember_first_error(&mut first_error, result);
+      },
       _ => {
         retries.push(async {
           let result = send_batch_with_retry(

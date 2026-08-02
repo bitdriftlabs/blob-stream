@@ -712,6 +712,86 @@ async fn retries_transient_status_until_success() {
   assert_eq!(retry_summary.samples[1].detail, "busy");
 }
 
+#[tokio::test]
+async fn bad_request_status_is_terminal() {
+  let config = default_config();
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let transport = Arc::new(FakeBrokerTransport::default());
+  transport
+    .enqueue_response(Ok(ProduceBatchResponse {
+      status: ProduceStatus::PRODUCE_STATUS_BAD_REQUEST.into(),
+      error_message: "record batch is empty".into(),
+      ..Default::default()
+    }))
+    .await;
+
+  let producer = ProducerClientImpl::new(
+    config,
+    vec![topic_config()],
+    discovery,
+    transport.clone(),
+    metrics_scope(),
+  )
+  .await
+  .unwrap();
+
+  let error = producer
+    .produce(ProducerRecord::new(
+      "telemetry".into(),
+      b"bad-request-key".to_vec(),
+      vec![7].into(),
+      100,
+    ))
+    .await
+    .expect_err("bad request status should not be retried");
+
+  assert!(matches!(error, ProducerError::Rejected(message) if message == "record batch is empty"));
+  assert_eq!(transport.sent.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn bad_request_status_is_terminal_in_retry_path() {
+  let config = default_config();
+  let transport = FakeBrokerTransport::default();
+  let clock = FixedRetryClock::new(Instant::now());
+  let membership = watch::channel(membership()).1;
+  let topics = HashMap::from([("telemetry".into(), topic_config())]);
+  let routes = ProducerRoutes::new(&config, &topics, &membership.borrow());
+  let dispatch_permits = Arc::new(Semaphore::new(1));
+  let batch = BufferedBatch {
+    topic: "telemetry".into(),
+    virtual_partition_id: 16,
+    records: Vec::new(),
+    waiters: Vec::new(),
+  };
+
+  let error = send_batch_with_retry(
+    &config,
+    &topics,
+    &routes,
+    &membership,
+    &transport,
+    &batch,
+    &dispatch_permits,
+    &super::ProducerMetrics::new(&metrics_scope()),
+    &super::ProducerRetryDiagnostics::default(),
+    Some(ProduceBatchResponse {
+      status: ProduceStatus::PRODUCE_STATUS_BAD_REQUEST.into(),
+      error_message: "record batch is empty".into(),
+      ..Default::default()
+    }),
+    1,
+    &clock,
+    clock.now(),
+  )
+  .await
+  .expect_err("bad request status should not be retried");
+
+  assert!(matches!(error, ProducerError::Rejected(message) if message == "record batch is empty"));
+  assert!(transport.sent.lock().await.is_empty());
+  assert!(clock.sleeps.lock().is_empty());
+}
+
 #[test]
 fn retry_diagnostics_retains_most_recent_samples() {
   let diagnostics = ProducerRetryDiagnostics::default();

@@ -13,6 +13,8 @@
 - Exported OTEL spans support at most 16 attributes. Put additional correlated recovery or handoff
   state in a bounded JSON attribute such as `recovery.summary_json` or `handoff.snapshot_json`
   instead of adding scalar span attributes.
+- Add a metric only when it provides legitimate operational value that cannot be derived from
+  existing metrics.
 - Do not run `cargo nextest list` in its default paging mode; it can page and hang the session. If
   listing is necessary, disable paging and constrain the output first, otherwise run a targeted
   `cargo nextest run` command directly.
