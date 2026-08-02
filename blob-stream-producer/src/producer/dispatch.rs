@@ -171,12 +171,16 @@ async fn send_grouped_batches_and_notify(
         remember_first_error(&mut first_error, result);
       },
       Some(ProduceStatus::PRODUCE_STATUS_BAD_REQUEST) => {
-        let result = Err(ProducerError::Rejected(
-          initial_response
-            .expect("bad request response must be present")
-            .error_message
-            .to_string(),
-        ));
+        let response = initial_response.expect("bad request response must be present");
+        let error = if response.error_message.is_empty() {
+          format!(
+            "broker status: {:?}",
+            response.status.enum_value_or_default()
+          )
+        } else {
+          response.error_message.to_string()
+        };
+        let result = Err(ProducerError::Rejected(error));
         notify_waiters(batch.waiters, &result);
         remember_first_error(&mut first_error, result);
       },

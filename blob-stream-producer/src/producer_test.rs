@@ -750,6 +750,46 @@ async fn bad_request_status_is_terminal() {
 }
 
 #[tokio::test]
+async fn bad_request_without_message_uses_status_name() {
+  let config = default_config();
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let transport = Arc::new(FakeBrokerTransport::default());
+  transport
+    .enqueue_response(Ok(ProduceBatchResponse {
+      status: ProduceStatus::PRODUCE_STATUS_BAD_REQUEST.into(),
+      ..Default::default()
+    }))
+    .await;
+
+  let producer = ProducerClientImpl::new(
+    config,
+    vec![topic_config()],
+    discovery,
+    transport.clone(),
+    metrics_scope(),
+  )
+  .await
+  .unwrap();
+
+  let error = producer
+    .produce(ProducerRecord::new(
+      "telemetry".into(),
+      b"bad-request-empty-message-key".to_vec(),
+      vec![7].into(),
+      100,
+    ))
+    .await
+    .expect_err("bad request status should not be retried");
+
+  assert!(matches!(
+    error,
+    ProducerError::Rejected(message)
+      if message == "broker status: PRODUCE_STATUS_BAD_REQUEST"
+  ));
+  assert_eq!(transport.sent.lock().await.len(), 1);
+}
+
+#[tokio::test]
 async fn bad_request_status_is_terminal_in_retry_path() {
   let config = default_config();
   let transport = FakeBrokerTransport::default();
