@@ -139,14 +139,54 @@ Unseen -> Skipped    when seq_end is already covered by readerCursor
 
 The `Delivered` transition moves the cursor to the batch's inclusive `seq_end`.
 It permits gaps because a new producer lease can leave unused values in a Hi-Lo
-reservation. `Skipped` models normal replay filtering: a metadata row seen more
-than once must not be delivered again when its whole range is already covered.
+reservation. When several rows are visible, delivery chooses the lowest unseen
+sequence range first. `Skipped` models normal replay filtering: a metadata row
+seen more than once must not be delivered again when its whole range is already
+covered.
 
 At this stage a skipped row is not automatically considered data loss. With a
 complete metadata view, it normally represents a safe duplicate observation.
-The next stale-writer witness will constrain the order so an older row is first
+The stale-writer witness below constrains the order so an older row is first
 published only after a newer row advanced the cursor; that is the accepted loss
 case described in the design.
+
+## Stale-Writer Loss Witness
+
+[StaleWriterWitness.tla](StaleWriterWitness.tla) is a separate phase-gated
+module that imports the general model and prescribes the documented stale-writer
+trace. It adds `scenarioPhase` only to control the witness; it does not weaken
+the production-model actions or use a TLC `CONSTRAINT` to prune transitions.
+
+Run its two checks from this directory:
+
+```sh
+make check-stale-writer-safety
+make witness-stale-writer
+```
+
+The first command passes 16 distinct states at depth 16. It checks every normal
+Stage 1-3 invariant and `AllSkippedBatchesHaveKnownCause`, while deliberately
+allowing the known loss predicate. The second command runs that safety check
+first, then asks TLC to check the false invariant
+`NoStaleWriterPublicationLoss`. The Make target succeeds only when TLC fails at
+that exact invariant and prints its counterexample trace.
+
+The trace is deliberately small:
+
+1. Broker A acquires the lease, accepts and uploads lower batch A with `[1, 1]`.
+2. Logical time reaches A's lease expiry; broker B acquires a new lease term,
+   accepts and uploads higher batch B with `[2, 2]`.
+3. B publishes B and the reader delivers it, advancing its cursor to `2`.
+4. Still-alive former holder A publishes and acknowledges A despite no longer
+   holding a valid lease.
+5. The reader observes A and skips `[1, 1]` because its cursor already covers
+   that range.
+
+This is an accepted product limitation, not a passing no-loss claim. The
+residual invariants remain true: the allocations do not overlap, each metadata
+row has a blob, acknowledgements follow metadata, and the cursor never moves
+backward. A transactional publication fence should intentionally make this
+witness unreachable and turn the no-loss assertion into a normal passing check.
 
 The model maps most directly to
 [blob-stream-metadata-store/src/lib.rs](../blob-stream-metadata-store/src/lib.rs)
@@ -190,22 +230,18 @@ and [blob-stream-broker/src/write/engine.rs](../blob-stream-broker/src/write/eng
 
 ## What Comes Next
 
-The next refinement constrains a stale-writer publication trace and runs it as
-an expected TLC counterexample: a former holder publishes a lower range after
-the reader already advances through a higher range.
-
-After that, the model will add the Fast reader's bounded metadata-observation
-horizon and reproduce the second accepted loss condition from the design:
+The next refinement adds the Fast reader's bounded metadata-observation horizon
+and reproduces the second accepted loss condition from the design:
 
 1. A Fast reader can observe later metadata while an eventually-consistent
    metadata scan omits an earlier row, then cursor/frontier advancement prevents
    recovery of that earlier row.
 
-Those paths will use separate TLC witness configurations. Each witness will
-first pass residual invariants, then intentionally fail one named no-loss
-invariant so TLC prints a trace. Ordinary configurations will continue to check
-residual guarantees and reject any permanent loss that is not explicitly
-classified as one of these two accepted causes.
+That path will use the same paired configuration pattern: first pass residual
+invariants, then intentionally fail one named no-loss invariant so TLC prints a
+trace. Ordinary configurations will continue to check residual guarantees and
+reject any permanent loss that is not explicitly classified as an accepted
+cause.
 
 ## Deadlock And Stuttering
 

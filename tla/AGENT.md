@@ -43,6 +43,17 @@ git -C .. diff --check
 git -C .. status --short --ignored tla
 ```
 
+When changing the stale-writer witness, also run:
+
+```sh
+make check-stale-writer-safety
+make witness-stale-writer
+```
+
+The witness Make target succeeds only after the residual-safety configuration
+passes and TLC then fails specifically at `NoStaleWriterPublicationLoss`. Do
+not treat an arbitrary nonzero TLC exit as an expected witness.
+
 `make check` automatically finds the macOS TLA+ Toolbox JAR. Override it only
 when the Toolbox is installed elsewhere:
 
@@ -58,5 +69,7 @@ bounds. TLC's `states/` directory is generated runtime output and is ignored.
 Extend the model in small, independently checked layers. First add the state,
 transitions, `TypeOK` clauses, and safety invariants; then run TLC before adding
 the next layer. Use separate constrained configurations for intentional loss
-witnesses, and document their expected traces rather than treating them as
-ordinary passing safety checks.
+witnesses. Prefer phase-gated witness actions over TLC `CONSTRAINT`: a
+constraint can remove transitions and hide the causal behavior being documented.
+Each witness must have a passing residual-safety configuration and a named,
+validated expected-failure configuration with a documented trace.

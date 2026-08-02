@@ -141,6 +141,22 @@ NextLeaseTerm(broker) ==
   IF RenewingLease(broker) THEN leaseTerm ELSE leaseTerm + 1
 
 (*******************************************************************************
+  FirstVisibleUnseenBatch captures the complete-view reader's per-partition
+  ordering rule. When several published rows are visible, the reader handles
+  the lowest unseen sequence range first. A covered lower range can be skipped
+  before a later range is delivered; this preserves normal replay behavior.
+
+  The future eventually-consistent stage will make "visible" an explicit scan
+  result. For now, every published row is visible by definition.
+*******************************************************************************)
+FirstVisibleUnseenBatch(batch) ==
+  \A other \in Batches :
+    /\ metadataPhase[other] = "Published"
+    /\ readerResult[other] = "Unseen"
+    /\ reservedRange[other] \in SequenceRange
+    => reservedRange[batch][1] <= reservedRange[other][1]
+
+(*******************************************************************************
   Init defines exactly one initial state. Every broker starts alive, no durable
   producer lease exists, no sequence has been reserved, and every batch is New.
 *******************************************************************************)
@@ -316,6 +332,7 @@ DeliverPublishedBatch(batch) ==
   /\ readerResult[batch] = "Unseen"
   /\ reservedRange[batch] \in SequenceRange
   /\ readerCursor < reservedRange[batch][1]
+  /\ FirstVisibleUnseenBatch(batch)
   /\ readerCursor' = reservedRange[batch][2]
   /\ previousReaderCursor' = readerCursor
   /\ readerResult' = [readerResult EXCEPT ![batch] = "Delivered"]
