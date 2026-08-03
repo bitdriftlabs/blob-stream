@@ -209,7 +209,7 @@ make check-eventual-metadata-safety
 make witness-eventual-metadata
 ```
 
-The safety configuration passes 21 distinct states at depth 21. It uses a
+The safety configuration passes 22 distinct states at depth 22. It uses a
 one-tick visibility delay and a two-tick Fast horizon. The expected-failure
 target runs that safety check first, then requires TLC to violate exactly
 `NoEventualMetadataLoss` and print the trace.
@@ -223,8 +223,9 @@ The trace is deliberately causal rather than a magical metadata deletion:
 4. The Fast scan returns B, the reader delivers it, and its cursor and observed
    frontier advance through B.
 5. A becomes replica-visible only after its publication time is older than the
-   Fast horizon. Fast excludes A's source window, and even a hypothetical later
-   rediscovery is cursor-skipped because the cursor is already `2`.
+   Fast horizon. Fast excludes A's source window; a later explicit rediscovery
+   returns A, and normal cursor filtering skips it because the cursor is already
+   `2`.
 
 This is also an accepted product limitation. The witness preserves sequence
 allocation safety, blob-before-metadata, acknowledgement ordering, cursor
@@ -248,9 +249,9 @@ and [blob-stream-broker/src/write/engine.rs](../blob-stream-broker/src/write/eng
 | `CrashBroker` | Broker is alive. | Broker stops initiating work; durable state remains. | Process crash or long pause. |
 | `RestartBroker` | Broker is stopped. | Broker becomes alive with a new process incarnation. | Restart after crash. |
 | `ReleaseLease` | Current valid holder releases gracefully. | Lease becomes unowned immediately. | Drained handoff/shutdown. |
-| `UploadBlob` | Accepting broker is alive and its batch is not uploaded. | The batch's blob becomes durable. | Segment blob-store write. |
-| `PublishMetadata` | Accepting broker is alive and its blob is uploaded. | Durable metadata is written with publisher provenance. | Metadata-store write; deliberately not publication-fenced. |
-| `AcknowledgeProducer` | Publishing broker is alive and metadata exists. | Batch receives successful acknowledgement. | Successful flush permits the producer RPC response. |
+| `UploadBlob` | Accepting broker incarnation is alive and its batch is not uploaded. | The batch's blob becomes durable. | Segment blob-store write. |
+| `PublishMetadata` | Accepting broker incarnation is alive and its blob is uploaded. | Durable metadata is written with publisher provenance. | Metadata-store write; deliberately not publication-fenced. |
+| `AcknowledgeProducer` | Publishing broker incarnation is alive and metadata exists. | Batch receives successful acknowledgement. | Successful flush permits the producer RPC response. |
 | `DeliverPublishedBatch` | Published blob-backed range begins above the cursor. | Batch is delivered and cursor advances to its sequence end. | Reader decodes newly observed metadata. |
 | `SkipCoveredBatch` | Published range is fully at or below the cursor. | Batch is marked skipped without changing the cursor. | Cursor filtering for duplicate metadata observation. |
 | `Quiescent` | Logical time reached the bounded model horizon. | No model variable changes. | Completed test scenario, not a production operation. |
@@ -266,7 +267,8 @@ and [blob-stream-broker/src/write/engine.rs](../blob-stream-broker/src/write/eng
 - `BlobBeforeMetadata`: published metadata always names a durable blob.
 - `MetadataBeforeAcknowledgement`: an acknowledged batch already has metadata.
 - `PublishedMetadataHasAcceptanceProvenance`: published metadata belongs to an
-   accepted batch and retains its accepting broker and lease-term evidence.
+   accepted batch and retains its accepting broker, lease-term, and process
+   incarnation evidence.
 - `ReaderCursorNeverRegresses`: a reader transition cannot move its cursor back.
 - `DeliveredBatchesWerePublished`: a delivered batch has durable metadata and
    blob state; the reader cannot invent data.

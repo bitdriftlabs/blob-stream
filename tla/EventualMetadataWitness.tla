@@ -20,7 +20,8 @@ VARIABLES
   metadataOrder,
   replicaVisibility,
   scanObservation,
-  fastFrontier
+  fastFrontier,
+  lateLowerReturned
 
 witnessVars == <<
   vars,
@@ -29,7 +30,8 @@ witnessVars == <<
   metadataOrder,
   replicaVisibility,
   scanObservation,
-  fastFrontier
+  fastFrontier,
+  lateLowerReturned
 >>
 
 (*******************************************************************************
@@ -68,6 +70,7 @@ ScenarioPhases == {
   "AdvancePastLowerHorizon",
   "ReplicaMakesLowerVisible",
   "FastExcludesLateLower",
+  "LateScanReturnsLower",
   "SkipLateLower",
   "Complete"
 }
@@ -80,6 +83,7 @@ WitnessInit ==
   /\ replicaVisibility = [batch \in Batches |-> "NotVisible"]
   /\ scanObservation = [batch \in Batches |-> "NotScanned"]
   /\ fastFrontier = 0
+  /\ lateLowerReturned = FALSE
 
 (*******************************************************************************
   A row is visibility-eligible only after the configured delay. The delay is a
@@ -109,28 +113,28 @@ AcquireWriter ==
   /\ AcquireOrRenewLease(WriterBroker)
   /\ scenarioPhase' = "ReserveLower"
   /\ UNCHANGED <<metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
-                 fastFrontier>>
+                 fastFrontier, lateLowerReturned>>
 
 ReserveLower ==
   /\ scenarioPhase = "ReserveLower"
   /\ ReserveRange(WriterBroker, LowerBatch)
   /\ scenarioPhase' = "AcceptLower"
   /\ UNCHANGED <<metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
-                 fastFrontier>>
+                 fastFrontier, lateLowerReturned>>
 
 AcceptLower ==
   /\ scenarioPhase = "AcceptLower"
   /\ AcceptBatch(WriterBroker, LowerBatch)
   /\ scenarioPhase' = "UploadLower"
   /\ UNCHANGED <<metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
-                 fastFrontier>>
+                 fastFrontier, lateLowerReturned>>
 
 UploadLower ==
   /\ scenarioPhase = "UploadLower"
   /\ UploadBlob(WriterBroker, LowerBatch)
   /\ scenarioPhase' = "PublishLower"
   /\ UNCHANGED <<metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
-                 fastFrontier>>
+                 fastFrontier, lateLowerReturned>>
 
 PublishLower ==
   /\ scenarioPhase = "PublishLower"
@@ -138,42 +142,42 @@ PublishLower ==
   /\ metadataPublishedAt' = [metadataPublishedAt EXCEPT ![LowerBatch] = now]
   /\ metadataOrder' = [metadataOrder EXCEPT ![LowerBatch] = 1]
   /\ scenarioPhase' = "AcknowledgeLower"
-  /\ UNCHANGED <<replicaVisibility, scanObservation, fastFrontier>>
+  /\ UNCHANGED <<replicaVisibility, scanObservation, fastFrontier, lateLowerReturned>>
 
 AcknowledgeLower ==
   /\ scenarioPhase = "AcknowledgeLower"
   /\ AcknowledgeProducer(WriterBroker, LowerBatch)
   /\ scenarioPhase' = "AdvanceAfterLower"
   /\ UNCHANGED <<metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
-                 fastFrontier>>
+                 fastFrontier, lateLowerReturned>>
 
 AdvanceAfterLower ==
   /\ scenarioPhase = "AdvanceAfterLower"
   /\ AdvanceTime
   /\ scenarioPhase' = "ReserveHigher"
   /\ UNCHANGED <<metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
-                 fastFrontier>>
+                 fastFrontier, lateLowerReturned>>
 
 ReserveHigher ==
   /\ scenarioPhase = "ReserveHigher"
   /\ ReserveRange(WriterBroker, HigherBatch)
   /\ scenarioPhase' = "AcceptHigher"
   /\ UNCHANGED <<metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
-                 fastFrontier>>
+                 fastFrontier, lateLowerReturned>>
 
 AcceptHigher ==
   /\ scenarioPhase = "AcceptHigher"
   /\ AcceptBatch(WriterBroker, HigherBatch)
   /\ scenarioPhase' = "UploadHigher"
   /\ UNCHANGED <<metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
-                 fastFrontier>>
+                 fastFrontier, lateLowerReturned>>
 
 UploadHigher ==
   /\ scenarioPhase = "UploadHigher"
   /\ UploadBlob(WriterBroker, HigherBatch)
   /\ scenarioPhase' = "PublishHigher"
   /\ UNCHANGED <<metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
-                 fastFrontier>>
+                 fastFrontier, lateLowerReturned>>
 
 PublishHigher ==
   /\ scenarioPhase = "PublishHigher"
@@ -181,14 +185,14 @@ PublishHigher ==
   /\ metadataPublishedAt' = [metadataPublishedAt EXCEPT ![HigherBatch] = now]
   /\ metadataOrder' = [metadataOrder EXCEPT ![HigherBatch] = 2]
   /\ scenarioPhase' = "AcknowledgeHigher"
-  /\ UNCHANGED <<replicaVisibility, scanObservation, fastFrontier>>
+  /\ UNCHANGED <<replicaVisibility, scanObservation, fastFrontier, lateLowerReturned>>
 
 AcknowledgeHigher ==
   /\ scenarioPhase = "AcknowledgeHigher"
   /\ AcknowledgeProducer(WriterBroker, HigherBatch)
   /\ scenarioPhase' = "AdvanceUntilHigherEligible"
   /\ UNCHANGED <<metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
-                 fastFrontier>>
+                 fastFrontier, lateLowerReturned>>
 
 (*******************************************************************************
   The configuration gives VisibilityDelay the value one. The reader waits one
@@ -201,7 +205,7 @@ AdvanceUntilHigherEligible ==
   /\ AdvanceTime
   /\ scenarioPhase' = "ReplicaMakesHigherVisible"
   /\ UNCHANGED <<metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
-                 fastFrontier>>
+                 fastFrontier, lateLowerReturned>>
 
 ReplicaMakesHigherVisible ==
   /\ scenarioPhase = "ReplicaMakesHigherVisible"
@@ -210,7 +214,8 @@ ReplicaMakesHigherVisible ==
   /\ replicaVisibility[HigherBatch] = "NotVisible"
   /\ replicaVisibility' = [replicaVisibility EXCEPT ![HigherBatch] = "Visible"]
   /\ scenarioPhase' = "ScanOmitsLowerReturnsHigher"
-  /\ UNCHANGED <<vars, metadataPublishedAt, metadataOrder, scanObservation, fastFrontier>>
+  /\ UNCHANGED <<vars, metadataPublishedAt, metadataOrder, scanObservation, fastFrontier,
+                 lateLowerReturned>>
 
 (*******************************************************************************
   The scan sees higher metadata but omits lower metadata despite both rows being
@@ -227,7 +232,8 @@ ScanOmitsLowerReturnsHigher ==
        ![LowerBatch] = "Omitted",
        ![HigherBatch] = "Returned"]
   /\ scenarioPhase' = "DeliverHigher"
-  /\ UNCHANGED <<vars, metadataPublishedAt, metadataOrder, replicaVisibility, fastFrontier>>
+  /\ UNCHANGED <<vars, metadataPublishedAt, metadataOrder, replicaVisibility, fastFrontier,
+                 lateLowerReturned>>
 
 (*******************************************************************************
   The base complete-view delivery action cannot be used here because it rightly
@@ -249,8 +255,8 @@ DeliverHigher ==
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
                  brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
                  acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy,
-                 acknowledgementPhase, metadataPublishedAt, metadataOrder, replicaVisibility,
-                 scanObservation>>
+                 acceptedIncarnation, acknowledgementPhase, metadataPublishedAt, metadataOrder, replicaVisibility,
+                 scanObservation, lateLowerReturned>>
 
 AdvancePastLowerHorizon ==
   /\ scenarioPhase = "AdvancePastLowerHorizon"
@@ -258,7 +264,7 @@ AdvancePastLowerHorizon ==
   /\ now + 1 - metadataPublishedAt[LowerBatch] > FastHorizon
   /\ scenarioPhase' = "ReplicaMakesLowerVisible"
   /\ UNCHANGED <<metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
-                 fastFrontier>>
+                 fastFrontier, lateLowerReturned>>
 
 ReplicaMakesLowerVisible ==
   /\ scenarioPhase = "ReplicaMakesLowerVisible"
@@ -266,7 +272,8 @@ ReplicaMakesLowerVisible ==
   /\ ~WithinFastHorizon(LowerBatch)
   /\ replicaVisibility' = [replicaVisibility EXCEPT ![LowerBatch] = "Visible"]
   /\ scenarioPhase' = "FastExcludesLateLower"
-  /\ UNCHANGED <<vars, metadataPublishedAt, metadataOrder, scanObservation, fastFrontier>>
+  /\ UNCHANGED <<vars, metadataPublishedAt, metadataOrder, scanObservation, fastFrontier,
+                 lateLowerReturned>>
 
 (*******************************************************************************
   Lower metadata is now visible at the replica, but Fast does not scan its old
@@ -279,8 +286,24 @@ FastExcludesLateLower ==
   /\ ~WithinFastHorizon(LowerBatch)
   /\ metadataOrder[LowerBatch] < fastFrontier
   /\ scanObservation' = [scanObservation EXCEPT ![LowerBatch] = "ExcludedByHorizon"]
+  /\ scenarioPhase' = "LateScanReturnsLower"
+  /\ UNCHANGED <<vars, metadataPublishedAt, metadataOrder, replicaVisibility, fastFrontier,
+                 lateLowerReturned>>
+
+(*******************************************************************************
+  Fast does not return lower from its old window, but a later explicit
+  rediscovery does return the durable row. This transition separates the query
+  bound that first excluded lower from the normal cursor filter that later
+  prevents delivery once higher has already advanced the cursor.
+*******************************************************************************)
+LateScanReturnsLower ==
+  /\ scenarioPhase = "LateScanReturnsLower"
+  /\ replicaVisibility[LowerBatch] = "Visible"
+  /\ scanObservation[LowerBatch] = "ExcludedByHorizon"
+  /\ lateLowerReturned' = TRUE
   /\ scenarioPhase' = "SkipLateLower"
-  /\ UNCHANGED <<vars, metadataPublishedAt, metadataOrder, replicaVisibility, fastFrontier>>
+  /\ UNCHANGED <<vars, metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
+                 fastFrontier>>
 
 (*******************************************************************************
   Even if a later query did rediscover the row, normal cursor filtering cannot
@@ -289,10 +312,11 @@ FastExcludesLateLower ==
 *******************************************************************************)
 SkipLateLower ==
   /\ scenarioPhase = "SkipLateLower"
+  /\ lateLowerReturned
   /\ SkipCoveredBatch(LowerBatch)
   /\ scenarioPhase' = "Complete"
   /\ UNCHANGED <<metadataPublishedAt, metadataOrder, replicaVisibility, scanObservation,
-                 fastFrontier>>
+                 fastFrontier, lateLowerReturned>>
 
 WitnessQuiescent ==
   /\ scenarioPhase = "Complete"
@@ -318,6 +342,7 @@ WitnessNext ==
   \/ AdvancePastLowerHorizon
   \/ ReplicaMakesLowerVisible
   \/ FastExcludesLateLower
+  \/ LateScanReturnsLower
   \/ SkipLateLower
   \/ WitnessQuiescent
 
@@ -339,6 +364,7 @@ WitnessTypeOK ==
   /\ replicaVisibility \in [Batches -> ReplicaVisibilityStates]
   /\ scanObservation \in [Batches -> ScanObservationStates]
   /\ fastFrontier \in MetadataOrders
+  /\ lateLowerReturned \in BOOLEAN
 
 (*******************************************************************************
   EventualMetadataLoss is a derived predicate. It requires evidence of every
@@ -354,6 +380,7 @@ EventualMetadataLoss ==
   /\ scanObservation[HigherBatch] = "Returned"
   /\ scanObservation[LowerBatch] = "ExcludedByHorizon"
   /\ replicaVisibility[LowerBatch] = "Visible"
+  /\ lateLowerReturned
   /\ readerResult[HigherBatch] = "Delivered"
   /\ readerResult[LowerBatch] = "Skipped"
   /\ fastFrontier = metadataOrder[HigherBatch]

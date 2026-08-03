@@ -70,6 +70,7 @@ RangeValues(range) == range[1] .. range[2]
   reservedBy          broker that durably reserved this batch's sequence range.
   reservedRange       the durable sequence range, or Null before reservation.
   acceptedLeaseTerm   lease term observed when the batch was accepted.
+  acceptedIncarnation process incarnation that accepted the in-memory batch.
   blobPhase           NotUploaded or Uploaded for each accepted batch's blob.
   metadataPhase       NotPublished or Published for each batch's metadata row.
   metadataPublishedBy broker that wrote the metadata row, or Null before it.
@@ -96,6 +97,7 @@ VARIABLES
   reservedBy,
   reservedRange,
   acceptedLeaseTerm,
+  acceptedIncarnation,
   blobPhase,
   metadataPhase,
   metadataPublishedBy,
@@ -117,6 +119,7 @@ vars == <<
   reservedBy,
   reservedRange,
   acceptedLeaseTerm,
+  acceptedIncarnation,
   blobPhase,
   metadataPhase,
   metadataPublishedBy,
@@ -173,6 +176,7 @@ Init ==
   /\ reservedBy = [batch \in Batches |-> Null]
   /\ reservedRange = [batch \in Batches |-> Null]
   /\ acceptedLeaseTerm = [batch \in Batches |-> Null]
+  /\ acceptedIncarnation = [batch \in Batches |-> Null]
   /\ blobPhase = [batch \in Batches |-> "NotUploaded"]
   /\ metadataPhase = [batch \in Batches |-> "NotPublished"]
   /\ metadataPublishedBy = [batch \in Batches |-> Null]
@@ -202,7 +206,7 @@ AcquireOrRenewLease(broker) ==
   /\ leaseTerm' = NextLeaseTerm(broker)
   /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, highWater, previousHighWater, brokerAlive, brokerIncarnation, batchPhase,
-                 reservedBy, reservedRange, acceptedLeaseTerm, blobPhase, metadataPhase,
+                 reservedBy, reservedRange, acceptedLeaseTerm, acceptedIncarnation, blobPhase, metadataPhase,
                  metadataPublishedBy, acknowledgementPhase, readerCursor, readerResult>>
 
 (*******************************************************************************
@@ -228,7 +232,7 @@ ReserveRange(broker, batch) ==
   /\ reservedRange' = [reservedRange EXCEPT ![batch] = <<highWater + 1, highWater + ReservationSize>>]
   /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, brokerAlive, brokerIncarnation,
-                 acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy,
+                 acceptedLeaseTerm, acceptedIncarnation, blobPhase, metadataPhase, metadataPublishedBy,
                  acknowledgementPhase, readerCursor, readerResult>>
 
 (*******************************************************************************
@@ -248,6 +252,7 @@ AcceptBatch(broker, batch) ==
   /\ reservedBy[batch] = broker
   /\ batchPhase' = [batchPhase EXCEPT ![batch] = "Accepted"]
   /\ acceptedLeaseTerm' = [acceptedLeaseTerm EXCEPT ![batch] = leaseTerm]
+  /\ acceptedIncarnation' = [acceptedIncarnation EXCEPT ![batch] = brokerIncarnation[broker]]
   /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
                  brokerAlive, brokerIncarnation, reservedBy, reservedRange, blobPhase,
@@ -257,8 +262,9 @@ AcceptBatch(broker, batch) ==
 (*******************************************************************************
   UploadBlob is the first durable publication step. A broker may persist work
   only after it accepted the work while holding a valid lease. Requiring the
-  original accepting broker keeps this model's initial publication path narrow;
-  a future retry/handoff refinement can introduce explicit transfer semantics.
+  original accepting broker and incarnation prevents a restart from resuming
+  stale in-memory work. A future retry/handoff refinement can introduce
+  explicit durable transfer semantics.
 *******************************************************************************)
 UploadBlob(broker, batch) ==
   /\ broker \in Brokers
@@ -266,12 +272,13 @@ UploadBlob(broker, batch) ==
   /\ brokerAlive[broker]
   /\ batchPhase[batch] = "Accepted"
   /\ reservedBy[batch] = broker
+  /\ acceptedIncarnation[batch] = brokerIncarnation[broker]
   /\ blobPhase[batch] = "NotUploaded"
   /\ blobPhase' = [blobPhase EXCEPT ![batch] = "Uploaded"]
   /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
                  brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
-                 acceptedLeaseTerm, metadataPhase, metadataPublishedBy, acknowledgementPhase,
+                 acceptedLeaseTerm, acceptedIncarnation, metadataPhase, metadataPublishedBy, acknowledgementPhase,
                  readerCursor, readerResult>>
 
 (*******************************************************************************
@@ -279,6 +286,8 @@ UploadBlob(broker, batch) ==
   absent ValidLease guard models the documented limitation: an alive broker that
   accepted and uploaded work before losing its lease may later write metadata.
   The stale-writer witness will make this permitted ordering visible to a reader.
+  It still requires the accepting process incarnation, so a crash/restart cannot
+  resume the old process's in-memory flush.
 *******************************************************************************)
 PublishMetadata(broker, batch) ==
   /\ broker \in Brokers
@@ -286,6 +295,7 @@ PublishMetadata(broker, batch) ==
   /\ brokerAlive[broker]
   /\ batchPhase[batch] = "Accepted"
   /\ reservedBy[batch] = broker
+  /\ acceptedIncarnation[batch] = brokerIncarnation[broker]
   /\ blobPhase[batch] = "Uploaded"
   /\ metadataPhase[batch] = "NotPublished"
   /\ metadataPhase' = [metadataPhase EXCEPT ![batch] = "Published"]
@@ -293,14 +303,15 @@ PublishMetadata(broker, batch) ==
   /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
                  brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
-                 acceptedLeaseTerm, blobPhase, acknowledgementPhase, readerCursor,
+                 acceptedLeaseTerm, acceptedIncarnation, blobPhase, acknowledgementPhase, readerCursor,
                  readerResult>>
 
 (*******************************************************************************
   AcknowledgeProducer models successful completion of the broker's flush path.
   It happens only after the metadata row is durable. The acknowledgement is
   tracked separately because a future reader can observe metadata before the
-  producer receives its RPC response.
+  producer receives its RPC response. Like upload and metadata publication, it
+  is restricted to the process incarnation that accepted the in-memory batch.
 *******************************************************************************)
 AcknowledgeProducer(broker, batch) ==
   /\ broker \in Brokers
@@ -308,12 +319,13 @@ AcknowledgeProducer(broker, batch) ==
   /\ brokerAlive[broker]
   /\ metadataPhase[batch] = "Published"
   /\ metadataPublishedBy[batch] = broker
+  /\ acceptedIncarnation[batch] = brokerIncarnation[broker]
   /\ acknowledgementPhase[batch] = "NotAcknowledged"
   /\ acknowledgementPhase' = [acknowledgementPhase EXCEPT ![batch] = "Acknowledged"]
   /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
                  brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
-                 acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy, readerCursor,
+                 acceptedLeaseTerm, acceptedIncarnation, blobPhase, metadataPhase, metadataPublishedBy, readerCursor,
                  readerResult>>
 
 (*******************************************************************************
@@ -338,7 +350,7 @@ DeliverPublishedBatch(batch) ==
   /\ readerResult' = [readerResult EXCEPT ![batch] = "Delivered"]
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
                  brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
-                 acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy,
+                 acceptedLeaseTerm, acceptedIncarnation, blobPhase, metadataPhase, metadataPublishedBy,
                  acknowledgementPhase>>
 
 (*******************************************************************************
@@ -358,7 +370,7 @@ SkipCoveredBatch(batch) ==
   /\ readerResult' = [readerResult EXCEPT ![batch] = "Skipped"]
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, previousHighWater,
                  brokerAlive, brokerIncarnation, batchPhase, reservedBy, reservedRange,
-                 acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy,
+                 acceptedLeaseTerm, acceptedIncarnation, blobPhase, metadataPhase, metadataPublishedBy,
                  acknowledgementPhase, readerCursor>>
 
 (*******************************************************************************
@@ -374,7 +386,7 @@ AdvanceTime ==
   /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<leaseHolder, leaseExpiresAt, leaseTerm, highWater, brokerAlive,
                  brokerIncarnation, batchPhase, reservedBy, reservedRange, acceptedLeaseTerm,
-                 blobPhase, metadataPhase, metadataPublishedBy, acknowledgementPhase,
+                 acceptedIncarnation, blobPhase, metadataPhase, metadataPublishedBy, acknowledgementPhase,
                  readerCursor, readerResult>>
 
 (*******************************************************************************
@@ -390,7 +402,7 @@ CrashBroker(broker) ==
   /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, brokerIncarnation,
                  batchPhase, reservedBy, reservedRange, acceptedLeaseTerm, blobPhase,
-                 metadataPhase, metadataPublishedBy, acknowledgementPhase, readerCursor,
+                 acceptedIncarnation, metadataPhase, metadataPublishedBy, acknowledgementPhase, readerCursor,
                  readerResult>>
 
 RestartBroker(broker) ==
@@ -403,7 +415,7 @@ RestartBroker(broker) ==
   /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseHolder, leaseExpiresAt, leaseTerm, highWater, batchPhase, reservedBy,
                  reservedRange, acceptedLeaseTerm, blobPhase, metadataPhase, metadataPublishedBy,
-                 acknowledgementPhase, readerCursor, readerResult>>
+                 acceptedIncarnation, acknowledgementPhase, readerCursor, readerResult>>
 
 (*******************************************************************************
   ReleaseLease represents a graceful producer handoff. It can only be performed
@@ -420,7 +432,7 @@ ReleaseLease(broker) ==
   /\ previousReaderCursor' = readerCursor
   /\ UNCHANGED <<now, leaseTerm, highWater, brokerAlive, brokerIncarnation, batchPhase,
                  reservedBy, reservedRange, acceptedLeaseTerm, blobPhase, metadataPhase,
-                 metadataPublishedBy, acknowledgementPhase, readerCursor, readerResult>>
+                 acceptedIncarnation, metadataPublishedBy, acknowledgementPhase, readerCursor, readerResult>>
 
 (*******************************************************************************
   BoundedScenarioIsComplete is a test-model condition, not a blob-stream
@@ -491,6 +503,7 @@ TypeOK ==
   /\ reservedBy \in [Batches -> (Brokers \cup {Null})]
   /\ reservedRange \in [Batches -> (SequenceRange \cup {Null})]
   /\ acceptedLeaseTerm \in [Batches -> (Nat \cup {Null})]
+  /\ acceptedIncarnation \in [Batches -> ((0 .. MaxIncarnation) \cup {Null})]
   /\ blobPhase \in [Batches -> {"NotUploaded", "Uploaded"}]
   /\ metadataPhase \in [Batches -> {"NotPublished", "Published"}]
   /\ metadataPublishedBy \in [Batches -> (Brokers \cup {Null})]
@@ -538,6 +551,7 @@ AcceptedBatchesWereReserved ==
     batchPhase[batch] = "Accepted" =>
       /\ reservedRange[batch] \in SequenceRange
       /\ acceptedLeaseTerm[batch] \in Nat \ {0}
+      /\ acceptedIncarnation[batch] \in 0 .. MaxIncarnation
 
 (*******************************************************************************
   BlobBeforeMetadata captures the first production ordering edge: a metadata
@@ -570,6 +584,7 @@ PublishedMetadataHasAcceptanceProvenance ==
       /\ batchPhase[batch] = "Accepted"
       /\ metadataPublishedBy[batch] = reservedBy[batch]
       /\ acceptedLeaseTerm[batch] \in Nat \ {0}
+      /\ acceptedIncarnation[batch] \in 0 .. MaxIncarnation
 
 (*******************************************************************************
   ReaderCursorNeverRegresses is the reader counterpart to high-water safety.
