@@ -112,44 +112,42 @@ impl WriteMetrics {
 //
 
 pub struct ProduceOutcomeMetrics {
-  produce_records_total: prometheus::IntCounter,
-  produce_payload_bytes_total: prometheus::IntCounter,
-  produce_rejected_records_total: prometheus::IntCounter,
-  produce_rejected_payload_bytes_total: prometheus::IntCounter,
-  produce_ok_total: prometheus::IntCounter,
-  produce_not_lease_holder_total: prometheus::IntCounter,
-  produce_overloaded_total: prometheus::IntCounter,
-  produce_unknown_topic_total: prometheus::IntCounter,
-  produce_latency_seconds: prometheus::Histogram,
+  records_total: prometheus::IntCounter,
+  payload_bytes_total: prometheus::IntCounter,
+  rejected_records_total: prometheus::IntCounter,
+  rejected_payload_bytes_total: prometheus::IntCounter,
+  ok_total: prometheus::IntCounter,
+  not_lease_holder_total: prometheus::IntCounter,
+  overloaded_total: prometheus::IntCounter,
+  unknown_topic_total: prometheus::IntCounter,
+  latency_seconds: prometheus::Histogram,
 }
 
 impl ProduceOutcomeMetrics {
   pub fn new(scope: &Scope) -> Self {
     let scope = scope.scope("write");
     Self {
-      produce_records_total: scope.counter("produce_records_total"),
-      produce_payload_bytes_total: scope.counter("produce_payload_bytes_total"),
-      produce_rejected_records_total: scope.counter("produce_rejected_records_total"),
-      produce_rejected_payload_bytes_total: scope.counter("produce_rejected_payload_bytes_total"),
-      produce_ok_total: scope.counter("produce_ok_total"),
-      produce_not_lease_holder_total: scope.counter("produce_not_lease_holder_total"),
-      produce_overloaded_total: scope.counter("produce_overloaded_total"),
-      produce_unknown_topic_total: scope.counter("produce_unknown_topic_total"),
-      produce_latency_seconds: scope.histogram("produce_latency_seconds"),
+      records_total: scope.counter("produce_records_total"),
+      payload_bytes_total: scope.counter("produce_payload_bytes_total"),
+      rejected_records_total: scope.counter("produce_rejected_records_total"),
+      rejected_payload_bytes_total: scope.counter("produce_rejected_payload_bytes_total"),
+      ok_total: scope.counter("produce_ok_total"),
+      not_lease_holder_total: scope.counter("produce_not_lease_holder_total"),
+      overloaded_total: scope.counter("produce_overloaded_total"),
+      unknown_topic_total: scope.counter("produce_unknown_topic_total"),
+      latency_seconds: scope.histogram("produce_latency_seconds"),
     }
   }
 
   fn record_error(&self, error: &WriteError, record_count: u64, payload_bytes: u64) {
-    self.produce_rejected_records_total.inc_by(record_count);
-    self
-      .produce_rejected_payload_bytes_total
-      .inc_by(payload_bytes);
+    self.rejected_records_total.inc_by(record_count);
+    self.rejected_payload_bytes_total.inc_by(payload_bytes);
     match error {
-      WriteError::UnknownTopic(_) => self.produce_unknown_topic_total.inc(),
-      WriteError::NotLeaseHolder { .. } => self.produce_not_lease_holder_total.inc(),
+      WriteError::UnknownTopic(_) => self.unknown_topic_total.inc(),
+      WriteError::NotLeaseHolder { .. } => self.not_lease_holder_total.inc(),
       WriteError::InvalidRequest(_) => {},
       WriteError::InvalidPartition { .. } | WriteError::Overloaded(_) | WriteError::Internal(_) => {
-        self.produce_overloaded_total.inc();
+        self.overloaded_total.inc();
       },
     }
   }
@@ -161,12 +159,12 @@ impl ProduceOutcomeMetrics {
     payload_bytes: u64,
     elapsed: std::time::Duration,
   ) {
-    self.produce_latency_seconds.observe(elapsed.as_secs_f64());
+    self.latency_seconds.observe(elapsed.as_secs_f64());
     match result {
       Ok(_) => {
-        self.produce_ok_total.inc();
-        self.produce_records_total.inc_by(record_count);
-        self.produce_payload_bytes_total.inc_by(payload_bytes);
+        self.ok_total.inc();
+        self.records_total.inc_by(record_count);
+        self.payload_bytes_total.inc_by(payload_bytes);
       },
       Err(error) => self.record_error(error, record_count, payload_bytes),
     }

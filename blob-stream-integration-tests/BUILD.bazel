@@ -1,0 +1,27 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("//tools/lint:linters.bzl", "rust_binary", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "blob-stream-integration-tests",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/**/*.rs"],
+    ),
+    crate_features = ["default"],
+    crate_name = "blob_stream_integration_tests",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "blob-stream-stress",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = ["default"],
+    crate_name = "blob_stream_stress",
+    crate_root = "src/bin/blob_stream_stress.rs",
+    edition = "2024",
+    deps = all_crate_deps(normal = True) + [":blob-stream-integration-tests"],
+)
