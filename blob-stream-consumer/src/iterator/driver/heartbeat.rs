@@ -155,6 +155,7 @@ impl ConsumerDriver {
           &self.group_config.topic,
           &self.group_config.group_id,
           &self.group_config.member_id,
+          self.group_config.pod_id.as_ref().map(ToString::to_string),
           now_ts_ms,
           consumer_lease_duration_ms(&self.group_config),
         )

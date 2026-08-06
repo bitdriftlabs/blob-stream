@@ -10,6 +10,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupLease,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupMember,
   ConsumerGroupMembershipStore,
   ConsumerGroupPlannerLease,
   ConsumerGroupPlannerLeaseOutcome,
@@ -1067,13 +1068,14 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
     topic: &str,
     group_id: &str,
     member_id: &str,
+    pod_id: Option<String>,
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> Result<()> {
     let _ = &self.controller;
     self
       .inner
-      .register_member(topic, group_id, member_id, now_ts_ms, ttl_ms)
+      .register_member(topic, group_id, member_id, pod_id, now_ts_ms, ttl_ms)
       .await
   }
 
@@ -1082,6 +1084,7 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
     topic: &str,
     group_id: &str,
     member_id: &str,
+    pod_id: Option<String>,
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> Result<()> {
@@ -1112,7 +1115,7 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
 
     let result = self
       .inner
-      .heartbeat_member(topic, group_id, member_id, now_ts_ms, ttl_ms)
+      .heartbeat_member(topic, group_id, member_id, pod_id, now_ts_ms, ttl_ms)
       .await;
     self
       .controller
@@ -1148,7 +1151,7 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
     topic: &str,
     group_id: &str,
     now_ts_ms: i64,
-  ) -> Result<Vec<String>> {
+  ) -> Result<Vec<ConsumerGroupMember>> {
     let _ = &self.controller;
     self
       .inner

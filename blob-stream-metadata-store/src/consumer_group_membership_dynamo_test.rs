@@ -2,6 +2,7 @@ use super::retry_planner_transaction_conflicts;
 use crate::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentPlan,
+  ConsumerGroupMember,
   ConsumerGroupMembershipStore,
   ConsumerGroupPlannerLeaseOutcome,
   DynamoConsumerGroupMembershipStore,
@@ -27,6 +28,7 @@ const LOCAL_ENDPOINT: &str = "http://localhost:8000";
 const REGION: &str = "us-east-1";
 const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
 const RECORD_TYPE_ATTRIBUTE_NAME: &str = "record_type";
+const POD_ID_ATTRIBUTE_NAME: &str = "pod_id";
 
 #[tokio::test]
 async fn planner_transaction_conflict_retries_until_success() {
@@ -130,13 +132,20 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
     DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
 
   store
-    .register_member("topic-a", "group-a", "member-a", 1_000, 100)
+    .register_member(
+      "topic-a",
+      "group-a",
+      "member-a",
+      Some("pod-a".to_string()),
+      1_000,
+      100,
+    )
     .await?;
   store
-    .register_member("topic-a", "group-a", "member-b", 1_000, 100)
+    .register_member("topic-a", "group-a", "member-b", None, 1_000, 100)
     .await?;
   store
-    .register_member("topic-a", "group-b", "member-c", 1_000, 100)
+    .register_member("topic-a", "group-b", "member-c", None, 1_000, 100)
     .await?;
 
   let members = store
@@ -144,17 +153,39 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
     .await?;
   assert_eq!(
     members,
-    vec!["member-a".to_string(), "member-b".to_string()]
+    vec![
+      ConsumerGroupMember {
+        member_id: "member-a".to_string(),
+        pod_id: Some("pod-a".to_string()),
+      },
+      ConsumerGroupMember {
+        member_id: "member-b".to_string(),
+        pod_id: None,
+      },
+    ]
   );
 
   store
-    .heartbeat_member("topic-a", "group-a", "member-a", 1_120, 100)
+    .heartbeat_member(
+      "topic-a",
+      "group-a",
+      "member-a",
+      Some("pod-a".to_string()),
+      1_120,
+      100,
+    )
     .await?;
 
   let members = store
     .list_active_members("topic-a", "group-a", 1_150)
     .await?;
-  assert_eq!(members, vec!["member-a".to_string()]);
+  assert_eq!(
+    members,
+    vec![ConsumerGroupMember {
+      member_id: "member-a".to_string(),
+      pod_id: Some("pod-a".to_string()),
+    }]
+  );
 
   store
     .deregister_member("topic-a", "group-a", "member-a")
@@ -178,7 +209,7 @@ async fn register_rejects_invalid_ttl() -> Result<()> {
   let store =
     DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
   let err = store
-    .register_member("topic-a", "group-a", "member-a", 1_000, 0)
+    .register_member("topic-a", "group-a", "member-a", None, 1_000, 0)
     .await
     .expect_err("expected invalid ttl error");
   assert!(
@@ -201,7 +232,14 @@ async fn writes_ttl_attribute_for_membership_rows() -> Result<()> {
     DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 120, None);
 
   store
-    .register_member("topic-a", "group-a", "member-a", 1_000, 1_000)
+    .register_member(
+      "topic-a",
+      "group-a",
+      "member-a",
+      Some("pod-a".to_string()),
+      1_000,
+      1_000,
+    )
     .await?;
 
   let item = client
@@ -226,6 +264,12 @@ async fn writes_ttl_attribute_for_membership_rows() -> Result<()> {
       .get(RECORD_TYPE_ATTRIBUTE_NAME)
       .and_then(|value| value.as_s().ok().map(String::as_str)),
     Some("member")
+  );
+  assert_eq!(
+    item
+      .get(POD_ID_ATTRIBUTE_NAME)
+      .and_then(|value| value.as_s().ok().map(String::as_str)),
+    Some("pod-a")
   );
   for attribute in ["topic", "group_id", "member_id"] {
     assert!(
@@ -289,7 +333,7 @@ async fn planner_records_do_not_appear_in_legacy_member_partition() -> Result<()
   let store =
     DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
   store
-    .register_member("topic-a", "group-a", "member-a", 1_000, 1_000)
+    .register_member("topic-a", "group-a", "member-a", None, 1_000, 1_000)
     .await?;
   assert_eq!(
     store
@@ -309,6 +353,7 @@ async fn planner_records_do_not_appear_in_legacy_member_partition() -> Result<()
           version: 1,
           planner_member_id: "member-a".to_string(),
           members: vec!["member-a".to_string()],
+          member_topology: None,
           assignments: vec![ConsumerGroupAssignment {
             virtual_partition_id: 0,
             member_id: "member-a".to_string(),
@@ -365,6 +410,7 @@ async fn planner_session_fences_stale_process_and_mismatched_plan_publisher() ->
     version: 1,
     planner_member_id: "member-a".to_string(),
     members: vec!["member-a".to_string()],
+    member_topology: None,
     assignments: vec![ConsumerGroupAssignment {
       virtual_partition_id: 0,
       member_id: "member-a".to_string(),

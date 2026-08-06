@@ -22,6 +22,7 @@ use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_metadata_store::{
   ConsumerGroupLeaseStore,
+  ConsumerGroupMember,
   ConsumerGroupMembershipStore,
   DynamoCapacityMetrics,
   DynamoConsumerGroupLeaseStore,
@@ -451,15 +452,21 @@ impl ConsumerCoordinationSource for MembershipCoordinationSource {
       .list_active_members(&self.topic, &self.group_id, now_ts_ms)
       .await?;
 
-    if !members.iter().any(|member| member == &self.local_member_id) {
-      members.push(self.local_member_id.clone());
+    if !members
+      .iter()
+      .any(|member| member.member_id == self.local_member_id)
+    {
+      members.push(ConsumerGroupMember {
+        member_id: self.local_member_id.clone(),
+        pod_id: None,
+      });
     }
 
-    members.sort();
-    members.dedup();
+    members.sort_by(|left, right| left.member_id.cmp(&right.member_id));
+    members.dedup_by(|left, right| left.member_id == right.member_id);
 
     Ok(CoordinationSnapshot {
-      members,
+      members: members.into_iter().map(|member| member.member_id).collect(),
       virtual_partitions: self.virtual_partitions.clone(),
     })
   }

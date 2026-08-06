@@ -1,6 +1,7 @@
 use crate::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentPlan,
+  ConsumerGroupMember,
   ConsumerGroupMembershipStore,
   ConsumerGroupPlannerLeaseOutcome,
   InMemoryConsumerGroupMembershipStore,
@@ -11,15 +12,22 @@ async fn register_heartbeat_list_and_deregister() {
   let store = InMemoryConsumerGroupMembershipStore::new();
 
   store
-    .register_member("topic-a", "group-a", "member-a", 1_000, 100)
+    .register_member(
+      "topic-a",
+      "group-a",
+      "member-a",
+      Some("pod-a".to_string()),
+      1_000,
+      100,
+    )
     .await
     .expect("register member-a");
   store
-    .register_member("topic-a", "group-a", "member-b", 1_000, 100)
+    .register_member("topic-a", "group-a", "member-b", None, 1_000, 100)
     .await
     .expect("register member-b");
   store
-    .register_member("topic-a", "group-b", "member-c", 1_000, 100)
+    .register_member("topic-a", "group-b", "member-c", None, 1_000, 100)
     .await
     .expect("register member-c");
 
@@ -29,11 +37,27 @@ async fn register_heartbeat_list_and_deregister() {
     .expect("list members");
   assert_eq!(
     members,
-    vec!["member-a".to_string(), "member-b".to_string()]
+    vec![
+      ConsumerGroupMember {
+        member_id: "member-a".to_string(),
+        pod_id: Some("pod-a".to_string()),
+      },
+      ConsumerGroupMember {
+        member_id: "member-b".to_string(),
+        pod_id: None,
+      },
+    ]
   );
 
   store
-    .heartbeat_member("topic-a", "group-a", "member-a", 1_120, 100)
+    .heartbeat_member(
+      "topic-a",
+      "group-a",
+      "member-a",
+      Some("pod-a".to_string()),
+      1_120,
+      100,
+    )
     .await
     .expect("heartbeat member-a");
 
@@ -41,7 +65,13 @@ async fn register_heartbeat_list_and_deregister() {
     .list_active_members("topic-a", "group-a", 1_150)
     .await
     .expect("list members");
-  assert_eq!(members, vec!["member-a".to_string()]);
+  assert_eq!(
+    members,
+    vec![ConsumerGroupMember {
+      member_id: "member-a".to_string(),
+      pod_id: Some("pod-a".to_string()),
+    }]
+  );
 
   store
     .deregister_member("topic-a", "group-a", "member-a")
@@ -59,7 +89,7 @@ async fn register_heartbeat_list_and_deregister() {
 async fn register_rejects_invalid_ttl() {
   let store = InMemoryConsumerGroupMembershipStore::new();
   let err = store
-    .register_member("topic-a", "group-a", "member-a", 1_000, 0)
+    .register_member("topic-a", "group-a", "member-a", None, 1_000, 0)
     .await
     .expect_err("register should reject zero ttl");
   assert!(
@@ -88,6 +118,7 @@ async fn planner_lease_fences_plan_publication() {
     version: 1,
     planner_member_id: "member-a".to_string(),
     members: vec!["member-a".to_string(), "member-b".to_string()],
+    member_topology: None,
     assignments: vec![
       ConsumerGroupAssignment {
         virtual_partition_id: 0,
@@ -148,6 +179,7 @@ async fn planner_release_allows_immediate_takeover_and_preserves_successor() {
     version: 1,
     planner_member_id: "member-a".to_string(),
     members: vec!["member-a".to_string()],
+    member_topology: None,
     assignments: vec![ConsumerGroupAssignment {
       virtual_partition_id: 0,
       member_id: "member-a".to_string(),
@@ -217,6 +249,7 @@ async fn planner_session_fences_stale_same_member_process() {
     version: 1,
     planner_member_id: "member-a".to_string(),
     members: vec!["member-a".to_string()],
+    member_topology: None,
     assignments: vec![ConsumerGroupAssignment {
       virtual_partition_id: 0,
       member_id: "member-a".to_string(),
@@ -279,6 +312,7 @@ async fn planner_rejects_plan_declared_for_a_different_member() {
     version: 1,
     planner_member_id: "member-b".to_string(),
     members: vec!["member-a".to_string()],
+    member_topology: None,
     assignments: vec![ConsumerGroupAssignment {
       virtual_partition_id: 0,
       member_id: "member-a".to_string(),

@@ -11,6 +11,7 @@ use super::{
 use blob_stream_metadata_store::{
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupMember,
   ConsumerGroupMembershipStore,
   InMemoryConsumerGroupLeaseStore,
   InMemoryConsumerGroupMembershipStore,
@@ -108,7 +109,7 @@ async fn consumer_member_deregistration_honors_faults_without_removing_membershi
   let store =
     FaultInjectedConsumerGroupMembershipStore::new(Arc::clone(&inner), controller.clone());
   inner
-    .register_member("telemetry", "group-a", "consumer-a", 1_000, 100)
+    .register_member("telemetry", "group-a", "consumer-a", None, 1_000, 100)
     .await
     .expect("register member");
   controller
@@ -133,6 +134,9 @@ async fn consumer_member_deregistration_honors_faults_without_removing_membershi
       .list_active_members("telemetry", "group-a", 1_001)
       .await
       .expect("list active members"),
-    vec!["consumer-a".to_string()]
+    vec![ConsumerGroupMember {
+      member_id: "consumer-a".to_string(),
+      pod_id: None,
+    }]
   );
 }

@@ -2,12 +2,22 @@
 #[path = "./coordination_test.rs"]
 mod tests;
 
+#[path = "./coordination/assignment.rs"]
+mod assignment;
+
 use crate::config::{ConsumerGroupConfig, consumer_lease_duration_ms, validate_group_config};
 use anyhow::{Error, Result};
+pub use assignment::cooperative_sticky_assignment;
+use assignment::{
+  assignment_plan,
+  assignment_plan_pod_ids,
+  assignment_plan_policy,
+  canonical_member_topology,
+  cooperative_sticky_assignment_with_pods,
+};
 use async_trait::async_trait;
 use bd_log::warn_every;
 use blob_stream_metadata_store::{
-  ConsumerGroupAssignment,
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupAssignmentPlan,
   ConsumerGroupCommitOutcome,
@@ -186,6 +196,10 @@ pub enum AssignmentPlanValidationError {
   MissingExpectedPartition {
     virtual_partition_id: VirtualPartitionId,
   },
+  /// Pod-aware topology does not match the active member list.
+  TopologyMembersMismatch,
+  /// A pod-aware topology record omitted a pod identifier.
+  TopologyMemberWithoutPod { member_id: String },
   /// Members differ by more than one assigned partition.
   ImbalancedLoad { min_load: usize, max_load: usize },
 }
@@ -320,9 +334,19 @@ impl ConsumerGroupCoordinatorImpl {
       .as_ref()
       .and_then(|plan| current_plan_validation_error.as_ref().map(|_| plan.version));
     let current_members = canonical_members(members, &self.config.member_id);
-    let topology_changed = current_plan
-      .as_ref()
-      .is_some_and(|plan| plan.members != current_members);
+    let active_members = self
+      .membership_store
+      .list_active_members(&self.config.topic, &self.config.group_id, now_ts_ms)
+      .await?;
+    let member_topology = canonical_member_topology(
+      &current_members,
+      &active_members,
+      &self.config.member_id,
+      self.config.pod_id.as_deref(),
+    );
+    let topology_changed = current_plan.as_ref().is_some_and(|plan| {
+      plan.members != current_members || plan.member_topology != member_topology
+    });
     if let Some(plan) = current_plan.as_ref()
       && current_plan_is_valid
     {
@@ -390,11 +414,18 @@ impl ConsumerGroupCoordinatorImpl {
         .as_ref()
         .map(plan_assignment_map)
         .unwrap_or_default();
-      let assignment = cooperative_sticky_assignment(
-        members,
-        partitions,
-        &previous_assignment,
-        &self.config.member_id,
+      let assignment = member_topology.as_deref().map_or_else(
+        || {
+          cooperative_sticky_assignment(
+            members,
+            partitions,
+            &previous_assignment,
+            &self.config.member_id,
+          )
+        },
+        |member_topology| {
+          cooperative_sticky_assignment_with_pods(member_topology, partitions, &previous_assignment)
+        },
       );
       let plan = assignment_plan(
         current_plan
@@ -403,18 +434,30 @@ impl ConsumerGroupCoordinatorImpl {
         members,
         partitions,
         &assignment,
+        member_topology,
         &self.config.member_id,
         now_ts_ms,
       );
+      let moved_partitions = plan
+        .assignments
+        .iter()
+        .filter(|assignment| {
+          previous_assignment.get(&assignment.virtual_partition_id) != Some(&assignment.member_id)
+        })
+        .count();
+      let pod_ids = assignment_plan_pod_ids(&plan);
       debug!(
         "consumer assignment plan publishing: topic={}, group_id={}, member_id={}, version={}, \
-         members={}, assignments={}",
+         policy={}, pods={:?}, members={}, assignments={}, moved_partitions={}",
         self.config.topic,
         self.config.group_id,
         self.config.member_id,
         plan.version,
+        assignment_plan_policy(&plan),
+        pod_ids,
         plan.members.len(),
-        plan.assignments.len()
+        plan.assignments.len(),
+        moved_partitions
       );
       if self
         .membership_store
@@ -430,13 +473,16 @@ impl ConsumerGroupCoordinatorImpl {
       {
         info!(
           "consumer assignment plan published: topic={}, group_id={}, member_id={}, version={}, \
-           members={}, partitions={}",
+           policy={}, pods={:?}, members={}, partitions={}, moved_partitions={}",
           self.config.topic,
           self.config.group_id,
           self.config.member_id,
           plan.version,
+          assignment_plan_policy(&plan),
+          assignment_plan_pod_ids(&plan),
           plan.members.len(),
-          plan.assignments.len()
+          plan.assignments.len(),
+          moved_partitions
         );
         return Ok(SharedAssignment {
           plan: Some(plan),
@@ -658,12 +704,14 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       if assignment_plan_applied {
         info!(
           "consumer assignment plan accepted: topic={}, group_id={}, member_id={}, version={}, \
-           planner_member_id={}, members={}, assignments={}",
+           planner_member_id={}, policy={}, pods={:?}, members={}, assignments={}",
           self.config.topic,
           self.config.group_id,
           self.config.member_id,
           plan.version,
           plan.planner_member_id,
+          assignment_plan_policy(plan),
+          assignment_plan_pod_ids(plan),
           plan.members.len(),
           plan.assignments.len()
         );
@@ -964,171 +1012,6 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
 // cooperative_sticky_assignment
 //
 
-#[must_use]
-#[allow(clippy::implicit_hasher)]
-/// Compute a cooperative sticky assignment.
-///
-/// The result maps each partition to an owner member id.
-pub fn cooperative_sticky_assignment(
-  members: &[String],
-  partitions: &[VirtualPartitionId],
-  previous_assignment: &HashMap<VirtualPartitionId, String>,
-  local_member_id: &str,
-) -> HashMap<VirtualPartitionId, String> {
-  // Normalize membership input and ensure local member is represented so callers can compute
-  // deterministic intent even if discovery omitted self temporarily.
-  let mut deduped_members = members
-    .iter()
-    .filter(|member| !member.trim().is_empty())
-    .cloned()
-    .collect::<Vec<_>>();
-  if !deduped_members
-    .iter()
-    .any(|member| member == local_member_id)
-  {
-    deduped_members.push(local_member_id.to_string());
-  }
-  deduped_members.sort();
-  deduped_members.dedup();
-
-  // Normalize partition input for deterministic assignment and test stability.
-  let mut deduped_partitions = partitions.to_vec();
-  deduped_partitions.sort_unstable();
-  deduped_partitions.dedup();
-
-  if deduped_members.is_empty() || deduped_partitions.is_empty() {
-    return HashMap::new();
-  }
-
-  let mut assignments = HashMap::new();
-  let member_set = deduped_members.iter().cloned().collect::<HashSet<_>>();
-  // Load tracks partition counts per member for balancing decisions.
-  let mut load = deduped_members
-    .iter()
-    .map(|member| (member.clone(), 0_usize))
-    .collect::<HashMap<_, _>>();
-
-  // Keep prior placements where possible to preserve stickiness.
-  for partition_id in &deduped_partitions {
-    if let Some(previous_owner) = previous_assignment.get(partition_id)
-      && member_set.contains(previous_owner)
-    {
-      assignments.insert(*partition_id, previous_owner.clone());
-      if let Some(member_load) = load.get_mut(previous_owner) {
-        *member_load += 1;
-      }
-    }
-  }
-
-  // Assign any unassigned partitions to the least-loaded member.
-  for partition_id in &deduped_partitions {
-    if assignments.contains_key(partition_id) {
-      continue;
-    }
-    let owner = least_loaded_member(&deduped_members, &load);
-    assignments.insert(*partition_id, owner.clone());
-    if let Some(member_load) = load.get_mut(&owner) {
-      *member_load += 1;
-    }
-  }
-
-  // Rebalance only if needed. A member at the integer-ceiling target may still need to donate
-  // when another member has no partition, so compare the actual extreme loads instead of only
-  // checking whether owners are above/below static target bounds.
-  loop {
-    let over = deduped_members
-      .iter()
-      .max_by_key(|member| load.get(*member).copied().unwrap_or(0))
-      .cloned();
-    let under = deduped_members
-      .iter()
-      .min_by_key(|member| load.get(*member).copied().unwrap_or(0))
-      .cloned();
-
-    let (Some(over_member), Some(under_member)) = (over, under) else {
-      break;
-    };
-    let over_load = load.get(&over_member).copied().unwrap_or_default();
-    let under_load = load.get(&under_member).copied().unwrap_or_default();
-    if over_load.saturating_sub(under_load) <= 1 {
-      break;
-    }
-
-    // Move exactly one partition at a time from over->under, then recompute. This keeps moves
-    // minimal and predictable.
-    if let Some(partition_to_move) = deduped_partitions
-      .iter()
-      .find(|partition_id| {
-        assignments
-          .get(partition_id)
-          .is_some_and(|owner| owner == &over_member)
-      })
-      .copied()
-    {
-      assignments.insert(partition_to_move, under_member.clone());
-      if let Some(over_load) = load.get_mut(&over_member) {
-        *over_load = over_load.saturating_sub(1);
-      }
-      if let Some(under_load) = load.get_mut(&under_member) {
-        *under_load += 1;
-      }
-    } else {
-      break;
-    }
-  }
-
-  assignments
-}
-
-fn least_loaded_member(members: &[String], load: &HashMap<String, usize>) -> String {
-  // Ties break lexicographically for deterministic output across runs.
-  let mut selected = members.first().cloned().unwrap_or_default();
-  let mut selected_load = load.get(&selected).copied().unwrap_or(usize::MAX);
-
-  for member in members.iter().skip(1) {
-    let member_load = load.get(member).copied().unwrap_or(usize::MAX);
-    if member_load < selected_load || (member_load == selected_load && member < &selected) {
-      selected.clone_from(member);
-      selected_load = member_load;
-    }
-  }
-
-  selected
-}
-
-fn assignment_plan(
-  version: u64,
-  members: &[String],
-  partitions: &[VirtualPartitionId],
-  assignments: &HashMap<VirtualPartitionId, String>,
-  local_member_id: &str,
-  published_ts_ms: i64,
-) -> ConsumerGroupAssignmentPlan {
-  let members = canonical_members(members, local_member_id);
-  let mut partitions = partitions.to_vec();
-  partitions.sort_unstable();
-  partitions.dedup();
-  let assignments = partitions
-    .into_iter()
-    .filter_map(|virtual_partition_id| {
-      assignments
-        .get(&virtual_partition_id)
-        .map(|member_id| ConsumerGroupAssignment {
-          virtual_partition_id,
-          member_id: member_id.clone(),
-        })
-    })
-    .collect();
-
-  ConsumerGroupAssignmentPlan {
-    version,
-    planner_member_id: local_member_id.to_string(),
-    members,
-    assignments,
-    published_ts_ms,
-  }
-}
-
 fn assignment_plan_validation_error(
   plan: &ConsumerGroupAssignmentPlan,
   partitions: &[VirtualPartitionId],
@@ -1192,10 +1075,76 @@ fn assignment_plan_validation_error(
     });
   }
 
-  let min_load = load.values().min().copied().unwrap_or_default();
-  let max_load = load.values().max().copied().unwrap_or_default();
-  (max_load.saturating_sub(min_load) > 1)
-    .then_some(AssignmentPlanValidationError::ImbalancedLoad { min_load, max_load })
+  let Some(member_topology) = &plan.member_topology else {
+    let min_load = load.values().min().copied().unwrap_or_default();
+    let max_load = load.values().max().copied().unwrap_or_default();
+    return (max_load.saturating_sub(min_load) > 1)
+      .then_some(AssignmentPlanValidationError::ImbalancedLoad { min_load, max_load });
+  };
+
+  if member_topology.len() != plan.members.len() {
+    return Some(AssignmentPlanValidationError::TopologyMembersMismatch);
+  }
+  let mut member_pods = HashMap::new();
+  for member in member_topology {
+    let Some(pod_id) = member.pod_id.as_ref() else {
+      return Some(AssignmentPlanValidationError::TopologyMemberWithoutPod {
+        member_id: member.member_id.clone(),
+      });
+    };
+    if member_pods
+      .insert(member.member_id.as_str(), pod_id.as_str())
+      .is_some()
+    {
+      return Some(AssignmentPlanValidationError::TopologyMembersMismatch);
+    }
+  }
+  if member_pods.len() != member_set.len()
+    || !member_set
+      .iter()
+      .all(|member_id| member_pods.contains_key(member_id.as_str()))
+  {
+    return Some(AssignmentPlanValidationError::TopologyMembersMismatch);
+  }
+
+  let mut pod_loads = HashMap::<&str, usize>::new();
+  let mut pod_member_loads = HashMap::<&str, Vec<usize>>::new();
+  for member_id in &plan.members {
+    let pod_id = member_pods
+      .get(member_id.as_str())
+      .expect("validated member topology has every member");
+    pod_member_loads
+      .entry(pod_id)
+      .or_default()
+      .push(*load.get(member_id).unwrap_or(&0));
+    pod_loads.entry(pod_id).or_default();
+  }
+  for assignment in &plan.assignments {
+    let pod_id = member_pods
+      .get(assignment.member_id.as_str())
+      .expect("validated assignment owner has topology");
+    *pod_loads.entry(pod_id).or_default() += 1;
+  }
+  let min_pod_load = pod_loads.values().min().copied().unwrap_or_default();
+  let max_pod_load = pod_loads.values().max().copied().unwrap_or_default();
+  if max_pod_load.saturating_sub(min_pod_load) > 1 {
+    return Some(AssignmentPlanValidationError::ImbalancedLoad {
+      min_load: min_pod_load,
+      max_load: max_pod_load,
+    });
+  }
+  for member_loads in pod_member_loads.values() {
+    let min_member_load = member_loads.iter().min().copied().unwrap_or_default();
+    let max_member_load = member_loads.iter().max().copied().unwrap_or_default();
+    if max_member_load.saturating_sub(min_member_load) > 1 {
+      return Some(AssignmentPlanValidationError::ImbalancedLoad {
+        min_load: min_member_load,
+        max_load: max_member_load,
+      });
+    }
+  }
+
+  None
 }
 
 fn log_assignment_plan_rejection(
