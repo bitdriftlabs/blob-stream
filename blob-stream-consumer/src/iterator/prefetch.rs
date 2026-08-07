@@ -116,12 +116,45 @@ pub(super) enum ConsumerReaderCommand {
     virtual_partition_id: VirtualPartitionId,
     offset: u64,
     now_unix_seconds: i64,
+    seek_trace: SeekTrace,
     response: oneshot::Sender<Result<()>>,
   },
 }
 
+//
+// SeekTrace
+//
+
+/// Root trace retained until the explicit seek's recovery reaches a terminal state.
+pub(super) struct SeekTrace {
+  span: Span,
+}
+
+impl SeekTrace {
+  pub(super) fn new(span: Span) -> Self {
+    Self { span }
+  }
+
+  pub(super) fn in_scope<T>(&self, make_child: impl FnOnce() -> T) -> T {
+    self.span.in_scope(make_child)
+  }
+
+  pub(super) fn finish(self, outcome: &str) {
+    self.span.record("seek.outcome", outcome);
+    self.span.record(
+      "otel.status_code",
+      if outcome == "fast_path_active" {
+        "OK"
+      } else {
+        "UNSET"
+      },
+    );
+  }
+}
+
 struct RecoveryTrace {
   span: Span,
+  seek_trace: Option<SeekTrace>,
   started_at: Instant,
   scan_passes: usize,
   metadata_batches_seen: usize,
@@ -158,6 +191,7 @@ pub(super) struct PrefetchWorker {
   base_idle_delay_ms: u64,
   max_idle_delay_ms: Option<u64>,
   recovery_traces: HashMap<VirtualPartitionId, RecoveryTrace>,
+  pending_seek_traces: HashMap<VirtualPartitionId, SeekTrace>,
   time_provider: Arc<dyn TimeProvider>,
   lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
   member_id: String,
@@ -194,6 +228,7 @@ impl PrefetchWorker {
       base_idle_delay_ms,
       max_idle_delay_ms,
       recovery_traces: HashMap::new(),
+      pending_seek_traces: HashMap::new(),
       time_provider,
       lifecycle_hooks,
       member_id,
@@ -222,6 +257,8 @@ impl PrefetchWorker {
         &mut pending,
         &mut pending_record_count,
         &mut pending_bytes,
+        &mut self.recovery_traces,
+        &mut self.pending_seek_traces,
       ) {
         self.finish_recovery_traces("worker_stopped");
         return;
@@ -343,28 +380,35 @@ impl PrefetchWorker {
       let recovery_start_cursor = partition.and_then(|partition| partition.cursor);
       let recovery_committed_cursor =
         partition.and_then(|partition| partition.last_committed_offset);
-      let span = bd_log::otel_info_span!(
-        "blob_stream.consumer.partition_recovery",
-        otel.kind = "consumer",
-        consumer.topic = %snapshot.topic,
-        consumer.group_id = %snapshot.group_id,
-        consumer.generation = snapshot.accepted_assignment_plan_version,
-        messaging.partition = partition_id,
-        handoff.cursor_key = %cursor_key,
-        recovery.start_cursor = ?recovery_start_cursor,
-        recovery.committed_cursor = ?recovery_committed_cursor,
-        recovery.next_window_start = next_window_start_unix_seconds,
-        recovery.cutover_window_start = cutover_window_start_unix_seconds,
-        recovery.scan_passes = field::Empty,
-        recovery.duration_ms = field::Empty,
-        recovery.outcome = field::Empty,
-        recovery.summary_json = field::Empty,
-        otel.status_code = field::Empty,
-      );
+      let seek_trace = self.pending_seek_traces.remove(&partition_id);
+      let make_span = || {
+        bd_log::otel_info_span!(
+          "blob_stream.consumer.partition_recovery",
+          otel.kind = "consumer",
+          consumer.topic = %snapshot.topic,
+          consumer.group_id = %snapshot.group_id,
+          consumer.generation = snapshot.accepted_assignment_plan_version,
+          messaging.partition = partition_id,
+          handoff.cursor_key = %cursor_key,
+          recovery.start_cursor = ?recovery_start_cursor,
+          recovery.committed_cursor = ?recovery_committed_cursor,
+          recovery.next_window_start = next_window_start_unix_seconds,
+          recovery.cutover_window_start = cutover_window_start_unix_seconds,
+          recovery.scan_passes = field::Empty,
+          recovery.duration_ms = field::Empty,
+          recovery.outcome = field::Empty,
+          recovery.summary_json = field::Empty,
+          otel.status_code = field::Empty,
+        )
+      };
+      let span = seek_trace
+        .as_ref()
+        .map_or_else(make_span, |seek_trace| seek_trace.in_scope(make_span));
       self.recovery_traces.insert(
         partition_id,
         RecoveryTrace {
           span,
+          seek_trace,
           started_at: Instant::now(),
           scan_passes: 0,
           metadata_batches_seen: 0,
@@ -441,21 +485,22 @@ impl PrefetchWorker {
         modes.get(partition_id),
         Some(ConsumerReaderPartitionMode::Fast)
       );
-      Self::finish_recovery_trace(
-        recovery,
+      if completed_normally {
+        fast_path_active.push(*partition_id);
+      }
+      completed.push((
+        *partition_id,
         if completed_normally {
           "fast_path_active"
         } else {
           "cancelled"
         },
-      );
-      if completed_normally {
-        fast_path_active.push(*partition_id);
-      }
-      completed.push(*partition_id);
+      ));
     }
-    for partition_id in completed {
-      self.recovery_traces.remove(&partition_id);
+    for (partition_id, outcome) in completed {
+      if let Some(recovery) = self.recovery_traces.remove(&partition_id) {
+        Self::finish_recovery_trace(recovery, outcome);
+      }
     }
     if !fast_path_active.is_empty()
       && let Some(lifecycle_hooks) = &self.lifecycle_hooks
@@ -473,13 +518,15 @@ impl PrefetchWorker {
   }
 
   fn finish_recovery_traces(&mut self, outcome: &str) {
-    for recovery in self.recovery_traces.values() {
+    for (_, recovery) in self.recovery_traces.drain() {
       Self::finish_recovery_trace(recovery, outcome);
     }
-    self.recovery_traces.clear();
+    for (_, seek_trace) in self.pending_seek_traces.drain() {
+      seek_trace.finish(outcome);
+    }
   }
 
-  fn finish_recovery_trace(recovery: &RecoveryTrace, outcome: &str) {
+  fn finish_recovery_trace(recovery: RecoveryTrace, outcome: &str) {
     let summary_json = serde_json::json!({
       "metadata_batches_seen": recovery.metadata_batches_seen,
       "batches_skipped_by_cursor": recovery.batches_skipped_by_cursor,
@@ -509,6 +556,9 @@ impl PrefetchWorker {
         "UNSET"
       },
     );
+    if let Some(seek_trace) = recovery.seek_trace {
+      seek_trace.finish(outcome);
+    }
   }
 
   /// Return capacity remaining after queued, pending, and partially delivered records.
@@ -684,6 +734,14 @@ impl PrefetchWorker {
   }
 }
 
+impl Drop for PrefetchWorker {
+  fn drop(&mut self) {
+    // Driver shutdown aborts this task to interrupt a blocked reader operation. Dropping the
+    // worker is therefore the only guaranteed trace-finalization path for that cancellation.
+    self.finish_recovery_traces("worker_stopped");
+  }
+}
+
 /// Convert reader-owned lifecycle state into the diagnostic representation after each mutation.
 pub(super) fn record_reader_diagnostics(
   reader: &ConsumerReaderImpl,
@@ -786,6 +844,8 @@ fn process_reader_commands(
   pending: &mut VecDeque<ConsumerBatch>,
   pending_record_count: &mut usize,
   pending_bytes: &mut u64,
+  recovery_traces: &mut HashMap<VirtualPartitionId, RecoveryTrace>,
+  pending_seek_traces: &mut HashMap<VirtualPartitionId, SeekTrace>,
 ) -> bool {
   loop {
     let command = match reader_command_rx.try_recv() {
@@ -819,6 +879,9 @@ fn process_reader_commands(
           shared_state.lock().terminal_error = Some(format!("{error:#}"));
           return false;
         }
+        // A revoked partition cannot enter recovery under this assignment. Close its active or
+        // pending seek trace now so a later reacquisition cannot inherit the old seek as parent.
+        finish_unassigned_recovery_traces(recovery_traces, pending_seek_traces, &assignment);
         if release_delivery_fence {
           let mut shared_state = shared_state.lock();
           if shared_state.delivery_state.revocation_in_progress {
@@ -834,8 +897,18 @@ fn process_reader_commands(
         virtual_partition_id,
         offset,
         now_unix_seconds,
+        seek_trace,
         response,
       } => {
+        // A newer seek replaces the reader cursor for this partition. Close any prior seek trace
+        // rather than letting it absorb recovery work initiated by the newer request.
+        if let Some(recovery) = recovery_traces.remove(&virtual_partition_id) {
+          PrefetchWorker::finish_recovery_trace(recovery, "superseded");
+        }
+        if let Some(seek_trace) = pending_seek_traces.remove(&virtual_partition_id) {
+          seek_trace.finish("superseded");
+        }
+        pending_seek_traces.insert(virtual_partition_id, seek_trace);
         reader.seek(virtual_partition_id, offset, now_unix_seconds);
         // A seek invalidates all unread reader output for that partition, including batches that
         // have not crossed the shared byte-budget boundary yet.
@@ -887,6 +960,34 @@ fn process_reader_commands(
     }
     if let Some(response) = seek_response {
       let _ = response.send(Ok(()));
+    }
+  }
+}
+
+fn finish_unassigned_recovery_traces(
+  recovery_traces: &mut HashMap<VirtualPartitionId, RecoveryTrace>,
+  pending_seek_traces: &mut HashMap<VirtualPartitionId, SeekTrace>,
+  assignment: &[VirtualPartitionId],
+) {
+  let unassigned_recoveries = recovery_traces
+    .keys()
+    .copied()
+    .filter(|partition_id| !assignment.contains(partition_id))
+    .collect::<Vec<_>>();
+  for partition_id in unassigned_recoveries {
+    if let Some(recovery) = recovery_traces.remove(&partition_id) {
+      PrefetchWorker::finish_recovery_trace(recovery, "cancelled");
+    }
+  }
+
+  let unassigned_seeks = pending_seek_traces
+    .keys()
+    .copied()
+    .filter(|partition_id| !assignment.contains(partition_id))
+    .collect::<Vec<_>>();
+  for partition_id in unassigned_seeks {
+    if let Some(seek_trace) = pending_seek_traces.remove(&partition_id) {
+      seek_trace.finish("cancelled");
     }
   }
 }

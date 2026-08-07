@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::delivery::{BufferedBatch, DeliveryState};
-use super::prefetch::IdlePollBackoff;
+use super::prefetch::{IdlePollBackoff, SeekTrace};
 use super::shared::{ActivePartitionState, ConsumerIteratorMetrics};
 use super::{
   ConsumerCoordinationSource,
@@ -91,6 +91,42 @@ struct CommitGateHooks {
 
 struct RebalanceRecordingHooks {
   rebalance_applied_calls: AtomicUsize,
+}
+
+#[test]
+fn seek_trace_records_cancellation_and_parents_recovery() {
+  let (spans, ()) = bd_log::test::with_two_phase_test_otel("blob-stream-consumer-test", async {
+    let seek_trace = SeekTrace::new(bd_log::otel_info_span!(
+      "blob_stream.consumer.partition_seek",
+      seek.outcome = tracing::field::Empty,
+      otel.status_code = tracing::field::Empty,
+    ));
+    let recovery_span =
+      seek_trace.in_scope(|| bd_log::otel_info_span!("blob_stream.consumer.partition_recovery"));
+    drop(recovery_span);
+    seek_trace.finish("cancelled");
+  });
+
+  let seek_span = spans
+    .iter()
+    .find(|span| span.name == "blob_stream.consumer.partition_seek")
+    .expect("seek span should be exported");
+  let recovery_span = spans
+    .iter()
+    .find(|span| span.name == "blob_stream.consumer.partition_recovery")
+    .expect("recovery span should be exported");
+  let outcome = seek_span
+    .attributes
+    .iter()
+    .find(|attribute| attribute.key.as_str() == "seek.outcome")
+    .map(|attribute| attribute.value.as_str());
+
+  assert_eq!(outcome.as_deref(), Some("cancelled"));
+  assert_eq!(format!("{:?}", seek_span.status), "Unset");
+  assert_eq!(
+    recovery_span.parent_span_id,
+    seek_span.span_context.span_id()
+  );
 }
 
 #[async_trait::async_trait]
@@ -2361,6 +2397,7 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
     .await
     .unwrap()
     .unwrap();
+  assert_eq!(iterator.metrics.seeks.get(), 1);
   let rewound = timeout(Duration::from_secs(2), iterator.next())
     .await
     .unwrap()

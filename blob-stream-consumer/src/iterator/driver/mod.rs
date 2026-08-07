@@ -1,6 +1,11 @@
 use super::api::RevokedPartitionsImpl;
 use super::delivery::{update_total_prefetch_bytes, update_worker_prefetch_metrics};
-use super::prefetch::{ConsumerReaderCommand, PrefetchWorker, record_reader_diagnostics};
+use super::prefetch::{
+  ConsumerReaderCommand,
+  PrefetchWorker,
+  SeekTrace,
+  record_reader_diagnostics,
+};
 use super::shared::{ConsumerIteratorMetrics, PendingCommit};
 use super::{
   AssignmentCallback,

@@ -4,6 +4,7 @@ use super::{
   HeartbeatReport,
   HeartbeatTrigger,
   Result,
+  SeekTrace,
   VirtualPartitionId,
   anyhow,
   debug,
@@ -269,6 +270,27 @@ impl ConsumerDriver {
       )));
       return;
     }
+    let snapshot = self.diagnostics.state_snapshot();
+    let partition = snapshot
+      .local
+      .partitions
+      .iter()
+      .find(|partition| partition.virtual_partition_id == virtual_partition_id);
+    let seek_trace = SeekTrace::new(bd_log::otel_info_span!(
+      "blob_stream.consumer.partition_seek",
+      otel.kind = "consumer",
+      consumer.topic = %snapshot.topic,
+      consumer.group_id = %snapshot.group_id,
+      consumer.member_id = %snapshot.member_id,
+      consumer.generation = snapshot.accepted_assignment_plan_version,
+      messaging.partition = virtual_partition_id,
+      seek.requested_offset = offset,
+      seek.start_cursor = ?partition.and_then(|partition| partition.cursor),
+      seek.committed_cursor = ?partition.and_then(|partition| partition.last_committed_offset),
+      seek.outcome = field::Empty,
+      otel.status_code = field::Empty,
+    ));
+    self.metrics.seeks.inc();
     {
       let mut shared_state = self.shared_state.lock();
       shared_state
@@ -294,6 +316,7 @@ impl ConsumerDriver {
       virtual_partition_id,
       offset,
       self.now_unix_seconds(),
+      seek_trace,
       response,
     );
     trace!(
