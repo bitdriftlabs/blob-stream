@@ -135,6 +135,10 @@ impl SeekTrace {
     Self { span }
   }
 
+  pub(super) fn in_scope<T>(&self, make_child: impl FnOnce() -> T) -> T {
+    self.span.in_scope(make_child)
+  }
+
   pub(super) fn finish(self, outcome: &str) {
     self.span.record("seek.outcome", outcome);
     self.span.record(
@@ -399,7 +403,7 @@ impl PrefetchWorker {
       };
       let span = seek_trace
         .as_ref()
-        .map_or_else(make_span, |seek_trace| seek_trace.span.in_scope(make_span));
+        .map_or_else(make_span, |seek_trace| seek_trace.in_scope(make_span));
       self.recovery_traces.insert(
         partition_id,
         RecoveryTrace {
@@ -730,6 +734,14 @@ impl PrefetchWorker {
   }
 }
 
+impl Drop for PrefetchWorker {
+  fn drop(&mut self) {
+    // Driver shutdown aborts this task to interrupt a blocked reader operation. Dropping the
+    // worker is therefore the only guaranteed trace-finalization path for that cancellation.
+    self.finish_recovery_traces("worker_stopped");
+  }
+}
+
 /// Convert reader-owned lifecycle state into the diagnostic representation after each mutation.
 pub(super) fn record_reader_diagnostics(
   reader: &ConsumerReaderImpl,
@@ -867,6 +879,9 @@ fn process_reader_commands(
           shared_state.lock().terminal_error = Some(format!("{error:#}"));
           return false;
         }
+        // A revoked partition cannot enter recovery under this assignment. Close its active or
+        // pending seek trace now so a later reacquisition cannot inherit the old seek as parent.
+        finish_unassigned_recovery_traces(recovery_traces, pending_seek_traces, &assignment);
         if release_delivery_fence {
           let mut shared_state = shared_state.lock();
           if shared_state.delivery_state.revocation_in_progress {
@@ -945,6 +960,34 @@ fn process_reader_commands(
     }
     if let Some(response) = seek_response {
       let _ = response.send(Ok(()));
+    }
+  }
+}
+
+fn finish_unassigned_recovery_traces(
+  recovery_traces: &mut HashMap<VirtualPartitionId, RecoveryTrace>,
+  pending_seek_traces: &mut HashMap<VirtualPartitionId, SeekTrace>,
+  assignment: &[VirtualPartitionId],
+) {
+  let unassigned_recoveries = recovery_traces
+    .keys()
+    .copied()
+    .filter(|partition_id| !assignment.contains(partition_id))
+    .collect::<Vec<_>>();
+  for partition_id in unassigned_recoveries {
+    if let Some(recovery) = recovery_traces.remove(&partition_id) {
+      PrefetchWorker::finish_recovery_trace(recovery, "cancelled");
+    }
+  }
+
+  let unassigned_seeks = pending_seek_traces
+    .keys()
+    .copied()
+    .filter(|partition_id| !assignment.contains(partition_id))
+    .collect::<Vec<_>>();
+  for partition_id in unassigned_seeks {
+    if let Some(seek_trace) = pending_seek_traces.remove(&partition_id) {
+      seek_trace.finish("cancelled");
     }
   }
 }

@@ -121,6 +121,7 @@ impl ConsumerDriver {
     }
 
     let Some(reader_command_tx) = self.reader_command_tx.as_ref() else {
+      seek_trace.finish("reader_unavailable");
       let _ = response.send(Err(anyhow!("consumer reader is unavailable")));
       return;
     };
@@ -132,9 +133,15 @@ impl ConsumerDriver {
       response,
     };
     if let Err(error) = reader_command_tx.send(command) {
-      let ConsumerReaderCommand::Seek { response, .. } = error.0 else {
+      let ConsumerReaderCommand::Seek {
+        seek_trace,
+        response,
+        ..
+      } = error.0
+      else {
         unreachable!("only seek commands are sent through this path");
       };
+      seek_trace.finish("worker_stopped");
       let _ = response.send(Err(anyhow!("consumer reader worker stopped")));
     } else {
       self.reader_command_notify.notify_one();
