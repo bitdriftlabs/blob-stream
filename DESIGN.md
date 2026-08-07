@@ -569,8 +569,20 @@ previous persisted plan, preserving existing placements where possible before mo
 required partitions to balance member load. It conditionally publishes the result while it owns the
 planner lease.
 
+Consumers can optionally register a stable physical `pod_id` alongside their stable member ID.
+When every active member has supplied this metadata, the planner automatically changes from the
+legacy flat member policy to a hierarchical policy: it first preserves and balances aggregate
+partition load across pods, then balances the partitions selected for each pod across that pod's
+members. Pod loads and per-pod member loads therefore differ by at most one partition. This keeps
+existing worker concurrency unchanged. If any active member lacks a `pod_id`, the planner retains
+the legacy flat policy, which balances all members globally. Rolling upgrades need no migration:
+the next plan published after all legacy membership rows have expired or been heartbeated with a
+`pod_id` uses the hierarchical policy and moves only the partitions necessary to meet pod balance.
+
 Every accepted plan must name its planner as a member, cover each configured virtual partition
-exactly once, assign every partition to a plan member, and keep member loads within one partition.
+exactly once, and assign every partition to a plan member. Flat plans keep global member loads
+within one partition. Pod-aware plans include a complete member-to-pod snapshot and keep both pod
+loads and member loads within each pod within one partition.
 A consumer makes no local desired-ownership decision while no structurally valid persisted plan is
 available. If it observes a stale local membership view while the elected planner remains live, it
 continues using the last valid shared plan rather than creating an incompatible local map. The
@@ -630,6 +642,10 @@ snapshot does not wait for metadata, blob, lease, or membership-store operations
 local diagnostics remain available while a reader scan is stalled on an external dependency.
 Snapshots are republished after completed local state transitions; their timestamp therefore
 reflects publication time and fields may lag an in-flight read or rebalance.
+
+Assignment-plan snapshots report their active policy, registered member-to-pod topology, aggregate
+pod loads, and the optional `pod_id` beside every partition's member assignment. Legacy plans
+continue to report member-only assignments without pod fields.
 
 The always-available `/state` endpoint returns that local state plus a fresh, strongly consistent
 lease-table query for the consumer group. The response joins retained lease rows with the last

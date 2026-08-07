@@ -8,6 +8,13 @@ use crate::coordination::{
   LeaseClaimCounts,
   assignment_plan_validation_error,
   cooperative_sticky_assignment,
+  cooperative_sticky_assignment_with_pods,
+};
+use crate::diagnostics::{
+  ConsumerAssignmentPolicy,
+  ConsumerMemberTopologySnapshot,
+  ConsumerPodLoadSnapshot,
+  assignment_plan_snapshot,
 };
 use blob_stream_metadata_store::{
   ConsumerGroupAssignment,
@@ -18,6 +25,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupLease,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupMember,
   ConsumerGroupMembershipStore,
   ConsumerGroupReleaseOutcome,
   InMemoryConsumerGroupLeaseStore,
@@ -286,6 +294,136 @@ fn sticky_assignment_repairs_zero_owner_when_other_members_are_at_ceiling() {
 }
 
 #[test]
+fn pod_aware_assignment_balances_pods_with_minimal_movement() {
+  let members = (0 .. 7)
+    .flat_map(|pod_index| {
+      (0 .. 2).map(move |worker_index| ConsumerGroupMember {
+        member_id: format!("pod-{pod_index}:worker-{worker_index}"),
+        pod_id: Some(format!("pod-{pod_index}")),
+      })
+    })
+    .collect::<Vec<_>>();
+  let partitions = (0 .. 32).collect::<Vec<_>>();
+  let mut previous = HashMap::new();
+  for partition_id in 0 .. 32 {
+    let pod_index = match partition_id {
+      0 .. 6 => 0,
+      6 .. 12 => 1,
+      _ => 2 + ((partition_id - 12) / 4),
+    };
+    let worker_index = match partition_id {
+      0 .. 12 => (partition_id % 6) / 3,
+      _ => (partition_id % 4) / 2,
+    };
+    previous.insert(
+      partition_id,
+      format!("pod-{pod_index}:worker-{worker_index}"),
+    );
+  }
+
+  let assignment = cooperative_sticky_assignment_with_pods(&members, &partitions, &previous);
+  let pod_loads = (0 .. 7)
+    .map(|pod_index| {
+      assignment
+        .values()
+        .filter(|member_id| member_id.starts_with(&format!("pod-{pod_index}:")))
+        .count()
+    })
+    .collect::<Vec<_>>();
+  let member_loads = members
+    .iter()
+    .map(|member| {
+      assignment
+        .values()
+        .filter(|member_id| *member_id == &member.member_id)
+        .count()
+    })
+    .collect::<Vec<_>>();
+  let moved = partitions
+    .iter()
+    .filter(|partition_id| assignment.get(partition_id) != previous.get(partition_id))
+    .count();
+
+  assert_eq!(pod_loads, vec![5, 5, 5, 5, 4, 4, 4]);
+  assert!(member_loads.iter().all(|load| (2 ..= 3).contains(load)));
+  assert_eq!(moved, 2);
+}
+
+#[test]
+fn pod_aware_assignment_plan_snapshot_includes_member_and_pod_identity() {
+  let plan = ConsumerGroupAssignmentPlan {
+    version: 7,
+    planner_member_id: "pod-a:worker-0".to_string(),
+    members: vec!["pod-a:worker-0".to_string(), "pod-b:worker-0".to_string()],
+    member_topology: Some(vec![
+      ConsumerGroupMember {
+        member_id: "pod-a:worker-0".to_string(),
+        pod_id: Some("pod-a".to_string()),
+      },
+      ConsumerGroupMember {
+        member_id: "pod-b:worker-0".to_string(),
+        pod_id: Some("pod-b".to_string()),
+      },
+      ConsumerGroupMember {
+        member_id: "pod-c:worker-0".to_string(),
+        pod_id: Some("pod-c".to_string()),
+      },
+    ]),
+    assignments: vec![
+      ConsumerGroupAssignment {
+        virtual_partition_id: 0,
+        member_id: "pod-a:worker-0".to_string(),
+      },
+      ConsumerGroupAssignment {
+        virtual_partition_id: 1,
+        member_id: "pod-b:worker-0".to_string(),
+      },
+    ],
+    published_ts_ms: 1_000,
+  };
+
+  let snapshot = assignment_plan_snapshot(plan);
+
+  assert_eq!(snapshot.policy, ConsumerAssignmentPolicy::PodAware);
+  assert_eq!(
+    snapshot.member_topology,
+    vec![
+      ConsumerMemberTopologySnapshot {
+        member_id: "pod-a:worker-0".to_string(),
+        pod_id: "pod-a".to_string(),
+      },
+      ConsumerMemberTopologySnapshot {
+        member_id: "pod-b:worker-0".to_string(),
+        pod_id: "pod-b".to_string(),
+      },
+      ConsumerMemberTopologySnapshot {
+        member_id: "pod-c:worker-0".to_string(),
+        pod_id: "pod-c".to_string(),
+      },
+    ]
+  );
+  assert_eq!(
+    snapshot.pod_loads,
+    vec![
+      ConsumerPodLoadSnapshot {
+        pod_id: "pod-a".to_string(),
+        partition_count: 1,
+      },
+      ConsumerPodLoadSnapshot {
+        pod_id: "pod-b".to_string(),
+        partition_count: 1,
+      },
+      ConsumerPodLoadSnapshot {
+        pod_id: "pod-c".to_string(),
+        partition_count: 0,
+      },
+    ]
+  );
+  assert_eq!(snapshot.assignments[0].pod_id.as_deref(), Some("pod-a"));
+  assert_eq!(snapshot.assignments[1].pod_id.as_deref(), Some("pod-b"));
+}
+
+#[test]
 fn assignment_plan_validation_reports_imbalanced_load() {
   let members = vec![
     "member-a".to_string(),
@@ -297,6 +435,7 @@ fn assignment_plan_validation_reports_imbalanced_load() {
     version: 73,
     planner_member_id: "member-a".to_string(),
     members,
+    member_topology: None,
     assignments: (0 .. 6)
       .map(|virtual_partition_id| ConsumerGroupAssignment {
         virtual_partition_id,

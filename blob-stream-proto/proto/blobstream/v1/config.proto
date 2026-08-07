@@ -354,6 +354,10 @@ message ConsumerGroupConfig {
   // Rebalance interval in milliseconds.
   // Default when unset: 10,000 ms.
   optional int64 rebalance_interval_ms = 6 [(validate.rules).int64.gt = 0];
+
+  // Stable physical pod identity for hierarchical consumer assignment.
+  // When unset, the group uses member-only assignment for compatibility.
+  optional string pod_id = 7 [(validate.rules).string.min_len = 1];
 }
 
 // Runtime configuration for consumer library applications.

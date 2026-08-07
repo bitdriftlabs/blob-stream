@@ -27,6 +27,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseTransition,
+  ConsumerGroupMember,
   InMemoryMetadataStore,
   MetadataStore,
   SegmentMetadata,
@@ -87,6 +88,13 @@ use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::{Barrier, Mutex, Notify, mpsc, oneshot, watch};
 use tokio::time::{Instant, timeout};
+
+fn member_ids(members: &[ConsumerGroupMember]) -> Vec<String> {
+  members
+    .iter()
+    .map(|member| member.member_id.clone())
+    .collect()
+}
 
 fn metrics_scope(component: &str) -> bd_server_stats::stats::Scope {
   Collector::default().scope(component)
@@ -1548,7 +1556,10 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
       now_unix_millis(),
     )
     .await?;
-  assert_eq!(active_members, vec![runtime_group.member_id.to_string()]);
+  assert_eq!(
+    member_ids(&active_members),
+    vec![runtime_group.member_id.to_string()]
+  );
   before_release.release()?;
 
   timeout(
@@ -4730,8 +4741,12 @@ async fn prefetch_rebalance_revocation_fences_buffered_record() -> Result<()> {
           consumer_time.now().unix_timestamp_ms(),
         )
         .await?;
-      if active_members.contains(&"prefetch-fence-a".to_string())
-        && active_members.contains(&"prefetch-fence-b".to_string())
+      if active_members
+        .iter()
+        .any(|member| member.member_id == "prefetch-fence-a")
+        && active_members
+          .iter()
+          .any(|member| member.member_id == "prefetch-fence-b")
       {
         return Ok::<_, anyhow::Error>(());
       }
@@ -5639,7 +5654,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
     )
     .await?;
   assert_eq!(
-    active_members,
+    member_ids(&active_members),
     vec![runtime_b.group.as_ref().unwrap().member_id.to_string()]
   );
 
@@ -6340,6 +6355,132 @@ async fn dynamic_membership_scale_out_rebalances() -> Result<()> {
   Ok(())
 }
 
+// High-level: verifies workers on the same physical pod share an aggregate partition budget.
+#[tokio::test]
+async fn consumer_group_balances_partitions_across_configured_pods() -> Result<()> {
+  let mut cluster = ClusterHarness::in_memory(1).start().await?;
+  let workers = [
+    ("pod-a-worker-0", "pod-a"),
+    ("pod-a-worker-1", "pod-a"),
+    ("pod-b-worker-0", "pod-b"),
+    ("pod-b-worker-1", "pod-b"),
+    ("pod-c-worker-0", "pod-c"),
+    ("pod-c-worker-1", "pod-c"),
+  ];
+  let worker_pods = workers.iter().copied().collect::<HashMap<_, _>>();
+  let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+  let mut stop_txs = Vec::new();
+  let mut consumer_tasks = Vec::new();
+
+  for (member_id, pod_id) in workers {
+    let mut runtime = consumer_runtime_config(member_id);
+    runtime
+      .group
+      .as_mut()
+      .ok_or_else(|| anyhow!("pod balancing consumer group config missing"))?
+      .pod_id = Some(pod_id.to_string().into());
+    let consumer = Box::new(cluster.create_consumer(&runtime).await?);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    stop_txs.push(stop_tx);
+    consumer_tasks.push(tokio::spawn(run_consumer_task(
+      consumer,
+      stop_rx,
+      event_tx.clone(),
+    )));
+  }
+  drop(event_tx);
+
+  let leases = timeout(Duration::from_secs(10), async {
+    loop {
+      while let Ok(event) = event_rx.try_recv() {
+        if let ConsumerTaskEvent::Revoked { ack } = event {
+          ack
+            .send(())
+            .map_err(|()| anyhow!("pod balancing consumer stopped before revocation completed"))?;
+        }
+      }
+
+      let leases = cluster
+        .consumer_lease_store()
+        .list_group_leases(TOPIC, "integration-group")
+        .await?;
+      let owners = leases
+        .iter()
+        .map(|lease| lease.owner_id.as_str())
+        .collect::<HashSet<_>>();
+      if leases.len() == PARTITION_COUNT as usize
+        && owners.len() == workers.len()
+        && owners.iter().all(|owner| worker_pods.contains_key(owner))
+      {
+        return Ok::<_, anyhow::Error>(leases);
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("pod-aware consumer group did not converge"))??;
+
+  let mut pod_loads = HashMap::<&str, usize>::new();
+  let mut member_loads = HashMap::<&str, usize>::new();
+  for lease in &leases {
+    let pod_id = worker_pods
+      .get(lease.owner_id.as_str())
+      .ok_or_else(|| anyhow!("lease owner lacks configured pod: {lease:?}"))?;
+    *pod_loads.entry(*pod_id).or_default() += 1;
+    *member_loads.entry(lease.owner_id.as_str()).or_default() += 1;
+  }
+  let mut sorted_pod_loads = pod_loads.values().copied().collect::<Vec<_>>();
+  sorted_pod_loads.sort_unstable();
+  assert_eq!(sorted_pod_loads, vec![5, 5, 6]);
+  for pod_id in ["pod-a", "pod-b", "pod-c"] {
+    let worker_loads = workers
+      .iter()
+      .filter(|(_, worker_pod_id)| *worker_pod_id == pod_id)
+      .map(|(member_id, _)| {
+        member_loads
+          .get(member_id)
+          .copied()
+          .ok_or_else(|| anyhow!("worker {member_id} did not receive a lease"))
+      })
+      .collect::<Result<Vec<_>>>()?;
+    let min_load = worker_loads.iter().min().copied().unwrap_or_default();
+    let max_load = worker_loads.iter().max().copied().unwrap_or_default();
+    assert!(
+      max_load - min_load <= 1,
+      "workers on {pod_id} are not balanced: {worker_loads:?}"
+    );
+  }
+
+  let plan = cluster
+    .consumer_membership_store()
+    .get_assignment_plan(TOPIC, "integration-group")
+    .await?
+    .ok_or_else(|| anyhow!("pod-aware consumer group did not persist an assignment plan"))?;
+  assert_eq!(
+    plan.member_topology,
+    Some(
+      workers
+        .iter()
+        .map(|(member_id, pod_id)| ConsumerGroupMember {
+          member_id: (*member_id).to_string(),
+          pod_id: Some((*pod_id).to_string()),
+        })
+        .collect()
+    )
+  );
+
+  for stop_tx in stop_txs {
+    let _ = stop_tx.send(true);
+  }
+  for task in consumer_tasks {
+    task
+      .await
+      .map_err(|error| anyhow!("pod balancing consumer task join error: {error}"))??;
+  }
+  cluster.shutdown().await;
+  Ok(())
+}
+
 // High-level: validates a bootstrap consumer gracefully restarts through the production S3 and
 // Dynamo configuration path without replaying committed data.
 #[tokio::test]
@@ -6811,7 +6952,7 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
       consumer_time.now().unix_timestamp_ms(),
     )
     .await?;
-  assert_eq!(active_members, vec!["bootstrap-a".to_string()]);
+  assert_eq!(member_ids(&active_members), vec!["bootstrap-a".to_string()]);
 
   let leases = resources
     .consumer_lease_store()

@@ -4,6 +4,7 @@ mod tests;
 
 use crate::{
   ConsumerGroupAssignmentPlan,
+  ConsumerGroupMember,
   ConsumerGroupMembershipStore,
   ConsumerGroupPlannerLease,
   ConsumerGroupPlannerLeaseOutcome,
@@ -37,6 +38,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    pod_id: Option<String>,
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> Result<()> {
@@ -48,6 +50,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     let key = MemberKey::new(topic, group_id, member_id);
     let state = MemberState {
       lease_expiration_ts_ms: expires_at,
+      pod_id,
     };
     self.state.write().members.insert(key, state);
     Ok(())
@@ -58,6 +61,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    pod_id: Option<String>,
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> Result<()> {
@@ -66,7 +70,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
        member_id={member_id}"
     );
     self
-      .register_member(topic, group_id, member_id, now_ts_ms, ttl_ms)
+      .register_member(topic, group_id, member_id, pod_id, now_ts_ms, ttl_ms)
       .await
   }
 
@@ -85,19 +89,22 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     topic: &str,
     group_id: &str,
     now_ts_ms: i64,
-  ) -> Result<Vec<String>> {
+  ) -> Result<Vec<ConsumerGroupMember>> {
     trace!("consumer membership(memory) list_active_members: topic={topic}, group_id={group_id}");
     let guard = self.state.read();
     let mut members = HashSet::new();
     for (key, state) in &guard.members {
       if key.topic == topic && key.group_id == group_id && state.lease_expiration_ts_ms > now_ts_ms
       {
-        members.insert(key.member_id.clone());
+        members.insert(ConsumerGroupMember {
+          member_id: key.member_id.clone(),
+          pod_id: state.pod_id.clone(),
+        });
       }
     }
 
     let mut members = members.into_iter().collect::<Vec<_>>();
-    members.sort();
+    members.sort_by(|left, right| left.member_id.cmp(&right.member_id));
     Ok(members)
   }
 
@@ -272,9 +279,10 @@ impl MemberKey {
 // MemberState
 //
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct MemberState {
   lease_expiration_ts_ms: i64,
+  pod_id: Option<String>,
 }
 
 //

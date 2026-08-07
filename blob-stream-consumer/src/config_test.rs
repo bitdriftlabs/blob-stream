@@ -151,3 +151,14 @@ fn validate_group_config_rejects_reserved_member_id_prefix() {
   let error = validate_group_config(&group).unwrap_err();
   assert!(error.to_string().contains("uses reserved prefix"));
 }
+
+#[test]
+fn validate_group_config_rejects_empty_pod_id() {
+  let mut group = ConsumerGroupConfig::new();
+  group.topic = "telemetry".to_string().into();
+  group.group_id = "group-a".to_string().into();
+  group.member_id = "member-a".to_string().into();
+  group.pod_id = Some(String::new().into());
+
+  assert!(validate_group_config(&group).is_err());
+}

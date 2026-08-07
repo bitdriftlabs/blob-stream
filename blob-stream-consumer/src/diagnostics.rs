@@ -219,9 +219,33 @@ pub struct ConsumerGroupPartitionLeaseSnapshot {
 pub struct ConsumerAssignmentPlanSnapshot {
   pub version: u64,
   pub planner_member_id: String,
+  pub policy: ConsumerAssignmentPolicy,
   pub members: Vec<String>,
+  pub member_topology: Vec<ConsumerMemberTopologySnapshot>,
+  pub pod_loads: Vec<ConsumerPodLoadSnapshot>,
   pub assignments: Vec<ConsumerPartitionAssignmentSnapshot>,
   pub published_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerAssignmentPolicy {
+  FlatMember,
+  PodAware,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// Physical topology registered by one member of a pod-aware plan.
+pub struct ConsumerMemberTopologySnapshot {
+  pub member_id: String,
+  pub pod_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// Aggregate partition load assigned to one physical pod.
+pub struct ConsumerPodLoadSnapshot {
+  pub pod_id: String,
+  pub partition_count: usize,
 }
 
 //
@@ -233,6 +257,7 @@ pub struct ConsumerAssignmentPlanSnapshot {
 pub struct ConsumerPartitionAssignmentSnapshot {
   pub virtual_partition_id: VirtualPartitionId,
   pub member_id: String,
+  pub pod_id: Option<String>,
 }
 
 //
@@ -500,15 +525,59 @@ impl ConsumerDiagnostics {
 pub fn assignment_plan_snapshot(
   plan: ConsumerGroupAssignmentPlan,
 ) -> ConsumerAssignmentPlanSnapshot {
+  let member_pods = plan
+    .member_topology
+    .as_ref()
+    .map(|members| {
+      members
+        .iter()
+        .filter_map(|member| {
+          member
+            .pod_id
+            .as_ref()
+            .map(|pod_id| (member.member_id.clone(), pod_id.clone()))
+        })
+        .collect::<BTreeMap<_, _>>()
+    })
+    .unwrap_or_default();
+  let mut pod_loads = BTreeMap::new();
+  for pod_id in member_pods.values() {
+    pod_loads.entry(pod_id.clone()).or_insert(0_usize);
+  }
+  for assignment in &plan.assignments {
+    if let Some(pod_id) = member_pods.get(&assignment.member_id) {
+      *pod_loads.entry(pod_id.clone()).or_insert(0_usize) += 1;
+    }
+  }
   ConsumerAssignmentPlanSnapshot {
     version: plan.version,
     planner_member_id: plan.planner_member_id,
+    policy: if plan.member_topology.is_some() {
+      ConsumerAssignmentPolicy::PodAware
+    } else {
+      ConsumerAssignmentPolicy::FlatMember
+    },
     members: plan.members,
+    member_topology: member_pods
+      .iter()
+      .map(|(member_id, pod_id)| ConsumerMemberTopologySnapshot {
+        member_id: member_id.clone(),
+        pod_id: pod_id.clone(),
+      })
+      .collect(),
+    pod_loads: pod_loads
+      .into_iter()
+      .map(|(pod_id, partition_count)| ConsumerPodLoadSnapshot {
+        pod_id,
+        partition_count,
+      })
+      .collect(),
     assignments: plan
       .assignments
       .into_iter()
       .map(|assignment| ConsumerPartitionAssignmentSnapshot {
         virtual_partition_id: assignment.virtual_partition_id,
+        pod_id: member_pods.get(&assignment.member_id).cloned(),
         member_id: assignment.member_id,
       })
       .collect(),

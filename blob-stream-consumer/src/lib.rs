@@ -107,13 +107,16 @@ pub use coordination::{
 };
 pub use diagnostics::{
   ConsumerAssignmentPlanSnapshot,
+  ConsumerAssignmentPolicy,
   ConsumerDiagnostics,
   ConsumerGroupLeaseObservation,
   ConsumerGroupPartitionLeaseSnapshot,
   ConsumerLocalPartitionSnapshot,
   ConsumerLocalStateSnapshot,
+  ConsumerMemberTopologySnapshot,
   ConsumerPartitionAssignmentSnapshot,
   ConsumerPartitionReadMode,
+  ConsumerPodLoadSnapshot,
   ConsumerReaderStateSnapshot,
   ConsumerSourceCheckpointSnapshot,
   ConsumerStateResponse,

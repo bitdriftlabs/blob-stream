@@ -540,6 +540,7 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    pod_id: Option<String>,
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> Result<()>;
@@ -550,6 +551,7 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    pod_id: Option<String>,
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> Result<()>;
@@ -563,7 +565,7 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
     topic: &str,
     group_id: &str,
     now_ts_ms: i64,
-  ) -> Result<Vec<String>>;
+  ) -> Result<Vec<ConsumerGroupMember>>;
 
   /// Return the last published complete assignment plan for this group.
   async fn get_assignment_plan(
@@ -612,6 +614,19 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
 }
 
 //
+// ConsumerGroupMember
+//
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Active consumer-group member with optional physical topology metadata.
+pub struct ConsumerGroupMember {
+  /// Stable consumer process identifier.
+  pub member_id: String,
+  /// Stable physical pod identifier when the caller supports pod-aware assignment.
+  pub pod_id: Option<String>,
+}
+
+//
 // ConsumerGroupAssignment
 //
 
@@ -637,6 +652,8 @@ pub struct ConsumerGroupAssignmentPlan {
   pub planner_member_id: String,
   /// Canonically sorted active members used to construct this plan.
   pub members: Vec<String>,
+  /// Optional canonical topology snapshot for pod-aware assignment plans.
+  pub member_topology: Option<Vec<ConsumerGroupMember>>,
   /// Canonically sorted partition ownership entries.
   pub assignments: Vec<ConsumerGroupAssignment>,
   /// Millisecond timestamp when the planner published this map.

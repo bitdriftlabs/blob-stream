@@ -21,6 +21,7 @@ use crate::config::{
 };
 use crate::diagnostics::{
   ConsumerAssignmentPlanSnapshot,
+  ConsumerAssignmentPolicy,
   ConsumerGroupLeaseObservation,
   ConsumerLocalPartitionSnapshot,
   ConsumerPartitionAssignmentSnapshot,
@@ -39,6 +40,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupLease,
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
+  ConsumerGroupMember,
   ConsumerGroupMembershipStore,
   ConsumerGroupPlannerLease,
   ConsumerGroupPlannerLeaseOutcome,
@@ -434,12 +436,13 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    pod_id: Option<String>,
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> anyhow::Result<()> {
     self
       .inner
-      .register_member(topic, group_id, member_id, now_ts_ms, ttl_ms)
+      .register_member(topic, group_id, member_id, pod_id, now_ts_ms, ttl_ms)
       .await
   }
 
@@ -448,6 +451,7 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     topic: &str,
     group_id: &str,
     member_id: &str,
+    pod_id: Option<String>,
     now_ts_ms: i64,
     ttl_ms: i64,
   ) -> anyhow::Result<()> {
@@ -461,7 +465,7 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     }
     self
       .inner
-      .heartbeat_member(topic, group_id, member_id, now_ts_ms, ttl_ms)
+      .heartbeat_member(topic, group_id, member_id, pod_id, now_ts_ms, ttl_ms)
       .await
   }
 
@@ -485,7 +489,7 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     topic: &str,
     group_id: &str,
     now_ts_ms: i64,
-  ) -> anyhow::Result<Vec<String>> {
+  ) -> anyhow::Result<Vec<ConsumerGroupMember>> {
     self
       .inner
       .list_active_members(topic, group_id, now_ts_ms)
@@ -1308,15 +1312,20 @@ fn group_lease_observation_includes_unleased_plan_partitions() {
   let plan = ConsumerAssignmentPlanSnapshot {
     version: 1,
     planner_member_id: "member-a".to_string(),
+    policy: ConsumerAssignmentPolicy::FlatMember,
     members: vec!["member-a".to_string(), "member-b".to_string()],
+    member_topology: vec![],
+    pod_loads: vec![],
     assignments: vec![
       ConsumerPartitionAssignmentSnapshot {
         virtual_partition_id: 0,
         member_id: "member-a".to_string(),
+        pod_id: None,
       },
       ConsumerPartitionAssignmentSnapshot {
         virtual_partition_id: 1,
         member_id: "member-b".to_string(),
+        pod_id: None,
       },
     ],
     published_at: "2026-07-17T00:00:00Z".to_string(),

@@ -6,6 +6,7 @@ use blob_stream_consumer::consumer::ConsumerReaderImpl;
 use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, NextResult};
 use blob_stream_consumer::{ConsumerReadConfig, DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS};
 use blob_stream_integration_tests::test_framework as framework;
+use blob_stream_metadata_store::ConsumerGroupMember;
 use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerError, ProducerRecord};
 use blob_stream_types::{logical_partition_for_key, virtual_partition_for_logical};
 use framework::{
@@ -42,6 +43,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::time::{Instant, timeout};
+
+fn member_ids(members: &[ConsumerGroupMember]) -> Vec<String> {
+  members
+    .iter()
+    .map(|member| member.member_id.clone())
+    .collect()
+}
 
 fn metrics_scope(component: &str) -> bd_server_stats::stats::Scope {
   Collector::default().scope(component)
@@ -2175,7 +2183,7 @@ async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
       consumer_time.now().unix_timestamp() * 1_000,
     )
     .await?;
-  assert_eq!(active_members, vec!["fit-010-b".to_string()]);
+  assert_eq!(member_ids(&active_members), vec!["fit-010-b".to_string()]);
   let takeover_leases = cluster
     .consumer_lease_store()
     .list_group_leases(group.topic.as_str(), group.group_id.as_str())
@@ -2793,10 +2801,12 @@ async fn graceful_shutdown_deregistration_fault_requires_expiry_before_full_repl
     .map_err(|error| anyhow::anyhow!("deregistration-fault shutdown task failed: {error}"))??;
 
   assert_eq!(
-    cluster
-      .consumer_membership_store()
-      .list_active_members(&topic, &group_id, logical_now_ms)
-      .await?,
+    member_ids(
+      &cluster
+        .consumer_membership_store()
+        .list_active_members(&topic, &group_id, logical_now_ms)
+        .await?,
+    ),
     vec!["fit-015-deregister-a".to_string()],
     "one-shot deregistration failure must leave A active until its lease expires"
   );
@@ -2821,7 +2831,7 @@ async fn graceful_shutdown_deregistration_fault_requires_expiry_before_full_repl
     .list_active_members(&topic, &group_id, logical_now_ms)
     .await?;
   assert_eq!(
-    members_before_expiry,
+    member_ids(&members_before_expiry),
     vec![
       "fit-015-deregister-a".to_string(),
       "fit-015-deregister-b".to_string(),
@@ -3147,9 +3157,9 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
     .await?;
   assert_eq!(leases.len(), PARTITION_COUNT as usize);
   assert!(
-    leases
+    leases.iter().all(|lease| active_members
       .iter()
-      .all(|lease| active_members.contains(&lease.owner_id)),
+      .any(|member| member.member_id == lease.owner_id)),
     "faulted consumer group has leases outside active membership: members={active_members:?}, \
      leases={leases:?}"
   );
