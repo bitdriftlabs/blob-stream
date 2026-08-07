@@ -6,19 +6,30 @@ use blob_stream_metadata_store::{
 use blob_stream_types::VirtualPartitionId;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+//
+// Consumer-group assignment algorithm
+//
+// Assignment is deterministic and cooperative: it first keeps every placement whose owner is
+// still active, fills gaps from the least-loaded owner, then moves only enough partitions to make
+// loads differ by at most one. Flat groups balance directly across members. Fully tagged groups
+// balance in two stages: partitions are balanced across physical pods before being balanced across
+// workers within each pod. That preserves worker concurrency without concentrating a group on a
+// small number of pods.
+
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 /// Compute a cooperative sticky assignment.
 ///
-/// The result maps each partition to an owner member id.
+/// The result maps each partition to an owner member ID. Normalization and lexicographic
+/// tie-breaking make every planner derive the same plan from the same inputs.
 pub fn cooperative_sticky_assignment(
   members: &[String],
   partitions: &[VirtualPartitionId],
   previous_assignment: &HashMap<VirtualPartitionId, String>,
   local_member_id: &str,
 ) -> HashMap<VirtualPartitionId, String> {
-  // Normalize membership input and ensure local member is represented so callers can compute
-  // deterministic intent even if discovery omitted self temporarily.
+  // Normalize membership and ensure the planner represents itself even when membership discovery
+  // has not observed its just-written heartbeat yet.
   let mut deduped_members = members
     .iter()
     .filter(|member| !member.trim().is_empty())
@@ -33,7 +44,8 @@ pub fn cooperative_sticky_assignment(
   deduped_members.sort();
   deduped_members.dedup();
 
-  // Normalize partition input for deterministic assignment and test stability.
+  // A plan has exactly one desired owner per virtual partition. Sorting and deduplicating prevents
+  // duplicate input values from affecting that desired ownership or the movement decision below.
   let mut deduped_partitions = partitions.to_vec();
   deduped_partitions.sort_unstable();
   deduped_partitions.dedup();
@@ -44,13 +56,15 @@ pub fn cooperative_sticky_assignment(
 
   let mut assignments = HashMap::new();
   let member_set = deduped_members.iter().cloned().collect::<HashSet<_>>();
-  // Load tracks partition counts per member for balancing decisions.
+  // Keep a load entry for inactive owners out of the calculation so departed members cannot retain
+  // a partition or affect the balancing target.
   let mut load = deduped_members
     .iter()
     .map(|member| (member.clone(), 0_usize))
     .collect::<HashMap<_, _>>();
 
-  // Keep prior placements where possible to preserve stickiness.
+  // Sticky retention is the first choice: reuse an active prior owner before considering a move.
+  // A missing or departed owner leaves its partition for the least-loaded active member instead.
   for partition_id in &deduped_partitions {
     if let Some(previous_owner) = previous_assignment.get(partition_id)
       && member_set.contains(previous_owner)
@@ -62,7 +76,7 @@ pub fn cooperative_sticky_assignment(
     }
   }
 
-  // Assign any unassigned partitions to the least-loaded member.
+  // Deterministically give new and orphaned partitions to the currently least-loaded member.
   for partition_id in &deduped_partitions {
     if assignments.contains_key(partition_id) {
       continue;
@@ -74,9 +88,9 @@ pub fn cooperative_sticky_assignment(
     }
   }
 
-  // Rebalance only if needed. A member at the integer-ceiling target may still need to donate
-  // when another member has no partition, so compare the actual extreme loads instead of only
-  // checking whether owners are above/below static target bounds.
+  // Repair only actual imbalance. Comparing extreme loads, rather than static floor/ceiling
+  // targets, handles oversubscribed groups where a member with the nominal ceiling must donate to
+  // an empty member.
   rebalance_member_loads(
     &deduped_members,
     &deduped_partitions,
@@ -92,6 +106,8 @@ pub(super) fn cooperative_sticky_assignment_with_pods(
   partitions: &[VirtualPartitionId],
   previous_assignment: &HashMap<VirtualPartitionId, String>,
 ) -> HashMap<VirtualPartitionId, String> {
+  // Build the physical topology up front. A partial topology is deliberately treated as a legacy
+  // group: planning with only some pod IDs would make pod balancing depend on discovery timing.
   let mut pod_members = BTreeMap::<String, Vec<String>>::new();
   let mut member_pods = HashMap::new();
   for member in members {
@@ -100,6 +116,7 @@ pub(super) fn cooperative_sticky_assignment_with_pods(
         .iter()
         .map(|member| member.member_id.clone())
         .collect::<Vec<_>>();
+      // The flat planner retains backward compatibility while existing members roll out pod IDs.
       return cooperative_sticky_assignment(
         &member_ids,
         partitions,
@@ -113,6 +130,7 @@ pub(super) fn cooperative_sticky_assignment_with_pods(
       .push(member.member_id.clone());
     member_pods.insert(member.member_id.clone(), pod_id.clone());
   }
+  // Each pod's member ordering determines deterministic within-pod tie breaking.
   for members in pod_members.values_mut() {
     members.sort();
     members.dedup();
@@ -121,6 +139,8 @@ pub(super) fn cooperative_sticky_assignment_with_pods(
     return HashMap::new();
   }
 
+  // The pod stage maps partitions to physical pods, then the worker stage below maps each pod's
+  // partitions to its current member IDs.
   let mut partitions = partitions.to_vec();
   partitions.sort_unstable();
   partitions.dedup();
@@ -131,7 +151,9 @@ pub(super) fn cooperative_sticky_assignment_with_pods(
     .collect::<BTreeMap<_, _>>();
   let mut partition_pods = HashMap::new();
 
-  // Preserve a partition's pod placement when its former owner remains active.
+  // Preserve a partition's existing physical placement whenever that owner remains active. This
+  // lets a pod add or lose workers without first moving partitions to another machine.
+  // Assign new and orphaned partitions at the pod level before considering individual workers.
   for partition_id in &partitions {
     if let Some(pod_id) = previous_assignment
       .get(partition_id)
@@ -150,10 +172,12 @@ pub(super) fn cooperative_sticky_assignment_with_pods(
     *pod_load.get_mut(&pod_id).expect("selected pod has load") += 1;
   }
 
-  // Move the fewest partitions necessary to make aggregate pod loads differ by at most one.
+  // Move only enough partitions to make aggregate pod loads differ by at most one.
   rebalance_pod_loads(&partitions, &mut partition_pods, &mut pod_load);
 
   let mut assignments = HashMap::new();
+  // With stable pod ownership fixed, independently balance each pod's assigned partitions among
+  // its workers. No worker balancing step can cross a physical pod boundary.
   for (pod_id, pod_member_ids) in &pod_members {
     let pod_partitions = partitions
       .iter()
@@ -182,6 +206,8 @@ pub(super) fn assignment_plan(
   local_member_id: &str,
   published_ts_ms: i64,
 ) -> ConsumerGroupAssignmentPlan {
+  // Persist canonical vectors rather than the hash-map iteration order used during planning. This
+  // makes plans byte-for-byte stable for diagnostics, validation, and peer planner comparison.
   let members = canonical_members(members, local_member_id);
   let mut partitions = partitions.to_vec();
   partitions.sort_unstable();
@@ -214,6 +240,8 @@ pub(super) fn canonical_member_topology(
   local_member_id: &str,
   local_pod_id: Option<&str>,
 ) -> Option<Vec<ConsumerGroupMember>> {
+  // A pod-aware plan is valid only when every planned member has a pod. Returning `None` for any
+  // incomplete view explicitly selects the legacy flat policy until the rollout is complete.
   let mut pod_ids = active_members
     .iter()
     .filter_map(|member| {
@@ -227,6 +255,7 @@ pub(super) fn canonical_member_topology(
     pod_ids.insert(local_member_id, local_pod_id);
   }
 
+  // `collect::<Option<_>>()` naturally rejects a missing topology record for any canonical member.
   members
     .iter()
     .map(|member_id| {
@@ -261,6 +290,7 @@ pub(super) fn assignment_plan_pod_ids(plan: &ConsumerGroupAssignmentPlan) -> Vec
 }
 
 fn least_loaded_pod(pod_load: &BTreeMap<String, usize>) -> String {
+  // `BTreeMap` order breaks equal-load ties by pod ID, giving independent planners the same pick.
   pod_load
     .iter()
     .min_by_key(|(pod_id, load)| (**load, *pod_id))
@@ -273,6 +303,9 @@ fn rebalance_pod_loads(
   partition_pods: &mut HashMap<VirtualPartitionId, String>,
   pod_load: &mut BTreeMap<String, usize>,
 ) {
+  // Each iteration moves one partition from the most-loaded pod to the least-loaded pod. Since
+  // prior placements are retained until this point, this is the minimum movement needed for the
+  // current load extremes.
   loop {
     let over = pod_load
       .iter()
@@ -290,6 +323,7 @@ fn rebalance_pod_loads(
     if over_load.saturating_sub(under_load) <= 1 {
       break;
     }
+    // Partitions are sorted, so choose a reproducible donor when several moves are valid.
     let Some(partition_id) = partitions
       .iter()
       .find(|partition_id| partition_pods.get(partition_id) == Some(&over_pod))
@@ -315,12 +349,16 @@ fn assign_within_pod(
   pod_id: &str,
   assignments: &mut HashMap<VirtualPartitionId, String>,
 ) {
+  // This mirrors flat sticky assignment, constrained to the partitions that the pod-level stage
+  // already assigned to this physical pod.
   let member_set = members.iter().collect::<HashSet<_>>();
   let mut load = members
     .iter()
     .cloned()
     .map(|member_id| (member_id, 0_usize))
     .collect::<HashMap<_, _>>();
+  // Retain a worker only when it remains active in the same pod. A retained member in another pod
+  // is intentionally ignored because the pod-level stage has already chosen this partition's pod.
   for partition_id in partitions {
     if let Some(previous_member) = previous_assignment.get(partition_id)
       && member_set.contains(previous_member)
@@ -334,6 +372,7 @@ fn assign_within_pod(
         .expect("active member has load") += 1;
     }
   }
+  // Newly arrived pod partitions and departed-worker partitions go to the least-loaded worker.
   for partition_id in partitions {
     if assignments.contains_key(partition_id) {
       continue;
@@ -351,6 +390,8 @@ fn rebalance_member_loads(
   assignments: &mut HashMap<VirtualPartitionId, String>,
   load: &mut HashMap<String, usize>,
 ) {
+  // Like pod rebalancing, transfer one deterministically selected partition at a time until the
+  // greatest and least member loads differ by no more than one.
   loop {
     let over = members
       .iter()
@@ -368,6 +409,7 @@ fn rebalance_member_loads(
     if over_load.saturating_sub(under_load) <= 1 {
       break;
     }
+    // The sorted partition list also keeps transfer selection stable for equal-load members.
     let Some(partition_id) = partitions
       .iter()
       .find(|partition_id| assignments.get(partition_id) == Some(&over_member))
@@ -386,7 +428,7 @@ fn rebalance_member_loads(
 }
 
 fn least_loaded_member(members: &[String], load: &HashMap<String, usize>) -> String {
-  // Ties break lexicographically for deterministic output across runs.
+  // Ties break lexicographically for deterministic output across independent planners.
   let mut selected = members.first().cloned().unwrap_or_default();
   let mut selected_load = load.get(&selected).copied().unwrap_or(usize::MAX);
 
@@ -402,6 +444,8 @@ fn least_loaded_member(members: &[String], load: &HashMap<String, usize>) -> Str
 }
 
 fn canonical_members(members: &[String], local_member_id: &str) -> Vec<String> {
+  // This shared canonicalization is also used when publishing plans, so membership discovery
+  // ordering and a temporarily missing local heartbeat cannot produce divergent planner input.
   let mut canonical = members
     .iter()
     .filter(|member| !member.trim().is_empty())
