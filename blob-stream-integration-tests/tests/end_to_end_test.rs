@@ -5620,7 +5620,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
         // The prefetch gate guarantees one buffered batch, but later batches can require another
         // refill cycle. Keep polling until the enclosing deadline instead of treating a normal
         // empty poll as a failed takeover.
-        Err(_) => continue,
+        Err(_) => {},
         Ok(Err(error)) => return Err(anyhow!("replacement owner next failed: {error}")),
         Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
         Ok(Ok(NextResult::Record(record))) => {
