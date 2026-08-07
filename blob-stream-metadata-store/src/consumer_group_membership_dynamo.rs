@@ -284,7 +284,7 @@ impl DynamoConsumerGroupMembershipStore {
     })
   }
 
-  fn plan_values(plan: &ConsumerGroupAssignmentPlan) -> HashMap<String, AttributeValue> {
+  fn plan_values(plan: &ConsumerGroupAssignmentPlan) -> Result<HashMap<String, AttributeValue>> {
     let mut values = HashMap::new();
     values.insert(
       ":version".to_string(),
@@ -306,30 +306,27 @@ impl DynamoConsumerGroupMembershipStore {
       ),
     );
     if let Some(member_topology) = &plan.member_topology {
+      let member_topology = member_topology
+        .iter()
+        .map(|member| {
+          let pod_id = member.pod_id.as_ref().ok_or_else(|| {
+            anyhow!(
+              "pod-aware assignment topology missing pod ID for member {}",
+              member.member_id
+            )
+          })?;
+          let mut entry = HashMap::new();
+          entry.insert(
+            ATTR_ASSIGNMENT_MEMBER.to_string(),
+            AttributeValue::S(member.member_id.clone()),
+          );
+          entry.insert(ATTR_POD_ID.to_string(), AttributeValue::S(pod_id.clone()));
+          Ok(AttributeValue::M(entry))
+        })
+        .collect::<Result<Vec<_>>>()?;
       values.insert(
         ":member_topology".to_string(),
-        AttributeValue::L(
-          member_topology
-            .iter()
-            .map(|member| {
-              let mut entry = HashMap::new();
-              entry.insert(
-                ATTR_ASSIGNMENT_MEMBER.to_string(),
-                AttributeValue::S(member.member_id.clone()),
-              );
-              entry.insert(
-                ATTR_POD_ID.to_string(),
-                AttributeValue::S(
-                  member
-                    .pod_id
-                    .clone()
-                    .expect("pod-aware topology has pod ID"),
-                ),
-              );
-              AttributeValue::M(entry)
-            })
-            .collect(),
-        ),
+        AttributeValue::L(member_topology),
       );
     }
     values.insert(
@@ -361,7 +358,7 @@ impl DynamoConsumerGroupMembershipStore {
       ":plan_type".to_string(),
       AttributeValue::S(RECORD_TYPE_ASSIGNMENT_PLAN.to_string()),
     );
-    values
+    Ok(values)
   }
 
   fn planner_lease_from_item(
@@ -792,7 +789,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       AttributeValue::S(planner_session_id.to_string()),
     );
     planner_values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-    let plan_values = Self::plan_values(&plan);
+    let plan_values = Self::plan_values(&plan)?;
     let group_key = Self::control_pk(topic, group_id);
 
     let planner_check = ConditionCheck::builder()

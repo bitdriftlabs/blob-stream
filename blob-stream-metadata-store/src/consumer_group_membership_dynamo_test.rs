@@ -386,6 +386,123 @@ async fn planner_records_do_not_appear_in_legacy_member_partition() -> Result<()
 }
 
 #[tokio::test]
+async fn assignment_plan_topology_round_trips_and_is_removed_for_flat_plan() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
+  create_membership_table(&client, &table_name).await?;
+
+  let store =
+    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
+  assert_eq!(
+    store
+      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-a", 1_000, 1_000)
+      .await?,
+    ConsumerGroupPlannerLeaseOutcome::Acquired
+  );
+  let assignments = vec![
+    ConsumerGroupAssignment {
+      virtual_partition_id: 0,
+      member_id: "member-a".to_string(),
+    },
+    ConsumerGroupAssignment {
+      virtual_partition_id: 1,
+      member_id: "member-b".to_string(),
+    },
+  ];
+  let member_topology = vec![
+    ConsumerGroupMember {
+      member_id: "member-a".to_string(),
+      pod_id: Some("pod-a".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "member-b".to_string(),
+      pod_id: Some("pod-b".to_string()),
+    },
+  ];
+  assert!(
+    store
+      .publish_assignment_plan(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-a",
+        1_000,
+        ConsumerGroupAssignmentPlan {
+          version: 1,
+          planner_member_id: "member-a".to_string(),
+          members: vec!["member-a".to_string(), "member-b".to_string()],
+          member_topology: Some(member_topology.clone()),
+          assignments: assignments.clone(),
+          published_ts_ms: 1_000,
+        },
+      )
+      .await?
+  );
+  assert_eq!(
+    store
+      .get_assignment_plan("topic-a", "group-a")
+      .await?
+      .and_then(|plan| plan.member_topology),
+    Some(member_topology)
+  );
+
+  assert!(
+    store
+      .publish_assignment_plan(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-a",
+        1_001,
+        ConsumerGroupAssignmentPlan {
+          version: 2,
+          planner_member_id: "member-a".to_string(),
+          members: vec!["member-a".to_string(), "member-b".to_string()],
+          member_topology: None,
+          assignments,
+          published_ts_ms: 1_001,
+        },
+      )
+      .await?
+  );
+  assert_eq!(
+    store
+      .get_assignment_plan("topic-a", "group-a")
+      .await?
+      .and_then(|plan| plan.member_topology),
+    None
+  );
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[test]
+fn assignment_plan_topology_missing_pod_id_returns_error() {
+  let plan = ConsumerGroupAssignmentPlan {
+    version: 1,
+    planner_member_id: "member-a".to_string(),
+    members: vec!["member-a".to_string()],
+    member_topology: Some(vec![ConsumerGroupMember {
+      member_id: "member-a".to_string(),
+      pod_id: None,
+    }]),
+    assignments: vec![ConsumerGroupAssignment {
+      virtual_partition_id: 0,
+      member_id: "member-a".to_string(),
+    }],
+    published_ts_ms: 1_000,
+  };
+
+  assert_eq!(
+    DynamoConsumerGroupMembershipStore::plan_values(&plan)
+      .err()
+      .map(|error| error.to_string()),
+    Some("pod-aware assignment topology missing pod ID for member member-a".to_string())
+  );
+}
+
+#[tokio::test]
 async fn planner_session_fences_stale_process_and_mismatched_plan_publisher() -> Result<()> {
   let client = dynamo_client().await?;
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());

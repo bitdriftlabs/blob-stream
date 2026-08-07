@@ -10,7 +10,12 @@ use crate::coordination::{
   cooperative_sticky_assignment,
   cooperative_sticky_assignment_with_pods,
 };
-use crate::diagnostics::{ConsumerAssignmentPolicy, assignment_plan_snapshot};
+use crate::diagnostics::{
+  ConsumerAssignmentPolicy,
+  ConsumerMemberTopologySnapshot,
+  ConsumerPodLoadSnapshot,
+  assignment_plan_snapshot,
+};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentOutcome,
@@ -359,6 +364,10 @@ fn pod_aware_assignment_plan_snapshot_includes_member_and_pod_identity() {
         member_id: "pod-b:worker-0".to_string(),
         pod_id: Some("pod-b".to_string()),
       },
+      ConsumerGroupMember {
+        member_id: "pod-c:worker-0".to_string(),
+        pod_id: Some("pod-c".to_string()),
+      },
     ]),
     assignments: vec![
       ConsumerGroupAssignment {
@@ -376,8 +385,40 @@ fn pod_aware_assignment_plan_snapshot_includes_member_and_pod_identity() {
   let snapshot = assignment_plan_snapshot(plan);
 
   assert_eq!(snapshot.policy, ConsumerAssignmentPolicy::PodAware);
-  assert_eq!(snapshot.member_topology.len(), 2);
-  assert_eq!(snapshot.pod_loads.len(), 2);
+  assert_eq!(
+    snapshot.member_topology,
+    vec![
+      ConsumerMemberTopologySnapshot {
+        member_id: "pod-a:worker-0".to_string(),
+        pod_id: "pod-a".to_string(),
+      },
+      ConsumerMemberTopologySnapshot {
+        member_id: "pod-b:worker-0".to_string(),
+        pod_id: "pod-b".to_string(),
+      },
+      ConsumerMemberTopologySnapshot {
+        member_id: "pod-c:worker-0".to_string(),
+        pod_id: "pod-c".to_string(),
+      },
+    ]
+  );
+  assert_eq!(
+    snapshot.pod_loads,
+    vec![
+      ConsumerPodLoadSnapshot {
+        pod_id: "pod-a".to_string(),
+        partition_count: 1,
+      },
+      ConsumerPodLoadSnapshot {
+        pod_id: "pod-b".to_string(),
+        partition_count: 1,
+      },
+      ConsumerPodLoadSnapshot {
+        pod_id: "pod-c".to_string(),
+        partition_count: 0,
+      },
+    ]
+  );
   assert_eq!(snapshot.assignments[0].pod_id.as_deref(), Some("pod-a"));
   assert_eq!(snapshot.assignments[1].pod_id.as_deref(), Some("pod-b"));
 }

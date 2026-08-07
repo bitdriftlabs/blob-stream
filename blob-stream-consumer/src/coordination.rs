@@ -334,16 +334,20 @@ impl ConsumerGroupCoordinatorImpl {
       .as_ref()
       .and_then(|plan| current_plan_validation_error.as_ref().map(|_| plan.version));
     let current_members = canonical_members(members, &self.config.member_id);
-    let active_members = self
-      .membership_store
-      .list_active_members(&self.config.topic, &self.config.group_id, now_ts_ms)
-      .await?;
-    let member_topology = canonical_member_topology(
-      &current_members,
-      &active_members,
-      &self.config.member_id,
-      self.config.pod_id.as_deref(),
-    );
+    let member_topology = if let Some(local_pod_id) = self.config.pod_id.as_deref() {
+      let active_members = self
+        .membership_store
+        .list_active_members(&self.config.topic, &self.config.group_id, now_ts_ms)
+        .await?;
+      canonical_member_topology(
+        &current_members,
+        &active_members,
+        &self.config.member_id,
+        Some(local_pod_id),
+      )
+    } else {
+      None
+    };
     let topology_changed = current_plan.as_ref().is_some_and(|plan| {
       plan.members != current_members || plan.member_topology != member_topology
     });

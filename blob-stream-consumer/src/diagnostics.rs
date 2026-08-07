@@ -537,10 +537,13 @@ pub fn assignment_plan_snapshot(
             .as_ref()
             .map(|pod_id| (member.member_id.clone(), pod_id.clone()))
         })
-        .collect::<HashMap<_, _>>()
+        .collect::<BTreeMap<_, _>>()
     })
     .unwrap_or_default();
   let mut pod_loads = BTreeMap::new();
+  for pod_id in member_pods.values() {
+    pod_loads.entry(pod_id.clone()).or_insert(0_usize);
+  }
   for assignment in &plan.assignments {
     if let Some(pod_id) = member_pods.get(&assignment.member_id) {
       *pod_loads.entry(pod_id.clone()).or_insert(0_usize) += 1;
