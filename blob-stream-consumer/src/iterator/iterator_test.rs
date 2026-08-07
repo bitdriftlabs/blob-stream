@@ -2361,6 +2361,7 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
     .await
     .unwrap()
     .unwrap();
+  assert_eq!(iterator.metrics.seeks.get(), 1);
   let rewound = timeout(Duration::from_secs(2), iterator.next())
     .await
     .unwrap()

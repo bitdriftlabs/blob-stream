@@ -8,6 +8,7 @@ use super::{
   PrefetchWorker,
   RecoveredCursor,
   Result,
+  SeekTrace,
   VirtualPartitionId,
   anyhow,
   mpsc,
@@ -106,11 +107,15 @@ impl ConsumerDriver {
     virtual_partition_id: VirtualPartitionId,
     offset: u64,
     now_unix_seconds: i64,
+    seek_trace: SeekTrace,
     response: oneshot::Sender<Result<()>>,
   ) {
     if let Some(reader) = &mut self.reader {
+      // Before the iterator starts, the driver owns the reader directly. There is no prefetch
+      // worker to enter recovery, so the seek trace finishes at this synchronous application.
       reader.seek(virtual_partition_id, offset, now_unix_seconds);
       record_reader_diagnostics(reader, &self.shared_state);
+      seek_trace.finish("reader_inline");
       let _ = response.send(Ok(()));
       return;
     }
@@ -123,6 +128,7 @@ impl ConsumerDriver {
       virtual_partition_id,
       offset,
       now_unix_seconds,
+      seek_trace,
       response,
     };
     if let Err(error) = reader_command_tx.send(command) {
