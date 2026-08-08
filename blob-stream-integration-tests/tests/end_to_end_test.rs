@@ -2604,9 +2604,8 @@ async fn live_group_recovery_waits_for_historical_metadata_visibility_delay() ->
   );
   // Set the late-publication time before starting B because the driver can begin a reader pass
   // while its rebalance hook is still held.
-  deferred_metadata_store.set_deferred_window_published_ts_ms(
-    consumer_time.now().unix_timestamp().saturating_mul(1_000),
-  );
+  let deferred_window_published_ts_ms = consumer_time.now().unix_timestamp().saturating_mul(1_000);
+  deferred_metadata_store.set_deferred_window_published_ts_ms(deferred_window_published_ts_ms);
   consumer_b.start()?;
   consumer_time.advance(TimeDuration::milliseconds(200));
   timeout(
@@ -2693,10 +2692,19 @@ async fn live_group_recovery_waits_for_historical_metadata_visibility_delay() ->
     "a deferred window must block all later recovery delivery: {delivery_counts:?}"
   );
 
-  // The worker's sleep began at the current fractional second. This reaches the next whole
-  // reader second but not the one-second sleep deadline, so a polling fallback would regress by
-  // rescanning and delivering the deferred row early.
-  consumer_time.advance(TimeDuration::milliseconds(999));
+  let visibility_deadline_ms = deferred_window_published_ts_ms.saturating_add(1_000);
+  let milliseconds_until_visibility_deadline = visibility_deadline_ms
+    .checked_sub(consumer_time.now().unix_timestamp_ms())
+    .ok_or_else(|| anyhow!("deferred-history visibility deadline has already elapsed"))?;
+  assert!(
+    milliseconds_until_visibility_deadline > 0,
+    "deferred-history visibility deadline must remain in the future"
+  );
+  // Advance to the final millisecond before the absolute deadline, rather than measuring from
+  // when the worker began its post-scan sleep.
+  consumer_time.advance(TimeDuration::milliseconds(
+    milliseconds_until_visibility_deadline - 1,
+  ));
   assert!(
     timeout(Duration::from_millis(100), consumer_b.next())
       .await

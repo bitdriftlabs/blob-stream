@@ -51,6 +51,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+use time::OffsetDateTime;
 use time::ext::NumericalDuration;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{Span, field};
@@ -313,10 +314,11 @@ impl PrefetchWorker {
         // A deferred row supplies a precise earliest retry instead of speculative exponential
         // polling. Re-read the clock after scanning because a slow scan can reduce the remaining
         // delay. If the deadline has arrived, retain the fallback rather than tight-looping.
-        let now_unix_seconds = self.time_provider.now().unix_timestamp();
+        let now = self.time_provider.now();
         let idle_delay = read_outcome
           .next_visibility_eligible_unix_seconds
-          .and_then(|deadline| deadline.checked_sub(now_unix_seconds))
+          .and_then(|deadline| OffsetDateTime::from_unix_timestamp(deadline).ok())
+          .map(|deadline| deadline - now)
           .filter(|delay| *delay > 0)
           .map_or_else(
             || {
