@@ -6,5 +6,5 @@ slow-timeout = { period = "1m", terminate-after = 1 }
 integration-services = { max-threads = 4 }
 
 [[profile.default.overrides]]
-filter = 'package(blob-stream-integration-tests)'
+filter     = 'package(blob-stream-integration-tests)'
 test-group = 'integration-services'

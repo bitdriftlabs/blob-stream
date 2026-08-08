@@ -13,7 +13,7 @@ use super::{
 };
 use crate::config::ConsumerGroupConfig;
 use bd_runtime_config::loader::Loader;
-use bd_test_helpers::feature_flags::{DefaultFeatureFlags, FakeLoader};
+use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_types::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS as SHARED_PUBLICATION_LAG_MS;
 use std::sync::Arc;
 

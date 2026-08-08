@@ -1,0 +1,39 @@
+name: License check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: org-read-only-install token
+        id: org-read-only
+        uses: getsentry/action-github-app-token@v2
+        with:
+          app_id: ${{ secrets.ORG_READ_ONLY_APP_ID }}
+          private_key: ${{ secrets.ORG_READ_ONLY_APP_PRIVATE_KEY }}
+
+      - name: Setup Git credentials
+        uses: de-vri-es/setup-git-credentials@v2
+        with:
+          credentials: https://x-access-token:${{ steps.org-read-only.outputs.token }}@github.com/
+
+      - name: Check licenses
+        uses: EmbarkStudios/cargo-deny-action@v2.0.6
+        with:
+          command: check licenses
