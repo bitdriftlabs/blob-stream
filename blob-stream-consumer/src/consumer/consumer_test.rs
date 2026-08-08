@@ -1559,6 +1559,180 @@ async fn recovery_capacity_resumes_at_the_first_deferred_window() {
 }
 
 #[tokio::test]
+async fn recovery_capacity_deferral_keeps_unprocessed_cutover_partitions_recovering() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let window_start = 900;
+
+  for (partition_id, snowflake_id) in [(7, 1), (8, 2)] {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      window_start,
+      snowflake_id,
+      partition_id,
+      SeqRange { start: 1, end: 1 },
+      vec![new_record(
+        vec![u8::try_from(partition_id).unwrap()],
+        window_start * 1_000,
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      metadata_visibility_delay_ms: Some(0),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .unwrap();
+  for partition_id in [7, 8] {
+    reader.hydrate_cursor_with_source(
+      partition_id,
+      &CommittedCursor {
+        virtual_partition_id: partition_id,
+        seq_end: 0,
+        source_checkpoint: Some(CommittedSourceCheckpoint {
+          window_start_unix_seconds: window_start,
+          snowflake_id: 0,
+        }),
+      },
+      Some(window_start * 1_000),
+      window_start,
+    );
+  }
+  reader
+    .set_assigned_virtual_partitions(&[7, 8], window_start)
+    .unwrap();
+
+  let first = reader
+    .read_available_with_capacity_and_settings(
+      window_start,
+      ReadCapacity::new(0),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert!(first.batches.is_empty());
+  for partition_id in [7, 8] {
+    assert!(matches!(
+      reader.virtual_partition_states.get(&partition_id),
+      Some(VirtualPartitionState::Recovering { recovery_state, .. })
+        if recovery_state.next_window_start_unix_seconds == window_start
+    ));
+  }
+
+  let resumed = reader
+    .read_available_with_capacity_and_settings(
+      window_start,
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(
+    resumed
+      .batches
+      .iter()
+      .map(|batch| batch.virtual_partition_id)
+      .collect::<Vec<_>>(),
+    vec![7, 8]
+  );
+}
+
+#[tokio::test]
+async fn fresh_capacity_deferral_retries_the_initial_window_before_fast_path() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let window_start = 900;
+
+  for (partition_id, snowflake_id) in [(7, 1), (8, 2)] {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      window_start,
+      snowflake_id,
+      partition_id,
+      SeqRange { start: 1, end: 1 },
+      vec![new_record(
+        vec![u8::try_from(partition_id).unwrap()],
+        window_start * 1_000,
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      metadata_visibility_delay_ms: Some(0),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .unwrap();
+  reader
+    .set_assigned_virtual_partitions(&[7, 8], window_start)
+    .unwrap();
+
+  let first = reader
+    .read_available_with_capacity_and_settings(
+      window_start,
+      ReadCapacity::new(0),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert!(first.batches.is_empty());
+  for partition_id in [7, 8] {
+    assert!(matches!(
+      reader.virtual_partition_states.get(&partition_id),
+      Some(VirtualPartitionState::Fresh { .. })
+    ));
+  }
+
+  let resumed = reader
+    .read_available_with_capacity_and_settings(
+      window_start,
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(
+    resumed
+      .batches
+      .iter()
+      .map(|batch| batch.virtual_partition_id)
+      .collect::<Vec<_>>(),
+    vec![7, 8]
+  );
+}
+
+#[tokio::test]
 async fn mature_recovery_metadata_is_scanned_once_across_capacity_cycles() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store = Arc::new(RecordingMetadataStore::new());

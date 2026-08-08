@@ -274,6 +274,7 @@ impl ConsumerReaderImpl {
     let mut blocked_recovering_partitions = HashSet::new();
     let mut deferred_recovery_windows = HashMap::<VirtualPartitionId, i64>::new();
     let mut capacity_deferred_recovery_windows = HashMap::<VirtualPartitionId, i64>::new();
+    let mut capacity_deferred_fresh_window_starts = HashSet::new();
     // Recovery can hand an active publication-horizon window to Fast. Fast retains the same
     // visibility safety check and replays its inclusive time floor once the row becomes eligible.
     let fast_horizon_windows = self
@@ -284,7 +285,7 @@ impl ConsumerReaderImpl {
     let mut deferred_fresh_partitions = HashSet::new();
     let mut segment_read_plans = Vec::new();
     let mut capacity_exhausted = false;
-    'windows: for (request, segments) in window_results {
+    'windows: for (request_index, (request, segments)) in window_results.into_iter().enumerate() {
       let window = request.window;
       trace!(
         "consumer scanned window: topic={}, window_start={}, segments={}",
@@ -506,14 +507,6 @@ impl ConsumerReaderImpl {
 
             if !capacity.reserve(batch_metadata.payload_bytes) {
               capacity_exhausted = true;
-              if matches!(
-                partition_state,
-                Some(VirtualPartitionState::Recovering { .. })
-              ) {
-                capacity_deferred_recovery_windows
-                  .entry(partition_id)
-                  .or_insert(window.window_start_unix_seconds);
-              }
               trace!(
                 "consumer deferred batch by prefetch capacity: topic={}, partition={}, \
                  seq_start={}, seq_end={}, payload_bytes={}",
@@ -559,6 +552,24 @@ impl ConsumerReaderImpl {
           )?);
         }
         if capacity_exhausted {
+          // A capacity stop leaves the current request only partially observed and prevents every
+          // later request from being processed. Keep all affected modes at their first incomplete
+          // window so a later pass cannot skip unread batches by advancing to Fast.
+          for deferred_request in scan_requests.iter().skip(request_index) {
+            for &partition_id in &deferred_request.eligibility.recovering_partitions {
+              capacity_deferred_recovery_windows
+                .entry(partition_id)
+                .and_modify(|deferred_window| {
+                  *deferred_window =
+                    (*deferred_window).min(deferred_request.window.window_start_unix_seconds);
+                })
+                .or_insert(deferred_request.window.window_start_unix_seconds);
+            }
+            if deferred_request.eligibility.fresh {
+              capacity_deferred_fresh_window_starts
+                .insert(deferred_request.window.window_start_unix_seconds);
+            }
+          }
           break 'windows;
         }
       }
@@ -635,7 +646,8 @@ impl ConsumerReaderImpl {
           initial_window_start_unix_seconds,
           ..
         } if scanned_fresh_window_starts.contains(initial_window_start_unix_seconds)
-          && !deferred_fresh_partitions.contains(partition_id) =>
+          && !deferred_fresh_partitions.contains(partition_id)
+          && !capacity_deferred_fresh_window_starts.contains(initial_window_start_unix_seconds) =>
         {
           initial_scans_completed.push((*partition_id, *initial_window_start_unix_seconds));
           next_state = Some(VirtualPartitionState::Fast {
