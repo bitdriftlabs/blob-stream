@@ -525,7 +525,19 @@ async fn visibility_delay_defers_newly_published_metadata() {
   )
   .unwrap();
 
-  assert!(reader.read_available(902).await.unwrap().is_empty());
+  let runtime_settings = reader.runtime_settings();
+  // The exact eligibility time is 903.000 seconds. The hint rounds it to the first reader clock
+  // second that cannot observe the row before the full one-second visibility delay has elapsed.
+  let outcome = reader
+    .read_available_with_capacity_and_settings(
+      902,
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+      runtime_settings,
+    )
+    .await
+    .unwrap();
+  assert!(outcome.batches.is_empty());
+  assert_eq!(outcome.next_visibility_eligible_unix_seconds, Some(903));
   let scan_state = reader.partition_scan_states();
   assert_eq!(scan_state.len(), 1);
   assert_eq!(scan_state[0].virtual_partition_id, 7);
@@ -1431,8 +1443,8 @@ async fn byte_capacity_defers_later_batches_until_the_next_scan() {
     .read_available_with_capacity_and_settings(950, ReadCapacity::new(1), first_settings)
     .await
     .unwrap();
-  assert_eq!(first.len(), 1);
-  assert_eq!(first[0].seq_range, SeqRange { start: 1, end: 1 });
+  assert_eq!(first.batches.len(), 1);
+  assert_eq!(first.batches[0].seq_range, SeqRange { start: 1, end: 1 });
   assert_eq!(reader.cursor(7), Some(1));
 
   let second_settings = reader.runtime_settings();
@@ -1440,8 +1452,8 @@ async fn byte_capacity_defers_later_batches_until_the_next_scan() {
     .read_available_with_capacity_and_settings(950, ReadCapacity::new(1), second_settings)
     .await
     .unwrap();
-  assert_eq!(second.len(), 1);
-  assert_eq!(second[0].seq_range, SeqRange { start: 2, end: 2 });
+  assert_eq!(second.batches.len(), 1);
+  assert_eq!(second.batches[0].seq_range, SeqRange { start: 2, end: 2 });
   assert_eq!(reader.cursor(7), Some(2));
 }
 
@@ -1575,6 +1587,7 @@ async fn capacity_limited_segment_read_excludes_deferred_batches() {
     .unwrap();
   assert_eq!(
     first
+      .batches
       .iter()
       .map(|batch| batch.virtual_partition_id)
       .collect::<Vec<_>>(),
@@ -1591,6 +1604,7 @@ async fn capacity_limited_segment_read_excludes_deferred_batches() {
     .unwrap();
   assert_eq!(
     second
+      .batches
       .iter()
       .map(|batch| batch.virtual_partition_id)
       .collect::<Vec<_>>(),

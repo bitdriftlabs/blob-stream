@@ -19,6 +19,7 @@ use super::shared::ConsumerIteratorMetrics;
 use super::{ConsumerLifecycleHooks, ConsumerSharedState};
 use crate::consumer::{
   ConsumerBatch,
+  ConsumerReadOutcome,
   ConsumerReader,
   ConsumerReaderFastFrontierState,
   ConsumerReaderFastScanBoundState,
@@ -50,6 +51,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+use time::OffsetDateTime;
 use time::ext::NumericalDuration;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{Span, field};
@@ -60,7 +62,7 @@ const MAX_SCAN_DETAIL_ENTRIES: usize = 64;
 // IdlePollBackoff
 //
 
-/// Exponential idle delay used only when a complete reader pass produces no batches.
+/// Exponential fallback delay for an empty pass that has no known metadata-visibility deadline.
 pub(super) struct IdlePollBackoff {
   inner: ExponentialBackoff,
 }
@@ -169,7 +171,9 @@ struct RecoveryTrace {
 }
 
 enum ReadAvailableOutcome {
-  Batches(Vec<ConsumerBatch>),
+  // A completed reader pass retains its internal scheduling information for the worker.
+  Batches(ConsumerReadOutcome),
+  // A command arrived while retrying a transient reader failure and must be applied first.
   CommandPending,
 }
 
@@ -291,7 +295,7 @@ impl PrefetchWorker {
       };
 
       let read_started_at = Instant::now();
-      let batches = match self
+      let read_outcome = match self
         .read_available_with_retry(capacity, runtime_settings)
         .await
       {
@@ -306,12 +310,26 @@ impl PrefetchWorker {
         .next_latency_seconds
         .observe(read_started_at.elapsed().as_secs_f64());
 
-      if batches.is_empty() {
-        let idle_delay_ms = idle_poll_backoff.next_delay_ms();
+      if read_outcome.batches.is_empty() {
+        // A deferred row supplies a precise earliest retry instead of speculative exponential
+        // polling. Re-read the clock after scanning because a slow scan can reduce the remaining
+        // delay. If the deadline has arrived, retain the fallback rather than tight-looping.
+        let now = self.time_provider.now();
+        let idle_delay = read_outcome
+          .next_visibility_eligible_unix_seconds
+          .and_then(|deadline| OffsetDateTime::from_unix_timestamp(deadline).ok())
+          .map(|deadline| deadline - now)
+          .filter(|delay| delay.is_positive())
+          .and_then(|delay| time::Duration::try_from(delay.unsigned_abs()).ok())
+          .unwrap_or_else(|| {
+            time::Duration::milliseconds(
+              i64::try_from(idle_poll_backoff.next_delay_ms()).unwrap_or(i64::MAX),
+            )
+          });
         tokio::select! {
-          () = self.time_provider.sleep(time::Duration::milliseconds(
-            i64::try_from(idle_delay_ms).unwrap_or(i64::MAX),
-          )) => {},
+          () = self.time_provider.sleep(idle_delay) => {},
+          // Configuration, assignment, hydration, and seek commands must not wait for metadata
+          // visibility. They wake the worker at this safe boundary and supersede the old hint.
           () = self.reader_command_notify.notified() => {},
         }
         continue;
@@ -320,14 +338,20 @@ impl PrefetchWorker {
       idle_poll_backoff.reset();
       self.metrics.prefetch_refill_cycles.inc();
       pending_record_count = pending_record_count.saturating_add(
-        batches
+        read_outcome
+          .batches
           .iter()
           .map(|batch| batch.records.len())
           .sum::<usize>(),
       );
-      pending_bytes =
-        pending_bytes.saturating_add(batches.iter().map(prefetched_batch_bytes).sum::<u64>());
-      pending.extend(batches);
+      pending_bytes = pending_bytes.saturating_add(
+        read_outcome
+          .batches
+          .iter()
+          .map(prefetched_batch_bytes)
+          .sum::<u64>(),
+      );
+      pending.extend(read_outcome.batches);
       self.record_pending_diagnostics(&pending, pending_record_count, pending_bytes);
     }
   }

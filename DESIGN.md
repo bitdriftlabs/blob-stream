@@ -365,6 +365,12 @@ active window while preserving the historical recovery barrier that protects cur
 metadata or blob read restores the pass's cursor and frontier state, so an undelivered batch is
 retried.
 
+After a successful pass that produces no batches solely because eligible metadata was deferred,
+the prefetch worker waits until the earliest deferred row can satisfy the visibility delay, rounded
+up to a whole second. This replaces only the normal empty-result idle backoff for that pass; a
+pass that produces batches continues immediately, and reader commands interrupt the wait so
+assignment, hydration, and seek changes remain prompt.
+
 ### Fast Query Bounds
 
 Let $D$ be the broker's enforced maximum metadata-publication lag plus

@@ -208,6 +208,11 @@ struct FailingReadBlobStore {
   failed_reads: AtomicUsize,
 }
 
+struct RecordingMetadataStore {
+  inner: InMemoryMetadataStore,
+  scans: AtomicUsize,
+}
+
 struct FailingLeaseStore {
   inner: InMemoryConsumerGroupLeaseStore,
 }
@@ -451,6 +456,25 @@ impl BlobStore for FailingReadBlobStore {
   }
 }
 
+#[async_trait::async_trait]
+impl MetadataStore for RecordingMetadataStore {
+  async fn write_segment(&self, metadata: SegmentMetadata) -> anyhow::Result<()> {
+    self.inner.write_segment(metadata).await
+  }
+
+  async fn scan_window_from_snowflake(
+    &self,
+    window: &TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
+  ) -> anyhow::Result<Vec<SegmentMetadata>> {
+    self.scans.fetch_add(1, Ordering::SeqCst);
+    self
+      .inner
+      .scan_window_from_snowflake(window, min_snowflake)
+      .await
+  }
+}
+
 impl BlockingMembershipStore {
   fn new() -> Self {
     Self {
@@ -689,15 +713,39 @@ async fn write_segment(
   seq_range: SeqRange,
   records: Vec<Record>,
 ) {
+  write_segment_with_publication_time(
+    blob_store,
+    metadata_store,
+    topic,
+    window_start,
+    snowflake_id,
+    virtual_partition_id,
+    seq_range,
+    records,
+    window_start * 1_000,
+  )
+  .await;
+}
+
+async fn write_segment_with_publication_time(
+  blob_store: &dyn BlobStore,
+  metadata_store: &dyn MetadataStore,
+  topic: &str,
+  window_start: i64,
+  snowflake_id: u64,
+  virtual_partition_id: VirtualPartitionId,
+  seq_range: SeqRange,
+  records: Vec<Record>,
+  metadata_published_ts_ms: i64,
+) {
   let batch = RecordBatch::new(virtual_partition_id, records.clone());
   let payload = StoredRecordBatch {
     virtual_partition_id,
-    records: records.clone(),
+    records,
     ..Default::default()
   }
   .write_to_bytes()
   .unwrap();
-
   let blob_key = BlobKey::new(format!("{topic}/{window_start}/{snowflake_id}.bin"));
 
   blob_store
@@ -706,30 +754,31 @@ async fn write_segment(
     .unwrap();
 
   let summary = batch.summary().unwrap();
-  let metadata = SegmentMetadata::new(
-    TopicWindowKey {
-      topic: topic.to_string(),
-      window_start_unix_seconds: window_start,
-    },
-    SnowflakeId(snowflake_id),
-    blob_key,
-    Compression::none(),
-    HashMap::from([(
-      virtual_partition_id,
-      vec![BatchMetadata {
-        seq_range,
-        byte_range: blob_stream_types::ByteRange {
-          start: 0,
-          end: payload.len() as u64,
-        },
-        payload_bytes: summary.payload_bytes,
-      }],
-    )]),
-    window_start * 1_000,
-    window_start * 1_000,
-  );
-
-  metadata_store.write_segment(metadata).await.unwrap();
+  metadata_store
+    .write_segment(SegmentMetadata::new(
+      TopicWindowKey {
+        topic: topic.to_string(),
+        window_start_unix_seconds: window_start,
+      },
+      SnowflakeId(snowflake_id),
+      blob_key,
+      Compression::none(),
+      HashMap::from([(
+        virtual_partition_id,
+        vec![BatchMetadata {
+          seq_range,
+          byte_range: blob_stream_types::ByteRange {
+            start: 0,
+            end: payload.len() as u64,
+          },
+          payload_bytes: summary.payload_bytes,
+        }],
+      )]),
+      metadata_published_ts_ms,
+      metadata_published_ts_ms,
+    ))
+    .await
+    .unwrap();
 }
 
 fn runtime_config() -> ConsumerRuntimeConfig {
@@ -835,6 +884,98 @@ async fn idle_prefetch_worker_processes_hydration_command_without_clock_advance(
   })
   .await
   .expect("idle prefetch worker did not process the hydration command");
+
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn visibility_deferred_empty_scan_waits_until_metadata_is_eligible() {
+  let time_provider = Arc::new(ManualTimeProvider::new(
+    time::OffsetDateTime::from_unix_timestamp(902).unwrap(),
+  ));
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(RecordingMetadataStore {
+    inner: InMemoryMetadataStore::new(),
+    scans: AtomicUsize::new(0),
+  });
+  let metadata_store_for_iterator: Arc<dyn MetadataStore> = metadata_store.clone();
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![3],
+    }));
+  let mut runtime = runtime_config();
+  runtime.read.as_mut().unwrap().metadata_visibility_delay_ms = Some(1_000);
+  write_segment_with_publication_time(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    3,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![1], 902_000)],
+    902_000,
+  )
+  .await;
+
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime,
+    blob_store,
+    metadata_store_for_iterator,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .time_provider(time_provider.clone())
+  .build()
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[3]).await;
+  // The prefetch worker has scanned the deferred row and registered its exact visibility wait.
+  // The coordination task accounts for the other manual-clock sleeper.
+  timeout(Duration::from_secs(1), async {
+    while metadata_store.scans.load(Ordering::SeqCst) < 1 {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("expected initial metadata scan");
+  time_provider.wait_until_sleeping(2).await;
+  assert_eq!(metadata_store.scans.load(Ordering::SeqCst), 1);
+
+  // The generic idle backoff is shorter than one second. Advancing to just before eligibility
+  // proves the worker uses the visibility deadline instead of repeatedly scanning that tail.
+  time_provider.advance(time::Duration::milliseconds(999));
+  for _ in 0 .. 10 {
+    tokio::task::yield_now().await;
+  }
+  assert_eq!(metadata_store.scans.load(Ordering::SeqCst), 1);
+
+  // At the rounded deadline, the deferred row becomes visible and the retry can deliver it.
+  time_provider.advance(time::Duration::milliseconds(1));
+  timeout(Duration::from_secs(1), async {
+    while metadata_store.scans.load(Ordering::SeqCst) < 2 {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("expected metadata rescan at the visibility deadline");
+  let next = timeout(Duration::from_secs(1), iterator.next())
+    .await
+    .unwrap()
+    .unwrap();
+  assert!(matches!(next, NextResult::Record(_)));
 
   Box::new(iterator).shutdown().await.unwrap();
 }
