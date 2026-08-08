@@ -17,7 +17,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
-use bd_test_helpers::feature_flags::{DefaultFeatureFlags, FakeLoader};
+use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
 use blob_stream_metadata_store::{InMemoryMetadataStore, MetadataStore, SegmentMetadata};
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;

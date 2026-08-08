@@ -1,5 +1,6 @@
 [package]
 edition = "2024"
+license = "Apache-2.0"
 name    = "blob-stream-integration-tests"
 publish = false
 version = "0.1.0"
@@ -18,7 +19,7 @@ aws-types.workspace               = true
 axum.workspace                    = true
 bd-server-stats.workspace         = true
 bd-shutdown.workspace             = true
-bd-test-helpers.workspace         = true
+bd-test-helpers-core.workspace    = true
 bd-time.workspace                 = true
 blob-stream-blob-store.path       = "../blob-stream-blob-store"
 blob-stream-broker.path           = "../blob-stream-broker"

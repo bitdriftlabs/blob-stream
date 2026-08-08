@@ -10,21 +10,13 @@ lto             = "thin"
 split-debuginfo = "off"
 
 [target.'cfg(target_vendor="apple")']
-rustflags = [
-  "-Csplit-debuginfo=unpacked",
-]
+rustflags = ["-Csplit-debuginfo=unpacked"]
 
 [target.x86_64-unknown-linux-gnu]
-rustflags = [
-  "-C",
-  "link-arg=-fuse-ld=lld",
-]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [target.aarch64-unknown-linux-gnu]
-rustflags = [
-  "-C",
-  "link-arg=-fuse-ld=lld",
-]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 #####################################
 # Warnings and Linter Configuration #
@@ -76,4 +68,4 @@ git-fetch-with-cli = true
 # Homebrew ld64.lld from the user Cargo config defaults to a macOS 11 deployment target,
 # which newer aws-lc/ring objects no longer satisfy on current Apple SDKs.
 MACOSX_DEPLOYMENT_TARGET = "26.0"
-PROTOC_NO_VENDOR = "true"
+PROTOC_NO_VENDOR         = "true"
