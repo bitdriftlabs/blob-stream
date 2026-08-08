@@ -828,6 +828,8 @@ fn reader_partition_scan_snapshot(
     recovery_segments_handed_to_fast_by_visibility: state
       .recovery_segments_handed_to_fast_by_visibility,
     recovery_segments_blocked_by_visibility: state.recovery_segments_blocked_by_visibility,
+    recovery_metadata_cache_hits: state.recovery_metadata_cache_hits,
+    recovery_metadata_cache_misses: state.recovery_metadata_cache_misses,
     metadata_batches_deferred_by_capacity: state.metadata_batches_deferred_by_capacity,
     batches_accepted: state.batches_accepted,
     records_accepted: state.records_accepted,

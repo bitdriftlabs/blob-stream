@@ -20,8 +20,36 @@ use super::{
   metadata_availability_delay_seconds,
   trace,
 };
+use crate::consumer::reader::RecoveryMetadataCacheKey;
 
 impl ConsumerReaderImpl {
+  /// Return the cache identity for an immutable, recovery-only metadata request.
+  pub(in crate::consumer) fn mature_recovery_metadata_cache_key(
+    &self,
+    request: &ScanRequest,
+    now_unix_seconds: i64,
+  ) -> Option<RecoveryMetadataCacheKey> {
+    let &[partition_id] = request.eligibility.recovering_partitions.as_slice() else {
+      return None;
+    };
+    let window_end_unix_seconds = request
+      .window
+      .window_start_unix_seconds
+      .saturating_add(consumer_window_size_seconds(&self.config));
+    if !request.recovery_scan
+      || request.eligibility.fast
+      || request.eligibility.fresh
+      || window_end_unix_seconds > self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds)
+    {
+      return None;
+    }
+    Some((
+      partition_id,
+      request.window.window_start_unix_seconds,
+      request.min_snowflake.map(SnowflakeId::as_u64),
+    ))
+  }
+
   /// Return the bounded current-window horizon, from oldest candidate to newest.
   pub(in crate::consumer) fn scan_windows(
     &self,
@@ -70,7 +98,15 @@ impl ConsumerReaderImpl {
       .and_modify(|request| {
         request.min_snowflake = request.min_snowflake.min(min_snowflake);
         request.recovery_scan |= recovery_scan;
-        request.eligibility.recovering |= eligibility.recovering;
+        for &partition_id in &eligibility.recovering_partitions {
+          if !request
+            .eligibility
+            .recovering_partitions
+            .contains(&partition_id)
+          {
+            request.eligibility.recovering_partitions.push(partition_id);
+          }
+        }
         request.eligibility.fast |= eligibility.fast;
         request.eligibility.fresh |= eligibility.fresh;
       })
@@ -223,92 +259,105 @@ impl ConsumerReaderImpl {
   /// Return the least lower bound that can serve every recovering partition in one window.
   pub(in crate::consumer) fn recovery_scan_min_snowflake(
     &self,
+    partition_id: VirtualPartitionId,
     window_start_unix_seconds: i64,
   ) -> Option<SnowflakeId> {
-    let mut minimum = None;
-    for state in self
-      .virtual_partition_states
-      .values()
-      .filter(|state| state.is_assigned())
+    let VirtualPartitionState::Recovering { recovery_state, .. } =
+      self.virtual_partition_states.get(&partition_id)?
+    else {
+      return None;
+    };
+    if recovery_state.next_window_start_unix_seconds > window_start_unix_seconds
+      || window_start_unix_seconds > recovery_state.cutover_window_start_unix_seconds
     {
-      let VirtualPartitionState::Recovering { recovery_state, .. } = state else {
-        continue;
-      };
-      if recovery_state.next_window_start_unix_seconds > window_start_unix_seconds
-        || window_start_unix_seconds > recovery_state.cutover_window_start_unix_seconds
-      {
-        continue;
-      }
-      let min_snowflake = recovery_state.first_window_min_snowflake.filter(|_| {
-        recovery_state.first_window_start_unix_seconds == Some(window_start_unix_seconds)
-          && recovery_state.next_window_start_unix_seconds == window_start_unix_seconds
-      })?;
-      minimum = Some(minimum.map_or(min_snowflake, |current: SnowflakeId| {
-        current.min(min_snowflake)
-      }));
+      return None;
     }
-    minimum
+    recovery_state.first_window_min_snowflake.filter(|_| {
+      recovery_state.first_window_start_unix_seconds == Some(window_start_unix_seconds)
+        && recovery_state.next_window_start_unix_seconds == window_start_unix_seconds
+    })
   }
 
   /// Build a scan pass that prioritizes bounded recovery before using the fast path.
   pub(in crate::consumer) fn scan_requests(
-    &self,
+    &mut self,
     now_unix_seconds: i64,
     assigned_partition_ids: &[VirtualPartitionId],
   ) -> Result<(Vec<ScanRequest>, bool)> {
     let mut scan_requests = BTreeMap::new();
     let mut recovery_scan = false;
 
-    // Scan a bounded chronological slice of retention recovery before allowing this partition's
-    // fast path. A failure leaves the state untouched, so the same slice is retried.
-    let oldest_recovery_window = self
+    // Rotate recovery slices between partitions so a dense historical partition cannot consume
+    // every prefetch cycle and starve a later partition's independent recovery.
+    let mut recovering_partitions = self
       .virtual_partition_states
-      .values()
-      .filter(|state| state.is_assigned())
-      .filter_map(|state| match state {
-        VirtualPartitionState::Recovering { recovery_state, .. } => {
-          Some(recovery_state.next_window_start_unix_seconds)
-        },
-        VirtualPartitionState::PendingCursor { .. }
+      .iter()
+      .filter_map(|(partition_id, state)| match state {
+        VirtualPartitionState::Recovering { recovery_state, .. } if state.is_assigned() => Some((
+          *partition_id,
+          recovery_state.next_window_start_unix_seconds,
+          recovery_state.cutover_window_start_unix_seconds,
+        )),
+        VirtualPartitionState::Recovering { .. }
+        | VirtualPartitionState::PendingCursor { .. }
         | VirtualPartitionState::PendingRecovering { .. }
         | VirtualPartitionState::PendingFast { .. }
         | VirtualPartitionState::Fresh { .. }
         | VirtualPartitionState::Fast { .. } => None,
       })
-      .min();
-    if let Some(oldest_recovery_window) = oldest_recovery_window {
-      let window_size_seconds = consumer_window_size_seconds(&self.config);
-      let latest_recovery_window = self
-        .virtual_partition_states
-        .values()
-        .filter(|state| state.is_assigned())
-        .filter_map(|state| match state {
-          VirtualPartitionState::Recovering { recovery_state, .. } => {
-            Some(recovery_state.cutover_window_start_unix_seconds)
+      .collect::<Vec<_>>();
+    recovering_partitions.sort_by_key(|(partition_id, ..)| *partition_id);
+    if recovering_partitions.is_empty() {
+      self.recovery_scan_last_partition = None;
+    } else if recovering_partitions.iter().all(
+      |(_, recovery_start_window, recovery_cutover_window)| {
+        recovery_start_window == recovery_cutover_window
+      },
+    ) {
+      // All partitions need only their active cutover window. They can share one query without
+      // allowing a dense historical recovery to monopolize subsequent capacity-limited passes.
+      for (partition_id, recovery_start_window, _) in &recovering_partitions {
+        Self::insert_scan_request(
+          &mut scan_requests,
+          self.config.topic.as_str(),
+          *recovery_start_window,
+          self.recovery_scan_min_snowflake(*partition_id, *recovery_start_window),
+          true,
+          ScanEligibility {
+            recovering_partitions: vec![*partition_id],
+            fast: false,
+            fresh: false,
           },
-          VirtualPartitionState::PendingCursor { .. }
-          | VirtualPartitionState::PendingRecovering { .. }
-          | VirtualPartitionState::PendingFast { .. }
-          | VirtualPartitionState::Fresh { .. }
-          | VirtualPartitionState::Fast { .. } => None,
-        })
-        .max()
-        .unwrap_or(oldest_recovery_window);
+        );
+      }
+      self.recovery_scan_last_partition = None;
+      recovery_scan = true;
+    } else {
+      let next_partition_index = self.recovery_scan_last_partition.map_or(0, |partition_id| {
+        recovering_partitions
+          .iter()
+          .position(|(candidate, ..)| *candidate > partition_id)
+          .unwrap_or(0)
+      });
+      let (partition_id, recovery_start_window, recovery_cutover_window) =
+        recovering_partitions[next_partition_index];
+      self.recovery_scan_last_partition = Some(partition_id);
+      let window_size_seconds = consumer_window_size_seconds(&self.config);
       for offset in 0 .. MAX_RECOVERY_WINDOWS_PER_SCAN {
         let offset = i64::try_from(offset).unwrap_or(i64::MAX);
         let window_start =
-          oldest_recovery_window.saturating_add(offset.saturating_mul(window_size_seconds));
-        if window_start > latest_recovery_window {
+          recovery_start_window.saturating_add(offset.saturating_mul(window_size_seconds));
+        if window_start > recovery_cutover_window {
           break;
         }
         Self::insert_scan_request(
           &mut scan_requests,
           self.config.topic.as_str(),
           window_start,
-          self.recovery_scan_min_snowflake(window_start),
+          self.recovery_scan_min_snowflake(partition_id, window_start),
           true,
           ScanEligibility {
-            recovering: true,
+            recovering_partitions: vec![partition_id],
             fast: false,
             fresh: false,
           },
@@ -334,7 +383,7 @@ impl ConsumerReaderImpl {
           None,
           true,
           ScanEligibility {
-            recovering: false,
+            recovering_partitions: Vec::new(),
             fast: false,
             fresh: true,
           },
@@ -360,7 +409,7 @@ impl ConsumerReaderImpl {
           )),
           false,
           ScanEligibility {
-            recovering: false,
+            recovering_partitions: Vec::new(),
             fast: true,
             fresh: false,
           },

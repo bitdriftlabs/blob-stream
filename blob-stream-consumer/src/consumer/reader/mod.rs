@@ -21,10 +21,11 @@ use anyhow::{Result, ensure};
 use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
 use blob_stream_blob_store::BlobStore;
-use blob_stream_metadata_store::MetadataStore;
-use blob_stream_types::{CommittedCursor, SnowflakeId, VirtualPartitionId, Window};
+use blob_stream_metadata_store::{MetadataStore, SegmentMetadata};
+use blob_stream_types::{BatchMetadata, CommittedCursor, SnowflakeId, VirtualPartitionId, Window};
 use log::info;
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::sync::Arc;
 
 mod diagnostics;
@@ -32,6 +33,9 @@ mod lifecycle;
 mod runtime;
 
 const HISTORICAL_SEEK_RECOVERY_SECONDS: i64 = 10 * 60;
+
+/// Identity of one immutable recovery metadata response retained by this reader instance.
+pub(in crate::consumer) type RecoveryMetadataCacheKey = (VirtualPartitionId, i64, Option<u64>);
 
 //
 // Scanning algorithm overview
@@ -100,6 +104,40 @@ pub struct ConsumerReaderImpl {
   pub(in crate::consumer) retention_days: u32,
   pub(in crate::consumer) maximum_metadata_publication_lag_ms: u64,
   pub(in crate::consumer) fast_frontiers: HashMap<(VirtualPartitionId, i64), SnowflakeId>,
+  pub(in crate::consumer) recovery_scan_last_partition: Option<VirtualPartitionId>,
+  pub(in crate::consumer) recovery_metadata_cache:
+    HashMap<RecoveryMetadataCacheKey, Arc<[SegmentMetadata]>>,
   pub(in crate::consumer) feature_flags: Option<FeatureFlagsWatch>,
   pub(in crate::consumer) metrics: ConsumerReaderMetrics,
+}
+
+impl ConsumerReaderImpl {
+  /// Record the current reader-local cache footprint after any mutation.
+  pub(in crate::consumer) fn record_recovery_metadata_cache_state(&self) {
+    self
+      .metrics
+      .record_recovery_metadata_cache_entries(self.recovery_metadata_cache.len());
+    self.metrics.record_recovery_metadata_cache_retained_bytes(
+      self
+        .recovery_metadata_cache
+        .values()
+        .flat_map(|segments| segments.iter())
+        .map(Self::recovery_metadata_cache_segment_bytes)
+        .fold(0_u64, u64::saturating_add),
+    );
+  }
+
+  fn recovery_metadata_cache_segment_bytes(segment: &SegmentMetadata) -> u64 {
+    let mut bytes = u64::try_from(size_of::<SegmentMetadata>()).unwrap_or(u64::MAX);
+    bytes = bytes.saturating_add(u64::try_from(segment.window.topic.len()).unwrap_or(u64::MAX));
+    bytes =
+      bytes.saturating_add(u64::try_from(segment.blob_key.as_str().len()).unwrap_or(u64::MAX));
+    for batches in segment.segment_index.values() {
+      bytes = bytes.saturating_add(
+        u64::try_from(size_of::<BatchMetadata>().saturating_mul(batches.capacity()))
+          .unwrap_or(u64::MAX),
+      );
+    }
+    bytes
+  }
 }
