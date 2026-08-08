@@ -130,6 +130,7 @@ cargo test -p blob-stream-metadata-store --doc
 
 - Format: `cargo +nightly fmt`
 - Lint: `cargo clippy --workspace --bins --examples --tests -- --no-deps`
+- License: `cargo deny check licenses`
 - Test: `cargo nextest run`
 - Integration tests: `cargo nextest run -p blob-stream-integration-tests`
 

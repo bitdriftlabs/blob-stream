@@ -12,3 +12,7 @@ test:
 clippy:
 	ci/setup.sh
 	SKIP_PROTO_GEN=1 cargo clippy --workspace --bins --examples --tests -- --no-deps
+
+.PHONY: license
+license:
+	cargo deny check licenses
