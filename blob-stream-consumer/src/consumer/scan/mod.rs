@@ -75,9 +75,9 @@ pub(in crate::consumer) struct ScanRequest {
 /// These flags are intentionally not mutually exclusive: recovery can overlap the fast horizon,
 /// and a newly assigned partition can share a window with either. They avoid duplicate metadata
 /// queries while each partition still applies its own cursor and mode filtering.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(in crate::consumer) struct ScanEligibility {
-  pub(in crate::consumer) recovering: bool,
+  pub(in crate::consumer) recovering_partitions: Vec<VirtualPartitionId>,
   pub(in crate::consumer) fast: bool,
   pub(in crate::consumer) fresh: bool,
 }

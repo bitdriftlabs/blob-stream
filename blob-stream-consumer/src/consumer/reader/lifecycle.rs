@@ -86,6 +86,8 @@ impl ConsumerReaderImpl {
       retention_days,
       maximum_metadata_publication_lag_ms,
       fast_frontiers: HashMap::new(),
+      recovery_scan_last_partition: None,
+      recovery_metadata_cache: HashMap::new(),
       config,
       blob_store,
       metadata_store,
@@ -120,6 +122,14 @@ impl ConsumerReaderImpl {
         .fast_frontiers
         .retain(|(partition_id, _), _| assigned.contains(partition_id));
     }
+    let cached_entry_count = self.recovery_metadata_cache.len();
+    self
+      .recovery_metadata_cache
+      .retain(|(partition_id, ..), _| assigned.contains(partition_id));
+    self.metrics.record_recovery_metadata_cache_invalidation(
+      cached_entry_count.saturating_sub(self.recovery_metadata_cache.len()),
+    );
+    self.record_recovery_metadata_cache_state();
     // A revoked partition has no reader-local work left after the iterator drains it. Its durable
     // cursor belongs in the consumer-group lease and is hydrated again if this reader reacquires
     // the partition.
@@ -156,6 +166,7 @@ impl ConsumerReaderImpl {
 
   /// Set the in-memory cursor for a virtual partition and reset its fast scan frontier.
   pub fn set_cursor(&mut self, virtual_partition_id: VirtualPartitionId, seq_end: u64) {
+    self.clear_recovery_metadata_cache(virtual_partition_id);
     self
       .virtual_partition_states
       .entry(virtual_partition_id)
@@ -167,6 +178,17 @@ impl ConsumerReaderImpl {
     self
       .fast_frontiers
       .retain(|(partition_id, _), _| *partition_id != virtual_partition_id);
+  }
+
+  fn clear_recovery_metadata_cache(&mut self, virtual_partition_id: VirtualPartitionId) {
+    let cached_entry_count = self.recovery_metadata_cache.len();
+    self
+      .recovery_metadata_cache
+      .retain(|(partition_id, ..), _| *partition_id != virtual_partition_id);
+    self.metrics.record_recovery_metadata_cache_invalidation(
+      cached_entry_count.saturating_sub(self.recovery_metadata_cache.len()),
+    );
+    self.record_recovery_metadata_cache_state();
   }
 
   /// Reposition a partition cursor and recover recent windows before returning to the fast path.
@@ -265,6 +287,7 @@ impl ConsumerReaderImpl {
       state.advance_cursor(committed_cursor.seq_end);
       return;
     }
+    self.clear_recovery_metadata_cache(virtual_partition_id);
     if source_window_start_unix_seconds <= cutover_window_start_unix_seconds {
       self.virtual_partition_states.insert(
         virtual_partition_id,

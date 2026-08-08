@@ -21,6 +21,12 @@ pub(in crate::consumer) struct ConsumerReaderMetrics {
   pub(in crate::consumer) metadata_recovery_scan_failures: IntCounter,
   metadata_recovery_scan_hits: IntCounter,
   metadata_recovery_scan_batches_read: IntCounter,
+  recovery_metadata_cache_hits: IntCounter,
+  recovery_metadata_cache_misses: IntCounter,
+  recovery_metadata_cache_inserts: IntCounter,
+  recovery_metadata_cache_invalidations: IntCounter,
+  recovery_metadata_cache_entries: IntGauge,
+  recovery_metadata_cache_retained_bytes: IntGauge,
   metadata_fast_scan_frontiers: IntGauge,
   pub(in crate::consumer) metadata_fast_scan_without_lower_bound: IntCounter,
   pub(in crate::consumer) metadata_fast_scan_segments_below_partition_frontier: IntCounter,
@@ -55,6 +61,12 @@ impl ConsumerReaderMetrics {
       metadata_recovery_scan_failures: scope.counter("metadata_recovery_scan_failures"),
       metadata_recovery_scan_hits: scope.counter("metadata_recovery_scan_hits"),
       metadata_recovery_scan_batches_read: scope.counter("metadata_recovery_scan_batches_read"),
+      recovery_metadata_cache_hits: scope.counter("recovery_metadata_cache_hits"),
+      recovery_metadata_cache_misses: scope.counter("recovery_metadata_cache_misses"),
+      recovery_metadata_cache_inserts: scope.counter("recovery_metadata_cache_inserts"),
+      recovery_metadata_cache_invalidations: scope.counter("recovery_metadata_cache_invalidations"),
+      recovery_metadata_cache_entries: scope.gauge("recovery_metadata_cache_entries"),
+      recovery_metadata_cache_retained_bytes: scope.gauge("recovery_metadata_cache_retained_bytes"),
       metadata_fast_scan_frontiers: scope.gauge("metadata_fast_scan_frontiers"),
       metadata_fast_scan_without_lower_bound: scope
         .counter("metadata_fast_scan_without_lower_bound"),
@@ -109,6 +121,36 @@ impl ConsumerReaderMetrics {
     self
       .metadata_fast_scan_frontiers
       .set(i64::try_from(frontier_count).unwrap_or(i64::MAX));
+  }
+
+  pub(in crate::consumer) fn record_recovery_metadata_cache_hit(&self) {
+    self.recovery_metadata_cache_hits.inc();
+  }
+
+  pub(in crate::consumer) fn record_recovery_metadata_cache_miss(&self) {
+    self.recovery_metadata_cache_misses.inc();
+  }
+
+  pub(in crate::consumer) fn record_recovery_metadata_cache_insert(&self) {
+    self.recovery_metadata_cache_inserts.inc();
+  }
+
+  pub(in crate::consumer) fn record_recovery_metadata_cache_invalidation(&self, count: usize) {
+    self
+      .recovery_metadata_cache_invalidations
+      .inc_by(u64::try_from(count).unwrap_or(u64::MAX));
+  }
+
+  pub(in crate::consumer) fn record_recovery_metadata_cache_entries(&self, count: usize) {
+    self
+      .recovery_metadata_cache_entries
+      .set(i64::try_from(count).unwrap_or(i64::MAX));
+  }
+
+  pub(in crate::consumer) fn record_recovery_metadata_cache_retained_bytes(&self, bytes: u64) {
+    self
+      .recovery_metadata_cache_retained_bytes
+      .set(i64::try_from(bytes).unwrap_or(i64::MAX));
   }
 
   pub(in crate::consumer) fn record_blob_range(&self, started_at: Instant, bytes: usize) {

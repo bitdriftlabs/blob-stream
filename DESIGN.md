@@ -348,10 +348,21 @@ the source checkpoint as a correctness ordering certificate.
 Recovery cost is proportional to the gap from the durable source checkpoint to the captured
 cutover, not to current partition activity. A sparse partition with an old committed cursor still
 recovers from that cursor's source window through retention in chronological slices of up to 32
-windows per pass. The first source window uses the bounded overlap; every later recovery window is
-a full-window query. This intentionally finds retained records written while the group was down,
-at the cost of scanning a long downtime interval. It is distinct from a cursorless partition,
-which has no retained recovery origin and starts Fresh in its current window.
+windows per pass. Historical passes select one Recovering partition in round-robin partition order,
+so a dense historical partition cannot starve a later, independent recovery. When every recovering
+partition needs only its active cutover window, they share that one query to avoid serializing a
+normal group takeover. The first source window uses the bounded overlap; every later recovery
+window is a full-window query. This intentionally finds retained records written while the group
+was down, at the cost of scanning a long downtime interval. It is distinct from a cursorless
+partition, which has no retained recovery origin and starts Fresh in its current window.
+
+When a recovery-only window has ended before the publication and visibility safety horizon, its
+successful metadata response is immutable for the reader's correctness model. The reader retains
+that response locally until every batch in the window is cursor-covered or delivered, so draining
+prefetch capacity or retrying a blob read never issues another metadata query for that window.
+Visibility-deferred, Fresh, Fast, shared, and active-horizon responses are not cached. The cache is
+intentionally reader-local and is discarded on restart, revocation, seek, or replacement recovery
+hydration.
 
 The visibility delay applies in every mode. When an eligible metadata row has
 `metadata_published_ts_ms > now_ms - metadata_visibility_delay_ms`, the reader defers it. In
@@ -364,6 +375,13 @@ retries from its inclusive time floor and frontier. This prevents recovery from 
 active window while preserving the historical recovery barrier that protects cursor order. A failed
 metadata or blob read restores the pass's cursor and frontier state, so an undelivered batch is
 retried.
+
+Prefetch-capacity exhaustion is also a recovery barrier. The reader advances the recovery pointer
+past only fully processed windows and leaves it at the earliest window containing a batch whose
+capacity reservation failed. After callers drain prefetched records, the next pass resumes at that
+window from its mature cached metadata when available, rather than querying either that window or
+the completed prefix of the slice again. This preserves the same cursor ordering guarantee as
+visibility deferral while avoiding repeated metadata scans during a long backlog.
 
 After a successful pass that produces no batches solely because eligible metadata was deferred,
 the prefetch worker waits until the earliest deferred row can satisfy the visibility delay, rounded

@@ -83,7 +83,7 @@ use framework::{
 use protobuf::Message;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::{Barrier, Mutex, Notify, mpsc, oneshot, watch};
@@ -165,6 +165,7 @@ async fn produce_message_at_manual_time(
 async fn write_recovery_segment(
   blob_store: &dyn BlobStore,
   metadata_store: &dyn MetadataStore,
+  virtual_partition_id: VirtualPartitionId,
   window_start_unix_seconds: i64,
   snowflake_id: u64,
   sequence: u64,
@@ -176,7 +177,7 @@ async fn write_recovery_segment(
     window_start_unix_seconds * 1_000,
   );
   let encoded = StoredRecordBatch {
-    virtual_partition_id: 0,
+    virtual_partition_id,
     records: vec![record.clone()],
     ..Default::default()
   }
@@ -198,7 +199,7 @@ async fn write_recovery_segment(
       blob_key,
       Compression::none(),
       HashMap::from([(
-        0,
+        virtual_partition_id,
         vec![BatchMetadata {
           seq_range: SeqRange {
             start: sequence,
@@ -283,6 +284,47 @@ impl MetadataStore for DelayedVisibilityMetadataStore {
     min_snowflake: Option<SnowflakeId>,
   ) -> Result<Vec<SegmentMetadata>> {
     self.flush_visible_segments().await?;
+    self
+      .inner
+      .scan_window_from_snowflake(window, min_snowflake)
+      .await
+  }
+}
+
+struct CountingWindowMetadataStore {
+  inner: Arc<dyn MetadataStore>,
+  counted_window_start: i64,
+  scan_count: AtomicUsize,
+}
+
+impl CountingWindowMetadataStore {
+  fn new(inner: Arc<dyn MetadataStore>, counted_window_start: i64) -> Self {
+    Self {
+      inner,
+      counted_window_start,
+      scan_count: AtomicUsize::new(0),
+    }
+  }
+
+  fn scan_count(&self) -> usize {
+    self.scan_count.load(Ordering::Acquire)
+  }
+}
+
+#[async_trait::async_trait]
+impl MetadataStore for CountingWindowMetadataStore {
+  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
+    self.inner.write_segment(metadata).await
+  }
+
+  async fn scan_window_from_snowflake(
+    &self,
+    window: &TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
+  ) -> Result<Vec<SegmentMetadata>> {
+    if window.window_start_unix_seconds == self.counted_window_start {
+      self.scan_count.fetch_add(1, Ordering::AcqRel);
+    }
     self
       .inner
       .scan_window_from_snowflake(window, min_snowflake)
@@ -1966,12 +2008,10 @@ async fn graceful_shutdown_final_checkpoint_commits_staged_record_before_release
   Ok(())
 }
 
-// High-level: verifies a persisted source checkpoint drives iterator recovery through more than
-// two bounded scan slices before current-window delivery begins.
+// High-level: verifies a persisted checkpoint reuses immutable historical metadata across
+// capacity-limited prefetch cycles.
 #[tokio::test]
-async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices() -> Result<()> {
-  const RECOVERY_WINDOW_COUNT: i64 = 80;
-
+async fn iterator_reuses_mature_recovery_metadata_across_prefetch_capacity_cycles() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let blob_store = resources.blob_store();
   let metadata_store = resources.metadata_store();
@@ -1980,21 +2020,38 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
   let now_ts_ms = now_unix_millis();
   let current_window_start =
     Window::for_timestamp(now_ts_ms / 1_000, WINDOW_SIZE_SECONDS).start_unix_seconds;
-  let recovery_start = current_window_start - (RECOVERY_WINDOW_COUNT * WINDOW_SIZE_SECONDS);
+  let recovery_window_start = current_window_start - (2 * WINDOW_SIZE_SECONDS);
   let published_ts_ms = now_ts_ms.saturating_sub(10_000);
+  let recovery_checkpoint_snowflake =
+    SnowflakeId::minimum_for_timestamp(OffsetDateTime::from_unix_timestamp(recovery_window_start)?);
 
-  // Seed one committed record followed by unread records in the first, middle, and final slices.
-  for (window_offset, snowflake_id, sequence, payload) in [
-    (0, 1, 1, "recovery-checkpoint"),
-    (31, 2, 2, "recovery-first-slice"),
-    (32, 3, 3, "recovery-second-slice"),
-    (64, 4, 4, "recovery-final-slice"),
-    (80, 5, 5, "recovery-cutover"),
+  for (snowflake_id, sequence, payload) in [
+    (
+      recovery_checkpoint_snowflake.as_u64(),
+      1,
+      "recovery-checkpoint",
+    ),
+    (
+      recovery_checkpoint_snowflake.as_u64().saturating_add(1),
+      2,
+      "recovery-cache-first",
+    ),
+    (
+      recovery_checkpoint_snowflake.as_u64().saturating_add(2),
+      3,
+      "recovery-cache-second",
+    ),
+    (
+      recovery_checkpoint_snowflake.as_u64().saturating_add(3),
+      4,
+      "recovery-cache-third",
+    ),
   ] {
     write_recovery_segment(
       blob_store.as_ref(),
       metadata_store.as_ref(),
-      recovery_start + (window_offset * WINDOW_SIZE_SECONDS),
+      0,
+      recovery_window_start,
       snowflake_id,
       sequence,
       payload,
@@ -2003,32 +2060,34 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
     .await?;
   }
 
-  // Dynamo scans are eventually consistent. Establish the fixture before starting recovery so
-  // this test exercises bounded traversal rather than timing-dependent metadata visibility.
-  for (window_offset, snowflake_id) in [(0, 1), (31, 2), (32, 3), (64, 4), (80, 5)] {
-    let window = TopicWindowKey {
-      topic: TOPIC.to_string(),
-      window_start_unix_seconds: recovery_start + (window_offset * WINDOW_SIZE_SECONDS),
-    };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-      let visible = metadata_store
-        .scan_window_from_snowflake(&window, Some(SnowflakeId(snowflake_id)))
-        .await?
-        .iter()
-        .any(|segment| segment.snowflake_id == SnowflakeId(snowflake_id));
-      if visible {
-        break;
-      }
-      if Instant::now() >= deadline {
-        return Err(anyhow!(
-          "deadline exceeded waiting for recovery metadata: window_start={}, \
-           snowflake_id={snowflake_id}",
-          window.window_start_unix_seconds
-        ));
-      }
-      tokio::task::yield_now().await;
+  let recovery_window = TopicWindowKey {
+    topic: TOPIC.to_string(),
+    window_start_unix_seconds: recovery_window_start,
+  };
+  let visibility_deadline = Instant::now() + Duration::from_secs(5);
+  loop {
+    let visible = metadata_store
+      .scan_window_from_snowflake(
+        &recovery_window,
+        Some(SnowflakeId(
+          recovery_checkpoint_snowflake.as_u64().saturating_add(3),
+        )),
+      )
+      .await?
+      .iter()
+      .any(|segment| {
+        segment.snowflake_id
+          == SnowflakeId(recovery_checkpoint_snowflake.as_u64().saturating_add(3))
+      });
+    if visible {
+      break;
     }
+    if Instant::now() >= visibility_deadline {
+      return Err(anyhow!(
+        "deadline exceeded waiting for recovery metadata: window_start={recovery_window_start}"
+      ));
+    }
+    tokio::task::yield_now().await;
   }
 
   let lease_key = ConsumerGroupLeaseKey {
@@ -2055,8 +2114,8 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
         virtual_partition_id: 0,
         seq_end: 1,
         source_checkpoint: Some(CommittedSourceCheckpoint {
-          window_start_unix_seconds: recovery_start,
-          snowflake_id: 1,
+          window_start_unix_seconds: recovery_window_start,
+          snowflake_id: recovery_checkpoint_snowflake.as_u64(),
         }),
       },
     )
@@ -2065,12 +2124,275 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
     .release_partition(&lease_key, "previous-owner", 1, now_ts_ms)
     .await?;
 
-  let mut runtime = consumer_runtime_config("recovery-member");
-  runtime
+  let counting_metadata_store = Arc::new(CountingWindowMetadataStore::new(
+    Arc::clone(&metadata_store),
+    recovery_window_start,
+  ));
+  let consumer_metadata_store: Arc<dyn MetadataStore> = counting_metadata_store.clone();
+  let mut runtime = consumer_runtime_config("recovery-cache-member");
+  let read = runtime
     .read
     .as_mut()
-    .ok_or_else(|| anyhow!("recovery reader config missing"))?
-    .metadata_visibility_delay_ms = Some(0);
+    .ok_or_else(|| anyhow!("recovery reader config missing"))?;
+  read.metadata_visibility_delay_ms = Some(0);
+  read.prefetch_max_bytes = Some(1);
+  let runtime_group = runtime
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("recovery group config missing"))?;
+  let mut iterator = Box::new(
+    ConsumerIteratorImpl::from_config(
+      &runtime,
+      Arc::clone(&blob_store),
+      consumer_metadata_store,
+      Arc::clone(&lease_store),
+      Arc::clone(&membership_store),
+      Arc::new(MembershipCoordinationSource::new(
+        runtime_group.topic.to_string(),
+        runtime_group.group_id.to_string(),
+        runtime_group.member_id.to_string(),
+        (0 .. PARTITION_COUNT).collect(),
+        Arc::clone(&membership_store),
+      )),
+      metrics_scope("blob_stream_consumer_it"),
+      1,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      None,
+    )
+    .await?,
+  );
+  iterator.start()?;
+
+  let expected = HashSet::from([
+    "recovery-cache-first".to_string(),
+    "recovery-cache-second".to_string(),
+    "recovery-cache-third".to_string(),
+  ]);
+  let mut delivery_counts = HashMap::new();
+  let mut maximum_offset = None;
+  let deadline = Instant::now() + Duration::from_secs(15);
+  while delivery_counts.len() < expected.len() {
+    if Instant::now() >= deadline {
+      return Err(anyhow!(
+        "deadline exceeded recovering cached metadata records: counts={delivery_counts:?}"
+      ));
+    }
+    let next_result = timeout(Duration::from_secs(2), iterator.next()).await;
+    let Ok(Ok(next_result)) = next_result else {
+      continue;
+    };
+    match next_result {
+      NextResult::Revoked(revoked) => revoked.complete().await,
+      NextResult::Record(record) => {
+        let payload = String::from_utf8(record.record.payload.to_vec())
+          .map_err(|error| anyhow!("recovery payload was not utf-8: {error}"))?;
+        if !expected.contains(&payload) {
+          return Err(anyhow!("unexpected recovery payload: {payload}"));
+        }
+        *delivery_counts.entry(payload).or_insert(0_usize) += 1;
+        maximum_offset =
+          Some(maximum_offset.map_or(record.offset, |offset: u64| offset.max(record.offset)));
+      },
+    }
+  }
+
+  assert!(
+    delivery_counts.values().all(|count| *count == 1),
+    "cached recovery must deliver each unread record exactly once: {delivery_counts:?}"
+  );
+  assert_eq!(
+    counting_metadata_store.scan_count(),
+    1,
+    "a mature recovery window must be queried once across prefetch capacity cycles"
+  );
+  iterator.store_offset(0, maximum_offset.expect("recovery delivered records"))?;
+  let _ = iterator.commit().await?;
+  iterator.shutdown().await?;
+  resources.cleanup().await;
+  Ok(())
+}
+
+// High-level: verifies persisted recovery advances through capacity boundaries and rotates to an
+// independent partition before resuming a dense historical recovery.
+#[tokio::test]
+async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices() -> Result<()> {
+  const RECOVERY_WINDOW_COUNT: i64 = 80;
+
+  let resources = IntegrationResources::create().await?;
+  let blob_store = resources.blob_store();
+  let metadata_store = resources.metadata_store();
+  let lease_store = resources.consumer_lease_store();
+  let membership_store = resources.consumer_membership_store();
+  let now_ts_ms = now_unix_millis();
+  let current_window_start =
+    Window::for_timestamp(now_ts_ms / 1_000, WINDOW_SIZE_SECONDS).start_unix_seconds;
+  let recovery_start = current_window_start - (RECOVERY_WINDOW_COUNT * WINDOW_SIZE_SECONDS);
+  let published_ts_ms = now_ts_ms.saturating_sub(10_000);
+  let other_partition_checkpoint_snowflake =
+    SnowflakeId::minimum_for_timestamp(OffsetDateTime::from_unix_timestamp(current_window_start)?);
+  let other_partition_record_snowflake = SnowflakeId(
+    other_partition_checkpoint_snowflake
+      .as_u64()
+      .saturating_add(1),
+  );
+
+  // Partition 0 begins with a dense historical recovery. Its first unread batch fills the tiny
+  // prefetch budget, forcing the following window to become the recovery boundary.
+  for (window_offset, snowflake_id, sequence, payload) in [
+    (0, 1, 1, "recovery-checkpoint"),
+    (1, 2, 2, "recovery-capacity-first"),
+    (2, 3, 3, "recovery-capacity-deferred"),
+    (31, 4, 4, "recovery-first-slice"),
+    (32, 5, 5, "recovery-second-slice"),
+    (64, 6, 6, "recovery-final-slice"),
+    (80, 7, 7, "recovery-cutover"),
+  ] {
+    write_recovery_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      0,
+      recovery_start + (window_offset * WINDOW_SIZE_SECONDS),
+      snowflake_id,
+      sequence,
+      payload,
+      published_ts_ms,
+    )
+    .await?;
+  }
+
+  // Partition 1 has independent, current-window recovery that must not wait for partition 0's
+  // historical slice to drain.
+  write_recovery_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    1,
+    current_window_start,
+    other_partition_checkpoint_snowflake.as_u64(),
+    1,
+    "recovery-other-checkpoint",
+    published_ts_ms,
+  )
+  .await?;
+  write_recovery_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    1,
+    current_window_start,
+    other_partition_record_snowflake.as_u64(),
+    2,
+    "recovery-other-partition",
+    published_ts_ms,
+  )
+  .await?;
+
+  // Dynamo scans are eventually consistent. Establish the fixture before starting recovery so
+  // this test exercises bounded traversal rather than timing-dependent metadata visibility.
+  for (window_offset, snowflake_id) in [(0, 1), (1, 2), (2, 3), (31, 4), (32, 5), (64, 6), (80, 7)]
+  {
+    let window = TopicWindowKey {
+      topic: TOPIC.to_string(),
+      window_start_unix_seconds: recovery_start + (window_offset * WINDOW_SIZE_SECONDS),
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+      let visible = metadata_store
+        .scan_window_from_snowflake(&window, Some(SnowflakeId(snowflake_id)))
+        .await?
+        .iter()
+        .any(|segment| segment.snowflake_id == SnowflakeId(snowflake_id));
+      if visible {
+        break;
+      }
+      if Instant::now() >= deadline {
+        return Err(anyhow!(
+          "deadline exceeded waiting for recovery metadata: window_start={}, \
+           snowflake_id={snowflake_id}",
+          window.window_start_unix_seconds
+        ));
+      }
+      tokio::task::yield_now().await;
+    }
+  }
+
+  for snowflake_id in [
+    other_partition_checkpoint_snowflake.as_u64(),
+    other_partition_record_snowflake.as_u64(),
+  ] {
+    let window = TopicWindowKey {
+      topic: TOPIC.to_string(),
+      window_start_unix_seconds: current_window_start,
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+      let visible = metadata_store
+        .scan_window_from_snowflake(&window, Some(SnowflakeId(snowflake_id)))
+        .await?
+        .iter()
+        .any(|segment| segment.snowflake_id == SnowflakeId(snowflake_id));
+      if visible {
+        break;
+      }
+      if Instant::now() >= deadline {
+        return Err(anyhow!(
+          "deadline exceeded waiting for recovery metadata: window_start={}, \
+           snowflake_id={snowflake_id}",
+          window.window_start_unix_seconds
+        ));
+      }
+      tokio::task::yield_now().await;
+    }
+  }
+
+  for (partition_id, source_window_start, snowflake_id) in [
+    (0, recovery_start, 1),
+    (
+      1,
+      current_window_start,
+      other_partition_checkpoint_snowflake.as_u64(),
+    ),
+  ] {
+    let lease_key = ConsumerGroupLeaseKey {
+      topic: TOPIC.to_string(),
+      group_id: "integration-group".to_string(),
+      virtual_partition_id: partition_id,
+    };
+    lease_store
+      .assign_partition(
+        lease_key.clone(),
+        "previous-owner".to_string(),
+        1,
+        now_ts_ms,
+        2_000,
+      )
+      .await?;
+    lease_store
+      .commit_cursor(
+        &lease_key,
+        "previous-owner",
+        1,
+        now_ts_ms,
+        CommittedCursor {
+          virtual_partition_id: partition_id,
+          seq_end: 1,
+          source_checkpoint: Some(CommittedSourceCheckpoint {
+            window_start_unix_seconds: source_window_start,
+            snowflake_id,
+          }),
+        },
+      )
+      .await?;
+    let _ = lease_store
+      .release_partition(&lease_key, "previous-owner", 1, now_ts_ms)
+      .await?;
+  }
+
+  let mut runtime = consumer_runtime_config("recovery-member");
+  let read = runtime
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow!("recovery reader config missing"))?;
+  read.metadata_visibility_delay_ms = Some(0);
+  read.prefetch_max_bytes = Some(1);
   let runtime_group = runtime
     .group
     .as_ref()
@@ -2099,12 +2421,16 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
   iterator.start()?;
 
   let expected = HashSet::from([
+    "recovery-capacity-first".to_string(),
+    "recovery-capacity-deferred".to_string(),
     "recovery-first-slice".to_string(),
     "recovery-second-slice".to_string(),
     "recovery-final-slice".to_string(),
     "recovery-cutover".to_string(),
+    "recovery-other-partition".to_string(),
   ]);
   let mut recovery_delivery_counts = HashMap::new();
+  let mut recovery_delivery_order = Vec::new();
   let mut recovery_max_offsets = HashMap::<VirtualPartitionId, u64>::new();
   let deadline = Instant::now() + Duration::from_secs(15);
   while recovery_delivery_counts.len() < expected.len() {
@@ -2127,6 +2453,7 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
         if !expected.contains(&payload) {
           return Err(anyhow!("unexpected recovery payload: {payload}"));
         }
+        recovery_delivery_order.push(payload.clone());
         *recovery_delivery_counts.entry(payload).or_insert(0_usize) += 1;
         recovery_max_offsets
           .entry(record.virtual_partition_id)
@@ -2147,6 +2474,19 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
     recovery_delivery_counts.values().all(|count| *count == 1),
     "checkpoint recovery must deliver every unread record exactly once: \
      {recovery_delivery_counts:?}"
+  );
+  let delivery_position = |payload: &str| {
+    recovery_delivery_order
+      .iter()
+      .position(|observed| observed == payload)
+      .ok_or_else(|| anyhow!("missing expected recovery payload: {payload}"))
+  };
+  assert!(
+    delivery_position("recovery-capacity-first")? < delivery_position("recovery-other-partition")?
+      && delivery_position("recovery-other-partition")?
+        < delivery_position("recovery-capacity-deferred")?,
+    "independent recovery must run before the capacity-deferred historical window: \
+     {recovery_delivery_order:?}"
   );
   for (partition_id, offset) in &recovery_max_offsets {
     iterator.store_offset(*partition_id, *offset)?;

@@ -130,6 +130,8 @@ pub struct ConsumerReaderScanSnapshot {
   pub metadata_segments_blocked_by_visibility: usize,
   pub recovery_segments_handed_to_fast_by_visibility: usize,
   pub recovery_segments_blocked_by_visibility: usize,
+  pub recovery_metadata_cache_hits: usize,
+  pub recovery_metadata_cache_misses: usize,
   pub metadata_batches_deferred_by_capacity: usize,
   pub batches_accepted: usize,
   pub records_accepted: usize,
