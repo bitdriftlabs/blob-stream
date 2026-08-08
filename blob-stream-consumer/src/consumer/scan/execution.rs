@@ -1,7 +1,6 @@
 use super::{
   Arc,
   BatchReadCandidate,
-  ConsumerBatch,
   ConsumerReadRuntimeSettings,
   ConsumerReaderFastFrontierState,
   ConsumerReaderImpl,
@@ -29,6 +28,7 @@ use super::{
   trace,
   try_join_all,
 };
+use crate::consumer::ConsumerReadOutcome;
 
 impl ConsumerReaderImpl {
   /// Execute one metadata scan pass, retaining no progress when a batch cannot reach the caller.
@@ -37,7 +37,7 @@ impl ConsumerReaderImpl {
     now_unix_seconds: i64,
     capacity: ReadCapacity,
     runtime_settings: ConsumerReadRuntimeSettings,
-  ) -> Result<Vec<ConsumerBatch>> {
+  ) -> Result<ConsumerReadOutcome> {
     // Cursor and frontier changes are only valid once every decoded batch is returned. A later
     // range-read failure must not make already decoded output disappear behind an advanced cursor.
     let virtual_partition_states = self.virtual_partition_states.clone();
@@ -58,7 +58,7 @@ impl ConsumerReaderImpl {
     now_unix_seconds: i64,
     mut capacity: ReadCapacity,
     runtime_settings: ConsumerReadRuntimeSettings,
-  ) -> Result<Vec<ConsumerBatch>> {
+  ) -> Result<ConsumerReadOutcome> {
     let read_started_at = Instant::now();
     let assigned_partition_ids = self.assigned_virtual_partition_ids();
     trace!(
@@ -70,11 +70,21 @@ impl ConsumerReaderImpl {
     let mut output = Vec::new();
     let mut metadata_batches_scanned = 0_usize;
     let mut metadata_batches_skipped_by_cursor = 0_usize;
-    let visibility_cutoff_ts_ms = now_unix_seconds.saturating_mul(1_000).saturating_sub(
-      i64::try_from(consumer_metadata_visibility_delay_ms(&self.config)).unwrap_or(i64::MAX),
-    );
+    // Metadata publication timestamps have millisecond precision while reader passes use whole
+    // seconds. Keep the visibility comparison in milliseconds, then round retry deadlines up so
+    // a worker never wakes in the second before a row becomes eligible.
+    let visibility_delay_ms =
+      i64::try_from(consumer_metadata_visibility_delay_ms(&self.config)).unwrap_or(i64::MAX);
+    let visibility_cutoff_ts_ms = now_unix_seconds
+      .saturating_mul(1_000)
+      .saturating_sub(visibility_delay_ms);
+    // A pass can defer several sources. The worker needs only the first safe retry, not a
+    // per-source timer, because rescanning then will reconsider every deferred source.
+    let mut next_visibility_eligible_unix_seconds = None;
 
-    // Recovery scans catch late lower-snowflake rows; fast scans avoid rereading old metadata.
+    // Requests merge partitions sharing a metadata window. Recovery scans catch late
+    // lower-snowflake rows, while fast scans avoid rereading metadata outside its visibility
+    // horizon; per-partition filtering is reapplied after each shared query.
     let (scan_requests, recovery_scan) =
       self.scan_requests(now_unix_seconds, &assigned_partition_ids)?;
     for request in &scan_requests {
@@ -256,6 +266,9 @@ impl ConsumerReaderImpl {
           let frontier_key = (partition_id, window.window_start_unix_seconds);
           let fast_partition = matches!(partition_state, Some(VirtualPartitionState::Fast { .. }));
           if fast_partition {
+            // The shared DynamoDB lower bound is the least restrictive partition bound. Reapply
+            // each partition's inclusive frontier here so a sparse partition cannot be skipped
+            // because another partition in the same query is further ahead.
             if blocked_fast_sources.contains(&frontier_key) {
               trace!(
                 "consumer metadata segment blocked by earlier visibility delay: topic={}, \
@@ -304,6 +317,20 @@ impl ConsumerReaderImpl {
             scan_state.metadata_segments_deferred_by_visibility = scan_state
               .metadata_segments_deferred_by_visibility
               .saturating_add(1);
+            // `metadata_published_ts_ms + delay` is the exact eligibility time. The reader
+            // accepts only whole-second `now` values, so ceiling division avoids a premature
+            // retry when that exact time falls inside a later second.
+            let visibility_eligible_unix_seconds = segment
+              .metadata_published_ts_ms
+              .saturating_add(visibility_delay_ms)
+              .saturating_add(999)
+              / 1_000;
+            next_visibility_eligible_unix_seconds = Some(
+              next_visibility_eligible_unix_seconds
+                .map_or(visibility_eligible_unix_seconds, |current: i64| {
+                  current.min(visibility_eligible_unix_seconds)
+                }),
+            );
             trace!(
               "consumer deferred metadata by visibility delay: topic={}, partition={}, \
                window_start={}, snowflake_id={}, published_at={}, visibility_cutoff={}",
@@ -648,6 +675,16 @@ impl ConsumerReaderImpl {
       recovery_scan,
     );
 
-    Ok(output)
+    // A visibility deadline is useful only when it is the sole reason this successful pass has
+    // no work. Ready output must keep the refill loop hot, and a capacity stop means unscanned
+    // metadata could be ready now, so either case falls back to normal worker behavior.
+    Ok(ConsumerReadOutcome {
+      next_visibility_eligible_unix_seconds: output
+        .is_empty()
+        .then_some(next_visibility_eligible_unix_seconds)
+        .flatten()
+        .filter(|deadline| !capacity_exhausted && *deadline > now_unix_seconds),
+      batches: output,
+    })
   }
 }

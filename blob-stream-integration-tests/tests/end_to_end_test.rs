@@ -290,33 +290,29 @@ impl MetadataStore for DelayedVisibilityMetadataStore {
   }
 }
 
-struct DeferredWindowVisibilityMetadataStore {
+struct DeferredWindowPublicationMetadataStore {
   inner: Arc<dyn MetadataStore>,
   deferred_window_start: Arc<AtomicI64>,
-  held_visibility_timestamp_ms: i64,
-  visibility_held: AtomicBool,
+  deferred_window_published_ts_ms: AtomicI64,
   deferred_window_scanned: AtomicBool,
   deferred_window_scan: Notify,
 }
 
-impl DeferredWindowVisibilityMetadataStore {
-  fn new(
-    inner: Arc<dyn MetadataStore>,
-    deferred_window_start: Arc<AtomicI64>,
-    held_visibility_timestamp_ms: i64,
-  ) -> Self {
+impl DeferredWindowPublicationMetadataStore {
+  fn new(inner: Arc<dyn MetadataStore>, deferred_window_start: Arc<AtomicI64>) -> Self {
     Self {
       inner,
       deferred_window_start,
-      held_visibility_timestamp_ms,
-      visibility_held: AtomicBool::new(true),
+      deferred_window_published_ts_ms: AtomicI64::new(0),
       deferred_window_scanned: AtomicBool::new(false),
       deferred_window_scan: Notify::new(),
     }
   }
 
-  fn release_visibility(&self) {
-    self.visibility_held.store(false, Ordering::Release);
+  fn set_deferred_window_published_ts_ms(&self, published_ts_ms: i64) {
+    self
+      .deferred_window_published_ts_ms
+      .store(published_ts_ms, Ordering::Release);
   }
 
   async fn wait_until_deferred_window_scanned(&self) {
@@ -331,7 +327,7 @@ impl DeferredWindowVisibilityMetadataStore {
 }
 
 #[async_trait::async_trait]
-impl MetadataStore for DeferredWindowVisibilityMetadataStore {
+impl MetadataStore for DeferredWindowPublicationMetadataStore {
   async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
     self.inner.write_segment(metadata).await
   }
@@ -345,11 +341,10 @@ impl MetadataStore for DeferredWindowVisibilityMetadataStore {
       .inner
       .scan_window_from_snowflake(window, min_snowflake)
       .await?;
-    if self.visibility_held.load(Ordering::Acquire)
-      && window.window_start_unix_seconds == self.deferred_window_start.load(Ordering::Acquire)
-    {
+    if window.window_start_unix_seconds == self.deferred_window_start.load(Ordering::Acquire) {
       for segment in &mut segments {
-        segment.metadata_published_ts_ms = self.held_visibility_timestamp_ms;
+        segment.metadata_published_ts_ms =
+          self.deferred_window_published_ts_ms.load(Ordering::Acquire);
       }
       self.deferred_window_scanned.store(true, Ordering::Release);
       self.deferred_window_scan.notify_waiters();
@@ -2451,23 +2446,18 @@ async fn live_group_restart_recovers_retained_history_before_fast_path() -> Resu
   Ok(())
 }
 
-// High-level: verifies a deferred historical metadata window holds recovery before a visible
-// later window until the named visibility boundary is released.
+// High-level: verifies a historical window published after its data window holds recovery before
+// later windows until the configured metadata visibility delay elapses.
 #[tokio::test]
-async fn live_group_recovery_waits_for_deferred_historical_visibility() -> Result<()> {
+async fn live_group_recovery_waits_for_historical_metadata_visibility_delay() -> Result<()> {
   let consumer_time = Arc::new(framework::ManualTimeProvider::new(
     OffsetDateTime::from_unix_timestamp(1_700_100_000)?,
   ));
   let deferred_window_start = Arc::new(AtomicI64::new(i64::MIN));
   let base_metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
-  let held_visibility_duration_ms = i64::try_from(TimeDuration::hours(24).whole_milliseconds())?;
-  let deferred_metadata_store = Arc::new(DeferredWindowVisibilityMetadataStore::new(
+  let deferred_metadata_store = Arc::new(DeferredWindowPublicationMetadataStore::new(
     base_metadata_store,
     deferred_window_start.clone(),
-    consumer_time
-      .now()
-      .unix_timestamp_ms()
-      .saturating_add(held_visibility_duration_ms),
   ));
   let metadata_store: Arc<dyn MetadataStore> = deferred_metadata_store.clone();
   let mut cluster = ClusterHarness::in_memory(1)
@@ -2494,7 +2484,7 @@ async fn live_group_recovery_waits_for_deferred_historical_visibility() -> Resul
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("deferred-history read config missing"))?
-      .metadata_visibility_delay_ms = Some(0);
+      .metadata_visibility_delay_ms = Some(1_000);
   }
   let group = runtime_a
     .group
@@ -2612,6 +2602,11 @@ async fn live_group_recovery_waits_for_deferred_historical_visibility() -> Resul
     "deferred-history-b",
     cluster.create_consumer(&runtime_b).await?,
   );
+  // Set the late-publication time before starting B because the driver can begin a reader pass
+  // while its rebalance hook is still held.
+  deferred_metadata_store.set_deferred_window_published_ts_ms(
+    consumer_time.now().unix_timestamp().saturating_mul(1_000),
+  );
   consumer_b.start()?;
   consumer_time.advance(TimeDuration::milliseconds(200));
   timeout(
@@ -2625,42 +2620,38 @@ async fn live_group_recovery_waits_for_deferred_historical_visibility() -> Resul
   let mut delivery_order = Vec::new();
   let mut delivery_counts = HashMap::new();
   let mut staged_before_release = Vec::new();
-  {
-    let deferred_scan = deferred_metadata_store.wait_until_deferred_window_scanned();
-    tokio::pin!(deferred_scan);
-    timeout(Duration::from_secs(10), async {
-      loop {
-        tokio::select! {
-          result = &mut deferred_scan => {
-            let () = result;
-            return Ok::<_, anyhow::Error>(());
-          },
-          next_result = consumer_b.next() => match next_result? {
-            NextResult::Revoked(revoked) => revoked.complete().await,
-            NextResult::Record(record) => {
-              let id = String::from_utf8(record.record.payload.to_vec())?;
-              if id == checkpoint_id || id == deferred_id || id == after_id {
-                return Err(anyhow!(
-                  "deferred recovery delivered {id} before its visibility boundary"
-                ));
-              }
-              if id != before_id {
-                return Err(anyhow!("unexpected deferred-history record before release: {id}"));
-              }
-              *delivery_counts.entry(id.clone()).or_insert(0_usize) += 1;
-              delivery_order.push(id);
-              staged_before_release.push((record.virtual_partition_id, record.offset));
-            },
-          },
-          () = tokio::task::yield_now() => {
-            consumer_time.advance(TimeDuration::seconds(1));
-          },
-        }
+  timeout(
+    Duration::from_secs(10),
+    deferred_metadata_store.wait_until_deferred_window_scanned(),
+  )
+  .await
+  .map_err(|_| anyhow!("consumer did not scan the deferred historical window"))?;
+  timeout(Duration::from_secs(10), async {
+    loop {
+      match consumer_b.next().await? {
+        NextResult::Revoked(revoked) => revoked.complete().await,
+        NextResult::Record(record) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          if id == checkpoint_id || id == deferred_id || id == after_id {
+            return Err(anyhow!(
+              "deferred recovery delivered {id} before its visibility deadline"
+            ));
+          }
+          if id != before_id {
+            return Err(anyhow!(
+              "unexpected deferred-history record before deadline: {id}"
+            ));
+          }
+          *delivery_counts.entry(id.clone()).or_insert(0_usize) += 1;
+          delivery_order.push(id);
+          staged_before_release.push((record.virtual_partition_id, record.offset));
+          return Ok::<_, anyhow::Error>(());
+        },
       }
-    })
-    .await
-    .map_err(|_| anyhow!("consumer did not scan the deferred historical window"))??;
-  }
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("consumer did not deliver the visible historical window"))??;
 
   let deferred_snapshot = consumer_b
     .iterator
@@ -2702,13 +2693,23 @@ async fn live_group_recovery_waits_for_deferred_historical_visibility() -> Resul
     "a deferred window must block all later recovery delivery: {delivery_counts:?}"
   );
 
-  deferred_metadata_store.release_visibility();
+  // The worker's sleep began at the current fractional second. This reaches the next whole
+  // reader second but not the one-second sleep deadline, so a polling fallback would regress by
+  // rescanning and delivering the deferred row early.
+  consumer_time.advance(TimeDuration::milliseconds(999));
+  assert!(
+    timeout(Duration::from_millis(100), consumer_b.next())
+      .await
+      .is_err(),
+    "consumer delivered a record before the metadata visibility deadline"
+  );
   for (partition_id, offset) in staged_before_release {
     consumer_b.store_offset(partition_id, offset)?;
   }
   if delivery_counts.contains_key(before_id) {
     consumer_b.commit().await?;
   }
+  consumer_time.advance(TimeDuration::milliseconds(1));
 
   let expected_ids = HashSet::from([
     before_id.to_string(),

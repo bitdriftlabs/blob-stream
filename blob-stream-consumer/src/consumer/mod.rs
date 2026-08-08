@@ -10,6 +10,7 @@ mod scan;
 mod state;
 mod time;
 
+pub(crate) use api::ConsumerReadOutcome;
 pub use api::{ConsumerBatch, ConsumerReader, ReadCapacity};
 pub(crate) use diagnostics::{
   ConsumerReaderFastFrontierState,

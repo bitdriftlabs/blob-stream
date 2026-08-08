@@ -14,6 +14,10 @@ rust_library_with_test(
     crate_name = "blob_stream_integration_tests",
     crate_root = "src/lib.rs",
     edition = "2024",
+    integration_test_deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
     deps = all_crate_deps(normal = True),
 )
 

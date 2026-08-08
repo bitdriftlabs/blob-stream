@@ -10,6 +10,7 @@ use super::{
   VirtualPartitionState,
   consumer_read_runtime_settings,
 };
+use crate::consumer::ConsumerReadOutcome;
 
 impl ConsumerReaderImpl {
   pub(crate) fn runtime_settings(&self) -> ConsumerReadRuntimeSettings {
@@ -21,7 +22,9 @@ impl ConsumerReaderImpl {
     now_unix_seconds: i64,
     capacity: ReadCapacity,
     runtime_settings: ConsumerReadRuntimeSettings,
-  ) -> Result<Vec<ConsumerBatch>> {
+  ) -> Result<ConsumerReadOutcome> {
+    // The background worker needs the empty-pass scheduling hint. Keep this internal entrypoint
+    // separate so callers of the public batch-reading trait do not inherit a scheduling contract.
     self
       .read_available_impl(now_unix_seconds, capacity, runtime_settings)
       .await
@@ -38,9 +41,14 @@ impl ConsumerReader for ConsumerReaderImpl {
     capacity: ReadCapacity,
   ) -> Result<Vec<ConsumerBatch>> {
     let runtime_settings = self.runtime_settings();
-    self
-      .read_available_impl(now_unix_seconds, capacity, runtime_settings)
-      .await
+    // Synchronous callers receive only deliverable batches. The visibility deadline controls
+    // polling, not the reader's public delivery semantics.
+    Ok(
+      self
+        .read_available_impl(now_unix_seconds, capacity, runtime_settings)
+        .await?
+        .batches,
+    )
   }
 
   fn cursor(&self, virtual_partition_id: VirtualPartitionId) -> Option<u64> {

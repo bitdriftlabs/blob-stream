@@ -21,6 +21,20 @@ pub struct ConsumerBatch {
 }
 
 //
+// ConsumerReadOutcome
+//
+
+/// Internal reader outcome used to schedule a visibility-aware empty-result retry.
+pub struct ConsumerReadOutcome {
+  /// Batches ready for the prefetch worker to admit to delivery.
+  pub batches: Vec<ConsumerBatch>,
+  /// Earliest whole second at which a deferred metadata row can be safely retried.
+  ///
+  /// This is present only when the pass has no ready batches and was not stopped by capacity.
+  pub next_visibility_eligible_unix_seconds: Option<i64>,
+}
+
+//
 // ConsumerReader
 //
 
