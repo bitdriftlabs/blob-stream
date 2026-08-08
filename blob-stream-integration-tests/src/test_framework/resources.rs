@@ -36,8 +36,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-const DYNAMO_ENDPOINT: &str = "http://localhost:8000";
-const S3_ENDPOINT: &str = "http://localhost:4566";
+const DEFAULT_DYNAMO_ENDPOINT: &str = "http://localhost:8000";
+const DEFAULT_S3_ENDPOINT: &str = "http://localhost:4566";
 const AWS_REGION: &str = "us-east-1";
 const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
 
@@ -67,13 +67,13 @@ impl IntegrationResources {
     configure_aws_env();
 
     let dynamo_config = aws_config::defaults(BehaviorVersion::latest())
-      .endpoint_url(DYNAMO_ENDPOINT)
+      .endpoint_url(dynamo_endpoint())
       .load()
       .await;
     let dynamo = DynamoClient::new(&dynamo_config);
 
     let shared_s3 = aws_config::defaults(BehaviorVersion::latest())
-      .endpoint_url(S3_ENDPOINT)
+      .endpoint_url(s3_endpoint())
       .load()
       .await;
     let s3_config = aws_sdk_s3::config::Builder::from(&shared_s3)
@@ -197,13 +197,13 @@ impl IntegrationResources {
   }
 
   #[must_use]
-  pub fn dynamo_endpoint(&self) -> &'static str {
-    DYNAMO_ENDPOINT
+  pub fn dynamo_endpoint(&self) -> String {
+    dynamo_endpoint()
   }
 
   #[must_use]
-  pub fn s3_endpoint(&self) -> &'static str {
-    S3_ENDPOINT
+  pub fn s3_endpoint(&self) -> String {
+    s3_endpoint()
   }
 
   #[must_use]
@@ -300,12 +300,21 @@ async fn wait_for_dependencies(dynamo: &DynamoClient, s3: &S3Client) -> Result<(
 
     if started.elapsed() >= timeout_at {
       return Err(anyhow!(
-        "compose dependencies not ready: dynamo_ready={dynamo_ready}, s3_ready={s3_ready}"
+        "integration-test dependencies not ready: dynamo_ready={dynamo_ready}, s3_ready={s3_ready}"
       ));
     }
 
     runtime_sleep(Duration::from_millis(300)).await;
   }
+}
+
+fn dynamo_endpoint() -> String {
+  std::env::var("BD_ITEST_DYNAMODB_ENDPOINT")
+    .unwrap_or_else(|_| DEFAULT_DYNAMO_ENDPOINT.to_string())
+}
+
+fn s3_endpoint() -> String {
+  std::env::var("BD_ITEST_S3_ENDPOINT").unwrap_or_else(|_| DEFAULT_S3_ENDPOINT.to_string())
 }
 
 async fn create_table_pk_sk(client: &DynamoClient, table_name: &str) -> Result<()> {

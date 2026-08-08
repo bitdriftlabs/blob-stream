@@ -18,6 +18,10 @@ rust_library_with_test(
         normal = True,
         normal_dev = True,
     ),
+    integration_test_itest_deps = [
+        "dynamodb",
+        "localstack",
+    ],
     deps = all_crate_deps(normal = True),
 )
 

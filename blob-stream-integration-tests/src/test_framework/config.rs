@@ -124,13 +124,13 @@ pub fn consumer_bootstrap_config_for(
   let mut s3 = S3BlobStoreConfig::new();
   s3.bucket = resources.bucket_name().to_string().into();
   s3.region = resources.aws_region().to_string().into();
-  s3.endpoint = resources.s3_endpoint().to_string().into();
+  s3.endpoint = resources.s3_endpoint().into();
   let mut blob_store = BlobStoreConfig::new();
   blob_store.set_s3(s3);
 
   let mut dynamo = DynamoMetadataStoreConfig::new();
   dynamo.region = resources.aws_region().to_string().into();
-  dynamo.endpoint = resources.dynamo_endpoint().to_string().into();
+  dynamo.endpoint = resources.dynamo_endpoint().into();
   dynamo.segment_metadata_table_name = resources.segment_metadata_table_name().to_string().into();
   dynamo.producer_partition_lease_table_name =
     resources.producer_lease_table_name().to_string().into();
