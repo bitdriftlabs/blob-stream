@@ -5963,12 +5963,13 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
   let mut recovered_offsets = HashMap::new();
   timeout(Duration::from_secs(5), async {
     while replacement_counts.len() < recovery_ids.len() {
+      // The first prefetch batch is gated above; later recovery batches can wait on the
+      // consumer clock before their next refill cycle.
+      consumer_time.advance(TimeDuration::seconds(1));
       tokio::task::yield_now().await;
 
       match timeout(Duration::from_millis(250), owner_b.next()).await {
-        // The prefetch gate guarantees one buffered batch, but later batches can require another
-        // refill cycle. Keep polling until the enclosing deadline instead of treating a normal
-        // empty poll as a failed takeover.
+        // A normal empty poll only means the prefetch worker has not buffered the next batch yet.
         Err(_) => {},
         Ok(Err(error)) => return Err(anyhow!("replacement owner next failed: {error}")),
         Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,

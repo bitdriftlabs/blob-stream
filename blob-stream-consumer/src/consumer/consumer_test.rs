@@ -1480,11 +1480,11 @@ async fn recovery_capacity_resumes_at_the_first_deferred_window() {
       metadata_store_dyn.as_ref(),
       "telemetry",
       window_start,
-      u64::from(sequence),
+      sequence,
       7,
       SeqRange {
-        start: u64::from(sequence),
-        end: u64::from(sequence),
+        start: sequence,
+        end: sequence,
       },
       vec![new_record(
         vec![u8::try_from(sequence).unwrap()],
