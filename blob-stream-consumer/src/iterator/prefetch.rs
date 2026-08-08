@@ -319,15 +319,13 @@ impl PrefetchWorker {
           .next_visibility_eligible_unix_seconds
           .and_then(|deadline| OffsetDateTime::from_unix_timestamp(deadline).ok())
           .map(|deadline| deadline - now)
-          .filter(|delay| *delay > 0)
-          .map_or_else(
-            || {
-              time::Duration::milliseconds(
-                i64::try_from(idle_poll_backoff.next_delay_ms()).unwrap_or(i64::MAX),
-              )
-            },
-            time::Duration::seconds,
-          );
+          .filter(|delay| delay.is_positive())
+          .and_then(|delay| time::Duration::try_from(delay.unsigned_abs()).ok())
+          .unwrap_or_else(|| {
+            time::Duration::milliseconds(
+              i64::try_from(idle_poll_backoff.next_delay_ms()).unwrap_or(i64::MAX),
+            )
+          });
         tokio::select! {
           () = self.time_provider.sleep(idle_delay) => {},
           // Configuration, assignment, hydration, and seek commands must not wait for metadata
