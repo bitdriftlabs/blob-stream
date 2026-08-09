@@ -22,6 +22,7 @@ use crate::config::{
 use crate::diagnostics::{
   ConsumerAssignmentPlanSnapshot,
   ConsumerAssignmentPolicy,
+  ConsumerCommittedCursorSnapshot,
   ConsumerGroupLeaseObservation,
   ConsumerLocalPartitionSnapshot,
   ConsumerPartitionAssignmentSnapshot,
@@ -1174,6 +1175,19 @@ async fn partial_heartbeat_failure_revokes_fenced_partition() {
 
   iterator.start().unwrap();
   wait_for_active_assignment(&iterator, &[0, 1]).await;
+  iterator
+    .shared_state
+    .lock()
+    .diagnostics
+    .last_committed_cursors
+    .insert(
+      0,
+      ConsumerCommittedCursorSnapshot {
+        offset: 1,
+        source_checkpoint: None,
+        committed_at_ms: None,
+      },
+    );
   time_provider.wait_until_sleeping(2).await;
   lease_store.failures_enabled.store(true, Ordering::SeqCst);
 
@@ -1183,6 +1197,11 @@ async fn partial_heartbeat_failure_revokes_fenced_partition() {
     panic!("expected fenced partition revocation");
   };
   assert_eq!(revoked.partitions(), &[0]);
+  let snapshot = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_snapshot();
+  assert_eq!(local_partition(&snapshot, 0).last_committed_offset, None);
   revoked.complete().await;
   Box::new(iterator).shutdown().await.unwrap();
 }
@@ -1825,6 +1844,25 @@ async fn commit_during_revocation_persists_revoked_partition_cursor() {
   );
 
   revoked.complete().await;
+  timeout(Duration::from_secs(1), async {
+    loop {
+      let snapshot = iterator
+        .diagnostics()
+        .expect("consumer implementation provides diagnostics")
+        .state_snapshot();
+      if snapshot
+        .local
+        .partitions
+        .iter()
+        .all(|partition| partition.virtual_partition_id != revoked_partition_id)
+      {
+        return;
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("revoked partition remained in local diagnostics");
   Box::new(iterator).shutdown().await.unwrap();
 }
 

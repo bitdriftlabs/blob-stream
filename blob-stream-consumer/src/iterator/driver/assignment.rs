@@ -26,6 +26,8 @@ impl ConsumerDriver {
   ) {
     {
       let mut shared_state = self.shared_state.lock();
+      // Keep reporting the last structurally valid plan when this rebalance did not receive a
+      // replacement. It remains the best available explanation of desired ownership.
       if let Some(plan) = plan {
         shared_state.diagnostics.assignment_plan = Some(assignment_plan_snapshot(plan));
       }
@@ -33,6 +35,8 @@ impl ConsumerDriver {
   }
 
   pub(in crate::iterator) fn record_rebalance_metrics(&self, report: &RebalanceReport) {
+    // The coordinator classifies each claim so operational metrics separate steady retention from
+    // recoveries that moved a partition after graceful release or lease expiry.
     if report.assignment_plan_applied {
       self.metrics.assignment_plans_applied_total.inc();
     }
@@ -76,6 +80,8 @@ impl ConsumerDriver {
       ..
     } = report;
     self.record_accepted_assignment_plan(accepted_assignment_plan);
+    // Hydrate before exposing the reader assignment so the first scan starts from the durable
+    // cursor claimed with this generation.
     self.hydrate_cursors(recovered_cursors, self.now_unix_seconds())?;
 
     self.apply_assignment(&owned_partitions)?;
@@ -86,6 +92,7 @@ impl ConsumerDriver {
     &mut self,
     assignment: &[VirtualPartitionId],
   ) -> Result<()> {
+    // A normal rebalance can make an assignment visible to delivery immediately.
     let active_assignment = assignment.iter().copied().collect();
     self.apply_assignment_with_active_set(assignment, active_assignment, false)
   }
@@ -94,6 +101,8 @@ impl ConsumerDriver {
     &mut self,
     assignment: &[VirtualPartitionId],
   ) -> Result<()> {
+    // A replacement assignment follows an application callback, so release its delivery fence
+    // only after the reader has accepted its new assignment.
     let active_assignment = assignment.iter().copied().collect();
     self.apply_assignment_with_active_set(assignment, active_assignment, true)
   }
@@ -118,6 +127,8 @@ impl ConsumerDriver {
       .copied()
       .collect::<Vec<_>>();
     newly_assigned.sort_unstable();
+    // The reader can fail to accept its command. Do that fallible work before publishing the new
+    // assignment to delivery or diagnostics, keeping their view consistent with the reader.
     self.set_reader_assignment(
       assignment.to_owned(),
       self.now_unix_seconds(),
@@ -135,15 +146,7 @@ impl ConsumerDriver {
       .set(i64::try_from(self.active_assignment.len()).unwrap_or(i64::MAX));
     {
       let mut shared_state = self.shared_state.lock();
-      shared_state
-        .active_partitions
-        .retain(|partition_id, _| self.active_assignment.contains(partition_id));
-      for partition_id in &self.active_assignment {
-        shared_state
-          .active_partitions
-          .entry(*partition_id)
-          .or_default();
-      }
+      shared_state.apply_active_assignment(&self.active_assignment);
       self.refresh_diagnostics_locked(&mut shared_state);
     }
     if reader_owned_by_driver && let Some(handoff_phase) = handoff_phase {
@@ -190,6 +193,7 @@ impl ConsumerDriver {
     &mut self,
     now_ts_ms: i64,
   ) -> Result<()> {
+    // Once renewal reaches its deadline, none of the current leases are safe to keep delivering.
     let fenced = self.active_assignment.iter().copied().collect();
     self
       .begin_fenced_partition_revocation(fenced, now_ts_ms)
@@ -200,6 +204,8 @@ impl ConsumerDriver {
     &mut self,
     now_ts_ms: i64,
   ) -> Result<()> {
+    // A failed heartbeat can still reveal lease loss through the coordinator's retained ownership
+    // view before the broader heartbeat deadline requires fencing every active partition.
     let owned = self
       .coordinator
       .owned_partitions()
@@ -220,14 +226,14 @@ impl ConsumerDriver {
       return Ok(());
     }
 
+    // A successful heartbeat can report individual leases fenced without requiring the
+    // application-level revocation callback used by a cooperative rebalance.
     for partition_id in fenced_partitions {
       self.active_assignment.remove(partition_id);
     }
     {
       let mut shared_state = self.shared_state.lock();
-      for partition_id in fenced_partitions {
-        shared_state.active_partitions.remove(partition_id);
-      }
+      shared_state.remove_fenced_partitions(fenced_partitions);
       self.refresh_diagnostics_locked(&mut shared_state);
     }
     self.set_reader_assignment(
@@ -264,6 +270,9 @@ impl ConsumerDriver {
     {
       let mut shared_state = self.shared_state.lock();
       let pending_bytes = shared_state.diagnostics.prefetch_pending_bytes;
+      // Fenced progress no longer describes a local owner. Preserve active state until the
+      // callback completes, but do not publish its old durable cursor as current local state.
+      shared_state.discard_committed_cursor_diagnostics(&fenced);
       shared_state.delivery_state.drop_partitions(&fenced_set);
       shared_state.delivery_state.pending_revocation =
         Some(NextResult::Revoked(Box::new(RevokedPartitionsImpl {
@@ -317,6 +326,8 @@ impl ConsumerDriver {
 
     match recv.try_recv() {
       Ok(()) | Err(oneshot::error::TryRecvError::Closed) => {
+        // The application has drained delivery. Release first so a replacement owner cannot
+        // process alongside this iterator, then publish the pending assignment.
         let revoked = self
           .pending_revocation_partitions
           .take()
@@ -379,6 +390,8 @@ impl ConsumerDriver {
           },
         );
         if let Err(error) = release_result {
+          // Do not activate the replacement assignment. The driver records this as a terminal
+          // failure with delivery fenced because the release outcome is unknown.
           handoff_span.record("handoff.assignment_outcome", "not_attempted");
           handoff_span.record("error.message", format!("lease release: {error:#}"));
           handoff_span.record("otel.status_code", "ERROR");
@@ -426,6 +439,8 @@ impl ConsumerDriver {
     let snapshot = self.coordination_source.snapshot().await?;
     self.record_coordination_snapshot(&snapshot);
     self.metrics.rebalances_total.inc();
+    // The coordinator validates the shared plan, claims the resulting leases, and returns both
+    // the owned set and any durable cursors that must be recovered before delivery resumes.
     let report = match self
       .coordinator
       .rebalance(snapshot.members, snapshot.virtual_partitions, now_ts_ms)
@@ -461,6 +476,8 @@ impl ConsumerDriver {
     self.hydrate_cursors(recovered_cursors, now_ts_ms / 1_000)?;
 
     if !assignment_changed {
+      // Ownership is unchanged, but retain plan and retry diagnostics so an incomplete rebalance
+      // remains observable without disrupting active delivery.
       self.refresh_rebalance_diagnostics();
       return retry_error.map_or_else(|| Ok(()), |error| Err(anyhow::Error::msg(error)));
     }
@@ -472,6 +489,8 @@ impl ConsumerDriver {
       .collect::<Vec<_>>();
 
     if revoked.is_empty() {
+      // Added partitions can be activated without an application drain because no delivered
+      // records need to be handed off from this iterator.
       self.apply_assignment_with_active_set(&next_assignment, next_assignment_set, false)?;
       if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
         lifecycle_hooks
@@ -492,6 +511,8 @@ impl ConsumerDriver {
       let mut shared_state = self.shared_state.lock();
       let pending_bytes = shared_state.diagnostics.prefetch_pending_bytes;
       let delivery_state = &mut shared_state.delivery_state;
+      // Cooperative revocation differs from lease fencing: retain active state and its cursor
+      // until the application acknowledges the callback, allowing it to commit final work.
       delivery_state.drop_partitions(&revoked_set);
       delivery_state.pending_revocation =
         Some(NextResult::Revoked(Box::new(RevokedPartitionsImpl {
