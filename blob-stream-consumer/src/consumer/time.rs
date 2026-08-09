@@ -1,6 +1,11 @@
 use crate::config::{ConsumerReadConfig, consumer_metadata_visibility_delay_ms};
 use blob_stream_types::format_unix_timestamp_ms;
 
+/// Return Fast's rounded-up metadata-availability horizon in seconds.
+///
+/// The horizon includes the broker publication deadline, while metadata may not exist yet, and
+/// the reader visibility delay, while a returned row may not be replica-visible. Fast and
+/// checkpoint-overlap scans must account for both before choosing their lower bound.
 pub(in crate::consumer) fn metadata_availability_delay_seconds(
   config: &ConsumerReadConfig,
   maximum_metadata_publication_lag_ms: u64,

@@ -92,7 +92,7 @@ Collect at least one representative steady interval and one peak interval. Recor
 
 Use actual regional prices and include the network path. Read caches are AZ/cluster-local, so the broker-to-consumer leg must remain local. Price the S3-to-broker and local broker-to-consumer paths, and reject any configuration that would route a cache response across AZs.
 
-`cost_analysis.py` is useful for broad request-cost sanity checking, but its fallback estimates are not authoritative here. The implementation already coalesces timer flushes by topic and consumer range reads by segment. Set direct segment and batch-read overrides from observed metrics before using the script for a decision.
+`cost-analysis/cost_analysis.py` is useful for broad request-cost sanity checking, but its fallback estimates are not authoritative here. The implementation already coalesces timer flushes by topic and consumer range reads by segment. Set direct segment and range-read overrides from observed metrics before using the script for a decision.
 
 ## Idea 1: Shared Cross-Topic Segment Objects
 

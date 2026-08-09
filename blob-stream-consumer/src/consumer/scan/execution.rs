@@ -533,6 +533,9 @@ impl ConsumerReaderImpl {
           }
 
           if fast_partition {
+            // Advance only after the segment passed visibility and processing checks. The
+            // inclusive value replays the boundary row on the next scan, while max prevents an
+            // unordered metadata result from regressing the observed frontier.
             next_fast_frontiers
               .entry(frontier_key)
               .and_modify(|frontier| *frontier = (*frontier).max(segment.snowflake_id))
