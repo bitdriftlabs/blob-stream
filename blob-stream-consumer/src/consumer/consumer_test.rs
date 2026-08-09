@@ -18,7 +18,14 @@ use async_trait::async_trait;
 use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
-use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
+use blob_stream_blob_store::{
+  BlobKey,
+  BlobStore,
+  BlobStoreError,
+  BlobStoreResult,
+  ByteRange,
+  InMemoryBlobStore,
+};
 use blob_stream_metadata_store::{InMemoryMetadataStore, MetadataStore, SegmentMetadata};
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
@@ -137,9 +144,50 @@ impl BlobStore for FailSecondRangeBlobStore {
     self.inner.put(key, payload).await
   }
 
-  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> Result<Bytes> {
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
     if self.range_reads.fetch_add(1, Ordering::SeqCst) == 1 {
-      return Err(anyhow::anyhow!("injected second range-read failure"));
+      return Err(BlobStoreError::Read {
+        key: key.as_str().to_string(),
+        source: anyhow::anyhow!("injected second range-read failure"),
+      });
+    }
+    self.inner.get_range(key, range).await
+  }
+}
+
+//
+// MissingRangeBlobStore
+//
+
+struct MissingRangeBlobStore {
+  inner: InMemoryBlobStore,
+  missing_key: Mutex<Option<BlobKey>>,
+}
+
+impl MissingRangeBlobStore {
+  fn new() -> Self {
+    Self {
+      inner: InMemoryBlobStore::new(),
+      missing_key: Mutex::new(None),
+    }
+  }
+
+  fn mark_missing(&self, key: BlobKey) {
+    *self.missing_key.lock() = Some(key);
+  }
+}
+
+#[async_trait]
+impl BlobStore for MissingRangeBlobStore {
+  async fn put(&self, key: &BlobKey, payload: Bytes) -> Result<()> {
+    self.inner.put(key, payload).await
+  }
+
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
+    if self.missing_key.lock().as_ref() == Some(key) {
+      return Err(BlobStoreError::NotFound {
+        key: key.as_str().to_string(),
+      });
     }
     self.inner.get_range(key, range).await
   }
@@ -173,7 +221,7 @@ impl BlobStore for RecordingRangeBlobStore {
     self.inner.put(key, payload).await
   }
 
-  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> Result<Bytes> {
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
     self.ranges.lock().push(range.clone());
     self.inner.get_range(key, range).await
   }
@@ -201,7 +249,7 @@ impl BlobStore for TruncatingRangeBlobStore {
     self.inner.put(key, payload).await
   }
 
-  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> Result<Bytes> {
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
     let payload = self.inner.get_range(key, range).await?;
     Ok(payload.slice(.. payload.len().saturating_sub(1)))
   }
@@ -252,7 +300,7 @@ impl BlobStore for BlockingRangeBlobStore {
     self.inner.put(key, payload).await
   }
 
-  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> Result<Bytes> {
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
     let active_reads = self
       .active_reads
       .fetch_add(1, Ordering::SeqCst)
@@ -1372,6 +1420,64 @@ async fn failed_scan_restores_cursor_before_retrying_undelivered_batches() {
     vec![SeqRange { start: 1, end: 1 }, SeqRange { start: 2, end: 2 }]
   );
   assert_eq!(reader.cursor(7), Some(2));
+}
+
+#[tokio::test]
+async fn missing_blob_range_is_counted_and_skipped() {
+  let blob_store = Arc::new(MissingRangeBlobStore::new());
+  let blob_store_dyn: Arc<dyn BlobStore> = blob_store.clone();
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+
+  for sequence in 1 ..= 2 {
+    write_segment(
+      blob_store_dyn.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      900,
+      sequence,
+      7,
+      SeqRange {
+        start: sequence,
+        end: sequence,
+      },
+      vec![new_record(
+        vec![u8::try_from(sequence).unwrap()],
+        1_000 + i64::try_from(sequence).unwrap(),
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+  blob_store.mark_missing(BlobKey::new("telemetry/900/1.bin"));
+
+  let collector = Collector::default();
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store_dyn,
+    metadata_store,
+    &collector.scope("blob_stream_consumer_test"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .unwrap();
+
+  let batches = reader.read_available(950).await.unwrap();
+
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].seq_range, SeqRange { start: 2, end: 2 });
+  assert_eq!(reader.cursor(7), Some(2));
+  let metrics = String::from_utf8(collector.prometheus_output()).unwrap();
+  assert!(
+    metrics.contains("blob_stream_consumer_test:reader:lost_records 1"),
+    "{metrics}"
+  );
 }
 
 #[tokio::test]

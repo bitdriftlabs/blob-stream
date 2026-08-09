@@ -2,8 +2,8 @@
 #[path = "./memory_test.rs"]
 mod tests;
 
-use crate::{BlobKey, BlobStore, ByteRange};
-use anyhow::{Result, anyhow, bail};
+use crate::{BlobKey, BlobStore, BlobStoreError, BlobStoreResult, ByteRange};
+use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use log::trace;
@@ -39,7 +39,7 @@ impl BlobStore for InMemoryBlobStore {
     Ok(())
   }
 
-  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> Result<Bytes> {
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
     trace!(
       "in-memory blob get_range: key={}, start={}, end={}",
       key.as_str(),
@@ -51,24 +51,26 @@ impl BlobStore for InMemoryBlobStore {
     }
 
     let guard = self.blobs.read();
-    let blob = guard
-      .get(key)
-      .ok_or_else(|| anyhow::anyhow!("blob not found: {}", key.as_str()))?;
+    let blob = guard.get(key).ok_or_else(|| BlobStoreError::NotFound {
+      key: key.as_str().to_string(),
+    })?;
     let len = blob.len() as u64;
 
     if range.end > len {
-      bail!(
-        "byte range end {} exceeds blob length {} for key {}",
-        range.end,
-        len,
-        key.as_str()
-      );
+      return Err(BlobStoreError::InvalidRange {
+        key: key.as_str().to_string(),
+        message: format!("range end {} exceeds blob length {len}", range.end),
+      });
     }
 
-    let start = usize::try_from(range.start)
-      .map_err(|_| anyhow!("byte range start {} exceeds usize", range.start))?;
-    let end = usize::try_from(range.end)
-      .map_err(|_| anyhow!("byte range end {} exceeds usize", range.end))?;
+    let start = usize::try_from(range.start).map_err(|_| BlobStoreError::InvalidRange {
+      key: key.as_str().to_string(),
+      message: format!("range start {} does not fit in memory", range.start),
+    })?;
+    let end = usize::try_from(range.end).map_err(|_| BlobStoreError::InvalidRange {
+      key: key.as_str().to_string(),
+      message: format!("range end {} does not fit in memory", range.end),
+    })?;
     Ok(blob.slice(start .. end))
   }
 }

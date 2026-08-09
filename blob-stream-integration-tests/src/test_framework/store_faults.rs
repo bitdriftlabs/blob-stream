@@ -1,7 +1,7 @@
 use crate::test_framework::event_log::TestEventLog;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange};
+use blob_stream_blob_store::{BlobKey, BlobStore, BlobStoreError, BlobStoreResult, ByteRange};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupAssignmentPlan,
@@ -83,6 +83,7 @@ pub enum StoreFaultOperation {
 #[derive(Clone, Debug)]
 pub enum StoreFaultAction {
   Fail { message: String },
+  NotFound,
   Delay(Duration),
   Timeout(Duration),
   StaleRead,
@@ -185,6 +186,7 @@ struct DelayedMetadataEntry {
 #[derive(Default)]
 struct StoreFaultEffects {
   fail_message: Option<String>,
+  not_found: bool,
   delay: Option<Duration>,
   timeout: Option<Duration>,
   stale_read: bool,
@@ -268,6 +270,9 @@ impl StoreFaultController {
       match action {
         StoreFaultAction::Fail { message } => {
           effects.fail_message = Some(message);
+        },
+        StoreFaultAction::NotFound => {
+          effects.not_found = true;
         },
         StoreFaultAction::Delay(duration) => {
           effects.delay = Some(max_duration(effects.delay, duration));
@@ -448,6 +453,7 @@ fn describe_store_operation(operation: StoreFaultOperation) -> &'static str {
 fn describe_store_fault_action(action: &StoreFaultAction) -> String {
   match action {
     StoreFaultAction::Fail { message } => format!("fail:{message}"),
+    StoreFaultAction::NotFound => "not_found".to_string(),
     StoreFaultAction::Delay(duration) => format!("delay:{}ms", duration.as_millis()),
     StoreFaultAction::Timeout(duration) => format!("timeout:{}ms", duration.as_millis()),
     StoreFaultAction::StaleRead => "stale_read".to_string(),
@@ -512,7 +518,7 @@ impl BlobStore for FaultInjectedBlobStore {
     result
   }
 
-  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> Result<Bytes> {
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
     let effects = self
       .controller
       .effects_for_call(
@@ -525,18 +531,29 @@ impl BlobStore for FaultInjectedBlobStore {
     if let Some(delay) = effects.delay {
       sleep(delay).await;
     }
+    if effects.not_found {
+      return Err(BlobStoreError::NotFound {
+        key: key.as_str().to_string(),
+      });
+    }
     if let Some(timeout) = effects.timeout {
       sleep(timeout).await;
-      return Err(anyhow!("blob get_range timed out for key {}", key.as_str()));
+      return Err(BlobStoreError::Read {
+        key: key.as_str().to_string(),
+        source: anyhow!("blob get_range timed out for key {}", key.as_str()),
+      });
     }
     if let Some(message) = effects.fail_message {
-      return Err(anyhow!(
-        "blob get_range fault for key {} [{}-{}): {}",
-        key.as_str(),
-        range.start,
-        range.end,
-        message
-      ));
+      return Err(BlobStoreError::Read {
+        key: key.as_str().to_string(),
+        source: anyhow!(
+          "blob get_range fault for key {} [{}-{}): {}",
+          key.as_str(),
+          range.start,
+          range.end,
+          message
+        ),
+      });
     }
 
     let result = self.inner.get_range(key, range).await;

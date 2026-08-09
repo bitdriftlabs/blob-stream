@@ -31,7 +31,14 @@ use crate::diagnostics::{
 };
 use bd_server_stats::stats::Collector;
 use bd_time::SystemTimeProvider;
-use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
+use blob_stream_blob_store::{
+  BlobKey,
+  BlobStore,
+  BlobStoreError,
+  BlobStoreResult,
+  ByteRange,
+  InMemoryBlobStore,
+};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupAssignmentPlan,
@@ -433,7 +440,7 @@ impl BlobStore for BlockingBlobStore {
     self.inner.put(key, payload).await
   }
 
-  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> anyhow::Result<Bytes> {
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
     if self.block_reads.load(Ordering::SeqCst) {
       self.read_started.notify_waiters();
       self.read_release.notified().await;
@@ -448,11 +455,12 @@ impl BlobStore for FailingReadBlobStore {
     self.inner.put(key, payload).await
   }
 
-  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> anyhow::Result<Bytes> {
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
     self.failed_reads.fetch_add(1, Ordering::SeqCst);
-    Err(anyhow::anyhow!(
-      "injected blob read failure for {key:?} at {range:?}"
-    ))
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("injected blob read failure for {key:?} at {range:?}"),
+    })
   }
 }
 
