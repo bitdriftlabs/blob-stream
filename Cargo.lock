@@ -948,7 +948,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "bd-backoff"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#3e482f951dbe1891818dd92d945d51e3dc9ddcc2"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#4c4ed2514b94fc882731a453538c1ce9a5b576a3"
 dependencies = [
  "bd-workspace-hack",
  "rand 0.10.2",
@@ -958,7 +958,7 @@ dependencies = [
 [[package]]
 name = "bd-grpc"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#3e482f951dbe1891818dd92d945d51e3dc9ddcc2"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#4c4ed2514b94fc882731a453538c1ce9a5b576a3"
 dependencies = [
  "anyhow",
  "assert_matches",
@@ -1001,7 +1001,7 @@ dependencies = [
 [[package]]
 name = "bd-grpc-codec"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#3e482f951dbe1891818dd92d945d51e3dc9ddcc2"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#4c4ed2514b94fc882731a453538c1ce9a5b576a3"
 dependencies = [
  "bd-stats-common",
  "bd-workspace-hack",
@@ -1015,7 +1015,7 @@ dependencies = [
 [[package]]
 name = "bd-log"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#3e482f951dbe1891818dd92d945d51e3dc9ddcc2"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#4c4ed2514b94fc882731a453538c1ce9a5b576a3"
 dependencies = [
  "anyhow",
  "bd-workspace-hack",
@@ -1036,7 +1036,7 @@ dependencies = [
 [[package]]
 name = "bd-panic"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#3e482f951dbe1891818dd92d945d51e3dc9ddcc2"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#4c4ed2514b94fc882731a453538c1ce9a5b576a3"
 dependencies = [
  "bd-workspace-hack",
  "color-backtrace",
@@ -1047,7 +1047,7 @@ dependencies = [
 [[package]]
 name = "bd-pgv"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#3e482f951dbe1891818dd92d945d51e3dc9ddcc2"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#4c4ed2514b94fc882731a453538c1ce9a5b576a3"
 dependencies = [
  "bd-workspace-hack",
  "log",
@@ -1059,7 +1059,7 @@ dependencies = [
 [[package]]
 name = "bd-rt"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#3e482f951dbe1891818dd92d945d51e3dc9ddcc2"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#4c4ed2514b94fc882731a453538c1ce9a5b576a3"
 dependencies = [
  "bd-workspace-hack",
  "log",
@@ -1069,7 +1069,7 @@ dependencies = [
 [[package]]
 name = "bd-runtime-config"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#3e482f951dbe1891818dd92d945d51e3dc9ddcc2"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#4c4ed2514b94fc882731a453538c1ce9a5b576a3"
 dependencies = [
  "async-trait",
  "bd-server-stats",
@@ -1090,7 +1090,7 @@ dependencies = [
 [[package]]
 name = "bd-server-stats"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#3e482f951dbe1891818dd92d945d51e3dc9ddcc2"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#4c4ed2514b94fc882731a453538c1ce9a5b576a3"
 dependencies = [
  "anyhow",
  "bd-stats-common",
@@ -1110,7 +1110,7 @@ dependencies = [
 [[package]]
 name = "bd-shutdown"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#3e482f951dbe1891818dd92d945d51e3dc9ddcc2"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#4c4ed2514b94fc882731a453538c1ce9a5b576a3"
 dependencies = [
  "bd-workspace-hack",
  "log",
@@ -1120,7 +1120,7 @@ dependencies = [
 [[package]]
 name = "bd-stats-common"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#3e482f951dbe1891818dd92d945d51e3dc9ddcc2"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#4c4ed2514b94fc882731a453538c1ce9a5b576a3"
 dependencies = [
  "anyhow",
  "bd-workspace-hack",
@@ -1130,7 +1130,7 @@ dependencies = [
 [[package]]
 name = "bd-test-helpers-core"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#3e482f951dbe1891818dd92d945d51e3dc9ddcc2"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#4c4ed2514b94fc882731a453538c1ce9a5b576a3"
 dependencies = [
  "async-trait",
  "bd-log",
@@ -1143,7 +1143,7 @@ dependencies = [
 [[package]]
 name = "bd-time"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#3e482f951dbe1891818dd92d945d51e3dc9ddcc2"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#4c4ed2514b94fc882731a453538c1ce9a5b576a3"
 dependencies = [
  "async-trait",
  "bd-workspace-hack",
@@ -1738,9 +1738,9 @@ dependencies = [
 
 [[package]]
 name = "ctor"
-version = "1.0.12"
+version = "1.0.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d83cb7e7a873830708d6b02a78cd36a592c6fa14bf267b68725103b85c0d77f"
+checksum = "914a755b7c2d4af2bdcff7ce1739e2db9a1b81a9b07123d8015786ae03c0980d"
 dependencies = [
  "link-section",
  "linktime-proc-macro",
@@ -3089,15 +3089,15 @@ dependencies = [
 
 [[package]]
 name = "link-section"
-version = "0.19.2"
+version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ee1a0d6e252afe82e7bc2db42fba60e02ddf3b1accaf8cb21d96e34ba61f3d4"
+checksum = "39c29a617ce3df32c08497bdc1ab6e2376e0b17948ac166a2fbe5977c5954cd9"
 
 [[package]]
 name = "linktime-proc-macro"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "348d0075b1fc163b26d72a7f75fc5141daf2fd1bdf128d873cbaf6785d495bdf"
+checksum = "7e57c38c1e860fd37c604281cdfb1dd2216977fd76a50f85ba2f388ef3219616"
 
 [[package]]
 name = "linux-raw-sys"
@@ -3728,9 +3728,9 @@ dependencies = [
 
 [[package]]
 name = "portable-atomic"
-version = "1.14.0"
+version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d20d5497ef88037a52ff98267d066e7f11fcc5e99bbfbd58a42336193aacec3"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "portable-atomic-util"
@@ -5675,9 +5675,9 @@ dependencies = [
 
 [[package]]
 name = "zbus"
-version = "5.18.0"
+version = "5.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe18fb60dc696039e738717b76eaea21e7a4489bbb1885020b43c94236d7e98a"
+checksum = "5db4be7c075cb421e4b7ee645541604239bd243ba7c357511f4ff3a74b555907"
 dependencies = [
  "async-broadcast",
  "async-executor",
@@ -5710,14 +5710,14 @@ dependencies = [
 
 [[package]]
 name = "zbus_macros"
-version = "5.18.0"
+version = "5.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe96480bed92df2b442a1a30df364e12d08eed03aeb061f2b8dc6afb2be91119"
+checksum = "2990635d09ade6df1868f72f8cac69a876a90981e8bd3c40b1be413f8dc88f40"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
  "zbus_names",
  "zvariant",
  "zvariant_utils",
@@ -5732,6 +5732,15 @@ dependencies = [
  "serde",
  "winnow",
  "zvariant",
+]
+
+[[package]]
+name = "zcheapstr"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1afec51604565183aeb5c54c20aeab286120d4e4460f7f76e3e8bb8c0d99473"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -5850,40 +5859,41 @@ dependencies = [
 
 [[package]]
 name = "zvariant"
-version = "5.13.1"
+version = "5.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bee2a0bcd2a907786a456fff45aaaaf54c9ba5f50b71ae9ec1a4edd200c94911"
+checksum = "b5e28c25bd8bb8da5a1f3e7065d0c156b9ee9a7973adf78b0e35eaefdf3b1b5c"
 dependencies = [
  "endi",
  "enumflags2",
  "serde",
  "winnow",
+ "zcheapstr",
  "zvariant_derive",
  "zvariant_utils",
 ]
 
 [[package]]
 name = "zvariant_derive"
-version = "5.13.1"
+version = "5.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38a708216a18780796770bfe3f4739c7c83a3e8f789b755534bbbc06e4e23e12"
+checksum = "d496a145685283b67e232bd9e47377f6b60ad9d51e3601b23867f77c42477f96"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
  "zvariant_utils",
 ]
 
 [[package]]
 name = "zvariant_utils"
-version = "3.5.0"
+version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90cb9383f9b45290407a1258b202d3f8f01db719eb60b4e4055c6375af4fc7c7"
+checksum = "629d80ece222cad20fe0e8741be493c4ab166acf3b85341bdc2cdbcfd8f3c2d6"
 dependencies = [
  "proc-macro2",
  "quote",
  "serde",
- "syn 2.0.119",
+ "syn 3.0.3",
  "winnow",
 ]
