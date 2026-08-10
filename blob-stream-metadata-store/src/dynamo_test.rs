@@ -1,4 +1,4 @@
-use crate::{DynamoMetadataStore, MetadataStore, SegmentMetadata};
+use crate::{DynamoMetadataStore, MetadataReadConsistency, MetadataStore, SegmentMetadata};
 use anyhow::{Context, Result, anyhow};
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client;
@@ -149,7 +149,9 @@ async fn writes_and_scans_window() -> Result<()> {
     topic: "topic-a".to_string(),
     window_start_unix_seconds: 100,
   };
-  let segments = store.scan_window_from_snowflake(&window, None).await?;
+  let segments = store
+    .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Eventual)
+    .await?;
 
   assert_eq!(segments.len(), 2);
   assert!(segments.contains(&first));
@@ -183,7 +185,11 @@ async fn scans_window_from_inclusive_snowflake() -> Result<()> {
     window_start_unix_seconds: 100,
   };
   let segments = store
-    .scan_window_from_snowflake(&window, Some(SnowflakeId(2)))
+    .scan_window_from_snowflake(
+      &window,
+      Some(SnowflakeId(2)),
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
 
   assert_eq!(segments, vec![second]);
@@ -304,7 +310,9 @@ async fn skips_noncompliant_segment_rows() -> Result<()> {
     window_start_unix_seconds: 100,
   };
   assert_eq!(
-    store.scan_window_from_snowflake(&window, None).await?,
+    store
+      .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Eventual)
+      .await?,
     vec![valid]
   );
 

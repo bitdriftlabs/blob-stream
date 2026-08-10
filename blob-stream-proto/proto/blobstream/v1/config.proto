@@ -330,6 +330,10 @@ message ConsumerReadConfig {
   // total consumer-owned payload capacity. Increase only after confirming object-store and host
   // capacity can sustain the additional concurrent work.
   optional uint64 max_in_flight_batch_reads = 10 [(validate.rules).uint64.gt = 0];
+
+  // Read metadata from DynamoDB with strong consistency. Default when unset: false.
+  // Strong reads remove read-replica staleness but do not fence stale producer publication.
+  optional bool strongly_consistent_metadata_reads = 11;
 }
 
 // Consumer group lease and heartbeat settings.

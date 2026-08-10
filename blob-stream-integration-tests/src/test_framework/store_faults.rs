@@ -19,6 +19,7 @@ use blob_stream_metadata_store::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
+  MetadataReadConsistency,
   MetadataStore,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
@@ -588,6 +589,7 @@ impl FaultInjectedMetadataStore {
     &self,
     window: &TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     let key = window.format();
     let effects = self
@@ -624,7 +626,7 @@ impl FaultInjectedMetadataStore {
 
     let mut scanned = self
       .inner
-      .scan_window_from_snowflake(window, min_snowflake)
+      .scan_window_from_snowflake(window, min_snowflake, consistency)
       .await?;
     scanned.append(&mut visible);
     self
@@ -684,8 +686,11 @@ impl MetadataStore for FaultInjectedMetadataStore {
     &self,
     window: &TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
-    self.scan_window_with_bound(window, min_snowflake).await
+    self
+      .scan_window_with_bound(window, min_snowflake, consistency)
+      .await
   }
 }
 

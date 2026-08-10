@@ -1,4 +1,4 @@
-use crate::{InMemoryMetadataStore, MetadataStore, SegmentMetadata};
+use crate::{InMemoryMetadataStore, MetadataReadConsistency, MetadataStore, SegmentMetadata};
 use blob_stream_blob_store::BlobKey;
 use blob_stream_proto::protos::blobstream::v1::metadata::SegmentMetadataV1;
 use blob_stream_types::{
@@ -61,7 +61,7 @@ async fn stores_and_scans_window() {
     window_start_unix_seconds: 100,
   };
   let segments = store
-    .scan_window_from_snowflake(&window, None)
+    .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Eventual)
     .await
     .expect("scan window");
 
@@ -87,7 +87,11 @@ async fn scans_window_from_inclusive_snowflake() {
     window_start_unix_seconds: 100,
   };
   let segments = store
-    .scan_window_from_snowflake(&window, Some(SnowflakeId(2)))
+    .scan_window_from_snowflake(
+      &window,
+      Some(SnowflakeId(2)),
+      MetadataReadConsistency::Eventual,
+    )
     .await
     .expect("scan bounded window");
 
@@ -136,7 +140,7 @@ async fn skips_noncompliant_segment_rows() {
   };
   assert_eq!(
     store
-      .scan_window_from_snowflake(&window, None)
+      .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Eventual)
       .await
       .expect("scan window"),
     vec![valid]

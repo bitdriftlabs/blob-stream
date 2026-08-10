@@ -20,7 +20,6 @@ use super::{
   TryStreamExt,
   VirtualPartitionId,
   VirtualPartitionState,
-  consumer_metadata_visibility_delay_ms,
   consumer_window_size_seconds,
   debug,
   format_unix_timestamp_ms,
@@ -79,7 +78,7 @@ impl ConsumerReaderImpl {
     // seconds. Keep the visibility comparison in milliseconds, then round retry deadlines up so
     // a worker never wakes in the second before a row becomes eligible.
     let visibility_delay_ms =
-      i64::try_from(consumer_metadata_visibility_delay_ms(&self.config)).unwrap_or(i64::MAX);
+      i64::try_from(runtime_settings.metadata_visibility_delay_ms).unwrap_or(i64::MAX);
     let visibility_cutoff_ts_ms = now_unix_seconds
       .saturating_mul(1_000)
       .saturating_sub(visibility_delay_ms);
@@ -91,7 +90,7 @@ impl ConsumerReaderImpl {
     // lower-snowflake rows, while fast scans avoid rereading metadata outside its visibility
     // horizon; per-partition filtering is reapplied after each shared query.
     let (scan_requests, recovery_scan) =
-      self.scan_requests(now_unix_seconds, &assigned_partition_ids)?;
+      self.scan_requests(now_unix_seconds, &assigned_partition_ids, runtime_settings)?;
     for request in &scan_requests {
       trace!(
         "consumer metadata scan planned: topic={}, window_start={}, recovery={}, fast={}, \
@@ -132,6 +131,7 @@ impl ConsumerReaderImpl {
       &scan_requests,
       &assigned_partition_ids,
       now_unix_seconds,
+      runtime_settings,
       &mut scan_states,
     );
     let mut recovery_window_ends = HashMap::<VirtualPartitionId, i64>::new();
@@ -153,7 +153,8 @@ impl ConsumerReaderImpl {
     let mut cached_window_results = Vec::new();
     let mut scan_futures = Vec::new();
     for (request_index, request) in scan_requests.iter().cloned().enumerate() {
-      let cache_key = self.mature_recovery_metadata_cache_key(&request, now_unix_seconds);
+      let cache_key =
+        self.mature_recovery_metadata_cache_key(&request, now_unix_seconds, runtime_settings);
       if let Some(cache_key) = cache_key
         && let Some(segments) = self.recovery_metadata_cache.get(&cache_key)
       {
@@ -182,13 +183,18 @@ impl ConsumerReaderImpl {
       }
       let metadata_store = Arc::clone(&self.metadata_store);
       let metrics = self.metrics.clone();
+      let metadata_read_consistency = runtime_settings.metadata_read_consistency;
       scan_futures.push(async move {
         if !request.recovery_scan && request.eligibility.fast && request.min_snowflake.is_none() {
           metrics.metadata_fast_scan_without_lower_bound.inc();
         }
         let scan_started_at = Instant::now();
         let segments = metadata_store
-          .scan_window_from_snowflake(&request.window, request.min_snowflake)
+          .scan_window_from_snowflake(
+            &request.window,
+            request.min_snowflake,
+            metadata_read_consistency,
+          )
           .await
           .with_context(|| {
             format!(
@@ -281,7 +287,7 @@ impl ConsumerReaderImpl {
     // Recovery can hand an active publication-horizon window to Fast. Fast retains the same
     // visibility safety check and replays its inclusive time floor once the row becomes eligible.
     let fast_horizon_windows = self
-      .eligible_fast_scan_windows(now_unix_seconds)?
+      .eligible_fast_scan_windows(now_unix_seconds, runtime_settings)?
       .into_iter()
       .map(|(window, _)| window.window_start_unix_seconds)
       .collect::<HashSet<_>>();
@@ -791,7 +797,7 @@ impl ConsumerReaderImpl {
     );
 
     self.fast_frontiers = next_fast_frontiers;
-    self.prune_fast_frontiers(now_unix_seconds)?;
+    self.prune_fast_frontiers(now_unix_seconds, runtime_settings)?;
     let completed_at_unix_seconds = system_now_unix_seconds();
     for ((partition_id, window_start_unix_seconds), snowflake_id) in &self.fast_frontiers {
       if let Some(scan_state) = scan_states.get_mut(partition_id) {

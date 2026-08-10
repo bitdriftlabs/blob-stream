@@ -26,7 +26,12 @@ use blob_stream_blob_store::{
   ByteRange,
   InMemoryBlobStore,
 };
-use blob_stream_metadata_store::{InMemoryMetadataStore, MetadataStore, SegmentMetadata};
+use blob_stream_metadata_store::{
+  InMemoryMetadataStore,
+  MetadataReadConsistency,
+  MetadataStore,
+  SegmentMetadata,
+};
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
   BatchMetadata,
@@ -70,6 +75,7 @@ impl ConsumerReaderImpl {
 struct RecordingMetadataStore {
   inner: InMemoryMetadataStore,
   scans: Mutex<Vec<(i64, Option<SnowflakeId>)>>,
+  consistencies: Mutex<Vec<MetadataReadConsistency>>,
 }
 
 impl RecordingMetadataStore {
@@ -77,6 +83,7 @@ impl RecordingMetadataStore {
     Self {
       inner: InMemoryMetadataStore::new(),
       scans: Mutex::new(Vec::new()),
+      consistencies: Mutex::new(Vec::new()),
     }
   }
 }
@@ -91,14 +98,16 @@ impl MetadataStore for RecordingMetadataStore {
     &self,
     window: &TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
+    self.consistencies.lock().push(consistency);
     self
       .scans
       .lock()
       .push((window.window_start_unix_seconds, min_snowflake));
     self
       .inner
-      .scan_window_from_snowflake(window, min_snowflake)
+      .scan_window_from_snowflake(window, min_snowflake, consistency)
       .await
   }
 }
@@ -115,6 +124,7 @@ impl MetadataStore for FailingMetadataStore {
     &self,
     _window: &TopicWindowKey,
     _min_snowflake: Option<SnowflakeId>,
+    _consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     Err(anyhow!("injected DynamoDB dispatch error").context("injected DynamoDB service error"))
   }
@@ -352,19 +362,24 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
     ConsumerReadRuntimeSettings {
       prefetch_max_bytes: 16,
       max_in_flight_batch_reads: 2,
+      metadata_read_consistency: MetadataReadConsistency::Eventual,
+      metadata_visibility_delay_ms: 2_000,
     }
   );
 
   feature_flags.update(Arc::new(
     DefaultFeatureFlags::default()
       .with_integer_flag("blob_stream_consumer_prefetch_max_bytes", 32)
-      .with_integer_flag("blob_stream_consumer_max_in_flight_batch_reads", 4),
+      .with_integer_flag("blob_stream_consumer_max_in_flight_batch_reads", 4)
+      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
   ));
   assert_eq!(
     reader.runtime_settings(),
     ConsumerReadRuntimeSettings {
       prefetch_max_bytes: 32,
       max_in_flight_batch_reads: 4,
+      metadata_read_consistency: MetadataReadConsistency::Strong,
+      metadata_visibility_delay_ms: 0,
     }
   );
 }
@@ -602,6 +617,169 @@ async fn visibility_delay_defers_newly_published_metadata() {
   assert_eq!(scan_state[0].cursor_after, Some(1));
   assert_eq!(scan_state[0].batches_accepted, 1);
   assert_eq!(scan_state[0].records_accepted, 1);
+}
+
+#[tokio::test]
+async fn strong_metadata_reads_ignore_configured_visibility_delay() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let recording_metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = recording_metadata_store.clone();
+
+  write_segment_with_publication_time(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    7,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![1], 902_000)],
+    Compression::none(),
+    902_000,
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      metadata_visibility_delay_ms: Some(1_000),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .unwrap();
+
+  let outcome = reader
+    .read_available_with_capacity_and_settings(
+      902,
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+
+  assert_eq!(outcome.batches.len(), 1);
+  assert_eq!(outcome.next_visibility_eligible_unix_seconds, None);
+  assert!(
+    recording_metadata_store
+      .consistencies
+      .lock()
+      .iter()
+      .all(|consistency| *consistency == MetadataReadConsistency::Strong)
+  );
+  let scan_state = reader.partition_scan_states();
+  assert_eq!(scan_state[0].metadata_segments_deferred_by_visibility, 0);
+}
+
+#[tokio::test]
+async fn runtime_strong_metadata_reads_apply_on_the_next_scan() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let recording_metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = recording_metadata_store.clone();
+  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
+
+  write_segment_with_publication_time(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    7,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![1], 902_000)],
+    Compression::none(),
+    902_000,
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      window_size_seconds: Some(300),
+      metadata_visibility_delay_ms: Some(1_000),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap();
+
+  let eventual = reader
+    .read_available_with_capacity_and_settings(
+      902,
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert!(eventual.batches.is_empty());
+  assert_eq!(reader.cursor(7), None);
+
+  feature_flags.update(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
+  ));
+  let strong = reader
+    .read_available_with_capacity_and_settings(
+      902,
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+
+  assert_eq!(strong.batches.len(), 1);
+  assert_eq!(reader.cursor(7), Some(1));
+  assert!(
+    recording_metadata_store
+      .consistencies
+      .lock()
+      .iter()
+      .rev()
+      .take(2)
+      .all(|consistency| *consistency == MetadataReadConsistency::Strong)
+  );
+}
+
+#[test]
+fn strong_metadata_reads_keep_only_the_publication_lag_in_fast_horizon() {
+  let reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      metadata_visibility_delay_ms: Some(2_000),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    &metrics_scope(),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )
+  .unwrap();
+
+  assert_eq!(
+    reader.fast_scan_safe_timestamp_unix_seconds(1_000, reader.runtime_settings()),
+    985
+  );
 }
 
 #[tokio::test]
@@ -857,7 +1035,9 @@ fn recovery_only_bounds_its_checkpoint_window() {
     .set_assigned_virtual_partitions(&[7], window_start + 300)
     .unwrap();
 
-  let (requests, recovery_scan) = reader.scan_requests(window_start + 300, &[7]).unwrap();
+  let (requests, recovery_scan) = reader
+    .scan_requests(window_start + 300, &[7], reader.runtime_settings())
+    .unwrap();
 
   assert!(recovery_scan);
   assert_eq!(requests.len(), 2);
@@ -2259,13 +2439,17 @@ fn recovery_planning_rotates_between_partitions() {
     .set_assigned_virtual_partitions(&[7, 8], 9_000)
     .unwrap();
 
-  let (first_requests, _) = reader.scan_requests(9_000, &[7, 8]).unwrap();
+  let (first_requests, _) = reader
+    .scan_requests(9_000, &[7, 8], reader.runtime_settings())
+    .unwrap();
   assert!(
     first_requests
       .iter()
       .all(|request| request.eligibility.recovering_partitions == vec![7])
   );
-  let (second_requests, _) = reader.scan_requests(9_000, &[7, 8]).unwrap();
+  let (second_requests, _) = reader
+    .scan_requests(9_000, &[7, 8], reader.runtime_settings())
+    .unwrap();
   assert!(
     second_requests
       .iter()
@@ -2385,7 +2569,9 @@ fn recovery_planning_batches_active_cutover_partitions() {
     .set_assigned_virtual_partitions(&[7, 8], 9_000)
     .unwrap();
 
-  let (requests, recovery_scan) = reader.scan_requests(9_000, &[7, 8]).unwrap();
+  let (requests, recovery_scan) = reader
+    .scan_requests(9_000, &[7, 8], reader.runtime_settings())
+    .unwrap();
   assert!(recovery_scan);
   assert_eq!(requests.len(), 1);
   assert_eq!(requests[0].eligibility.recovering_partitions, vec![7, 8]);

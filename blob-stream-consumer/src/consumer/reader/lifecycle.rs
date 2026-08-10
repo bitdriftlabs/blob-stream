@@ -242,7 +242,11 @@ impl ConsumerReaderImpl {
   ) {
     // Hydration can arrive before assignment during a rebalance. The default Pending lifecycle
     // state retains the recovery plan without allowing the reader to scan this partition.
+    // A later runtime consistency change affects new scan passes but deliberately does not rewrite
+    // this hydrated source-window overlap or replay already planned recovery work.
     let cutover_window_start_unix_seconds = self.window_start(now_unix_seconds);
+    let runtime_settings =
+      consumer_read_runtime_settings(&self.config, self.feature_flags.as_ref());
     let retention_floor = self.retention_floor_window_start(cutover_window_start_unix_seconds);
     let source_checkpoint = committed_cursor.source_checkpoint.as_ref();
     let source_window_start_unix_seconds = committed_cursor
@@ -262,7 +266,7 @@ impl ConsumerReaderImpl {
         let floor_timestamp_unix_seconds = checkpoint_timestamp
           .unix_timestamp()
           .saturating_sub(metadata_availability_delay_seconds(
-            &self.config,
+            runtime_settings.metadata_visibility_delay_ms,
             self.maximum_metadata_publication_lag_ms,
           ))
           .max(source_window_start_unix_seconds);

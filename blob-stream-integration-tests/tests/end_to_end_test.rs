@@ -29,6 +29,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupLeaseTransition,
   ConsumerGroupMember,
   InMemoryMetadataStore,
+  MetadataReadConsistency,
   MetadataStore,
   SegmentMetadata,
 };
@@ -282,11 +283,12 @@ impl MetadataStore for DelayedVisibilityMetadataStore {
     &self,
     window: &blob_stream_types::TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     self.flush_visible_segments().await?;
     self
       .inner
-      .scan_window_from_snowflake(window, min_snowflake)
+      .scan_window_from_snowflake(window, min_snowflake, consistency)
       .await
   }
 }
@@ -321,13 +323,14 @@ impl MetadataStore for CountingWindowMetadataStore {
     &self,
     window: &TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     if window.window_start_unix_seconds == self.counted_window_start {
       self.scan_count.fetch_add(1, Ordering::AcqRel);
     }
     self
       .inner
-      .scan_window_from_snowflake(window, min_snowflake)
+      .scan_window_from_snowflake(window, min_snowflake, consistency)
       .await
   }
 }
@@ -378,10 +381,11 @@ impl MetadataStore for DeferredWindowPublicationMetadataStore {
     &self,
     window: &TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     let mut segments = self
       .inner
-      .scan_window_from_snowflake(window, min_snowflake)
+      .scan_window_from_snowflake(window, min_snowflake, consistency)
       .await?;
     if window.window_start_unix_seconds == self.deferred_window_start.load(Ordering::Acquire) {
       for segment in &mut segments {
@@ -1002,7 +1006,7 @@ async fn broker_coalesces_same_partition_requests_into_one_consumer_batch() -> R
   let segments = loop {
     let segments = resources
       .metadata_store()
-      .scan_window_from_snowflake(&window, None)
+      .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Eventual)
       .await?;
     if !segments.is_empty() {
       break segments;
@@ -2072,6 +2076,7 @@ async fn iterator_reuses_mature_recovery_metadata_across_prefetch_capacity_cycle
         Some(SnowflakeId(
           recovery_checkpoint_snowflake.as_u64().saturating_add(3),
         )),
+        MetadataReadConsistency::Eventual,
       )
       .await?
       .iter()
@@ -2296,7 +2301,11 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
       let visible = metadata_store
-        .scan_window_from_snowflake(&window, Some(SnowflakeId(snowflake_id)))
+        .scan_window_from_snowflake(
+          &window,
+          Some(SnowflakeId(snowflake_id)),
+          MetadataReadConsistency::Eventual,
+        )
         .await?
         .iter()
         .any(|segment| segment.snowflake_id == SnowflakeId(snowflake_id));
@@ -2325,7 +2334,11 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
       let visible = metadata_store
-        .scan_window_from_snowflake(&window, Some(SnowflakeId(snowflake_id)))
+        .scan_window_from_snowflake(
+          &window,
+          Some(SnowflakeId(snowflake_id)),
+          MetadataReadConsistency::Eventual,
+        )
         .await?
         .iter()
         .any(|segment| segment.snowflake_id == SnowflakeId(snowflake_id));

@@ -35,6 +35,7 @@ use blob_stream_metadata_store::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
+  MetadataReadConsistency,
   MetadataStore,
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
@@ -90,10 +91,11 @@ impl MetadataStore for FailsTopicMetadataStore {
     &self,
     window: &blob_stream_types::TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     self
       .inner
-      .scan_window_from_snowflake(window, min_snowflake)
+      .scan_window_from_snowflake(window, min_snowflake, consistency)
       .await
   }
 }
@@ -860,7 +862,11 @@ async fn buffers_until_size_rollover() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert!(segments.is_empty());
 
@@ -874,7 +880,11 @@ async fn buffers_until_size_rollover() -> Result<()> {
   first.await??;
 
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 1);
   assert_eq!(segments[0].segment_index[&0].len(), 1);
@@ -1083,7 +1093,11 @@ async fn flushes_on_time_rollover() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 1);
   Ok(())
@@ -1168,7 +1182,11 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 1);
   assert_eq!(segments[0].segment_index.len(), 2);
@@ -1236,7 +1254,11 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
   next_second.await??;
 
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 2);
   assert!(
@@ -1332,7 +1354,11 @@ async fn time_due_flush_completes_before_later_byte_flush() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 2);
   assert!(segments.iter().any(|segment| {
@@ -1400,7 +1426,11 @@ async fn byte_flush_does_not_coalesce_buffered_topic_peers() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 1);
   assert_eq!(segments[0].segment_index.len(), 1);
@@ -1726,7 +1756,11 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   let mut ranges: Vec<_> = segments
     .iter()
@@ -1875,7 +1909,11 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
     WriteConfig::with_defaults().window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 2);
   Ok(())
@@ -2285,7 +2323,11 @@ async fn writes_compressed_metadata() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 1);
 
@@ -2306,6 +2348,7 @@ impl MetadataStore for FailingMetadataStore {
     &self,
     _window: &blob_stream_types::TopicWindowKey,
     _min_snowflake: Option<SnowflakeId>,
+    _consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     Ok(Vec::new())
   }
