@@ -1,3 +1,5 @@
+<img width="2926" height="1606" alt="blob-stream" src="https://github.com/user-attachments/assets/18979bb4-3c66-4222-a359-9d98f741a021" />
+
 # blob-stream
 
 `blob-stream` is a Kafka-like streaming system optimized for high-throughput telemetry with lower
