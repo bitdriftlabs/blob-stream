@@ -1,4 +1,4 @@
-<img width="2816" height="1536" alt="Gemini_Generated_Image_37932g37932g3793" src="https://github.com/user-attachments/assets/3cf30755-7eee-4c7d-8a06-45e96c8677d4" />
+<img width="2926" height="1606" alt="blob-stream" src="https://github.com/user-attachments/assets/18979bb4-3c66-4222-a359-9d98f741a021" />
 
 # blob-stream
 
