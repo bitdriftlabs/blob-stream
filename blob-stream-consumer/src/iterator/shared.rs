@@ -5,7 +5,7 @@ use blob_stream_types::{CommittedSourceCheckpoint, VirtualPartitionId};
 use parking_lot::Mutex;
 use prometheus::{Histogram, IntCounter, IntGauge};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 //
 // ConsumerIteratorMetrics
@@ -153,6 +153,47 @@ pub struct ConsumerSharedState {
 }
 
 impl ConsumerSharedState {
+  /// Align commit-eligible and diagnostic state with the active assignment after a reader change
+  /// has succeeded. Both collections must exclude revoked partitions so diagnostics cannot
+  /// recreate a stale local partition from its old committed cursor.
+  pub(in crate::iterator) fn apply_active_assignment(
+    &mut self,
+    active_assignment: &HashSet<VirtualPartitionId>,
+  ) {
+    self
+      .active_partitions
+      .retain(|partition_id, _| active_assignment.contains(partition_id));
+    self
+      .diagnostics
+      .last_committed_cursors
+      .retain(|partition_id, _| active_assignment.contains(partition_id));
+    for partition_id in active_assignment {
+      self.active_partitions.entry(*partition_id).or_default();
+    }
+  }
+
+  /// Remove state that is valid only while the consumer holds a partition lease.
+  pub(in crate::iterator) fn remove_fenced_partitions(
+    &mut self,
+    fenced_partitions: &[VirtualPartitionId],
+  ) {
+    for partition_id in fenced_partitions {
+      self.active_partitions.remove(partition_id);
+      self.diagnostics.last_committed_cursors.remove(partition_id);
+    }
+  }
+
+  /// Drop only committed-cursor diagnostics while a fencing revocation is being acknowledged.
+  /// The active partition state remains so the application can finish its in-flight callback.
+  pub(in crate::iterator) fn discard_committed_cursor_diagnostics(
+    &mut self,
+    partition_ids: &[VirtualPartitionId],
+  ) {
+    for partition_id in partition_ids {
+      self.diagnostics.last_committed_cursors.remove(partition_id);
+    }
+  }
+
   #[allow(dead_code)]
   fn assert_mutex_type(_: &Mutex<Self>) {}
 }

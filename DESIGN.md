@@ -672,12 +672,13 @@ pod loads, and the optional `pod_id` beside every partition's member assignment.
 continue to report member-only assignments without pod fields.
 
 The always-available `/state` endpoint returns that local state plus a fresh, strongly consistent
-lease-table query for the consumer group. The response joins retained lease rows with the last
-structurally valid assignment plan accepted by the local coordinator, so it includes planned but
-currently unleased partitions as well as other consumers' owner, generation, heartbeat, and
-committed cursor information. The inline query never enters the driver control flow and is bounded
-to one second. A query error or timeout is represented as `lookup_failed`; the local state remains
-available in that response.
+lease-table query for the consumer group. Its `local.partitions` reports only current or pending
+local assignments; revocation discards the prior local cursor snapshot. The response joins
+retained lease rows with the last structurally valid assignment plan accepted by the local
+coordinator, so it includes planned but currently unleased partitions as well as other consumers'
+owner, generation, heartbeat, and committed cursor information. The inline query never enters the
+driver control flow and is bounded to one second. A query error or timeout is represented as
+`lookup_failed`; the local state remains available in that response.
 
 ## Correctness and Failure Behavior
 
