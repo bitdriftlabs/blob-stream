@@ -19,7 +19,14 @@ use async_trait::async_trait;
 use bd_server_stats::stats::{Collector, Scope};
 use bd_shutdown::ComponentShutdownTrigger;
 use bd_time::{OffsetDateTimeExt, TimeProvider};
-use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
+use blob_stream_blob_store::{
+  BlobKey,
+  BlobStore,
+  BlobStoreError,
+  BlobStoreResult,
+  ByteRange,
+  InMemoryBlobStore,
+};
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{
   InMemoryMetadataStore,
@@ -109,8 +116,11 @@ impl BlobStore for GatedBlobStore {
     Ok(())
   }
 
-  async fn get_range(&self, _key: &BlobKey, _range: ByteRange) -> Result<Bytes> {
-    Err(anyhow::anyhow!("reads are not used by this test"))
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("reads are not used by this test: {range:?}"),
+    })
   }
 }
 
@@ -130,8 +140,11 @@ impl BlobStore for BlockingBlobStore {
     Ok(())
   }
 
-  async fn get_range(&self, _key: &BlobKey, _range: ByteRange) -> Result<Bytes> {
-    Err(anyhow::anyhow!("reads are not used by this test"))
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("reads are not used by this test: {range:?}"),
+    })
   }
 }
 

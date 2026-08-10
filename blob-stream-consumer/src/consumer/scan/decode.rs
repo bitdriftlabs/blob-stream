@@ -1,6 +1,6 @@
 use super::{
   BatchMetadata,
-  BatchReadCandidate,
+  BatchReadResult,
   CommittedSourceCheckpoint,
   CompressionCodec,
   ConsumerBatch,
@@ -13,6 +13,7 @@ use super::{
   trace,
 };
 use anyhow::{anyhow, ensure};
+use blob_stream_blob_store::BlobStoreError;
 use protobuf::Message;
 use std::io::Cursor;
 use std::time::Instant;
@@ -22,7 +23,7 @@ impl ConsumerReaderImpl {
   pub(in crate::consumer) async fn read_segment_plan(
     &self,
     plan: SegmentReadPlan,
-  ) -> Result<Vec<(BatchReadCandidate, ConsumerBatch)>> {
+  ) -> Result<Vec<BatchReadResult>> {
     trace!(
       "consumer read segment range start: topic={}, blob_key={}, start={}, end={}, batches={}",
       self.config.topic,
@@ -32,31 +33,51 @@ impl ConsumerReaderImpl {
       plan.candidates.len()
     );
 
+    let SegmentReadPlan {
+      metadata,
+      candidates,
+      byte_range,
+    } = plan;
     let blob_read_started_at = Instant::now();
-    let payload = self
+    let payload = match self
       .blob_store
-      .get_range(&plan.metadata.blob_key, plan.byte_range.clone())
-      .await?;
+      .get_range(&metadata.blob_key, byte_range.clone())
+      .await
+    {
+      Ok(payload) => payload,
+      Err(BlobStoreError::NotFound { .. }) => {
+        return Ok(
+          candidates
+            .into_iter()
+            .map(|candidate| BatchReadResult::Missing {
+              candidate,
+              blob_key: metadata.blob_key.clone(),
+            })
+            .collect(),
+        );
+      },
+      Err(error) => return Err(error.into()),
+    };
     self
       .metrics
       .record_blob_range(blob_read_started_at, payload.len());
-    let selected_bytes = plan.candidates.iter().fold(0_u64, |total, candidate| {
+    let selected_bytes = candidates.iter().fold(0_u64, |total, candidate| {
       total.saturating_add(candidate.batch_metadata.byte_range.len())
     });
     self
       .metrics
-      .record_blob_batch_ranges(plan.candidates.len(), selected_bytes);
+      .record_blob_batch_ranges(candidates.len(), selected_bytes);
 
-    let mut decoded_batches = Vec::with_capacity(plan.candidates.len());
-    for candidate in plan.candidates {
+    let mut decoded_batches = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
       let batch_range = &candidate.batch_metadata.byte_range;
       let start = batch_range
         .start
-        .checked_sub(plan.byte_range.start)
+        .checked_sub(byte_range.start)
         .ok_or_else(|| anyhow!("batch range starts before its segment read range"))?;
       let end = batch_range
         .end
-        .checked_sub(plan.byte_range.start)
+        .checked_sub(byte_range.start)
         .ok_or_else(|| anyhow!("batch range ends before its segment read range"))?;
       let start =
         usize::try_from(start).map_err(|_| anyhow!("batch range start does not fit in memory"))?;
@@ -69,12 +90,12 @@ impl ConsumerReaderImpl {
       );
       let batch_payload = payload.slice(start .. end);
       let batch = self.decode_batch(
-        &plan.metadata,
+        &metadata,
         &candidate.batch_metadata,
         candidate.virtual_partition_id,
         batch_payload,
       )?;
-      decoded_batches.push((candidate, batch));
+      decoded_batches.push(BatchReadResult::Decoded { candidate, batch });
     }
 
     Ok(decoded_batches)

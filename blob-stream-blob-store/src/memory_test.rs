@@ -1,4 +1,4 @@
-use crate::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
+use crate::{BlobKey, BlobStore, BlobStoreError, ByteRange, InMemoryBlobStore};
 use bytes::Bytes;
 
 #[tokio::test]
@@ -30,4 +30,20 @@ async fn empty_range_returns_empty_bytes() {
     .expect("read empty range");
 
   assert!(slice.is_empty());
+}
+
+#[tokio::test]
+async fn missing_key_returns_not_found() {
+  let store = InMemoryBlobStore::new();
+  let key = BlobKey::from("topic/1/missing");
+
+  let error = store
+    .get_range(&key, ByteRange { start: 0, end: 1 })
+    .await
+    .expect_err("missing blob should return an error");
+
+  assert!(matches!(
+    error,
+    BlobStoreError::NotFound { key } if key == "topic/1/missing"
+  ));
 }
