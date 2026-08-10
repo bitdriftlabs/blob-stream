@@ -561,7 +561,9 @@ every metadata-query page. It defaults to false. The runtime feature flag
 `blob_stream_consumer_strong_metadata_reads` overrides that setting, using the configuration value
 as its fallback. The reader snapshots the resolved value at the beginning of each scan pass; a flag
 change therefore affects the next pass without invalidating metadata caches, clearing Fast
-frontiers, or replaying cursors. Strong mode ignores a configured nonzero
+frontiers, replaying cursors, or retroactively changing a hydrated recovery source-window overlap.
+Operational flag changes are expected to be infrequent: a strong-to-eventual change after hydration
+retains the shorter strong-mode overlap for that recovery. Strong mode ignores a configured nonzero
 `metadata_visibility_delay_ms`: its effective delay is zero while the broker publication deadline
 remains part of Fast and checkpoint-recovery overlap calculations.
 

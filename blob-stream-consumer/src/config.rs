@@ -187,7 +187,7 @@ pub fn consumer_candidate_window_count(
 }
 
 /// Derive candidate windows for an explicit per-pass effective visibility delay.
-pub(crate) fn consumer_candidate_window_count_with_visibility_delay(
+pub fn consumer_candidate_window_count_with_visibility_delay(
   config: &ConsumerReadConfig,
   maximum_metadata_publication_lag_ms: u64,
   metadata_visibility_delay_ms: u64,

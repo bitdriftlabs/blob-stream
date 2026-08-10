@@ -25,6 +25,9 @@ use crate::consumer::reader::RecoveryMetadataCacheKey;
 
 impl ConsumerReaderImpl {
   /// Return the cache identity for an immutable, recovery-only metadata request.
+  ///
+  /// The key intentionally excludes consistency: runtime changes do not invalidate a completed
+  /// recovery observation or replay it with stronger reads.
   pub(in crate::consumer) fn mature_recovery_metadata_cache_key(
     &self,
     request: &ScanRequest,

@@ -109,9 +109,9 @@ impl SegmentMetadata {
 /// Consistency requested for one metadata window query.
 pub enum MetadataReadConsistency {
   #[default]
-  /// Read from a replica when DynamoDB permits it.
+  /// Read from a replica when `DynamoDB` permits it.
   Eventual,
-  /// Read committed metadata from DynamoDB's leader.
+  /// Read committed metadata from `DynamoDB`'s leader.
   Strong,
 }
 
