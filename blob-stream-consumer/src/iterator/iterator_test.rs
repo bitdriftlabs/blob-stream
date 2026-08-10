@@ -22,6 +22,7 @@ use crate::config::{
 use crate::diagnostics::{
   ConsumerAssignmentPlanSnapshot,
   ConsumerAssignmentPolicy,
+  ConsumerCommittedCursorSnapshot,
   ConsumerGroupLeaseObservation,
   ConsumerLocalPartitionSnapshot,
   ConsumerPartitionAssignmentSnapshot,
@@ -31,7 +32,14 @@ use crate::diagnostics::{
 };
 use bd_server_stats::stats::Collector;
 use bd_time::SystemTimeProvider;
-use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
+use blob_stream_blob_store::{
+  BlobKey,
+  BlobStore,
+  BlobStoreError,
+  BlobStoreResult,
+  ByteRange,
+  InMemoryBlobStore,
+};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupAssignmentPlan,
@@ -433,7 +441,7 @@ impl BlobStore for BlockingBlobStore {
     self.inner.put(key, payload).await
   }
 
-  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> anyhow::Result<Bytes> {
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
     if self.block_reads.load(Ordering::SeqCst) {
       self.read_started.notify_waiters();
       self.read_release.notified().await;
@@ -448,11 +456,12 @@ impl BlobStore for FailingReadBlobStore {
     self.inner.put(key, payload).await
   }
 
-  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> anyhow::Result<Bytes> {
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
     self.failed_reads.fetch_add(1, Ordering::SeqCst);
-    Err(anyhow::anyhow!(
-      "injected blob read failure for {key:?} at {range:?}"
-    ))
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("injected blob read failure for {key:?} at {range:?}"),
+    })
   }
 }
 
@@ -1174,6 +1183,19 @@ async fn partial_heartbeat_failure_revokes_fenced_partition() {
 
   iterator.start().unwrap();
   wait_for_active_assignment(&iterator, &[0, 1]).await;
+  iterator
+    .shared_state
+    .lock()
+    .diagnostics
+    .last_committed_cursors
+    .insert(
+      0,
+      ConsumerCommittedCursorSnapshot {
+        offset: 1,
+        source_checkpoint: None,
+        committed_at_ms: None,
+      },
+    );
   time_provider.wait_until_sleeping(2).await;
   lease_store.failures_enabled.store(true, Ordering::SeqCst);
 
@@ -1183,6 +1205,11 @@ async fn partial_heartbeat_failure_revokes_fenced_partition() {
     panic!("expected fenced partition revocation");
   };
   assert_eq!(revoked.partitions(), &[0]);
+  let snapshot = iterator
+    .diagnostics()
+    .expect("consumer implementation provides diagnostics")
+    .state_snapshot();
+  assert_eq!(local_partition(&snapshot, 0).last_committed_offset, None);
   revoked.complete().await;
   Box::new(iterator).shutdown().await.unwrap();
 }
@@ -1825,6 +1852,25 @@ async fn commit_during_revocation_persists_revoked_partition_cursor() {
   );
 
   revoked.complete().await;
+  timeout(Duration::from_secs(1), async {
+    loop {
+      let snapshot = iterator
+        .diagnostics()
+        .expect("consumer implementation provides diagnostics")
+        .state_snapshot();
+      if snapshot
+        .local
+        .partitions
+        .iter()
+        .all(|partition| partition.virtual_partition_id != revoked_partition_id)
+      {
+        return;
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("revoked partition remained in local diagnostics");
   Box::new(iterator).shutdown().await.unwrap();
 }
 

@@ -22,7 +22,7 @@ use crate::config::{
   consumer_window_size_seconds,
 };
 use anyhow::{Context, Error, Result, ensure};
-use blob_stream_blob_store::ByteRange;
+use blob_stream_blob_store::{BlobKey, ByteRange};
 use blob_stream_metadata_store::SegmentMetadata;
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
@@ -90,6 +90,24 @@ pub(in crate::consumer) struct ScanEligibility {
 pub(in crate::consumer) struct BatchReadCandidate {
   pub(in crate::consumer) batch_metadata: BatchMetadata,
   pub(in crate::consumer) virtual_partition_id: VirtualPartitionId,
+}
+
+//
+// BatchReadResult
+//
+
+/// Result of reading one selected batch from a segment.
+pub(in crate::consumer) enum BatchReadResult {
+  /// A selected batch was fetched and decoded successfully.
+  Decoded {
+    candidate: BatchReadCandidate,
+    batch: ConsumerBatch,
+  },
+  /// The segment object was conclusively missing and its batch is lost.
+  Missing {
+    candidate: BatchReadCandidate,
+    blob_key: BlobKey,
+  },
 }
 
 //

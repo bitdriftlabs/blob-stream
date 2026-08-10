@@ -373,8 +373,17 @@ deferred window inside that horizon instead completes recovery and is handed to 
 the same visibility check, blocks later snowflakes in that partition/window during the pass, and
 retries from its inclusive time floor and frontier. This prevents recovery from tail-chasing a busy
 active window while preserving the historical recovery barrier that protects cursor order. A failed
-metadata or blob read restores the pass's cursor and frontier state, so an undelivered batch is
-retried.
+metadata or blob read, except a classified missing blob, restores the pass's cursor and frontier
+state so an undelivered batch is retried.
+
+A classified blob `NotFound` is a retention or storage durability violation: metadata is published
+only after its blob upload, and S3 retention must outlive the referencing metadata. The reader
+counts the missing batch's records in `lost_records`, advances its in-memory cursor through the
+batch's sequence range, and does not deliver its records. This lets later retained data continue
+without treating timeouts, permissions, corruption, or other storage failures as loss. The reader
+does not automatically commit this skip; the normal caller-controlled commit path remains
+responsible for persisting later acknowledged progress. A restart before that commit can classify
+the same missing range again rather than silently acknowledging previously delivered records.
 
 Prefetch-capacity exhaustion is also a recovery barrier. The reader advances the recovery pointer
 past only fully processed windows and leaves it at the earliest window containing a batch whose
@@ -672,12 +681,13 @@ pod loads, and the optional `pod_id` beside every partition's member assignment.
 continue to report member-only assignments without pod fields.
 
 The always-available `/state` endpoint returns that local state plus a fresh, strongly consistent
-lease-table query for the consumer group. The response joins retained lease rows with the last
-structurally valid assignment plan accepted by the local coordinator, so it includes planned but
-currently unleased partitions as well as other consumers' owner, generation, heartbeat, and
-committed cursor information. The inline query never enters the driver control flow and is bounded
-to one second. A query error or timeout is represented as `lookup_failed`; the local state remains
-available in that response.
+lease-table query for the consumer group. Its `local.partitions` reports only current or pending
+local assignments; revocation discards the prior local cursor snapshot. The response joins
+retained lease rows with the last structurally valid assignment plan accepted by the local
+coordinator, so it includes planned but currently unleased partitions as well as other consumers'
+owner, generation, heartbeat, and committed cursor information. The inline query never enters the
+driver control flow and is bounded to one second. A query error or timeout is represented as
+`lookup_failed`; the local state remains available in that response.
 
 ## Correctness and Failure Behavior
 

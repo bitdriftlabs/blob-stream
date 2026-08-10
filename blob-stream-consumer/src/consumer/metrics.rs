@@ -39,6 +39,7 @@ pub(in crate::consumer) struct ConsumerReaderMetrics {
   blob_batch_ranges: IntCounter,
   blob_batch_range_bytes: IntCounter,
   blob_range_latency_seconds: Histogram,
+  lost_records: IntCounter,
   batches_read: IntCounter,
   records_read: IntCounter,
   record_payload_bytes: IntCounter,
@@ -89,6 +90,7 @@ impl ConsumerReaderMetrics {
       blob_batch_ranges: scope.counter("blob_batch_ranges"),
       blob_batch_range_bytes: scope.counter("blob_batch_range_bytes"),
       blob_range_latency_seconds: scope.histogram("blob_range_latency_seconds"),
+      lost_records: scope.counter("lost_records"),
       batches_read: scope.counter("batches_read"),
       records_read: scope.counter("records_read"),
       record_payload_bytes: scope.counter("record_payload_bytes"),
@@ -174,6 +176,10 @@ impl ConsumerReaderMetrics {
       .blob_batch_ranges
       .inc_by(u64::try_from(range_count).unwrap_or(u64::MAX));
     self.blob_batch_range_bytes.inc_by(bytes);
+  }
+
+  pub(in crate::consumer) fn record_lost_records(&self, record_count: u64) {
+    self.lost_records.inc_by(record_count);
   }
 
   pub(in crate::consumer) fn record_batch(&self, record_count: usize, payload_bytes: usize) {

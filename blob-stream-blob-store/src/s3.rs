@@ -1,6 +1,8 @@
-use crate::{BlobKey, BlobStore, ByteRange};
+use crate::{BlobKey, BlobStore, BlobStoreError, BlobStoreResult, ByteRange};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use log::{debug, trace};
@@ -54,7 +56,7 @@ impl BlobStore for S3BlobStore {
     Ok(())
   }
 
-  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> Result<Bytes> {
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
     trace!(
       "s3 get_range start: bucket={}, key={}, start={}, end={}",
       self.bucket,
@@ -69,7 +71,7 @@ impl BlobStore for S3BlobStore {
     let end_inclusive = range.end - 1;
     let range_header = format!("bytes={}-{}", range.start, end_inclusive);
 
-    let response = self
+    let response = match self
       .client
       .get_object()
       .bucket(&self.bucket)
@@ -77,9 +79,29 @@ impl BlobStore for S3BlobStore {
       .range(range_header)
       .send()
       .await
-      .with_context(|| format!("get S3 object {}", key.as_str()))?;
+    {
+      Ok(response) => response,
+      Err(SdkError::ServiceError(error)) if matches!(error.err(), GetObjectError::NoSuchKey(_)) => {
+        return Err(BlobStoreError::NotFound {
+          key: key.as_str().to_string(),
+        });
+      },
+      Err(source) => {
+        return Err(BlobStoreError::Read {
+          key: key.as_str().to_string(),
+          source: source.into(),
+        });
+      },
+    };
 
-    let body = response.body.collect().await.context("collect S3 body")?;
+    let body = response
+      .body
+      .collect()
+      .await
+      .map_err(|source| BlobStoreError::Read {
+        key: key.as_str().to_string(),
+        source: source.into(),
+      })?;
     let bytes = body.into_bytes();
     debug!(
       "s3 get_range complete: bucket={}, key={}, bytes={}",
