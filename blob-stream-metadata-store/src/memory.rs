@@ -3,7 +3,7 @@
 mod tests;
 
 use crate::codec::EncodedSegmentMetadata;
-use crate::{MetadataStore, SegmentMetadata};
+use crate::{MetadataReadConsistency, MetadataStore, SegmentMetadata};
 use anyhow::Result;
 use async_trait::async_trait;
 use bd_log::warn_every;
@@ -56,6 +56,7 @@ impl MetadataStore for InMemoryMetadataStore {
     &self,
     window: &TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    _consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     trace!(
       "metadata(memory) scan_window: topic={}, window_start={}, min_snowflake={:?}",

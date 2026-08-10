@@ -17,8 +17,7 @@ use super::{
 };
 use crate::config::{
   ConsumerReadRuntimeSettings,
-  consumer_candidate_window_count,
-  consumer_metadata_visibility_delay_ms,
+  consumer_candidate_window_count_with_visibility_delay,
   consumer_window_size_seconds,
 };
 use anyhow::{Context, Error, Result, ensure};

@@ -8,12 +8,14 @@ use super::{
   consumer_metadata_visibility_delay_ms,
   consumer_prefetch_max_bytes,
   consumer_read_runtime_settings,
+  consumer_strongly_consistent_metadata_reads,
   validate_group_config,
   validate_read_config,
 };
 use crate::config::ConsumerGroupConfig;
 use bd_runtime_config::loader::Loader;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
+use blob_stream_metadata_store::MetadataReadConsistency;
 use blob_stream_types::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS as SHARED_PUBLICATION_LAG_MS;
 use std::sync::Arc;
 
@@ -38,6 +40,7 @@ fn read_defaults_derive_two_candidate_windows_and_two_second_idle_cap() {
   assert_eq!(consumer_max_idle_poll_delay_ms(&read), 2_000);
   assert_eq!(consumer_prefetch_max_bytes(&read), 64 * 1024 * 1024);
   assert_eq!(consumer_metadata_visibility_delay_ms(&read), 2_000);
+  assert!(!consumer_strongly_consistent_metadata_reads(&read));
   assert_eq!(consumer_max_in_flight_batch_reads(&read), 32);
 }
 
@@ -114,8 +117,45 @@ fn runtime_feature_flags_override_configured_reader_settings() {
     super::ConsumerReadRuntimeSettings {
       prefetch_max_bytes: 32,
       max_in_flight_batch_reads: 4,
+      metadata_read_consistency: MetadataReadConsistency::Eventual,
+      metadata_visibility_delay_ms: 2_000,
     }
   );
+}
+
+#[test]
+fn strong_metadata_reads_use_zero_effective_visibility_delay() {
+  let mut read = read_config();
+  read.metadata_visibility_delay_ms = Some(1_500);
+  read.strongly_consistent_metadata_reads = Some(true);
+
+  let runtime_settings = consumer_read_runtime_settings(&read, None);
+
+  assert!(consumer_strongly_consistent_metadata_reads(&read));
+  assert_eq!(
+    runtime_settings.metadata_read_consistency,
+    MetadataReadConsistency::Strong
+  );
+  assert_eq!(runtime_settings.metadata_visibility_delay_ms, 0);
+}
+
+#[test]
+fn runtime_feature_flag_overrides_configured_metadata_read_consistency() {
+  let mut read = read_config();
+  read.strongly_consistent_metadata_reads = Some(true);
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", false),
+  ));
+
+  let runtime_settings =
+    consumer_read_runtime_settings(&read, Some(&feature_flags.snapshot_watch()));
+
+  assert_eq!(
+    runtime_settings.metadata_read_consistency,
+    MetadataReadConsistency::Eventual
+  );
+  assert_eq!(runtime_settings.metadata_visibility_delay_ms, 2_000);
 }
 
 #[test]

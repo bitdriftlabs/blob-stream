@@ -1,4 +1,10 @@
-use crate::{DynamoCapacityMetrics, MetadataStore, SegmentMetadata, codec};
+use crate::{
+  DynamoCapacityMetrics,
+  MetadataReadConsistency,
+  MetadataStore,
+  SegmentMetadata,
+  codec,
+};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
@@ -145,9 +151,11 @@ impl MetadataStore for DynamoMetadataStore {
     &self,
     window: &TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     trace!(
-      "metadata(dynamo) scan_window start: table={}, topic={}, window_start={}, min_snowflake={:?}",
+      "metadata(dynamo) scan_window start: table={}, topic={}, window_start={}, \
+       min_snowflake={:?}, consistency={consistency:?}",
       self.table_name,
       window.topic,
       format_unix_timestamp_ms(window.window_start_unix_seconds.saturating_mul(1_000)),
@@ -178,7 +186,7 @@ impl MetadataStore for DynamoMetadataStore {
         .key_condition_expression(key_condition)
         .projection_expression(format!("{ATTR_PK}, {ATTR_SK}, {ATTR_SEGMENT_METADATA_V1}"))
         .set_expression_attribute_values(Some(values))
-        .consistent_read(false);
+        .consistent_read(matches!(consistency, MetadataReadConsistency::Strong));
       if let Some(key) = start_key.take() {
         query = query.set_exclusive_start_key(Some(key));
       }

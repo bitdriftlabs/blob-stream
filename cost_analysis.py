@@ -75,10 +75,9 @@ class Inputs:
   kb_scanned_per_window_query: float
   kb_membership_query_page: float
 
-  # Read consistency factor:
-  # - eventually consistent reads: 0.5
-  # - strongly consistent reads:   1.0
-  c_read: float
+  # Mirrors ConsumerReadConfig.strongly_consistent_metadata_reads and its runtime override.
+  # False charges eventual metadata queries at 0.5 RRU per 4 KB; true charges strong queries at 1.
+  strongly_consistent_metadata_reads: bool
 
   # ---------- Operational overhead factors ----------
   # Optional multipliers for retries/contention overhead.
@@ -223,10 +222,12 @@ def compute(i: Inputs) -> dict[str, float]:
     + req_ddb_w_membership_hb * ceil(i.kb_membership / 1.0)
   )
 
-  # Reads: 1 RRU per 4 KB strongly-consistent read, 0.5 for eventual consistency.
+  # Metadata pages are eventual by default and strong when the consumer setting or runtime flag is
+  # enabled. Membership queries are already strongly consistent regardless of that choice.
+  metadata_read_rru_factor = 1.0 if i.strongly_consistent_metadata_reads else 0.5
   rru_hour = (
-    req_ddb_r_scan * ceil(i.kb_scanned_per_window_query / 4.0) * i.c_read
-    + req_ddb_r_membership * ceil(i.kb_membership_query_page / 4.0) * i.c_read
+    req_ddb_r_scan * ceil(i.kb_scanned_per_window_query / 4.0) * metadata_read_rru_factor
+    + req_ddb_r_membership * ceil(i.kb_membership_query_page / 4.0)
   )
 
   # ---------- Hourly cost ----------
@@ -318,8 +319,8 @@ DEFAULTS = Inputs(
   kb_scanned_per_window_query=8.0,
   kb_membership_query_page=4.0,
 
-  # Eventual consistency by default in current code paths.
-  c_read=0.5,
+  # Eventual metadata reads by default; set true to model the configuration/feature-flag override.
+  strongly_consistent_metadata_reads=False,
 
   # No extra contention overhead by default.
   f_write_conflict_overhead=0.0,

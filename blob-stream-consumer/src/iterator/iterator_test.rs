@@ -56,6 +56,7 @@ use blob_stream_metadata_store::{
   InMemoryConsumerGroupLeaseStore,
   InMemoryConsumerGroupMembershipStore,
   InMemoryMetadataStore,
+  MetadataReadConsistency,
   MetadataStore,
   SegmentMetadata,
 };
@@ -475,11 +476,12 @@ impl MetadataStore for RecordingMetadataStore {
     &self,
     window: &TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> anyhow::Result<Vec<SegmentMetadata>> {
     self.scans.fetch_add(1, Ordering::SeqCst);
     self
       .inner
-      .scan_window_from_snowflake(window, min_snowflake)
+      .scan_window_from_snowflake(window, min_snowflake, consistency)
       .await
   }
 }

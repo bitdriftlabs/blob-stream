@@ -105,6 +105,16 @@ impl SegmentMetadata {
 // MetadataStore
 //
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Consistency requested for one metadata window query.
+pub enum MetadataReadConsistency {
+  #[default]
+  /// Read from a replica when DynamoDB permits it.
+  Eventual,
+  /// Read committed metadata from DynamoDB's leader.
+  Strong,
+}
+
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 /// Segment metadata index store.
@@ -118,6 +128,7 @@ pub trait MetadataStore: Send + Sync {
     &self,
     window: &TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>>;
 }
 
