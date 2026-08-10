@@ -1,3 +1,5 @@
+<img width="2816" height="1536" alt="Gemini_Generated_Image_37932g37932g3793" src="https://github.com/user-attachments/assets/3cf30755-7eee-4c7d-8a06-45e96c8677d4" />
+
 # blob-stream
 
 `blob-stream` is a Kafka-like streaming system optimized for high-throughput telemetry with lower
