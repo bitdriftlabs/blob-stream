@@ -1,5 +1,5 @@
-use bd_server_stats::stats::Scope;
-use prometheus::{Histogram, IntCounter, IntGauge};
+use bd_server_stats::stats::{ContributionGauge, Scope};
+use prometheus::{Histogram, IntCounter};
 use std::time::Instant;
 
 //
@@ -25,9 +25,9 @@ pub(in crate::consumer) struct ConsumerReaderMetrics {
   recovery_metadata_cache_misses: IntCounter,
   recovery_metadata_cache_inserts: IntCounter,
   recovery_metadata_cache_invalidations: IntCounter,
-  recovery_metadata_cache_entries: IntGauge,
-  recovery_metadata_cache_retained_bytes: IntGauge,
-  metadata_fast_scan_frontiers: IntGauge,
+  recovery_metadata_cache_entries: ContributionGauge,
+  recovery_metadata_cache_retained_bytes: ContributionGauge,
+  metadata_fast_scan_frontiers: ContributionGauge,
   pub(in crate::consumer) metadata_fast_scan_without_lower_bound: IntCounter,
   pub(in crate::consumer) metadata_fast_scan_segments_below_partition_frontier: IntCounter,
   pub(in crate::consumer) metadata_fast_scan_segments_without_assigned_batches: IntCounter,
@@ -66,9 +66,15 @@ impl ConsumerReaderMetrics {
       recovery_metadata_cache_misses: scope.counter("recovery_metadata_cache_misses"),
       recovery_metadata_cache_inserts: scope.counter("recovery_metadata_cache_inserts"),
       recovery_metadata_cache_invalidations: scope.counter("recovery_metadata_cache_invalidations"),
-      recovery_metadata_cache_entries: scope.gauge("recovery_metadata_cache_entries"),
-      recovery_metadata_cache_retained_bytes: scope.gauge("recovery_metadata_cache_retained_bytes"),
-      metadata_fast_scan_frontiers: scope.gauge("metadata_fast_scan_frontiers"),
+      recovery_metadata_cache_entries: ContributionGauge::new(
+        scope.gauge("recovery_metadata_cache_entries"),
+      ),
+      recovery_metadata_cache_retained_bytes: ContributionGauge::new(
+        scope.gauge("recovery_metadata_cache_retained_bytes"),
+      ),
+      metadata_fast_scan_frontiers: ContributionGauge::new(
+        scope.gauge("metadata_fast_scan_frontiers"),
+      ),
       metadata_fast_scan_without_lower_bound: scope
         .counter("metadata_fast_scan_without_lower_bound"),
       metadata_fast_scan_segments_below_partition_frontier: scope
