@@ -37,6 +37,7 @@ use blob_stream_metadata_store::{
   LeaseReleaseOutcome,
   MetadataReadConsistency,
   MetadataStore,
+  ProducerPartitionFence,
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
@@ -80,11 +81,16 @@ struct FailsTopicMetadataStore {
 
 #[async_trait]
 impl MetadataStore for FailsTopicMetadataStore {
-  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> Result<()> {
     if metadata.window.topic == self.failed_topic {
       return Err(anyhow::anyhow!("metadata write failed"));
     }
-    self.inner.write_segment(metadata).await
+    self.inner.write_segment(metadata, fences, now_ts_ms).await
   }
 
   async fn scan_window_from_snowflake(
@@ -163,12 +169,19 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome> {
     self
       .inner
-      .acquire_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .acquire_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        lease_duration_ms,
+      )
       .await
   }
 
@@ -176,6 +189,7 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
     reservation_size: Option<u64>,
@@ -199,6 +213,7 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
       .acquire_lease_and_reserve_sequences(
         key,
         holder_id,
+        lease_session_id,
         now_ts_ms,
         lease_duration_ms,
         reservation_size,
@@ -210,12 +225,19 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseHeartbeatOutcome> {
     self
       .inner
-      .heartbeat_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .heartbeat_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        lease_duration_ms,
+      )
       .await
   }
 
@@ -223,6 +245,7 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
@@ -240,7 +263,13 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     }
     self
       .inner
-      .reserve_sequences(key, holder_id, now_ts_ms, reservation_size)
+      .reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        reservation_size,
+      )
       .await
   }
 
@@ -248,9 +277,13 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
   ) -> Result<LeaseReleaseOutcome> {
-    self.inner.release_lease(key, holder_id, now_ts_ms).await
+    self
+      .inner
+      .release_lease(key, holder_id, lease_session_id, now_ts_ms)
+      .await
   }
 }
 
@@ -278,6 +311,7 @@ fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
   ));
   initial.transition.finish(
     LeaseExpirationUpdate::Set(Some(2_000)),
+    None,
     Some(SeqRange { start: 0, end: 3 }),
   );
 
@@ -310,6 +344,7 @@ fn maintenance_top_up_extends_the_current_reservation() {
   };
   initial.transition.finish_lease_maintenance(
     LeaseExpirationUpdate::Set(Some(2_000)),
+    None,
     Some(SeqRange { start: 0, end: 99 }),
     0,
   );
@@ -336,6 +371,7 @@ fn maintenance_top_up_extends_the_current_reservation() {
   ));
   top_up.transition.finish_lease_maintenance(
     LeaseExpirationUpdate::Set(Some(2_100)),
+    None,
     Some(SeqRange {
       start: 100,
       end: 199,
@@ -367,6 +403,7 @@ fn maintenance_high_utilization_doubles_the_adaptive_reservation_target() {
   };
   initial.transition.finish_lease_maintenance(
     LeaseExpirationUpdate::Set(Some(2_000)),
+    None,
     Some(SeqRange { start: 0, end: 99 }),
     0,
   );
@@ -404,6 +441,7 @@ fn maintenance_high_utilization_waits_until_another_window_is_needed() {
   };
   initial.transition.finish_lease_maintenance(
     LeaseExpirationUpdate::Set(Some(2_000)),
+    None,
     Some(SeqRange { start: 0, end: 199 }),
     0,
   );
@@ -442,6 +480,7 @@ fn lease_reacquisition_discards_stale_sequence_capacity() {
   };
   initial.transition.finish(
     LeaseExpirationUpdate::Set(Some(2_000)),
+    None,
     Some(SeqRange { start: 0, end: 9 }),
   );
 
@@ -461,7 +500,7 @@ fn lease_reacquisition_discards_stale_sequence_capacity() {
   assert!(reacquire.reservation.is_none());
   reacquire
     .transition
-    .finish(LeaseExpirationUpdate::Set(Some(3_000)), None);
+    .finish(LeaseExpirationUpdate::Set(Some(3_000)), None, None);
 
   let reservation = begin_allocation_transition(&state, "telemetry", 0, 1, 2_001, false, 10);
   let AllocationTransitionDecision::Claimed(reservation) = reservation else {
@@ -469,6 +508,7 @@ fn lease_reacquisition_discards_stale_sequence_capacity() {
   };
   reservation.transition.finish(
     LeaseExpirationUpdate::Preserve,
+    None,
     Some(SeqRange { start: 20, end: 29 }),
   );
 
@@ -721,7 +761,13 @@ async fn state_snapshot_reports_expired_observed_lease() -> Result<()> {
     virtual_partition_id: 0,
   };
   lease_store
-    .acquire_lease(key, "former-owner".to_string(), now_ms - 1_000, 100)
+    .acquire_lease(
+      key,
+      "former-owner".to_string(),
+      "former-owner-session".to_string(),
+      now_ms - 1_000,
+      100,
+    )
     .await?;
 
   let snapshot = engine.state_snapshot().await;
@@ -804,7 +850,13 @@ async fn fenced_sequence_reservations_do_not_record_failure_metrics() -> Result<
     virtual_partition_id: 0,
   };
   lease_store
-    .acquire_lease(key, "other-broker".to_string(), now_ms, 30_000)
+    .acquire_lease(
+      key,
+      "other-broker".to_string(),
+      "other-broker-session".to_string(),
+      now_ms,
+      30_000,
+    )
     .await?;
   let error = engine
     .produce_batch(WriteRequest {
@@ -1872,7 +1924,13 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
     virtual_partition_id: 0,
   };
   let held_by_a = lease_store
-    .acquire_lease(key.clone(), "node-b".to_string(), now_ms, 30_000)
+    .acquire_lease(
+      key.clone(),
+      "node-b".to_string(),
+      "node-b-session".to_string(),
+      now_ms,
+      30_000,
+    )
     .await?;
   assert!(matches!(held_by_a, LeaseAcquireOutcome::HeldByOther(_)));
 
@@ -1881,7 +1939,13 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   receive_blob_write(&mut entered_rx).await;
 
   let still_held_by_a = lease_store
-    .acquire_lease(key.clone(), "node-b".to_string(), now_ms, 30_000)
+    .acquire_lease(
+      key.clone(),
+      "node-b".to_string(),
+      "node-b-session".to_string(),
+      now_ms,
+      30_000,
+    )
     .await?;
   assert!(matches!(
     still_held_by_a,
@@ -1894,7 +1958,13 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   let mut acquired_by_b = false;
   for _ in 0 .. 100 {
     let outcome = lease_store
-      .acquire_lease(key.clone(), "node-b".to_string(), now_ms, 30_000)
+      .acquire_lease(
+        key.clone(),
+        "node-b".to_string(),
+        "node-b-session".to_string(),
+        now_ms,
+        30_000,
+      )
       .await?;
     if matches!(outcome, LeaseAcquireOutcome::Acquired(_)) {
       acquired_by_b = true;
@@ -1985,7 +2055,13 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
     virtual_partition_id: 0,
   };
   let held_by_a = lease_store
-    .acquire_lease(key.clone(), "node-b".to_string(), now_ms, 30_000)
+    .acquire_lease(
+      key.clone(),
+      "node-b".to_string(),
+      "node-b-session".to_string(),
+      now_ms,
+      30_000,
+    )
     .await?;
   assert!(matches!(held_by_a, LeaseAcquireOutcome::HeldByOther(_)));
   assert!(!shutdown.is_finished());
@@ -1997,7 +2073,13 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
     .expect("component shutdown did not complete after flush drained")?;
 
   let acquired_by_b = lease_store
-    .acquire_lease(key, "node-b".to_string(), now_ms, 30_000)
+    .acquire_lease(
+      key,
+      "node-b".to_string(),
+      "node-b-session".to_string(),
+      now_ms,
+      30_000,
+    )
     .await?;
   assert!(matches!(acquired_by_b, LeaseAcquireOutcome::Acquired(_)));
   Ok(())
@@ -2340,7 +2422,12 @@ struct FailingMetadataStore;
 
 #[async_trait]
 impl MetadataStore for FailingMetadataStore {
-  async fn write_segment(&self, _metadata: SegmentMetadata) -> Result<()> {
+  async fn write_segment(
+    &self,
+    _metadata: SegmentMetadata,
+    _fences: Option<&[ProducerPartitionFence]>,
+    _now_ts_ms: i64,
+  ) -> Result<()> {
     Err(anyhow::anyhow!("metadata write failed"))
   }
 

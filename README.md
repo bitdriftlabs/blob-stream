@@ -59,6 +59,11 @@ broker:
   flush_max_delay_ms: 1000
   # Base reservation size. The broker adapts upward per active partition after exhaustion.
   sequence_reservation_size: 10000
+  # Default-off rollout control. The runtime flag below overrides this value when configured.
+  fenced_metadata_writes: false
+  feature_flags:
+    dir: "/config_map/feature_flags"
+    file: "/config_map/feature_flags/feature_flags.yaml"
   node_identity:
     hostname: {}
   discovery:
@@ -155,6 +160,45 @@ after an interrupted commit or a partition rebalance. Consumers need S3 object r
 metadata-table query access, and read/write/delete access to the consumer lease and membership
 tables. Brokers need S3 object write access, segment-metadata writes, and producer-lease access.
 
+### Broker fenced metadata writes
+
+Set `broker.fenced_metadata_writes` to transactionally publish each segment metadata row only while
+every partition in its flush plan still has its current producer lease. The runtime feature flag
+`blob_stream_broker_fenced_metadata_writes` overrides this static setting when `feature_flags.dir`
+and `feature_flags.file` are configured. The value is resolved once per flush-plan collection, so
+an in-flight plan cannot change publication mode.
+
+Fenced writes are default-off for rolling deployment compatibility. First deploy the session-aware
+broker version with the setting disabled, then grant the transactional IAM permissions below, and
+only then enable the static setting or runtime flag. No segment-metadata schema or consumer change
+is required. A transaction can contain the metadata write plus at most 99 producer-lease condition
+checks, so the scheduler splits larger same-topic flushes into plans of 99 partitions. If a fence
+is lost after the blob upload, the blob can remain orphaned but the metadata row is not published;
+the producer receives a retryable failure.
+
+### Broker IAM permissions
+
+For unfenced DynamoDB publication, a broker requires `dynamodb:PutItem` on the segment metadata
+table plus its normal producer-lease permissions. Fenced publication additionally requires
+`dynamodb:TransactWriteItems` and `dynamodb:ConditionCheckItem` on both the segment metadata and
+producer lease tables. The transaction writes one metadata item and condition-checks every producer
+lease, so omitting either action can cause publication to fail with `AccessDeniedException`.
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "dynamodb:PutItem",
+    "dynamodb:TransactWriteItems",
+    "dynamodb:ConditionCheckItem"
+  ],
+  "Resource": [
+    "arn:aws:dynamodb:<region>:<account-id>:table/<segment-metadata-table>",
+    "arn:aws:dynamodb:<region>:<account-id>:table/<producer-lease-table>"
+  ]
+}
+```
+
 ### Consumer IAM permissions
 
 For DynamoDB, a consumer role needs `dynamodb:Query` on the segment metadata and consumer
@@ -234,8 +278,8 @@ Keys:
 - Partition key: `pk` = `"<topic>#<virtual_partition_id>"`
 
 Representative attributes:
-- `holder_id`, `lease_expiration_ts_ms`, `max_allocated_seq`, `topic`, `virtual_partition_id`,
-  `ttl_epoch_seconds`
+- `holder_id`, `lease_epoch`, `lease_session_id`, `lease_expiration_ts_ms`, `max_allocated_seq`,
+  `topic`, `virtual_partition_id`, `ttl_epoch_seconds`
 
 ### 3) `consumer_group_leases`
 

@@ -7,6 +7,7 @@ use crate::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
+  ProducerLeaseFence,
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
@@ -50,11 +51,19 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome> {
     match self
-      .acquire_lease_and_reserve_sequences(key, holder_id, now_ts_ms, lease_duration_ms, None)
+      .acquire_lease_and_reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        lease_duration_ms,
+        None,
+      )
       .await?
     {
       LeaseAcquireAndReserveOutcome::Acquired {
@@ -77,6 +86,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
     reservation_size: Option<u64>,
@@ -94,15 +104,26 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     let mut guard = self.leases.write();
     let state = guard.entry(key.clone()).or_insert_with(|| LeaseState {
       holder_id: holder_id.clone(),
+      lease_epoch: 1,
+      lease_session_id: lease_session_id.clone(),
       lease_expiration_ts_ms: expires_at,
       max_allocated_seq: None,
     });
-    if !state.is_expired(now_ts_ms) && state.holder_id != holder_id {
+    if !state.is_expired(now_ts_ms)
+      && (state.holder_id != holder_id || state.lease_session_id != lease_session_id)
+    {
       return Ok(LeaseAcquireAndReserveOutcome::HeldByOther(
         state.to_lease(key),
       ));
     }
 
+    if state.is_expired(now_ts_ms) || state.lease_session_id != lease_session_id {
+      state.lease_epoch = state
+        .lease_epoch
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("lease epoch overflow"))?;
+      state.lease_session_id = lease_session_id;
+    }
     state.holder_id = holder_id;
     state.lease_expiration_ts_ms = expires_at;
     let reservation = if let Some(size) = reservation_size {
@@ -121,6 +142,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseHeartbeatOutcome> {
@@ -137,7 +159,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       return Ok(LeaseHeartbeatOutcome::Expired);
     }
 
-    if state.holder_id != holder_id {
+    if state.holder_id != holder_id || state.lease_session_id != lease_session_id {
       return Ok(LeaseHeartbeatOutcome::HeldByOther(
         state.to_lease(key.clone()),
       ));
@@ -151,6 +173,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
@@ -171,7 +194,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       return Ok(SequenceReservationOutcome::Expired);
     }
 
-    if state.holder_id != holder_id {
+    if state.holder_id != holder_id || state.lease_session_id != lease_session_id {
       return Ok(SequenceReservationOutcome::HeldByOther(
         state.to_lease(key.clone()),
       ));
@@ -190,6 +213,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
   ) -> Result<LeaseReleaseOutcome> {
     trace!(
@@ -205,7 +229,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       return Ok(LeaseReleaseOutcome::Expired);
     }
 
-    if state.holder_id != holder_id {
+    if state.holder_id != holder_id || state.lease_session_id != lease_session_id {
       return Ok(LeaseReleaseOutcome::HeldByOther(
         state.to_lease(key.clone()),
       ));
@@ -224,6 +248,8 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
 #[derive(Clone, Debug)]
 struct LeaseState {
   holder_id: String,
+  lease_epoch: u64,
+  lease_session_id: String,
   lease_expiration_ts_ms: i64,
   max_allocated_seq: Option<u64>,
 }
@@ -237,6 +263,11 @@ impl LeaseState {
     ProducerPartitionLease {
       key,
       holder_id: self.holder_id.clone(),
+      fence: Some(ProducerLeaseFence {
+        holder_id: self.holder_id.clone(),
+        lease_epoch: self.lease_epoch,
+        lease_session_id: self.lease_session_id.clone(),
+      }),
       lease_expiration_ts_ms: self.lease_expiration_ts_ms,
       max_allocated_seq: self.max_allocated_seq,
     }

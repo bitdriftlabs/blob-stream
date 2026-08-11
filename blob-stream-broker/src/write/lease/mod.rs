@@ -20,6 +20,7 @@ mod assignment;
 pub(super) async fn acquire_lease_and_reserve_sequences(
   lease_store: &Arc<dyn ProducerPartitionLeaseStore>,
   holder_id: &str,
+  lease_session_id: &str,
   key: ProducerPartitionLeaseKey,
   now_ts_ms: i64,
   lease_duration_ms: i64,
@@ -31,6 +32,7 @@ pub(super) async fn acquire_lease_and_reserve_sequences(
     .acquire_lease_and_reserve_sequences(
       key,
       holder_id.to_string(),
+      lease_session_id.to_string(),
       now_ts_ms,
       lease_duration_ms,
       reservation_size,
@@ -51,7 +53,7 @@ impl WriteEngineImpl {
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
     now_ts_ms: i64,
-  ) -> Result<i64, WriteError> {
+  ) -> Result<blob_stream_metadata_store::ProducerPartitionLease, WriteError> {
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string().into(),
       virtual_partition_id,
@@ -62,13 +64,14 @@ impl WriteEngineImpl {
       .acquire_lease(
         key,
         self.holder_id.clone(),
+        self.lease_session_id.clone(),
         now_ts_ms,
         self.config.lease_duration_ms,
       )
       .await
       .context("acquire producer partition lease")?
     {
-      LeaseAcquireOutcome::Acquired(lease) => Ok(lease.lease_expiration_ts_ms),
+      LeaseAcquireOutcome::Acquired(lease) => Ok(lease),
       LeaseAcquireOutcome::HeldByOther(_) => Err(WriteError::NotLeaseHolder {
         topic: topic.to_string().into(),
         virtual_partition_id,
@@ -90,7 +93,13 @@ impl WriteEngineImpl {
     let started = Instant::now();
     let outcome = self
       .lease_store
-      .reserve_sequences(&key, &self.holder_id, now_ts_ms, reservation_size)
+      .reserve_sequences(
+        &key,
+        &self.holder_id,
+        &self.lease_session_id,
+        now_ts_ms,
+        reservation_size,
+      )
       .await
       .context("reserve sequences");
     self
@@ -128,7 +137,7 @@ impl WriteEngineImpl {
     virtual_partition_id: VirtualPartitionId,
     now_ts_ms: i64,
     reservation_size: u64,
-  ) -> Result<(i64, SeqRange), WriteError> {
+  ) -> Result<(blob_stream_metadata_store::ProducerPartitionLease, SeqRange), WriteError> {
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string().into(),
       virtual_partition_id,
@@ -136,6 +145,7 @@ impl WriteEngineImpl {
     let outcome = acquire_lease_and_reserve_sequences(
       &self.lease_store,
       &self.holder_id,
+      &self.lease_session_id,
       key,
       now_ts_ms,
       self.config.lease_duration_ms,
@@ -156,7 +166,7 @@ impl WriteEngineImpl {
            requested_size={reservation_size}, start={}, end={}",
           reservation.start, reservation.end
         );
-        Ok((lease.lease_expiration_ts_ms, reservation))
+        Ok((lease, reservation))
       },
       Ok(LeaseAcquireAndReserveOutcome::Acquired {
         reservation: None, ..

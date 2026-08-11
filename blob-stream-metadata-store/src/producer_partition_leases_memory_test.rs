@@ -23,32 +23,146 @@ async fn fences_lease_holders() {
   let key = lease_key();
 
   let outcome = store
-    .acquire_lease(key.clone(), "broker-a".to_string(), 1000, 100)
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-a".to_string(),
+      1000,
+      100,
+    )
     .await
     .expect("acquire lease");
 
   assert!(matches!(outcome, LeaseAcquireOutcome::Acquired(_)));
 
   let outcome = store
-    .acquire_lease(key.clone(), "broker-b".to_string(), 1000, 100)
+    .acquire_lease(
+      key.clone(),
+      "broker-b".to_string(),
+      "session-b".to_string(),
+      1000,
+      100,
+    )
     .await
     .expect("acquire lease");
 
   assert!(matches!(outcome, LeaseAcquireOutcome::HeldByOther(_)));
 
   let outcome = store
-    .heartbeat_lease(&key, "broker-b", 1000, 100)
+    .heartbeat_lease(&key, "broker-b", "session-b", 1000, 100)
     .await
     .expect("heartbeat lease");
 
   assert!(matches!(outcome, LeaseHeartbeatOutcome::HeldByOther(_)));
 
   let outcome = store
-    .acquire_lease(key.clone(), "broker-b".to_string(), 1100, 100)
+    .acquire_lease(
+      key.clone(),
+      "broker-b".to_string(),
+      "session-b".to_string(),
+      1100,
+      100,
+    )
     .await
     .expect("acquire lease after expiration");
 
   assert!(matches!(outcome, LeaseAcquireOutcome::Acquired(_)));
+}
+
+#[tokio::test]
+async fn fences_stale_broker_sessions() {
+  let store = InMemoryProducerPartitionLeaseStore::new();
+  let key = lease_key();
+
+  let first = store
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-1".to_string(),
+      1_000,
+      100,
+    )
+    .await
+    .expect("initial acquisition");
+  let LeaseAcquireOutcome::Acquired(first) = first else {
+    panic!("expected initial acquisition");
+  };
+  assert_eq!(
+    first.fence.expect("memory lease has a fence").lease_epoch,
+    1
+  );
+
+  let renewal = store
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-1".to_string(),
+      1_050,
+      100,
+    )
+    .await
+    .expect("same session renewal");
+  let LeaseAcquireOutcome::Acquired(renewal) = renewal else {
+    panic!("expected same session renewal");
+  };
+  assert_eq!(
+    renewal.fence.expect("memory lease has a fence").lease_epoch,
+    1
+  );
+
+  let live_takeover = store
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-2".to_string(),
+      1_100,
+      100,
+    )
+    .await
+    .expect("live takeover attempt");
+  assert!(matches!(live_takeover, LeaseAcquireOutcome::HeldByOther(_)));
+
+  let takeover = store
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-2".to_string(),
+      1_150,
+      100,
+    )
+    .await
+    .expect("expired takeover");
+  let LeaseAcquireOutcome::Acquired(takeover) = takeover else {
+    panic!("expected expired takeover");
+  };
+  assert_eq!(
+    takeover
+      .fence
+      .expect("memory lease has a fence")
+      .lease_epoch,
+    2
+  );
+
+  let heartbeat = store
+    .heartbeat_lease(&key, "broker-a", "session-1", 1_150, 100)
+    .await
+    .expect("stale heartbeat");
+  assert!(matches!(heartbeat, LeaseHeartbeatOutcome::HeldByOther(_)));
+
+  let reservation = store
+    .reserve_sequences(&key, "broker-a", "session-1", 1_150, 1)
+    .await
+    .expect("stale reservation");
+  assert!(matches!(
+    reservation,
+    SequenceReservationOutcome::HeldByOther(_)
+  ));
+
+  let release = store
+    .release_lease(&key, "broker-a", "session-1", 1_150)
+    .await
+    .expect("stale release");
+  assert!(matches!(release, LeaseReleaseOutcome::HeldByOther(_)));
 }
 
 #[tokio::test]
@@ -57,12 +171,18 @@ async fn reserves_sequences_in_order() {
   let key = lease_key();
 
   store
-    .acquire_lease(key.clone(), "broker-a".to_string(), 1000, 100)
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-a".to_string(),
+      1000,
+      100,
+    )
     .await
     .expect("acquire lease");
 
   let first = store
-    .reserve_sequences(&key, "broker-a", 1000, 5)
+    .reserve_sequences(&key, "broker-a", "session-a", 1000, 5)
     .await
     .expect("reserve seq");
 
@@ -74,7 +194,7 @@ async fn reserves_sequences_in_order() {
   assert_eq!(first.range.end, 4);
 
   let second = store
-    .reserve_sequences(&key, "broker-a", 1000, 3)
+    .reserve_sequences(&key, "broker-a", "session-a", 1000, 3)
     .await
     .expect("reserve seq");
 
@@ -92,7 +212,14 @@ async fn acquires_and_reserves_sequences_in_one_operation() {
   let key = lease_key();
 
   let first = store
-    .acquire_lease_and_reserve_sequences(key.clone(), "broker-a".to_string(), 1_000, 100, Some(5))
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-a".to_string(),
+      1_000,
+      100,
+      Some(5),
+    )
     .await
     .expect("acquire and reserve");
   let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = first else {
@@ -103,7 +230,14 @@ async fn acquires_and_reserves_sequences_in_one_operation() {
   assert_eq!(reservation, Some(SeqRange { start: 0, end: 4 }));
 
   let second = store
-    .acquire_lease_and_reserve_sequences(key, "broker-a".to_string(), 1_050, 100, Some(3))
+    .acquire_lease_and_reserve_sequences(
+      key,
+      "broker-a".to_string(),
+      "session-a".to_string(),
+      1_050,
+      100,
+      Some(3),
+    )
     .await
     .expect("renew and reserve");
   let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = second else {
@@ -120,12 +254,18 @@ async fn releases_lease_for_current_holder() {
   let key = lease_key();
 
   store
-    .acquire_lease(key.clone(), "broker-a".to_string(), 1000, 100)
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-a".to_string(),
+      1000,
+      100,
+    )
     .await
     .expect("acquire lease");
 
   let reservation = store
-    .reserve_sequences(&key, "broker-a", 1_000, 5)
+    .reserve_sequences(&key, "broker-a", "session-a", 1_000, 5)
     .await
     .expect("reserve sequences");
   assert!(matches!(
@@ -134,7 +274,7 @@ async fn releases_lease_for_current_holder() {
   ));
 
   let outcome = store
-    .release_lease(&key, "broker-a", 1000)
+    .release_lease(&key, "broker-a", "session-a", 1000)
     .await
     .expect("release lease");
   assert!(matches!(outcome, LeaseReleaseOutcome::Released));
@@ -148,13 +288,19 @@ async fn releases_lease_for_current_holder() {
   assert_eq!(released_lease.max_allocated_seq, Some(4));
 
   let reacquired = store
-    .acquire_lease(key.clone(), "broker-b".to_string(), 1_000, 100)
+    .acquire_lease(
+      key.clone(),
+      "broker-b".to_string(),
+      "session-b".to_string(),
+      1_000,
+      100,
+    )
     .await
     .expect("acquire after release");
   assert!(matches!(reacquired, LeaseAcquireOutcome::Acquired(_)));
 
   let reservation = store
-    .reserve_sequences(&key, "broker-b", 1_000, 2)
+    .reserve_sequences(&key, "broker-b", "session-b", 1_000, 2)
     .await
     .expect("reserve sequences after release");
   let SequenceReservationOutcome::Reserved(reservation) = reservation else {
@@ -178,7 +324,13 @@ async fn lookup_reports_absent_and_active_leases() {
   );
 
   store
-    .acquire_lease(key.clone(), "broker-a".to_string(), 1_000, 100)
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-a".to_string(),
+      1_000,
+      100,
+    )
     .await
     .expect("acquire lease");
 

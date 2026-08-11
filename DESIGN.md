@@ -164,12 +164,20 @@ graceful membership handoff or orderly shutdown, the broker stops accepting new 
 partition, drains its already accepted work, and only then voluntarily releases the producer
 lease. Flushes for different virtual partitions remain concurrent.
 
-This is not a durable cross-process publication fence. A broker crash, long pause, network
-partition, or stale process resuming after its lease expires can still result in a former holder
-attempting its unconditional metadata write after a successor has published higher sequences. A
-consumer cursor advances past a later `seq_end` and cannot recover an earlier range that appears
-afterward, so this remains a known limitation until metadata publication is transactionally
-conditioned on a unique producer lease session or epoch.
+The optional `fenced_metadata_writes` mode supplies a durable cross-process publication fence. Each
+write engine creates a unique process session ID; acquisition by a new or expired session increments
+the durable lease epoch, while a live renewal by the same session preserves it. Metadata publication
+uses one DynamoDB transaction containing the metadata `Put` and a condition check for every
+partition's holder ID, epoch, session ID, and unexpired lease. A former process cannot publish after
+a successor takes the lease, even if both processes use the same node ID.
+
+The mode defaults off for roll-forward compatibility. A cluster can first deploy session-aware
+brokers while continuing unconditional metadata writes, then enable the mode after transactional IAM
+permissions are present. Readers require no metadata migration because the epoch and session remain
+lease-table fields. A transaction has room for one metadata write and at most 99 lease checks, so
+the scheduler splits larger flushes. A lost fence after blob upload can leave an orphaned blob, but
+the transaction does not publish metadata and the producer receives a retryable failure. When the
+mode is disabled, the former stale-writer limitation remains.
 
 A consumer cursor is the greatest processed `seq_end` for one virtual partition. During scans,
 the consumer skips a batch when `batch.seq_end <= cursor` and advances its cursor only forward.
@@ -206,9 +214,10 @@ invariant.
    durable-plan completions; a completion immediately promotes an eligible successor epoch.
 6. A flush coalesces each virtual partition's accepted batches into one `StoredRecordBatch`,
   compresses each serialized partition batch independently, concatenates the stored bytes into a
-  segment blob, uploads the blob, and then writes the segment metadata row. Plans may run
-  concurrently for different virtual partitions, but each virtual partition persists plans in
-  sequence order.
+  segment blob, uploads the blob, and then writes the segment metadata row. With fenced metadata
+  writes enabled, that final write is a transaction conditioned on the snapshot lease fence for
+  every partition in the plan. Plans may run concurrently for different virtual partitions, but
+  each virtual partition persists plans in sequence order.
 7. Only after both blob upload and metadata write succeed does the broker complete the waiting
    write and return `OK`. A producer acknowledgement therefore represents durable segment
    metadata, not merely in-memory buffering.
@@ -585,20 +594,19 @@ advances this bound during ordinary replica lag; it does not turn the frontier i
 watermark or establish a DynamoDB visibility guarantee.
 
 A Fast or checkpoint-overlap recovery scan can miss a row that becomes visible outside its bounded
-availability horizon. Strong metadata reads remove the read-replica component, but they still do not
-prevent a stale former producer from publishing after lease expiry or make a paginated query an
-atomic multi-page snapshot. A transactional producer publication fence is required with stronger
-reads for a complete ordering guarantee.
+availability horizon. Strong metadata reads remove the read-replica component, but do not make a
+paginated query an atomic multi-page snapshot. Enabling fenced broker metadata writes additionally
+prevents a stale former producer from publishing after lease expiry; with it disabled, the former
+stale-writer limitation remains.
 
 The reader's cursor filtering relies on metadata becoming visible in compatible sequence order.
-Graceful broker handoff drains locally accepted work before lease release, but the expiry/stale
-writer limitation described above remains. Applications must tolerate duplicates, and deployments
-that require a stronger at-least-once contract across all writer failures need a transactional
-producer publication fence in addition to any reader-consistency choice.
+Graceful broker handoff drains locally accepted work before lease release. Applications must tolerate
+duplicates; deployments that require the stronger cross-process publication property must enable
+fenced metadata writes in addition to choosing an appropriate reader-consistency mode.
 
 Strong metadata queries remove read-replica staleness at approximately twice the metadata-query RRU
-component. They do not by themselves prevent a stale former producer from publishing metadata after
-lease expiry, so they must be paired with a publication fence for a complete ordering guarantee.
+component. They do not by themselves prevent stale publication; fenced broker metadata writes
+provide that publication fence when enabled.
 
 Use `cost_analysis.py` with real page sizes, poll rates, consumer counts, and regional pricing
 before enabling strong reads. Set its `strongly_consistent_metadata_reads` input to model the

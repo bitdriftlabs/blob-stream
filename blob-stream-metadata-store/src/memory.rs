@@ -3,7 +3,7 @@
 mod tests;
 
 use crate::codec::EncodedSegmentMetadata;
-use crate::{MetadataReadConsistency, MetadataStore, SegmentMetadata};
+use crate::{MetadataReadConsistency, MetadataStore, ProducerPartitionFence, SegmentMetadata};
 use anyhow::Result;
 use async_trait::async_trait;
 use bd_log_util::warn_every;
@@ -31,7 +31,16 @@ impl InMemoryMetadataStore {
 
 #[async_trait]
 impl MetadataStore for InMemoryMetadataStore {
-  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[ProducerPartitionFence]>,
+    _now_ts_ms: i64,
+  ) -> Result<()> {
+    anyhow::ensure!(
+      fences.is_none(),
+      "fenced metadata writes require the DynamoDB metadata store"
+    );
     trace!(
       "metadata(memory) write_segment: topic={}, window_start={}, snowflake_id={}",
       metadata.window.topic,

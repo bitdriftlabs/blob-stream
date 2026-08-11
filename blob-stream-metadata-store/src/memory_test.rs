@@ -47,14 +47,17 @@ async fn stores_and_scans_window() {
   let other = build_segment("topic-b", 200, 3);
 
   store
-    .write_segment(first.clone())
+    .write_segment(first.clone(), None, 0)
     .await
     .expect("write first");
   store
-    .write_segment(second.clone())
+    .write_segment(second.clone(), None, 0)
     .await
     .expect("write second");
-  store.write_segment(other).await.expect("write other");
+  store
+    .write_segment(other, None, 0)
+    .await
+    .expect("write other");
 
   let window = TopicWindowKey {
     topic: "topic-a".to_string(),
@@ -76,9 +79,12 @@ async fn scans_window_from_inclusive_snowflake() {
   let first = build_segment("topic-a", 100, 1);
   let second = build_segment("topic-a", 100, 2);
 
-  store.write_segment(first).await.expect("write first");
   store
-    .write_segment(second.clone())
+    .write_segment(first, None, 0)
+    .await
+    .expect("write first");
+  store
+    .write_segment(second.clone(), None, 0)
     .await
     .expect("write second");
 
@@ -103,7 +109,7 @@ async fn skips_noncompliant_segment_rows() {
   let store = InMemoryMetadataStore::new();
   let valid = build_segment("topic-a", 100, 2);
   store
-    .write_segment(valid.clone())
+    .write_segment(valid.clone(), None, 0)
     .await
     .expect("write valid segment");
   store

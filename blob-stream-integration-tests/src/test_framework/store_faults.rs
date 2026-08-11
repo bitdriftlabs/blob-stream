@@ -639,7 +639,12 @@ impl FaultInjectedMetadataStore {
 
 #[async_trait]
 impl MetadataStore for FaultInjectedMetadataStore {
-  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> Result<()> {
     let key = metadata.window.format();
     let effects = self
       .controller
@@ -669,7 +674,7 @@ impl MetadataStore for FaultInjectedMetadataStore {
       return Ok(());
     }
 
-    let result = self.inner.write_segment(metadata).await;
+    let result = self.inner.write_segment(metadata, fences, now_ts_ms).await;
     self
       .controller
       .record_operation_outcome(
@@ -725,6 +730,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome> {
@@ -756,7 +762,13 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .acquire_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .acquire_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        lease_duration_ms,
+      )
       .await;
     self
       .controller
@@ -784,6 +796,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
     reservation_size: Option<u64>,
@@ -844,6 +857,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
       .acquire_lease_and_reserve_sequences(
         key,
         holder_id,
+        lease_session_id,
         now_ts_ms,
         lease_duration_ms,
         reservation_size,
@@ -868,6 +882,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseHeartbeatOutcome> {
@@ -899,7 +914,13 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .heartbeat_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .heartbeat_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        lease_duration_ms,
+      )
       .await;
     self
       .controller
@@ -921,6 +942,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
@@ -952,7 +974,13 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .reserve_sequences(key, holder_id, now_ts_ms, reservation_size)
+      .reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        reservation_size,
+      )
       .await;
     self
       .controller
@@ -974,6 +1002,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
   ) -> Result<LeaseReleaseOutcome> {
     let effects = self
@@ -1002,7 +1031,10 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
       ));
     }
 
-    let result = self.inner.release_lease(key, holder_id, now_ts_ms).await;
+    let result = self
+      .inner
+      .release_lease(key, holder_id, lease_session_id, now_ts_ms)
+      .await;
     self
       .controller
       .record_operation_outcome(

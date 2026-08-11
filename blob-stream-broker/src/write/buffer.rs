@@ -1,10 +1,17 @@
 use super::WriteConfig;
 use anyhow::Result;
+use blob_stream_metadata_store::ProducerLeaseFence;
 use blob_stream_types::{BatchSummary, Record, SeqRange, VirtualPartitionId};
 use protobuf::Chars;
 use tokio::sync::oneshot;
 
-pub(super) type FlushCompletion = oneshot::Sender<Result<(), String>>;
+pub(super) type FlushCompletion = oneshot::Sender<Result<(), FlushCompletionError>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FlushCompletionError {
+  LeaseFenceLost,
+  Internal,
+}
 
 //
 // BufferState
@@ -52,6 +59,15 @@ impl BufferState {
     self.buffered_bytes = 0;
     self.first_buffered_ts_ms = None;
   }
+
+  pub(super) fn discard(&mut self) -> Vec<FlushCompletion> {
+    self.buffered_bytes = 0;
+    self.first_buffered_ts_ms = None;
+    std::mem::take(&mut self.batches)
+      .into_iter()
+      .filter_map(|mut batch| batch.completion.take())
+      .collect()
+  }
 }
 
 //
@@ -63,6 +79,7 @@ pub(super) struct BufferedBatch {
   pub(super) records: Vec<Record>,
   pub(super) summary: BatchSummary,
   pub(super) seq_range: SeqRange,
+  pub(super) acceptance_fence: Option<ProducerLeaseFence>,
   pub(super) completion: Option<FlushCompletion>,
 }
 
@@ -75,6 +92,7 @@ pub(super) struct FlushPlan {
   pub(super) topic: Chars,
   pub(super) partitions: Vec<FlushPartition>,
   pub(super) max_metadata_publication_lag_ms: u64,
+  pub(super) fenced_metadata_writes: bool,
 }
 
 //
@@ -84,6 +102,7 @@ pub(super) struct FlushPlan {
 #[derive(Debug)]
 pub(super) struct FlushPartition {
   pub(super) virtual_partition_id: VirtualPartitionId,
+  pub(super) lease_fence: Option<ProducerLeaseFence>,
   pub(super) batches: Vec<BufferedBatch>,
   pub(super) trigger: FlushTrigger,
 }

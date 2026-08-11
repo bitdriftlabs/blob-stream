@@ -2,12 +2,21 @@
 #[path = "./producer_partition_leases_dynamo_test.rs"]
 mod tests;
 
+use crate::dynamo_attributes::{
+  ATTR_EPOCH,
+  ATTR_EXPIRES,
+  ATTR_HOLDER,
+  ATTR_PK,
+  ATTR_SESSION,
+  ATTR_TTL,
+};
 use crate::{
   DynamoCapacityMetrics,
   LeaseAcquireAndReserveOutcome,
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
+  ProducerLeaseFence,
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
@@ -24,11 +33,7 @@ use log::{debug, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-const ATTR_PK: &str = "pk";
-const ATTR_HOLDER: &str = "holder_id";
-const ATTR_EXPIRES: &str = "lease_expiration_ts_ms";
 const ATTR_MAX_SEQ: &str = "max_allocated_seq";
-const ATTR_TTL: &str = "ttl_epoch_seconds";
 
 //
 // DynamoProducerPartitionLeaseStore
@@ -96,7 +101,7 @@ impl DynamoProducerPartitionLeaseStore {
     };
 
     let entry: DynamoLeaseItem = serde_dynamo::from_item(item)?;
-    Ok(Some(entry.into_lease(key.clone())))
+    Ok(Some(entry.into_lease(key.clone())?))
   }
 
   fn lease_from_item(
@@ -104,7 +109,7 @@ impl DynamoProducerPartitionLeaseStore {
     key: ProducerPartitionLeaseKey,
   ) -> Result<ProducerPartitionLease> {
     let entry: DynamoLeaseItem = serde_dynamo::from_item(attributes)?;
-    Ok(entry.into_lease(key))
+    entry.into_lease(key)
   }
 }
 
@@ -121,11 +126,19 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome> {
     match self
-      .acquire_lease_and_reserve_sequences(key, holder_id, now_ts_ms, lease_duration_ms, None)
+      .acquire_lease_and_reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        lease_duration_ms,
+        None,
+      )
       .await?
     {
       LeaseAcquireAndReserveOutcome::Acquired {
@@ -148,6 +161,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
     reservation_size: Option<u64>,
@@ -166,6 +180,10 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
 
     let mut values = HashMap::new();
     values.insert(":holder".to_string(), AttributeValue::S(holder_id.clone()));
+    values.insert(
+      ":session".to_string(),
+      AttributeValue::S(lease_session_id.clone()),
+    );
     values.insert(
       ":expires".to_string(),
       AttributeValue::N(expires_at.to_string()),
@@ -187,34 +205,30 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       );
     }
 
-    let update = match reservation_size {
+    let renewal_update = match reservation_size {
       Some(_) => format!(
-        "SET {ATTR_HOLDER} = :holder, {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl, \
-         {ATTR_MAX_SEQ} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta"
+        "SET {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl, {ATTR_MAX_SEQ} = \
+         if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta"
       ),
-      None => {
-        format!("SET {ATTR_HOLDER} = :holder, {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl")
-      },
+      None => format!("SET {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl"),
     };
-    let lease_condition = format!(
-      "attribute_not_exists({ATTR_PK}) OR {ATTR_EXPIRES} <= :now OR {ATTR_HOLDER} = :holder"
-    );
-    let condition = match reservation_size {
+    let renewal_condition =
+      format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EXPIRES} > :now");
+    let renewal_condition = match reservation_size {
       Some(_) => format!(
-        "({lease_condition}) AND (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= \
+        "({renewal_condition}) AND (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= \
          :max_reservable)"
       ),
-      None => lease_condition,
+      None => renewal_condition,
     };
-
     let response = self
       .client
       .update_item()
       .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(pk))
-      .update_expression(update)
-      .condition_expression(condition)
-      .set_expression_attribute_values(Some(values))
+      .key(ATTR_PK, AttributeValue::S(pk.clone()))
+      .update_expression(renewal_update)
+      .condition_expression(renewal_condition)
+      .set_expression_attribute_values(Some(values.clone()))
       .return_values(ReturnValue::AllNew)
       .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
@@ -244,15 +258,91 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
       {
-        debug!("producer lease(dynamo) acquire/reserve result: held_by_other");
-        let lease = self
-          .read_lease(&key)
-          .await?
-          .ok_or_else(|| anyhow!("lease missing after conditional failure"))?;
-        if reservation_would_overflow(&lease, &holder_id, now_ts_ms, reservation_size) {
-          return Err(anyhow!("sequence range overflow"));
-        }
-        Ok(LeaseAcquireAndReserveOutcome::HeldByOther(lease))
+        values.insert(
+          ":epoch_zero".to_string(),
+          AttributeValue::N("0".to_string()),
+        );
+        values.insert(
+          ":epoch_increment".to_string(),
+          AttributeValue::N("1".to_string()),
+        );
+        let claim_update = match reservation_size {
+          Some(_) => format!(
+            "SET {ATTR_HOLDER} = :holder, {ATTR_SESSION} = :session, {ATTR_EXPIRES} = :expires, \
+             {ATTR_TTL} = :ttl, {ATTR_EPOCH} = if_not_exists({ATTR_EPOCH}, :epoch_zero) + \
+             :epoch_increment, {ATTR_MAX_SEQ} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta"
+          ),
+          None => format!(
+            "SET {ATTR_HOLDER} = :holder, {ATTR_SESSION} = :session, {ATTR_EXPIRES} = :expires, \
+             {ATTR_TTL} = :ttl, {ATTR_EPOCH} = if_not_exists({ATTR_EPOCH}, :epoch_zero) + \
+             :epoch_increment"
+          ),
+        };
+        let claim_condition = format!(
+          "attribute_not_exists({ATTR_PK}) OR {ATTR_EXPIRES} <= :now OR ({ATTR_HOLDER} = :holder \
+           AND attribute_not_exists({ATTR_SESSION}))"
+        );
+        let claim_condition = match reservation_size {
+          Some(_) => format!(
+            "({claim_condition}) AND (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= \
+             :max_reservable)"
+          ),
+          None => claim_condition,
+        };
+        let claim = self
+          .client
+          .update_item()
+          .table_name(&self.table_name)
+          .key(ATTR_PK, AttributeValue::S(pk))
+          .update_expression(claim_update)
+          .condition_expression(claim_condition)
+          .set_expression_attribute_values(Some(values))
+          .return_values(ReturnValue::AllNew)
+          .return_consumed_capacity(ReturnConsumedCapacity::Total)
+          .send()
+          .await;
+        let output = match claim {
+          Ok(output) => output,
+          Err(SdkError::ServiceError(service_error))
+            if service_error.err().is_conditional_check_failed_exception() =>
+          {
+            debug!("producer lease(dynamo) acquire/reserve result: held_by_other");
+            let lease = self
+              .read_lease(&key)
+              .await?
+              .ok_or_else(|| anyhow!("lease missing after conditional failure"))?;
+            if reservation_would_overflow(
+              &lease,
+              &holder_id,
+              &lease_session_id,
+              now_ts_ms,
+              reservation_size,
+            ) {
+              return Err(anyhow!("sequence range overflow"));
+            }
+            return Ok(LeaseAcquireAndReserveOutcome::HeldByOther(lease));
+          },
+          Err(error) => return Err(error.into()),
+        };
+        self.record_write_capacity(output.consumed_capacity.as_ref());
+        let attributes = output
+          .attributes
+          .ok_or_else(|| anyhow!("lease attributes missing"))?;
+        let lease = Self::lease_from_item(attributes, key.clone())?;
+        let reservation = match reservation_size {
+          Some(size) => Some(reservation_from_new_max(
+            lease
+              .max_allocated_seq
+              .ok_or_else(|| anyhow!("reserved lease missing max allocated sequence"))?,
+            size,
+          )?),
+          None => None,
+        };
+        debug!(
+          "producer lease(dynamo) acquire/reserve result: acquired takeover, \
+           reservation={reservation:?}"
+        );
+        Ok(LeaseAcquireAndReserveOutcome::Acquired { lease, reservation })
       },
       Err(error) => Err(error.into()),
     }
@@ -262,6 +352,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseHeartbeatOutcome> {
@@ -278,6 +369,10 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       AttributeValue::S(holder_id.to_string()),
     );
     values.insert(
+      ":session".to_string(),
+      AttributeValue::S(lease_session_id.to_string()),
+    );
+    values.insert(
       ":expires".to_string(),
       AttributeValue::N(expires_at.to_string()),
     );
@@ -288,7 +383,8 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
 
     let update = format!("SET {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl");
-    let condition = format!("{ATTR_HOLDER} = :holder AND {ATTR_EXPIRES} > :now");
+    let condition =
+      format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EXPIRES} > :now");
 
     let response = self
       .client
@@ -336,6 +432,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
@@ -352,6 +449,10 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       ":holder".to_string(),
       AttributeValue::S(holder_id.to_string()),
     );
+    values.insert(
+      ":session".to_string(),
+      AttributeValue::S(lease_session_id.to_string()),
+    );
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
     values.insert(
       ":delta".to_string(),
@@ -365,7 +466,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
 
     let update = format!("SET {ATTR_MAX_SEQ} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta");
     let condition = format!(
-      "{ATTR_HOLDER} = :holder AND {ATTR_EXPIRES} > :now AND \
+      "{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EXPIRES} > :now AND \
        (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= :max_reservable)"
     );
 
@@ -414,7 +515,13 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
           debug!("producer lease(dynamo) reserve result: expired");
           return Ok(SequenceReservationOutcome::Expired);
         };
-        if reservation_would_overflow(&lease, holder_id, now_ts_ms, Some(reservation_size)) {
+        if reservation_would_overflow(
+          &lease,
+          holder_id,
+          lease_session_id,
+          now_ts_ms,
+          Some(reservation_size),
+        ) {
           return Err(anyhow!("sequence range overflow"));
         }
         if lease.lease_expiration_ts_ms <= now_ts_ms {
@@ -433,6 +540,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
   ) -> Result<LeaseReleaseOutcome> {
     trace!(
@@ -445,6 +553,10 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       AttributeValue::S(holder_id.to_string()),
     );
     values.insert(
+      ":session".to_string(),
+      AttributeValue::S(lease_session_id.to_string()),
+    );
+    values.insert(
       ":expired".to_string(),
       AttributeValue::N(now_ts_ms.to_string()),
     );
@@ -454,7 +566,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     );
 
     let update = format!("SET {ATTR_EXPIRES} = :expired, {ATTR_TTL} = :ttl");
-    let condition = format!("{ATTR_HOLDER} = :holder");
+    let condition = format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session");
     let response = self
       .client
       .update_item()
@@ -501,18 +613,38 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DynamoLeaseItem {
   holder_id: String,
+  // TODO: Once every broker is session-aware and legacy lease rows have expired, make
+  // `ProducerPartitionLease::fence` required and deserialize these attributes as required
+  // fields. Fenced metadata writes are a separate rollout toggle; session-aware brokers always
+  // write these attributes when they acquire a lease.
+  lease_epoch: Option<u64>,
+  lease_session_id: Option<String>,
   lease_expiration_ts_ms: i64,
   max_allocated_seq: Option<u64>,
 }
 
 impl DynamoLeaseItem {
-  fn into_lease(self, key: ProducerPartitionLeaseKey) -> ProducerPartitionLease {
-    ProducerPartitionLease {
+  fn into_lease(self, key: ProducerPartitionLeaseKey) -> Result<ProducerPartitionLease> {
+    let fence = match (self.lease_epoch, self.lease_session_id) {
+      (None, None) => None,
+      (Some(lease_epoch), Some(lease_session_id)) => Some(ProducerLeaseFence {
+        holder_id: self.holder_id.clone(),
+        lease_epoch,
+        lease_session_id,
+      }),
+      _ => {
+        return Err(anyhow!(
+          "producer partition lease has a partial fence identity"
+        ));
+      },
+    };
+    Ok(ProducerPartitionLease {
       key,
       holder_id: self.holder_id,
+      fence,
       lease_expiration_ts_ms: self.lease_expiration_ts_ms,
       max_allocated_seq: self.max_allocated_seq,
-    }
+    })
   }
 }
 
@@ -552,11 +684,16 @@ fn parse_u64(value: &AttributeValue) -> Result<u64> {
 fn reservation_would_overflow(
   lease: &ProducerPartitionLease,
   holder_id: &str,
+  lease_session_id: &str,
   now_ts_ms: i64,
   reservation_size: Option<u64>,
 ) -> bool {
   reservation_size.is_some_and(|size| {
     lease.holder_id == holder_id
+      && lease
+        .fence
+        .as_ref()
+        .is_some_and(|fence| fence.lease_session_id == lease_session_id)
       && lease.lease_expiration_ts_ms > now_ts_ms
       && lease
         .max_allocated_seq

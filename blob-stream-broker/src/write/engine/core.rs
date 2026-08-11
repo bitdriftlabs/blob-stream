@@ -11,6 +11,7 @@ use super::super::{
 };
 use super::MemoryPressureAdmissionController;
 use anyhow::Result;
+use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
 use bd_shutdown::ComponentShutdownTriggerHandle;
 use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
@@ -25,6 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use time::Duration as TimeDuration;
 use tokio::sync::{Notify, watch};
+use uuid::Uuid;
 
 //
 // WriteEngineImpl
@@ -37,12 +39,14 @@ pub struct WriteEngineImpl {
   pub(in crate::write) flush_context: FlushContext,
   pub(in crate::write) lease_store: Arc<dyn ProducerPartitionLeaseStore>,
   pub(in crate::write) holder_id: String,
+  pub(in crate::write) lease_session_id: String,
   pub(in crate::write) time_provider: Arc<dyn TimeProvider>,
   pub(in crate::write) metrics: WriteMetrics,
   pub(in crate::write) state: Arc<Mutex<WriteState>>,
   pub(in crate::write) flush_notifier: Arc<Notify>,
   pub(in crate::write) shutdown_trigger_handle: ComponentShutdownTriggerHandle,
   pub(in crate::write) lifecycle_hooks: Option<Arc<dyn BrokerLifecycleHooks>>,
+  pub(in crate::write) feature_flags: Option<FeatureFlagsWatch>,
 }
 
 //
@@ -57,6 +61,7 @@ pub struct WriteEngineBuilder<'a> {
   metadata_store: Arc<dyn MetadataStore>,
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
   holder_id: String,
+  lease_session_id: Option<String>,
   shutdown_trigger_handle: ComponentShutdownTriggerHandle,
   metrics_scope: &'a Scope,
   machine_id: Option<u16>,
@@ -64,6 +69,7 @@ pub struct WriteEngineBuilder<'a> {
   admission: Option<Arc<dyn AdmissionController>>,
   time_provider: Arc<dyn TimeProvider>,
   lifecycle_hooks: Option<Arc<dyn BrokerLifecycleHooks>>,
+  feature_flags: Option<FeatureFlagsWatch>,
 }
 
 impl<'a> WriteEngineBuilder<'a> {
@@ -84,6 +90,7 @@ impl<'a> WriteEngineBuilder<'a> {
       metadata_store,
       lease_store,
       holder_id,
+      lease_session_id: None,
       shutdown_trigger_handle,
       metrics_scope,
       machine_id: None,
@@ -91,6 +98,7 @@ impl<'a> WriteEngineBuilder<'a> {
       admission: None,
       time_provider: Arc::new(SystemTimeProvider),
       lifecycle_hooks: None,
+      feature_flags: None,
     }
   }
 
@@ -124,6 +132,18 @@ impl<'a> WriteEngineBuilder<'a> {
     self
   }
 
+  #[must_use]
+  pub fn feature_flags(mut self, feature_flags: Option<FeatureFlagsWatch>) -> Self {
+    self.feature_flags = feature_flags;
+    self
+  }
+
+  #[must_use]
+  pub fn lease_session_id(mut self, lease_session_id: String) -> Self {
+    self.lease_session_id = Some(lease_session_id);
+    self
+  }
+
   pub fn build(self) -> Result<WriteEngineImpl> {
     let Self {
       config,
@@ -132,6 +152,7 @@ impl<'a> WriteEngineBuilder<'a> {
       metadata_store,
       lease_store,
       holder_id,
+      lease_session_id,
       shutdown_trigger_handle,
       metrics_scope,
       machine_id,
@@ -139,6 +160,7 @@ impl<'a> WriteEngineBuilder<'a> {
       admission,
       time_provider,
       lifecycle_hooks,
+      feature_flags,
     } = self;
     let snowflake = match machine_id {
       Some(machine_id) => super::super::flush::SnowflakeGenerator::with_machine_id(machine_id)?,
@@ -178,12 +200,14 @@ impl<'a> WriteEngineBuilder<'a> {
       flush_context,
       lease_store,
       holder_id,
+      lease_session_id: lease_session_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
       time_provider,
       metrics: WriteMetrics::new(metrics_scope),
       state,
       flush_notifier: Arc::new(Notify::new()),
       shutdown_trigger_handle,
       lifecycle_hooks,
+      feature_flags,
     };
 
     engine.spawn_flush_loop();
@@ -202,6 +226,7 @@ impl WriteEngineImpl {
     let topics = self.topics.clone();
     let time_provider = Arc::clone(&self.time_provider);
     let metrics = self.metrics.clone();
+    let feature_flags = self.feature_flags.clone();
     let flush_notifier = Arc::clone(&self.flush_notifier);
     let mut shutdown = self.shutdown_trigger_handle.make_shutdown();
 
@@ -221,6 +246,7 @@ impl WriteEngineImpl {
           &state,
           now.unix_timestamp_ms(),
           flush_context.config(),
+          feature_flags.as_ref(),
           &topics,
           available_slots,
         );

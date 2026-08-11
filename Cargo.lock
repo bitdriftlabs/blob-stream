@@ -1224,6 +1224,7 @@ dependencies = [
  "bd-panic",
  "bd-pgv",
  "bd-rt",
+ "bd-runtime-config",
  "bd-server-stats",
  "bd-shutdown",
  "bd-time",

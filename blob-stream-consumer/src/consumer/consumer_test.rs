@@ -90,8 +90,13 @@ impl RecordingMetadataStore {
 
 #[async_trait]
 impl MetadataStore for RecordingMetadataStore {
-  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
-    self.inner.write_segment(metadata).await
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> Result<()> {
+    self.inner.write_segment(metadata, fences, now_ts_ms).await
   }
 
   async fn scan_window_from_snowflake(
@@ -116,7 +121,12 @@ struct FailingMetadataStore;
 
 #[async_trait]
 impl MetadataStore for FailingMetadataStore {
-  async fn write_segment(&self, _metadata: SegmentMetadata) -> Result<()> {
+  async fn write_segment(
+    &self,
+    _metadata: SegmentMetadata,
+    _fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
+    _now_ts_ms: i64,
+  ) -> Result<()> {
     Ok(())
   }
 
@@ -475,7 +485,10 @@ async fn write_segment_with_publication_time(
     metadata_published_ts_ms,
   );
 
-  metadata_store.write_segment(metadata).await.unwrap();
+  metadata_store
+    .write_segment(metadata, None, 0)
+    .await
+    .unwrap();
 }
 
 async fn write_multi_partition_segment(
@@ -533,18 +546,22 @@ async fn write_multi_partition_segment(
     .await
     .unwrap();
   metadata_store
-    .write_segment(SegmentMetadata::new(
-      TopicWindowKey {
-        topic: topic.to_string(),
-        window_start_unix_seconds: window_start,
-      },
-      SnowflakeId(snowflake_id),
-      blob_key,
-      compression,
-      segment_index,
-      window_start * 1_000,
-      window_start * 1_000,
-    ))
+    .write_segment(
+      SegmentMetadata::new(
+        TopicWindowKey {
+          topic: topic.to_string(),
+          window_start_unix_seconds: window_start,
+        },
+        SnowflakeId(snowflake_id),
+        blob_key,
+        compression,
+        segment_index,
+        window_start * 1_000,
+        window_start * 1_000,
+      ),
+      None,
+      0,
+    )
     .await
     .unwrap();
 

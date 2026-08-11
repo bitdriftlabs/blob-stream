@@ -22,6 +22,7 @@ bd-log-util.workspace             = true
 bd-panic.workspace                = true
 bd-pgv.workspace                  = true
 bd-rt.workspace                   = true
+bd-runtime-config.workspace       = true
 bd-server-stats.workspace         = true
 bd-shutdown.workspace             = true
 bd-time.workspace                 = true

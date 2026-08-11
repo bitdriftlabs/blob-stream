@@ -170,7 +170,9 @@ pub enum WriteError {
   InvalidRequest(String),
   #[error("broker overloaded: {0}")]
   Overloaded(String),
-  #[error("write failure: {0}")]
+  #[error("producer lease fence was lost")]
+  LeaseFenceLost,
+  #[error("write failure: {0:#}")]
   Internal(#[from] anyhow::Error),
 }
 
@@ -179,7 +181,9 @@ impl WriteError {
   pub fn status(&self) -> ProduceStatus {
     match self {
       Self::UnknownTopic(_) => ProduceStatus::PRODUCE_STATUS_UNKNOWN_TOPIC,
-      Self::NotLeaseHolder { .. } => ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER,
+      Self::NotLeaseHolder { .. } | Self::LeaseFenceLost => {
+        ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER
+      },
       Self::InvalidRequest(_) => ProduceStatus::PRODUCE_STATUS_BAD_REQUEST,
       Self::InvalidPartition { .. } | Self::Overloaded(_) | Self::Internal(_) => {
         ProduceStatus::PRODUCE_STATUS_OVERLOADED

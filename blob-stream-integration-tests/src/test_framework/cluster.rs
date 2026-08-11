@@ -115,6 +115,7 @@ pub struct ClusterHarness {
   partition_count: u32,
   topic_num_writers: u32,
   broker_flush_max_delay: Duration,
+  fenced_metadata_writes: bool,
   transport: Arc<dyn BrokerTransport>,
   lifecycle_hooks: TestLifecycleHooks,
   broker_time_provider: Arc<dyn TimeProvider>,
@@ -220,6 +221,7 @@ impl InMemoryClusterHarnessBuilder {
       self.partition_count,
       self.topic_num_writers,
       self.broker_flush_max_delay,
+      false,
       self.start_with_all_nodes,
       Arc::new(InMemoryTestTransport::new()),
       self.broker_time_provider,
@@ -241,6 +243,7 @@ pub struct ClusterHarnessBuilder<'a> {
   partition_count: u32,
   topic_num_writers: u32,
   broker_flush_max_delay: Duration,
+  fenced_metadata_writes: bool,
   start_with_all_nodes: bool,
   transport: Arc<dyn BrokerTransport>,
   broker_time_provider: Arc<dyn TimeProvider>,
@@ -270,6 +273,12 @@ impl ClusterHarnessBuilder<'_> {
 
   pub fn broker_flush_max_delay(mut self, broker_flush_max_delay: Duration) -> Self {
     self.broker_flush_max_delay = broker_flush_max_delay;
+    self
+  }
+
+  #[must_use]
+  pub fn fenced_metadata_writes(mut self) -> Self {
+    self.fenced_metadata_writes = true;
     self
   }
 
@@ -318,6 +327,7 @@ impl ClusterHarnessBuilder<'_> {
       self.partition_count,
       self.topic_num_writers,
       self.broker_flush_max_delay,
+      self.fenced_metadata_writes,
       self.start_with_all_nodes,
       self.transport,
       self.broker_time_provider,
@@ -340,6 +350,7 @@ impl ClusterHarness {
       partition_count: PARTITION_COUNT,
       topic_num_writers: 1,
       broker_flush_max_delay: Duration::from_millis(10),
+      fenced_metadata_writes: false,
       start_with_all_nodes: false,
       transport: Arc::new(GrpcTcpTransport),
       broker_time_provider: Arc::new(SystemTimeProvider),
@@ -372,6 +383,7 @@ impl ClusterHarness {
     partition_count: u32,
     topic_num_writers: u32,
     broker_flush_max_delay: Duration,
+    fenced_metadata_writes: bool,
     start_with_all_nodes: bool,
     transport: Arc<dyn BrokerTransport>,
     broker_time_provider: Arc<dyn TimeProvider>,
@@ -445,6 +457,7 @@ impl ClusterHarness {
       partition_count,
       topic_num_writers,
       broker_flush_max_delay,
+      fenced_metadata_writes,
       transport,
       lifecycle_hooks,
       broker_time_provider,
@@ -660,6 +673,7 @@ impl ClusterHarness {
       partition_count,
       topic_num_writers,
       self.broker_flush_max_delay,
+      self.fenced_metadata_writes,
       broker_shutdown_trigger.make_handle(),
       Arc::new(self.lifecycle_hooks.clone()),
       Arc::clone(&self.broker_time_provider),
@@ -760,6 +774,7 @@ fn build_write_engine(
   partition_count: u32,
   topic_num_writers: u32,
   broker_flush_max_delay: Duration,
+  fenced_metadata_writes: bool,
   shutdown_trigger_handle: ComponentShutdownTriggerHandle,
   lifecycle_hooks: Arc<dyn blob_stream_broker::write::BrokerLifecycleHooks>,
   time_provider: Arc<dyn TimeProvider>,
@@ -784,6 +799,7 @@ fn build_write_engine(
     .map_err(|_| anyhow!("broker_flush_max_delay exceeds milliseconds as i64"))?;
   config.flush_max_bytes = 1024;
   config.reservation_size = 64;
+  config.fenced_metadata_writes = fenced_metadata_writes;
   let metrics_scope = Collector::default().scope("blob_stream_broker_it");
   let engine = WriteEngineBuilder::new(
     config,
