@@ -5,7 +5,7 @@ mod tests;
 use crate::{BrokerDiscovery, BrokerMembership, BrokerNode};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Endpoints;
 use kube::runtime::WatchStreamExt;

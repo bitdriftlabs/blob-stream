@@ -3,7 +3,7 @@
 mod tests;
 
 use anyhow::{Result, anyhow, ensure};
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use bd_pgv::proto_validate;
 use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
 use blob_stream_metadata_store::MetadataReadConsistency;

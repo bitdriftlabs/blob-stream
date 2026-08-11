@@ -31,7 +31,7 @@ use super::{
   try_join_all,
 };
 use crate::consumer::ConsumerReadOutcome;
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use time::ext::NumericalDuration;
 
 impl ConsumerReaderImpl {

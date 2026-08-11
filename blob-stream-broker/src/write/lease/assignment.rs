@@ -11,7 +11,7 @@ use super::super::metrics::WriteMetrics;
 use super::super::state::WriteState;
 use super::super::{BrokerLifecycleHooks, TopicInfo, WriteEngineImpl};
 use super::acquire_lease_and_reserve_sequences;
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use bd_time::OffsetDateTimeExt;
 use blob_stream_broker_discovery::{
   BrokerMembership,

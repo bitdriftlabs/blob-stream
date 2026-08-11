@@ -1,7 +1,7 @@
 use super::metrics::WriteMetrics;
 use super::{WriteEngineImpl, WriteError};
 use anyhow::{Context, Result, anyhow};
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use blob_stream_metadata_store::{
   LeaseAcquireAndReserveOutcome,
   LeaseAcquireOutcome,

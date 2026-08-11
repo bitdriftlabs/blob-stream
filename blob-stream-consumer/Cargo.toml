@@ -18,6 +18,7 @@ aws-types.workspace             = true
 axum.workspace                  = true
 bd-backoff.workspace            = true
 bd-log.workspace                = true
+bd-log-util.workspace           = true
 bd-pgv.workspace                = true
 bd-runtime-config.workspace     = true
 bd-server-stats.workspace       = true
