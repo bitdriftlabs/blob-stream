@@ -1,7 +1,7 @@
 use super::{ConsumerDriver, ConsumerDriverCommand, HeartbeatTrigger, RETRY_MAX_DELAY_MS};
 use anyhow::{Result, ensure};
 use bd_backoff::InfiniteBackoff;
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use blob_stream_types::format_unix_timestamp_ms;
 use log::{debug, info, trace};
 use std::cmp::max;

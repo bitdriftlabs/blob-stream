@@ -6,7 +6,7 @@ use crate::codec::EncodedSegmentMetadata;
 use crate::{MetadataReadConsistency, MetadataStore, SegmentMetadata};
 use anyhow::Result;
 use async_trait::async_trait;
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use blob_stream_types::{SnowflakeId, TopicWindowKey, format_unix_timestamp_ms};
 use log::trace;
 use parking_lot::RwLock;

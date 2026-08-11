@@ -19,7 +19,7 @@ use crate::config::{
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bd_backoff::{ExponentialBackoff, ExponentialBackoffBuilder, InfiniteBackoff};
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode, BrokerPartition};
 use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchResponse,

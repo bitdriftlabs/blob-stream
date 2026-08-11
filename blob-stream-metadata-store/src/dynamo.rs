@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnConsumedCapacity};
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use blob_stream_types::{SnowflakeId, TopicWindowKey, format_unix_timestamp_ms};
 use bytes::Bytes;
 use log::{debug, trace};

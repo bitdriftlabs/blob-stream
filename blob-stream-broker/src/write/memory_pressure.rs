@@ -12,7 +12,7 @@ use anyhow::Result;
 #[cfg(target_os = "linux")]
 use anyhow::anyhow;
 #[cfg(any(target_os = "linux", test))]
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use bd_server_stats::stats::Scope;
 use bd_shutdown::ComponentShutdownTriggerHandle;
 #[cfg(target_os = "linux")]

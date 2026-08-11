@@ -42,7 +42,7 @@ use crate::diagnostics::{
 };
 use anyhow::Result;
 use bd_backoff::{ExponentialBackoff, ExponentialBackoffBuilder, InfiniteBackoff as _};
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use bd_time::TimeProvider;
 use blob_stream_types::{SnowflakeId, VirtualPartitionId, format_unix_timestamp_ms};
 use log::debug;

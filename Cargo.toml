@@ -24,6 +24,7 @@ axum                 = { version = "0.8.9", features = ["http2", "macros"] }
 bd-backoff           = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bd-grpc              = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bd-log               = { git = "https://github.com/bitdriftlabs/shared-core.git" }
+bd-log-util          = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bd-panic             = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bd-pgv               = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bd-rt                = { git = "https://github.com/bitdriftlabs/shared-core.git" }

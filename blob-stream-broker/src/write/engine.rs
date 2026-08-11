@@ -23,7 +23,7 @@ use crate::write::buffer::BufferedBatch;
 use crate::write::memory_pressure::MemoryPressureController;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use bd_server_stats::stats::Scope;
 use bd_shutdown::ComponentShutdownTriggerHandle;
 use bd_time::OffsetDateTimeExt;

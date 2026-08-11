@@ -16,7 +16,7 @@ use assignment::{
   cooperative_sticky_assignment_with_pods,
 };
 use async_trait::async_trait;
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupAssignmentPlan,
