@@ -635,7 +635,7 @@ async fn strong_metadata_reads_ignore_configured_visibility_delay() {
     SeqRange { start: 1, end: 1 },
     vec![new_record(vec![1], 902_000)],
     Compression::none(),
-    902_000,
+    902_500,
   )
   .await;
 

@@ -32,6 +32,7 @@ use super::{
 };
 use crate::consumer::ConsumerReadOutcome;
 use bd_log_util::warn_every;
+use blob_stream_metadata_store::MetadataReadConsistency;
 use time::ext::NumericalDuration;
 
 impl ConsumerReaderImpl {
@@ -410,7 +411,12 @@ impl ConsumerReaderImpl {
             }
           }
 
-          if segment.metadata_published_ts_ms > visibility_cutoff_ts_ms {
+          // Strong DynamoDB reads return committed metadata immediately. The publication horizon
+          // still plans rescans for rows that have not been written yet, but returned rows need
+          // no replica-visibility delay.
+          if runtime_settings.metadata_read_consistency == MetadataReadConsistency::Eventual
+            && segment.metadata_published_ts_ms > visibility_cutoff_ts_ms
+          {
             self
               .metrics
               .metadata_segments_deferred_by_visibility_delay
