@@ -22,6 +22,8 @@ rust_library_with_test(
         "dynamodb",
         "localstack",
     ],
+    # These tests share local S3/Dynamo service capacity; match blob-stream's Nextest limit.
+    nextest_args = ["--test-threads=4"],
     deps = all_crate_deps(normal = True),
 )
 
