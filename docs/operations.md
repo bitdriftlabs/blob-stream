@@ -57,45 +57,14 @@ with lease status and error metrics before treating it as an incident.
 
 ## Metrics
 
-Broker metric names use the `blob_stream_broker` namespace and component scopes such as `grpc` and
-`write`. The precise Prometheus exposition is available at `/metrics`.
+The broker serves its Prometheus registry at `GET /metrics`. Producer and consumer libraries add
+metrics to the `bd-server-stats` scope supplied by their embedding application. See the complete
+[Metrics reference](metrics.md) for names, scopes, types, and meanings.
 
-### Request Outcomes
-
-Monitor `grpc:requests_total`, `grpc:request_latency_seconds`, and
-`grpc:request_timeouts_total`, along with the `write:produce_*` counters. `write:produce_requests_total`
-counts attempts entering the write engine. `write:produce_records_total` and
-`write:produce_payload_bytes_total` count durable `OK` outcomes, while their `rejected_*`
-counterparts count definitive failures. A gRPC timeout is deliberately neither success nor rejection:
-the broker may still complete the flush, and a producer retry can duplicate the batch.
-
-Rising `produce_not_lease_holder_total` indicates routing or ownership churn. Rising
-`produce_overloaded_total` or `admission_rejections_total` indicates admission pressure or an
-internal transient failure. Correlate both with `/admin/state` before changing capacity.
-
-### Flush And Publication
-
-Use `flush_plans_total`, `flush_partitions_total`, and `flush_batches_total` to understand write
-coalescing. The `flush_batches_max_bytes_total`, `flush_batches_max_delay_total`, and
-`flush_batches_lease_drain_total` counters identify the trigger. Investigate increases in
-`flush_failures_total`, `flush_latency_seconds`,
-`metadata_publication_latency_seconds`, and either
-`metadata_publication_deadline_exhausted_before_persistence_total` or
-`metadata_publication_deadline_exhausted_while_persisting_total`.
-
-Publication deadline exhaustion fails the flush; it is not a warning that permits delayed
-publication. Check blob-store latency, DynamoDB throttling, object size
-(`flush_uploaded_object_bytes` and `flush_uploaded_object_bytes_total`), and configured
-`max_metadata_publication_lag_ms` together.
-
-### Leases And Sequence Reservations
-
-`sequence_reservations_total`, `sequence_reservation_records_total`,
-`sequence_reservation_failures_total`, and `sequence_reservation_latency_seconds` describe durable
-Hi-Lo range allocation. A large reservation rate relative to record rate can indicate ownership
-churn, restart churn, or undersized reservation targets. `lease_drain_starts_total` and
-`lease_drain_completions_total` expose graceful ownership handoffs; sustained divergence indicates
-partitions are failing to drain or release.
+For broker alerts, focus on gRPC timeouts and status failures, write admission rejections and
+flush failures, metadata-publication deadline exhaustion, sequence-reservation failures, and
+memory admission state. Pair ownership or admission failures with `/admin/state` before changing
+capacity or routing.
 
 ## Diagnostic Runbooks
 

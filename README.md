@@ -41,6 +41,9 @@ after interrupted commits or rebalances, so applications must tolerate duplicate
   discovery RBAC
 - [Operations guide](docs/operations.md): runtime controls, metrics, diagnostic endpoints, and
   troubleshooting
+- [Producer and consumer integration](docs/integration.md): library entry points, configuration
+  contracts, lifecycles, and application-mounted diagnostics
+- [Metrics reference](docs/metrics.md): producer, consumer, and broker metric definitions
 - [FAQ](docs/faq.md)
 - [Cost analysis](docs/cost-analysis.md)
 
