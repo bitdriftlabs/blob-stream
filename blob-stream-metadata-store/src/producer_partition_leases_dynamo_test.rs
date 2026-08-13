@@ -1,3 +1,4 @@
+use super::DynamoLeaseItem;
 use crate::{
   DynamoProducerPartitionLeaseStore,
   LeaseAcquireAndReserveOutcome,
@@ -19,6 +20,7 @@ use aws_sdk_dynamodb::types::{
   KeyType,
   ScalarAttributeType,
 };
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -90,6 +92,23 @@ fn lease_key() -> ProducerPartitionLeaseKey {
 
 fn default_lease_store(client: Client, table_name: String) -> DynamoProducerPartitionLeaseStore {
   DynamoProducerPartitionLeaseStore::new(client, table_name, 3_600, None)
+}
+
+#[test]
+fn rejects_legacy_lease_rows_without_fence_identity() {
+  let decoded: std::result::Result<DynamoLeaseItem, _> = serde_dynamo::from_item(HashMap::from([
+    (
+      "holder_id".to_string(),
+      AttributeValue::S("broker-a".to_string()),
+    ),
+    (
+      "lease_expiration_ts_ms".to_string(),
+      AttributeValue::N("1100".to_string()),
+    ),
+  ]));
+  let error = decoded.expect_err("legacy lease rows must not deserialize");
+
+  assert!(error.to_string().contains("lease_epoch"));
 }
 
 #[tokio::test]
@@ -381,7 +400,7 @@ async fn lookup_reports_absent_and_active_leases() -> Result<()> {
     .get_lease(&key)
     .await?
     .ok_or_else(|| anyhow!("active lease should exist"))?;
-  assert_eq!(lease.holder_id, "broker-a");
+  assert_eq!(lease.fence.holder_id, "broker-a");
   assert_eq!(lease.lease_expiration_ts_ms, 1_100);
 
   client.delete_table().table_name(table_name).send().await?;

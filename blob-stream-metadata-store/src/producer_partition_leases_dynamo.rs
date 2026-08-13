@@ -102,7 +102,7 @@ impl DynamoProducerPartitionLeaseStore {
     };
 
     let entry: DynamoLeaseItem = serde_dynamo::from_item(item)?;
-    Ok(Some(entry.into_lease(key.clone())?))
+    Ok(Some(entry.into_lease(key.clone())))
   }
 
   fn lease_from_item(
@@ -110,7 +110,7 @@ impl DynamoProducerPartitionLeaseStore {
     key: ProducerPartitionLeaseKey,
   ) -> Result<ProducerPartitionLease> {
     let entry: DynamoLeaseItem = serde_dynamo::from_item(attributes)?;
-    entry.into_lease(key)
+    Ok(entry.into_lease(key))
   }
 
   // Both renewal and takeover requests return the complete updated lease. Decode that shared
@@ -141,9 +141,8 @@ impl DynamoProducerPartitionLeaseStore {
     Ok(LeaseAcquireAndReserveOutcome::Acquired { lease, reservation })
   }
 
-  // A failed renewal can mean an absent or expired lease, or a legacy same-holder row with no
-  // session identity. Claim only those cases: a live session-aware lease remains owned by its
-  // current holder, and must be reported to the caller rather than overwritten.
+  // A failed renewal can mean an absent or expired lease. A live lease remains owned by its
+  // current holder and must be reported to the caller rather than overwritten.
   async fn claim_after_failed_renewal(
     &self,
     pk: String,
@@ -170,10 +169,7 @@ impl DynamoProducerPartitionLeaseStore {
          :epoch_increment"
       ),
     };
-    let claim_condition = format!(
-      "attribute_not_exists({ATTR_PK}) OR {ATTR_EXPIRES} <= :now OR ({ATTR_HOLDER} = :holder AND \
-       attribute_not_exists({ATTR_SESSION}))"
-    );
+    let claim_condition = format!("attribute_not_exists({ATTR_PK}) OR {ATTR_EXPIRES} <= :now");
     let claim_condition = match reservation_size {
       Some(_) => format!(
         "({claim_condition}) AND (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= \
@@ -624,38 +620,24 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DynamoLeaseItem {
   holder_id: String,
-  // TODO: Once every broker is session-aware and legacy lease rows have expired, make
-  // `ProducerPartitionLease::fence` required and deserialize these attributes as required
-  // fields. Fenced metadata writes are a separate rollout toggle; session-aware brokers always
-  // write these attributes when they acquire a lease.
-  lease_epoch: Option<u64>,
-  lease_session_id: Option<String>,
+  lease_epoch: u64,
+  lease_session_id: String,
   lease_expiration_ts_ms: i64,
   max_allocated_seq: Option<u64>,
 }
 
 impl DynamoLeaseItem {
-  fn into_lease(self, key: ProducerPartitionLeaseKey) -> Result<ProducerPartitionLease> {
-    let fence = match (self.lease_epoch, self.lease_session_id) {
-      (None, None) => None,
-      (Some(lease_epoch), Some(lease_session_id)) => Some(ProducerLeaseFence {
-        holder_id: self.holder_id.clone(),
-        lease_epoch,
-        lease_session_id,
-      }),
-      _ => {
-        return Err(anyhow!(
-          "producer partition lease has a partial fence identity"
-        ));
-      },
-    };
-    Ok(ProducerPartitionLease {
+  fn into_lease(self, key: ProducerPartitionLeaseKey) -> ProducerPartitionLease {
+    ProducerPartitionLease {
       key,
-      holder_id: self.holder_id,
-      fence,
+      fence: ProducerLeaseFence {
+        holder_id: self.holder_id,
+        lease_epoch: self.lease_epoch,
+        lease_session_id: self.lease_session_id,
+      },
       lease_expiration_ts_ms: self.lease_expiration_ts_ms,
       max_allocated_seq: self.max_allocated_seq,
-    })
+    }
   }
 }
 
@@ -700,11 +682,8 @@ fn reservation_would_overflow(
   reservation_size: Option<u64>,
 ) -> bool {
   reservation_size.is_some_and(|size| {
-    lease.holder_id == holder_id
-      && lease
-        .fence
-        .as_ref()
-        .is_some_and(|fence| fence.lease_session_id == lease_session_id)
+    lease.fence.holder_id == holder_id
+      && lease.fence.lease_session_id == lease_session_id
       && lease.lease_expiration_ts_ms > now_ts_ms
       && lease
         .max_allocated_seq

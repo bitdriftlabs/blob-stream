@@ -166,10 +166,10 @@ async fn acquire_producer_fence(
   let LeaseAcquireOutcome::Acquired(lease) = outcome else {
     return Err(anyhow!("expected producer lease acquisition"));
   };
-  let fence = lease
-    .fence
-    .ok_or_else(|| anyhow!("new producer lease must have a durable fence"))?;
-  Ok(ProducerPartitionFence { key, fence })
+  Ok(ProducerPartitionFence {
+    key,
+    fence: lease.fence,
+  })
 }
 
 #[tokio::test]
@@ -375,7 +375,7 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
   let LeaseAcquireOutcome::Acquired(first) = first else {
     return Err(anyhow!("expected initial lease acquisition"));
   };
-  assert_eq!(first.fence.as_ref().map(|fence| fence.lease_epoch), Some(1));
+  assert_eq!(first.fence.lease_epoch, 1);
 
   let renewal = lease_store
     .acquire_lease(
@@ -389,10 +389,7 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
   let LeaseAcquireOutcome::Acquired(renewal) = renewal else {
     return Err(anyhow!("expected same-session lease renewal"));
   };
-  assert_eq!(
-    renewal.fence.as_ref().map(|fence| fence.lease_epoch),
-    Some(1)
-  );
+  assert_eq!(renewal.fence.lease_epoch, 1);
 
   let live_takeover = lease_store
     .acquire_lease(
@@ -417,10 +414,7 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
   let LeaseAcquireOutcome::Acquired(takeover) = takeover else {
     return Err(anyhow!("expected expired lease takeover"));
   };
-  assert_eq!(
-    takeover.fence.as_ref().map(|fence| fence.lease_epoch),
-    Some(2)
-  );
+  assert_eq!(takeover.fence.lease_epoch, 2);
 
   let heartbeat = lease_store
     .heartbeat_lease(&key, "broker-a", "session-1", 1_150, 100)

@@ -354,11 +354,11 @@ impl WriteEngine for WriteEngineImpl {
             .nodes()
             .unwrap_or_default()
             .iter()
-            .find(|node| node.node_id.as_str() == lease.holder_id)
+            .find(|node| node.node_id.as_str() == lease.fence.holder_id)
             .map(|node| node.address.clone());
           let lease_status = if !is_active {
             BrokerLeaseStatus::UnleasedOrExpired
-          } else if lease.holder_id == self.holder_id {
+          } else if lease.fence.holder_id == self.holder_id {
             BrokerLeaseStatus::LocalActive
           } else {
             BrokerLeaseStatus::RemoteActive
@@ -366,7 +366,7 @@ impl WriteEngine for WriteEngineImpl {
           (
             lease_status,
             Some(BrokerLeaseSnapshot {
-              holder_id: lease.holder_id,
+              holder_id: lease.fence.holder_id,
               holder_address,
               expires_at: format_unix_timestamp_ms(lease.lease_expiration_ts_ms),
               is_active,

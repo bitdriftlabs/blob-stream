@@ -272,12 +272,11 @@ impl LeaseState {
   fn to_lease(&self, key: ProducerPartitionLeaseKey) -> ProducerPartitionLease {
     ProducerPartitionLease {
       key,
-      holder_id: self.holder_id.clone(),
-      fence: Some(ProducerLeaseFence {
+      fence: ProducerLeaseFence {
         holder_id: self.holder_id.clone(),
         lease_epoch: self.lease_epoch,
         lease_session_id: self.lease_session_id.clone(),
-      }),
+      },
       lease_expiration_ts_ms: self.lease_expiration_ts_ms,
       max_allocated_seq: self.max_allocated_seq,
     }
