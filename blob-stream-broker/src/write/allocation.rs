@@ -83,7 +83,7 @@ impl AllocationTransition {
         partition_state.lease_expiration_ts_ms = lease_expiration_ts_ms;
       }
       if let Some(lease) = lease {
-        let lease_fence = lease.fence.map(Arc::new);
+        let lease_fence = Some(Arc::new(lease.fence));
         if partition_state.lease_fence != lease_fence {
           stale_completions = partition_state.buffer.discard();
         }

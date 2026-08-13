@@ -318,7 +318,7 @@ async fn all_partitions_held_by(
     let Ok(Some(lease)) = store.get_lease(&key).await else {
       return false;
     };
-    if lease.holder_id != holder_id || lease.lease_expiration_ts_ms <= now_ts_ms {
+    if lease.fence.holder_id != holder_id || lease.lease_expiration_ts_ms <= now_ts_ms {
       return false;
     }
   }

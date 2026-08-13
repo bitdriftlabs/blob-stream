@@ -171,13 +171,12 @@ uses one DynamoDB transaction containing the metadata `Put` and a condition chec
 partition's holder ID, epoch, session ID, and unexpired lease. A former process cannot publish after
 a successor takes the lease, even if both processes use the same node ID.
 
-The mode defaults off for roll-forward compatibility. A cluster can first deploy session-aware
-brokers while continuing unconditional metadata writes, then enable the mode after transactional IAM
-permissions are present. Readers require no metadata migration because the epoch and session remain
-lease-table fields. A transaction has room for one metadata write and at most 99 lease checks, so
-the scheduler splits larger flushes. A lost fence after blob upload can leave an orphaned blob, but
-the transaction does not publish metadata and the producer receives a retryable failure. When the
-mode is disabled, the former stale-writer limitation remains.
+The mode defaults off. Producer lease rows always carry a holder ID, lease epoch, and session ID;
+the DynamoDB lease decoder rejects rows without this durable fence identity. A transaction has room
+for one metadata write and at most 99 lease checks, so the scheduler splits larger flushes. A lost
+fence after blob upload can leave an orphaned blob, but the transaction does not publish metadata and
+the producer receives a retryable failure. When the mode is disabled, the stale-writer limitation
+remains.
 
 A consumer cursor is the greatest processed `seq_end` for one virtual partition. During scans,
 the consumer skips a batch when `batch.seq_end <= cursor` and advances its cursor only forward.

@@ -168,13 +168,12 @@ every partition in its flush plan still has its current producer lease. The runt
 and `feature_flags.file` are configured. The value is resolved once per flush-plan collection, so
 an in-flight plan cannot change publication mode.
 
-Fenced writes are default-off for rolling deployment compatibility. First deploy the session-aware
-broker version with the setting disabled, then grant the transactional IAM permissions below, and
-only then enable the static setting or runtime flag. No segment-metadata schema or consumer change
-is required. A transaction can contain the metadata write plus at most 99 producer-lease condition
-checks, so the scheduler splits larger same-topic flushes into plans of 99 partitions. If a fence
-is lost after the blob upload, the blob can remain orphaned but the metadata row is not published;
-the producer receives a retryable failure.
+Fenced writes default off. Producer lease rows must include a durable holder ID, lease epoch, and
+session ID; the broker rejects rows without this fence identity. No segment-metadata schema or
+consumer change is required. A transaction can contain the metadata write plus at most 99
+producer-lease condition checks, so the scheduler splits larger same-topic flushes into plans of 99
+partitions. If a fence is lost after blob upload, the blob can remain orphaned but the metadata row
+is not published; the producer receives a retryable failure.
 
 ### Broker IAM permissions
 

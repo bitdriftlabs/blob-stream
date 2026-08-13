@@ -192,14 +192,10 @@ impl ProducerPartitionLeaseKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Producer lease row.
 pub struct ProducerPartitionLease {
-  // TODO: Once all producer lease rows are fence-capable, remove this duplicated holder id and
-  // make `fence` required.
   /// Lease key.
   pub key: ProducerPartitionLeaseKey,
-  /// Current holder id.
-  pub holder_id: String,
-  /// Durable identity that authorizes metadata publication, absent on a legacy lease row.
-  pub fence: Option<ProducerLeaseFence>,
+  /// Durable identity that authorizes metadata publication.
+  pub fence: ProducerLeaseFence,
   /// Lease expiration timestamp in milliseconds.
   pub lease_expiration_ts_ms: i64,
   /// High watermark for allocated sequence numbers.

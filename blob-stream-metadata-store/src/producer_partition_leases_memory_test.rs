@@ -87,10 +87,7 @@ async fn fences_stale_broker_sessions() {
   let LeaseAcquireOutcome::Acquired(first) = first else {
     panic!("expected initial acquisition");
   };
-  assert_eq!(
-    first.fence.expect("memory lease has a fence").lease_epoch,
-    1
-  );
+  assert_eq!(first.fence.lease_epoch, 1);
 
   let renewal = store
     .acquire_lease(
@@ -105,10 +102,7 @@ async fn fences_stale_broker_sessions() {
   let LeaseAcquireOutcome::Acquired(renewal) = renewal else {
     panic!("expected same session renewal");
   };
-  assert_eq!(
-    renewal.fence.expect("memory lease has a fence").lease_epoch,
-    1
-  );
+  assert_eq!(renewal.fence.lease_epoch, 1);
 
   let live_takeover = store
     .acquire_lease(
@@ -135,13 +129,7 @@ async fn fences_stale_broker_sessions() {
   let LeaseAcquireOutcome::Acquired(takeover) = takeover else {
     panic!("expected expired takeover");
   };
-  assert_eq!(
-    takeover
-      .fence
-      .expect("memory lease has a fence")
-      .lease_epoch,
-    2
-  );
+  assert_eq!(takeover.fence.lease_epoch, 2);
 
   let heartbeat = store
     .heartbeat_lease(&key, "broker-a", "session-1", 1_150, 100)
@@ -283,10 +271,10 @@ async fn preserves_previous_lease_when_takeover_reservation_overflows() {
     .await
     .expect("read lease after failed takeover")
     .expect("previous lease remains present");
-  assert_eq!(lease.holder_id, "broker-a");
+  assert_eq!(lease.fence.holder_id, "broker-a");
   assert_eq!(lease.lease_expiration_ts_ms, 1_100);
   assert_eq!(lease.max_allocated_seq, Some(u64::MAX - 1));
-  let fence = lease.fence.expect("memory lease has a fence");
+  let fence = lease.fence;
   assert_eq!(fence.lease_epoch, 1);
   assert_eq!(fence.lease_session_id, "session-a");
 }
@@ -382,6 +370,6 @@ async fn lookup_reports_absent_and_active_leases() {
     .await
     .expect("lookup active lease")
     .expect("active lease exists");
-  assert_eq!(lease.holder_id, "broker-a");
+  assert_eq!(lease.fence.holder_id, "broker-a");
   assert_eq!(lease.lease_expiration_ts_ms, 1_100);
 }
