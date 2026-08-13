@@ -53,6 +53,7 @@ fn defaults_segment_compression_to_zstd() {
   assert_eq!(config.compression.level, Some(3));
   assert_eq!(config.writer_id, 0);
   assert_eq!(config.reservation_size, 10_000);
+  assert!(!config.fenced_metadata_writes);
 }
 
 #[test]
@@ -74,6 +75,25 @@ fn respects_explicit_sequence_reservation_size() {
   let config = WriteConfig::from_broker_config(&broker_config).unwrap();
 
   assert_eq!(config.reservation_size, 25_000);
+}
+
+#[test]
+fn respects_explicit_fenced_metadata_writes() {
+  let mut broker_config = BrokerConfig::new();
+  broker_config.writer_id = Some(0);
+  broker_config.fenced_metadata_writes = true;
+
+  let config = WriteConfig::from_broker_config(&broker_config).unwrap();
+
+  assert!(config.fenced_metadata_writes);
+}
+
+#[test]
+fn fenced_metadata_writes_defaults_to_static_config_without_feature_flags() {
+  let mut config = WriteConfig::with_defaults();
+  config.fenced_metadata_writes = true;
+
+  assert!(config.fenced_metadata_writes(None));
 }
 
 #[test]

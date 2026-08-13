@@ -29,9 +29,20 @@ use blob_stream_metadata_store::{
   ConsumerGroupLeaseTransition,
   ConsumerGroupMember,
   InMemoryMetadataStore,
+  LeaseAcquireAndReserveOutcome,
+  LeaseAcquireOutcome,
+  LeaseHeartbeatOutcome,
+  LeaseReleaseOutcome,
+  MAX_FENCED_METADATA_PARTITIONS,
   MetadataReadConsistency,
   MetadataStore,
+  MetadataWriteError,
+  MetadataWriteResult,
+  ProducerPartitionFence,
+  ProducerPartitionLeaseKey,
+  ProducerPartitionLeaseStore,
   SegmentMetadata,
+  SequenceReservationOutcome,
 };
 use blob_stream_producer::{
   GrpcBrokerTransport,
@@ -99,6 +110,457 @@ fn member_ids(members: &[ConsumerGroupMember]) -> Vec<String> {
 
 fn metrics_scope(component: &str) -> bd_server_stats::stats::Scope {
   Collector::default().scope(component)
+}
+
+fn fenced_metadata_segment(
+  snowflake_id: u64,
+  virtual_partition_ids: impl IntoIterator<Item = VirtualPartitionId>,
+) -> SegmentMetadata {
+  let segment_index = virtual_partition_ids
+    .into_iter()
+    .map(|virtual_partition_id| {
+      (
+        virtual_partition_id,
+        vec![BatchMetadata {
+          seq_range: SeqRange { start: 0, end: 0 },
+          byte_range: blob_stream_types::ByteRange { start: 0, end: 1 },
+          payload_bytes: 1,
+        }],
+      )
+    })
+    .collect();
+  SegmentMetadata::new(
+    TopicWindowKey {
+      topic: TOPIC.to_string(),
+      window_start_unix_seconds: 0,
+    },
+    SnowflakeId(snowflake_id),
+    BlobKey::new(format!("fenced-metadata/{snowflake_id}.bin")),
+    Compression::none(),
+    segment_index,
+    0,
+    0,
+  )
+}
+
+async fn acquire_producer_fence(
+  lease_store: &dyn ProducerPartitionLeaseStore,
+  virtual_partition_id: VirtualPartitionId,
+  holder_id: &str,
+  lease_session_id: &str,
+  now_ts_ms: i64,
+) -> Result<ProducerPartitionFence> {
+  let key = ProducerPartitionLeaseKey {
+    topic: TOPIC.into(),
+    virtual_partition_id,
+  };
+  let outcome = lease_store
+    .acquire_lease(
+      key.clone(),
+      holder_id.to_string(),
+      lease_session_id.to_string(),
+      now_ts_ms,
+      100,
+    )
+    .await?;
+  let LeaseAcquireOutcome::Acquired(lease) = outcome else {
+    return Err(anyhow!("expected producer lease acquisition"));
+  };
+  let fence = lease
+    .fence
+    .ok_or_else(|| anyhow!("new producer lease must have a durable fence"))?;
+  Ok(ProducerPartitionFence { key, fence })
+}
+
+#[tokio::test]
+async fn dynamo_fenced_metadata_write_requires_current_producer_lease() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let metadata_store = resources.metadata_store();
+  let lease_store = resources.producer_lease_store();
+  let original_fence =
+    acquire_producer_fence(lease_store.as_ref(), 0, "broker-a", "session-a", 1_000).await?;
+  let published = fenced_metadata_segment(1, [0]);
+  metadata_store
+    .write_segment(
+      published.clone(),
+      Some(std::slice::from_ref(&original_fence)),
+      1_000,
+    )
+    .await?;
+
+  let replacement_fence =
+    acquire_producer_fence(lease_store.as_ref(), 0, "broker-b", "session-b", 1_100).await?;
+  let error = metadata_store
+    .write_segment(
+      fenced_metadata_segment(2, [0]),
+      Some(std::slice::from_ref(&original_fence)),
+      1_100,
+    )
+    .await
+    .map_err(anyhow::Error::new)
+    .expect_err("stale fence must reject metadata publication");
+  assert!(error.to_string().contains("producer lease fence was lost"));
+
+  let replacement = fenced_metadata_segment(3, [0]);
+  metadata_store
+    .write_segment(
+      replacement.clone(),
+      Some(std::slice::from_ref(&replacement_fence)),
+      1_100,
+    )
+    .await?;
+  assert_eq!(
+    metadata_store
+      .scan_window_from_snowflake(&published.window, None, MetadataReadConsistency::Strong)
+      .await?,
+    vec![published, replacement]
+  );
+
+  resources.cleanup().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn dynamo_fenced_metadata_write_requires_fences_matching_segment_partitions() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let metadata_store = resources.metadata_store();
+  let lease_store = resources.producer_lease_store();
+  let unrelated_fence =
+    acquire_producer_fence(lease_store.as_ref(), 1, "broker-a", "session-a", 1_000).await?;
+  let metadata = fenced_metadata_segment(1, [0]);
+
+  let error = metadata_store
+    .write_segment(
+      metadata.clone(),
+      Some(std::slice::from_ref(&unrelated_fence)),
+      1_000,
+    )
+    .await
+    .expect_err("fences for other partitions must reject metadata publication");
+  assert!(
+    error
+      .to_string()
+      .contains("fences matching segment partitions")
+  );
+  assert!(
+    metadata_store
+      .scan_window_from_snowflake(&metadata.window, None, MetadataReadConsistency::Strong)
+      .await?
+      .is_empty(),
+    "fence validation must reject metadata before it is persisted"
+  );
+
+  resources.cleanup().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn dynamo_fenced_metadata_write_is_atomic_across_multiple_producer_leases() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let metadata_store = resources.metadata_store();
+  let lease_store = resources.producer_lease_store();
+  let first_fence =
+    acquire_producer_fence(lease_store.as_ref(), 0, "broker-a", "session-a", 1_000).await?;
+  let stale_fence =
+    acquire_producer_fence(lease_store.as_ref(), 1, "broker-a", "session-a", 1_000).await?;
+  acquire_producer_fence(lease_store.as_ref(), 1, "broker-b", "session-b", 1_100).await?;
+
+  let metadata = fenced_metadata_segment(1, [0, 1]);
+  let error = metadata_store
+    .write_segment(metadata.clone(), Some(&[first_fence, stale_fence]), 1_100)
+    .await
+    .expect_err("one stale partition fence must reject the whole transaction");
+  assert!(error.to_string().contains("producer lease fence was lost"));
+  assert!(
+    metadata_store
+      .scan_window_from_snowflake(&metadata.window, None, MetadataReadConsistency::Strong)
+      .await?
+      .is_empty(),
+    "failed transaction must not persist its metadata put"
+  );
+
+  resources.cleanup().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn dynamo_fenced_metadata_write_enforces_transaction_item_boundaries() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let metadata_store = resources.metadata_store();
+  let lease_store = resources.producer_lease_store();
+  let partition_count = u32::try_from(MAX_FENCED_METADATA_PARTITIONS)
+    .expect("DynamoDB transaction partition limit fits in u32");
+  let mut fences = Vec::with_capacity(MAX_FENCED_METADATA_PARTITIONS);
+  for virtual_partition_id in 0 .. partition_count {
+    fences.push(
+      acquire_producer_fence(
+        lease_store.as_ref(),
+        virtual_partition_id,
+        "broker-a",
+        "session-a",
+        1_000,
+      )
+      .await?,
+    );
+  }
+
+  let valid_metadata = fenced_metadata_segment(1, 0 .. partition_count);
+  metadata_store
+    .write_segment(valid_metadata.clone(), Some(&fences), 1_000)
+    .await?;
+
+  let extra_fence = acquire_producer_fence(
+    lease_store.as_ref(),
+    partition_count,
+    "broker-a",
+    "session-a",
+    1_000,
+  )
+  .await?;
+  let mut oversized_fences = fences.clone();
+  oversized_fences.push(extra_fence);
+  let error = metadata_store
+    .write_segment(
+      fenced_metadata_segment(2, 0 ..= partition_count),
+      Some(&oversized_fences),
+      1_000,
+    )
+    .await
+    .expect_err("100 producer fences exceed DynamoDB's transaction item limit");
+  assert!(error.to_string().contains("at most 99 partitions"));
+
+  let duplicate_fences = [fences[0].clone(), fences[0].clone()];
+  let error = metadata_store
+    .write_segment(
+      fenced_metadata_segment(3, [0]),
+      Some(&duplicate_fences),
+      1_000,
+    )
+    .await
+    .expect_err("duplicate lease keys must be rejected before the transaction");
+  assert!(error.to_string().contains("duplicate producer lease key"));
+  assert_eq!(
+    metadata_store
+      .scan_window_from_snowflake(
+        &valid_metadata.window,
+        None,
+        MetadataReadConsistency::Strong,
+      )
+      .await?,
+    vec![valid_metadata]
+  );
+
+  resources.cleanup().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let lease_store = resources.producer_lease_store();
+  let key = ProducerPartitionLeaseKey {
+    topic: TOPIC.into(),
+    virtual_partition_id: 0,
+  };
+
+  let first = lease_store
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-1".to_string(),
+      1_000,
+      100,
+    )
+    .await?;
+  let LeaseAcquireOutcome::Acquired(first) = first else {
+    return Err(anyhow!("expected initial lease acquisition"));
+  };
+  assert_eq!(first.fence.as_ref().map(|fence| fence.lease_epoch), Some(1));
+
+  let renewal = lease_store
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-1".to_string(),
+      1_050,
+      100,
+    )
+    .await?;
+  let LeaseAcquireOutcome::Acquired(renewal) = renewal else {
+    return Err(anyhow!("expected same-session lease renewal"));
+  };
+  assert_eq!(
+    renewal.fence.as_ref().map(|fence| fence.lease_epoch),
+    Some(1)
+  );
+
+  let live_takeover = lease_store
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-2".to_string(),
+      1_100,
+      100,
+    )
+    .await?;
+  assert!(matches!(live_takeover, LeaseAcquireOutcome::HeldByOther(_)));
+
+  let takeover = lease_store
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-2".to_string(),
+      1_150,
+      100,
+    )
+    .await?;
+  let LeaseAcquireOutcome::Acquired(takeover) = takeover else {
+    return Err(anyhow!("expected expired lease takeover"));
+  };
+  assert_eq!(
+    takeover.fence.as_ref().map(|fence| fence.lease_epoch),
+    Some(2)
+  );
+
+  let heartbeat = lease_store
+    .heartbeat_lease(&key, "broker-a", "session-1", 1_150, 100)
+    .await?;
+  assert!(matches!(heartbeat, LeaseHeartbeatOutcome::HeldByOther(_)));
+  let reservation = lease_store
+    .reserve_sequences(&key, "broker-a", "session-1", 1_150, 1)
+    .await?;
+  assert!(matches!(
+    reservation,
+    SequenceReservationOutcome::HeldByOther(_)
+  ));
+  let release = lease_store
+    .release_lease(&key, "broker-a", "session-1", 1_150)
+    .await?;
+  assert!(matches!(release, LeaseReleaseOutcome::HeldByOther(_)));
+
+  resources.cleanup().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn dynamo_sequence_reservation_rejects_stale_same_holder_session_before_overflow()
+-> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let lease_store = resources.producer_lease_store();
+  let key = ProducerPartitionLeaseKey {
+    topic: TOPIC.into(),
+    virtual_partition_id: 0,
+  };
+
+  let initial = lease_store
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-1".to_string(),
+      1_000,
+      100,
+      Some(u64::MAX),
+    )
+    .await?;
+  assert!(matches!(
+    initial,
+    LeaseAcquireAndReserveOutcome::Acquired { .. }
+  ));
+
+  let takeover = lease_store
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-2".to_string(),
+      1_100,
+      100,
+    )
+    .await?;
+  assert!(matches!(takeover, LeaseAcquireOutcome::Acquired(_)));
+
+  let reservation = lease_store
+    .reserve_sequences(&key, "broker-a", "session-1", 1_100, 2)
+    .await?;
+  assert!(matches!(
+    reservation,
+    SequenceReservationOutcome::HeldByOther(_)
+  ));
+
+  resources.cleanup().await;
+  Ok(())
+}
+
+struct FenceInvalidatingMetadataStore {
+  inner: Arc<dyn MetadataStore>,
+  lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+  attempted_window: Mutex<Option<TopicWindowKey>>,
+  rejected_fenced_write: AtomicBool,
+}
+
+impl FenceInvalidatingMetadataStore {
+  fn new(inner: Arc<dyn MetadataStore>, lease_store: Arc<dyn ProducerPartitionLeaseStore>) -> Self {
+    Self {
+      inner,
+      lease_store,
+      attempted_window: Mutex::new(None),
+      rejected_fenced_write: AtomicBool::new(false),
+    }
+  }
+
+  async fn attempted_window(&self) -> Option<TopicWindowKey> {
+    self.attempted_window.lock().await.clone()
+  }
+
+  fn rejected_fenced_write(&self) -> bool {
+    self.rejected_fenced_write.load(Ordering::Acquire)
+  }
+}
+
+#[async_trait::async_trait]
+impl MetadataStore for FenceInvalidatingMetadataStore {
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> MetadataWriteResult {
+    let fence = fences
+      .and_then(|fences| fences.first())
+      .cloned()
+      .ok_or_else(|| anyhow!("fenced metadata write did not include a producer lease fence"))?;
+    *self.attempted_window.lock().await = Some(metadata.window.clone());
+
+    let release = self
+      .lease_store
+      .release_lease(
+        &fence.key,
+        &fence.fence.holder_id,
+        &fence.fence.lease_session_id,
+        now_ts_ms,
+      )
+      .await?;
+    if release != LeaseReleaseOutcome::Released {
+      return Err(anyhow!("test fault could not invalidate producer lease: {release:?}").into());
+    }
+
+    let result = self.inner.write_segment(metadata, fences, now_ts_ms).await;
+    if matches!(&result, Err(MetadataWriteError::ProducerLeaseFenceLost)) {
+      self.rejected_fenced_write.store(true, Ordering::Release);
+    }
+    result
+  }
+
+  async fn scan_window_from_snowflake(
+    &self,
+    window: &TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
+  ) -> Result<Vec<SegmentMetadata>> {
+    self
+      .inner
+      .scan_window_from_snowflake(window, min_snowflake, consistency)
+      .await
+  }
 }
 
 async fn new_producer(
@@ -191,38 +653,50 @@ async fn write_recovery_segment(
     .await?;
 
   metadata_store
-    .write_segment(SegmentMetadata::new(
-      TopicWindowKey {
-        topic: TOPIC.to_string(),
-        window_start_unix_seconds,
-      },
-      SnowflakeId(snowflake_id),
-      blob_key,
-      Compression::none(),
-      HashMap::from([(
-        virtual_partition_id,
-        vec![BatchMetadata {
-          seq_range: SeqRange {
-            start: sequence,
-            end: sequence,
-          },
-          byte_range: blob_stream_types::ByteRange {
-            start: 0,
-            end: u64::try_from(encoded.len())?,
-          },
-          payload_bytes: u64::try_from(encoded.len())?,
-        }],
-      )]),
-      window_start_unix_seconds * 1_000,
-      published_ts_ms,
-    ))
+    .write_segment(
+      SegmentMetadata::new(
+        TopicWindowKey {
+          topic: TOPIC.to_string(),
+          window_start_unix_seconds,
+        },
+        SnowflakeId(snowflake_id),
+        blob_key,
+        Compression::none(),
+        HashMap::from([(
+          virtual_partition_id,
+          vec![BatchMetadata {
+            seq_range: SeqRange {
+              start: sequence,
+              end: sequence,
+            },
+            byte_range: blob_stream_types::ByteRange {
+              start: 0,
+              end: u64::try_from(encoded.len())?,
+            },
+            payload_bytes: u64::try_from(encoded.len())?,
+          }],
+        )]),
+        window_start_unix_seconds * 1_000,
+        published_ts_ms,
+      ),
+      None,
+      0,
+    )
     .await
+    .map_err(anyhow::Error::new)
 }
+
+type PendingMetadataWrite = (
+  Instant,
+  SegmentMetadata,
+  Option<Vec<blob_stream_metadata_store::ProducerPartitionFence>>,
+  i64,
+);
 
 struct DelayedVisibilityMetadataStore {
   inner: Arc<dyn MetadataStore>,
   delay: Duration,
-  pending: Mutex<Vec<(Instant, SegmentMetadata)>>,
+  pending: Mutex<Vec<PendingMetadataWrite>>,
   visibility_held: AtomicBool,
 }
 
@@ -254,18 +728,21 @@ impl DelayedVisibilityMetadataStore {
     let mut ready = Vec::new();
     let mut future = Vec::new();
 
-    for (visible_at, metadata) in pending.drain(..) {
+    for (visible_at, metadata, fences, now_ts_ms) in pending.drain(..) {
       if visible_at <= now {
-        ready.push(metadata);
+        ready.push((metadata, fences, now_ts_ms));
       } else {
-        future.push((visible_at, metadata));
+        future.push((visible_at, metadata, fences, now_ts_ms));
       }
     }
     *pending = future;
     drop(pending);
 
-    for metadata in ready {
-      self.inner.write_segment(metadata).await?;
+    for (metadata, fences, now_ts_ms) in ready {
+      self
+        .inner
+        .write_segment(metadata, fences.as_deref(), now_ts_ms)
+        .await?;
     }
     Ok(())
   }
@@ -273,9 +750,19 @@ impl DelayedVisibilityMetadataStore {
 
 #[async_trait::async_trait]
 impl MetadataStore for DelayedVisibilityMetadataStore {
-  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> MetadataWriteResult {
     let mut pending = self.pending.lock().await;
-    pending.push((Instant::now() + self.delay, metadata));
+    pending.push((
+      Instant::now() + self.delay,
+      metadata,
+      fences.map(ToOwned::to_owned),
+      now_ts_ms,
+    ));
     Ok(())
   }
 
@@ -315,8 +802,13 @@ impl CountingWindowMetadataStore {
 
 #[async_trait::async_trait]
 impl MetadataStore for CountingWindowMetadataStore {
-  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
-    self.inner.write_segment(metadata).await
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> MetadataWriteResult {
+    self.inner.write_segment(metadata, fences, now_ts_ms).await
   }
 
   async fn scan_window_from_snowflake(
@@ -373,8 +865,13 @@ impl DeferredWindowPublicationMetadataStore {
 
 #[async_trait::async_trait]
 impl MetadataStore for DeferredWindowPublicationMetadataStore {
-  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
-    self.inner.write_segment(metadata).await
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> MetadataWriteResult {
+    self.inner.write_segment(metadata, fences, now_ts_ms).await
   }
 
   async fn scan_window_from_snowflake(
@@ -874,6 +1371,55 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
   assert!(duplicate_scan.is_empty());
 
   // Step 6: Tear down broker and dependency resources.
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn fenced_metadata_write_fails_when_lease_is_invalidated_before_dynamo_transaction()
+-> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let metadata_store = Arc::new(FenceInvalidatingMetadataStore::new(
+    resources.metadata_store(),
+    resources.producer_lease_store(),
+  ));
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .metadata_store(metadata_store.clone())
+    .fenced_metadata_writes()
+    .in_memory_transport()
+    .start()
+    .await?;
+  let mut config = producer_config();
+  config.retry_deadline_ms = Some(100);
+  let producer = cluster
+    .create_producer(config, vec![producer_topic()])
+    .await?;
+  let error = produce_message(&producer, b"fenced-metadata-fault".to_vec(), "fenced-fault")
+    .await
+    .expect_err("metadata publication must fail after its producer lease is invalidated");
+  assert!(
+    format!("{error:#}").contains("producer retries exhausted"),
+    "unexpected produce failure: {error:#}"
+  );
+  assert!(
+    metadata_store.rejected_fenced_write(),
+    "Dynamo must reject metadata publication with the invalidated producer lease fence"
+  );
+
+  let attempted_window = metadata_store
+    .attempted_window()
+    .await
+    .expect("metadata publication was attempted");
+  let segments = resources
+    .metadata_store()
+    .scan_window_from_snowflake(&attempted_window, None, MetadataReadConsistency::Strong)
+    .await?;
+  assert!(
+    segments.is_empty(),
+    "a rejected fenced write must not persist segment metadata: {segments:#?}"
+  );
+
   cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())

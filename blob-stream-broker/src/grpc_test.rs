@@ -63,6 +63,10 @@ struct GatedWriteEngine {
   release: Arc<Semaphore>,
 }
 
+struct FailingWriteEngine {
+  fence_lost: bool,
+}
+
 #[async_trait]
 impl crate::write::WriteEngine for GatedWriteEngine {
   async fn produce_batch(
@@ -93,6 +97,30 @@ impl crate::write::WriteEngine for GatedWriteEngine {
   }
 }
 
+#[async_trait]
+impl crate::write::WriteEngine for FailingWriteEngine {
+  async fn produce_batch(
+    &self,
+    _request: crate::write::WriteRequest,
+  ) -> Result<crate::write::WriteResponse, crate::write::WriteError> {
+    if self.fence_lost {
+      Err(crate::write::WriteError::LeaseFenceLost)
+    } else {
+      Err(crate::write::WriteError::Internal(anyhow::anyhow!(
+        "DynamoDB write failed for table private-metadata-table"
+      )))
+    }
+  }
+
+  fn produce_request_timeout(&self) -> std::time::Duration {
+    std::time::Duration::from_secs(1)
+  }
+
+  async fn state_snapshot(&self) -> crate::write::BrokerStateSnapshot {
+    unreachable!("test write engine does not expose state")
+  }
+}
+
 #[test]
 fn limits_decoded_produce_request_bytes() {
   assert_eq!(
@@ -110,6 +138,49 @@ fn records_produce_request_timeouts() {
 
   let output = String::from_utf8(collector.prometheus_output()).expect("metrics output is UTF-8");
   assert!(output.contains("blob_stream_broker_test:grpc:request_timeouts_total 1"));
+}
+
+#[tokio::test]
+async fn sanitizes_internal_write_errors_and_preserves_fence_loss() -> Result<()> {
+  let scope = Collector::default().scope("blob_stream_broker_test");
+  let request = ProduceBatchRequest {
+    topic: "telemetry".into(),
+    virtual_partition_id: 0,
+    records: vec![new_record(vec![1], 1)],
+    ..Default::default()
+  };
+
+  let internal_grpc = BrokerGrpc::new(Arc::new(FailingWriteEngine { fence_lost: false }), &scope);
+  let internal_response = internal_grpc
+    .handle(HeaderMap::new(), Extensions::new(), request.clone())
+    .await?;
+  assert_eq!(
+    internal_response.status,
+    ProduceStatus::PRODUCE_STATUS_OVERLOADED.into()
+  );
+  assert_eq!(
+    internal_response.error_message.as_str(),
+    "internal write failure"
+  );
+  assert!(
+    !internal_response
+      .error_message
+      .contains("private-metadata-table")
+  );
+
+  let fence_grpc = BrokerGrpc::new(Arc::new(FailingWriteEngine { fence_lost: true }), &scope);
+  let fence_response = fence_grpc
+    .handle(HeaderMap::new(), Extensions::new(), request)
+    .await?;
+  assert_eq!(
+    fence_response.status,
+    ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER.into()
+  );
+  assert_eq!(
+    fence_response.error_message.as_str(),
+    "producer lease fence was lost"
+  );
+  Ok(())
 }
 
 #[tokio::test]

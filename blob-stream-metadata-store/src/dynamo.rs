@@ -1,32 +1,52 @@
+use crate::aws::retry_dynamo_transaction_conflicts;
+use crate::dynamo_attributes::{
+  ATTR_EPOCH,
+  ATTR_EXPIRES,
+  ATTR_HOLDER,
+  ATTR_PK,
+  ATTR_SESSION,
+  ATTR_SK,
+  ATTR_TTL,
+};
 use crate::{
   DynamoCapacityMetrics,
   MetadataReadConsistency,
   MetadataStore,
+  MetadataWriteError,
+  MetadataWriteResult,
+  ProducerPartitionFence,
   SegmentMetadata,
   codec,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::error::SdkError;
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
-use aws_sdk_dynamodb::types::{AttributeValue, ReturnConsumedCapacity};
+use aws_sdk_dynamodb::types::{
+  AttributeValue,
+  ConditionCheck,
+  Put,
+  ReturnConsumedCapacity,
+  TransactWriteItem,
+};
 use bd_log_util::warn_every;
 use blob_stream_types::{SnowflakeId, TopicWindowKey, format_unix_timestamp_ms};
 use bytes::Bytes;
 use log::{debug, trace};
 use protobuf::Chars;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use time::ext::NumericalDuration;
+use uuid::Uuid;
 
 #[cfg(test)]
 #[path = "./dynamo_test.rs"]
 mod tests;
 
-const ATTR_PK: &str = "pk";
-const ATTR_SK: &str = "sk";
 const ATTR_SEGMENT_METADATA_V1: &str = "segment_metadata_v1";
-const ATTR_TTL_EPOCH_SECONDS: &str = "ttl_epoch_seconds";
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+pub const MAX_FENCED_METADATA_PARTITIONS: usize = 99;
 
 //
 // DynamoMetadataStore
@@ -36,6 +56,7 @@ const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 pub struct DynamoMetadataStore {
   client: Client,
   table_name: String,
+  producer_partition_lease_table_name: String,
   topic_retention_days: HashMap<Chars, u32>,
   ttl_buffer_seconds: i64,
   capacity_metrics: Option<DynamoCapacityMetrics>,
@@ -46,6 +67,7 @@ impl DynamoMetadataStore {
   pub fn new(
     client: Client,
     table_name: impl Into<String>,
+    producer_partition_lease_table_name: impl Into<String>,
     topic_retention_days: HashMap<Chars, u32>,
     ttl_buffer_seconds: u32,
     capacity_metrics: Option<DynamoCapacityMetrics>,
@@ -53,6 +75,7 @@ impl DynamoMetadataStore {
     Self {
       client,
       table_name: table_name.into(),
+      producer_partition_lease_table_name: producer_partition_lease_table_name.into(),
       topic_retention_days,
       ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
       capacity_metrics,
@@ -96,7 +119,12 @@ impl DynamoMetadataStore {
 
 #[async_trait]
 impl MetadataStore for DynamoMetadataStore {
-  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> MetadataWriteResult {
     trace!(
       "metadata(dynamo) write_segment start: table={}, topic={}, window_start={}, snowflake_id={}",
       self.table_name,
@@ -109,8 +137,50 @@ impl MetadataStore for DynamoMetadataStore {
       ),
       metadata.snowflake_id.as_u64()
     );
+    if let Some(fences) = fences {
+      if fences.is_empty() {
+        return Err(
+          anyhow!("fenced metadata publication requires at least one producer partition fence")
+            .into(),
+        );
+      }
+      if fences.len() > MAX_FENCED_METADATA_PARTITIONS {
+        return Err(
+          anyhow!(
+            "fenced metadata publication supports at most {MAX_FENCED_METADATA_PARTITIONS} \
+             partitions"
+          )
+          .into(),
+        );
+      }
+      let mut lease_keys = HashSet::with_capacity(fences.len());
+      for fence in fences {
+        if !lease_keys.insert(&fence.key) {
+          return Err(
+            anyhow!("fenced metadata publication has duplicate producer lease key").into(),
+          );
+        }
+      }
+      if fences.len() != metadata.segment_index.len()
+        || !fences.iter().all(|fence| {
+          fence.key.topic.as_str() == metadata.window.topic
+            && metadata
+              .segment_index
+              .contains_key(&fence.key.virtual_partition_id)
+        })
+      {
+        return Err(
+          anyhow!(
+            "fenced metadata publication requires producer lease fences matching segment \
+             partitions"
+          )
+          .into(),
+        );
+      }
+    }
+
     let ttl_epoch_seconds = self.metadata_ttl_epoch_seconds(&metadata);
-    let encoded = codec::encode(metadata)?;
+    let encoded = codec::encode(metadata).map_err(MetadataWriteError::from)?;
     let mut item = HashMap::from([
       (
         ATTR_PK.to_string(),
@@ -124,27 +194,109 @@ impl MetadataStore for DynamoMetadataStore {
     ]);
     if let Some(ttl_epoch_seconds) = ttl_epoch_seconds {
       item.insert(
-        ATTR_TTL_EPOCH_SECONDS.to_string(),
+        ATTR_TTL.to_string(),
         AttributeValue::N(ttl_epoch_seconds.to_string()),
       );
     }
 
-    let response = self
-      .client
-      .put_item()
+    let Some(fences) = fences else {
+      let response = self
+        .client
+        .put_item()
+        .table_name(&self.table_name)
+        .set_item(Some(item))
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .await
+        .map_err(|error| MetadataWriteError::Other(error.into()))?;
+      self.record_write_capacity(response.consumed_capacity.as_ref());
+
+      debug!(
+        "metadata(dynamo) write_segment complete: table={}",
+        self.table_name
+      );
+      return Ok(());
+    };
+
+    let metadata_put = Put::builder()
       .table_name(&self.table_name)
       .set_item(Some(item))
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await?;
-    self.record_write_capacity(response.consumed_capacity.as_ref());
+      .build()
+      .map_err(|error| MetadataWriteError::Other(error.into()))?;
+    let mut transaction_items = Vec::with_capacity(fences.len() + 1);
+    transaction_items.push(TransactWriteItem::builder().put(metadata_put).build());
+    for producer_fence in fences {
+      let mut values = HashMap::new();
+      values.insert(
+        ":holder".to_string(),
+        AttributeValue::S(producer_fence.fence.holder_id.clone()),
+      );
+      values.insert(
+        ":epoch".to_string(),
+        AttributeValue::N(producer_fence.fence.lease_epoch.to_string()),
+      );
+      values.insert(
+        ":session".to_string(),
+        AttributeValue::S(producer_fence.fence.lease_session_id.clone()),
+      );
+      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+      let lease_check = ConditionCheck::builder()
+        .table_name(&self.producer_partition_lease_table_name)
+        .key(ATTR_PK, AttributeValue::S(producer_fence.key.format()))
+        .condition_expression(format!(
+          "{ATTR_HOLDER} = :holder AND {ATTR_EPOCH} = :epoch AND {ATTR_SESSION} = :session AND \
+           {ATTR_EXPIRES} > :now"
+        ))
+        .set_expression_attribute_values(Some(values))
+        .build()
+        .map_err(|error| MetadataWriteError::Other(error.into()))?;
+      transaction_items.push(
+        TransactWriteItem::builder()
+          .condition_check(lease_check)
+          .build(),
+      );
+    }
 
-    debug!(
-      "metadata(dynamo) write_segment complete: table={}",
-      self.table_name
-    );
-
-    Ok(())
+    let client_request_token = Uuid::new_v4().to_string();
+    let result = retry_dynamo_transaction_conflicts(
+      "fenced_metadata_write",
+      || {
+        self
+          .client
+          .transact_write_items()
+          .client_request_token(client_request_token.clone())
+          .set_transact_items(Some(transaction_items.clone()))
+          .return_consumed_capacity(ReturnConsumedCapacity::Total)
+          .send()
+      },
+      |error| {
+        matches!(
+          error,
+          SdkError::ServiceError(service_error)
+            if transaction_cancellation_has_code(service_error.err(), "TransactionConflict")
+        )
+      },
+    )
+    .await;
+    match result {
+      Ok(output) => {
+        for capacity in output.consumed_capacity.as_deref().unwrap_or_default() {
+          self.record_write_capacity(Some(capacity));
+        }
+        debug!(
+          "metadata(dynamo) fenced write complete: table={}, partitions={}",
+          self.table_name,
+          fences.len()
+        );
+        Ok(())
+      },
+      Err(SdkError::ServiceError(service_error))
+        if transaction_cancellation_has_code(service_error.err(), "ConditionalCheckFailed") =>
+      {
+        Err(MetadataWriteError::ProducerLeaseFenceLost)
+      },
+      Err(error) => Err(MetadataWriteError::Other(error.into())),
+    }
   }
 
   async fn scan_window_from_snowflake(
@@ -221,6 +373,17 @@ impl MetadataStore for DynamoMetadataStore {
     );
     Ok(segments)
   }
+}
+
+fn transaction_cancellation_has_code(error: &TransactWriteItemsError, expected_code: &str) -> bool {
+  matches!(
+    error,
+    TransactWriteItemsError::TransactionCanceledException(cancellation)
+      if cancellation
+        .cancellation_reasons()
+        .iter()
+        .any(|reason| reason.code() == Some(expected_code))
+  )
 }
 
 impl DynamoMetadataStore {

@@ -116,12 +116,14 @@ The model uses four separate per-batch state values instead of replacing
 step separate makes their distinct causal roles visible in an invariant and will
 let the next reader stage observe metadata before a producer acknowledgement.
 
-`PublishMetadata` intentionally does **not** require `ValidLease(broker)`. The
-broker did hold a valid lease when it accepted the batch, but the production
-design does not transactionally fence the later metadata write. An alive former
-holder may therefore publish its already uploaded batch after its lease expires.
-This is the precisely scoped behavior needed for the documented stale-writer
-witness; it is not a claim that accepting new work without a lease is allowed.
+`PublishMetadata` intentionally does **not** require `ValidLease(broker)`. This
+model represents production with optional fenced metadata writes disabled. In
+that mode an alive former holder may publish its already uploaded batch after
+its lease expires. Fenced production mode transactionally checks the current
+lease epoch and process session before publishing metadata; it is outside this
+teaching model. The unfenced behavior is the precisely scoped condition needed
+for the documented stale-writer witness; it is not a claim that accepting new
+work without a lease is allowed.
 
 ## Stage 3: Minimal Cursor Reader
 

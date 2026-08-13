@@ -353,6 +353,7 @@ async fn build_metadata_and_coordination_stores(
     let dynamo = config.dynamo();
     let region = dynamo.region.to_string();
     let metadata_table = dynamo.segment_metadata_table_name.to_string();
+    let producer_partition_lease_table = dynamo.producer_partition_lease_table_name.to_string();
     let consumer_lease_table = dynamo.consumer_group_lease_table_name.to_string();
     let consumer_membership_table = dynamo.consumer_group_membership_table_name.to_string();
 
@@ -370,6 +371,7 @@ async fn build_metadata_and_coordination_stores(
     let metadata_store: Arc<dyn MetadataStore> = Arc::new(DynamoMetadataStore::new(
       client.clone(),
       metadata_table,
+      producer_partition_lease_table,
       HashMap::new(),
       DEFAULT_MEMBERSHIP_TTL_BUFFER_SECONDS,
       Some(capacity_metrics.clone()),

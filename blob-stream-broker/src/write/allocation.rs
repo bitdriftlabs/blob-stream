@@ -1,4 +1,10 @@
+#[cfg(test)]
+#[path = "./allocation_test.rs"]
+mod tests;
+
 use super::state::WriteState;
+use crate::write::buffer::FlushCompletionError;
+use blob_stream_metadata_store::ProducerPartitionLease;
 use blob_stream_types::{SeqRange, VirtualPartitionId};
 use log::trace;
 use parking_lot::Mutex;
@@ -23,19 +29,22 @@ impl AllocationTransition {
   pub(super) fn finish(
     mut self,
     lease_expiration_update: LeaseExpirationUpdate,
+    lease: Option<ProducerPartitionLease>,
     reservation: Option<SeqRange>,
   ) {
-    self.finish_inner(lease_expiration_update, reservation, None);
+    self.finish_inner(lease_expiration_update, lease, reservation, None);
   }
 
   pub(super) fn finish_lease_maintenance(
     mut self,
     lease_expiration_update: LeaseExpirationUpdate,
+    lease: Option<ProducerPartitionLease>,
     reservation: Option<SeqRange>,
     records_allocated_since_last_maintenance: u64,
   ) {
     self.finish_inner(
       lease_expiration_update,
+      lease,
       reservation,
       Some(records_allocated_since_last_maintenance),
     );
@@ -44,6 +53,7 @@ impl AllocationTransition {
   fn finish_inner(
     &mut self,
     lease_expiration_update: LeaseExpirationUpdate,
+    lease: Option<ProducerPartitionLease>,
     reservation: Option<SeqRange>,
     records_allocated_since_last_maintenance: Option<u64>,
   ) {
@@ -65,11 +75,22 @@ impl AllocationTransition {
       self.reset_sequence_allocation_on_finish,
     );
 
-    let (allocation_notify, drain_notify) = {
+    let (allocation_notify, drain_notify, stale_completions) = {
       let mut state = self.state.lock();
       let partition_state = state.partition_state_mut(&self.topic, self.virtual_partition_id);
+      let mut stale_completions = Vec::new();
       if let LeaseExpirationUpdate::Set(lease_expiration_ts_ms) = lease_expiration_update {
         partition_state.lease_expiration_ts_ms = lease_expiration_ts_ms;
+      }
+      if let Some(lease) = lease {
+        let lease_fence = lease.fence.map(Arc::new);
+        if partition_state.lease_fence != lease_fence {
+          stale_completions = partition_state.buffer.discard();
+        }
+        partition_state.lease_fence = lease_fence;
+      } else if matches!(lease_expiration_update, LeaseExpirationUpdate::Set(None)) {
+        stale_completions = partition_state.buffer.discard();
+        partition_state.lease_fence = None;
       }
       if matches!(lease_expiration_update, LeaseExpirationUpdate::Set(None))
         || (self.reset_sequence_allocation_on_finish
@@ -95,6 +116,7 @@ impl AllocationTransition {
       (
         Arc::clone(&partition_state.allocation_notify),
         Arc::clone(&partition_state.drain_notify),
+        stale_completions,
       )
     };
     self.finished = true;
@@ -105,12 +127,15 @@ impl AllocationTransition {
     );
     allocation_notify.notify_waiters();
     drain_notify.notify_waiters();
+    for completion in stale_completions {
+      let _ignored = completion.send(Err(FlushCompletionError::LeaseFenceLost));
+    }
   }
 }
 
 impl Drop for AllocationTransition {
   fn drop(&mut self) {
-    self.finish_inner(LeaseExpirationUpdate::Preserve, None, None);
+    self.finish_inner(LeaseExpirationUpdate::Preserve, None, None, None);
   }
 }
 

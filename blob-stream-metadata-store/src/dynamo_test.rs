@@ -2,11 +2,14 @@ use crate::{DynamoMetadataStore, MetadataReadConsistency, MetadataStore, Segment
 use anyhow::{Context, Result, anyhow};
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
+use aws_sdk_dynamodb::types::error::TransactionCanceledException;
 use aws_sdk_dynamodb::types::{
   AttributeDefinition,
   AttributeValue,
   BillingMode,
+  CancellationReason,
   KeySchemaElement,
   KeyType,
   ScalarAttributeType,
@@ -124,6 +127,45 @@ fn build_segment(
   )
 }
 
+#[test]
+fn classifies_transaction_cancellation_codes() {
+  let transaction_conflict = TransactWriteItemsError::TransactionCanceledException(
+    TransactionCanceledException::builder()
+      .cancellation_reasons(
+        CancellationReason::builder()
+          .code("TransactionConflict")
+          .build(),
+      )
+      .build(),
+  );
+  assert!(super::transaction_cancellation_has_code(
+    &transaction_conflict,
+    "TransactionConflict"
+  ));
+  assert!(!super::transaction_cancellation_has_code(
+    &transaction_conflict,
+    "ConditionalCheckFailed"
+  ));
+
+  let conditional_check_failure = TransactWriteItemsError::TransactionCanceledException(
+    TransactionCanceledException::builder()
+      .cancellation_reasons(
+        CancellationReason::builder()
+          .code("ConditionalCheckFailed")
+          .build(),
+      )
+      .build(),
+  );
+  assert!(super::transaction_cancellation_has_code(
+    &conditional_check_failure,
+    "ConditionalCheckFailed"
+  ));
+  assert!(!super::transaction_cancellation_has_code(
+    &conditional_check_failure,
+    "TransactionConflict"
+  ));
+}
+
 #[tokio::test]
 async fn writes_and_scans_window() -> Result<()> {
   let client = dynamo_client().await?;
@@ -133,6 +175,7 @@ async fn writes_and_scans_window() -> Result<()> {
   let store = DynamoMetadataStore::new(
     client.clone(),
     table_name.clone(),
+    "unused_producer_leases_table",
     HashMap::new(),
     3_600,
     None,
@@ -141,9 +184,9 @@ async fn writes_and_scans_window() -> Result<()> {
   let second = build_segment("topic-a", 100, 2);
   let other = build_segment("topic-b", 200, 3);
 
-  store.write_segment(first.clone()).await?;
-  store.write_segment(second.clone()).await?;
-  store.write_segment(other).await?;
+  store.write_segment(first.clone(), None, 0).await?;
+  store.write_segment(second.clone(), None, 0).await?;
+  store.write_segment(other, None, 0).await?;
 
   let window = TopicWindowKey {
     topic: "topic-a".to_string(),
@@ -171,14 +214,15 @@ async fn scans_window_from_inclusive_snowflake() -> Result<()> {
   let store = DynamoMetadataStore::new(
     client.clone(),
     table_name.clone(),
+    "unused_producer_leases_table",
     HashMap::new(),
     3_600,
     None,
   );
   let first = build_segment("topic-a", 100, 1);
   let second = build_segment("topic-a", 100, 2);
-  store.write_segment(first).await?;
-  store.write_segment(second.clone()).await?;
+  store.write_segment(first, None, 0).await?;
+  store.write_segment(second.clone(), None, 0).await?;
 
   let window = TopicWindowKey {
     topic: "topic-a".to_string(),
@@ -209,13 +253,14 @@ async fn writes_segment_ttl_attribute() -> Result<()> {
   let store = DynamoMetadataStore::new(
     client.clone(),
     table_name.clone(),
+    "unused_producer_leases_table",
     retention_days,
     3_600,
     None,
   );
   let segment = build_segment("topic-a", 100, 1);
 
-  store.write_segment(segment.clone()).await?;
+  store.write_segment(segment.clone(), None, 0).await?;
 
   let item = client
     .get_item()
@@ -273,12 +318,13 @@ async fn skips_noncompliant_segment_rows() -> Result<()> {
   let store = DynamoMetadataStore::new(
     client.clone(),
     table_name.clone(),
+    "unused_producer_leases_table",
     HashMap::new(),
     3_600,
     None,
   );
   let valid = build_segment("topic-a", 100, 2);
-  store.write_segment(valid.clone()).await?;
+  store.write_segment(valid.clone(), None, 0).await?;
   let encoded = crate::codec::encode(valid.clone())?;
   let mut invalid_metadata = SegmentMetadataV1::parse_from_tokio_bytes(&encoded.payload)?;
   invalid_metadata.partitions[0].batches[0].byte_end = 0;

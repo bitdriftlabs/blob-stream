@@ -4,7 +4,12 @@ use super::{BrokerLifecycleHooks, DEFAULT_ZSTD_LEVEL, WriteConfig, WriteError};
 use anyhow::{Context, Result};
 use bd_time::OffsetDateTimeExt;
 use blob_stream_blob_store::{BlobKey, BlobStore};
-use blob_stream_metadata_store::MetadataStore;
+use blob_stream_metadata_store::{
+  MetadataStore,
+  MetadataWriteError,
+  ProducerPartitionFence,
+  ProducerPartitionLeaseKey,
+};
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
   BatchMetadata,
@@ -306,6 +311,27 @@ impl FlushContext {
       .iter()
       .map(|partition| partition.virtual_partition_id)
       .collect::<Vec<_>>();
+    let fences = if plan.fenced_metadata_writes {
+      Some(
+        partitions
+          .iter()
+          .map(|partition| {
+            let fence = partition.lease_fence.as_deref().cloned().ok_or_else(|| {
+              anyhow::anyhow!("fenced metadata publication requires a durable producer lease fence")
+            })?;
+            Ok(ProducerPartitionFence {
+              key: ProducerPartitionLeaseKey {
+                topic: plan.topic.clone(),
+                virtual_partition_id: partition.virtual_partition_id,
+              },
+              fence,
+            })
+          })
+          .collect::<Result<Vec<_>, anyhow::Error>>()?,
+      )
+    } else {
+      None
+    };
     let (payload, envelope) = self.build_segment(plan.topic.as_str(), partitions, now)?;
     let payload_bytes = payload.len();
     let record_count = envelope.record_count;
@@ -332,7 +358,7 @@ impl FlushContext {
         .blob_store
         .put(&envelope.blob_key, payload)
         .await
-        .context("write segment blob")?;
+        .map_err(|error| MetadataWriteError::Other(error.context("write segment blob")))?;
       metrics.record_uploaded_object(payload_bytes);
       if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
         lifecycle_hooks
@@ -342,25 +368,40 @@ impl FlushContext {
       let metadata = envelope.into_metadata(self.time_provider.now().unix_timestamp_ms());
       self
         .metadata_store
-        .write_segment(metadata)
-        .await
-        .context("write segment metadata")?;
+        .write_segment(
+          metadata,
+          fences.as_deref(),
+          self.time_provider.now().unix_timestamp_ms(),
+        )
+        .await?;
       if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
         lifecycle_hooks
           .metadata_persisted(plan.topic.as_str(), &virtual_partition_ids)
           .await;
       }
-      Ok::<(), anyhow::Error>(())
+      Ok::<(), MetadataWriteError>(())
     })
     .await;
     metrics.record_metadata_publication_latency(publication_started_at);
-    persistence_result.map_err(|_| {
-      metrics.record_metadata_publication_deadline_exhausted_while_persisting();
-      anyhow::anyhow!(
-        "metadata publication exceeded {} ms while persisting segment",
-        plan.max_metadata_publication_lag_ms
-      )
-    })??;
+    match persistence_result {
+      Ok(Ok(())) => {},
+      Ok(Err(MetadataWriteError::ProducerLeaseFenceLost)) => {
+        return Err(WriteError::LeaseFenceLost);
+      },
+      Ok(Err(error)) => {
+        return Err(anyhow::Error::new(error).context("persist segment").into());
+      },
+      Err(_elapsed) => {
+        metrics.record_metadata_publication_deadline_exhausted_while_persisting();
+        return Err(
+          anyhow::anyhow!(
+            "metadata publication exceeded {} ms while persisting segment",
+            plan.max_metadata_publication_lag_ms
+          )
+          .into(),
+        );
+      },
+    }
 
     debug!(
       "flush persisted segment: topic={}, partitions={partition_count}, records={record_count}, \

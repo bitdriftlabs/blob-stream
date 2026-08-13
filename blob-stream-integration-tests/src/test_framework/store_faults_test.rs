@@ -45,7 +45,14 @@ async fn coalesced_reservation_honors_sequence_reservation_faults() {
   };
 
   let error = store
-    .acquire_lease_and_reserve_sequences(key.clone(), "broker-a".to_string(), 1_000, 100, Some(1))
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-a".to_string(),
+      1_000,
+      100,
+      Some(1),
+    )
     .await
     .expect_err("coalesced reservation should honor the reservation fault");
   assert!(error.to_string().contains("reservation unavailable"));

@@ -9,9 +9,13 @@ deadline.
 Set `strongly_consistent_metadata_reads` or the runtime flag
 `blob_stream_consumer_strong_metadata_reads` to use strongly consistent metadata queries. This
 removes read-replica staleness, ignores the configured visibility delay, and approximately doubles
-metadata-query RRUs. It does not fence stale producer publication, make paginated scans atomic, or
-provide a complete ordering guarantee; that still requires transactionally fencing metadata
-publication to the active producer lease session or epoch.
+metadata-query RRUs. It does not make paginated scans atomic. Enable broker
+`fenced_metadata_writes` as well when stale producer publication must be rejected: it conditions
+metadata publication on the active lease session and epoch, requires transactional DynamoDB IAM
+permissions, and is default-off for rolling deployment compatibility. This has a significant
+write-cost impact: each metadata publication becomes a DynamoDB transaction containing the segment
+metadata write plus a lease condition check for every partition in the flush, and DynamoDB charges
+transactional writes and reads at twice the normal capacity-unit rate.
 
 # Why haven't you implemented compaction?
 
