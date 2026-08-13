@@ -249,6 +249,49 @@ async fn acquires_and_reserves_sequences_in_one_operation() {
 }
 
 #[tokio::test]
+async fn preserves_previous_lease_when_takeover_reservation_overflows() {
+  let store = InMemoryProducerPartitionLeaseStore::new();
+  let key = lease_key();
+
+  store
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-a".to_string(),
+      1_000,
+      100,
+      Some(u64::MAX),
+    )
+    .await
+    .expect("initial acquisition and reservation");
+
+  let error = store
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "broker-b".to_string(),
+      "session-b".to_string(),
+      1_100,
+      100,
+      Some(2),
+    )
+    .await
+    .expect_err("overflowing takeover reservation must fail");
+  assert!(error.to_string().contains("sequence range overflow"));
+
+  let lease = store
+    .get_lease(&key)
+    .await
+    .expect("read lease after failed takeover")
+    .expect("previous lease remains present");
+  assert_eq!(lease.holder_id, "broker-a");
+  assert_eq!(lease.lease_expiration_ts_ms, 1_100);
+  assert_eq!(lease.max_allocated_seq, Some(u64::MAX - 1));
+  let fence = lease.fence.expect("memory lease has a fence");
+  assert_eq!(fence.lease_epoch, 1);
+  assert_eq!(fence.lease_session_id, "session-a");
+}
+
+#[tokio::test]
 async fn releases_lease_for_current_holder() {
   let store = InMemoryProducerPartitionLeaseStore::new();
   let key = lease_key();

@@ -117,17 +117,27 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       ));
     }
 
-    if state.is_expired(now_ts_ms) || state.lease_session_id != lease_session_id {
-      state.lease_epoch = state
+    let takeover = state.is_expired(now_ts_ms) || state.lease_session_id != lease_session_id;
+    let lease_epoch = if takeover {
+      state
         .lease_epoch
         .checked_add(1)
-        .ok_or_else(|| anyhow!("lease epoch overflow"))?;
+        .ok_or_else(|| anyhow!("lease epoch overflow"))?
+    } else {
+      state.lease_epoch
+    };
+    let reservation = reservation_size
+      .map(|size| reserve_range(state.max_allocated_seq, size))
+      .transpose()?;
+
+    // Compute all fallible takeover state first so an overflow leaves the active lease unchanged.
+    if takeover {
+      state.lease_epoch = lease_epoch;
       state.lease_session_id = lease_session_id;
     }
     state.holder_id = holder_id;
     state.lease_expiration_ts_ms = expires_at;
-    let reservation = if let Some(size) = reservation_size {
-      let (range, updated) = reserve_range(state.max_allocated_seq, size)?;
+    let reservation = if let Some((range, updated)) = reservation {
       state.max_allocated_seq = Some(updated);
       Some(range)
     } else {
