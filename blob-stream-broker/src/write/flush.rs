@@ -6,7 +6,7 @@ use bd_time::OffsetDateTimeExt;
 use blob_stream_blob_store::{BlobKey, BlobStore};
 use blob_stream_metadata_store::{
   MetadataStore,
-  ProducerLeaseFenceLost,
+  MetadataWriteError,
   ProducerPartitionFence,
   ProducerPartitionLeaseKey,
 };
@@ -358,7 +358,7 @@ impl FlushContext {
         .blob_store
         .put(&envelope.blob_key, payload)
         .await
-        .context("write segment blob")?;
+        .map_err(|error| MetadataWriteError::Other(error.context("write segment blob")))?;
       metrics.record_uploaded_object(payload_bytes);
       if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
         lifecycle_hooks
@@ -373,23 +373,24 @@ impl FlushContext {
           fences.as_deref(),
           self.time_provider.now().unix_timestamp_ms(),
         )
-        .await
-        .context("write segment metadata")?;
+        .await?;
       if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
         lifecycle_hooks
           .metadata_persisted(plan.topic.as_str(), &virtual_partition_ids)
           .await;
       }
-      Ok::<(), anyhow::Error>(())
+      Ok::<(), MetadataWriteError>(())
     })
     .await;
     metrics.record_metadata_publication_latency(publication_started_at);
     match persistence_result {
       Ok(Ok(())) => {},
-      Ok(Err(error)) if error.downcast_ref::<ProducerLeaseFenceLost>().is_some() => {
+      Ok(Err(MetadataWriteError::ProducerLeaseFenceLost)) => {
         return Err(WriteError::LeaseFenceLost);
       },
-      Ok(Err(error)) => return Err(error.into()),
+      Ok(Err(error)) => {
+        return Err(anyhow::Error::new(error).context("persist segment").into());
+      },
       Err(_elapsed) => {
         metrics.record_metadata_publication_deadline_exhausted_while_persisting();
         return Err(

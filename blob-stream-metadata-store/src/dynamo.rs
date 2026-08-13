@@ -12,12 +12,13 @@ use crate::{
   DynamoCapacityMetrics,
   MetadataReadConsistency,
   MetadataStore,
-  ProducerLeaseFenceLost,
+  MetadataWriteError,
+  MetadataWriteResult,
   ProducerPartitionFence,
   SegmentMetadata,
   codec,
 };
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
@@ -123,7 +124,7 @@ impl MetadataStore for DynamoMetadataStore {
     metadata: SegmentMetadata,
     fences: Option<&[ProducerPartitionFence]>,
     now_ts_ms: i64,
-  ) -> Result<()> {
+  ) -> MetadataWriteResult {
     trace!(
       "metadata(dynamo) write_segment start: table={}, topic={}, window_start={}, snowflake_id={}",
       self.table_name,
@@ -137,35 +138,49 @@ impl MetadataStore for DynamoMetadataStore {
       metadata.snowflake_id.as_u64()
     );
     if let Some(fences) = fences {
-      ensure!(
-        !fences.is_empty(),
-        "fenced metadata publication requires at least one producer partition fence"
-      );
-      ensure!(
-        fences.len() <= MAX_FENCED_METADATA_PARTITIONS,
-        "fenced metadata publication supports at most {MAX_FENCED_METADATA_PARTITIONS} partitions"
-      );
-      let mut lease_keys = HashSet::with_capacity(fences.len());
-      for fence in fences {
-        ensure!(
-          lease_keys.insert(&fence.key),
-          "fenced metadata publication has duplicate producer lease key"
+      if fences.is_empty() {
+        return Err(
+          anyhow!("fenced metadata publication requires at least one producer partition fence")
+            .into(),
         );
       }
-      ensure!(
-        fences.len() == metadata.segment_index.len()
-          && fences.iter().all(|fence| {
-            fence.key.topic.as_str() == metadata.window.topic
-              && metadata
-                .segment_index
-                .contains_key(&fence.key.virtual_partition_id)
-          }),
-        "fenced metadata publication requires producer lease fences matching segment partitions"
-      );
+      if fences.len() > MAX_FENCED_METADATA_PARTITIONS {
+        return Err(
+          anyhow!(
+            "fenced metadata publication supports at most {MAX_FENCED_METADATA_PARTITIONS} \
+             partitions"
+          )
+          .into(),
+        );
+      }
+      let mut lease_keys = HashSet::with_capacity(fences.len());
+      for fence in fences {
+        if !lease_keys.insert(&fence.key) {
+          return Err(
+            anyhow!("fenced metadata publication has duplicate producer lease key").into(),
+          );
+        }
+      }
+      if fences.len() != metadata.segment_index.len()
+        || !fences.iter().all(|fence| {
+          fence.key.topic.as_str() == metadata.window.topic
+            && metadata
+              .segment_index
+              .contains_key(&fence.key.virtual_partition_id)
+        })
+      {
+        return Err(
+          anyhow!(
+            "fenced metadata publication requires producer lease fences matching segment \
+             partitions"
+          )
+          .into(),
+        );
+      }
     }
 
     let ttl_epoch_seconds = self.metadata_ttl_epoch_seconds(&metadata);
-    let encoded = codec::encode(metadata)?;
+    let encoded = codec::encode(metadata).map_err(MetadataWriteError::from)?;
     let mut item = HashMap::from([
       (
         ATTR_PK.to_string(),
@@ -192,7 +207,8 @@ impl MetadataStore for DynamoMetadataStore {
         .set_item(Some(item))
         .return_consumed_capacity(ReturnConsumedCapacity::Total)
         .send()
-        .await?;
+        .await
+        .map_err(|error| MetadataWriteError::Other(error.into()))?;
       self.record_write_capacity(response.consumed_capacity.as_ref());
 
       debug!(
@@ -205,7 +221,8 @@ impl MetadataStore for DynamoMetadataStore {
     let metadata_put = Put::builder()
       .table_name(&self.table_name)
       .set_item(Some(item))
-      .build()?;
+      .build()
+      .map_err(|error| MetadataWriteError::Other(error.into()))?;
     let mut transaction_items = Vec::with_capacity(fences.len() + 1);
     transaction_items.push(TransactWriteItem::builder().put(metadata_put).build());
     for producer_fence in fences {
@@ -231,7 +248,8 @@ impl MetadataStore for DynamoMetadataStore {
            {ATTR_EXPIRES} > :now"
         ))
         .set_expression_attribute_values(Some(values))
-        .build()?;
+        .build()
+        .map_err(|error| MetadataWriteError::Other(error.into()))?;
       transaction_items.push(
         TransactWriteItem::builder()
           .condition_check(lease_check)
@@ -275,9 +293,9 @@ impl MetadataStore for DynamoMetadataStore {
       Err(SdkError::ServiceError(service_error))
         if transaction_cancellation_has_code(service_error.err(), "ConditionalCheckFailed") =>
       {
-        Err(ProducerLeaseFenceLost.into())
+        Err(MetadataWriteError::ProducerLeaseFenceLost)
       },
-      Err(error) => Err(error.into()),
+      Err(error) => Err(MetadataWriteError::Other(error.into())),
     }
   }
 

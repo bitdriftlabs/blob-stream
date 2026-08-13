@@ -27,6 +27,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
+use aws_sdk_dynamodb::operation::update_item::UpdateItemOutput;
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnConsumedCapacity, ReturnValue};
 use blob_stream_types::SeqRange;
 use log::{debug, trace};
@@ -110,6 +111,98 @@ impl DynamoProducerPartitionLeaseStore {
   ) -> Result<ProducerPartitionLease> {
     let entry: DynamoLeaseItem = serde_dynamo::from_item(attributes)?;
     entry.into_lease(key)
+  }
+
+  // Both renewal and takeover requests return the complete updated lease. Decode that shared
+  // response here so their reservation ranges, capacity accounting, and error behavior remain
+  // identical.
+  fn complete_acquire(
+    &self,
+    output: UpdateItemOutput,
+    key: ProducerPartitionLeaseKey,
+    reservation_size: Option<u64>,
+    outcome: &str,
+  ) -> Result<LeaseAcquireAndReserveOutcome> {
+    self.record_write_capacity(output.consumed_capacity.as_ref());
+    let attributes = output
+      .attributes
+      .ok_or_else(|| anyhow!("lease attributes missing"))?;
+    let lease = Self::lease_from_item(attributes, key)?;
+    let reservation = match reservation_size {
+      Some(size) => Some(reservation_from_new_max(
+        lease
+          .max_allocated_seq
+          .ok_or_else(|| anyhow!("reserved lease missing max allocated sequence"))?,
+        size,
+      )?),
+      None => None,
+    };
+    debug!("producer lease(dynamo) acquire/reserve result: {outcome}, reservation={reservation:?}");
+    Ok(LeaseAcquireAndReserveOutcome::Acquired { lease, reservation })
+  }
+
+  // A failed renewal can mean an absent or expired lease, or a legacy same-holder row with no
+  // session identity. Claim only those cases: a live session-aware lease remains owned by its
+  // current holder, and must be reported to the caller rather than overwritten.
+  async fn claim_after_failed_renewal(
+    &self,
+    pk: String,
+    mut values: HashMap<String, AttributeValue>,
+    reservation_size: Option<u64>,
+  ) -> Result<Option<UpdateItemOutput>> {
+    values.insert(
+      ":epoch_zero".to_string(),
+      AttributeValue::N("0".to_string()),
+    );
+    values.insert(
+      ":epoch_increment".to_string(),
+      AttributeValue::N("1".to_string()),
+    );
+    let claim_update = match reservation_size {
+      Some(_) => format!(
+        "SET {ATTR_HOLDER} = :holder, {ATTR_SESSION} = :session, {ATTR_EXPIRES} = :expires, \
+         {ATTR_TTL} = :ttl, {ATTR_EPOCH} = if_not_exists({ATTR_EPOCH}, :epoch_zero) + \
+         :epoch_increment, {ATTR_MAX_SEQ} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta"
+      ),
+      None => format!(
+        "SET {ATTR_HOLDER} = :holder, {ATTR_SESSION} = :session, {ATTR_EXPIRES} = :expires, \
+         {ATTR_TTL} = :ttl, {ATTR_EPOCH} = if_not_exists({ATTR_EPOCH}, :epoch_zero) + \
+         :epoch_increment"
+      ),
+    };
+    let claim_condition = format!(
+      "attribute_not_exists({ATTR_PK}) OR {ATTR_EXPIRES} <= :now OR ({ATTR_HOLDER} = :holder AND \
+       attribute_not_exists({ATTR_SESSION}))"
+    );
+    let claim_condition = match reservation_size {
+      Some(_) => format!(
+        "({claim_condition}) AND (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= \
+         :max_reservable)"
+      ),
+      None => claim_condition,
+    };
+
+    match self
+      .client
+      .update_item()
+      .table_name(&self.table_name)
+      .key(ATTR_PK, AttributeValue::S(pk))
+      .update_expression(claim_update)
+      .condition_expression(claim_condition)
+      .set_expression_attribute_values(Some(values))
+      .return_values(ReturnValue::AllNew)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
+      .send()
+      .await
+    {
+      Ok(output) => Ok(Some(output)),
+      Err(SdkError::ServiceError(service_error))
+        if service_error.err().is_conditional_check_failed_exception() =>
+      {
+        Ok(None)
+      },
+      Err(error) => Err(error.into()),
+    }
   }
 }
 
@@ -235,114 +328,32 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       .await;
 
     match response {
-      Ok(output) => {
-        self.record_write_capacity(output.consumed_capacity.as_ref());
-        let attributes = output
-          .attributes
-          .ok_or_else(|| anyhow!("lease attributes missing"))?;
-        let lease = Self::lease_from_item(attributes, key.clone())?;
-        let reservation = match reservation_size {
-          Some(size) => Some(reservation_from_new_max(
-            lease
-              .max_allocated_seq
-              .ok_or_else(|| anyhow!("reserved lease missing max allocated sequence"))?,
-            size,
-          )?),
-          None => None,
-        };
-        debug!(
-          "producer lease(dynamo) acquire/reserve result: acquired, reservation={reservation:?}"
-        );
-        Ok(LeaseAcquireAndReserveOutcome::Acquired { lease, reservation })
-      },
+      Ok(output) => self.complete_acquire(output, key, reservation_size, "acquired"),
       Err(SdkError::ServiceError(service_error))
         if service_error.err().is_conditional_check_failed_exception() =>
       {
-        values.insert(
-          ":epoch_zero".to_string(),
-          AttributeValue::N("0".to_string()),
-        );
-        values.insert(
-          ":epoch_increment".to_string(),
-          AttributeValue::N("1".to_string()),
-        );
-        let claim_update = match reservation_size {
-          Some(_) => format!(
-            "SET {ATTR_HOLDER} = :holder, {ATTR_SESSION} = :session, {ATTR_EXPIRES} = :expires, \
-             {ATTR_TTL} = :ttl, {ATTR_EPOCH} = if_not_exists({ATTR_EPOCH}, :epoch_zero) + \
-             :epoch_increment, {ATTR_MAX_SEQ} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta"
-          ),
-          None => format!(
-            "SET {ATTR_HOLDER} = :holder, {ATTR_SESSION} = :session, {ATTR_EXPIRES} = :expires, \
-             {ATTR_TTL} = :ttl, {ATTR_EPOCH} = if_not_exists({ATTR_EPOCH}, :epoch_zero) + \
-             :epoch_increment"
-          ),
-        };
-        let claim_condition = format!(
-          "attribute_not_exists({ATTR_PK}) OR {ATTR_EXPIRES} <= :now OR ({ATTR_HOLDER} = :holder \
-           AND attribute_not_exists({ATTR_SESSION}))"
-        );
-        let claim_condition = match reservation_size {
-          Some(_) => format!(
-            "({claim_condition}) AND (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= \
-             :max_reservable)"
-          ),
-          None => claim_condition,
-        };
-        let claim = self
-          .client
-          .update_item()
-          .table_name(&self.table_name)
-          .key(ATTR_PK, AttributeValue::S(pk))
-          .update_expression(claim_update)
-          .condition_expression(claim_condition)
-          .set_expression_attribute_values(Some(values))
-          .return_values(ReturnValue::AllNew)
-          .return_consumed_capacity(ReturnConsumedCapacity::Total)
-          .send()
-          .await;
-        let output = match claim {
-          Ok(output) => output,
-          Err(SdkError::ServiceError(service_error))
-            if service_error.err().is_conditional_check_failed_exception() =>
-          {
-            debug!("producer lease(dynamo) acquire/reserve result: held_by_other");
-            let lease = self
-              .read_lease(&key)
-              .await?
-              .ok_or_else(|| anyhow!("lease missing after conditional failure"))?;
-            if reservation_would_overflow(
-              &lease,
-              &holder_id,
-              &lease_session_id,
-              now_ts_ms,
-              reservation_size,
-            ) {
-              return Err(anyhow!("sequence range overflow"));
-            }
-            return Ok(LeaseAcquireAndReserveOutcome::HeldByOther(lease));
-          },
-          Err(error) => return Err(error.into()),
-        };
-        self.record_write_capacity(output.consumed_capacity.as_ref());
-        let attributes = output
-          .attributes
-          .ok_or_else(|| anyhow!("lease attributes missing"))?;
-        let lease = Self::lease_from_item(attributes, key.clone())?;
-        let reservation = match reservation_size {
-          Some(size) => Some(reservation_from_new_max(
-            lease
-              .max_allocated_seq
-              .ok_or_else(|| anyhow!("reserved lease missing max allocated sequence"))?,
-            size,
-          )?),
-          None => None,
-        };
-        debug!(
-          "producer lease(dynamo) acquire/reserve result: acquired takeover, \
-           reservation={reservation:?}"
-        );
-        Ok(LeaseAcquireAndReserveOutcome::Acquired { lease, reservation })
+        if let Some(output) = self
+          .claim_after_failed_renewal(pk, values, reservation_size)
+          .await?
+        {
+          self.complete_acquire(output, key, reservation_size, "acquired takeover")
+        } else {
+          debug!("producer lease(dynamo) acquire/reserve result: held_by_other");
+          let lease = self
+            .read_lease(&key)
+            .await?
+            .ok_or_else(|| anyhow!("lease missing after conditional failure"))?;
+          if reservation_would_overflow(
+            &lease,
+            &holder_id,
+            &lease_session_id,
+            now_ts_ms,
+            reservation_size,
+          ) {
+            return Err(anyhow!("sequence range overflow"));
+          }
+          Ok(LeaseAcquireAndReserveOutcome::HeldByOther(lease))
+        }
       },
       Err(error) => Err(error.into()),
     }

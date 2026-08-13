@@ -18,7 +18,6 @@ use blob_stream_types::{
 };
 use protobuf::Chars;
 use std::collections::HashMap;
-use std::fmt;
 
 mod aws;
 mod codec;
@@ -45,20 +44,22 @@ pub use producer_partition_leases_dynamo::DynamoProducerPartitionLeaseStore;
 pub use producer_partition_leases_memory::InMemoryProducerPartitionLeaseStore;
 
 //
-// ProducerLeaseFenceLost
+// MetadataWriteError
 //
 
-#[derive(Debug)]
-/// A metadata publication fence no longer authorizes its producer lease.
-pub struct ProducerLeaseFenceLost;
-
-impl fmt::Display for ProducerLeaseFenceLost {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    formatter.write_str("producer lease fence was lost")
-  }
+/// Error returned when persisting segment metadata.
+#[derive(Debug, thiserror::Error)]
+pub enum MetadataWriteError {
+  /// A metadata publication fence no longer authorizes its producer lease.
+  #[error("producer lease fence was lost")]
+  ProducerLeaseFenceLost,
+  /// A backend, encoding, or validation failure unrelated to producer fencing.
+  #[error(transparent)]
+  Other(#[from] anyhow::Error),
 }
 
-impl std::error::Error for ProducerLeaseFenceLost {}
+/// Result returned by a segment metadata publication.
+pub type MetadataWriteResult = std::result::Result<(), MetadataWriteError>;
 
 //
 // SegmentMetadata
@@ -142,7 +143,7 @@ pub trait MetadataStore: Send + Sync {
     metadata: SegmentMetadata,
     fences: Option<&[ProducerPartitionFence]>,
     now_ts_ms: i64,
-  ) -> Result<()>;
+  ) -> MetadataWriteResult;
 
   /// Scan a single window from an optional inclusive snowflake lower bound. Results are unordered
   /// for cost and performance.

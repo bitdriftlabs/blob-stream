@@ -30,6 +30,7 @@ use blob_stream_metadata_store::{
   InMemoryMetadataStore,
   MetadataReadConsistency,
   MetadataStore,
+  MetadataWriteResult,
   SegmentMetadata,
 };
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
@@ -95,7 +96,7 @@ impl MetadataStore for RecordingMetadataStore {
     metadata: SegmentMetadata,
     fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
     now_ts_ms: i64,
-  ) -> Result<()> {
+  ) -> MetadataWriteResult {
     self.inner.write_segment(metadata, fences, now_ts_ms).await
   }
 
@@ -126,7 +127,7 @@ impl MetadataStore for FailingMetadataStore {
     _metadata: SegmentMetadata,
     _fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
     _now_ts_ms: i64,
-  ) -> Result<()> {
+  ) -> MetadataWriteResult {
     Ok(())
   }
 

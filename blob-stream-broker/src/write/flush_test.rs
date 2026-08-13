@@ -10,6 +10,8 @@ use blob_stream_metadata_store::{
   InMemoryMetadataStore,
   MetadataReadConsistency,
   MetadataStore,
+  MetadataWriteError,
+  MetadataWriteResult,
   ProducerLeaseFence,
   ProducerPartitionFence,
   ProducerPartitionLeaseKey,
@@ -32,7 +34,7 @@ impl MetadataStore for LostFenceMetadataStore {
     _metadata: SegmentMetadata,
     fences: Option<&[ProducerPartitionFence]>,
     _now_ts_ms: i64,
-  ) -> Result<()> {
+  ) -> MetadataWriteResult {
     assert_eq!(
       fences,
       Some(&[ProducerPartitionFence {
@@ -44,9 +46,7 @@ impl MetadataStore for LostFenceMetadataStore {
       }] as &[ProducerPartitionFence])
     );
     self.calls.fetch_add(1, Ordering::Relaxed);
-    Err(anyhow::anyhow!(
-      "fenced metadata publication rejected because a producer lease fence was lost"
-    ))
+    Err(MetadataWriteError::ProducerLeaseFenceLost)
   }
 
   async fn scan_window_from_snowflake(

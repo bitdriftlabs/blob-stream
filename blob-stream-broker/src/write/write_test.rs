@@ -37,6 +37,7 @@ use blob_stream_metadata_store::{
   LeaseReleaseOutcome,
   MetadataReadConsistency,
   MetadataStore,
+  MetadataWriteResult,
   ProducerPartitionFence,
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
@@ -86,9 +87,9 @@ impl MetadataStore for FailsTopicMetadataStore {
     metadata: SegmentMetadata,
     fences: Option<&[ProducerPartitionFence]>,
     now_ts_ms: i64,
-  ) -> Result<()> {
+  ) -> MetadataWriteResult {
     if metadata.window.topic == self.failed_topic {
-      return Err(anyhow::anyhow!("metadata write failed"));
+      return Err(anyhow::anyhow!("metadata write failed").into());
     }
     self.inner.write_segment(metadata, fences, now_ts_ms).await
   }
@@ -2427,8 +2428,8 @@ impl MetadataStore for FailingMetadataStore {
     _metadata: SegmentMetadata,
     _fences: Option<&[ProducerPartitionFence]>,
     _now_ts_ms: i64,
-  ) -> Result<()> {
-    Err(anyhow::anyhow!("metadata write failed"))
+  ) -> MetadataWriteResult {
+    Err(anyhow::anyhow!("metadata write failed").into())
   }
 
   async fn scan_window_from_snowflake(

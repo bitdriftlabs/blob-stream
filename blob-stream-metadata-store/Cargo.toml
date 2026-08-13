@@ -27,6 +27,7 @@ prometheus.workspace        = true
 protobuf.workspace          = true
 serde.workspace             = true
 serde_dynamo                = { workspace = true, features = ["aws-sdk-dynamodb+1"] }
+thiserror.workspace         = true
 time.workspace              = true
 tokio.workspace             = true
 uuid.workspace              = true

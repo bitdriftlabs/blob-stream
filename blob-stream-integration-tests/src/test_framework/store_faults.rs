@@ -21,6 +21,7 @@ use blob_stream_metadata_store::{
   LeaseReleaseOutcome,
   MetadataReadConsistency,
   MetadataStore,
+  MetadataWriteResult,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
   SegmentMetadata,
@@ -644,7 +645,7 @@ impl MetadataStore for FaultInjectedMetadataStore {
     metadata: SegmentMetadata,
     fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
     now_ts_ms: i64,
-  ) -> Result<()> {
+  ) -> MetadataWriteResult {
     let key = metadata.window.format();
     let effects = self
       .controller
@@ -660,10 +661,10 @@ impl MetadataStore for FaultInjectedMetadataStore {
     }
     if let Some(timeout) = effects.timeout {
       sleep(timeout).await;
-      return Err(anyhow!("metadata write timed out for window {key}"));
+      return Err(anyhow!("metadata write timed out for window {key}").into());
     }
     if let Some(message) = effects.fail_message {
-      return Err(anyhow!("metadata write fault for window {key}: {message}"));
+      return Err(anyhow!("metadata write fault for window {key}: {message}").into());
     }
 
     if let Some(delay) = effects.delayed_visibility {

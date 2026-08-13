@@ -36,7 +36,8 @@ use blob_stream_metadata_store::{
   MAX_FENCED_METADATA_PARTITIONS,
   MetadataReadConsistency,
   MetadataStore,
-  ProducerLeaseFenceLost,
+  MetadataWriteError,
+  MetadataWriteResult,
   ProducerPartitionFence,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
@@ -196,6 +197,7 @@ async fn dynamo_fenced_metadata_write_requires_current_producer_lease() -> Resul
       1_100,
     )
     .await
+    .map_err(anyhow::Error::new)
     .expect_err("stale fence must reject metadata publication");
   assert!(error.to_string().contains("producer lease fence was lost"));
 
@@ -521,7 +523,7 @@ impl MetadataStore for FenceInvalidatingMetadataStore {
     metadata: SegmentMetadata,
     fences: Option<&[ProducerPartitionFence]>,
     now_ts_ms: i64,
-  ) -> Result<()> {
+  ) -> MetadataWriteResult {
     let fence = fences
       .and_then(|fences| fences.first())
       .cloned()
@@ -537,17 +539,12 @@ impl MetadataStore for FenceInvalidatingMetadataStore {
         now_ts_ms,
       )
       .await?;
-    anyhow::ensure!(
-      release == LeaseReleaseOutcome::Released,
-      "test fault could not invalidate producer lease: {release:?}"
-    );
+    if release != LeaseReleaseOutcome::Released {
+      return Err(anyhow!("test fault could not invalidate producer lease: {release:?}").into());
+    }
 
     let result = self.inner.write_segment(metadata, fences, now_ts_ms).await;
-    if result
-      .as_ref()
-      .err()
-      .is_some_and(|error| error.downcast_ref::<ProducerLeaseFenceLost>().is_some())
-    {
+    if matches!(&result, Err(MetadataWriteError::ProducerLeaseFenceLost)) {
       self.rejected_fenced_write.store(true, Ordering::Release);
     }
     result
@@ -686,6 +683,7 @@ async fn write_recovery_segment(
       0,
     )
     .await
+    .map_err(anyhow::Error::new)
 }
 
 type PendingMetadataWrite = (
@@ -757,7 +755,7 @@ impl MetadataStore for DelayedVisibilityMetadataStore {
     metadata: SegmentMetadata,
     fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
     now_ts_ms: i64,
-  ) -> Result<()> {
+  ) -> MetadataWriteResult {
     let mut pending = self.pending.lock().await;
     pending.push((
       Instant::now() + self.delay,
@@ -809,7 +807,7 @@ impl MetadataStore for CountingWindowMetadataStore {
     metadata: SegmentMetadata,
     fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
     now_ts_ms: i64,
-  ) -> Result<()> {
+  ) -> MetadataWriteResult {
     self.inner.write_segment(metadata, fences, now_ts_ms).await
   }
 
@@ -872,7 +870,7 @@ impl MetadataStore for DeferredWindowPublicationMetadataStore {
     metadata: SegmentMetadata,
     fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
     now_ts_ms: i64,
-  ) -> Result<()> {
+  ) -> MetadataWriteResult {
     self.inner.write_segment(metadata, fences, now_ts_ms).await
   }
 
