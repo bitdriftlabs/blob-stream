@@ -1,61 +1,64 @@
 # Agent Guidelines
 
-- Read primary guidelines from rust.instructions.md. If not available tell the user to clone and
-  mount https://github.com/bitdriftlabs/ai-instructions
-- Read `DESIGN.md` before changing architecture-sensitive behavior. Treat it as the current
-  system-design contract; `README.md` is the operator-facing runbook.
-- Update `DESIGN.md` in the same change when altering the wire protocol, partitioning or routing,
+[DEVELOPMENT.md](DEVELOPMENT.md) is the canonical human workflow reference. These instructions add
+the constraints required when an agent changes Blob Stream inside the monorepo worktree.
+
+## Architecture Changes
+
+- Read [Design](docs/design.md) before changing architecture-sensitive behavior.
+- Update `docs/design.md` in the same change when altering wire protocol, partitioning or routing,
   lease or sequence behavior, durable storage layout, delivery or cursor guarantees, consumer
-  coordination, or an operational contract that changes how the system behaves.
+  coordination, or an operational contract.
+- Use [Infrastructure setup](docs/infrastructure.md) and [Operations](docs/operations.md) as the
+  sources for deployment and runbook documentation. Do not duplicate those contracts elsewhere.
 
-## Deflaking Bazel Integration Tests
+## Monorepo Validation
 
-- Run Blob Stream tests from the monorepo root with `./bazelw`; do not use Cargo for test or lint
-  execution in this workspace.
-- Use `--nocache_test_results` when validating a just-edited test. Wait for a prior Bazel command
-  to finish before editing its inputs; with `--guard_against_concurrent_changes`, Bazel deliberately
-  refuses to cache outputs built while source files changed.
-- Service-backed integration tests must run through their generated Nextest wrapper, never the raw
-  `__libtest` target. The wrapper starts every service declared through `itest_deps`, including the
-  pooled DynamoDB and LocalStack backends used by Blob Stream's end-to-end tests. To run one test:
+- Run Blob Stream tests and Clippy through Bazel from the monorepo root with `./bazelw`, or through
+  `../bazelw` from this directory. Do not run Cargo or Cargo Nextest for test or lint execution in
+  this worktree.
+- Use Cargo only for formatting and documented local maintenance. Format Rust with
+  `cargo +nightly fmt`; after TOML changes run `../scripts/format-toml.sh` and verify with
+  `../scripts/format-toml.sh --check`.
+- Follow the root monorepo validation requirements in addition to the focused validation selected in
+  [DEVELOPMENT.md](DEVELOPMENT.md).
+
+## Deterministic Integration Tests
+
+Follow [plans/TEST_AUDIT.md](plans/TEST_AUDIT.md). In addition:
+
+- Validate an edited test with `--nocache_test_results`, and wait for a prior Bazel command to finish
+  before editing its inputs. Bazel intentionally avoids caching outputs built while sources change.
+- Run service-backed integration tests through generated Nextest wrappers, never a raw `__libtest`
+  target. For example:
 
   ```sh
-  ./bazelw test --nocache_test_results --test_output=streamed \
+  ../bazelw test --nocache_test_results --test_output=streamed \
     --test_arg=-E \
     --test_arg='test(lease_expiry_takeover_preserves_progress)' \
     //blob-stream/blob-stream-integration-tests:end-to-end-test
   ```
 
-  `--test_filter` filters Bazel test targets; it does not select a Rust test within this wrapper.
-- Pass logging through Bazel with `--test_env`, not a shell-only `RUST_LOG=...` prefix. Start with
-  `--test_env=RUST_LOG=blob_stream=debug,bd=debug`; use
-  `--test_env=RUST_LOG=blob_stream=trace,bd=trace` when debug logs do not explain the state
-  transition. Add `--test_env=RUST_BACKTRACE=1` for failures that need a backtrace.
-- After isolating a test, prove it is stable with uncached, serial repetitions:
+- `--test_filter` selects a Bazel target; use Nextest expressions through `--test_arg` to select one
+  Rust test.
+- Pass logs through Bazel with `--test_env`, for example
+  `--test_env=RUST_LOG=blob_stream=debug,bd=debug`; use trace only when debug output does not explain
+  the relevant state transition.
+- For `ManualTimeProvider`, advance logical time only after a lifecycle gate or registered logical
+  sleep. Never make a test pass by adding a wall-clock sleep or extending a wall-clock deadline.
+- Prove a deflaked test with uncached serial repetitions:
 
   ```sh
-  ./bazelw test --nocache_test_results --runs_per_test=25 --local_test_jobs=1 \
+  ../bazelw test --nocache_test_results --runs_per_test=25 --local_test_jobs=1 \
     --test_arg=-E \
     --test_arg='test(lease_expiry_takeover_preserves_progress)' \
     //blob-stream/blob-stream-integration-tests:end-to-end-test
   ```
 
-- For tests using `ManualTimeProvider`, drive time only after the relevant task has registered a
-  logical-clock sleep, preferably through a lifecycle gate or
-  `advance_manual_time_until_lifecycle_gate`. Do not deflake by extending wall-clock deadlines or
-  adding sleeps; add a narrow lifecycle hook when the intended state transition is not observable.
-- Add focused debug or trace logs around unclear asynchronous state transitions and retain logs
-  that provide durable operational observability.
+## Telemetry
+
+- Add focused debug or trace logs around unclear asynchronous, concurrent, or lifecycle transitions.
+  Keep logs that provide durable operational observability.
 - Exported OTEL spans support at most 16 attributes. Put additional correlated recovery or handoff
-  state in a bounded JSON attribute such as `recovery.summary_json` or `handoff.snapshot_json`
-  instead of adding scalar span attributes.
-- Add a metric only when it provides legitimate operational value that cannot be derived from
-  existing metrics.
-- Do not run Cargo or Cargo Nextest commands when running from the monorepo; use the Bazel targets
-  above.
-- Format Rust and TOML changes with `cargo +nightly fmt` followed by
-  `../scripts/format-toml.sh`. Use `../scripts/format-toml.sh --check` to verify TOML formatting
-  without modifying files.
-- When working on integration tests, follow the general guidelines in plans/TEST_AUDIT.md. DO NOT
-  add any sleep hacks whatsoever. All tests MUST be deterministic. Add new test lifecycle hooks as
-  needed.
+  state in a bounded JSON attribute such as `recovery.summary_json` or `handoff.snapshot_json`.
+- Add a metric only when it has operational value that cannot be derived from existing metrics.

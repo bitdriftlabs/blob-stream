@@ -449,7 +449,7 @@ Implementation order:
 | Consumer metadata transport | `blob-stream-consumer/src/consumer/scan/execution.rs` | Cache transport plus direct-Dynamo fallback while retaining planning and delivery state. |
 | Read discovery/configuration | Broker discovery and consumer configuration modules | Dedicated AZ/cluster-local read-broker membership, producer-style routing, and feature flags. |
 
-Any implemented change that alters object layout, broker routing, metadata availability, or read behavior must update `DESIGN.md` in the same change. `DESIGN.md` is the current architecture contract; this document is a decision and implementation-planning aid.
+Any implemented change that alters object layout, broker routing, metadata availability, or read behavior must update `docs/design.md` in the same change. `docs/design.md` is the current architecture contract; this document is a decision and implementation-planning aid.
 
 ## Validation And Rollout Checklist
 

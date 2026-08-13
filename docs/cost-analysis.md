@@ -10,18 +10,17 @@ egress. Use provider billing data for those costs.
 
 ## Quick Start
 
-From the `blob-stream` root, enter the cost-analysis directory and run the baseline model:
+From this `docs` directory, run the baseline model:
 
 ```bash
-cd cost-analysis
-python3 cost_analysis.py
+python3 ../cost-analysis/cost_analysis.py
 ```
 
 The defaults are illustrative only. They contain placeholder regional prices and fallback estimates,
 not a production workload. Override individual values without editing the script:
 
 ```bash
-python3 cost_analysis.py \
+python3 ../cost-analysis/cost_analysis.py \
 	--set r_ingest_per_hour=50000000 \
 	--set s_seg_per_hour=24000 \
 	--set s_range_read_per_hour=36000 \
@@ -35,15 +34,15 @@ the two proposed stronger modes separately:
 
 ```bash
 # Strongly consistent segment-metadata queries. Consumer coordination reads are already strong.
-python3 cost_analysis.py --strong-metadata-reads
+python3 ../cost-analysis/cost_analysis.py --strong-metadata-reads
 
 # Transactionally fence metadata publication against the producing lease rows.
-python3 cost_analysis.py \
+python3 ../cost-analysis/cost_analysis.py \
 	--transactional-metadata-writes \
 	--set avg_partitions_per_segment=6
 
 # Price both stronger modes for the same workload.
-python3 cost_analysis.py \
+python3 ../cost-analysis/cost_analysis.py \
 	--strong-metadata-reads \
 	--transactional-metadata-writes \
 	--set avg_partitions_per_segment=6
@@ -52,7 +51,7 @@ python3 cost_analysis.py \
 Every `Inputs` field can also be set with `--set NAME=VALUE`. Boolean values are `true` or `false`.
 
 ```bash
-python3 cost_analysis.py \
+python3 ../cost-analysis/cost_analysis.py \
 	--set metadata_strong_reads=true \
 	--set transactional_metadata_writes=true \
 	--set pages_per_metadata_query=1.4
@@ -103,7 +102,7 @@ With eventual metadata reads, each 4 KiB metadata-query page costs $0.5$ RRU. Th
 `--strong-metadata-reads` switch changes only those metadata-query pages to 1 RRU. Consumer-group
 coordination is already strongly consistent, so it is unaffected by the switch.
 
-`--transactional-metadata-writes` models the proposed producer publication fence: a transactional
+`--transactional-metadata-writes` models enabled broker fenced metadata publication: a transactional
 metadata `Put` plus one transactional producer-lease `ConditionCheck` per contributing virtual
 partition. For metadata size $M$ KiB and $P$ average partitions per segment, capacity per published
 segment is:

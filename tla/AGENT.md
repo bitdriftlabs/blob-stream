@@ -7,7 +7,7 @@ not as a transcription of Rust control flow.
 ## Before Editing
 
 - Read `README.md`, the comments around the action or invariant you will touch,
-  and the relevant product contract in `../DESIGN.md`.
+  and the relevant product contract in `../docs/design.md`.
 - Preserve the current model boundary unless the task explicitly expands it:
   one virtual partition, bounded brokers/batches/time, producer lease and
   Hi-Lo safety, and blob-to-metadata-to-acknowledgement publication ordering.

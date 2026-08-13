@@ -1,18 +1,33 @@
 # Development Guide
 
-This document contains developer workflows for building, testing, and previewing docs in
-`blob-stream`.
+This guide is the canonical workflow reference for contributors. See the
+[repository overview](README.md) for the full documentation map and [Design](docs/design.md) before
+changing architecture-sensitive behavior.
+
+## Choose Your Environment
+
+Use the workflow that matches how the repository was checked out.
+
+| Environment | Build, lint, and test | Formatting |
+| --- | --- | --- |
+| Standalone `blob-stream` clone | Cargo and Cargo Nextest | `cargo +nightly fmt` |
+| Blob Stream in the monorepo | Bazel from the monorepo root or `../bazelw` from this directory | `cargo +nightly fmt`; run `../scripts/format-toml.sh` when TOML changes |
+
+The monorepo's [AGENTS.md](AGENTS.md) adds mandatory agent constraints, especially for deterministic
+integration tests. It does not replace this guide.
 
 ## Prerequisites
 
-- Rust toolchain (edition 2024)
-- Docker + Docker Compose (for local dependencies)
-- Optional for local cloud emulation commands:
-  - AWS CLI
+- Rust toolchain for edition 2024
+- Docker and Docker Compose for local dependencies
+- AWS CLI when using optional local-cloud emulation commands
+- Bazel wrapper dependencies when working in the monorepo
 
-## Build and test
+## Build, Lint, And Test
 
-From repo root:
+### Standalone Clone
+
+Run from the `blob-stream` root:
 
 ```bash
 cargo build --workspace
@@ -20,71 +35,75 @@ cargo clippy --workspace --bins --examples --tests -- --no-deps
 cargo nextest run
 ```
 
-Integration tests for this project specifically:
+Run only the integration-test crate when needed:
 
 ```bash
 RUST_LOG=off cargo nextest run -p blob-stream-integration-tests
 ```
 
-For deeper integration-test debugging, use trace logs:
+Use `RUST_LOG=blob_stream=trace,bd=trace` only for targeted investigation.
+
+### Monorepo Worktree
+
+Run Bazel tests and Clippy from the monorepo root, or use `../bazelw` from the `blob-stream`
+directory. For example:
 
 ```bash
-RUST_LOG=blob_stream=trace,bd=trace cargo nextest run -p blob-stream-integration-tests
+../bazelw test //blob-stream/blob-stream-metadata-store:unit-test
+../bazelw test --config=clippy //blob-stream/blob-stream-metadata-store:blob-stream-metadata-store__clippy
 ```
 
-## Local infrastructure (S3 + Dynamo emulation)
+Service-backed Blob Stream integration tests must use their generated Nextest wrappers, not raw
+`__libtest` targets. See [AGENTS.md](AGENTS.md) and
+[plans/TEST_AUDIT.md](plans/TEST_AUDIT.md) for deterministic-test requirements and focused commands.
 
-Start local dependencies:
+## Format And Verify Changes
+
+Format Rust from this directory:
+
+```bash
+cargo +nightly fmt
+```
+
+When TOML changes in the monorepo, also run:
+
+```bash
+../scripts/format-toml.sh
+../scripts/format-toml.sh --check
+```
+
+Before submitting a change, run the narrowest relevant build, lint, and test command for the
+checkout context, inspect editor diagnostics, and run:
+
+```bash
+git diff --check
+```
+
+## Local Infrastructure
+
+Start S3 and DynamoDB emulation:
 
 ```bash
 docker compose up -d
 ```
 
-This starts:
-- DynamoDB Local on `http://localhost:8000`
-- LocalStack S3 on `http://localhost:4566`
+This starts DynamoDB Local at `http://localhost:8000` and LocalStack S3 at
+`http://localhost:4566`.
 
-## Local stress runner
+## Local Stress Runner
 
-The opt-in stress runner exercises real in-process TCP brokers, LocalStack S3, DynamoDB Local,
-the producer client, and production consumer bootstrap. Each run creates an isolated bucket and
-set of DynamoDB tables, which are cleaned up when the run completes.
+The optional stress runner exercises in-process TCP brokers, LocalStack S3, DynamoDB Local, the
+producer client, and production consumer bootstrap. Each run creates and cleans up an isolated
+bucket and DynamoDB table set.
 
-Start the local dependencies first:
-
-```bash
-docker compose up -d
-```
-
-Run a small smoke workload:
+Start local dependencies, then run a small workload:
 
 ```bash
 RUST_LOG=off cargo run -p blob-stream-integration-tests --bin blob-stream-stress -- \
   --brokers 1 --producers 1 --consumers 1 --partitions 4 --records 100
 ```
 
-Smoke runs have a 10-second overall deadline covering setup, brokers, production, shutdown, and
-verification. The runner reports the active stage and live record counters to stderr every five
-seconds. Use `--overall-timeout-seconds`, `--startup-timeout-seconds`,
-`--producer-timeout-seconds`, and `--consumer-shutdown-timeout-seconds` to diagnose or extend a
-specific phase.
-
-By default, each harness producer uses the producer library's normal batching values: up to 1,000
-records or 1 MiB per batch, with a 200 ms flush deadline. The harness submits up to 64 records
-concurrently per producer so the library can fill those batches. Override these with
-`--producer-max-batch-records`, `--producer-max-batch-bytes`,
-`--producer-flush-max-delay-ms`, `--producer-max-request-concurrency`, and
-`--producer-submit-concurrency` when exploring throughput or latency tradeoffs.
-The stress broker uses the normal 1-second flush delay by default; override it with
-`--broker-flush-max-delay-ms`. The runner generates keys that target every configured virtual
-partition, so inline partition observations reflect workload coverage rather than hash collisions.
-Workload consumers commit every 100 records by default and commit their remaining staged offsets
-during graceful shutdown. Use `--consumer-commit-interval-records` to change that cadence. The
-runner prints the full validated configuration to stderr before every run. After producers finish,
-the consumer group drains until it validates every identity across its owned partitions; the final
-direct reader remains an independent storage-level verification pass.
-
-Run a larger local workload:
+A larger example:
 
 ```bash
 RUST_LOG=off cargo run -p blob-stream-integration-tests --bin blob-stream-stress -- \
@@ -93,26 +112,17 @@ RUST_LOG=off cargo run -p blob-stream-integration-tests --bin blob-stream-stress
   --drain-timeout-seconds 120
 ```
 
-The runner exits unsuccessfully if an acknowledged record is missing, duplicated, misrouted, a
-producer or consumer fails, or a consumed payload does not belong to the current run. This is
-intentionally stricter than blob-stream's at-least-once delivery contract: duplicate deliveries
-are a stress-test correctness failure.
+The runner validates every acknowledged record and intentionally treats duplicate delivery as a
+stress-test failure, even though the service delivery contract is at least once. It reports active
+stages and live counters to stderr. Use its timeout and batching flags to investigate a specific
+phase rather than treating a larger overall deadline as a fix.
 
-## Local Rust docs and doctests
+## Rustdocs And Doctests
 
-Primary API examples live in crate rustdocs and are validated through doctests.
-
-Build and open local docs:
+Build local API documentation:
 
 ```bash
 cargo doc --workspace --no-deps --open
-```
-
-Open docs for specific crates:
-
-```bash
-cargo doc -p blob-stream-producer --no-deps --open
-cargo doc -p blob-stream-consumer --no-deps --open
 ```
 
 Run doctests for public crates:
@@ -126,13 +136,10 @@ cargo test -p blob-stream-blob-store --doc
 cargo test -p blob-stream-metadata-store --doc
 ```
 
-## Development verification checklist
+## Related Guides
 
-- Format: `cargo +nightly fmt`
-- Lint: `cargo clippy --workspace --bins --examples --tests -- --no-deps`
-- License: `cargo deny check licenses`
-- Test: `cargo nextest run`
-- Integration tests: `cargo nextest run -p blob-stream-integration-tests`
-
-Fault-injection tests are in:
-- `blob-stream-integration-tests/tests/fault_injection_test.rs`
+- [Design](docs/design.md): system behavior and correctness contracts
+- [Infrastructure setup](docs/infrastructure.md): local and production resources
+- [Operations guide](docs/operations.md): runtime controls and diagnostics
+- [Integration-test audit](plans/TEST_AUDIT.md): deterministic test rules and hardening work
+- [TLA+ model](tla/README.md): formal model and verification workflow

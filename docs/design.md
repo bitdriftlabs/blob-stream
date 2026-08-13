@@ -5,9 +5,10 @@ throughput and storage cost over ultra-low latency. Producers write opaque recor
 broker, brokers persist compressed segment blobs and metadata indexes, and consumer groups read
 directly from blob storage and metadata storage.
 
-This document describes the current implementation and its behavioral contracts. See
-[README.md](README.md) for deployment, configuration, storage provisioning, RBAC, and
-observability. See [DEVELOPMENT.md](DEVELOPMENT.md) for contributor workflows.
+This document describes the current implementation and its behavioral contracts. See the
+[repository overview](../README.md), [Infrastructure setup](infrastructure.md), and
+[Operations guide](operations.md) for deployment and runtime guidance. See
+[DEVELOPMENT.md](../DEVELOPMENT.md) for contributor workflows.
 
 ## Goals and Boundaries
 
