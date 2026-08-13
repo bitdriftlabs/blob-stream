@@ -15,15 +15,16 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow               = "1.0.104"
-async-trait          = "0.1.91"
+async-trait          = "0.1.92"
 aws-config           = "1.10.1"
-aws-sdk-dynamodb     = "1.119.0"
-aws-sdk-s3           = "1.140.0"
+aws-sdk-dynamodb     = "1.120.0"
+aws-sdk-s3           = "1.141.0"
 aws-types            = "1.5.0"
 axum                 = { version = "0.8.9", features = ["http2", "macros"] }
 bd-backoff           = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bd-grpc              = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bd-log               = { git = "https://github.com/bitdriftlabs/shared-core.git" }
+bd-log-util          = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bd-panic             = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bd-pgv               = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bd-rt                = { git = "https://github.com/bitdriftlabs/shared-core.git" }
@@ -34,9 +35,9 @@ bd-test-helpers-core = { git = "https://github.com/bitdriftlabs/shared-core.git"
 bd-time              = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bytes                = "1.12.1"
 cgroups-rs           = "0.5.1"
-clap                 = { version = "4.6.4", features = ["derive", "env"] }
-ctor                 = "1.0.12"
-futures              = "0.3.33"
+clap                 = { version = "4.6.6", features = ["derive", "env"] }
+ctor                 = "1.0.13"
+futures              = "0.3.34"
 hostname             = "0.4.2"
 http                 = "1.5.0"
 hyper-util           = { version = "0.1.20", features = ["client", "client-legacy"] }
@@ -58,10 +59,10 @@ serde_dynamo      = "4.3.0"
 serde_json        = { version = "1.0.151" }
 serde_yaml        = "0.9.34"
 sonyflake         = { git = "https://github.com/mattklein123/sonyflake-rs.git" }
-thiserror         = "2.0.19"
+thiserror         = "2.0.20"
 tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }
 tikv-jemallocator = "0.7.0"
-time              = { version = "0.3.54", features = ["formatting", "serde-well-known", "macros", "parsing"] }
+time              = { version = "0.3.55", features = ["formatting", "serde-well-known", "macros", "parsing"] }
 tokio             = { version = "1.53.1", features = ["full"] }
 tokio-stream      = "0.1.19"
 tracing           = "0.1.44"

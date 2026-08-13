@@ -26,6 +26,7 @@ mod consumer_group_leases_memory;
 mod consumer_group_membership_dynamo;
 mod consumer_group_membership_memory;
 mod dynamo;
+mod dynamo_attributes;
 mod dynamo_metrics;
 mod memory;
 mod producer_partition_leases_dynamo;
@@ -36,11 +37,29 @@ pub use consumer_group_leases_dynamo::DynamoConsumerGroupLeaseStore;
 pub use consumer_group_leases_memory::InMemoryConsumerGroupLeaseStore;
 pub use consumer_group_membership_dynamo::DynamoConsumerGroupMembershipStore;
 pub use consumer_group_membership_memory::InMemoryConsumerGroupMembershipStore;
-pub use dynamo::DynamoMetadataStore;
+pub use dynamo::{DynamoMetadataStore, MAX_FENCED_METADATA_PARTITIONS};
 pub use dynamo_metrics::DynamoCapacityMetrics;
 pub use memory::InMemoryMetadataStore;
 pub use producer_partition_leases_dynamo::DynamoProducerPartitionLeaseStore;
 pub use producer_partition_leases_memory::InMemoryProducerPartitionLeaseStore;
+
+//
+// MetadataWriteError
+//
+
+/// Error returned when persisting segment metadata.
+#[derive(Debug, thiserror::Error)]
+pub enum MetadataWriteError {
+  /// A metadata publication fence no longer authorizes its producer lease.
+  #[error("producer lease fence was lost")]
+  ProducerLeaseFenceLost,
+  /// A backend, encoding, or validation failure unrelated to producer fencing.
+  #[error(transparent)]
+  Other(#[from] anyhow::Error),
+}
+
+/// Result returned by a segment metadata publication.
+pub type MetadataWriteResult = std::result::Result<(), MetadataWriteError>;
 
 //
 // SegmentMetadata
@@ -105,12 +124,26 @@ impl SegmentMetadata {
 // MetadataStore
 //
 
-#[cfg_attr(test, mockall::automock)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Consistency requested for one metadata window query.
+pub enum MetadataReadConsistency {
+  #[default]
+  /// Read from a replica when `DynamoDB` permits it.
+  Eventual,
+  /// Read committed metadata from `DynamoDB`'s leader.
+  Strong,
+}
+
 #[async_trait]
 /// Segment metadata index store.
 pub trait MetadataStore: Send + Sync {
-  /// Persist metadata for a flushed segment.
-  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()>;
+  /// Persist metadata for a flushed segment, optionally conditioned on producer lease fences.
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> MetadataWriteResult;
 
   /// Scan a single window from an optional inclusive snowflake lower bound. Results are unordered
   /// for cost and performance.
@@ -118,7 +151,17 @@ pub trait MetadataStore: Send + Sync {
     &self,
     window: &TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Producer lease fence paired with the partition it authorizes.
+pub struct ProducerPartitionFence {
+  /// Producer partition lease key.
+  pub key: ProducerPartitionLeaseKey,
+  /// Durable lease identity.
+  pub fence: ProducerLeaseFence,
 }
 
 //
@@ -151,12 +194,30 @@ impl ProducerPartitionLeaseKey {
 pub struct ProducerPartitionLease {
   /// Lease key.
   pub key: ProducerPartitionLeaseKey,
-  /// Current holder id.
-  pub holder_id: String,
+  /// Durable identity that authorizes metadata publication.
+  pub fence: ProducerLeaseFence,
   /// Lease expiration timestamp in milliseconds.
   pub lease_expiration_ts_ms: i64,
   /// High watermark for allocated sequence numbers.
   pub max_allocated_seq: Option<u64>,
+}
+
+//
+// ProducerLeaseFence
+//
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Durable producer-lease identity that authorizes metadata publication.
+///
+/// The epoch advances when ownership is taken over, rejecting a prior owner. The session id
+/// additionally rejects an earlier broker process that restarts with the same stable holder id.
+pub struct ProducerLeaseFence {
+  /// Stable broker identity that owns the lease.
+  pub holder_id: String,
+  /// Monotonic ownership epoch.
+  pub lease_epoch: u64,
+  /// Unique identity of the owning broker process.
+  pub lease_session_id: String,
 }
 
 //
@@ -252,6 +313,7 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome>;
@@ -261,6 +323,7 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
     reservation_size: Option<u64>,
@@ -271,6 +334,7 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseHeartbeatOutcome>;
@@ -280,6 +344,7 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome>;
@@ -289,6 +354,7 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
   ) -> Result<LeaseReleaseOutcome>;
 }

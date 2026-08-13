@@ -1,6 +1,7 @@
 use super::{
   Arc,
   BatchReadCandidate,
+  BatchReadResult,
   ConsumerReadRuntimeSettings,
   ConsumerReaderFastFrontierState,
   ConsumerReaderImpl,
@@ -19,7 +20,6 @@ use super::{
   TryStreamExt,
   VirtualPartitionId,
   VirtualPartitionState,
-  consumer_metadata_visibility_delay_ms,
   consumer_window_size_seconds,
   debug,
   format_unix_timestamp_ms,
@@ -31,6 +31,9 @@ use super::{
   try_join_all,
 };
 use crate::consumer::ConsumerReadOutcome;
+use bd_log_util::warn_every;
+use blob_stream_metadata_store::MetadataReadConsistency;
+use time::ext::NumericalDuration;
 
 impl ConsumerReaderImpl {
   /// Execute one metadata scan pass, retaining no progress when a batch cannot reach the caller.
@@ -76,7 +79,7 @@ impl ConsumerReaderImpl {
     // seconds. Keep the visibility comparison in milliseconds, then round retry deadlines up so
     // a worker never wakes in the second before a row becomes eligible.
     let visibility_delay_ms =
-      i64::try_from(consumer_metadata_visibility_delay_ms(&self.config)).unwrap_or(i64::MAX);
+      i64::try_from(runtime_settings.metadata_visibility_delay_ms).unwrap_or(i64::MAX);
     let visibility_cutoff_ts_ms = now_unix_seconds
       .saturating_mul(1_000)
       .saturating_sub(visibility_delay_ms);
@@ -88,7 +91,7 @@ impl ConsumerReaderImpl {
     // lower-snowflake rows, while fast scans avoid rereading metadata outside its visibility
     // horizon; per-partition filtering is reapplied after each shared query.
     let (scan_requests, recovery_scan) =
-      self.scan_requests(now_unix_seconds, &assigned_partition_ids)?;
+      self.scan_requests(now_unix_seconds, &assigned_partition_ids, runtime_settings)?;
     for request in &scan_requests {
       trace!(
         "consumer metadata scan planned: topic={}, window_start={}, recovery={}, fast={}, \
@@ -129,6 +132,7 @@ impl ConsumerReaderImpl {
       &scan_requests,
       &assigned_partition_ids,
       now_unix_seconds,
+      runtime_settings,
       &mut scan_states,
     );
     let mut recovery_window_ends = HashMap::<VirtualPartitionId, i64>::new();
@@ -150,7 +154,8 @@ impl ConsumerReaderImpl {
     let mut cached_window_results = Vec::new();
     let mut scan_futures = Vec::new();
     for (request_index, request) in scan_requests.iter().cloned().enumerate() {
-      let cache_key = self.mature_recovery_metadata_cache_key(&request, now_unix_seconds);
+      let cache_key =
+        self.mature_recovery_metadata_cache_key(&request, now_unix_seconds, runtime_settings);
       if let Some(cache_key) = cache_key
         && let Some(segments) = self.recovery_metadata_cache.get(&cache_key)
       {
@@ -179,13 +184,18 @@ impl ConsumerReaderImpl {
       }
       let metadata_store = Arc::clone(&self.metadata_store);
       let metrics = self.metrics.clone();
+      let metadata_read_consistency = runtime_settings.metadata_read_consistency;
       scan_futures.push(async move {
         if !request.recovery_scan && request.eligibility.fast && request.min_snowflake.is_none() {
           metrics.metadata_fast_scan_without_lower_bound.inc();
         }
         let scan_started_at = Instant::now();
         let segments = metadata_store
-          .scan_window_from_snowflake(&request.window, request.min_snowflake)
+          .scan_window_from_snowflake(
+            &request.window,
+            request.min_snowflake,
+            metadata_read_consistency,
+          )
           .await
           .with_context(|| {
             format!(
@@ -278,7 +288,7 @@ impl ConsumerReaderImpl {
     // Recovery can hand an active publication-horizon window to Fast. Fast retains the same
     // visibility safety check and replays its inclusive time floor once the row becomes eligible.
     let fast_horizon_windows = self
-      .eligible_fast_scan_windows(now_unix_seconds)?
+      .eligible_fast_scan_windows(now_unix_seconds, runtime_settings)?
       .into_iter()
       .map(|(window, _)| window.window_start_unix_seconds)
       .collect::<HashSet<_>>();
@@ -401,7 +411,12 @@ impl ConsumerReaderImpl {
             }
           }
 
-          if segment.metadata_published_ts_ms > visibility_cutoff_ts_ms {
+          // Strong DynamoDB reads return committed metadata immediately. The publication horizon
+          // still plans rescans for rows that have not been written yet, but returned rows need
+          // no replica-visibility delay.
+          if runtime_settings.metadata_read_consistency == MetadataReadConsistency::Eventual
+            && segment.metadata_published_ts_ms > visibility_cutoff_ts_ms
+          {
             self
               .metrics
               .metadata_segments_deferred_by_visibility_delay
@@ -580,7 +595,7 @@ impl ConsumerReaderImpl {
 
     // `buffered` preserves segment-plan order while allowing independent object-store requests
     // and decoding work to overlap. Cursor changes occur only after every planned read succeeds.
-    let mut decoded_batches = stream::iter(
+    let mut batch_read_results = stream::iter(
       segment_read_plans
         .into_iter()
         .map(|plan| async { self.read_segment_plan(plan).await }),
@@ -593,15 +608,24 @@ impl ConsumerReaderImpl {
     .collect::<Vec<_>>();
     // Segment plans retain scan order, but concurrent metadata windows may not be ordered by a
     // partition's sequence range. Normalize before cursor advancement and delivery.
-    decoded_batches
-      .sort_by_key(|(candidate, batch)| (candidate.virtual_partition_id, batch.seq_range.start));
+    batch_read_results.sort_by_key(|result| match result {
+      BatchReadResult::Decoded { candidate, .. } | BatchReadResult::Missing { candidate, .. } => (
+        candidate.virtual_partition_id,
+        candidate.batch_metadata.seq_range.start,
+      ),
+    });
 
-    for (candidate, batch) in decoded_batches {
+    for result in batch_read_results {
+      let candidate = match &result {
+        BatchReadResult::Decoded { candidate, .. } | BatchReadResult::Missing { candidate, .. } => {
+          candidate
+        },
+      };
       let current_cursor = self
         .virtual_partition_states
         .get(&candidate.virtual_partition_id)
         .and_then(VirtualPartitionState::cursor);
-      if current_cursor.is_some_and(|cursor| batch.seq_range.end <= cursor) {
+      if current_cursor.is_some_and(|cursor| candidate.batch_metadata.seq_range.end <= cursor) {
         metadata_batches_skipped_by_cursor = metadata_batches_skipped_by_cursor.saturating_add(1);
         if let Some(scan_state) = scan_states.get_mut(&candidate.virtual_partition_id) {
           scan_state.metadata_batches_skipped_by_cursor = scan_state
@@ -611,31 +635,65 @@ impl ConsumerReaderImpl {
         continue;
       }
 
-      // Cursor always moves forward. max() keeps monotonicity if metadata ordering is odd.
-      let next_cursor = batch.seq_range.end.max(current_cursor.unwrap_or(0));
-      if let Some(state) = self
-        .virtual_partition_states
-        .get_mut(&candidate.virtual_partition_id)
-      {
-        state.advance_cursor(next_cursor);
+      match result {
+        BatchReadResult::Decoded { candidate, batch } => {
+          // Cursor always moves forward. max() keeps monotonicity if metadata ordering is odd.
+          let next_cursor = batch.seq_range.end.max(current_cursor.unwrap_or(0));
+          if let Some(state) = self
+            .virtual_partition_states
+            .get_mut(&candidate.virtual_partition_id)
+          {
+            state.advance_cursor(next_cursor);
+          }
+          trace!(
+            "consumer accepted batch: topic={}, partition={}, seq_start={}, seq_end={}, \
+             records={}, new_cursor={}",
+            self.config.topic,
+            candidate.virtual_partition_id,
+            batch.seq_range.start,
+            batch.seq_range.end,
+            batch.records.len(),
+            next_cursor
+          );
+          if let Some(scan_state) = scan_states.get_mut(&candidate.virtual_partition_id) {
+            scan_state.batches_accepted = scan_state.batches_accepted.saturating_add(1);
+            scan_state.records_accepted = scan_state
+              .records_accepted
+              .saturating_add(batch.records.len());
+          }
+          output.push(batch);
+        },
+        BatchReadResult::Missing {
+          candidate,
+          blob_key,
+        } => {
+          let next_cursor = candidate
+            .batch_metadata
+            .seq_range
+            .end
+            .max(current_cursor.unwrap_or(0));
+          if let Some(state) = self
+            .virtual_partition_states
+            .get_mut(&candidate.virtual_partition_id)
+          {
+            state.advance_cursor(next_cursor);
+          }
+          let lost_records = candidate.batch_metadata.seq_range.len();
+          self.metrics.record_lost_records(lost_records);
+          warn_every!(
+            15.seconds(),
+            "consumer skipped lost blob range: topic={}, blob_key={}, partition={}, seq_start={}, \
+             seq_end={}, records={}, new_cursor={}",
+            self.config.topic,
+            blob_key.as_str(),
+            candidate.virtual_partition_id,
+            candidate.batch_metadata.seq_range.start,
+            candidate.batch_metadata.seq_range.end,
+            lost_records,
+            next_cursor
+          );
+        },
       }
-      trace!(
-        "consumer accepted batch: topic={}, partition={}, seq_start={}, seq_end={}, records={}, \
-         new_cursor={}",
-        self.config.topic,
-        candidate.virtual_partition_id,
-        batch.seq_range.start,
-        batch.seq_range.end,
-        batch.records.len(),
-        next_cursor
-      );
-      if let Some(scan_state) = scan_states.get_mut(&candidate.virtual_partition_id) {
-        scan_state.batches_accepted = scan_state.batches_accepted.saturating_add(1);
-        scan_state.records_accepted = scan_state
-          .records_accepted
-          .saturating_add(batch.records.len());
-      }
-      output.push(batch);
     }
 
     let window_size_seconds = consumer_window_size_seconds(&self.config);
@@ -748,7 +806,7 @@ impl ConsumerReaderImpl {
     );
 
     self.fast_frontiers = next_fast_frontiers;
-    self.prune_fast_frontiers(now_unix_seconds)?;
+    self.prune_fast_frontiers(now_unix_seconds, runtime_settings)?;
     let completed_at_unix_seconds = system_now_unix_seconds();
     for ((partition_id, window_start_unix_seconds), snowflake_id) in &self.fast_frontiers {
       if let Some(scan_state) = scan_states.get_mut(partition_id) {

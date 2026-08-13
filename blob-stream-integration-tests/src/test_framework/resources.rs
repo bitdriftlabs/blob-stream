@@ -136,6 +136,7 @@ impl IntegrationResources {
     let inner: Arc<dyn MetadataStore> = Arc::new(DynamoMetadataStore::new(
       self.dynamo.clone(),
       self.metadata_table.clone(),
+      self.producer_lease_table.clone(),
       HashMap::new(),
       3_600,
       None,

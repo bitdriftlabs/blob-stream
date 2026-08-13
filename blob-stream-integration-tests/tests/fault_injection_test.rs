@@ -1485,6 +1485,104 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
   Ok(())
 }
 
+// High-level: validates a conclusively missing blob is counted as loss without blocking reads.
+#[tokio::test]
+async fn s3_get_not_found_consumer_skips_lost_data() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let mut cluster = ClusterHarness::builder(&resources, 2)
+    .in_memory_transport()
+    .blob_store(resources.s3_blob_store())
+    .start()
+    .await?;
+
+  let producer = cluster
+    .create_producer(producer_config(), vec![producer_topic()])
+    .await?;
+
+  let mut expected_ids = HashSet::new();
+  let mut produced_partitions = HashSet::new();
+  for message_id in 0 .. 30 {
+    let id = format!("fit-006-not-found-{message_id}");
+    let ack = produce_message(
+      &producer,
+      format!("fit-006-not-found-key-{}", message_id % 10).into_bytes(),
+      &id,
+    )
+    .await?;
+    produced_partitions.insert(ack.virtual_partition_id);
+    expected_ids.insert(id);
+  }
+
+  resources
+    .store_fault_controller()
+    .enable_fault(StoreFaultRule {
+      domain: StoreFaultDomain::Blob,
+      operation: StoreFaultOperation::BlobGetRange,
+      key_pattern: None,
+      action: StoreFaultAction::NotFound,
+      remaining_hits: Some(1),
+    })
+    .await;
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: TOPIC.to_string().into(),
+      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      metadata_visibility_delay_ms: Some(0),
+      ..Default::default()
+    },
+    produced_partitions.into_iter().collect(),
+    HashMap::new(),
+    resources.s3_blob_store(),
+    resources.metadata_store(),
+    &metrics_scope("blob_stream_consumer_not_found_it"),
+    1,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    None,
+  )?;
+
+  let mut deliveries = Vec::new();
+  let reader_now = framework::now_unix_seconds().saturating_add(1);
+  for _ in 0 .. 20 {
+    rescan_reader_with_trace(&mut reader, reader_now, &mut deliveries).await?;
+    if !deliveries.is_empty() {
+      break;
+    }
+  }
+
+  let delivered_id_counts = reader_delivery_counts(&deliveries);
+  assert!(
+    !delivered_id_counts.is_empty(),
+    "consumer made no progress after a missing blob"
+  );
+  assert!(
+    delivered_id_counts.len() < expected_ids.len(),
+    "missing blob should remove at least one expected record: {deliveries:?}"
+  );
+  assert!(
+    delivered_id_counts
+      .keys()
+      .all(|delivered_id| expected_ids.contains(delivered_id)),
+    "consumer returned an unexpected record after skipping a missing blob: {deliveries:?}"
+  );
+
+  let _store_fault_event = cluster
+    .wait_for_event(
+      &TestEventMatcher {
+        category: Some("store".to_string()),
+        operation: Some("blob_get_range".to_string()),
+        key_contains: None,
+        status: Some("fault_applied".to_string()),
+      },
+      Duration::from_secs(5),
+    )
+    .await?;
+
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
 // High-level: validates metadata-write retry exhaustion and recovery with a group-level durable
 // acknowledgement oracle.
 #[tokio::test]

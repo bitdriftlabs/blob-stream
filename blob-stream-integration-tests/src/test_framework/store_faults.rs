@@ -1,7 +1,7 @@
 use crate::test_framework::event_log::TestEventLog;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange};
+use blob_stream_blob_store::{BlobKey, BlobStore, BlobStoreError, BlobStoreResult, ByteRange};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupAssignmentPlan,
@@ -19,7 +19,9 @@ use blob_stream_metadata_store::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
+  MetadataReadConsistency,
   MetadataStore,
+  MetadataWriteResult,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
   SegmentMetadata,
@@ -83,6 +85,7 @@ pub enum StoreFaultOperation {
 #[derive(Clone, Debug)]
 pub enum StoreFaultAction {
   Fail { message: String },
+  NotFound,
   Delay(Duration),
   Timeout(Duration),
   StaleRead,
@@ -185,6 +188,7 @@ struct DelayedMetadataEntry {
 #[derive(Default)]
 struct StoreFaultEffects {
   fail_message: Option<String>,
+  not_found: bool,
   delay: Option<Duration>,
   timeout: Option<Duration>,
   stale_read: bool,
@@ -268,6 +272,9 @@ impl StoreFaultController {
       match action {
         StoreFaultAction::Fail { message } => {
           effects.fail_message = Some(message);
+        },
+        StoreFaultAction::NotFound => {
+          effects.not_found = true;
         },
         StoreFaultAction::Delay(duration) => {
           effects.delay = Some(max_duration(effects.delay, duration));
@@ -448,6 +455,7 @@ fn describe_store_operation(operation: StoreFaultOperation) -> &'static str {
 fn describe_store_fault_action(action: &StoreFaultAction) -> String {
   match action {
     StoreFaultAction::Fail { message } => format!("fail:{message}"),
+    StoreFaultAction::NotFound => "not_found".to_string(),
     StoreFaultAction::Delay(duration) => format!("delay:{}ms", duration.as_millis()),
     StoreFaultAction::Timeout(duration) => format!("timeout:{}ms", duration.as_millis()),
     StoreFaultAction::StaleRead => "stale_read".to_string(),
@@ -512,7 +520,7 @@ impl BlobStore for FaultInjectedBlobStore {
     result
   }
 
-  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> Result<Bytes> {
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
     let effects = self
       .controller
       .effects_for_call(
@@ -525,18 +533,29 @@ impl BlobStore for FaultInjectedBlobStore {
     if let Some(delay) = effects.delay {
       sleep(delay).await;
     }
+    if effects.not_found {
+      return Err(BlobStoreError::NotFound {
+        key: key.as_str().to_string(),
+      });
+    }
     if let Some(timeout) = effects.timeout {
       sleep(timeout).await;
-      return Err(anyhow!("blob get_range timed out for key {}", key.as_str()));
+      return Err(BlobStoreError::Read {
+        key: key.as_str().to_string(),
+        source: anyhow!("blob get_range timed out for key {}", key.as_str()),
+      });
     }
     if let Some(message) = effects.fail_message {
-      return Err(anyhow!(
-        "blob get_range fault for key {} [{}-{}): {}",
-        key.as_str(),
-        range.start,
-        range.end,
-        message
-      ));
+      return Err(BlobStoreError::Read {
+        key: key.as_str().to_string(),
+        source: anyhow!(
+          "blob get_range fault for key {} [{}-{}): {}",
+          key.as_str(),
+          range.start,
+          range.end,
+          message
+        ),
+      });
     }
 
     let result = self.inner.get_range(key, range).await;
@@ -571,6 +590,7 @@ impl FaultInjectedMetadataStore {
     &self,
     window: &TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     let key = window.format();
     let effects = self
@@ -607,7 +627,7 @@ impl FaultInjectedMetadataStore {
 
     let mut scanned = self
       .inner
-      .scan_window_from_snowflake(window, min_snowflake)
+      .scan_window_from_snowflake(window, min_snowflake, consistency)
       .await?;
     scanned.append(&mut visible);
     self
@@ -620,7 +640,12 @@ impl FaultInjectedMetadataStore {
 
 #[async_trait]
 impl MetadataStore for FaultInjectedMetadataStore {
-  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> MetadataWriteResult {
     let key = metadata.window.format();
     let effects = self
       .controller
@@ -636,10 +661,10 @@ impl MetadataStore for FaultInjectedMetadataStore {
     }
     if let Some(timeout) = effects.timeout {
       sleep(timeout).await;
-      return Err(anyhow!("metadata write timed out for window {key}"));
+      return Err(anyhow!("metadata write timed out for window {key}").into());
     }
     if let Some(message) = effects.fail_message {
-      return Err(anyhow!("metadata write fault for window {key}: {message}"));
+      return Err(anyhow!("metadata write fault for window {key}: {message}").into());
     }
 
     if let Some(delay) = effects.delayed_visibility {
@@ -650,7 +675,7 @@ impl MetadataStore for FaultInjectedMetadataStore {
       return Ok(());
     }
 
-    let result = self.inner.write_segment(metadata).await;
+    let result = self.inner.write_segment(metadata, fences, now_ts_ms).await;
     self
       .controller
       .record_operation_outcome(
@@ -667,8 +692,11 @@ impl MetadataStore for FaultInjectedMetadataStore {
     &self,
     window: &TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
-    self.scan_window_with_bound(window, min_snowflake).await
+    self
+      .scan_window_with_bound(window, min_snowflake, consistency)
+      .await
   }
 }
 
@@ -703,6 +731,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome> {
@@ -734,7 +763,13 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .acquire_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .acquire_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        lease_duration_ms,
+      )
       .await;
     self
       .controller
@@ -762,6 +797,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
     reservation_size: Option<u64>,
@@ -822,6 +858,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
       .acquire_lease_and_reserve_sequences(
         key,
         holder_id,
+        lease_session_id,
         now_ts_ms,
         lease_duration_ms,
         reservation_size,
@@ -846,6 +883,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseHeartbeatOutcome> {
@@ -877,7 +915,13 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .heartbeat_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .heartbeat_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        lease_duration_ms,
+      )
       .await;
     self
       .controller
@@ -899,6 +943,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
@@ -930,7 +975,13 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .reserve_sequences(key, holder_id, now_ts_ms, reservation_size)
+      .reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        reservation_size,
+      )
       .await;
     self
       .controller
@@ -952,6 +1003,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
   ) -> Result<LeaseReleaseOutcome> {
     let effects = self
@@ -980,7 +1032,10 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
       ));
     }
 
-    let result = self.inner.release_lease(key, holder_id, now_ts_ms).await;
+    let result = self
+      .inner
+      .release_lease(key, holder_id, lease_session_id, now_ts_ms)
+      .await;
     self
       .controller
       .record_operation_outcome(

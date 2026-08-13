@@ -1,15 +1,22 @@
 # This thing uses eventual consistency, isn't it broken?
 
-It is true that the current implementation uses eventually consistent DynamoDB reads. See
-[DESIGN.md](DESIGN.md) for details. This is an intentional cost/consistency tradeoff: the default
-two-second visibility delay is a best-effort margin for ordinary replica lag, not a DynamoDB
-correctness guarantee. It is part of a broader bounded availability horizon that also includes the
-broker's metadata-publication deadline.
+By default, consumer metadata reads are eventually consistent. See [DESIGN.md](DESIGN.md) for
+details. This is an intentional cost/consistency tradeoff: the default two-second visibility delay
+is a best-effort margin for ordinary replica lag, not a DynamoDB correctness guarantee. It is part
+of a broader bounded availability horizon that also includes the broker's metadata-publication
+deadline.
 
-Strongly consistent consumer metadata reads would remove read-replica staleness, but complete
-ordering also requires transactionally fencing broker metadata publication to the active producer
-lease session or epoch. Both changes add cost and complexity, and may be implemented and become
-configurable in the future.
+Set `strongly_consistent_metadata_reads` or the runtime flag
+`blob_stream_consumer_strong_metadata_reads` to use strongly consistent metadata queries. This
+removes read-replica staleness, ignores the configured visibility delay, and approximately doubles
+metadata-query RRUs. It does not make paginated scans atomic. Enable broker
+`fenced_metadata_writes` as well when stale producer publication must be rejected: it conditions
+metadata publication on the active lease session and epoch, requires transactional DynamoDB IAM
+permissions, and defaults off. The durable holder ID, lease epoch, and session ID are required in
+every producer lease row regardless of this setting. Fenced publication has a significant write-cost
+impact: each metadata publication becomes a DynamoDB transaction containing the segment metadata
+write plus a lease condition check for every partition in the flush, and DynamoDB charges
+transactional writes and reads at twice the normal capacity-unit rate.
 
 # Why haven't you implemented compaction?
 

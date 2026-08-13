@@ -11,7 +11,7 @@ use super::super::metrics::WriteMetrics;
 use super::super::state::WriteState;
 use super::super::{BrokerLifecycleHooks, TopicInfo, WriteEngineImpl};
 use super::acquire_lease_and_reserve_sequences;
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use bd_time::OffsetDateTimeExt;
 use blob_stream_broker_discovery::{
   BrokerMembership,
@@ -70,6 +70,7 @@ impl WriteEngineImpl {
     let interval = StdDuration::from_millis(interval_ms);
     let topics = self.topics.clone();
     let holder_id = self.holder_id.clone();
+    let lease_session_id = self.lease_session_id.clone();
     let writer_id = self.config.writer_id;
     let lease_duration_ms = self.config.lease_duration_ms;
     let base_reservation_size = self.config.reservation_size;
@@ -133,6 +134,7 @@ impl WriteEngineImpl {
             &flush_notifier,
             &metrics,
             &holder_id,
+            &lease_session_id,
             partitions,
             time_provider.now().unix_timestamp_ms(),
             lifecycle_hooks.as_ref(),
@@ -188,6 +190,7 @@ impl WriteEngineImpl {
           &flush_notifier,
           &metrics,
           &holder_id,
+          &lease_session_id,
           lost_partitions,
           time_provider.now().unix_timestamp_ms(),
           lifecycle_hooks.as_ref(),
@@ -231,6 +234,7 @@ impl WriteEngineImpl {
           match acquire_lease_and_reserve_sequences(
             &lease_store,
             &holder_id,
+            &lease_session_id,
             key,
             now_ts_ms,
             lease_duration_ms,
@@ -250,8 +254,11 @@ impl WriteEngineImpl {
                   reservation.end,
                 );
               }
+              let lease_expiration_update =
+                LeaseExpirationUpdate::Set(Some(lease.lease_expiration_ts_ms));
               transition.transition.finish_lease_maintenance(
-                LeaseExpirationUpdate::Set(Some(lease.lease_expiration_ts_ms)),
+                lease_expiration_update,
+                Some(lease),
                 reservation,
                 transition
                   .records_allocated_since_last_maintenance
@@ -269,7 +276,7 @@ impl WriteEngineImpl {
             Ok(LeaseAcquireAndReserveOutcome::HeldByOther(_)) => {
               transition
                 .transition
-                .finish(LeaseExpirationUpdate::Set(None), None);
+                .finish(LeaseExpirationUpdate::Set(None), None, None);
             },
             Err(error) => {
               if reservation_request.is_some() {
@@ -283,7 +290,7 @@ impl WriteEngineImpl {
               );
               transition
                 .transition
-                .finish(LeaseExpirationUpdate::Preserve, None);
+                .finish(LeaseExpirationUpdate::Preserve, None, None);
             },
           }
         }
@@ -297,6 +304,7 @@ impl WriteEngineImpl {
     flush_notifier: &Arc<tokio::sync::Notify>,
     metrics: &WriteMetrics,
     holder_id: &str,
+    lease_session_id: &str,
     topic: &Chars,
     virtual_partition_id: VirtualPartitionId,
     now_ts_ms: i64,
@@ -342,7 +350,10 @@ impl WriteEngineImpl {
         .await;
     }
 
-    match lease_store.release_lease(&key, holder_id, now_ts_ms).await {
+    match lease_store
+      .release_lease(&key, holder_id, lease_session_id, now_ts_ms)
+      .await
+    {
       Ok(
         LeaseReleaseOutcome::Released
         | LeaseReleaseOutcome::Expired
@@ -356,6 +367,7 @@ impl WriteEngineImpl {
             state.partition_state_mut_if_present(topic, virtual_partition_id)
           {
             partition_state.lease_expiration_ts_ms = None;
+            partition_state.lease_fence = None;
             partition_state.reset_sequence_allocation();
           }
         }
@@ -380,6 +392,7 @@ impl WriteEngineImpl {
     flush_notifier: &Arc<tokio::sync::Notify>,
     metrics: &WriteMetrics,
     holder_id: &str,
+    lease_session_id: &str,
     partitions: Vec<(Chars, VirtualPartitionId)>,
     now_ts_ms: i64,
     lifecycle_hooks: Option<&Arc<dyn BrokerLifecycleHooks>>,
@@ -393,6 +406,7 @@ impl WriteEngineImpl {
           flush_notifier,
           metrics,
           holder_id,
+          lease_session_id,
           &topic,
           virtual_partition_id,
           now_ts_ms,

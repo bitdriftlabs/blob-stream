@@ -10,7 +10,7 @@ use crate::config::{
   producer_retry_deadline_ms,
 };
 use anyhow::anyhow;
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use blob_stream_broker_discovery::BrokerMembership;
 use blob_stream_proto::protos::blobstream::v1::broker::{ProduceBatchesRequest, ProduceStatus};
 use futures::StreamExt;

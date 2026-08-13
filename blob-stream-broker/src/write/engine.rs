@@ -19,11 +19,11 @@ use crate::write::allocation::{
   LeaseExpirationUpdate,
   begin_allocation_transition,
 };
-use crate::write::buffer::BufferedBatch;
+use crate::write::buffer::{BufferedBatch, FlushCompletionError};
 use crate::write::memory_pressure::MemoryPressureController;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use bd_server_stats::stats::Scope;
 use bd_shutdown::ComponentShutdownTriggerHandle;
 use bd_time::OffsetDateTimeExt;
@@ -122,6 +122,7 @@ impl WriteEngine for WriteEngineImpl {
               records: records.take().expect("records are buffered only once"),
               summary: summary.take().expect("summary is buffered only once"),
               seq_range: seq_range.clone(),
+              acceptance_fence: partition_state.lease_fence.clone(),
               completion: Some(completion_tx),
             },
             now_ts_ms,
@@ -153,7 +154,7 @@ impl WriteEngine for WriteEngineImpl {
         AllocationTransitionDecision::Ready => {},
         AllocationTransitionDecision::Waiting(notified) => notified.await,
         AllocationTransitionDecision::Claimed(work) => {
-          let mut lease_expiration = LeaseExpirationUpdate::Preserve;
+          let mut acquired_lease = None;
           // Sequence reservation is conditionally accepted only for the current active lease
           // holder. When acquisition is required, the lease may be absent or expired, so it must
           // complete before reserving sequences; these calls cannot be run in parallel.
@@ -168,14 +169,14 @@ impl WriteEngine for WriteEngineImpl {
               )
               .await
             {
-              Ok((expires_at, range)) => {
-                lease_expiration = LeaseExpirationUpdate::Set(Some(expires_at));
+              Ok((lease, range)) => {
+                acquired_lease = Some(lease);
                 reservation = Some(range);
               },
               Err(error) => {
                 work
                   .transition
-                  .finish(LeaseExpirationUpdate::Preserve, None);
+                  .finish(LeaseExpirationUpdate::Preserve, None, None);
                 return Err(error);
               },
             },
@@ -183,11 +184,11 @@ impl WriteEngine for WriteEngineImpl {
               .ensure_lease(&topic, virtual_partition_id, now_ts_ms)
               .await
             {
-              Ok(expires_at) => lease_expiration = LeaseExpirationUpdate::Set(Some(expires_at)),
+              Ok(lease) => acquired_lease = Some(lease),
               Err(error) => {
                 work
                   .transition
-                  .finish(LeaseExpirationUpdate::Preserve, None);
+                  .finish(LeaseExpirationUpdate::Preserve, None, None);
                 return Err(error);
               },
             },
@@ -197,13 +198,22 @@ impl WriteEngine for WriteEngineImpl {
             {
               Ok(range) => reservation = Some(range),
               Err(error) => {
-                work.transition.finish(lease_expiration, None);
+                work
+                  .transition
+                  .finish(LeaseExpirationUpdate::Preserve, None, None);
                 return Err(error);
               },
             },
             (false, None) => {},
           }
-          work.transition.finish(lease_expiration, reservation);
+          let lease_expiration_update = acquired_lease
+            .as_ref()
+            .map_or(LeaseExpirationUpdate::Preserve, |lease| {
+              LeaseExpirationUpdate::Set(Some(lease.lease_expiration_ts_ms))
+            });
+          work
+            .transition
+            .finish(lease_expiration_update, acquired_lease, reservation);
         },
       }
     };
@@ -212,9 +222,9 @@ impl WriteEngine for WriteEngineImpl {
 
     match completion_rx.await {
       Ok(Ok(())) => {},
-      Ok(Err(error)) => {
-        let write_error = WriteError::Internal(anyhow!(error));
-        return Err(write_error);
+      Ok(Err(FlushCompletionError::LeaseFenceLost)) => return Err(WriteError::LeaseFenceLost),
+      Ok(Err(FlushCompletionError::Internal)) => {
+        return Err(WriteError::Internal(anyhow!("flush failed")));
       },
       Err(_closed) => {
         let write_error = WriteError::Internal(anyhow!(
@@ -344,11 +354,11 @@ impl WriteEngine for WriteEngineImpl {
             .nodes()
             .unwrap_or_default()
             .iter()
-            .find(|node| node.node_id.as_str() == lease.holder_id)
+            .find(|node| node.node_id.as_str() == lease.fence.holder_id)
             .map(|node| node.address.clone());
           let lease_status = if !is_active {
             BrokerLeaseStatus::UnleasedOrExpired
-          } else if lease.holder_id == self.holder_id {
+          } else if lease.fence.holder_id == self.holder_id {
             BrokerLeaseStatus::LocalActive
           } else {
             BrokerLeaseStatus::RemoteActive
@@ -356,7 +366,7 @@ impl WriteEngine for WriteEngineImpl {
           (
             lease_status,
             Some(BrokerLeaseSnapshot {
-              holder_id: lease.holder_id,
+              holder_id: lease.fence.holder_id,
               holder_address,
               expires_at: format_unix_timestamp_ms(lease.lease_expiration_ts_ms),
               is_active,

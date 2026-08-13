@@ -46,12 +46,19 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome> {
     self
       .inner
-      .acquire_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .acquire_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        lease_duration_ms,
+      )
       .await
   }
 
@@ -59,6 +66,7 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
     reservation_size: Option<u64>,
@@ -68,6 +76,7 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
       .acquire_lease_and_reserve_sequences(
         key,
         holder_id,
+        lease_session_id,
         now_ts_ms,
         lease_duration_ms,
         reservation_size,
@@ -79,12 +88,19 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseHeartbeatOutcome> {
     self
       .inner
-      .heartbeat_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .heartbeat_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        lease_duration_ms,
+      )
       .await
   }
 
@@ -92,12 +108,19 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
     self
       .inner
-      .reserve_sequences(key, holder_id, now_ts_ms, reservation_size)
+      .reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        reservation_size,
+      )
       .await
   }
 
@@ -105,6 +128,7 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
   ) -> Result<blob_stream_metadata_store::LeaseReleaseOutcome> {
     self
@@ -117,7 +141,10 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
       .await
       .expect("parallel release test gate remains open")
       .forget();
-    self.inner.release_lease(key, holder_id, now_ts_ms).await
+    self
+      .inner
+      .release_lease(key, holder_id, lease_session_id, now_ts_ms)
+      .await
   }
 }
 
@@ -245,25 +272,6 @@ fn make_topic(partition_count: u32) -> HashMap<Chars, TopicInfo> {
   topics
 }
 
-async fn acquire_all_partitions(
-  store: &InMemoryProducerPartitionLeaseStore,
-  holder_id: &str,
-  partition_count: u32,
-) {
-  for logical_partition_id in 0 .. partition_count {
-    let virtual_partition_id =
-      virtual_partition_for_logical(logical_partition_id, partition_count, 0);
-    let key = ProducerPartitionLeaseKey {
-      topic: "telemetry".into(),
-      virtual_partition_id,
-    };
-    let _outcome = store
-      .acquire_lease(key, holder_id.to_string(), 1_000, 60_000)
-      .await
-      .expect("acquire lease");
-  }
-}
-
 async fn all_partitions_acquired(
   store: &InMemoryProducerPartitionLeaseStore,
   holder_id: &str,
@@ -277,7 +285,13 @@ async fn all_partitions_acquired(
       virtual_partition_id,
     };
     let outcome = store
-      .acquire_lease(key, holder_id.to_string(), 1_000, 60_000)
+      .acquire_lease(
+        key,
+        holder_id.to_string(),
+        holder_id.to_string(),
+        1_000,
+        60_000,
+      )
       .await
       .expect("acquire lease");
     if !matches!(outcome, LeaseAcquireOutcome::Acquired(_)) {
@@ -304,7 +318,7 @@ async fn all_partitions_held_by(
     let Ok(Some(lease)) = store.get_lease(&key).await else {
       return false;
     };
-    if lease.holder_id != holder_id || lease.lease_expiration_ts_ms <= now_ts_ms {
+    if lease.fence.holder_id != holder_id || lease.lease_expiration_ts_ms <= now_ts_ms {
       return false;
     }
   }
@@ -357,6 +371,7 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
     &flush_notifier,
     &metrics,
     "node-a",
+    "session-a",
     vec![("telemetry".into(), 0), ("telemetry".into(), 1)],
     1_000,
     lifecycle_hooks.as_ref(),
@@ -528,11 +543,17 @@ async fn scale_down_releases_previously_owned_leases() -> Result<()> {
     &metrics_scope(),
   )
   .membership_rx(membership_rx)
+  .lease_session_id("session-a".to_string())
   .time_provider(time_provider)
   .build()?;
 
-  acquire_all_partitions(&lease_store, "node-a", partition_count).await;
-  tokio::time::sleep(StdDuration::from_millis(50)).await;
+  assert!(
+    wait_for_all_partitions(|| {
+      all_partitions_held_by(&lease_store, "node-a", partition_count, 1_000)
+    })
+    .await,
+    "node-a did not acquire its initial leases"
+  );
 
   membership_tx.send(BrokerMembership::new(vec![BrokerNode {
     node_id: "node-b".into(),
@@ -579,10 +600,17 @@ async fn shutdown_releases_currently_owned_leases() -> Result<()> {
     &metrics_scope(),
   )
   .membership_rx(membership_rx)
+  .lease_session_id("session-a".to_string())
   .time_provider(time_provider)
   .build()?;
 
-  acquire_all_partitions(&lease_store, "node-a", partition_count).await;
+  assert!(
+    wait_for_all_partitions(|| {
+      all_partitions_held_by(&lease_store, "node-a", partition_count, 1_000)
+    })
+    .await,
+    "node-a did not acquire its initial leases"
+  );
 
   shutdown_trigger.shutdown().await;
 

@@ -1,3 +1,5 @@
+<img width="2926" height="1606" alt="blob-stream" src="https://github.com/user-attachments/assets/18979bb4-3c66-4222-a359-9d98f741a021" />
+
 # blob-stream
 
 `blob-stream` is a Kafka-like streaming system optimized for high-throughput telemetry with lower
@@ -57,6 +59,11 @@ broker:
   flush_max_delay_ms: 1000
   # Base reservation size. The broker adapts upward per active partition after exhaustion.
   sequence_reservation_size: 10000
+  # Optional, default-off metadata-publication fence. The runtime flag overrides this value.
+  fenced_metadata_writes: false
+  feature_flags:
+    dir: "/config_map/feature_flags"
+    file: "/config_map/feature_flags/feature_flags.yaml"
   node_identity:
     hostname: {}
   discovery:
@@ -153,6 +160,53 @@ after an interrupted commit or a partition rebalance. Consumers need S3 object r
 metadata-table query access, and read/write/delete access to the consumer lease and membership
 tables. Brokers need S3 object write access, segment-metadata writes, and producer-lease access.
 
+### Consumer metadata read consistency
+
+Set `runtime.read.strongly_consistent_metadata_reads` to use DynamoDB strongly consistent metadata
+queries. The runtime flag `blob_stream_consumer_strong_metadata_reads` overrides this setting when
+configured. Strong reads remove read-replica staleness and make the effective metadata visibility
+delay zero, but they approximately double metadata-query RRUs and do not make paginated scans
+atomic or fence stale producer publication. Use broker fenced metadata writes as well when stale
+publication must be rejected.
+
+### Broker fenced metadata writes
+
+Set `broker.fenced_metadata_writes` to transactionally publish each segment metadata row only while
+every partition in its flush plan still has its current producer lease. The runtime feature flag
+`blob_stream_broker_fenced_metadata_writes` overrides this static setting when `feature_flags.dir`
+and `feature_flags.file` are configured. The value is resolved once per flush-plan collection, so
+an in-flight plan cannot change publication mode.
+
+Fenced writes default off. Producer lease rows must include a durable holder ID, lease epoch, and
+session ID; the broker rejects rows without this fence identity. No segment-metadata schema or
+consumer change is required. A transaction can contain the metadata write plus at most 99
+producer-lease condition checks, so the scheduler splits larger same-topic flushes into plans of 99
+partitions. If a fence is lost after blob upload, the blob can remain orphaned but the metadata row
+is not published; the producer receives a retryable failure.
+
+### Broker IAM permissions
+
+For unfenced DynamoDB publication, a broker requires `dynamodb:PutItem` on the segment metadata
+table plus its normal producer-lease permissions. Fenced publication additionally requires
+`dynamodb:TransactWriteItems` and `dynamodb:ConditionCheckItem` on both the segment metadata and
+producer lease tables. The transaction writes one metadata item and condition-checks every producer
+lease, so omitting either action can cause publication to fail with `AccessDeniedException`.
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "dynamodb:PutItem",
+    "dynamodb:TransactWriteItems",
+    "dynamodb:ConditionCheckItem"
+  ],
+  "Resource": [
+    "arn:aws:dynamodb:<region>:<account-id>:table/<segment-metadata-table>",
+    "arn:aws:dynamodb:<region>:<account-id>:table/<producer-lease-table>"
+  ]
+}
+```
+
 ### Consumer IAM permissions
 
 For DynamoDB, a consumer role needs `dynamodb:Query` on the segment metadata and consumer
@@ -232,8 +286,8 @@ Keys:
 - Partition key: `pk` = `"<topic>#<virtual_partition_id>"`
 
 Representative attributes:
-- `holder_id`, `lease_expiration_ts_ms`, `max_allocated_seq`, `topic`, `virtual_partition_id`,
-  `ttl_epoch_seconds`
+- `holder_id`, `lease_epoch`, `lease_session_id`, `lease_expiration_ts_ms`, `max_allocated_seq`,
+  `topic`, `virtual_partition_id`, `ttl_epoch_seconds`
 
 ### 3) `consumer_group_leases`
 

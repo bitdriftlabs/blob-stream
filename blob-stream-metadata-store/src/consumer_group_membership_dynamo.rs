@@ -2,6 +2,7 @@
 #[path = "./consumer_group_membership_dynamo_test.rs"]
 mod tests;
 
+use crate::aws::retry_dynamo_transaction_conflicts;
 use crate::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentPlan,
@@ -22,13 +23,10 @@ use aws_sdk_dynamodb::types::{
   TransactWriteItem,
   Update,
 };
-use bd_backoff::{ExponentialBackoffBuilder, Finite, FiniteBackoff as _, SystemClock};
 use log::trace;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::time::Duration;
-use time::Duration as TimeDuration;
-use tokio::time::sleep;
+use uuid::Uuid;
 
 const ATTR_PK: &str = "pk";
 const ATTR_SK: &str = "sk";
@@ -53,10 +51,6 @@ const RECORD_TYPE_PLANNER_LEASE: &str = "assignment_planner_lease";
 const ASSIGNMENT_CONTROL_PARTITION_PREFIX: &str = "__blob_stream_assignment_control_v1__";
 const ASSIGNMENT_PLAN_SORT_KEY: &str = "__blob_stream_assignment_plan_v1__";
 const PLANNER_LEASE_SORT_KEY: &str = "__blob_stream_assignment_planner_v1__";
-const PLANNER_TRANSACTION_CONFLICT_RETRY_BUDGET: Duration = Duration::from_millis(175);
-const PLANNER_TRANSACTION_CONFLICT_INITIAL_DELAY: Duration = Duration::from_millis(25);
-const PLANNER_TRANSACTION_CONFLICT_MAX_DELAY: Duration = Duration::from_millis(100);
-
 //
 // retry_planner_transaction_conflicts
 //
@@ -70,7 +64,7 @@ const PLANNER_TRANSACTION_CONFLICT_MAX_DELAY: Duration = Duration::from_millis(1
 /// transaction finish.
 async fn retry_planner_transaction_conflicts<T, E, F, Fut, IsConflict>(
   operation_name: &str,
-  mut operation: F,
+  operation: F,
   is_transaction_conflict: IsConflict,
 ) -> Result<T, E>
 where
@@ -78,42 +72,7 @@ where
   Fut: Future<Output = Result<T, E>>,
   IsConflict: Fn(&E) -> bool,
 {
-  let mut backoff = ExponentialBackoffBuilder::<SystemClock, Finite>::new()
-    .with_max_elapsed_time(
-      TimeDuration::try_from(PLANNER_TRANSACTION_CONFLICT_RETRY_BUDGET)
-        .unwrap_or(TimeDuration::MAX),
-    )
-    .with_initial_interval(
-      TimeDuration::try_from(PLANNER_TRANSACTION_CONFLICT_INITIAL_DELAY)
-        .unwrap_or(TimeDuration::MAX),
-    )
-    .with_multiplier(2.0)
-    .with_max_interval(
-      TimeDuration::try_from(PLANNER_TRANSACTION_CONFLICT_MAX_DELAY).unwrap_or(TimeDuration::MAX),
-    )
-    .build();
-  let mut retry = 0;
-
-  loop {
-    match operation().await {
-      Ok(value) => return Ok(value),
-      Err(error) if is_transaction_conflict(&error) => match backoff.next_backoff() {
-        Some(delay) => {
-          retry += 1;
-          trace!(
-            "consumer planner operation retrying transaction conflict: operation={}, retry={}, \
-             delay_ms={}",
-            operation_name,
-            retry,
-            delay.whole_milliseconds()
-          );
-          sleep(delay.unsigned_abs()).await;
-        },
-        None => return Err(error),
-      },
-      Err(error) => return Err(error),
-    }
-  }
+  retry_dynamo_transaction_conflicts(operation_name, operation, is_transaction_conflict).await
 }
 
 //
@@ -823,9 +782,11 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       ))
       .set_expression_attribute_values(Some(plan_values))
       .build()?;
+    let client_request_token = Uuid::new_v4().to_string();
     let response = self
       .client
       .transact_write_items()
+      .client_request_token(client_request_token)
       .transact_items(
         TransactWriteItem::builder()
           .condition_check(planner_check)

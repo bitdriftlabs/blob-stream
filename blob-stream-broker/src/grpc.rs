@@ -10,7 +10,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bd_grpc::service::ServiceMethod;
 use bd_grpc::{Handler, UnaryRequestConfig, UnaryRouterBuilder, ValidationOptions};
-use bd_log::{SwapLogger, warn_every};
+use bd_log::SwapLogger;
+use bd_log_util::warn_every;
 use bd_server_stats::stats::Scope;
 use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchRequest,
@@ -311,7 +312,7 @@ async fn log(Query(params): Query<HashMap<String, String>>) {
 
 fn error_message(error: &WriteError) -> String {
   match error {
-    WriteError::Internal(inner) => inner.to_string(),
+    WriteError::Internal(_) => "internal write failure".to_string(),
     other => other.to_string(),
   }
 }

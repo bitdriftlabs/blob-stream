@@ -19,7 +19,14 @@ use async_trait::async_trait;
 use bd_server_stats::stats::{Collector, Scope};
 use bd_shutdown::ComponentShutdownTrigger;
 use bd_time::{OffsetDateTimeExt, TimeProvider};
-use blob_stream_blob_store::{BlobKey, BlobStore, ByteRange, InMemoryBlobStore};
+use blob_stream_blob_store::{
+  BlobKey,
+  BlobStore,
+  BlobStoreError,
+  BlobStoreResult,
+  ByteRange,
+  InMemoryBlobStore,
+};
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{
   InMemoryMetadataStore,
@@ -28,7 +35,10 @@ use blob_stream_metadata_store::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
+  MetadataReadConsistency,
   MetadataStore,
+  MetadataWriteResult,
+  ProducerPartitionFence,
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
@@ -72,21 +82,27 @@ struct FailsTopicMetadataStore {
 
 #[async_trait]
 impl MetadataStore for FailsTopicMetadataStore {
-  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> MetadataWriteResult {
     if metadata.window.topic == self.failed_topic {
-      return Err(anyhow::anyhow!("metadata write failed"));
+      return Err(anyhow::anyhow!("metadata write failed").into());
     }
-    self.inner.write_segment(metadata).await
+    self.inner.write_segment(metadata, fences, now_ts_ms).await
   }
 
   async fn scan_window_from_snowflake(
     &self,
     window: &blob_stream_types::TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     self
       .inner
-      .scan_window_from_snowflake(window, min_snowflake)
+      .scan_window_from_snowflake(window, min_snowflake, consistency)
       .await
   }
 }
@@ -109,8 +125,11 @@ impl BlobStore for GatedBlobStore {
     Ok(())
   }
 
-  async fn get_range(&self, _key: &BlobKey, _range: ByteRange) -> Result<Bytes> {
-    Err(anyhow::anyhow!("reads are not used by this test"))
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("reads are not used by this test: {range:?}"),
+    })
   }
 }
 
@@ -130,8 +149,11 @@ impl BlobStore for BlockingBlobStore {
     Ok(())
   }
 
-  async fn get_range(&self, _key: &BlobKey, _range: ByteRange) -> Result<Bytes> {
-    Err(anyhow::anyhow!("reads are not used by this test"))
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("reads are not used by this test: {range:?}"),
+    })
   }
 }
 
@@ -148,12 +170,19 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseAcquireOutcome> {
     self
       .inner
-      .acquire_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .acquire_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        lease_duration_ms,
+      )
       .await
   }
 
@@ -161,6 +190,7 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     &self,
     key: ProducerPartitionLeaseKey,
     holder_id: String,
+    lease_session_id: String,
     now_ts_ms: i64,
     lease_duration_ms: i64,
     reservation_size: Option<u64>,
@@ -184,6 +214,7 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
       .acquire_lease_and_reserve_sequences(
         key,
         holder_id,
+        lease_session_id,
         now_ts_ms,
         lease_duration_ms,
         reservation_size,
@@ -195,12 +226,19 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     lease_duration_ms: i64,
   ) -> Result<LeaseHeartbeatOutcome> {
     self
       .inner
-      .heartbeat_lease(key, holder_id, now_ts_ms, lease_duration_ms)
+      .heartbeat_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        lease_duration_ms,
+      )
       .await
   }
 
@@ -208,6 +246,7 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
@@ -225,7 +264,13 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     }
     self
       .inner
-      .reserve_sequences(key, holder_id, now_ts_ms, reservation_size)
+      .reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now_ts_ms,
+        reservation_size,
+      )
       .await
   }
 
@@ -233,9 +278,13 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
+    lease_session_id: &str,
     now_ts_ms: i64,
   ) -> Result<LeaseReleaseOutcome> {
-    self.inner.release_lease(key, holder_id, now_ts_ms).await
+    self
+      .inner
+      .release_lease(key, holder_id, lease_session_id, now_ts_ms)
+      .await
   }
 }
 
@@ -263,6 +312,7 @@ fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
   ));
   initial.transition.finish(
     LeaseExpirationUpdate::Set(Some(2_000)),
+    None,
     Some(SeqRange { start: 0, end: 3 }),
   );
 
@@ -295,6 +345,7 @@ fn maintenance_top_up_extends_the_current_reservation() {
   };
   initial.transition.finish_lease_maintenance(
     LeaseExpirationUpdate::Set(Some(2_000)),
+    None,
     Some(SeqRange { start: 0, end: 99 }),
     0,
   );
@@ -321,6 +372,7 @@ fn maintenance_top_up_extends_the_current_reservation() {
   ));
   top_up.transition.finish_lease_maintenance(
     LeaseExpirationUpdate::Set(Some(2_100)),
+    None,
     Some(SeqRange {
       start: 100,
       end: 199,
@@ -352,6 +404,7 @@ fn maintenance_high_utilization_doubles_the_adaptive_reservation_target() {
   };
   initial.transition.finish_lease_maintenance(
     LeaseExpirationUpdate::Set(Some(2_000)),
+    None,
     Some(SeqRange { start: 0, end: 99 }),
     0,
   );
@@ -389,6 +442,7 @@ fn maintenance_high_utilization_waits_until_another_window_is_needed() {
   };
   initial.transition.finish_lease_maintenance(
     LeaseExpirationUpdate::Set(Some(2_000)),
+    None,
     Some(SeqRange { start: 0, end: 199 }),
     0,
   );
@@ -427,6 +481,7 @@ fn lease_reacquisition_discards_stale_sequence_capacity() {
   };
   initial.transition.finish(
     LeaseExpirationUpdate::Set(Some(2_000)),
+    None,
     Some(SeqRange { start: 0, end: 9 }),
   );
 
@@ -446,7 +501,7 @@ fn lease_reacquisition_discards_stale_sequence_capacity() {
   assert!(reacquire.reservation.is_none());
   reacquire
     .transition
-    .finish(LeaseExpirationUpdate::Set(Some(3_000)), None);
+    .finish(LeaseExpirationUpdate::Set(Some(3_000)), None, None);
 
   let reservation = begin_allocation_transition(&state, "telemetry", 0, 1, 2_001, false, 10);
   let AllocationTransitionDecision::Claimed(reservation) = reservation else {
@@ -454,6 +509,7 @@ fn lease_reacquisition_discards_stale_sequence_capacity() {
   };
   reservation.transition.finish(
     LeaseExpirationUpdate::Preserve,
+    None,
     Some(SeqRange { start: 20, end: 29 }),
   );
 
@@ -706,7 +762,13 @@ async fn state_snapshot_reports_expired_observed_lease() -> Result<()> {
     virtual_partition_id: 0,
   };
   lease_store
-    .acquire_lease(key, "former-owner".to_string(), now_ms - 1_000, 100)
+    .acquire_lease(
+      key,
+      "former-owner".to_string(),
+      "former-owner-session".to_string(),
+      now_ms - 1_000,
+      100,
+    )
     .await?;
 
   let snapshot = engine.state_snapshot().await;
@@ -789,7 +851,13 @@ async fn fenced_sequence_reservations_do_not_record_failure_metrics() -> Result<
     virtual_partition_id: 0,
   };
   lease_store
-    .acquire_lease(key, "other-broker".to_string(), now_ms, 30_000)
+    .acquire_lease(
+      key,
+      "other-broker".to_string(),
+      "other-broker-session".to_string(),
+      now_ms,
+      30_000,
+    )
     .await?;
   let error = engine
     .produce_batch(WriteRequest {
@@ -847,7 +915,11 @@ async fn buffers_until_size_rollover() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert!(segments.is_empty());
 
@@ -861,7 +933,11 @@ async fn buffers_until_size_rollover() -> Result<()> {
   first.await??;
 
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 1);
   assert_eq!(segments[0].segment_index[&0].len(), 1);
@@ -1070,7 +1146,11 @@ async fn flushes_on_time_rollover() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 1);
   Ok(())
@@ -1155,7 +1235,11 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 1);
   assert_eq!(segments[0].segment_index.len(), 2);
@@ -1223,7 +1307,11 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
   next_second.await??;
 
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 2);
   assert!(
@@ -1319,7 +1407,11 @@ async fn time_due_flush_completes_before_later_byte_flush() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 2);
   assert!(segments.iter().any(|segment| {
@@ -1387,7 +1479,11 @@ async fn byte_flush_does_not_coalesce_buffered_topic_peers() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 1);
   assert_eq!(segments[0].segment_index.len(), 1);
@@ -1713,7 +1809,11 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   let mut ranges: Vec<_> = segments
     .iter()
@@ -1825,7 +1925,13 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
     virtual_partition_id: 0,
   };
   let held_by_a = lease_store
-    .acquire_lease(key.clone(), "node-b".to_string(), now_ms, 30_000)
+    .acquire_lease(
+      key.clone(),
+      "node-b".to_string(),
+      "node-b-session".to_string(),
+      now_ms,
+      30_000,
+    )
     .await?;
   assert!(matches!(held_by_a, LeaseAcquireOutcome::HeldByOther(_)));
 
@@ -1834,7 +1940,13 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   receive_blob_write(&mut entered_rx).await;
 
   let still_held_by_a = lease_store
-    .acquire_lease(key.clone(), "node-b".to_string(), now_ms, 30_000)
+    .acquire_lease(
+      key.clone(),
+      "node-b".to_string(),
+      "node-b-session".to_string(),
+      now_ms,
+      30_000,
+    )
     .await?;
   assert!(matches!(
     still_held_by_a,
@@ -1847,7 +1959,13 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   let mut acquired_by_b = false;
   for _ in 0 .. 100 {
     let outcome = lease_store
-      .acquire_lease(key.clone(), "node-b".to_string(), now_ms, 30_000)
+      .acquire_lease(
+        key.clone(),
+        "node-b".to_string(),
+        "node-b-session".to_string(),
+        now_ms,
+        30_000,
+      )
       .await?;
     if matches!(outcome, LeaseAcquireOutcome::Acquired(_)) {
       acquired_by_b = true;
@@ -1862,7 +1980,11 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
     WriteConfig::with_defaults().window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 2);
   Ok(())
@@ -1934,7 +2056,13 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
     virtual_partition_id: 0,
   };
   let held_by_a = lease_store
-    .acquire_lease(key.clone(), "node-b".to_string(), now_ms, 30_000)
+    .acquire_lease(
+      key.clone(),
+      "node-b".to_string(),
+      "node-b-session".to_string(),
+      now_ms,
+      30_000,
+    )
     .await?;
   assert!(matches!(held_by_a, LeaseAcquireOutcome::HeldByOther(_)));
   assert!(!shutdown.is_finished());
@@ -1946,7 +2074,13 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
     .expect("component shutdown did not complete after flush drained")?;
 
   let acquired_by_b = lease_store
-    .acquire_lease(key, "node-b".to_string(), now_ms, 30_000)
+    .acquire_lease(
+      key,
+      "node-b".to_string(),
+      "node-b-session".to_string(),
+      now_ms,
+      30_000,
+    )
     .await?;
   assert!(matches!(acquired_by_b, LeaseAcquireOutcome::Acquired(_)));
   Ok(())
@@ -2272,7 +2406,11 @@ async fn writes_compressed_metadata() -> Result<()> {
     config.window_size_seconds,
   );
   let segments = metadata_store
-    .scan_window_from_snowflake(&window.key("telemetry"), None)
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
     .await?;
   assert_eq!(segments.len(), 1);
 
@@ -2285,14 +2423,20 @@ struct FailingMetadataStore;
 
 #[async_trait]
 impl MetadataStore for FailingMetadataStore {
-  async fn write_segment(&self, _metadata: SegmentMetadata) -> Result<()> {
-    Err(anyhow::anyhow!("metadata write failed"))
+  async fn write_segment(
+    &self,
+    _metadata: SegmentMetadata,
+    _fences: Option<&[ProducerPartitionFence]>,
+    _now_ts_ms: i64,
+  ) -> MetadataWriteResult {
+    Err(anyhow::anyhow!("metadata write failed").into())
   }
 
   async fn scan_window_from_snowflake(
     &self,
     _window: &blob_stream_types::TopicWindowKey,
     _min_snowflake: Option<SnowflakeId>,
+    _consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     Ok(Vec::new())
   }

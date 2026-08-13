@@ -1,5 +1,5 @@
-use bd_server_stats::stats::Scope;
-use prometheus::{Histogram, IntCounter, IntGauge};
+use bd_server_stats::stats::{ContributionGauge, Scope};
+use prometheus::{Histogram, IntCounter};
 use std::time::Instant;
 
 //
@@ -25,9 +25,9 @@ pub(in crate::consumer) struct ConsumerReaderMetrics {
   recovery_metadata_cache_misses: IntCounter,
   recovery_metadata_cache_inserts: IntCounter,
   recovery_metadata_cache_invalidations: IntCounter,
-  recovery_metadata_cache_entries: IntGauge,
-  recovery_metadata_cache_retained_bytes: IntGauge,
-  metadata_fast_scan_frontiers: IntGauge,
+  recovery_metadata_cache_entries: ContributionGauge,
+  recovery_metadata_cache_retained_bytes: ContributionGauge,
+  metadata_fast_scan_frontiers: ContributionGauge,
   pub(in crate::consumer) metadata_fast_scan_without_lower_bound: IntCounter,
   pub(in crate::consumer) metadata_fast_scan_segments_below_partition_frontier: IntCounter,
   pub(in crate::consumer) metadata_fast_scan_segments_without_assigned_batches: IntCounter,
@@ -39,6 +39,7 @@ pub(in crate::consumer) struct ConsumerReaderMetrics {
   blob_batch_ranges: IntCounter,
   blob_batch_range_bytes: IntCounter,
   blob_range_latency_seconds: Histogram,
+  lost_records: IntCounter,
   batches_read: IntCounter,
   records_read: IntCounter,
   record_payload_bytes: IntCounter,
@@ -65,9 +66,15 @@ impl ConsumerReaderMetrics {
       recovery_metadata_cache_misses: scope.counter("recovery_metadata_cache_misses"),
       recovery_metadata_cache_inserts: scope.counter("recovery_metadata_cache_inserts"),
       recovery_metadata_cache_invalidations: scope.counter("recovery_metadata_cache_invalidations"),
-      recovery_metadata_cache_entries: scope.gauge("recovery_metadata_cache_entries"),
-      recovery_metadata_cache_retained_bytes: scope.gauge("recovery_metadata_cache_retained_bytes"),
-      metadata_fast_scan_frontiers: scope.gauge("metadata_fast_scan_frontiers"),
+      recovery_metadata_cache_entries: ContributionGauge::new(
+        scope.gauge("recovery_metadata_cache_entries"),
+      ),
+      recovery_metadata_cache_retained_bytes: ContributionGauge::new(
+        scope.gauge("recovery_metadata_cache_retained_bytes"),
+      ),
+      metadata_fast_scan_frontiers: ContributionGauge::new(
+        scope.gauge("metadata_fast_scan_frontiers"),
+      ),
       metadata_fast_scan_without_lower_bound: scope
         .counter("metadata_fast_scan_without_lower_bound"),
       metadata_fast_scan_segments_below_partition_frontier: scope
@@ -83,6 +90,7 @@ impl ConsumerReaderMetrics {
       blob_batch_ranges: scope.counter("blob_batch_ranges"),
       blob_batch_range_bytes: scope.counter("blob_batch_range_bytes"),
       blob_range_latency_seconds: scope.histogram("blob_range_latency_seconds"),
+      lost_records: scope.counter("lost_records"),
       batches_read: scope.counter("batches_read"),
       records_read: scope.counter("records_read"),
       record_payload_bytes: scope.counter("record_payload_bytes"),
@@ -168,6 +176,10 @@ impl ConsumerReaderMetrics {
       .blob_batch_ranges
       .inc_by(u64::try_from(range_count).unwrap_or(u64::MAX));
     self.blob_batch_range_bytes.inc_by(bytes);
+  }
+
+  pub(in crate::consumer) fn record_lost_records(&self, record_count: u64) {
+    self.lost_records.inc_by(record_count);
   }
 
   pub(in crate::consumer) fn record_batch(&self, record_count: usize, payload_bytes: usize) {

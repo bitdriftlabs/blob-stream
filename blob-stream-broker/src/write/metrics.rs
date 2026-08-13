@@ -144,7 +144,9 @@ impl ProduceOutcomeMetrics {
     self.rejected_payload_bytes_total.inc_by(payload_bytes);
     match error {
       WriteError::UnknownTopic(_) => self.unknown_topic_total.inc(),
-      WriteError::NotLeaseHolder { .. } => self.not_lease_holder_total.inc(),
+      WriteError::NotLeaseHolder { .. } | WriteError::LeaseFenceLost => {
+        self.not_lease_holder_total.inc();
+      },
       WriteError::InvalidRequest(_) => {},
       WriteError::InvalidPartition { .. } | WriteError::Overloaded(_) | WriteError::Internal(_) => {
         self.overloaded_total.inc();

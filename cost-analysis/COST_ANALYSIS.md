@@ -58,6 +58,13 @@ python3 cost_analysis.py \
 	--set pages_per_metadata_query=1.4
 ```
 
+`--strong-metadata-reads` and `metadata_strong_reads` model the resolved
+`ConsumerReadConfig.strongly_consistent_metadata_reads` setting, including its
+`blob_stream_consumer_strong_metadata_reads` runtime override. `--transactional-metadata-writes`
+and `transactional_metadata_writes` model broker `fenced_metadata_writes`, including its
+`blob_stream_broker_fenced_metadata_writes` runtime override. The fence mode is optional, but its
+holder ID, lease epoch, and session ID remain required in every producer lease row.
+
 ## Calibration
 
 Use direct observed rates whenever available. The fallback segment and range-read estimates are for

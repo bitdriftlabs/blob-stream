@@ -3,9 +3,10 @@
 mod tests;
 
 use anyhow::{Result, anyhow, ensure};
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use bd_pgv::proto_validate;
 use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
+use blob_stream_metadata_store::MetadataReadConsistency;
 pub use blob_stream_proto::protos::blobstream::v1::config::{
   ConsumerGroupConfig,
   ConsumerReadConfig,
@@ -29,6 +30,7 @@ const RESERVED_MEMBER_ID_PREFIX: &str = "__blob_stream_";
 const PREFETCH_MAX_BYTES_FEATURE_FLAG: &str = "blob_stream_consumer_prefetch_max_bytes";
 const MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG: &str =
   "blob_stream_consumer_max_in_flight_batch_reads";
+const STRONG_METADATA_READS_FEATURE_FLAG: &str = "blob_stream_consumer_strong_metadata_reads";
 
 //
 // ConsumerReadConfig
@@ -38,6 +40,8 @@ const MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG: &str =
 pub struct ConsumerReadRuntimeSettings {
   pub(crate) prefetch_max_bytes: u64,
   pub(crate) max_in_flight_batch_reads: usize,
+  pub(crate) metadata_read_consistency: MetadataReadConsistency,
+  pub(crate) metadata_visibility_delay_ms: u64,
 }
 
 #[must_use]
@@ -79,6 +83,12 @@ pub fn consumer_metadata_visibility_delay_ms(config: &ConsumerReadConfig) -> u64
   config
     .metadata_visibility_delay_ms
     .unwrap_or(DEFAULT_METADATA_VISIBILITY_DELAY_MS)
+}
+
+#[must_use]
+/// Return whether metadata queries are strongly consistent, applying the eventual default.
+pub fn consumer_strongly_consistent_metadata_reads(config: &ConsumerReadConfig) -> bool {
+  config.strongly_consistent_metadata_reads.unwrap_or(false)
 }
 
 #[must_use]
@@ -132,23 +142,62 @@ pub fn consumer_read_runtime_settings(
     },
   };
 
+  let configured_strong_metadata_reads = consumer_strongly_consistent_metadata_reads(config);
+  let strong_metadata_reads = feature_flags.map_or(configured_strong_metadata_reads, |flags| {
+    flags.get_bool(
+      STRONG_METADATA_READS_FEATURE_FLAG,
+      configured_strong_metadata_reads,
+    )
+  });
+  let metadata_read_consistency = if strong_metadata_reads {
+    MetadataReadConsistency::Strong
+  } else {
+    MetadataReadConsistency::Eventual
+  };
+  let metadata_visibility_delay_ms = if strong_metadata_reads {
+    0
+  } else {
+    consumer_metadata_visibility_delay_ms(config)
+  };
+
   ConsumerReadRuntimeSettings {
     prefetch_max_bytes,
     max_in_flight_batch_reads,
+    metadata_read_consistency,
+    metadata_visibility_delay_ms,
   }
 }
 
 /// Derive the candidate windows needed to cover publication and visibility delay.
+#[cfg(test)]
 pub fn consumer_candidate_window_count(
   config: &ConsumerReadConfig,
   maximum_metadata_publication_lag_ms: u64,
+) -> Result<usize> {
+  let metadata_visibility_delay_ms = if consumer_strongly_consistent_metadata_reads(config) {
+    0
+  } else {
+    consumer_metadata_visibility_delay_ms(config)
+  };
+  consumer_candidate_window_count_with_visibility_delay(
+    config,
+    maximum_metadata_publication_lag_ms,
+    metadata_visibility_delay_ms,
+  )
+}
+
+/// Derive candidate windows for an explicit per-pass effective visibility delay.
+pub fn consumer_candidate_window_count_with_visibility_delay(
+  config: &ConsumerReadConfig,
+  maximum_metadata_publication_lag_ms: u64,
+  metadata_visibility_delay_ms: u64,
 ) -> Result<usize> {
   let window_size_ms = u64::try_from(consumer_window_size_seconds(config))
     .map_err(|_| anyhow!("consumer.read.window_size_seconds must be positive"))?
     .checked_mul(1_000)
     .ok_or_else(|| anyhow!("consumer.read.window_size_seconds is too large"))?;
   let coverage_ms = maximum_metadata_publication_lag_ms
-    .checked_add(consumer_metadata_visibility_delay_ms(config))
+    .checked_add(metadata_visibility_delay_ms)
     .ok_or_else(|| anyhow!("metadata availability horizon is too large"))?;
   let trailing_windows = coverage_ms
     .checked_add(window_size_ms.saturating_sub(1))

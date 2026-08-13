@@ -1,5 +1,6 @@
 use super::{
   BTreeMap,
+  ConsumerReadRuntimeSettings,
   ConsumerReaderFastScanBoundState,
   ConsumerReaderImpl,
   ConsumerReaderPartitionScanState,
@@ -14,7 +15,7 @@ use super::{
   VirtualPartitionId,
   VirtualPartitionState,
   Window,
-  consumer_candidate_window_count,
+  consumer_candidate_window_count_with_visibility_delay,
   consumer_window_size_seconds,
   format_unix_timestamp_seconds,
   metadata_availability_delay_seconds,
@@ -24,10 +25,14 @@ use crate::consumer::reader::RecoveryMetadataCacheKey;
 
 impl ConsumerReaderImpl {
   /// Return the cache identity for an immutable, recovery-only metadata request.
+  ///
+  /// The key intentionally excludes consistency: runtime changes do not invalidate a completed
+  /// recovery observation or replay it with stronger reads.
   pub(in crate::consumer) fn mature_recovery_metadata_cache_key(
     &self,
     request: &ScanRequest,
     now_unix_seconds: i64,
+    runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Option<RecoveryMetadataCacheKey> {
     let &[partition_id] = request.eligibility.recovering_partitions.as_slice() else {
       return None;
@@ -39,7 +44,8 @@ impl ConsumerReaderImpl {
     if !request.recovery_scan
       || request.eligibility.fast
       || request.eligibility.fresh
-      || window_end_unix_seconds > self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds)
+      || window_end_unix_seconds
+        > self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds, runtime_settings)
     {
       return None;
     }
@@ -54,15 +60,19 @@ impl ConsumerReaderImpl {
   pub(in crate::consumer) fn scan_windows(
     &self,
     now_unix_seconds: i64,
+    runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<Vec<TopicWindowKey>> {
     // Anchor scans to the current window and cover the enforced publication deadline plus the
-    // eventual-read visibility delay. Oldest -> newest ordering keeps traversal deterministic.
+    // effective visibility delay. Oldest -> newest ordering keeps traversal deterministic.
     let current_window =
       Window::for_timestamp(now_unix_seconds, consumer_window_size_seconds(&self.config))
         .start_unix_seconds;
 
-    let candidate_windows =
-      consumer_candidate_window_count(&self.config, self.maximum_metadata_publication_lag_ms)?;
+    let candidate_windows = consumer_candidate_window_count_with_visibility_delay(
+      &self.config,
+      self.maximum_metadata_publication_lag_ms,
+      runtime_settings.metadata_visibility_delay_ms,
+    )?;
     let window_size_seconds = consumer_window_size_seconds(&self.config);
     let mut windows = Vec::with_capacity(candidate_windows);
     for offset in (0 .. candidate_windows).rev() {
@@ -176,9 +186,11 @@ impl ConsumerReaderImpl {
     scan_requests: &[ScanRequest],
     assigned_partition_ids: &[VirtualPartitionId],
     now_unix_seconds: i64,
+    runtime_settings: ConsumerReadRuntimeSettings,
     scan_states: &mut HashMap<VirtualPartitionId, ConsumerReaderPartitionScanState>,
   ) {
-    let safe_timestamp_unix_seconds = self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds);
+    let safe_timestamp_unix_seconds =
+      self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds, runtime_settings);
     for request in scan_requests {
       if !request.eligibility.fast {
         continue;
@@ -218,12 +230,13 @@ impl ConsumerReaderImpl {
   pub(in crate::consumer) fn fast_scan_safe_timestamp_unix_seconds(
     &self,
     now_unix_seconds: i64,
+    runtime_settings: ConsumerReadRuntimeSettings,
   ) -> i64 {
     // T_safe = now - D, where D combines the broker publication deadline and reader visibility
     // delay. This relies on synchronized broker and consumer clocks; keep the bounds together so
     // a future skew margin has one obvious place to join the safety calculation.
     now_unix_seconds.saturating_sub(metadata_availability_delay_seconds(
-      &self.config,
+      runtime_settings.metadata_visibility_delay_ms,
       self.maximum_metadata_publication_lag_ms,
     ))
   }
@@ -238,11 +251,13 @@ impl ConsumerReaderImpl {
   pub(in crate::consumer) fn eligible_fast_scan_windows(
     &self,
     now_unix_seconds: i64,
+    runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<Vec<(TopicWindowKey, SnowflakeId)>> {
-    let safe_timestamp_unix_seconds = self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds);
+    let safe_timestamp_unix_seconds =
+      self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds, runtime_settings);
     let window_size_seconds = consumer_window_size_seconds(&self.config);
     let windows = self
-      .scan_windows(now_unix_seconds)?
+      .scan_windows(now_unix_seconds, runtime_settings)?
       .into_iter()
       .filter(|window| {
         window
@@ -287,6 +302,7 @@ impl ConsumerReaderImpl {
     &mut self,
     now_unix_seconds: i64,
     assigned_partition_ids: &[VirtualPartitionId],
+    runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<(Vec<ScanRequest>, bool)> {
     let mut scan_requests = BTreeMap::new();
     let mut recovery_scan = false;
@@ -401,7 +417,9 @@ impl ConsumerReaderImpl {
       .values()
       .any(|state| state.is_assigned() && matches!(state, VirtualPartitionState::Fast { .. }))
     {
-      for (window, safe_floor) in self.eligible_fast_scan_windows(now_unix_seconds)? {
+      for (window, safe_floor) in
+        self.eligible_fast_scan_windows(now_unix_seconds, runtime_settings)?
+      {
         Self::insert_scan_request(
           &mut scan_requests,
           self.config.topic.as_str(),
@@ -425,9 +443,13 @@ impl ConsumerReaderImpl {
   }
 
   /// Discard frontiers for windows that Fast scans no longer query.
-  pub(in crate::consumer) fn prune_fast_frontiers(&mut self, now_unix_seconds: i64) -> Result<()> {
+  pub(in crate::consumer) fn prune_fast_frontiers(
+    &mut self,
+    now_unix_seconds: i64,
+    runtime_settings: ConsumerReadRuntimeSettings,
+  ) -> Result<()> {
     let eligible_window_starts = self
-      .eligible_fast_scan_windows(now_unix_seconds)?
+      .eligible_fast_scan_windows(now_unix_seconds, runtime_settings)?
       .into_iter()
       .map(|(window, _)| window.window_start_unix_seconds)
       .collect::<HashSet<_>>();

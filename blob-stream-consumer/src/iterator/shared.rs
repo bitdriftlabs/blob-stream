@@ -1,11 +1,11 @@
 use super::delivery::{DeliveredSourceRange, DeliveryState};
 use crate::diagnostics::ConsumerDiagnosticsRuntimeState;
-use bd_server_stats::stats::Scope;
+use bd_server_stats::stats::{ContributionGauge, Scope};
 use blob_stream_types::{CommittedSourceCheckpoint, VirtualPartitionId};
 use parking_lot::Mutex;
-use prometheus::{Histogram, IntCounter, IntGauge};
+use prometheus::{Histogram, IntCounter};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 //
 // ConsumerIteratorMetrics
@@ -28,14 +28,14 @@ pub(super) struct ConsumerIteratorMetrics {
   pub(super) lease_claims_retained: IntCounter,
   pub(super) lease_claims_graceful_handoff: IntCounter,
   pub(super) lease_claims_expiry_takeover: IntCounter,
-  pub(super) desired_partitions: IntGauge,
-  pub(super) owned_partitions: IntGauge,
-  pub(super) active_partitions: IntGauge,
-  pub(super) prefetch_buffered_batches: IntGauge,
-  pub(super) prefetch_buffered_bytes: IntGauge,
-  pub(super) prefetch_pending_batches: IntGauge,
-  pub(super) prefetch_pending_bytes: IntGauge,
-  pub(super) prefetch_total_bytes: IntGauge,
+  pub(super) desired_partitions: ContributionGauge,
+  pub(super) owned_partitions: ContributionGauge,
+  pub(super) active_partitions: ContributionGauge,
+  pub(super) prefetch_buffered_batches: ContributionGauge,
+  pub(super) prefetch_buffered_bytes: ContributionGauge,
+  pub(super) prefetch_pending_batches: ContributionGauge,
+  pub(super) prefetch_pending_bytes: ContributionGauge,
+  pub(super) prefetch_total_bytes: ContributionGauge,
   pub(super) prefetch_paused_budget: IntCounter,
   pub(super) prefetch_refill_cycles: IntCounter,
   pub(super) heartbeat_calls: IntCounter,
@@ -75,14 +75,14 @@ impl ConsumerIteratorMetrics {
       lease_claims_retained: scope.counter("lease_claims_retained"),
       lease_claims_graceful_handoff: scope.counter("lease_claims_graceful_handoff"),
       lease_claims_expiry_takeover: scope.counter("lease_claims_expiry_takeover"),
-      desired_partitions: scope.gauge("desired_partitions"),
-      owned_partitions: scope.gauge("owned_partitions"),
-      active_partitions: scope.gauge("active_partitions"),
-      prefetch_buffered_batches: scope.gauge("prefetch_buffered_batches"),
-      prefetch_buffered_bytes: scope.gauge("prefetch_buffered_bytes"),
-      prefetch_pending_batches: scope.gauge("prefetch_pending_batches"),
-      prefetch_pending_bytes: scope.gauge("prefetch_pending_bytes"),
-      prefetch_total_bytes: scope.gauge("prefetch_total_bytes"),
+      desired_partitions: ContributionGauge::new(scope.gauge("desired_partitions")),
+      owned_partitions: ContributionGauge::new(scope.gauge("owned_partitions")),
+      active_partitions: ContributionGauge::new(scope.gauge("active_partitions")),
+      prefetch_buffered_batches: ContributionGauge::new(scope.gauge("prefetch_buffered_batches")),
+      prefetch_buffered_bytes: ContributionGauge::new(scope.gauge("prefetch_buffered_bytes")),
+      prefetch_pending_batches: ContributionGauge::new(scope.gauge("prefetch_pending_batches")),
+      prefetch_pending_bytes: ContributionGauge::new(scope.gauge("prefetch_pending_bytes")),
+      prefetch_total_bytes: ContributionGauge::new(scope.gauge("prefetch_total_bytes")),
       prefetch_paused_budget: scope.counter("prefetch_paused_budget"),
       prefetch_refill_cycles: scope.counter("prefetch_refill_cycles"),
       heartbeat_calls: scope.counter("heartbeat_calls"),
@@ -153,6 +153,47 @@ pub struct ConsumerSharedState {
 }
 
 impl ConsumerSharedState {
+  /// Align commit-eligible and diagnostic state with the active assignment after a reader change
+  /// has succeeded. Both collections must exclude revoked partitions so diagnostics cannot
+  /// recreate a stale local partition from its old committed cursor.
+  pub(in crate::iterator) fn apply_active_assignment(
+    &mut self,
+    active_assignment: &HashSet<VirtualPartitionId>,
+  ) {
+    self
+      .active_partitions
+      .retain(|partition_id, _| active_assignment.contains(partition_id));
+    self
+      .diagnostics
+      .last_committed_cursors
+      .retain(|partition_id, _| active_assignment.contains(partition_id));
+    for partition_id in active_assignment {
+      self.active_partitions.entry(*partition_id).or_default();
+    }
+  }
+
+  /// Remove state that is valid only while the consumer holds a partition lease.
+  pub(in crate::iterator) fn remove_fenced_partitions(
+    &mut self,
+    fenced_partitions: &[VirtualPartitionId],
+  ) {
+    for partition_id in fenced_partitions {
+      self.active_partitions.remove(partition_id);
+      self.diagnostics.last_committed_cursors.remove(partition_id);
+    }
+  }
+
+  /// Drop only committed-cursor diagnostics while a fencing revocation is being acknowledged.
+  /// The active partition state remains so the application can finish its in-flight callback.
+  pub(in crate::iterator) fn discard_committed_cursor_diagnostics(
+    &mut self,
+    partition_ids: &[VirtualPartitionId],
+  ) {
+    for partition_id in partition_ids {
+      self.diagnostics.last_committed_cursors.remove(partition_id);
+    }
+  }
+
   #[allow(dead_code)]
   fn assert_mutex_type(_: &Mutex<Self>) {}
 }

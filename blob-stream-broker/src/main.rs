@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use bd_panic::PanicType;
+use bd_runtime_config::loader::Stats;
 use bd_shutdown::{ComponentShutdownTrigger, real_graceful_shutdown};
 use blob_stream_broker::config::load_runtime_config;
 use blob_stream_broker::grpc::make_broker_router;
@@ -46,11 +47,26 @@ async fn async_main() -> Result<()> {
 
   let metrics = BrokerMetrics::new();
   let metrics_scope = metrics.scope();
+  let feature_flags = broker_config
+    .feature_flags
+    .as_ref()
+    .map(|feature_flags| {
+      bd_runtime_config::feature_flags::new_memory_feature_flags_loader(
+        &feature_flags.dir,
+        &feature_flags.file,
+        Stats::new(&metrics_scope.scope("feature_flags_loader")),
+      )
+    })
+    .transpose()?;
+  let feature_flags_watch = feature_flags
+    .as_ref()
+    .map(|feature_flags| feature_flags.snapshot_watch());
   let broker_shutdown_trigger = ComponentShutdownTrigger::default();
   let write_engine = build_write_engine(
     &config,
     broker_shutdown_trigger.make_handle(),
     &metrics_scope,
+    feature_flags_watch,
   )
   .await?;
   let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -71,6 +87,9 @@ async fn async_main() -> Result<()> {
 
   info!("broker draining writes and releasing producer leases");
   broker_shutdown_trigger.shutdown().await;
+  if let Some(feature_flags) = feature_flags {
+    feature_flags.shutdown().await;
+  }
   info!("broker shutdown complete");
   Ok(())
 }

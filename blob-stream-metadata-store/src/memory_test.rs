@@ -1,4 +1,4 @@
-use crate::{InMemoryMetadataStore, MetadataStore, SegmentMetadata};
+use crate::{InMemoryMetadataStore, MetadataReadConsistency, MetadataStore, SegmentMetadata};
 use blob_stream_blob_store::BlobKey;
 use blob_stream_proto::protos::blobstream::v1::metadata::SegmentMetadataV1;
 use blob_stream_types::{
@@ -47,21 +47,24 @@ async fn stores_and_scans_window() {
   let other = build_segment("topic-b", 200, 3);
 
   store
-    .write_segment(first.clone())
+    .write_segment(first.clone(), None, 0)
     .await
     .expect("write first");
   store
-    .write_segment(second.clone())
+    .write_segment(second.clone(), None, 0)
     .await
     .expect("write second");
-  store.write_segment(other).await.expect("write other");
+  store
+    .write_segment(other, None, 0)
+    .await
+    .expect("write other");
 
   let window = TopicWindowKey {
     topic: "topic-a".to_string(),
     window_start_unix_seconds: 100,
   };
   let segments = store
-    .scan_window_from_snowflake(&window, None)
+    .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Eventual)
     .await
     .expect("scan window");
 
@@ -76,9 +79,12 @@ async fn scans_window_from_inclusive_snowflake() {
   let first = build_segment("topic-a", 100, 1);
   let second = build_segment("topic-a", 100, 2);
 
-  store.write_segment(first).await.expect("write first");
   store
-    .write_segment(second.clone())
+    .write_segment(first, None, 0)
+    .await
+    .expect("write first");
+  store
+    .write_segment(second.clone(), None, 0)
     .await
     .expect("write second");
 
@@ -87,7 +93,11 @@ async fn scans_window_from_inclusive_snowflake() {
     window_start_unix_seconds: 100,
   };
   let segments = store
-    .scan_window_from_snowflake(&window, Some(SnowflakeId(2)))
+    .scan_window_from_snowflake(
+      &window,
+      Some(SnowflakeId(2)),
+      MetadataReadConsistency::Eventual,
+    )
     .await
     .expect("scan bounded window");
 
@@ -99,7 +109,7 @@ async fn skips_noncompliant_segment_rows() {
   let store = InMemoryMetadataStore::new();
   let valid = build_segment("topic-a", 100, 2);
   store
-    .write_segment(valid.clone())
+    .write_segment(valid.clone(), None, 0)
     .await
     .expect("write valid segment");
   store
@@ -136,7 +146,7 @@ async fn skips_noncompliant_segment_rows() {
   };
   assert_eq!(
     store
-      .scan_window_from_snowflake(&window, None)
+      .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Eventual)
       .await
       .expect("scan window"),
     vec![valid]

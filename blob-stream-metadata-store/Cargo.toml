@@ -15,6 +15,7 @@ aws-config.workspace        = true
 aws-sdk-dynamodb.workspace  = true
 bd-backoff.workspace        = true
 bd-log.workspace            = true
+bd-log-util.workspace       = true
 bd-server-stats.workspace   = true
 blob-stream-blob-store.path = "../blob-stream-blob-store"
 blob-stream-proto.path      = "../blob-stream-proto"
@@ -26,9 +27,10 @@ prometheus.workspace        = true
 protobuf.workspace          = true
 serde.workspace             = true
 serde_dynamo                = { workspace = true, features = ["aws-sdk-dynamodb+1"] }
+thiserror.workspace         = true
 time.workspace              = true
 tokio.workspace             = true
+uuid.workspace              = true
 
 [dev-dependencies]
 mockall.workspace = true
-uuid.workspace    = true

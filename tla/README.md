@@ -116,12 +116,14 @@ The model uses four separate per-batch state values instead of replacing
 step separate makes their distinct causal roles visible in an invariant and will
 let the next reader stage observe metadata before a producer acknowledgement.
 
-`PublishMetadata` intentionally does **not** require `ValidLease(broker)`. The
-broker did hold a valid lease when it accepted the batch, but the production
-design does not transactionally fence the later metadata write. An alive former
-holder may therefore publish its already uploaded batch after its lease expires.
-This is the precisely scoped behavior needed for the documented stale-writer
-witness; it is not a claim that accepting new work without a lease is allowed.
+`PublishMetadata` intentionally does **not** require `ValidLease(broker)`. This
+model represents production with optional fenced metadata writes disabled. In
+that mode an alive former holder may publish its already uploaded batch after
+its lease expires. Fenced production mode transactionally checks the current
+lease epoch and process session before publishing metadata; it is outside this
+teaching model. The unfenced behavior is the precisely scoped condition needed
+for the documented stale-writer witness; it is not a claim that accepting new
+work without a lease is allowed.
 
 ## Stage 3: Minimal Cursor Reader
 
@@ -227,12 +229,14 @@ The trace is deliberately causal rather than a magical metadata deletion:
    returns A, and normal cursor filtering skips it because the cursor is already
    `2`.
 
-This is also an accepted product limitation. The witness preserves sequence
-allocation safety, blob-before-metadata, acknowledgement ordering, cursor
-monotonicity, and the rule that every delivered batch came from metadata and a
-blob. Strongly consistent metadata reads or an unbounded/recovery scan policy
-should intentionally make this witness unreachable and promote its no-loss
-assertion to a normal passing check.
+This is also an accepted product limitation in the default eventual-read mode.
+The witness preserves sequence allocation safety, blob-before-metadata,
+acknowledgement ordering, cursor monotonicity, and the rule that every delivered
+batch came from metadata and a blob. Production strong metadata reads remove the
+replica-omission step represented here, although this model does not yet encode
+the configuration or runtime flag. An unbounded/recovery scan policy would also
+make this witness unreachable and promote its no-loss assertion to a normal
+passing check.
 
 The model maps most directly to
 [blob-stream-metadata-store/src/lib.rs](../blob-stream-metadata-store/src/lib.rs)
@@ -316,10 +320,10 @@ separate focused modules rather than all at once.
    accepted batches; add blob-write, metadata-write, and acknowledgement
    failures, restart recovery, in-flight flushes, and the broker's local drain
    ordering across handoff.
-6. **Storage and publication strengthening:** Model a transactional producer
-   publication fence and strongly consistent metadata reads as alternative
-   designs. Their key success condition is that the two current no-loss witness
-   assertions become ordinary passing properties.
+6. **Storage and publication strengthening:** Model the available strong
+   metadata-read configuration and a transactional producer publication fence.
+   Strong reads should eliminate only the eventual-replica witness; the fence is
+   additionally needed to eliminate the stale-writer witness.
 7. **Liveness and fairness:** After the safety abstraction remains stable, add
    explicit assumptions for a live lease holder, available storage, and a
    scheduled reader, then check conditional eventual publication and delivery.

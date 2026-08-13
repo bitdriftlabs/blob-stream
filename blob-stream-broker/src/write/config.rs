@@ -4,6 +4,7 @@ use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
 use aws_types::region::Region;
 use bd_pgv::proto_validate;
+use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
 use bd_server_stats::stats::Scope;
 use bd_shutdown::ComponentShutdownTriggerHandle;
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
@@ -50,6 +51,7 @@ const DEFAULT_RESERVATION_SIZE: u64 = 10_000;
 const DEFAULT_SEGMENT_TTL_BUFFER_SECONDS: u32 = 3_600;
 const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
 const PRODUCE_REQUEST_TIMEOUT_FLUSH_DELAY_MULTIPLIER: u64 = 10;
+pub const FENCED_METADATA_WRITES_FEATURE_FLAG: &str = "blob_stream_broker_fenced_metadata_writes";
 
 #[cfg(test)]
 #[path = "./config_test.rs"]
@@ -75,6 +77,7 @@ pub struct WriteConfig {
   pub writer_id: u32,
   pub compression: blob_stream_types::Compression,
   pub blob_prefix: Option<String>,
+  pub fenced_metadata_writes: bool,
 }
 
 impl WriteConfig {
@@ -89,6 +92,7 @@ impl WriteConfig {
       writer_id: 0,
       compression: Compression::zstd(DEFAULT_ZSTD_LEVEL),
       blob_prefix: None,
+      fenced_metadata_writes: false,
     }
   }
 
@@ -115,6 +119,8 @@ impl WriteConfig {
       config.reservation_size = u64::from(sequence_reservation_size);
     }
 
+    config.fenced_metadata_writes = broker.fenced_metadata_writes;
+
     let compression = broker.segment_compression.as_ref().map_or(
       SegmentCompression::SEGMENT_COMPRESSION_ZSTD,
       EnumOrUnknown::enum_value_or_default,
@@ -132,6 +138,16 @@ impl WriteConfig {
     Duration::from_millis(
       flush_delay_ms.saturating_mul(PRODUCE_REQUEST_TIMEOUT_FLUSH_DELAY_MULTIPLIER),
     )
+  }
+
+  #[must_use]
+  pub(crate) fn fenced_metadata_writes(&self, feature_flags: Option<&FeatureFlagsWatch>) -> bool {
+    feature_flags.map_or(self.fenced_metadata_writes, |feature_flags| {
+      feature_flags.get_bool(
+        FENCED_METADATA_WRITES_FEATURE_FLAG,
+        self.fenced_metadata_writes,
+      )
+    })
   }
 }
 
@@ -178,6 +194,7 @@ pub async fn build_write_engine(
   config: &RuntimeConfig,
   shutdown_trigger_handle: ComponentShutdownTriggerHandle,
   metrics_scope: &Scope,
+  feature_flags: Option<FeatureFlagsWatch>,
 ) -> Result<Arc<dyn WriteEngine>> {
   trace!("building broker write engine from runtime config");
   proto_validate::validate(config)?;
@@ -228,6 +245,7 @@ pub async fn build_write_engine(
     metrics_scope,
   )
   .membership_rx(membership_rx)
+  .feature_flags(feature_flags)
   .build()?;
 
   debug!(
@@ -439,6 +457,8 @@ async fn build_metadata_store(
     debug!("using dynamo metadata store backend");
     let dynamo = config.dynamo();
     let table_name = dynamo_table_name(dynamo, DynamoTablePurpose::SegmentMetadata).to_string();
+    let producer_partition_lease_table_name =
+      dynamo_table_name(dynamo, DynamoTablePurpose::ProducerPartitionLeases).to_string();
     let region = dynamo.region.to_string();
 
     let region_provider = RegionProviderChain::first_try(Some(Region::new(region)));
@@ -465,6 +485,7 @@ async fn build_metadata_store(
       Arc::new(blob_stream_metadata_store::DynamoMetadataStore::new(
         client,
         table_name,
+        producer_partition_lease_table_name,
         retention_days_by_topic,
         ttl_buffer_seconds,
         Some(capacity_metrics),

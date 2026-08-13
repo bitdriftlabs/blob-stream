@@ -164,12 +164,19 @@ graceful membership handoff or orderly shutdown, the broker stops accepting new 
 partition, drains its already accepted work, and only then voluntarily releases the producer
 lease. Flushes for different virtual partitions remain concurrent.
 
-This is not a durable cross-process publication fence. A broker crash, long pause, network
-partition, or stale process resuming after its lease expires can still result in a former holder
-attempting its unconditional metadata write after a successor has published higher sequences. A
-consumer cursor advances past a later `seq_end` and cannot recover an earlier range that appears
-afterward, so this remains a known limitation until metadata publication is transactionally
-conditioned on a unique producer lease session or epoch.
+The optional `fenced_metadata_writes` mode supplies a durable cross-process publication fence. Each
+write engine creates a unique process session ID; acquisition by a new or expired session increments
+the durable lease epoch, while a live renewal by the same session preserves it. Metadata publication
+uses one DynamoDB transaction containing the metadata `Put` and a condition check for every
+partition's holder ID, epoch, session ID, and unexpired lease. A former process cannot publish after
+a successor takes the lease, even if both processes use the same node ID.
+
+The mode defaults off. Producer lease rows always carry a holder ID, lease epoch, and session ID;
+the DynamoDB lease decoder rejects rows without this durable fence identity. A transaction has room
+for one metadata write and at most 99 lease checks, so the scheduler splits larger flushes. A lost
+fence after blob upload can leave an orphaned blob, but the transaction does not publish metadata and
+the producer receives a retryable failure. When the mode is disabled, the stale-writer limitation
+remains.
 
 A consumer cursor is the greatest processed `seq_end` for one virtual partition. During scans,
 the consumer skips a batch when `batch.seq_end <= cursor` and advances its cursor only forward.
@@ -206,9 +213,10 @@ invariant.
    durable-plan completions; a completion immediately promotes an eligible successor epoch.
 6. A flush coalesces each virtual partition's accepted batches into one `StoredRecordBatch`,
   compresses each serialized partition batch independently, concatenates the stored bytes into a
-  segment blob, uploads the blob, and then writes the segment metadata row. Plans may run
-  concurrently for different virtual partitions, but each virtual partition persists plans in
-  sequence order.
+  segment blob, uploads the blob, and then writes the segment metadata row. With fenced metadata
+  writes enabled, that final write is a transaction conditioned on the snapshot lease fence for
+  every partition in the plan. Plans may run concurrently for different virtual partitions, but
+  each virtual partition persists plans in sequence order.
 7. Only after both blob upload and metadata write succeed does the broker complete the waiting
    write and return `OK`. A producer acknowledgement therefore represents durable segment
    metadata, not merely in-memory buffering.
@@ -334,7 +342,7 @@ query still apply their own frontier filters after the result is returned.
 
 For a usable source checkpoint that was not clamped to retention, recovery uses an inclusive lower
 bound only for its first window. Let $D$ be the broker's publication deadline plus the reader's
-visibility delay, rounded up to whole seconds. The lower bound is the minimum Sonyflake at
+effective visibility delay, rounded up to whole seconds. The lower bound is the minimum Sonyflake at
 $max(checkpoint\_window\_start, checkpoint\_snowflake\_time - D)$. The cursor remains the
 correctness watermark: the inclusive boundary row is replayed and skipped if its sequence end is
 already committed. Every later recovery window is queried without a Sonyflake lower bound.
@@ -364,17 +372,27 @@ Visibility-deferred, Fresh, Fast, shared, and active-horizon responses are not c
 intentionally reader-local and is discarded on restart, revocation, seek, or replacement recovery
 hydration.
 
-The visibility delay applies in every mode. When an eligible metadata row has
-`metadata_published_ts_ms > now_ms - metadata_visibility_delay_ms`, the reader defers it. In
-Recovery, deferring a window blocks later recovery windows for that partition in the same pass, so
-the cursor cannot advance past a missing earlier sequence range. The recovery pointer remains at
-the deferred window for the next pass when that window is outside Fast's bounded scan horizon. A
-deferred window inside that horizon instead completes recovery and is handed to Fast: Fast retains
-the same visibility check, blocks later snowflakes in that partition/window during the pass, and
-retries from its inclusive time floor and frontier. This prevents recovery from tail-chasing a busy
-active window while preserving the historical recovery barrier that protects cursor order. A failed
-metadata or blob read restores the pass's cursor and frontier state, so an undelivered batch is
-retried.
+The effective visibility delay applies in every mode. In the default eventual-read mode it is
+`metadata_visibility_delay_ms`; when strong metadata reads are enabled it is zero. When an eligible
+metadata row has `metadata_published_ts_ms > now_ms - effective_visibility_delay_ms`, the reader
+defers it. In Recovery, deferring a window blocks later recovery windows for that partition in the
+same pass, so the cursor cannot advance past a missing earlier sequence range. The recovery pointer
+remains at the deferred window for the next pass when that window is outside Fast's bounded scan
+horizon. A deferred window inside that horizon instead completes recovery and is handed to Fast:
+Fast retains the same visibility check, blocks later snowflakes in that partition/window during the
+pass, and retries from its inclusive time floor and frontier. This prevents recovery from
+tail-chasing a busy active window while preserving the historical recovery barrier that protects
+cursor order. A failed metadata or blob read, except a classified missing blob, restores the pass's
+cursor and frontier state so an undelivered batch is retried.
+
+A classified blob `NotFound` is a retention or storage durability violation: metadata is published
+only after its blob upload, and S3 retention must outlive the referencing metadata. The reader
+counts the missing batch's records in `lost_records`, advances its in-memory cursor through the
+batch's sequence range, and does not deliver its records. This lets later retained data continue
+without treating timeouts, permissions, corruption, or other storage failures as loss. The reader
+does not automatically commit this skip; the normal caller-controlled commit path remains
+responsible for persisting later acknowledged progress. A restart before that commit can classify
+the same missing range again rather than silently acknowledging previously delivered records.
 
 Prefetch-capacity exhaustion is also a recovery barrier. The reader advances the recovery pointer
 past only fully processed windows and leaves it at the earliest window containing a batch whose
@@ -391,10 +409,10 @@ assignment, hydration, and seek changes remain prompt.
 
 ### Fast Query Bounds
 
-Let $D$ be the broker's enforced maximum metadata-publication lag plus
-`metadata_visibility_delay_ms`, rounded up to whole seconds. The Fast safe timestamp is
-$T_{safe} = now - D$. The reader considers the current window plus enough preceding windows to
-cover $D$, then omits every window whose end is at or before $T_{safe}$.
+Let $D$ be the broker's enforced maximum metadata-publication lag plus the effective visibility
+delay, rounded up to whole seconds. The Fast safe timestamp is $T_{safe} = now - D$. The reader
+considers the current window plus enough preceding windows to cover $D$, then omits every window
+whose end is at or before $T_{safe}$.
 
 With the defaults, $D = 15s + 2s = 17s$. This is Fast's metadata-query lower-bound horizon, not
 a 17-second wait applied to every returned row: the publication deadline accounts for time while a
@@ -536,8 +554,10 @@ trades data transfer for one fewer object-store request.
 
 The broker starts `max_metadata_publication_lag_ms` before segment construction and requires both
 blob upload and metadata persistence to finish within the remaining budget. The unset topic default
-is 15 seconds. Consumers combine that deadline with `metadata_visibility_delay_ms` (two seconds by
-default), so their default availability overlap is $D = 17s$.
+is 15 seconds. Eventual-read consumers combine that deadline with `metadata_visibility_delay_ms`
+(two seconds by default), so their default availability overlap is $D = 17s$. Strong metadata reads
+set the effective visibility delay to zero, yielding $D = 15s$ under the default publication
+deadline.
 
 The Fast safe timestamp is $T_{safe} = now - D$; it omits older windows and uses the Sonyflake
 minimum for $max(window\_start, T_{safe})$ in the remaining windows. Checkpoint recovery uses the
@@ -558,12 +578,23 @@ investigate deadline exhaustion and flush failures rather than silently widening
 
 ### Read Consistency and Delivery Tradeoffs
 
-The implementation uses eventually consistent DynamoDB metadata queries. A broker returns `OK`
-only after it uploads the segment blob and writes its metadata row, but an eventually consistent
-reader replica may not observe that row immediately. `metadata_visibility_delay_ms` can defer
-accepting metadata whose publication timestamp is too recent. It defaults to two seconds and is a
-best-effort staleness margin, not a correctness guarantee: DynamoDB supplies no bounded
-replication-delay contract, and the delay does not solve stale-writer publication.
+Metadata queries are eventually consistent by default. A broker returns `OK` only after it uploads
+the segment blob and writes its metadata row, but an eventually consistent reader replica may not
+observe that row immediately. `metadata_visibility_delay_ms` can defer accepting metadata whose
+publication timestamp is too recent. It defaults to two seconds and is a best-effort staleness
+margin, not a correctness guarantee: DynamoDB supplies no bounded replication-delay contract, and
+the delay does not solve stale-writer publication.
+
+Set `ConsumerReadConfig.strongly_consistent_metadata_reads` to enable DynamoDB `ConsistentRead` for
+every metadata-query page. It defaults to false. The runtime feature flag
+`blob_stream_consumer_strong_metadata_reads` overrides that setting, using the configuration value
+as its fallback. The reader snapshots the resolved value at the beginning of each scan pass; a flag
+change therefore affects the next pass without invalidating metadata caches, clearing Fast
+frontiers, replaying cursors, or retroactively changing a hydrated recovery source-window overlap.
+Operational flag changes are expected to be infrequent: a strong-to-eventual change after hydration
+retains the shorter strong-mode overlap for that recovery. Strong mode ignores a configured nonzero
+`metadata_visibility_delay_ms`: its effective delay is zero while the broker publication deadline
+remains part of Fast and checkpoint-recovery overlap calculations.
 
 The delay is needed even though Fast retains a per-partition observed snowflake frontier. That
 frontier records only metadata returned by a prior query; it is not evidence that the query returned
@@ -583,26 +614,25 @@ advances this bound during ordinary replica lag; it does not turn the frontier i
 watermark or establish a DynamoDB visibility guarantee.
 
 A Fast or checkpoint-overlap recovery scan can miss a row that becomes visible outside its bounded
-availability horizon. Strongly consistent metadata reads remove the read-replica component, but
-they still do not prevent a stale former producer from publishing after lease expiry. A transactional
-producer publication fence is required with stronger reads for a complete ordering guarantee.
+availability horizon. Strong metadata reads remove the read-replica component, but do not make a
+paginated query an atomic multi-page snapshot. Enabling fenced broker metadata writes additionally
+prevents a stale former producer from publishing after lease expiry; with it disabled, the former
+stale-writer limitation remains.
 
 The reader's cursor filtering relies on metadata becoming visible in compatible sequence order.
-Graceful broker handoff drains locally accepted work before lease release, but the expiry/stale
-writer limitation described above remains. Applications must tolerate duplicates, and deployments
-that require a stronger at-least-once contract across all writer failures need a transactional
-producer publication fence in addition to any reader-consistency choice.
+Graceful broker handoff drains locally accepted work before lease release. Applications must tolerate
+duplicates; deployments that require the stronger cross-process publication property must enable
+fenced metadata writes in addition to choosing an appropriate reader-consistency mode.
 
-Future reader modes may offer the following cost/correctness tradeoffs:
-
-- **Strongly consistent metadata queries:** Querying every metadata page with DynamoDB strong
-  consistency removes read-replica staleness at approximately twice the metadata-query RRU
-  component. It does not by itself prevent a stale former producer from publishing metadata after
-  lease expiry, so it must be paired with a publication fence for a complete ordering guarantee.
+Strong metadata queries remove read-replica staleness at approximately twice the metadata-query RRU
+component. They do not by themselves prevent stale publication; fenced broker metadata writes
+provide that publication fence when enabled.
 
 Use `cost-analysis/cost_analysis.py` with real page sizes, poll rates, consumer counts, and
-regional pricing before selecting strong reads: they approximately double metadata scan RRUs, while
-higher recovery query rates or delayed-visibility horizons add scan work.
+regional pricing before enabling strong reads. Its `--strong-metadata-reads` mode models the
+resolved `strongly_consistent_metadata_reads` configuration or runtime-flag value; it doubles
+metadata scan RRUs but leaves already strongly consistent coordination reads unchanged. Its
+`--transactional-metadata-writes` mode separately models fenced metadata publication.
 
 ## Consumer Group Coordination
 
@@ -693,12 +723,13 @@ pod loads, and the optional `pod_id` beside every partition's member assignment.
 continue to report member-only assignments without pod fields.
 
 The always-available `/state` endpoint returns that local state plus a fresh, strongly consistent
-lease-table query for the consumer group. The response joins retained lease rows with the last
-structurally valid assignment plan accepted by the local coordinator, so it includes planned but
-currently unleased partitions as well as other consumers' owner, generation, heartbeat, and
-committed cursor information. The inline query never enters the driver control flow and is bounded
-to one second. A query error or timeout is represented as `lookup_failed`; the local state remains
-available in that response.
+lease-table query for the consumer group. Its `local.partitions` reports only current or pending
+local assignments; revocation discards the prior local cursor snapshot. The response joins
+retained lease rows with the last structurally valid assignment plan accepted by the local
+coordinator, so it includes planned but currently unleased partitions as well as other consumers'
+owner, generation, heartbeat, and committed cursor information. The inline query never enters the
+driver control flow and is bounded to one second. A query error or timeout is represented as
+`lookup_failed`; the local state remains available in that response.
 
 ## Correctness and Failure Behavior
 
@@ -740,6 +771,7 @@ defaults are:
 | Consumer metadata window | 300 seconds |
 | Broker metadata publication deadline | 15 seconds |
 | Consumer metadata visibility delay | 2 seconds |
+| Consumer strong metadata reads | Disabled |
 | Consumer recovery slice | Up to 32 metadata windows per scan pass |
 | Consumer prefetch target | 64 MiB |
 | Consumer lease duration | 30 seconds |

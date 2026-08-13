@@ -1,8 +1,10 @@
-use super::buffer::{FlushPartition, FlushPlan, FlushTrigger};
+use super::buffer::{FlushCompletionError, FlushPartition, FlushPlan, FlushTrigger};
 use super::flush::FlushContext;
 use super::metrics::WriteMetrics;
 use super::state::{PartitionState, WriteState};
 use super::{TopicInfo, WriteConfig};
+use bd_runtime_config::feature_flags::FeatureFlagsWatch;
+use blob_stream_metadata_store::MAX_FENCED_METADATA_PARTITIONS;
 use log::trace;
 use parking_lot::Mutex;
 use protobuf::Chars;
@@ -11,6 +13,10 @@ use std::iter;
 use std::sync::Arc;
 use std::time::Instant;
 use time::OffsetDateTime;
+
+#[cfg(test)]
+#[path = "./scheduler_test.rs"]
+mod tests;
 
 pub(super) async fn flush_plan_and_notify(
   flush_context: &FlushContext,
@@ -43,11 +49,15 @@ pub(super) async fn flush_plan_and_notify(
     .flush_latency_seconds
     .observe(flush_started.elapsed().as_secs_f64());
   mark_flush_complete(state, &topic, &flushed_partitions);
-  let completion_result = result
-    .as_ref()
-    .map_or_else(|error| Err(error.to_string()), |_ok| Ok(()));
+  let completion_result = result.as_ref().map_or_else(
+    |error| match error {
+      super::WriteError::LeaseFenceLost => Err(FlushCompletionError::LeaseFenceLost),
+      _ => Err(FlushCompletionError::Internal),
+    },
+    |_ok| Ok(()),
+  );
   for completion in completions {
-    let _ignored = completion.send(completion_result.clone());
+    let _ignored = completion.send(completion_result);
   }
 }
 
@@ -87,10 +97,27 @@ fn take_flush_partition(
   partition_state: &mut PartitionState,
   virtual_partition_id: blob_stream_types::VirtualPartitionId,
   trigger: FlushTrigger,
+  require_fence: bool,
 ) -> Option<FlushPartition> {
-  let batches = std::mem::take(&mut partition_state.buffer.batches);
+  let mut batches = std::mem::take(&mut partition_state.buffer.batches);
   if batches.is_empty() {
     partition_state.buffer.reset();
+    return None;
+  }
+
+  let lease_fence = batches
+    .first()
+    .and_then(|batch| batch.acceptance_fence.clone());
+  let matching_fences = batches
+    .iter()
+    .all(|batch| batch.acceptance_fence == lease_fence);
+  if require_fence && (lease_fence.is_none() || !matching_fences) {
+    partition_state.buffer.reset();
+    for batch in &mut batches {
+      if let Some(completion) = batch.completion.take() {
+        let _ignored = completion.send(Err(FlushCompletionError::LeaseFenceLost));
+      }
+    }
     return None;
   }
 
@@ -98,6 +125,7 @@ fn take_flush_partition(
   partition_state.flush_in_flight = true;
   Some(FlushPartition {
     virtual_partition_id,
+    lease_fence,
     batches,
     trigger,
   })
@@ -127,6 +155,8 @@ fn take_flush_partitions(
   topic: &Chars,
   virtual_partition_ids: impl IntoIterator<Item = blob_stream_types::VirtualPartitionId>,
   trigger: FlushTrigger,
+  max_partitions: usize,
+  require_fence: bool,
 ) -> Vec<FlushPartition> {
   virtual_partition_ids
     .into_iter()
@@ -136,9 +166,15 @@ fn take_flush_partitions(
       if partition_state.flush_in_flight {
         None
       } else {
-        take_flush_partition(partition_state, virtual_partition_id, trigger)
+        take_flush_partition(
+          partition_state,
+          virtual_partition_id,
+          trigger,
+          require_fence,
+        )
       }
     })
+    .take(max_partitions)
     .collect()
 }
 
@@ -146,12 +182,14 @@ pub(super) fn collect_flush_plans(
   state: &Arc<Mutex<WriteState>>,
   now_ts_ms: i64,
   config: &WriteConfig,
+  feature_flags: Option<&FeatureFlagsWatch>,
   topics: &HashMap<Chars, TopicInfo>,
   max_plans: usize,
 ) -> Vec<FlushPlan> {
   if max_plans == 0 {
     return Vec::new();
   }
+  let fenced_metadata_writes = config.fenced_metadata_writes(feature_flags);
   let mut state = state.lock();
   let mut partition_keys = state.partition_keys();
   partition_keys.sort_unstable();
@@ -170,7 +208,8 @@ pub(super) fn collect_flush_plans(
       .unwrap_or(0)
   });
   let partition_state_count = partition_keys.len();
-  let mut plans_by_topic: HashMap<Chars, Vec<FlushPartition>> = HashMap::new();
+  let mut plans_by_topic: HashMap<Chars, Vec<Vec<FlushPartition>>> = HashMap::new();
+  let mut planned_count = 0;
   let mut last_planned_topic = None;
 
   for (topic, virtual_partition_id) in partition_keys
@@ -182,8 +221,13 @@ pub(super) fn collect_flush_plans(
     topics
       .get(topic.as_str())
       .expect("write state is created only for configured topics");
-    let is_new_topic = !plans_by_topic.contains_key(topic);
-    if is_new_topic && plans_by_topic.len() == max_plans {
+    let existing_partition_count = plans_by_topic
+      .get(topic)
+      .and_then(|plans| plans.last())
+      .map_or(0, Vec::len);
+    let requires_new_plan = !plans_by_topic.contains_key(topic)
+      || (fenced_metadata_writes && existing_partition_count == MAX_FENCED_METADATA_PARTITIONS);
+    if requires_new_plan && planned_count == max_plans {
       continue;
     }
     let flush_trigger = state
@@ -193,6 +237,15 @@ pub(super) fn collect_flush_plans(
       continue;
     };
 
+    let max_partitions = if fenced_metadata_writes {
+      if requires_new_plan {
+        MAX_FENCED_METADATA_PARTITIONS
+      } else {
+        MAX_FENCED_METADATA_PARTITIONS.saturating_sub(existing_partition_count)
+      }
+    } else {
+      usize::MAX
+    };
     let partitions = match flush_trigger {
       // A topic's first time-due partition establishes its flush cadence. Pulling its available
       // peers forward produces one larger segment rather than retaining their startup skew.
@@ -205,24 +258,31 @@ pub(super) fn collect_flush_plans(
           .iter()
           .copied(),
         FlushTrigger::MaxDelay,
+        max_partitions,
+        fenced_metadata_writes,
       ),
       FlushTrigger::MaxBytes | FlushTrigger::LeaseDrain => take_flush_partitions(
         &mut state,
         topic,
         iter::once(*virtual_partition_id),
         flush_trigger,
+        max_partitions,
+        fenced_metadata_writes,
       ),
     };
     if partitions.is_empty() {
       continue;
     }
-    plans_by_topic
-      .entry(topic.clone())
-      .or_default()
-      .extend(partitions);
-    if is_new_topic {
+    let plans = plans_by_topic.entry(topic.clone()).or_default();
+    if requires_new_plan {
+      plans.push(Vec::new());
+      planned_count += 1;
       last_planned_topic = Some(topic.clone());
     }
+    plans
+      .last_mut()
+      .expect("new or existing flush plan is available")
+      .extend(partitions);
   }
 
   if let Some(last_planned_topic) = last_planned_topic {
@@ -231,13 +291,17 @@ pub(super) fn collect_flush_plans(
 
   plans_by_topic
     .into_iter()
-    .map(|(topic, partitions)| FlushPlan {
-      max_metadata_publication_lag_ms: topics
+    .flat_map(|(topic, plans)| {
+      let max_metadata_publication_lag_ms = topics
         .get(topic.as_str())
         .expect("flush plans are created only for configured topics")
-        .max_metadata_publication_lag_ms,
-      topic,
-      partitions,
+        .max_metadata_publication_lag_ms;
+      plans.into_iter().map(move |partitions| FlushPlan {
+        max_metadata_publication_lag_ms,
+        topic: topic.clone(),
+        partitions,
+        fenced_metadata_writes,
+      })
     })
     .collect()
 }

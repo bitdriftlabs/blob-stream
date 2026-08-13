@@ -3,10 +3,16 @@
 mod tests;
 
 use crate::codec::EncodedSegmentMetadata;
-use crate::{MetadataStore, SegmentMetadata};
+use crate::{
+  MetadataReadConsistency,
+  MetadataStore,
+  MetadataWriteResult,
+  ProducerPartitionFence,
+  SegmentMetadata,
+};
 use anyhow::Result;
 use async_trait::async_trait;
-use bd_log::warn_every;
+use bd_log_util::warn_every;
 use blob_stream_types::{SnowflakeId, TopicWindowKey, format_unix_timestamp_ms};
 use log::trace;
 use parking_lot::RwLock;
@@ -31,7 +37,17 @@ impl InMemoryMetadataStore {
 
 #[async_trait]
 impl MetadataStore for InMemoryMetadataStore {
-  async fn write_segment(&self, metadata: SegmentMetadata) -> Result<()> {
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[ProducerPartitionFence]>,
+    _now_ts_ms: i64,
+  ) -> MetadataWriteResult {
+    if fences.is_some() {
+      return Err(
+        anyhow::anyhow!("fenced metadata writes require the DynamoDB metadata store").into(),
+      );
+    }
     trace!(
       "metadata(memory) write_segment: topic={}, window_start={}, snowflake_id={}",
       metadata.window.topic,
@@ -56,6 +72,7 @@ impl MetadataStore for InMemoryMetadataStore {
     &self,
     window: &TopicWindowKey,
     min_snowflake: Option<SnowflakeId>,
+    _consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     trace!(
       "metadata(memory) scan_window: topic={}, window_start={}, min_snowflake={:?}",

@@ -12,8 +12,12 @@
 
 - Run Blob Stream tests from the monorepo root with `./bazelw`; do not use Cargo for test or lint
   execution in this workspace.
-- To run one Rust test inside the Nextest-backed Bazel target, pass a Nextest expression through
-  `--test_arg`. For example:
+- Use `--nocache_test_results` when validating a just-edited test. Wait for a prior Bazel command
+  to finish before editing its inputs; with `--guard_against_concurrent_changes`, Bazel deliberately
+  refuses to cache outputs built while source files changed.
+- Service-backed integration tests must run through their generated Nextest wrapper, never the raw
+  `__libtest` target. The wrapper starts every service declared through `itest_deps`, including the
+  pooled DynamoDB and LocalStack backends used by Blob Stream's end-to-end tests. To run one test:
 
   ```sh
   ./bazelw test --nocache_test_results --test_output=streamed \
@@ -47,9 +51,8 @@
   instead of adding scalar span attributes.
 - Add a metric only when it provides legitimate operational value that cannot be derived from
   existing metrics.
-- Do not run `cargo nextest list` in its default paging mode; it can page and hang the session. If
-  listing is necessary, disable paging and constrain the output first, otherwise run a targeted
-  `cargo nextest run` command directly.
+- Do not run Cargo or Cargo Nextest commands when running from the monorepo; use the Bazel targets
+  above.
 - Format Rust and TOML changes with `cargo +nightly fmt` followed by
   `../scripts/format-toml.sh`. Use `../scripts/format-toml.sh --check` to verify TOML formatting
   without modifying files.
