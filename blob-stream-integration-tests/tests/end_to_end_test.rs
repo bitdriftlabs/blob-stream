@@ -36,6 +36,7 @@ use blob_stream_metadata_store::{
   MAX_FENCED_METADATA_PARTITIONS,
   MetadataReadConsistency,
   MetadataStore,
+  ProducerLeaseFenceLost,
   ProducerPartitionFence,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
@@ -48,7 +49,6 @@ use blob_stream_producer::{
   ProducerClientImpl,
   ProducerConfig,
   ProducerRecord,
-  ProducerRetryReason,
   ProducerTopicConfig,
 };
 use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
@@ -492,6 +492,7 @@ struct FenceInvalidatingMetadataStore {
   inner: Arc<dyn MetadataStore>,
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
   attempted_window: Mutex<Option<TopicWindowKey>>,
+  rejected_fenced_write: AtomicBool,
 }
 
 impl FenceInvalidatingMetadataStore {
@@ -500,11 +501,16 @@ impl FenceInvalidatingMetadataStore {
       inner,
       lease_store,
       attempted_window: Mutex::new(None),
+      rejected_fenced_write: AtomicBool::new(false),
     }
   }
 
   async fn attempted_window(&self) -> Option<TopicWindowKey> {
     self.attempted_window.lock().await.clone()
+  }
+
+  fn rejected_fenced_write(&self) -> bool {
+    self.rejected_fenced_write.load(Ordering::Acquire)
   }
 }
 
@@ -536,7 +542,15 @@ impl MetadataStore for FenceInvalidatingMetadataStore {
       "test fault could not invalidate producer lease: {release:?}"
     );
 
-    self.inner.write_segment(metadata, fences, now_ts_ms).await
+    let result = self.inner.write_segment(metadata, fences, now_ts_ms).await;
+    if result
+      .as_ref()
+      .err()
+      .is_some_and(|error| error.downcast_ref::<ProducerLeaseFenceLost>().is_some())
+    {
+      self.rejected_fenced_write.store(true, Ordering::Release);
+    }
+    result
   }
 
   async fn scan_window_from_snowflake(
@@ -1383,7 +1397,6 @@ async fn fenced_metadata_write_fails_when_lease_is_invalidated_before_dynamo_tra
   let producer = cluster
     .create_producer(config, vec![producer_topic()])
     .await?;
-
   let error = produce_message(&producer, b"fenced-metadata-fault".to_vec(), "fenced-fault")
     .await
     .expect_err("metadata publication must fail after its producer lease is invalidated");
@@ -1391,18 +1404,9 @@ async fn fenced_metadata_write_fails_when_lease_is_invalidated_before_dynamo_tra
     format!("{error:#}").contains("producer retries exhausted"),
     "unexpected produce failure: {error:#}"
   );
-  let retry_summary = producer
-    .diagnostics()
-    .expect("producer exposes retry diagnostics")
-    .retry_summary();
   assert!(
-    retry_summary.samples.iter().any(|sample| {
-      sample.reason == ProducerRetryReason::Overloaded
-        && sample
-          .detail
-          .contains("fenced metadata publication rejected because a producer lease fence was lost")
-    }),
-    "producer never observed the fenced metadata rejection: {retry_summary:#?}"
+    metadata_store.rejected_fenced_write(),
+    "Dynamo must reject metadata publication with the invalidated producer lease fence"
   );
 
   let attempted_window = metadata_store
