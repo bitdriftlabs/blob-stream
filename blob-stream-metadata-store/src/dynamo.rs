@@ -148,7 +148,7 @@ impl MetadataStore for DynamoMetadataStore {
       let mut lease_keys = HashSet::with_capacity(fences.len());
       for fence in fences {
         ensure!(
-          lease_keys.insert(fence.key.format()),
+          lease_keys.insert(&fence.key),
           "fenced metadata publication has duplicate producer lease key"
         );
       }
@@ -201,12 +201,6 @@ impl MetadataStore for DynamoMetadataStore {
       );
       return Ok(());
     };
-
-    let mut lease_keys = HashSet::with_capacity(fences.len());
-    for fence in fences {
-      let key_is_new = lease_keys.insert(fence.key.format());
-      debug_assert!(key_is_new, "fence keys were validated before encoding");
-    }
 
     let metadata_put = Put::builder()
       .table_name(&self.table_name)
@@ -274,7 +268,7 @@ impl MetadataStore for DynamoMetadataStore {
         debug!(
           "metadata(dynamo) fenced write complete: table={}, partitions={}",
           self.table_name,
-          lease_keys.len()
+          fences.len()
         );
         Ok(())
       },

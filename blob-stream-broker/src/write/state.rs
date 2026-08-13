@@ -100,7 +100,7 @@ pub(super) struct PartitionState {
   pub(super) adaptive_reservation_size: Option<u64>,
   pub(super) records_allocated_since_lease_maintenance: u64,
   pub(super) lease_expiration_ts_ms: Option<i64>,
-  pub(super) lease_fence: Option<ProducerLeaseFence>,
+  pub(super) lease_fence: Option<Arc<ProducerLeaseFence>>,
   pub(super) flush_in_flight: bool,
   pub(super) allocation_in_flight: bool,
   pub(super) allocation_started_ts_ms: Option<i64>,

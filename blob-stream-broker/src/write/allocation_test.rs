@@ -25,7 +25,7 @@ fn fence_change_discards_buffered_batches_and_completes_them() {
   {
     let mut state = state.lock();
     let partition = state.partition_state_mut("telemetry", 0);
-    partition.lease_fence = Some(fence(1));
+    partition.lease_fence = Some(Arc::new(fence(1)));
     partition.buffer.push(
       BufferedBatch {
         records: vec![new_record(vec![1], 0)],
@@ -34,7 +34,7 @@ fn fence_change_discards_buffered_batches_and_completes_them() {
           payload_bytes: 1,
         },
         seq_range: SeqRange { start: 0, end: 0 },
-        acceptance_fence: Some(fence(1)),
+        acceptance_fence: Some(Arc::new(fence(1))),
         completion: Some(completion),
       },
       0,
@@ -74,5 +74,5 @@ fn fence_change_discards_buffered_batches_and_completes_them() {
     .partition_state("telemetry", 0)
     .expect("partition exists");
   assert!(partition.buffer.batches.is_empty());
-  assert_eq!(partition.lease_fence, Some(fence(2)));
+  assert_eq!(partition.lease_fence.as_deref(), Some(&fence(2)));
 }

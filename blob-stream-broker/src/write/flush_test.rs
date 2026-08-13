@@ -90,7 +90,7 @@ fn merge_partition_batches_preserves_order_and_combines_metadata() -> Result<()>
   let (virtual_partition_id, records, summary, seq_range) =
     FlushContext::merge_partition_batches(FlushPartition {
       virtual_partition_id: 4,
-      lease_fence: Some(lease_fence()),
+      lease_fence: Some(Arc::new(lease_fence())),
       batches: vec![
         BufferedBatch {
           records: vec![new_record(b"first".to_vec(), 10)],
@@ -99,7 +99,7 @@ fn merge_partition_batches_preserves_order_and_combines_metadata() -> Result<()>
             payload_bytes: 5,
           },
           seq_range: SeqRange { start: 8, end: 8 },
-          acceptance_fence: Some(lease_fence()),
+          acceptance_fence: Some(Arc::new(lease_fence())),
           completion: None,
         },
         BufferedBatch {
@@ -109,7 +109,7 @@ fn merge_partition_batches_preserves_order_and_combines_metadata() -> Result<()>
             payload_bytes: 6,
           },
           seq_range: SeqRange { start: 9, end: 9 },
-          acceptance_fence: Some(lease_fence()),
+          acceptance_fence: Some(Arc::new(lease_fence())),
           completion: None,
         },
       ],
@@ -134,7 +134,7 @@ fn merge_partition_batches_preserves_order_and_combines_metadata() -> Result<()>
 fn merge_partition_batches_rejects_noncontiguous_ranges() {
   let result = FlushContext::merge_partition_batches(FlushPartition {
     virtual_partition_id: 4,
-    lease_fence: Some(lease_fence()),
+    lease_fence: Some(Arc::new(lease_fence())),
     batches: vec![
       BufferedBatch {
         records: vec![new_record(b"first".to_vec(), 10)],
@@ -143,7 +143,7 @@ fn merge_partition_batches_rejects_noncontiguous_ranges() {
           payload_bytes: 5,
         },
         seq_range: SeqRange { start: 8, end: 8 },
-        acceptance_fence: Some(lease_fence()),
+        acceptance_fence: Some(Arc::new(lease_fence())),
         completion: None,
       },
       BufferedBatch {
@@ -153,7 +153,7 @@ fn merge_partition_batches_rejects_noncontiguous_ranges() {
           payload_bytes: 5,
         },
         seq_range: SeqRange { start: 10, end: 10 },
-        acceptance_fence: Some(lease_fence()),
+        acceptance_fence: Some(Arc::new(lease_fence())),
         completion: None,
       },
     ],
@@ -189,7 +189,7 @@ async fn lost_fence_does_not_fall_back_to_ordinary_metadata_write() -> Result<()
     topic: "telemetry".into(),
     partitions: vec![FlushPartition {
       virtual_partition_id: 4,
-      lease_fence: Some(lease_fence()),
+      lease_fence: Some(Arc::new(lease_fence())),
       batches: vec![BufferedBatch {
         records: vec![new_record(b"payload".to_vec(), 10)],
         summary: BatchSummary {
@@ -197,7 +197,7 @@ async fn lost_fence_does_not_fall_back_to_ordinary_metadata_write() -> Result<()
           payload_bytes: 7,
         },
         seq_range: SeqRange { start: 0, end: 0 },
-        acceptance_fence: Some(lease_fence()),
+        acceptance_fence: Some(Arc::new(lease_fence())),
         completion: None,
       }],
       trigger: FlushTrigger::MaxBytes,

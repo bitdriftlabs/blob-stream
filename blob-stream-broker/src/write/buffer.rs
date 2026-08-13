@@ -3,6 +3,7 @@ use anyhow::Result;
 use blob_stream_metadata_store::ProducerLeaseFence;
 use blob_stream_types::{BatchSummary, Record, SeqRange, VirtualPartitionId};
 use protobuf::Chars;
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 pub(super) type FlushCompletion = oneshot::Sender<Result<(), FlushCompletionError>>;
@@ -79,7 +80,7 @@ pub(super) struct BufferedBatch {
   pub(super) records: Vec<Record>,
   pub(super) summary: BatchSummary,
   pub(super) seq_range: SeqRange,
-  pub(super) acceptance_fence: Option<ProducerLeaseFence>,
+  pub(super) acceptance_fence: Option<Arc<ProducerLeaseFence>>,
   pub(super) completion: Option<FlushCompletion>,
 }
 
@@ -102,7 +103,7 @@ pub(super) struct FlushPlan {
 #[derive(Debug)]
 pub(super) struct FlushPartition {
   pub(super) virtual_partition_id: VirtualPartitionId,
-  pub(super) lease_fence: Option<ProducerLeaseFence>,
+  pub(super) lease_fence: Option<Arc<ProducerLeaseFence>>,
   pub(super) batches: Vec<BufferedBatch>,
   pub(super) trigger: FlushTrigger,
 }

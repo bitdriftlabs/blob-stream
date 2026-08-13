@@ -316,9 +316,15 @@ impl FlushContext {
         partitions
           .iter()
           .map(|partition| {
-            let fence = partition.lease_fence.clone().ok_or_else(|| {
-              anyhow::anyhow!("fenced metadata publication requires a durable producer lease fence")
-            })?;
+            let fence = partition
+              .lease_fence
+              .as_deref()
+              .cloned()
+              .ok_or_else(|| {
+                anyhow::anyhow!(
+                  "fenced metadata publication requires a durable producer lease fence"
+                )
+              })?;
             Ok(ProducerPartitionFence {
               key: ProducerPartitionLeaseKey {
                 topic: plan.topic.clone(),

@@ -36,7 +36,7 @@ fn fenced_flushes_split_at_ninety_nine_flushable_partitions() {
     let mut state = state.lock();
     for virtual_partition_id in 0 .. 100 {
       let partition = state.partition_state_mut("telemetry", virtual_partition_id);
-      partition.lease_fence = Some(fence());
+      partition.lease_fence = Some(Arc::new(fence()));
       partition.buffer.push(
         BufferedBatch {
           records: vec![new_record(vec![1], 0)],
@@ -48,7 +48,7 @@ fn fenced_flushes_split_at_ninety_nine_flushable_partitions() {
             start: virtual_partition_id.into(),
             end: virtual_partition_id.into(),
           },
-          acceptance_fence: Some(fence()),
+          acceptance_fence: Some(Arc::new(fence())),
           completion: None,
         },
         0,
@@ -77,7 +77,7 @@ fn fenced_flush_uses_the_batches_acceptance_fence() {
   {
     let mut state = state.lock();
     let partition = state.partition_state_mut("telemetry", 0);
-    partition.lease_fence = Some(current_fence);
+    partition.lease_fence = Some(Arc::new(current_fence));
     partition.buffer.push(
       BufferedBatch {
         records: vec![new_record(vec![1], 0)],
@@ -86,7 +86,7 @@ fn fenced_flush_uses_the_batches_acceptance_fence() {
           payload_bytes: 1,
         },
         seq_range: SeqRange { start: 0, end: 0 },
-        acceptance_fence: Some(acceptance_fence.clone()),
+        acceptance_fence: Some(Arc::new(acceptance_fence.clone())),
         completion: None,
       },
       0,
@@ -98,7 +98,10 @@ fn fenced_flush_uses_the_batches_acceptance_fence() {
   let plans = collect_flush_plans(&state, 1_000, &config, None, &topics(), 1);
 
   assert_eq!(plans.len(), 1);
-  assert_eq!(plans[0].partitions[0].lease_fence, Some(acceptance_fence));
+  assert_eq!(
+    plans[0].partitions[0].lease_fence.as_deref(),
+    Some(&acceptance_fence)
+  );
 }
 
 #[test]
@@ -108,7 +111,7 @@ fn fenced_flush_drops_batches_without_an_acceptance_fence() {
   {
     let mut state = state.lock();
     let partition = state.partition_state_mut("telemetry", 0);
-    partition.lease_fence = Some(fence());
+    partition.lease_fence = Some(Arc::new(fence()));
     partition.buffer.push(
       BufferedBatch {
         records: vec![new_record(vec![1], 0)],
