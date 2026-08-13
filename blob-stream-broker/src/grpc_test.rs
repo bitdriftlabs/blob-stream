@@ -122,7 +122,11 @@ impl crate::write::WriteEngine for FailingWriteEngine {
 }
 
 #[test]
-fn limits_decoded_produce_request_bytes() {
+fn limits_produce_request_bytes() {
+  assert_eq!(
+    produce_request_config().max_request_bytes,
+    MAX_PRODUCE_BATCHES_REQUEST_BYTES
+  );
   assert_eq!(
     produce_request_config().max_decoded_request_bytes,
     MAX_PRODUCE_BATCHES_REQUEST_BYTES

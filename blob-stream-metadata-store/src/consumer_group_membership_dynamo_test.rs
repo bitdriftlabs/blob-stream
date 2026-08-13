@@ -1,4 +1,4 @@
-use super::retry_planner_transaction_conflicts;
+use crate::aws::retry_dynamo_transaction_conflicts;
 use crate::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentPlan,
@@ -31,11 +31,11 @@ const RECORD_TYPE_ATTRIBUTE_NAME: &str = "record_type";
 const POD_ID_ATTRIBUTE_NAME: &str = "pod_id";
 
 #[tokio::test]
-async fn planner_transaction_conflict_retries_until_success() {
+async fn transaction_conflict_retries_until_success() {
   let attempts = Arc::new(AtomicUsize::new(0));
   let operation_attempts = attempts.clone();
 
-  let result = retry_planner_transaction_conflicts(
+  let result = retry_dynamo_transaction_conflicts(
     "test",
     move || {
       let operation_attempts = operation_attempts.clone();

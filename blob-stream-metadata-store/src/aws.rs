@@ -1,5 +1,7 @@
 use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
+use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use bd_backoff::{ExponentialBackoffBuilder, Finite, FiniteBackoff as _, SystemClock};
 use log::trace;
 use std::future::Future;
@@ -25,6 +27,35 @@ pub fn aws_timeout_config() -> TimeoutConfig {
     .operation_timeout(OPERATION_TIMEOUT)
     .operation_attempt_timeout(OPERATION_ATTEMPT_TIMEOUT)
     .build()
+}
+
+/// Returns whether a `DynamoDB` operation failed with a direct transaction conflict.
+///
+/// Single-item operations, such as `UpdateItem`, report this as
+/// `TransactionConflictException`. Transactional writes report per-item cancellation reasons and
+/// use [`transaction_cancellation_has_code`] instead.
+pub fn is_dynamo_transaction_conflict<E, R>(error: &SdkError<E, R>) -> bool
+where
+  E: ProvideErrorMetadata,
+{
+  error
+    .as_service_error()
+    .is_some_and(|service_error| service_error.code() == Some("TransactionConflictException"))
+}
+
+/// Returns whether a transactional write was canceled with a specific per-item reason code.
+pub fn transaction_cancellation_has_code(
+  error: &TransactWriteItemsError,
+  expected_code: &str,
+) -> bool {
+  matches!(
+    error,
+    TransactWriteItemsError::TransactionCanceledException(cancellation)
+      if cancellation
+        .cancellation_reasons()
+        .iter()
+        .any(|reason| reason.code() == Some(expected_code))
+  )
 }
 
 /// Retry short-lived `DynamoDB` transaction conflicts outside the SDK retry classifier.

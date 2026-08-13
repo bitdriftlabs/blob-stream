@@ -2,7 +2,7 @@
 #[path = "./consumer_group_membership_dynamo_test.rs"]
 mod tests;
 
-use crate::aws::retry_dynamo_transaction_conflicts;
+use crate::aws::{is_dynamo_transaction_conflict, retry_dynamo_transaction_conflicts};
 use crate::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentPlan,
@@ -25,7 +25,6 @@ use aws_sdk_dynamodb::types::{
 };
 use log::trace;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use uuid::Uuid;
 
 const ATTR_PK: &str = "pk";
@@ -51,30 +50,6 @@ const RECORD_TYPE_PLANNER_LEASE: &str = "assignment_planner_lease";
 const ASSIGNMENT_CONTROL_PARTITION_PREFIX: &str = "__blob_stream_assignment_control_v1__";
 const ASSIGNMENT_PLAN_SORT_KEY: &str = "__blob_stream_assignment_plan_v1__";
 const PLANNER_LEASE_SORT_KEY: &str = "__blob_stream_assignment_planner_v1__";
-//
-// retry_planner_transaction_conflicts
-//
-
-/// Retry only short-lived conflicts on the planner item.
-///
-/// `DynamoDB`'s standard SDK retry classifier does not retry `TransactionConflictException`.
-/// Assignment-plan publication condition-checks the planner item transactionally, so concurrent
-/// planner acquisition or release can receive that transient error even though its condition is
-/// valid. The bounded waits keep the normal lease-fencing behavior intact while letting the
-/// transaction finish.
-async fn retry_planner_transaction_conflicts<T, E, F, Fut, IsConflict>(
-  operation_name: &str,
-  operation: F,
-  is_transaction_conflict: IsConflict,
-) -> Result<T, E>
-where
-  F: FnMut() -> Fut,
-  Fut: Future<Output = Result<T, E>>,
-  IsConflict: Fn(&E) -> bool,
-{
-  retry_dynamo_transaction_conflicts(operation_name, operation, is_transaction_conflict).await
-}
-
 //
 // DynamoConsumerGroupMembershipStore
 //
@@ -622,7 +597,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     );
 
     let control_pk = Self::control_pk(topic, group_id);
-    let response = retry_planner_transaction_conflicts(
+    let response = retry_dynamo_transaction_conflicts(
       "acquire_or_renew",
       || {
         self
@@ -644,13 +619,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
           .return_consumed_capacity(ReturnConsumedCapacity::Total)
           .send()
       },
-      |error| {
-        matches!(
-          error,
-          SdkError::ServiceError(service_error)
-            if service_error.err().is_transaction_conflict_exception()
-        )
-      },
+      is_dynamo_transaction_conflict,
     )
     .await;
 
@@ -685,7 +654,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       AttributeValue::S(planner_session_id.to_string()),
     );
     let control_pk = Self::control_pk(topic, group_id);
-    let response = retry_planner_transaction_conflicts(
+    let response = retry_dynamo_transaction_conflicts(
       "release",
       || {
         self
@@ -701,13 +670,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
           .return_consumed_capacity(ReturnConsumedCapacity::Total)
           .send()
       },
-      |error| {
-        matches!(
-          error,
-          SdkError::ServiceError(service_error)
-            if service_error.err().is_transaction_conflict_exception()
-        )
-      },
+      is_dynamo_transaction_conflict,
     )
     .await;
 

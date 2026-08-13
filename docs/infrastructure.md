@@ -124,19 +124,33 @@ Repeat this for the producer lease, consumer lease, and consumer membership tabl
 
 ## IAM
 
-Brokers need S3 object write access for their configured bucket/prefix, DynamoDB access to segment
-metadata and producer leases, and `dynamodb:PutItem` for unfenced metadata publication. Enabling
-fenced metadata publication also requires `dynamodb:TransactWriteItems` and
-`dynamodb:ConditionCheckItem` on both the segment-metadata and producer-lease tables.
+Scope resource ARNs to the configured table names and bucket prefix. The following list covers the
+AWS API calls made by Blob Stream; a bucket using SSE-KMS also needs the KMS key permissions
+required by its encryption policy.
 
-Consumers need S3 `GetObject`, `dynamodb:Query` for segment metadata and membership, and
-`dynamodb:GetItem`, `dynamodb:UpdateItem`, and `dynamodb:DeleteItem` for consumer leases and
-membership. Assignment-plan publication additionally needs `dynamodb:TransactWriteItems` and
-`dynamodb:ConditionCheckItem` on the membership table.
+### Broker
 
-Scope resource ARNs to the configured table names and bucket prefix. Do not grant a fenced broker
-only `TransactWriteItems`: DynamoDB also authorizes the lease conditions as
-`ConditionCheckItem` actions.
+- S3 bucket/prefix: `s3:PutObject`.
+- Segment-metadata table: `dynamodb:PutItem` for ordinary metadata publication.
+- Producer-lease table: `dynamodb:GetItem` and `dynamodb:UpdateItem` for lease observation,
+  acquisition, heartbeat, sequence reservation, and release.
+- Fenced publication: `dynamodb:TransactWriteItems` on both the segment-metadata and
+  producer-lease tables, plus `dynamodb:ConditionCheckItem` on the producer-lease table. The
+  transaction puts segment metadata and condition-checks each current producer lease; it does not
+  condition-check a segment-metadata item.
+
+### Consumer
+
+- S3 bucket/prefix: `s3:GetObject`.
+- Segment-metadata table: `dynamodb:Query`.
+- Consumer-lease table: `dynamodb:GetItem`, `dynamodb:Query`, and `dynamodb:UpdateItem`.
+- Consumer-membership table: `dynamodb:GetItem`, `dynamodb:Query`, `dynamodb:UpdateItem`, and
+  `dynamodb:DeleteItem`. Assignment-plan publication additionally needs
+  `dynamodb:TransactWriteItems` and `dynamodb:ConditionCheckItem` on this table.
+
+Do not grant a fenced broker only `TransactWriteItems`: its normal producer-lease lifecycle still
+uses `GetItem` and `UpdateItem`, and DynamoDB separately authorizes the transaction's lease
+condition checks as `ConditionCheckItem` actions.
 
 ## Kubernetes Discovery RBAC
 

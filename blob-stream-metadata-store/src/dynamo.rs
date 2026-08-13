@@ -1,4 +1,4 @@
-use crate::aws::retry_dynamo_transaction_conflicts;
+use crate::aws::{retry_dynamo_transaction_conflicts, transaction_cancellation_has_code};
 use crate::dynamo_attributes::{
   ATTR_EPOCH,
   ATTR_EXPIRES,
@@ -22,7 +22,6 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
-use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
   AttributeValue,
@@ -373,17 +372,6 @@ impl MetadataStore for DynamoMetadataStore {
     );
     Ok(segments)
   }
-}
-
-fn transaction_cancellation_has_code(error: &TransactWriteItemsError, expected_code: &str) -> bool {
-  matches!(
-    error,
-    TransactWriteItemsError::TransactionCanceledException(cancellation)
-      if cancellation
-        .cancellation_reasons()
-        .iter()
-        .any(|reason| reason.code() == Some(expected_code))
-  )
 }
 
 impl DynamoMetadataStore {
