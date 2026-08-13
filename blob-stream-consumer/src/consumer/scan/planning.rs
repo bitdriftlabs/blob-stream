@@ -131,7 +131,11 @@ impl ConsumerReaderImpl {
       });
   }
 
-  /// Find the least inclusive lower bound required when one query serves several fast partitions.
+  /// Find the least inclusive lower bound required when one query serves several Fast partitions.
+  ///
+  /// Each partition needs the greater of its frontier and the shared time floor. The merged query
+  /// uses the least of those bounds so a sparse partition is not skipped by another partition
+  /// whose frontier is further ahead; execution reapplies the individual frontier afterward.
   pub(in crate::consumer) fn fast_scan_min_snowflake(
     &self,
     assigned_partition_ids: &[VirtualPartitionId],
@@ -228,9 +232,9 @@ impl ConsumerReaderImpl {
     now_unix_seconds: i64,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> i64 {
-    // This relies on the existing deployment assumption that broker and consumer clocks are
-    // synchronized. Keep the two configured timing bounds together so a future skew margin has
-    // one obvious place to join the safety calculation.
+    // T_safe = now - D, where D combines the broker publication deadline and reader visibility
+    // delay. This relies on synchronized broker and consumer clocks; keep the bounds together so
+    // a future skew margin has one obvious place to join the safety calculation.
     now_unix_seconds.saturating_sub(metadata_availability_delay_seconds(
       runtime_settings.metadata_visibility_delay_ms,
       self.maximum_metadata_publication_lag_ms,

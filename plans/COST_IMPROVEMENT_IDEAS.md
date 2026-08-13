@@ -92,7 +92,7 @@ Collect at least one representative steady interval and one peak interval. Recor
 
 Use actual regional prices and include the network path. Read caches are AZ/cluster-local, so the broker-to-consumer leg must remain local. Price the S3-to-broker and local broker-to-consumer paths, and reject any configuration that would route a cache response across AZs.
 
-`cost_analysis.py` is useful for broad request-cost sanity checking, but its fallback estimates are not authoritative here. The implementation already coalesces timer flushes by topic and consumer range reads by segment. Set direct segment and batch-read overrides from observed metrics before using the script for a decision.
+`cost-analysis/cost_analysis.py` is useful for broad request-cost sanity checking, but its fallback estimates are not authoritative here. The implementation already coalesces timer flushes by topic and consumer range reads by segment. Set direct segment and range-read overrides from observed metrics before using the script for a decision.
 
 ## Idea 1: Shared Cross-Topic Segment Objects
 
@@ -449,7 +449,7 @@ Implementation order:
 | Consumer metadata transport | `blob-stream-consumer/src/consumer/scan/execution.rs` | Cache transport plus direct-Dynamo fallback while retaining planning and delivery state. |
 | Read discovery/configuration | Broker discovery and consumer configuration modules | Dedicated AZ/cluster-local read-broker membership, producer-style routing, and feature flags. |
 
-Any implemented change that alters object layout, broker routing, metadata availability, or read behavior must update `DESIGN.md` in the same change. `DESIGN.md` is the current architecture contract; this document is a decision and implementation-planning aid.
+Any implemented change that alters object layout, broker routing, metadata availability, or read behavior must update `docs/design.md` in the same change. `docs/design.md` is the current architecture contract; this document is a decision and implementation-planning aid.
 
 ## Validation And Rollout Checklist
 

@@ -5,9 +5,10 @@ throughput and storage cost over ultra-low latency. Producers write opaque recor
 broker, brokers persist compressed segment blobs and metadata indexes, and consumer groups read
 directly from blob storage and metadata storage.
 
-This document describes the current implementation and its behavioral contracts. See
-[README.md](README.md) for deployment, configuration, storage provisioning, RBAC, and
-observability. See [DEVELOPMENT.md](DEVELOPMENT.md) for contributor workflows.
+This document describes the current implementation and its behavioral contracts. See the
+[repository overview](../README.md), [Infrastructure setup](infrastructure.md), and
+[Operations guide](operations.md) for deployment and runtime guidance. See
+[DEVELOPMENT.md](../DEVELOPMENT.md) for contributor workflows.
 
 ## Goals and Boundaries
 
@@ -414,6 +415,13 @@ delay, rounded up to whole seconds. The Fast safe timestamp is $T_{safe} = now -
 considers the current window plus enough preceding windows to cover $D$, then omits every window
 whose end is at or before $T_{safe}$.
 
+With the defaults, $D = 15s + 2s = 17s$. This is Fast's metadata-query lower-bound horizon, not
+a 17-second wait applied to every returned row: the publication deadline accounts for time while a
+metadata row might not exist, while the visibility delay separately decides whether an existing
+returned row is old enough to use. A higher observed frontier can narrow an individual steady-state
+query beyond the time floor, but it does not reduce the 17-second horizon required before that
+frontier exists.
+
 For each remaining window, the time floor is the smallest Sonyflake for
 $max(window_start, T_{safe})$. A Fast partition's effective lower bound is the greater of this
 time floor and its observed inclusive `(virtual_partition_id, window)` frontier. If several Fast
@@ -512,6 +520,20 @@ rescans it from its inclusive lower bound and delivers it. This avoids waiting f
 to close while preserving the normal visibility and cursor protections; it is covered by
 `consumer_restart_hands_active_window_visibility_deferral_to_fast`.
 
+**Constantly producing Fast partition.** Assume one Fast partition in topic `telemetry` produces
+segments continuously in the `[900, 1,200)` window. With the default 15-second publication
+deadline and 2-second visibility delay, at `now = 1,020` $D = 17s$ and $T_{safe} = 1,003$.
+Suppose an earlier scan already observed a visibility-eligible segment at Sonyflake timestamp
+1,015, so its inclusive frontier is 1,015. The next query uses
+$max(1,003, 1,015) = 1,015$: it replays the boundary row and does not rescan the interval from
+1,003 through 1,014. If that query returns a later segment whose metadata was published at
+1,019, Fast defers that segment at `now = 1,020` because it is newer than the 2-second visibility
+cutoff of 1,018. Its frontier remains 1,015 and the segment becomes eligible at `now = 1,021`.
+The 17-second floor still matters before a higher frontier exists: a segment with Sonyflake
+timestamp 1,004 can be selected by that floor but, if its metadata was published at 1,019, is
+separately deferred until 1,021. Thus 17 seconds controls how far back Fast queries; 2 seconds
+controls whether a returned metadata row is accepted on that pass.
+
 **Fast time floor and frontiers.** Assume topic `telemetry` uses 300-second windows, the default
 15-second publication deadline, and the default 2-second visibility delay. At `now = 1,020`, the
 current window is `[900, 1,200)` and $D = 17s$, so $T_{safe} = 1,003$. The preceding window
@@ -607,10 +629,11 @@ Strong metadata queries remove read-replica staleness at approximately twice the
 component. They do not by themselves prevent stale publication; fenced broker metadata writes
 provide that publication fence when enabled.
 
-Use `cost_analysis.py` with real page sizes, poll rates, consumer counts, and regional pricing
-before enabling strong reads. Set its `strongly_consistent_metadata_reads` input to model the
-resolved configuration or runtime-flag value; it doubles metadata scan RRUs but leaves already
-strongly consistent coordination reads unchanged.
+Use `cost-analysis/cost_analysis.py` with real page sizes, poll rates, consumer counts, and
+regional pricing before enabling strong reads. Its `--strong-metadata-reads` mode models the
+resolved `strongly_consistent_metadata_reads` configuration or runtime-flag value; it doubles
+metadata scan RRUs but leaves already strongly consistent coordination reads unchanged. Its
+`--transactional-metadata-writes` mode separately models fenced metadata publication.
 
 ## Consumer Group Coordination
 
@@ -774,3 +797,45 @@ defaults are:
   [blob-stream-consumer/src](blob-stream-consumer/src)
 - End-to-end and deterministic fault-injection coverage:
   [blob-stream-integration-tests](blob-stream-integration-tests)
+
+## Operational Assumptions and Accepted Risks
+
+This system makes the following operational assumptions. They reduce the probability of known
+failure modes but are not correctness guarantees. Deployments that cannot accept the corresponding
+risks must use the stronger mechanisms described below.
+
+### Clock Synchronization
+
+Fast scans and checkpoint-overlap recovery assume broker and consumer clocks are synchronized
+closely enough that the configured publication deadline and visibility delay cover the relevant
+publication and replica-visibility interval. There is no separately configured clock-skew margin.
+Managed cloud time synchronization normally makes this practical, but deployments must maintain
+clock synchronization and investigate clock drift; event timestamps do not participate in this
+calculation.
+
+### Eventually Consistent Metadata Reads
+
+Consumers use eventually consistent DynamoDB metadata queries. The visibility delay is a
+best-effort operational margin intended for ordinary replica lag; DynamoDB does not provide a
+bounded replication-delay guarantee. Fast and checkpoint-overlap scans can miss metadata that
+becomes visible outside their bounded availability horizon.
+
+This tradeoff is appropriate only when occasional delayed or missed discovery under an extreme
+replica-lag event is acceptable. Increasing the visibility delay reduces the risk at the cost of
+more scan work and latency. Strongly consistent metadata reads remove the read-replica component,
+but do not by themselves fence stale producer publication.
+
+### Unfenced Stale-Writer Publication
+
+Producer leases fence sequence reservation and write acceptance, but segment metadata publication
+is not transactionally conditioned on a unique producer lease session or epoch. A broker that
+crashes, pauses for an extended period, loses network connectivity, or resumes after lease expiry
+can publish metadata after a successor has already published later sequences. A consumer can then
+advance its cursor past the late range and cannot recover it.
+
+Kubernetes liveness probes, broker deadlines, and graceful handoff reduce the likelihood and
+duration of some stalled-process failures, but they do not provide a publication fence: a paused or
+partitioned former holder can still resume and publish late. This tradeoff is appropriate only
+when that rare loss mode is acceptable. Deployments requiring a stronger at-least-once guarantee
+across writer failures need transactionally fenced metadata publication, paired with strongly
+consistent reads where replica staleness must also be eliminated.

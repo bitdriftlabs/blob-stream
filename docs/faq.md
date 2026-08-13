@@ -1,10 +1,11 @@
 # This thing uses eventual consistency, isn't it broken?
 
-By default, consumer metadata reads are eventually consistent. See [DESIGN.md](DESIGN.md) for
-details. This is an intentional cost/consistency tradeoff: the default two-second visibility delay
-is a best-effort margin for ordinary replica lag, not a DynamoDB correctness guarantee. It is part
-of a broader bounded availability horizon that also includes the broker's metadata-publication
 deadline.
+By default, consumer metadata reads are eventually consistent. See [Design](design.md) and
+[Operations](operations.md) for details. This is an intentional cost/consistency tradeoff: the
+default two-second visibility delay is a best-effort margin for ordinary replica lag, not a DynamoDB
+correctness guarantee. It is part of a broader bounded availability horizon that also includes the
+broker's metadata-publication deadline.
 
 Set `strongly_consistent_metadata_reads` or the runtime flag
 `blob_stream_consumer_strong_metadata_reads` to use strongly consistent metadata queries. This
@@ -12,9 +13,10 @@ removes read-replica staleness, ignores the configured visibility delay, and app
 metadata-query RRUs. It does not make paginated scans atomic. Enable broker
 `fenced_metadata_writes` as well when stale producer publication must be rejected: it conditions
 metadata publication on the active lease session and epoch, requires transactional DynamoDB IAM
-permissions, and is default-off for rolling deployment compatibility. This has a significant
-write-cost impact: each metadata publication becomes a DynamoDB transaction containing the segment
-metadata write plus a lease condition check for every partition in the flush, and DynamoDB charges
+permissions, and defaults off. The durable holder ID, lease epoch, and session ID are required in
+every producer lease row regardless of this setting. Fenced publication has a significant write-cost
+impact: each metadata publication becomes a DynamoDB transaction containing the segment metadata
+write plus a lease condition check for every partition in the flush, and DynamoDB charges
 transactional writes and reads at twice the normal capacity-unit rate.
 
 # Why haven't you implemented compaction?
@@ -53,9 +55,15 @@ main requirement is that both the metadata and blob store must support out of ba
 and blobs. Doing internal cleanup adds a lot of complexity (and cost) and we would prefer to avoid
 that.
 
-# Will you improve the configuration mechanics of the system?
+# Will configuration become centrally managed?
 
-This is something we would like to do in the future. We admit the current system of hard coding
-topic configurations across different parts of the system is extremely suboptimal. We haven't yet
-decided on the best way of doing this but it will probably involve a configuration API driven
-through the broker.
+This is not currently planned but it is something we would like to do in the future. Brokers,
+producers, and consumers still receive their configuration independently, and the shared topic shape
+remains a deployment contract. Broker and consumer runtime feature flags can override selected
+operational settings, but they are not a configuration-distribution API. See [Infrastructure
+setup](infrastructure.md) for the configuration contract.
+
+# Will you provide broker docker images?
+
+There are no plans currently. The broker is a single binary so it should be easy to compile it and
+pack it in your own image.
