@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "./aws_test.rs"]
+mod tests;
+
 use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};

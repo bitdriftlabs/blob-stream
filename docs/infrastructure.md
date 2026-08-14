@@ -131,12 +131,11 @@ required by its encryption policy.
 ### Broker
 
 - S3 bucket/prefix: `s3:PutObject`.
-- Segment-metadata table: `dynamodb:PutItem` for ordinary metadata publication.
+- Segment-metadata table: `dynamodb:PutItem` for ordinary and fenced metadata publication.
 - Producer-lease table: `dynamodb:GetItem` and `dynamodb:UpdateItem` for lease observation,
   acquisition, heartbeat, sequence reservation, and release.
-- Fenced publication: `dynamodb:TransactWriteItems` on both the segment-metadata and
-  producer-lease tables, plus `dynamodb:ConditionCheckItem` on the producer-lease table. The
-  transaction puts segment metadata and condition-checks each current producer lease; it does not
+- Fenced publication: `dynamodb:ConditionCheckItem` on the producer-lease table. The transaction
+  puts segment metadata and condition-checks each current producer lease; it does not
   condition-check a segment-metadata item.
 
 ### Consumer
@@ -146,11 +145,10 @@ required by its encryption policy.
 - Consumer-lease table: `dynamodb:GetItem`, `dynamodb:Query`, and `dynamodb:UpdateItem`.
 - Consumer-membership table: `dynamodb:GetItem`, `dynamodb:Query`, `dynamodb:UpdateItem`, and
   `dynamodb:DeleteItem`. Assignment-plan publication additionally needs
-  `dynamodb:TransactWriteItems` and `dynamodb:ConditionCheckItem` on this table.
+  `dynamodb:ConditionCheckItem` on this table.
 
-Do not grant a fenced broker only `TransactWriteItems`: its normal producer-lease lifecycle still
-uses `GetItem` and `UpdateItem`, and DynamoDB separately authorizes the transaction's lease
-condition checks as `ConditionCheckItem` actions.
+Do not grant a fenced broker only `PutItem` and `ConditionCheckItem`: its normal producer-lease
+lifecycle still uses `GetItem` and `UpdateItem`.
 
 ## Kubernetes Discovery RBAC
 
