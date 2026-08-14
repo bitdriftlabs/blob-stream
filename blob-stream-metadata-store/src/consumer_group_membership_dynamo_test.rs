@@ -1,4 +1,3 @@
-use super::retry_planner_transaction_conflicts;
 use crate::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentPlan,
@@ -18,8 +17,6 @@ use aws_sdk_dynamodb::types::{
   KeyType,
   ScalarAttributeType,
 };
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -29,32 +26,6 @@ const REGION: &str = "us-east-1";
 const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
 const RECORD_TYPE_ATTRIBUTE_NAME: &str = "record_type";
 const POD_ID_ATTRIBUTE_NAME: &str = "pod_id";
-
-#[tokio::test]
-async fn planner_transaction_conflict_retries_until_success() {
-  let attempts = Arc::new(AtomicUsize::new(0));
-  let operation_attempts = attempts.clone();
-
-  let result = retry_planner_transaction_conflicts(
-    "test",
-    move || {
-      let operation_attempts = operation_attempts.clone();
-      async move {
-        let attempt = operation_attempts.fetch_add(1, Ordering::Relaxed);
-        if attempt == 0 {
-          Err("transaction conflict")
-        } else {
-          Ok(())
-        }
-      }
-    },
-    |error| *error == "transaction conflict",
-  )
-  .await;
-
-  assert_eq!(result, Ok(()));
-  assert_eq!(attempts.load(Ordering::Relaxed), 2);
-}
 
 async fn dynamo_client() -> Result<Client> {
   unsafe {

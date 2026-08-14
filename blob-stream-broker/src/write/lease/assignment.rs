@@ -285,7 +285,7 @@ impl WriteEngineImpl {
               warn_every!(
                 15.seconds(),
                 "lease self-assignment acquire/reserve failed: topic={topic}, \
-                 virtual_partition_id={virtual_partition_id}, requested_size={:?}, error={error}",
+                 virtual_partition_id={virtual_partition_id}, requested_size={:?}, error={error:#}",
                 reservation_request.map(|request| request.size),
               );
               transition

@@ -1,6 +1,5 @@
 # This thing uses eventual consistency, isn't it broken?
 
-deadline.
 By default, consumer metadata reads are eventually consistent. See [Design](design.md) and
 [Operations](operations.md) for details. This is an intentional cost/consistency tradeoff: the
 default two-second visibility delay is a best-effort margin for ordinary replica lag, not a DynamoDB
@@ -32,12 +31,13 @@ It should be relatively easy to add a C interop shim to the existing libraries w
 wrapping in almost any language. We have no plans on doing this work but reach out if you are
 interested in helping with this.
 
-# Will you improve the system to make it more performant and cost effective for multiple concurrent consumer groups?
+# Will you improve the system to make it more performant and cost effective for multiple concurrent consumer groups or very large groups?
 
 We have no plans at the current time. For compaction specifically, see the question above. For
-general improvements such as consuming through a broker API, attempting to consolidate S3 reads
-at the broker level, etc. this is technically possible but adds complexity. We may consider this
-in the future depending on need and interest.
+general improvements such as consuming through a broker API, attempting to consolidate S3 reads at
+the broker level, etc. this is technically possible but adds complexity. We may consider this in the
+future depending on need and interest. See
+[COST_IMPROVEMENT_IDEAS.md](../plans/COST_IMPROVEMENT_IDEAS.md) for a discussion.
 
 # Are you going to implement the Kafka API?
 

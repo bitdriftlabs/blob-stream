@@ -1,3 +1,4 @@
+use crate::aws::transaction_cancellation_has_code;
 use crate::{DynamoMetadataStore, MetadataReadConsistency, MetadataStore, SegmentMetadata};
 use anyhow::{Context, Result, anyhow};
 use aws_config::BehaviorVersion;
@@ -138,11 +139,11 @@ fn classifies_transaction_cancellation_codes() {
       )
       .build(),
   );
-  assert!(super::transaction_cancellation_has_code(
+  assert!(transaction_cancellation_has_code(
     &transaction_conflict,
     "TransactionConflict"
   ));
-  assert!(!super::transaction_cancellation_has_code(
+  assert!(!transaction_cancellation_has_code(
     &transaction_conflict,
     "ConditionalCheckFailed"
   ));
@@ -156,11 +157,11 @@ fn classifies_transaction_cancellation_codes() {
       )
       .build(),
   );
-  assert!(super::transaction_cancellation_has_code(
+  assert!(transaction_cancellation_has_code(
     &conditional_check_failure,
     "ConditionalCheckFailed"
   ));
-  assert!(!super::transaction_cancellation_has_code(
+  assert!(!transaction_cancellation_has_code(
     &conditional_check_failure,
     "TransactionConflict"
   ));

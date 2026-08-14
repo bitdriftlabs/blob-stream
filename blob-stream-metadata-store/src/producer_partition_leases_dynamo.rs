@@ -2,6 +2,7 @@
 #[path = "./producer_partition_leases_dynamo_test.rs"]
 mod tests;
 
+use crate::aws::{is_dynamo_transaction_conflict, retry_dynamo_transaction_conflicts};
 use crate::dynamo_attributes::{
   ATTR_EPOCH,
   ATTR_EXPIRES,
@@ -178,18 +179,24 @@ impl DynamoProducerPartitionLeaseStore {
       None => claim_condition,
     };
 
-    match self
-      .client
-      .update_item()
-      .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(pk))
-      .update_expression(claim_update)
-      .condition_expression(claim_condition)
-      .set_expression_attribute_values(Some(values))
-      .return_values(ReturnValue::AllNew)
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await
+    match retry_dynamo_transaction_conflicts(
+      "producer_lease_claim",
+      || {
+        self
+          .client
+          .update_item()
+          .table_name(&self.table_name)
+          .key(ATTR_PK, AttributeValue::S(pk.clone()))
+          .update_expression(claim_update.clone())
+          .condition_expression(claim_condition.clone())
+          .set_expression_attribute_values(Some(values.clone()))
+          .return_values(ReturnValue::AllNew)
+          .return_consumed_capacity(ReturnConsumedCapacity::Total)
+          .send()
+      },
+      is_dynamo_transaction_conflict,
+    )
+    .await
     {
       Ok(output) => Ok(Some(output)),
       Err(SdkError::ServiceError(service_error))
@@ -310,18 +317,24 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       ),
       None => renewal_condition,
     };
-    let response = self
-      .client
-      .update_item()
-      .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(pk.clone()))
-      .update_expression(renewal_update)
-      .condition_expression(renewal_condition)
-      .set_expression_attribute_values(Some(values.clone()))
-      .return_values(ReturnValue::AllNew)
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await;
+    let response = retry_dynamo_transaction_conflicts(
+      "producer_lease_acquire_or_renew",
+      || {
+        self
+          .client
+          .update_item()
+          .table_name(&self.table_name)
+          .key(ATTR_PK, AttributeValue::S(pk.clone()))
+          .update_expression(renewal_update.clone())
+          .condition_expression(renewal_condition.clone())
+          .set_expression_attribute_values(Some(values.clone()))
+          .return_values(ReturnValue::AllNew)
+          .return_consumed_capacity(ReturnConsumedCapacity::Total)
+          .send()
+      },
+      is_dynamo_transaction_conflict,
+    )
+    .await;
 
     match response {
       Ok(output) => self.complete_acquire(output, key, reservation_size, "acquired"),
@@ -393,18 +406,24 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     let condition =
       format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EXPIRES} > :now");
 
-    let response = self
-      .client
-      .update_item()
-      .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(key.format()))
-      .update_expression(update)
-      .condition_expression(condition)
-      .set_expression_attribute_values(Some(values))
-      .return_values(ReturnValue::AllNew)
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await;
+    let response = retry_dynamo_transaction_conflicts(
+      "producer_lease_heartbeat",
+      || {
+        self
+          .client
+          .update_item()
+          .table_name(&self.table_name)
+          .key(ATTR_PK, AttributeValue::S(key.format()))
+          .update_expression(update.clone())
+          .condition_expression(condition.clone())
+          .set_expression_attribute_values(Some(values.clone()))
+          .return_values(ReturnValue::AllNew)
+          .return_consumed_capacity(ReturnConsumedCapacity::Total)
+          .send()
+      },
+      is_dynamo_transaction_conflict,
+    )
+    .await;
 
     match response {
       Ok(output) => {
@@ -477,18 +496,24 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
        (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= :max_reservable)"
     );
 
-    let response = self
-      .client
-      .update_item()
-      .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(key.format()))
-      .update_expression(update)
-      .condition_expression(condition)
-      .set_expression_attribute_values(Some(values))
-      .return_values(ReturnValue::UpdatedOld)
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await;
+    let response = retry_dynamo_transaction_conflicts(
+      "producer_lease_reserve_sequences",
+      || {
+        self
+          .client
+          .update_item()
+          .table_name(&self.table_name)
+          .key(ATTR_PK, AttributeValue::S(key.format()))
+          .update_expression(update.clone())
+          .condition_expression(condition.clone())
+          .set_expression_attribute_values(Some(values.clone()))
+          .return_values(ReturnValue::UpdatedOld)
+          .return_consumed_capacity(ReturnConsumedCapacity::Total)
+          .send()
+      },
+      is_dynamo_transaction_conflict,
+    )
+    .await;
 
     match response {
       Ok(output) => {
@@ -574,18 +599,24 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
 
     let update = format!("SET {ATTR_EXPIRES} = :expired, {ATTR_TTL} = :ttl");
     let condition = format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session");
-    let response = self
-      .client
-      .update_item()
-      .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(key.format()))
-      .update_expression(update)
-      .condition_expression(condition)
-      .set_expression_attribute_values(Some(values))
-      .return_values(ReturnValue::AllNew)
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await;
+    let response = retry_dynamo_transaction_conflicts(
+      "producer_lease_release",
+      || {
+        self
+          .client
+          .update_item()
+          .table_name(&self.table_name)
+          .key(ATTR_PK, AttributeValue::S(key.format()))
+          .update_expression(update.clone())
+          .condition_expression(condition.clone())
+          .set_expression_attribute_values(Some(values.clone()))
+          .return_values(ReturnValue::AllNew)
+          .return_consumed_capacity(ReturnConsumedCapacity::Total)
+          .send()
+      },
+      is_dynamo_transaction_conflict,
+    )
+    .await;
 
     match response {
       Ok(output) => {

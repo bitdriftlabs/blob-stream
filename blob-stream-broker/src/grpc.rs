@@ -297,6 +297,7 @@ pub fn make_broker_router(write_engine: Arc<dyn WriteEngine>, metrics: &BrokerMe
 
 fn produce_request_config() -> UnaryRequestConfig {
   UnaryRequestConfig {
+    max_request_bytes: MAX_PRODUCE_BATCHES_REQUEST_BYTES,
     max_decoded_request_bytes: MAX_PRODUCE_BATCHES_REQUEST_BYTES,
     ..UnaryRequestConfig::default()
   }
