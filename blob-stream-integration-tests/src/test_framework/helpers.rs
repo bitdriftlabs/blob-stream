@@ -10,6 +10,7 @@ use blob_stream_consumer::consumer::{
 use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerRecord};
 use blob_stream_types::VirtualPartitionId;
 use std::collections::{HashMap, HashSet};
+use time::OffsetDateTime;
 use tokio::time::Instant;
 
 const TEST_READ_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
@@ -36,7 +37,7 @@ impl TestConsumerReader for ConsumerReaderImpl {
   async fn read_available(&mut self, now_unix_seconds: i64) -> Result<Vec<ConsumerBatch>> {
     ConsumerReader::read_available(
       self,
-      now_unix_seconds,
+      OffsetDateTime::from_unix_timestamp(now_unix_seconds).expect("test timestamp is in range"),
       ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
     )
     .await

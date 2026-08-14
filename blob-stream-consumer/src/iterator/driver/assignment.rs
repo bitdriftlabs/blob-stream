@@ -9,16 +9,16 @@ use super::{
   Span,
   VirtualPartitionId,
   assignment_plan_snapshot,
-  consumer_rebalance_interval_ms,
+  consumer_rebalance_interval,
   emit_partition_handoff_snapshots,
   field,
   info,
+  offset_datetime_from_unix_millis,
   oneshot,
   update_total_prefetch_bytes,
   update_worker_prefetch_metrics,
 };
 use crate::iterator::NextResult;
-
 impl ConsumerDriver {
   pub(in crate::iterator) fn record_accepted_assignment_plan(
     &self,
@@ -82,7 +82,7 @@ impl ConsumerDriver {
     self.record_accepted_assignment_plan(accepted_assignment_plan);
     // Hydrate before exposing the reader assignment so the first scan starts from the durable
     // cursor claimed with this generation.
-    self.hydrate_cursors(recovered_cursors, self.now_unix_seconds())?;
+    self.hydrate_cursors(recovered_cursors, self.time_provider.now())?;
 
     self.apply_assignment(&owned_partitions)?;
     Ok(owned_partitions)
@@ -131,7 +131,7 @@ impl ConsumerDriver {
     // assignment to delivery or diagnostics, keeping their view consistent with the reader.
     self.set_reader_assignment(
       assignment.to_owned(),
-      self.now_unix_seconds(),
+      self.time_provider.now(),
       if reader_owned_by_driver {
         None
       } else {
@@ -191,18 +191,16 @@ impl ConsumerDriver {
 
   pub(in crate::iterator) async fn fence_active_partitions_after_heartbeat_failure(
     &mut self,
-    now_ts_ms: i64,
+    now: time::OffsetDateTime,
   ) -> Result<()> {
     // Once renewal reaches its deadline, none of the current leases are safe to keep delivering.
     let fenced = self.active_assignment.iter().copied().collect();
-    self
-      .begin_fenced_partition_revocation(fenced, now_ts_ms)
-      .await
+    self.begin_fenced_partition_revocation(fenced, now).await
   }
 
   pub(in crate::iterator) async fn reconcile_fenced_partitions(
     &mut self,
-    now_ts_ms: i64,
+    now: time::OffsetDateTime,
   ) -> Result<()> {
     // A failed heartbeat can still reveal lease loss through the coordinator's retained ownership
     // view before the broader heartbeat deadline requires fencing every active partition.
@@ -212,15 +210,13 @@ impl ConsumerDriver {
       .into_iter()
       .collect::<HashSet<_>>();
     let fenced = self.active_assignment.difference(&owned).copied().collect();
-    self
-      .begin_fenced_partition_revocation(fenced, now_ts_ms)
-      .await
+    self.begin_fenced_partition_revocation(fenced, now).await
   }
 
   pub(in crate::iterator) fn remove_fenced_partitions(
     &mut self,
     fenced_partitions: &[VirtualPartitionId],
-    now_ts_ms: i64,
+    now: time::OffsetDateTime,
   ) -> Result<()> {
     if fenced_partitions.is_empty() {
       return Ok(());
@@ -238,7 +234,7 @@ impl ConsumerDriver {
     }
     self.set_reader_assignment(
       self.active_assignment.iter().copied().collect(),
-      now_ts_ms / 1_000,
+      now,
       None,
       false,
     )?;
@@ -253,7 +249,7 @@ impl ConsumerDriver {
   async fn begin_fenced_partition_revocation(
     &mut self,
     mut fenced: Vec<VirtualPartitionId>,
-    now_ts_ms: i64,
+    now: time::OffsetDateTime,
   ) -> Result<()> {
     if self.pending_revocation_completion.is_some() {
       return Ok(());
@@ -290,7 +286,7 @@ impl ConsumerDriver {
       .difference(&fenced_set)
       .copied()
       .collect::<Vec<_>>();
-    self.set_reader_assignment(pending_assignment.clone(), now_ts_ms / 1_000, None, false)?;
+    self.set_reader_assignment(pending_assignment.clone(), now, None, false)?;
     self.prefetch_space_notify.notify_waiters();
     self.pending_assignment = Some(pending_assignment);
     self.pending_revocation_completion = Some(completion_rx);
@@ -342,7 +338,7 @@ impl ConsumerDriver {
           .unwrap_or_else(Span::none);
         let release_result = self
           .coordinator
-          .release_partitions(&revoked, self.now_unix_millis())
+          .release_partitions(&revoked, self.time_provider.now())
           .await;
         match &release_result {
           Ok(released_partitions) => {
@@ -426,8 +422,11 @@ impl ConsumerDriver {
     }
   }
 
-  pub(in crate::iterator) async fn maybe_rebalance(&mut self, now_ts_ms: i64) -> Result<()> {
-    if now_ts_ms < self.next_rebalance_at_ms {
+  pub(in crate::iterator) async fn maybe_rebalance(
+    &mut self,
+    now: time::OffsetDateTime,
+  ) -> Result<()> {
+    if now < self.next_rebalance_at {
       return Ok(());
     }
 
@@ -443,7 +442,7 @@ impl ConsumerDriver {
     // the owned set and any durable cursors that must be recovered before delivery resumes.
     let report = match self
       .coordinator
-      .rebalance(snapshot.members, snapshot.virtual_partitions, now_ts_ms)
+      .rebalance(snapshot.members, snapshot.virtual_partitions, now)
       .await
     {
       Ok(report) => report,
@@ -463,17 +462,17 @@ impl ConsumerDriver {
     } = report;
     self.record_accepted_assignment_plan(accepted_assignment_plan);
 
-    self.next_rebalance_at_ms = now_ts_ms + consumer_rebalance_interval_ms(&self.group_config);
+    self.next_rebalance_at = now.saturating_add(consumer_rebalance_interval(&self.group_config));
 
     let next_assignment_set = next_assignment.iter().copied().collect::<HashSet<_>>();
     let assignment_changed = self.active_assignment != next_assignment_set;
     if let Some(active_partition_lease_expiration_deadline_ms) =
       active_partition_lease_expiration_deadline_ms
     {
-      self.active_partition_lease_expiration_deadline_ms =
-        active_partition_lease_expiration_deadline_ms;
+      self.active_partition_lease_expiration_deadline =
+        offset_datetime_from_unix_millis(active_partition_lease_expiration_deadline_ms);
     }
-    self.hydrate_cursors(recovered_cursors, now_ts_ms / 1_000)?;
+    self.hydrate_cursors(recovered_cursors, now)?;
 
     if !assignment_changed {
       // Ownership is unchanged, but retain plan and retry diagnostics so an incomplete rebalance

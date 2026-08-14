@@ -31,6 +31,7 @@ use blob_stream_types::{CommittedCursor, SnowflakeId, TopicWindowKey};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
 
@@ -732,8 +733,8 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     key: ProducerPartitionLeaseKey,
     holder_id: String,
     lease_session_id: String,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
   ) -> Result<LeaseAcquireOutcome> {
     let effects = self
       .controller
@@ -763,13 +764,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .acquire_lease(
-        key,
-        holder_id,
-        lease_session_id,
-        now_ts_ms,
-        lease_duration_ms,
-      )
+      .acquire_lease(key, holder_id, lease_session_id, now, lease_duration)
       .await;
     self
       .controller
@@ -798,8 +793,8 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     key: ProducerPartitionLeaseKey,
     holder_id: String,
     lease_session_id: String,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
     reservation_size: Option<u64>,
   ) -> Result<LeaseAcquireAndReserveOutcome> {
     let key_format = key.format();
@@ -859,8 +854,8 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
         key,
         holder_id,
         lease_session_id,
-        now_ts_ms,
-        lease_duration_ms,
+        now,
+        lease_duration,
         reservation_size,
       )
       .await;
@@ -884,8 +879,8 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
   ) -> Result<LeaseHeartbeatOutcome> {
     let effects = self
       .controller
@@ -915,13 +910,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .heartbeat_lease(
-        key,
-        holder_id,
-        lease_session_id,
-        now_ts_ms,
-        lease_duration_ms,
-      )
+      .heartbeat_lease(key, holder_id, lease_session_id, now, lease_duration)
       .await;
     self
       .controller
@@ -944,7 +933,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
     let effects = self
@@ -975,13 +964,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .reserve_sequences(
-        key,
-        holder_id,
-        lease_session_id,
-        now_ts_ms,
-        reservation_size,
-      )
+      .reserve_sequences(key, holder_id, lease_session_id, now, reservation_size)
       .await;
     self
       .controller
@@ -1004,7 +987,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<LeaseReleaseOutcome> {
     let effects = self
       .controller
@@ -1034,7 +1017,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .release_lease(key, holder_id, lease_session_id, now_ts_ms)
+      .release_lease(key, holder_id, lease_session_id, now)
       .await;
     self
       .controller
@@ -1124,13 +1107,13 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: TimeDuration,
   ) -> Result<()> {
     let _ = &self.controller;
     self
       .inner
-      .register_member(topic, group_id, member_id, pod_id, now_ts_ms, ttl_ms)
+      .register_member(topic, group_id, member_id, pod_id, now, ttl)
       .await
   }
 
@@ -1140,8 +1123,8 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: TimeDuration,
   ) -> Result<()> {
     let key = format!("{topic}#{group_id}#{member_id}");
     let effects = self
@@ -1170,7 +1153,7 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
 
     let result = self
       .inner
-      .heartbeat_member(topic, group_id, member_id, pod_id, now_ts_ms, ttl_ms)
+      .heartbeat_member(topic, group_id, member_id, pod_id, now, ttl)
       .await;
     self
       .controller
@@ -1205,13 +1188,10 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
     &self,
     topic: &str,
     group_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<Vec<ConsumerGroupMember>> {
     let _ = &self.controller;
-    self
-      .inner
-      .list_active_members(topic, group_id, now_ts_ms)
-      .await
+    self.inner.list_active_members(topic, group_id, now).await
   }
 
   async fn get_assignment_plan(
@@ -1256,8 +1236,8 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
     group_id: &str,
     member_id: &str,
     planner_session_id: &str,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: TimeDuration,
   ) -> Result<ConsumerGroupPlannerLeaseOutcome> {
     let key = format!("{topic}#{group_id}#{member_id}");
     self
@@ -1269,14 +1249,7 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
         key,
         self
           .inner
-          .acquire_or_renew_planner(
-            topic,
-            group_id,
-            member_id,
-            planner_session_id,
-            now_ts_ms,
-            ttl_ms,
-          )
+          .acquire_or_renew_planner(topic, group_id, member_id, planner_session_id, now, ttl)
           .await,
       )
       .await
@@ -1311,7 +1284,7 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
     group_id: &str,
     member_id: &str,
     planner_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     plan: ConsumerGroupAssignmentPlan,
   ) -> Result<bool> {
     let key = format!("{topic}#{group_id}#{member_id}");
@@ -1324,14 +1297,7 @@ impl ConsumerGroupMembershipStore for FaultInjectedConsumerGroupMembershipStore 
         key,
         self
           .inner
-          .publish_assignment_plan(
-            topic,
-            group_id,
-            member_id,
-            planner_session_id,
-            now_ts_ms,
-            plan,
-          )
+          .publish_assignment_plan(topic, group_id, member_id, planner_session_id, now, plan)
           .await,
       )
       .await
@@ -1392,8 +1358,8 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
     key: ConsumerGroupLeaseKey,
     owner_id: String,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
   ) -> Result<ConsumerGroupAssignmentOutcome> {
     let key_str = format!("{}#{}", key.partition_key(), key.sort_key());
     let effects = self
@@ -1422,7 +1388,7 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
 
     let result = self
       .inner
-      .assign_partition(key, owner_id, generation, now_ts_ms, lease_duration_ms)
+      .assign_partition(key, owner_id, generation, now, lease_duration)
       .await;
     self
       .controller
@@ -1444,8 +1410,8 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
     committed_cursor: Option<CommittedCursor>,
   ) -> Result<ConsumerGroupHeartbeatOutcome> {
     let key_str = format!("{}#{}", key.partition_key(), key.sort_key());
@@ -1479,8 +1445,8 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
         key,
         owner_id,
         generation,
-        now_ts_ms,
-        lease_duration_ms,
+        now,
+        lease_duration,
         committed_cursor,
       )
       .await;
@@ -1505,7 +1471,7 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     committed_cursor: CommittedCursor,
   ) -> Result<ConsumerGroupCommitOutcome> {
     let key_str = format!("{}#{}", key.partition_key(), key.sort_key());
@@ -1535,7 +1501,7 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
 
     let result = self
       .inner
-      .commit_cursor(key, owner_id, generation, now_ts_ms, committed_cursor)
+      .commit_cursor(key, owner_id, generation, now, committed_cursor)
       .await;
     self
       .controller
@@ -1558,7 +1524,7 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<ConsumerGroupReleaseOutcome> {
     let key_str = format!("{}#{}", key.partition_key(), key.sort_key());
     self
@@ -1596,7 +1562,7 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
 
     let result = self
       .inner
-      .release_partition(key, owner_id, generation, now_ts_ms)
+      .release_partition(key, owner_id, generation, now)
       .await;
 
     self

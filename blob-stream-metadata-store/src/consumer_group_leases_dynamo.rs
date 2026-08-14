@@ -19,10 +19,11 @@ use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnConsumedCapacity, ReturnValue};
-use blob_stream_types::CommittedCursor;
+use blob_stream_types::{CommittedCursor, unix_millis_from_offset_datetime};
 use log::{debug, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use time::{Duration, OffsetDateTime};
 
 const ATTR_PK: &str = "pk";
 const ATTR_SK: &str = "sk";
@@ -184,14 +185,18 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     key: ConsumerGroupLeaseKey,
     owner_id: String,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
   ) -> Result<ConsumerGroupAssignmentOutcome> {
     trace!(
       "consumer lease(dynamo) assign: table={}, topic={}, group_id={}, partition={}, owner_id={}, \
        generation={}",
       self.table_name, key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
     );
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+    let lease_duration_ms = i64::try_from(lease_duration.whole_milliseconds())
+      .map_err(|_| anyhow!("lease duration exceeds Dynamo millisecond range"))?;
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
     let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
 
@@ -296,8 +301,8 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
     committed_cursor: Option<CommittedCursor>,
   ) -> Result<ConsumerGroupHeartbeatOutcome> {
     trace!(
@@ -309,6 +314,10 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       validate_cursor(key, cursor)?;
     }
 
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+    let lease_duration_ms = i64::try_from(lease_duration.whole_milliseconds())
+      .map_err(|_| anyhow!("lease duration exceeds Dynamo millisecond range"))?;
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
     let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
 
@@ -394,7 +403,7 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     committed_cursor: CommittedCursor,
   ) -> Result<ConsumerGroupCommitOutcome> {
     trace!(
@@ -410,6 +419,8 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     );
     validate_cursor(key, &committed_cursor)?;
 
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
     let mut values = HashMap::new();
     values.insert(
       ":owner".to_string(),
@@ -478,7 +489,7 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<ConsumerGroupReleaseOutcome> {
     trace!(
       "consumer lease(dynamo) release: table={}, topic={}, group_id={}, partition={}, \
@@ -486,6 +497,8 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       self.table_name, key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
     );
 
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
     let mut values = HashMap::new();
     values.insert(
       ":owner".to_string(),

@@ -16,7 +16,7 @@ use blob_stream_consumer::{
   ConsumerBootstrapIteratorBuilder,
   ConsumerPartitionReadMode,
   ConsumerReadConfig,
-  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG,
   HeartbeatReport,
   MembershipCoordinationSource,
 };
@@ -66,6 +66,7 @@ use blob_stream_types::{
   logical_partition_for_key,
   new_record,
   now_unix_millis,
+  offset_datetime_from_unix_millis,
   virtual_partition_for_logical,
 };
 use bytes::Bytes;
@@ -138,8 +139,8 @@ fn fenced_metadata_segment(
     BlobKey::new(format!("fenced-metadata/{snowflake_id}.bin")),
     Compression::none(),
     segment_index,
-    0,
-    0,
+    OffsetDateTime::UNIX_EPOCH,
+    OffsetDateTime::UNIX_EPOCH,
   )
 }
 
@@ -159,8 +160,8 @@ async fn acquire_producer_fence(
       key.clone(),
       holder_id.to_string(),
       lease_session_id.to_string(),
-      now_ts_ms,
-      100,
+      offset_datetime_from_unix_millis(now_ts_ms),
+      TimeDuration::milliseconds(100),
     )
     .await?;
   let LeaseAcquireOutcome::Acquired(lease) = outcome else {
@@ -368,8 +369,8 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
       key.clone(),
       "broker-a".to_string(),
       "session-1".to_string(),
-      1_000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
     )
     .await?;
   let LeaseAcquireOutcome::Acquired(first) = first else {
@@ -382,8 +383,8 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
       key.clone(),
       "broker-a".to_string(),
       "session-1".to_string(),
-      1_050,
-      100,
+      offset_datetime_from_unix_millis(1_050),
+      TimeDuration::milliseconds(100),
     )
     .await?;
   let LeaseAcquireOutcome::Acquired(renewal) = renewal else {
@@ -396,8 +397,8 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
       key.clone(),
       "broker-a".to_string(),
       "session-2".to_string(),
-      1_100,
-      100,
+      offset_datetime_from_unix_millis(1_100),
+      TimeDuration::milliseconds(100),
     )
     .await?;
   assert!(matches!(live_takeover, LeaseAcquireOutcome::HeldByOther(_)));
@@ -407,8 +408,8 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
       key.clone(),
       "broker-a".to_string(),
       "session-2".to_string(),
-      1_150,
-      100,
+      offset_datetime_from_unix_millis(1_150),
+      TimeDuration::milliseconds(100),
     )
     .await?;
   let LeaseAcquireOutcome::Acquired(takeover) = takeover else {
@@ -417,18 +418,35 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
   assert_eq!(takeover.fence.lease_epoch, 2);
 
   let heartbeat = lease_store
-    .heartbeat_lease(&key, "broker-a", "session-1", 1_150, 100)
+    .heartbeat_lease(
+      &key,
+      "broker-a",
+      "session-1",
+      offset_datetime_from_unix_millis(1_150),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
   assert!(matches!(heartbeat, LeaseHeartbeatOutcome::HeldByOther(_)));
   let reservation = lease_store
-    .reserve_sequences(&key, "broker-a", "session-1", 1_150, 1)
+    .reserve_sequences(
+      &key,
+      "broker-a",
+      "session-1",
+      offset_datetime_from_unix_millis(1_150),
+      1,
+    )
     .await?;
   assert!(matches!(
     reservation,
     SequenceReservationOutcome::HeldByOther(_)
   ));
   let release = lease_store
-    .release_lease(&key, "broker-a", "session-1", 1_150)
+    .release_lease(
+      &key,
+      "broker-a",
+      "session-1",
+      offset_datetime_from_unix_millis(1_150),
+    )
     .await?;
   assert!(matches!(release, LeaseReleaseOutcome::HeldByOther(_)));
 
@@ -451,8 +469,8 @@ async fn dynamo_sequence_reservation_rejects_stale_same_holder_session_before_ov
       key.clone(),
       "broker-a".to_string(),
       "session-1".to_string(),
-      1_000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
       Some(u64::MAX),
     )
     .await?;
@@ -466,14 +484,20 @@ async fn dynamo_sequence_reservation_rejects_stale_same_holder_session_before_ov
       key.clone(),
       "broker-a".to_string(),
       "session-2".to_string(),
-      1_100,
-      100,
+      offset_datetime_from_unix_millis(1_100),
+      TimeDuration::milliseconds(100),
     )
     .await?;
   assert!(matches!(takeover, LeaseAcquireOutcome::Acquired(_)));
 
   let reservation = lease_store
-    .reserve_sequences(&key, "broker-a", "session-1", 1_100, 2)
+    .reserve_sequences(
+      &key,
+      "broker-a",
+      "session-1",
+      offset_datetime_from_unix_millis(1_100),
+      2,
+    )
     .await?;
   assert!(matches!(
     reservation,
@@ -530,7 +554,7 @@ impl MetadataStore for FenceInvalidatingMetadataStore {
         &fence.key,
         &fence.fence.holder_id,
         &fence.fence.lease_session_id,
-        now_ts_ms,
+        offset_datetime_from_unix_millis(now_ts_ms),
       )
       .await?;
     if release != LeaseReleaseOutcome::Released {
@@ -670,8 +694,8 @@ async fn write_recovery_segment(
             payload_bytes: u64::try_from(encoded.len())?,
           }],
         )]),
-        window_start_unix_seconds * 1_000,
-        published_ts_ms,
+        OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(window_start_unix_seconds * 1_000),
+        OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(published_ts_ms),
       ),
       None,
       0,
@@ -880,8 +904,10 @@ impl MetadataStore for DeferredWindowPublicationMetadataStore {
       .await?;
     if window.window_start_unix_seconds == self.deferred_window_start.load(Ordering::Acquire) {
       for segment in &mut segments {
-        segment.metadata_published_ts_ms =
-          self.deferred_window_published_ts_ms.load(Ordering::Acquire);
+        segment.metadata_published_at = OffsetDateTime::UNIX_EPOCH
+          + TimeDuration::milliseconds(
+            self.deferred_window_published_ts_ms.load(Ordering::Acquire),
+          );
       }
       self.deferred_window_scanned.store(true, Ordering::Release);
       self.deferred_window_scan.notify_waiters();
@@ -1341,8 +1367,8 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -1541,7 +1567,11 @@ async fn broker_coalesces_same_partition_requests_into_one_consumer_batch() -> R
 
   let broker_now = broker_time.now().unix_timestamp();
   let reader_now = broker_now.saturating_add(1);
-  let window = Window::for_timestamp(broker_now, WINDOW_SIZE_SECONDS).key(TOPIC);
+  let window = Window::for_timestamp(
+    broker_time.now(),
+    TimeDuration::seconds(WINDOW_SIZE_SECONDS),
+  )
+  .key(TOPIC);
   let metadata_deadline = Instant::now() + Duration::from_secs(5);
   let segments = loop {
     let segments = resources
@@ -1575,8 +1605,8 @@ async fn broker_coalesces_same_partition_requests_into_one_consumer_batch() -> R
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
   let consumer_deadline = Instant::now() + Duration::from_secs(5);
@@ -1942,8 +1972,8 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -2134,7 +2164,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
     .list_active_members(
       runtime_group.topic.as_str(),
       runtime_group.group_id.as_str(),
-      now_unix_millis(),
+      offset_datetime_from_unix_millis(now_unix_millis()),
     )
     .await?;
   assert_eq!(
@@ -2172,7 +2202,7 @@ async fn consumer_restart_resume_from_committed_offsets() -> Result<()> {
       .list_active_members(
         runtime_group.topic.as_str(),
         runtime_group.group_id.as_str(),
-        now_unix_millis(),
+        offset_datetime_from_unix_millis(now_unix_millis()),
       )
       .await?
       .is_empty(),
@@ -2463,7 +2493,7 @@ async fn graceful_shutdown_final_checkpoint_commits_staged_record_before_release
       .list_active_members(
         group.topic.as_str(),
         group.group_id.as_str(),
-        logical_now_ms
+        offset_datetime_from_unix_millis(logical_now_ms),
       )
       .await?
       .is_empty(),
@@ -2562,8 +2592,12 @@ async fn iterator_reuses_mature_recovery_metadata_across_prefetch_capacity_cycle
   let lease_store = resources.consumer_lease_store();
   let membership_store = resources.consumer_membership_store();
   let now_ts_ms = now_unix_millis();
-  let current_window_start =
-    Window::for_timestamp(now_ts_ms / 1_000, WINDOW_SIZE_SECONDS).start_unix_seconds;
+  let current_window_start = Window::for_timestamp(
+    offset_datetime_from_unix_millis(now_ts_ms),
+    TimeDuration::seconds(WINDOW_SIZE_SECONDS),
+  )
+  .start
+  .unix_timestamp();
   let recovery_window_start = current_window_start - (2 * WINDOW_SIZE_SECONDS);
   let published_ts_ms = now_ts_ms.saturating_sub(10_000);
   let recovery_checkpoint_snowflake =
@@ -2645,8 +2679,8 @@ async fn iterator_reuses_mature_recovery_metadata_across_prefetch_capacity_cycle
       lease_key.clone(),
       "previous-owner".to_string(),
       1,
-      now_ts_ms,
-      2_000,
+      offset_datetime_from_unix_millis(now_ts_ms),
+      TimeDuration::milliseconds(2_000),
     )
     .await?;
   lease_store
@@ -2654,7 +2688,7 @@ async fn iterator_reuses_mature_recovery_metadata_across_prefetch_capacity_cycle
       &lease_key,
       "previous-owner",
       1,
-      now_ts_ms,
+      offset_datetime_from_unix_millis(now_ts_ms),
       CommittedCursor {
         virtual_partition_id: 0,
         seq_end: 1,
@@ -2666,7 +2700,12 @@ async fn iterator_reuses_mature_recovery_metadata_across_prefetch_capacity_cycle
     )
     .await?;
   let _ = lease_store
-    .release_partition(&lease_key, "previous-owner", 1, now_ts_ms)
+    .release_partition(
+      &lease_key,
+      "previous-owner",
+      1,
+      offset_datetime_from_unix_millis(now_ts_ms),
+    )
     .await?;
 
   let counting_metadata_store = Arc::new(CountingWindowMetadataStore::new(
@@ -2701,7 +2740,7 @@ async fn iterator_reuses_mature_recovery_metadata_across_prefetch_capacity_cycle
       )),
       metrics_scope("blob_stream_consumer_it"),
       1,
-      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
     )
     .await?,
@@ -2769,8 +2808,12 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
   let lease_store = resources.consumer_lease_store();
   let membership_store = resources.consumer_membership_store();
   let now_ts_ms = now_unix_millis();
-  let current_window_start =
-    Window::for_timestamp(now_ts_ms / 1_000, WINDOW_SIZE_SECONDS).start_unix_seconds;
+  let current_window_start = Window::for_timestamp(
+    offset_datetime_from_unix_millis(now_ts_ms),
+    TimeDuration::seconds(WINDOW_SIZE_SECONDS),
+  )
+  .start
+  .unix_timestamp();
   let recovery_start = current_window_start - (RECOVERY_WINDOW_COUNT * WINDOW_SIZE_SECONDS);
   let published_ts_ms = now_ts_ms.saturating_sub(10_000);
   let other_partition_checkpoint_snowflake =
@@ -2914,8 +2957,8 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
         lease_key.clone(),
         "previous-owner".to_string(),
         1,
-        now_ts_ms,
-        2_000,
+        offset_datetime_from_unix_millis(now_ts_ms),
+        TimeDuration::milliseconds(2_000),
       )
       .await?;
     lease_store
@@ -2923,7 +2966,7 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
         &lease_key,
         "previous-owner",
         1,
-        now_ts_ms,
+        offset_datetime_from_unix_millis(now_ts_ms),
         CommittedCursor {
           virtual_partition_id: partition_id,
           seq_end: 1,
@@ -2935,7 +2978,12 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
       )
       .await?;
     let _ = lease_store
-      .release_partition(&lease_key, "previous-owner", 1, now_ts_ms)
+      .release_partition(
+        &lease_key,
+        "previous-owner",
+        1,
+        offset_datetime_from_unix_millis(now_ts_ms),
+      )
       .await?;
   }
 
@@ -2966,7 +3014,7 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
       )),
       metrics_scope("blob_stream_consumer_it"),
       1,
-      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
     )
     .await?,
@@ -3189,7 +3237,11 @@ async fn live_group_restart_recovers_retained_history_before_fast_path() -> Resu
   assert!(
     cluster
       .consumer_membership_store()
-      .list_active_members(group_topic.as_str(), group_id.as_str(), logical_now_ms)
+      .list_active_members(
+        group_topic.as_str(),
+        group_id.as_str(),
+        offset_datetime_from_unix_millis(logical_now_ms),
+      )
       .await?
       .is_empty(),
     "graceful shutdown must leave the group before retained history is published"
@@ -3461,8 +3513,12 @@ async fn live_group_recovery_waits_for_historical_metadata_visibility_delay() ->
   .await?;
   consumer_time.advance(TimeDuration::seconds(WINDOW_SIZE_SECONDS + 1));
   deferred_window_start.store(
-    Window::for_timestamp(consumer_time.now().unix_timestamp(), WINDOW_SIZE_SECONDS)
-      .start_unix_seconds,
+    Window::for_timestamp(
+      consumer_time.now(),
+      TimeDuration::seconds(WINDOW_SIZE_SECONDS),
+    )
+    .start
+    .unix_timestamp(),
     Ordering::Release,
   );
   produce_message_at_manual_time(
@@ -4561,8 +4617,8 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -4699,8 +4755,8 @@ async fn multi_topic_isolation() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -4716,8 +4772,8 @@ async fn multi_topic_isolation() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -4880,8 +4936,8 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -5030,8 +5086,8 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
     resources.blob_store(),
     metadata_store,
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -5426,11 +5482,7 @@ async fn graceful_shutdown_recovers_prefetched_undelivered_record() -> Result<()
   assert!(
     cluster
       .consumer_membership_store()
-      .list_active_members(
-        group_topic.as_str(),
-        group_id.as_str(),
-        consumer_time.now().unix_timestamp_ms(),
-      )
+      .list_active_members(group_topic.as_str(), group_id.as_str(), consumer_time.now(),)
       .await?
       .is_empty(),
     "graceful shutdown must deregister the original member"
@@ -5640,7 +5692,7 @@ async fn prefetch_rebalance_revocation_fences_buffered_record() -> Result<()> {
         .list_active_members(
           group.topic.as_str(),
           group.group_id.as_str(),
-          consumer_time.now().unix_timestamp_ms(),
+          consumer_time.now(),
         )
         .await?;
       if active_members
@@ -5817,8 +5869,8 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       key.clone(),
       "member-a".to_string(),
       initial_generation,
-      start_ts_ms,
-      lease_duration_ms,
+      offset_datetime_from_unix_millis(start_ts_ms),
+      TimeDuration::milliseconds(lease_duration_ms),
     )
     .await?;
   assert!(matches!(
@@ -5831,8 +5883,8 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       &key,
       "member-a",
       initial_generation,
-      start_ts_ms + 10,
-      lease_duration_ms,
+      offset_datetime_from_unix_millis(start_ts_ms + 10),
+      TimeDuration::milliseconds(lease_duration_ms),
       Some(CommittedCursor {
         virtual_partition_id: key.virtual_partition_id,
         seq_end: 10,
@@ -5860,8 +5912,8 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       key.clone(),
       "member-b".to_string(),
       takeover_generation,
-      start_ts_ms + 250,
-      lease_duration_ms,
+      offset_datetime_from_unix_millis(start_ts_ms + 250),
+      TimeDuration::milliseconds(lease_duration_ms),
     )
     .await?;
   let ConsumerGroupAssignmentOutcome::Assigned {
@@ -5888,8 +5940,8 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       &key,
       "member-b",
       takeover_generation,
-      start_ts_ms + 260,
-      lease_duration_ms,
+      offset_datetime_from_unix_millis(start_ts_ms + 260),
+      TimeDuration::milliseconds(lease_duration_ms),
       Some(CommittedCursor {
         virtual_partition_id: key.virtual_partition_id,
         seq_end: 20,
@@ -5917,8 +5969,8 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       &key,
       "member-a",
       initial_generation,
-      start_ts_ms + 270,
-      lease_duration_ms,
+      offset_datetime_from_unix_millis(start_ts_ms + 270),
+      TimeDuration::milliseconds(lease_duration_ms),
       Some(CommittedCursor {
         virtual_partition_id: key.virtual_partition_id,
         seq_end: 999,
@@ -5945,7 +5997,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       &key,
       "member-a",
       initial_generation,
-      start_ts_ms + 280,
+      offset_datetime_from_unix_millis(start_ts_ms + 280),
       CommittedCursor {
         virtual_partition_id: key.virtual_partition_id,
         seq_end: 999,
@@ -5973,7 +6025,7 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       &key,
       "member-b",
       takeover_generation,
-      start_ts_ms + 290,
+      offset_datetime_from_unix_millis(start_ts_ms + 290),
       CommittedCursor {
         virtual_partition_id: key.virtual_partition_id,
         seq_end: 21,
@@ -6000,8 +6052,8 @@ async fn consumer_generation_fencing_rejects_stale_commit() -> Result<()> {
       &key,
       "member-a",
       initial_generation,
-      start_ts_ms + 300,
-      lease_duration_ms,
+      offset_datetime_from_unix_millis(start_ts_ms + 300),
+      TimeDuration::milliseconds(lease_duration_ms),
       Some(CommittedCursor {
         virtual_partition_id: key.virtual_partition_id,
         seq_end: 1_000,
@@ -6272,8 +6324,8 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -6552,7 +6604,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
     .list_active_members(
       group.topic.as_str(),
       group.group_id.as_str(),
-      consumer_time.now().unix_timestamp_ms(),
+      consumer_time.now(),
     )
     .await?;
   assert_eq!(
@@ -6599,8 +6651,8 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
       &recovery_lease.key,
       runtime_a.group.as_ref().unwrap().member_id.as_str(),
       initial_generations[&stale_partition],
-      consumer_time.now().unix_timestamp_ms(),
-      2_000,
+      consumer_time.now(),
+      TimeDuration::milliseconds(2_000),
       recovery_lease.committed_cursor.clone(),
     )
     .await?;
@@ -6773,8 +6825,8 @@ async fn consumer_crash_recovery_redelivers_only_uncommitted_record() -> Result<
       &recovered_lease.key,
       runtime_a.group.as_ref().unwrap().member_id.as_str(),
       first_generation,
-      consumer_time.now().unix_timestamp_ms(),
-      2_000,
+      consumer_time.now(),
+      TimeDuration::milliseconds(2_000),
       recovered_lease.committed_cursor.clone(),
     )
     .await?;
@@ -7524,7 +7576,11 @@ async fn bootstrap_graceful_restart_resumes_durable_s3_dynamo_progress() -> Resu
   assert!(
     resources
       .consumer_membership_store()
-      .list_active_members(TOPIC, "integration-group", now_unix_millis())
+      .list_active_members(
+        TOPIC,
+        "integration-group",
+        offset_datetime_from_unix_millis(now_unix_millis()),
+      )
       .await?
       .is_empty(),
     "bootstrap member remained registered after graceful shutdown"
@@ -7848,11 +7904,7 @@ async fn bootstrap_dynamic_membership_scale_in_after_expiry() -> Result<()> {
   assert!(recovered_counts.values().all(|count| *count == 1));
 
   let active_members = membership_store
-    .list_active_members(
-      TOPIC,
-      "integration-group",
-      consumer_time.now().unix_timestamp_ms(),
-    )
+    .list_active_members(TOPIC, "integration-group", consumer_time.now())
     .await?;
   assert_eq!(member_ids(&active_members), vec!["bootstrap-a".to_string()]);
 

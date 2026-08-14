@@ -5,7 +5,7 @@ mod tests;
 #[path = "./coordination/assignment.rs"]
 mod assignment;
 
-use crate::config::{ConsumerGroupConfig, consumer_lease_duration_ms, validate_group_config};
+use crate::config::{ConsumerGroupConfig, consumer_lease_duration, validate_group_config};
 use anyhow::{Error, Result};
 pub use assignment::cooperative_sticky_assignment;
 use assignment::{
@@ -17,6 +17,7 @@ use assignment::{
 };
 use async_trait::async_trait;
 use bd_log_util::warn_every;
+use bd_time::OffsetDateTimeExt;
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupAssignmentPlan,
@@ -30,7 +31,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupPlannerLeaseOutcome,
   ConsumerGroupReleaseOutcome,
 };
-use blob_stream_types::{CommittedCursor, VirtualPartitionId, format_unix_timestamp_ms};
+use blob_stream_types::{CommittedCursor, VirtualPartitionId, offset_datetime_from_unix_millis};
 use futures::{StreamExt, stream};
 use log::{debug, info, trace};
 
@@ -53,6 +54,7 @@ pub struct LeaseClaimCounts {
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use time::OffsetDateTime;
 use time::ext::NumericalDuration;
 use uuid::Uuid;
 
@@ -226,20 +228,20 @@ pub trait ConsumerGroupCoordinator: Send + Sync {
     &mut self,
     members: Vec<String>,
     partitions: Vec<VirtualPartitionId>,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<RebalanceReport>;
 
   /// Heartbeat currently owned partitions and optionally commit cursors.
   async fn heartbeat_and_commit(
     &mut self,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     cursors: &HashMap<VirtualPartitionId, CommittedCursor>,
   ) -> Result<HeartbeatReport>;
 
   /// Commit staged cursors without renewing unrelated partition leases.
   async fn commit_cursors(
     &mut self,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     cursors: &HashMap<VirtualPartitionId, CommittedCursor>,
   ) -> Result<HeartbeatReport>;
 
@@ -247,11 +249,11 @@ pub trait ConsumerGroupCoordinator: Send + Sync {
   async fn release_partitions(
     &mut self,
     partitions: &[VirtualPartitionId],
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<Vec<VirtualPartitionId>>;
 
   /// Release all owned partitions (best-effort), usually during shutdown.
-  async fn release_owned(&mut self, now_ts_ms: i64) -> Result<Vec<VirtualPartitionId>>;
+  async fn release_owned(&mut self, now: OffsetDateTime) -> Result<Vec<VirtualPartitionId>>;
 
   /// Return current coordinator generation.
   fn generation(&self) -> u64;
@@ -299,7 +301,7 @@ impl ConsumerGroupCoordinatorImpl {
     &self,
     members: &[String],
     partitions: &[VirtualPartitionId],
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<SharedAssignment> {
     let current_plan = self
       .membership_store
@@ -337,7 +339,7 @@ impl ConsumerGroupCoordinatorImpl {
     let member_topology = if let Some(local_pod_id) = self.config.pod_id.as_deref() {
       let active_members = self
         .membership_store
-        .list_active_members(&self.config.topic, &self.config.group_id, now_ts_ms)
+        .list_active_members(&self.config.topic, &self.config.group_id, now)
         .await?;
       canonical_member_topology(
         &current_members,
@@ -359,7 +361,8 @@ impl ConsumerGroupCoordinatorImpl {
         .get_planner_lease(&self.config.topic, &self.config.group_id)
         .await?;
       let planner_is_active = planner_lease.as_ref().is_some_and(|lease| {
-        lease.member_id == plan.planner_member_id && lease.lease_expiration_ts_ms > now_ts_ms
+        lease.member_id == plan.planner_member_id
+          && lease.lease_expiration_ts_ms > now.unix_timestamp_ms()
       });
       if planner_is_active && plan.planner_member_id != self.config.member_id.as_ref() {
         debug!(
@@ -384,8 +387,8 @@ impl ConsumerGroupCoordinatorImpl {
             &self.config.group_id,
             &self.config.member_id,
             &self.planner_session_id,
-            now_ts_ms,
-            consumer_lease_duration_ms(&self.config),
+            now,
+            consumer_lease_duration(&self.config),
           )
           .await?;
         if outcome == ConsumerGroupPlannerLeaseOutcome::Acquired {
@@ -409,8 +412,8 @@ impl ConsumerGroupCoordinatorImpl {
         &self.config.group_id,
         &self.config.member_id,
         &self.planner_session_id,
-        now_ts_ms,
-        consumer_lease_duration_ms(&self.config),
+        now,
+        consumer_lease_duration(&self.config),
       )
       .await?;
     if planner_outcome == ConsumerGroupPlannerLeaseOutcome::Acquired {
@@ -440,7 +443,7 @@ impl ConsumerGroupCoordinatorImpl {
         &assignment,
         member_topology,
         &self.config.member_id,
-        now_ts_ms,
+        now.unix_timestamp_ms(),
       );
       let moved_partitions = plan
         .assignments
@@ -470,7 +473,7 @@ impl ConsumerGroupCoordinatorImpl {
           &self.config.group_id,
           &self.config.member_id,
           &self.planner_session_id,
-          now_ts_ms,
+          now,
           plan.clone(),
         )
         .await?
@@ -533,7 +536,7 @@ impl ConsumerGroupCoordinatorImpl {
 
   async fn maintain_partitions(
     &mut self,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     cursors: &HashMap<VirtualPartitionId, CommittedCursor>,
     partitions: Vec<(VirtualPartitionId, u64)>,
     operation: LeaseMaintenanceOperation,
@@ -547,7 +550,7 @@ impl ConsumerGroupCoordinatorImpl {
     let topic = self.config.topic.to_string();
     let group_id = self.config.group_id.to_string();
     let member_id = self.config.member_id.to_string();
-    let lease_duration_ms = consumer_lease_duration_ms(&self.config);
+    let lease_duration = consumer_lease_duration(&self.config);
     let outcomes = stream::iter(partitions.into_iter().map(|(partition_id, generation)| {
       let lease_store = Arc::clone(&self.lease_store);
       let key = ConsumerGroupLeaseKey {
@@ -564,8 +567,8 @@ impl ConsumerGroupCoordinatorImpl {
               &key,
               &member_id,
               generation,
-              now_ts_ms,
-              lease_duration_ms,
+              now,
+              lease_duration,
               committed_cursor,
             )
             .await?
@@ -583,7 +586,7 @@ impl ConsumerGroupCoordinatorImpl {
               &key,
               &member_id,
               generation,
-              now_ts_ms,
+              now,
               committed_cursor.expect("cursor commits only target staged partitions"),
             )
             .await?
@@ -632,8 +635,8 @@ impl ConsumerGroupCoordinatorImpl {
             self.generation,
             lease.owner_id,
             lease.generation,
-            format_unix_timestamp_ms(lease.lease_expiration_ts_ms),
-            format_unix_timestamp_ms(lease.last_heartbeat_ts_ms)
+            offset_datetime_from_unix_millis(lease.lease_expiration_ts_ms),
+            offset_datetime_from_unix_millis(lease.last_heartbeat_ts_ms)
           );
         },
         LeaseMaintenanceOutcome::Expired => {
@@ -647,7 +650,7 @@ impl ConsumerGroupCoordinatorImpl {
             partition_id,
             self.config.member_id,
             self.generation,
-            format_unix_timestamp_ms(now_ts_ms)
+            now
           );
         },
       }
@@ -691,16 +694,14 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     &mut self,
     members: Vec<String>,
     partitions: Vec<VirtualPartitionId>,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<RebalanceReport> {
     // Desired ownership is accepted only from a valid persisted plan. During a planner transition
     // without one, this member makes no local ownership decision.
     let SharedAssignment {
       plan: shared_plan,
       rejected_assignment_plan_version,
-    } = self
-      .shared_assignment(&members, &partitions, now_ts_ms)
-      .await?;
+    } = self.shared_assignment(&members, &partitions, now).await?;
     let accepted_assignment_plan_version = shared_plan.as_ref().map(|plan| plan.version);
     let assignment_plan_applied =
       accepted_assignment_plan_version.is_some_and(|plan_version| self.generation != plan_version);
@@ -752,7 +753,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     let topic = self.config.topic.to_string();
     let group_id = self.config.group_id.to_string();
     let generation = self.generation;
-    let lease_duration_ms = consumer_lease_duration_ms(&self.config);
+    let lease_duration = consumer_lease_duration(&self.config);
     let partitions_to_claim = partitions
       .into_iter()
       .filter(|partition_id| {
@@ -776,7 +777,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
         let member_id = member_id.clone();
         async move {
           let outcome = lease_store
-            .assign_partition(key, member_id, generation, now_ts_ms, lease_duration_ms)
+            .assign_partition(key, member_id, generation, now, lease_duration)
             .await?;
           Ok::<_, Error>((partition_id, outcome))
         }
@@ -826,7 +827,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
                 generation,
                 previous_owner_id,
                 previous_generation,
-                format_unix_timestamp_ms(previous_last_heartbeat_ts_ms),
+                offset_datetime_from_unix_millis(previous_last_heartbeat_ts_ms),
               );
             },
           }
@@ -856,8 +857,8 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
             self.generation,
             lease.owner_id,
             lease.generation,
-            format_unix_timestamp_ms(lease.lease_expiration_ts_ms),
-            format_unix_timestamp_ms(lease.last_heartbeat_ts_ms)
+            offset_datetime_from_unix_millis(lease.lease_expiration_ts_ms),
+            offset_datetime_from_unix_millis(lease.last_heartbeat_ts_ms)
           );
         },
       }
@@ -913,7 +914,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
 
   async fn heartbeat_and_commit(
     &mut self,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     cursors: &HashMap<VirtualPartitionId, CommittedCursor>,
   ) -> Result<HeartbeatReport> {
     let owned = self
@@ -922,18 +923,13 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       .map(|(partition_id, lease)| (*partition_id, lease.generation))
       .collect::<Vec<_>>();
     self
-      .maintain_partitions(
-        now_ts_ms,
-        cursors,
-        owned,
-        LeaseMaintenanceOperation::Heartbeat,
-      )
+      .maintain_partitions(now, cursors, owned, LeaseMaintenanceOperation::Heartbeat)
       .await
   }
 
   async fn commit_cursors(
     &mut self,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     cursors: &HashMap<VirtualPartitionId, CommittedCursor>,
   ) -> Result<HeartbeatReport> {
     let owned = cursors
@@ -946,19 +942,14 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       })
       .collect::<Vec<_>>();
     self
-      .maintain_partitions(
-        now_ts_ms,
-        cursors,
-        owned,
-        LeaseMaintenanceOperation::CommitCursor,
-      )
+      .maintain_partitions(now, cursors, owned, LeaseMaintenanceOperation::CommitCursor)
       .await
   }
 
   async fn release_partitions(
     &mut self,
     partitions: &[VirtualPartitionId],
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<Vec<VirtualPartitionId>> {
     let mut released = Vec::new();
 
@@ -974,7 +965,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
 
       let outcome = self
         .lease_store
-        .release_partition(&key, &self.config.member_id, lease.generation, now_ts_ms)
+        .release_partition(&key, &self.config.member_id, lease.generation, now)
         .await?;
 
       match outcome {
@@ -992,9 +983,9 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     Ok(released)
   }
 
-  async fn release_owned(&mut self, now_ts_ms: i64) -> Result<Vec<VirtualPartitionId>> {
+  async fn release_owned(&mut self, now: OffsetDateTime) -> Result<Vec<VirtualPartitionId>> {
     let owned = self.owned.keys().copied().collect::<Vec<_>>();
-    self.release_partitions(&owned, now_ts_ms).await
+    self.release_partitions(&owned, now).await
   }
 
   fn generation(&self) -> u64 {

@@ -14,6 +14,7 @@ use log::debug;
 use std::sync::Arc;
 use std::time::Instant;
 use time::ext::NumericalDuration;
+use time::{Duration, OffsetDateTime};
 
 mod assignment;
 
@@ -22,8 +23,8 @@ pub(super) async fn acquire_lease_and_reserve_sequences(
   holder_id: &str,
   lease_session_id: &str,
   key: ProducerPartitionLeaseKey,
-  now_ts_ms: i64,
-  lease_duration_ms: i64,
+  now: OffsetDateTime,
+  lease_duration: Duration,
   reservation_size: Option<u64>,
   metrics: &WriteMetrics,
 ) -> Result<LeaseAcquireAndReserveOutcome> {
@@ -33,8 +34,8 @@ pub(super) async fn acquire_lease_and_reserve_sequences(
       key,
       holder_id.to_string(),
       lease_session_id.to_string(),
-      now_ts_ms,
-      lease_duration_ms,
+      now,
+      lease_duration,
       reservation_size,
     )
     .await
@@ -52,7 +53,7 @@ impl WriteEngineImpl {
     &self,
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<blob_stream_metadata_store::ProducerPartitionLease, WriteError> {
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string().into(),
@@ -65,8 +66,8 @@ impl WriteEngineImpl {
         key,
         self.holder_id.clone(),
         self.lease_session_id.clone(),
-        now_ts_ms,
-        self.config.lease_duration_ms,
+        now,
+        self.config.lease_duration,
       )
       .await
       .context("acquire producer partition lease")?
@@ -83,7 +84,7 @@ impl WriteEngineImpl {
     &self,
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     reservation_size: u64,
   ) -> Result<SeqRange, WriteError> {
     let key = ProducerPartitionLeaseKey {
@@ -97,7 +98,7 @@ impl WriteEngineImpl {
         &key,
         &self.holder_id,
         &self.lease_session_id,
-        now_ts_ms,
+        now,
         reservation_size,
       )
       .await
@@ -135,7 +136,7 @@ impl WriteEngineImpl {
     &self,
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     reservation_size: u64,
   ) -> Result<(blob_stream_metadata_store::ProducerPartitionLease, SeqRange), WriteError> {
     let key = ProducerPartitionLeaseKey {
@@ -147,8 +148,8 @@ impl WriteEngineImpl {
       &self.holder_id,
       &self.lease_session_id,
       key,
-      now_ts_ms,
-      self.config.lease_duration_ms,
+      now,
+      self.config.lease_duration,
       Some(reservation_size),
       &self.metrics,
     )

@@ -54,8 +54,11 @@ that domain.
 
 Important broker defaults are 64 MiB `flush_max_bytes`, 1 second `flush_max_delay_ms`, 10,000
 `sequence_reservation_size`, zstd segment compression, and disabled `fenced_metadata_writes`.
-Topics default `max_metadata_publication_lag_ms` to 15 seconds. Producer and consumer defaults,
-including batching, retry, read-window, and prefetch values, are documented in the protobuf schema.
+Topics default `max_metadata_publication_lag_ms` to 15 seconds when unset. Consumers default
+`max_clock_skew_ms` to 10 ms when unset. Configure the skew bound to the proven, monitored pairwise
+broker-to-consumer clock offset for the deployment; it is a consumer read setting.
+Producer and consumer defaults, including batching, retry, read-window, and prefetch values, are
+documented in the protobuf schema.
 
 ### Feature-Flag Mounts
 

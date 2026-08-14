@@ -19,12 +19,16 @@ use blob_stream_metadata_store::{
   SequenceReservationOutcome,
 };
 use blob_stream_test_utils::ManualTimeProvider;
-use blob_stream_types::{VirtualPartitionId, virtual_partition_for_logical};
+use blob_stream_types::{
+  VirtualPartitionId,
+  offset_datetime_from_unix_millis,
+  virtual_partition_for_logical,
+};
 use protobuf::Chars;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokio::sync::{Semaphore, mpsc, watch};
 
 struct BlockingReleaseLeaseStore {
@@ -47,18 +51,12 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     key: ProducerPartitionLeaseKey,
     holder_id: String,
     lease_session_id: String,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
   ) -> Result<LeaseAcquireOutcome> {
     self
       .inner
-      .acquire_lease(
-        key,
-        holder_id,
-        lease_session_id,
-        now_ts_ms,
-        lease_duration_ms,
-      )
+      .acquire_lease(key, holder_id, lease_session_id, now, lease_duration)
       .await
   }
 
@@ -67,8 +65,8 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     key: ProducerPartitionLeaseKey,
     holder_id: String,
     lease_session_id: String,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
     reservation_size: Option<u64>,
   ) -> Result<LeaseAcquireAndReserveOutcome> {
     self
@@ -77,8 +75,8 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
         key,
         holder_id,
         lease_session_id,
-        now_ts_ms,
-        lease_duration_ms,
+        now,
+        lease_duration,
         reservation_size,
       )
       .await
@@ -89,18 +87,12 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
   ) -> Result<LeaseHeartbeatOutcome> {
     self
       .inner
-      .heartbeat_lease(
-        key,
-        holder_id,
-        lease_session_id,
-        now_ts_ms,
-        lease_duration_ms,
-      )
+      .heartbeat_lease(key, holder_id, lease_session_id, now, lease_duration)
       .await
   }
 
@@ -109,18 +101,12 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
     self
       .inner
-      .reserve_sequences(
-        key,
-        holder_id,
-        lease_session_id,
-        now_ts_ms,
-        reservation_size,
-      )
+      .reserve_sequences(key, holder_id, lease_session_id, now, reservation_size)
       .await
   }
 
@@ -129,7 +115,7 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<blob_stream_metadata_store::LeaseReleaseOutcome> {
     self
       .started_tx
@@ -143,14 +129,9 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
       .forget();
     self
       .inner
-      .release_lease(key, holder_id, lease_session_id, now_ts_ms)
+      .release_lease(key, holder_id, lease_session_id, now)
       .await
   }
-}
-
-fn time_from_ms(ms: i64) -> OffsetDateTime {
-  OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
-    .unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
 
 fn metrics_scope() -> bd_server_stats::stats::Scope {
@@ -167,7 +148,7 @@ fn ownership_changes_with_membership() {
       partition_count: 8,
       num_writers: 1,
       retention_days: 7,
-      max_metadata_publication_lag_ms: 30_000,
+      max_metadata_publication_lag: Duration::seconds(30),
     },
   );
 
@@ -227,7 +208,7 @@ fn ownership_includes_only_local_producer_writer_virtual_partitions() {
       partition_count: 2,
       num_writers: 2,
       retention_days: 7,
-      max_metadata_publication_lag_ms: 30_000,
+      max_metadata_publication_lag: Duration::seconds(30),
     },
   );
   let membership = BrokerMembership::new(vec![
@@ -266,7 +247,7 @@ fn make_topic(partition_count: u32) -> HashMap<Chars, TopicInfo> {
       partition_count,
       num_writers: 1,
       retention_days: 7,
-      max_metadata_publication_lag_ms: 30_000,
+      max_metadata_publication_lag: Duration::seconds(30),
     },
   );
   topics
@@ -289,8 +270,8 @@ async fn all_partitions_acquired(
         key,
         holder_id.to_string(),
         holder_id.to_string(),
-        1_000,
-        60_000,
+        offset_datetime_from_unix_millis(1_000),
+        Duration::seconds(60),
       )
       .await
       .expect("acquire lease");
@@ -306,7 +287,7 @@ async fn all_partitions_held_by(
   store: &InMemoryProducerPartitionLeaseStore,
   holder_id: &str,
   partition_count: u32,
-  now_ts_ms: i64,
+  now: OffsetDateTime,
 ) -> bool {
   for logical_partition_id in 0 .. partition_count {
     let virtual_partition_id =
@@ -318,7 +299,7 @@ async fn all_partitions_held_by(
     let Ok(Some(lease)) = store.get_lease(&key).await else {
       return false;
     };
-    if lease.fence.holder_id != holder_id || lease.lease_expiration_ts_ms <= now_ts_ms {
+    if lease.fence.holder_id != holder_id || lease.lease_expiration_at <= now {
       return false;
     }
   }
@@ -329,7 +310,7 @@ async fn all_partitions_held_by(
 async fn all_partitions_expired(
   store: &InMemoryProducerPartitionLeaseStore,
   partition_count: u32,
-  now_ts_ms: i64,
+  now: OffsetDateTime,
 ) -> bool {
   for logical_partition_id in 0 .. partition_count {
     let virtual_partition_id =
@@ -341,7 +322,7 @@ async fn all_partitions_expired(
     let Ok(Some(lease)) = store.get_lease(&key).await else {
       return false;
     };
-    if lease.lease_expiration_ts_ms > now_ts_ms {
+    if lease.lease_expiration_at > now {
       return false;
     }
   }
@@ -373,7 +354,7 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
     "node-a",
     "session-a",
     vec![("telemetry".into(), 0), ("telemetry".into(), 1)],
-    1_000,
+    offset_datetime_from_unix_millis(1_000),
     lifecycle_hooks.as_ref(),
   );
   tokio::pin!(releases);
@@ -408,9 +389,11 @@ async fn lease_assignment_waits_for_initialized_self_membership() -> Result<()> 
   let topics = make_topic(partition_count);
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
   let now_ts_ms = 1_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ts_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ts_ms,
+  )));
   let mut config = WriteConfig::with_defaults();
-  config.lease_duration_ms = 60_000;
+  config.lease_duration = Duration::seconds(60);
   let (membership_tx, membership_rx) = watch::channel(BrokerMembership::default());
   let shutdown_trigger = ComponentShutdownTrigger::default();
 
@@ -429,14 +412,30 @@ async fn lease_assignment_waits_for_initialized_self_membership() -> Result<()> 
   .build()?;
 
   tokio::time::sleep(StdDuration::from_millis(50)).await;
-  assert!(!all_partitions_held_by(&lease_store, "node-a", partition_count, now_ts_ms).await);
+  assert!(
+    !all_partitions_held_by(
+      &lease_store,
+      "node-a",
+      partition_count,
+      offset_datetime_from_unix_millis(now_ts_ms)
+    )
+    .await
+  );
 
   membership_tx.send(BrokerMembership::new(vec![BrokerNode {
     node_id: "node-b".into(),
     address: "10.0.0.2:8080".into(),
   }]))?;
   tokio::time::sleep(StdDuration::from_millis(50)).await;
-  assert!(!all_partitions_held_by(&lease_store, "node-a", partition_count, now_ts_ms).await);
+  assert!(
+    !all_partitions_held_by(
+      &lease_store,
+      "node-a",
+      partition_count,
+      offset_datetime_from_unix_millis(now_ts_ms)
+    )
+    .await
+  );
 
   membership_tx.send(BrokerMembership::new(vec![BrokerNode {
     node_id: "node-a".into(),
@@ -444,7 +443,12 @@ async fn lease_assignment_waits_for_initialized_self_membership() -> Result<()> 
   }]))?;
   assert!(
     wait_for_all_partitions(|| {
-      all_partitions_held_by(&lease_store, "node-a", partition_count, now_ts_ms)
+      all_partitions_held_by(
+        &lease_store,
+        "node-a",
+        partition_count,
+        offset_datetime_from_unix_millis(now_ts_ms),
+      )
     })
     .await,
     "leases were not acquired after node-a appeared in membership"
@@ -460,9 +464,11 @@ async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Resul
   let topics = make_topic(partition_count);
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
   let now_ts_ms = 1_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ts_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ts_ms,
+  )));
   let mut config = WriteConfig::with_defaults();
-  config.lease_duration_ms = 60_000;
+  config.lease_duration = Duration::seconds(60);
   let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
     node_id: "node-a".into(),
     address: "10.0.0.1:8080".into(),
@@ -485,7 +491,12 @@ async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Resul
 
   assert!(
     wait_for_all_partitions(|| {
-      all_partitions_held_by(&lease_store, "node-a", partition_count, now_ts_ms)
+      all_partitions_held_by(
+        &lease_store,
+        "node-a",
+        partition_count,
+        offset_datetime_from_unix_millis(now_ts_ms),
+      )
     })
     .await,
     "node-a did not acquire its initial leases"
@@ -496,8 +507,12 @@ async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Resul
     address: "10.0.0.2:8080".into(),
   }]))?;
   assert!(
-    wait_for_all_partitions(|| all_partitions_expired(&lease_store, partition_count, now_ts_ms))
-      .await,
+    wait_for_all_partitions(|| all_partitions_expired(
+      &lease_store,
+      partition_count,
+      offset_datetime_from_unix_millis(now_ts_ms)
+    ))
+    .await,
     "node-a did not release leases after losing membership"
   );
 
@@ -507,7 +522,12 @@ async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Resul
   }]))?;
   assert!(
     wait_for_all_partitions(|| {
-      all_partitions_held_by(&lease_store, "node-a", partition_count, now_ts_ms)
+      all_partitions_held_by(
+        &lease_store,
+        "node-a",
+        partition_count,
+        offset_datetime_from_unix_millis(now_ts_ms),
+      )
     })
     .await,
     "node-a did not reacquire leases after rejoining membership"
@@ -522,9 +542,11 @@ async fn scale_down_releases_previously_owned_leases() -> Result<()> {
   let partition_count = 4;
   let topics = make_topic(partition_count);
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_000,
+  )));
   let mut config = WriteConfig::with_defaults();
-  config.lease_duration_ms = 60_000;
+  config.lease_duration = Duration::seconds(60);
 
   let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
     node_id: "node-a".into(),
@@ -549,7 +571,12 @@ async fn scale_down_releases_previously_owned_leases() -> Result<()> {
 
   assert!(
     wait_for_all_partitions(|| {
-      all_partitions_held_by(&lease_store, "node-a", partition_count, 1_000)
+      all_partitions_held_by(
+        &lease_store,
+        "node-a",
+        partition_count,
+        offset_datetime_from_unix_millis(1_000),
+      )
     })
     .await,
     "node-a did not acquire its initial leases"
@@ -579,9 +606,11 @@ async fn shutdown_releases_currently_owned_leases() -> Result<()> {
   let partition_count = 4;
   let topics = make_topic(partition_count);
   let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_000,
+  )));
   let mut config = WriteConfig::with_defaults();
-  config.lease_duration_ms = 60_000;
+  config.lease_duration = Duration::seconds(60);
 
   let (_membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
     node_id: "node-a".into(),
@@ -606,7 +635,12 @@ async fn shutdown_releases_currently_owned_leases() -> Result<()> {
 
   assert!(
     wait_for_all_partitions(|| {
-      all_partitions_held_by(&lease_store, "node-a", partition_count, 1_000)
+      all_partitions_held_by(
+        &lease_store,
+        "node-a",
+        partition_count,
+        offset_datetime_from_unix_millis(1_000),
+      )
     })
     .await,
     "node-a did not acquire its initial leases"

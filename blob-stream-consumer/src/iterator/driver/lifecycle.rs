@@ -46,7 +46,7 @@ impl ConsumerDriver {
         .await;
     }
     self
-      .heartbeat(self.now_unix_millis(), HeartbeatTrigger::Commit)
+      .heartbeat(self.time_provider.now(), HeartbeatTrigger::Commit)
       .await
   }
 
@@ -97,7 +97,10 @@ impl ConsumerDriver {
           .before_release_owned(&self.group_config.member_id, self.coordinator.generation())
           .await;
       }
-      let release_result = self.coordinator.release_owned(self.now_unix_millis()).await;
+      let release_result = self
+        .coordinator
+        .release_owned(self.time_provider.now())
+        .await;
       match &release_result {
         Ok(released_partitions) => {
           let released_partitions = released_partitions.iter().copied().collect::<HashSet<_>>();
@@ -315,7 +318,7 @@ impl ConsumerDriver {
     self.seek_reader(
       virtual_partition_id,
       offset,
-      self.now_unix_seconds(),
+      self.time_provider.now(),
       seek_trace,
       response,
     );

@@ -11,21 +11,24 @@ pub use blob_stream_proto::protos::blobstream::v1::config::{
   ConsumerGroupConfig,
   ConsumerReadConfig,
   ConsumerRuntimeConfig,
+  TopicConfig,
 };
-pub use blob_stream_types::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS;
-use blob_stream_types::DEFAULT_METADATA_WINDOW_SIZE_SECONDS;
+pub use blob_stream_types::DEFAULT_MAX_METADATA_PUBLICATION_LAG;
+use blob_stream_types::DEFAULT_METADATA_WINDOW_SIZE;
 use log::{debug, trace};
+use time::Duration;
 use time::ext::NumericalDuration;
 
-const DEFAULT_IDLE_POLL_DELAY_MS: u64 = 250;
-const DEFAULT_MAX_IDLE_POLL_DELAY_MS: u64 = 2_000;
+const DEFAULT_IDLE_POLL_DELAY: Duration = Duration::milliseconds(250);
+const DEFAULT_MAX_IDLE_POLL_DELAY: Duration = Duration::seconds(2);
 const DEFAULT_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const DEFAULT_METADATA_VISIBILITY_DELAY_MS: u64 = 2_000;
+const DEFAULT_METADATA_VISIBILITY_DELAY: Duration = Duration::milliseconds(2_000);
 const DEFAULT_MAX_IN_FLIGHT_BATCH_READS: u64 = 32;
+pub const DEFAULT_MAX_CLOCK_SKEW: Duration = Duration::milliseconds(10);
 const MAX_CANDIDATE_WINDOWS: usize = 32;
-const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
-const DEFAULT_HEARTBEAT_INTERVAL_MS: i64 = 10_000;
-const DEFAULT_REBALANCE_INTERVAL_MS: i64 = 10_000;
+const DEFAULT_LEASE_DURATION: Duration = Duration::seconds(30);
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::seconds(10);
+const DEFAULT_REBALANCE_INTERVAL: Duration = Duration::seconds(10);
 const RESERVED_MEMBER_ID_PREFIX: &str = "__blob_stream_";
 const PREFETCH_MAX_BYTES_FEATURE_FLAG: &str = "blob_stream_consumer_prefetch_max_bytes";
 const MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG: &str =
@@ -41,31 +44,35 @@ pub struct ConsumerReadRuntimeSettings {
   pub(crate) prefetch_max_bytes: u64,
   pub(crate) max_in_flight_batch_reads: usize,
   pub(crate) metadata_read_consistency: MetadataReadConsistency,
-  pub(crate) metadata_visibility_delay_ms: u64,
+  pub(crate) metadata_visibility_delay: Duration,
 }
 
 #[must_use]
-/// Return the configured read window size in seconds, applying defaults when omitted.
-pub fn consumer_window_size_seconds(config: &ConsumerReadConfig) -> i64 {
+/// Return the configured read window size, applying defaults when omitted.
+pub fn consumer_window_size(config: &ConsumerReadConfig) -> Duration {
   config
     .window_size_seconds
-    .unwrap_or(DEFAULT_METADATA_WINDOW_SIZE_SECONDS)
+    .map_or(DEFAULT_METADATA_WINDOW_SIZE, Duration::seconds)
 }
 
 #[must_use]
-/// Return the base idle poll delay in milliseconds, applying defaults.
-pub fn consumer_idle_poll_delay_ms(config: &ConsumerReadConfig) -> u64 {
+/// Return the base idle poll delay, applying defaults.
+pub fn consumer_idle_poll_delay(config: &ConsumerReadConfig) -> Duration {
   config
     .idle_poll_delay_ms
-    .unwrap_or(DEFAULT_IDLE_POLL_DELAY_MS)
+    .map_or(DEFAULT_IDLE_POLL_DELAY, |milliseconds| {
+      Duration::milliseconds(i64::try_from(milliseconds).unwrap_or(i64::MAX))
+    })
 }
 
 #[must_use]
 /// Return the max idle poll delay used by exponential backoff, applying defaults when omitted.
-pub fn consumer_max_idle_poll_delay_ms(config: &ConsumerReadConfig) -> u64 {
+pub fn consumer_max_idle_poll_delay(config: &ConsumerReadConfig) -> Duration {
   config
     .max_idle_poll_delay_ms
-    .unwrap_or(DEFAULT_MAX_IDLE_POLL_DELAY_MS)
+    .map_or(DEFAULT_MAX_IDLE_POLL_DELAY, |milliseconds| {
+      Duration::milliseconds(i64::try_from(milliseconds).unwrap_or(i64::MAX))
+    })
 }
 
 #[must_use]
@@ -79,10 +86,30 @@ pub fn consumer_prefetch_max_bytes(config: &ConsumerReadConfig) -> u64 {
 
 #[must_use]
 /// Return the delay before newly published metadata ranges become eligible for consumption.
-pub fn consumer_metadata_visibility_delay_ms(config: &ConsumerReadConfig) -> u64 {
-  config
-    .metadata_visibility_delay_ms
-    .unwrap_or(DEFAULT_METADATA_VISIBILITY_DELAY_MS)
+pub fn consumer_metadata_visibility_delay(config: &ConsumerReadConfig) -> Duration {
+  Duration::milliseconds(
+    i64::try_from(config.metadata_visibility_delay_ms.unwrap_or_else(|| {
+      u64::try_from(DEFAULT_METADATA_VISIBILITY_DELAY.whole_milliseconds()).unwrap_or(u64::MAX)
+    }))
+    .unwrap_or(i64::MAX),
+  )
+}
+
+#[must_use]
+/// Return the topic publication-lag budget as a typed duration, applying its default when unset.
+pub fn topic_max_metadata_publication_lag(config: &TopicConfig) -> Duration {
+  config.max_metadata_publication_lag_ms.map_or(
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    |maximum_metadata_publication_lag_ms| {
+      Duration::milliseconds(i64::try_from(maximum_metadata_publication_lag_ms).unwrap_or(i64::MAX))
+    },
+  )
+}
+
+#[must_use]
+/// Return the consumer clock-skew budget as a typed duration, applying the 10 ms default.
+pub fn consumer_max_clock_skew(config: &ConsumerReadConfig) -> Duration {
+  Duration::milliseconds(i64::try_from(config.max_clock_skew_ms.unwrap_or(10)).unwrap_or(i64::MAX))
 }
 
 #[must_use]
@@ -154,17 +181,16 @@ pub fn consumer_read_runtime_settings(
   } else {
     MetadataReadConsistency::Eventual
   };
-  let metadata_visibility_delay_ms = if strong_metadata_reads {
-    0
-  } else {
-    consumer_metadata_visibility_delay_ms(config)
-  };
+  let metadata_visibility_delay = crate::consumer::metadata_visibility_delay(
+    consumer_metadata_visibility_delay(config),
+    strong_metadata_reads,
+  );
 
   ConsumerReadRuntimeSettings {
     prefetch_max_bytes,
     max_in_flight_batch_reads,
     metadata_read_consistency,
-    metadata_visibility_delay_ms,
+    metadata_visibility_delay,
   }
 }
 
@@ -172,33 +198,26 @@ pub fn consumer_read_runtime_settings(
 #[cfg(test)]
 pub fn consumer_candidate_window_count(
   config: &ConsumerReadConfig,
-  maximum_metadata_publication_lag_ms: u64,
+  maximum_metadata_publication_lag: Duration,
 ) -> Result<usize> {
-  let metadata_visibility_delay_ms = if consumer_strongly_consistent_metadata_reads(config) {
-    0
-  } else {
-    consumer_metadata_visibility_delay_ms(config)
-  };
-  consumer_candidate_window_count_with_visibility_delay(
+  let metadata_visibility_delay = crate::consumer::metadata_visibility_delay(
+    consumer_metadata_visibility_delay(config),
+    consumer_strongly_consistent_metadata_reads(config),
+  );
+  consumer_candidate_window_count_with_availability_horizon(
     config,
-    maximum_metadata_publication_lag_ms,
-    metadata_visibility_delay_ms,
+    maximum_metadata_publication_lag.saturating_add(metadata_visibility_delay),
   )
 }
 
-/// Derive candidate windows for an explicit per-pass effective visibility delay.
-pub fn consumer_candidate_window_count_with_visibility_delay(
+/// Derive candidate windows for an already combined, typed availability horizon.
+pub fn consumer_candidate_window_count_with_availability_horizon(
   config: &ConsumerReadConfig,
-  maximum_metadata_publication_lag_ms: u64,
-  metadata_visibility_delay_ms: u64,
+  availability_horizon: Duration,
 ) -> Result<usize> {
-  let window_size_ms = u64::try_from(consumer_window_size_seconds(config))
-    .map_err(|_| anyhow!("consumer.read.window_size_seconds must be positive"))?
-    .checked_mul(1_000)
-    .ok_or_else(|| anyhow!("consumer.read.window_size_seconds is too large"))?;
-  let coverage_ms = maximum_metadata_publication_lag_ms
-    .checked_add(metadata_visibility_delay_ms)
-    .ok_or_else(|| anyhow!("metadata availability horizon is too large"))?;
+  let window_size_ms = u64::try_from(consumer_window_size(config).whole_milliseconds())
+    .map_err(|_| anyhow!("consumer.read.window_size_seconds must be positive"))?;
+  let coverage_ms = u64::try_from(availability_horizon.whole_milliseconds()).unwrap_or(u64::MAX);
   let trailing_windows = coverage_ms
     .checked_add(window_size_ms.saturating_sub(1))
     .ok_or_else(|| anyhow!("metadata availability horizon is too large"))?
@@ -213,27 +232,27 @@ pub fn consumer_candidate_window_count_with_visibility_delay(
 }
 
 #[must_use]
-/// Return consumer-group lease duration in milliseconds, applying defaults.
-pub fn consumer_lease_duration_ms(config: &ConsumerGroupConfig) -> i64 {
+/// Return consumer-group lease duration, applying defaults.
+pub fn consumer_lease_duration(config: &ConsumerGroupConfig) -> Duration {
   config
     .lease_duration_ms
-    .unwrap_or(DEFAULT_LEASE_DURATION_MS)
+    .map_or(DEFAULT_LEASE_DURATION, Duration::milliseconds)
 }
 
 #[must_use]
-/// Return consumer-group heartbeat interval in milliseconds, applying defaults.
-pub fn consumer_heartbeat_interval_ms(config: &ConsumerGroupConfig) -> i64 {
+/// Return consumer-group heartbeat interval, applying defaults.
+pub fn consumer_heartbeat_interval(config: &ConsumerGroupConfig) -> Duration {
   config
     .heartbeat_interval_ms
-    .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL_MS)
+    .map_or(DEFAULT_HEARTBEAT_INTERVAL, Duration::milliseconds)
 }
 
 #[must_use]
-/// Return consumer-group rebalance interval in milliseconds, applying defaults.
-pub fn consumer_rebalance_interval_ms(config: &ConsumerGroupConfig) -> i64 {
+/// Return consumer-group rebalance interval, applying defaults.
+pub fn consumer_rebalance_interval(config: &ConsumerGroupConfig) -> Duration {
   config
     .rebalance_interval_ms
-    .unwrap_or(DEFAULT_REBALANCE_INTERVAL_MS)
+    .map_or(DEFAULT_REBALANCE_INTERVAL, Duration::milliseconds)
 }
 
 /// Validate consumer read configuration.
@@ -244,7 +263,7 @@ pub fn validate_read_config(config: &ConsumerReadConfig) -> Result<()> {
   );
   proto_validate::validate(config)?;
   ensure!(
-    consumer_max_idle_poll_delay_ms(config) >= consumer_idle_poll_delay_ms(config),
+    consumer_max_idle_poll_delay(config) >= consumer_idle_poll_delay(config),
     "consumer.read.max_idle_poll_delay_ms must be greater than or equal to \
      consumer.read.idle_poll_delay_ms"
   );

@@ -133,7 +133,7 @@ fn take_flush_partition(
 
 fn flush_trigger(
   partition_state: &PartitionState,
-  now_ts_ms: i64,
+  now: time::OffsetDateTime,
   config: &WriteConfig,
 ) -> Option<FlushTrigger> {
   if partition_state.flush_in_flight {
@@ -144,9 +144,9 @@ fn flush_trigger(
   } else {
     partition_state
       .buffer
-      .is_time_due(now_ts_ms, config)
+      .is_time_due(now, config)
       .then_some(FlushTrigger::MaxDelay)
-      .or_else(|| partition_state.buffer.flush_trigger(now_ts_ms, config))
+      .or_else(|| partition_state.buffer.flush_trigger(now, config))
   }
 }
 
@@ -180,7 +180,7 @@ fn take_flush_partitions(
 
 pub(super) fn collect_flush_plans(
   state: &Arc<Mutex<WriteState>>,
-  now_ts_ms: i64,
+  now: time::OffsetDateTime,
   config: &WriteConfig,
   feature_flags: Option<&FeatureFlagsWatch>,
   topics: &HashMap<Chars, TopicInfo>,
@@ -232,7 +232,7 @@ pub(super) fn collect_flush_plans(
     }
     let flush_trigger = state
       .partition_state(topic.as_str(), *virtual_partition_id)
-      .and_then(|partition_state| flush_trigger(partition_state, now_ts_ms, config));
+      .and_then(|partition_state| flush_trigger(partition_state, now, config));
     let Some(flush_trigger) = flush_trigger else {
       continue;
     };
@@ -292,12 +292,12 @@ pub(super) fn collect_flush_plans(
   plans_by_topic
     .into_iter()
     .flat_map(|(topic, plans)| {
-      let max_metadata_publication_lag_ms = topics
+      let max_metadata_publication_lag = topics
         .get(topic.as_str())
         .expect("flush plans are created only for configured topics")
-        .max_metadata_publication_lag_ms;
+        .max_metadata_publication_lag;
       plans.into_iter().map(move |partitions| FlushPlan {
-        max_metadata_publication_lag_ms,
+        max_metadata_publication_lag,
         topic: topic.clone(),
         partitions,
         fenced_metadata_writes,

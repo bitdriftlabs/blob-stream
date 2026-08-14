@@ -4,11 +4,15 @@ use bd_time::TimeProvider;
 use blob_stream_broker::write::BrokerLeaseStatus;
 use blob_stream_consumer::consumer::ConsumerReaderImpl;
 use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, NextResult};
-use blob_stream_consumer::{ConsumerReadConfig, DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS};
+use blob_stream_consumer::{ConsumerReadConfig, DEFAULT_MAX_METADATA_PUBLICATION_LAG};
 use blob_stream_integration_tests::test_framework as framework;
 use blob_stream_metadata_store::ConsumerGroupMember;
 use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerError, ProducerRecord};
-use blob_stream_types::{logical_partition_for_key, virtual_partition_for_logical};
+use blob_stream_types::{
+  logical_partition_for_key,
+  offset_datetime_from_unix_millis,
+  virtual_partition_for_logical,
+};
 use framework::{
   ClusterHarness,
   IntegrationResources,
@@ -332,8 +336,8 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -815,8 +819,8 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -1054,8 +1058,8 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -1213,8 +1217,8 @@ async fn producer_retry_deadline_respected_after_transport_failures() -> Result<
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -1345,8 +1349,8 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
     resources.s3_blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -1425,8 +1429,8 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
     resources.s3_blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -1536,8 +1540,8 @@ async fn s3_get_not_found_consumer_skips_lost_data() -> Result<()> {
     resources.s3_blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_not_found_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -1825,8 +1829,8 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -2064,8 +2068,8 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 
@@ -2278,7 +2282,7 @@ async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
     .list_active_members(
       group.topic.as_str(),
       group.group_id.as_str(),
-      consumer_time.now().unix_timestamp() * 1_000,
+      consumer_time.now(),
     )
     .await?;
   assert_eq!(member_ids(&active_members), vec!["fit-010-b".to_string()]);
@@ -2558,7 +2562,11 @@ async fn graceful_shutdown_final_commit_failure_redelivers_staged_record() -> Re
   assert!(
     cluster
       .consumer_membership_store()
-      .list_active_members(&topic, &group_id, logical_now_ms)
+      .list_active_members(
+        &topic,
+        &group_id,
+        offset_datetime_from_unix_millis(logical_now_ms),
+      )
       .await?
       .is_empty(),
     "shutdown must deregister the member despite a failed final checkpoint"
@@ -2754,7 +2762,11 @@ async fn graceful_shutdown_release_fault_fences_replacement_until_expiry() -> Re
   assert!(
     cluster
       .consumer_membership_store()
-      .list_active_members(&topic, &group_id, logical_now_ms)
+      .list_active_members(
+        &topic,
+        &group_id,
+        offset_datetime_from_unix_millis(logical_now_ms),
+      )
       .await?
       .is_empty(),
     "successful deregistration must remove A despite its release failure"
@@ -2902,7 +2914,11 @@ async fn graceful_shutdown_deregistration_fault_requires_expiry_before_full_repl
     member_ids(
       &cluster
         .consumer_membership_store()
-        .list_active_members(&topic, &group_id, logical_now_ms)
+        .list_active_members(
+          &topic,
+          &group_id,
+          offset_datetime_from_unix_millis(logical_now_ms),
+        )
         .await?,
     ),
     vec!["fit-015-deregister-a".to_string()],
@@ -2926,7 +2942,11 @@ async fn graceful_shutdown_deregistration_fault_requires_expiry_before_full_repl
       .await?;
   let members_before_expiry = cluster
     .consumer_membership_store()
-    .list_active_members(&topic, &group_id, logical_now_ms)
+    .list_active_members(
+      &topic,
+      &group_id,
+      offset_datetime_from_unix_millis(logical_now_ms),
+    )
     .await?;
   assert_eq!(
     member_ids(&members_before_expiry),
@@ -3250,7 +3270,7 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
     .list_active_members(
       group.topic.as_str(),
       group.group_id.as_str(),
-      OffsetDateTime::now_utc().unix_timestamp() * 1_000,
+      OffsetDateTime::now_utc(),
     )
     .await?;
   assert_eq!(leases.len(), PARTITION_COUNT as usize);
@@ -3425,8 +3445,8 @@ async fn combined_network_and_metadata_faults_preserve_producer_publication() ->
     resources.blob_store(),
     resources.metadata_store(),
     &metrics_scope("blob_stream_consumer_it"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
 

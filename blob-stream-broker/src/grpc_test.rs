@@ -22,7 +22,7 @@ use blob_stream_types::{MAX_PRODUCE_BATCHES_REQUEST_BYTES, SeqRange, new_record}
 use http::{Extensions, HeaderMap};
 use std::collections::HashMap;
 use std::sync::Arc;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokio::sync::{Semaphore, mpsc};
 
 struct OverloadedAdmissionController;
@@ -202,7 +202,7 @@ async fn returns_overloaded_when_admission_controller_rejects() -> Result<()> {
           partition_count: 1,
           num_writers: 1,
           retention_days: 7,
-          max_metadata_publication_lag_ms: 30_000,
+          max_metadata_publication_lag: Duration::seconds(30),
         },
       )]),
       Arc::new(InMemoryBlobStore::new()),
@@ -251,7 +251,7 @@ async fn successful_batches_record_accepted_write_volume() -> Result<()> {
   let scope = collector.scope("blob_stream_broker_test");
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
-  config.flush_max_delay_ms = 60_000;
+  config.flush_max_delay = Duration::seconds(60);
   let engine = Arc::new(
     WriteEngineBuilder::new(
       config,
@@ -262,7 +262,7 @@ async fn successful_batches_record_accepted_write_volume() -> Result<()> {
           partition_count: 1,
           num_writers: 1,
           retention_days: 7,
-          max_metadata_publication_lag_ms: 30_000,
+          max_metadata_publication_lag: Duration::seconds(30),
         },
       )]),
       Arc::new(InMemoryBlobStore::new()),
@@ -315,7 +315,7 @@ async fn empty_logical_batches_return_bad_request() -> Result<()> {
           partition_count: 1,
           num_writers: 1,
           retention_days: 7,
-          max_metadata_publication_lag_ms: 30_000,
+          max_metadata_publication_lag: Duration::seconds(30),
         },
       )]),
       Arc::new(InMemoryBlobStore::new()),

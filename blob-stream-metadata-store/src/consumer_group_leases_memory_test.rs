@@ -8,7 +8,8 @@ use crate::{
   ConsumerGroupReleaseOutcome,
   InMemoryConsumerGroupLeaseStore,
 };
-use blob_stream_types::CommittedCursor;
+use blob_stream_types::{CommittedCursor, offset_datetime_from_unix_millis};
+use time::Duration;
 
 fn lease_key() -> ConsumerGroupLeaseKey {
   ConsumerGroupLeaseKey {
@@ -42,23 +43,53 @@ async fn list_group_leases_returns_retained_rows_in_partition_order() {
   let other_group_key = lease_key_for("topic-a", "group-b", 4);
 
   store
-    .assign_partition(key_ten.clone(), "member-b".to_string(), 3, 1_000, 100)
+    .assign_partition(
+      key_ten.clone(),
+      "member-b".to_string(),
+      3,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .unwrap();
   store
-    .heartbeat_partition(&key_ten, "member-b", 3, 1_010, 100, Some(cursor(10, 42)))
+    .heartbeat_partition(
+      &key_ten,
+      "member-b",
+      3,
+      offset_datetime_from_unix_millis(1_010),
+      Duration::milliseconds(100),
+      Some(cursor(10, 42)),
+    )
     .await
     .unwrap();
   store
-    .assign_partition(key_two.clone(), "member-a".to_string(), 2, 1_000, 100)
+    .assign_partition(
+      key_two.clone(),
+      "member-a".to_string(),
+      2,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .unwrap();
   store
-    .release_partition(&key_two, "member-a", 2, 1_020)
+    .release_partition(
+      &key_two,
+      "member-a",
+      2,
+      offset_datetime_from_unix_millis(1_020),
+    )
     .await
     .unwrap();
   store
-    .assign_partition(other_group_key, "member-c".to_string(), 1, 1_000, 100)
+    .assign_partition(
+      other_group_key,
+      "member-c".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .unwrap();
 
@@ -83,7 +114,13 @@ async fn fences_assignment() {
   let key = lease_key();
 
   let outcome = store
-    .assign_partition(key.clone(), "member-a".to_string(), 1, 1000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("assign lease");
 
@@ -96,7 +133,13 @@ async fn fences_assignment() {
   ));
 
   let outcome = store
-    .assign_partition(key.clone(), "member-b".to_string(), 1, 1000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-b".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("assign lease");
 
@@ -106,7 +149,13 @@ async fn fences_assignment() {
   ));
 
   let outcome = store
-    .assign_partition(key.clone(), "member-b".to_string(), 2, 1100, 100)
+    .assign_partition(
+      key.clone(),
+      "member-b".to_string(),
+      2,
+      offset_datetime_from_unix_millis(1_100),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("assign lease after expiration");
 
@@ -129,7 +178,13 @@ async fn heartbeats_and_commits() {
   let key = lease_key();
 
   store
-    .assign_partition(key.clone(), "member-a".to_string(), 1, 1000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("assign lease");
 
@@ -138,8 +193,8 @@ async fn heartbeats_and_commits() {
       &key,
       "member-a",
       1,
-      1010,
-      100,
+      offset_datetime_from_unix_millis(1_010),
+      Duration::milliseconds(100),
       Some(cursor(key.virtual_partition_id, 10)),
     )
     .await
@@ -159,7 +214,7 @@ async fn heartbeats_and_commits() {
       &key,
       "member-a",
       1,
-      1020,
+      offset_datetime_from_unix_millis(1_020),
       cursor(key.virtual_partition_id, 12),
     )
     .await
@@ -182,7 +237,13 @@ async fn retained_assignment_preserves_committed_cursor() {
   let committed_cursor = cursor(key.virtual_partition_id, 10);
 
   store
-    .assign_partition(key.clone(), "member-a".to_string(), 1, 1_000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("assign lease");
   store
@@ -190,15 +251,21 @@ async fn retained_assignment_preserves_committed_cursor() {
       &key,
       "member-a",
       1,
-      1_010,
-      100,
+      offset_datetime_from_unix_millis(1_010),
+      Duration::milliseconds(100),
       Some(committed_cursor.clone()),
     )
     .await
     .expect("commit cursor");
 
   let outcome = store
-    .assign_partition(key, "member-a".to_string(), 2, 1_020, 100)
+    .assign_partition(
+      key,
+      "member-a".to_string(),
+      2,
+      offset_datetime_from_unix_millis(1_020),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("retain lease");
 
@@ -219,12 +286,25 @@ async fn heartbeat_fences_other_members() {
   let key = lease_key();
 
   store
-    .assign_partition(key.clone(), "member-a".to_string(), 1, 1000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("assign lease");
 
   let outcome = store
-    .heartbeat_partition(&key, "member-b", 1, 1010, 100, None)
+    .heartbeat_partition(
+      &key,
+      "member-b",
+      1,
+      offset_datetime_from_unix_millis(1_010),
+      Duration::milliseconds(100),
+      None,
+    )
     .await
     .expect("heartbeat lease");
 
@@ -245,18 +325,30 @@ async fn release_partition_allows_immediate_takeover() {
   };
 
   store
-    .assign_partition(key.clone(), "member-a".to_string(), 2, 1000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      2,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("assign lease");
 
   let release = store
-    .release_partition(&key, "member-a", 2, 1010)
+    .release_partition(&key, "member-a", 2, offset_datetime_from_unix_millis(1_010))
     .await
     .expect("release lease");
   assert_eq!(release, ConsumerGroupReleaseOutcome::Released);
 
   let reassigned = store
-    .assign_partition(key, "member-b".to_string(), 3, 1010, 100)
+    .assign_partition(
+      key,
+      "member-b".to_string(),
+      3,
+      offset_datetime_from_unix_millis(1_010),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("assign lease after release");
   assert!(matches!(
@@ -284,12 +376,18 @@ async fn release_partition_rejects_stale_owner_or_generation() {
   };
 
   store
-    .assign_partition(key.clone(), "member-a".to_string(), 2, 1000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      2,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("assign lease");
 
   let release = store
-    .release_partition(&key, "member-b", 2, 1010)
+    .release_partition(&key, "member-b", 2, offset_datetime_from_unix_millis(1_010))
     .await
     .expect("release lease");
   assert!(matches!(

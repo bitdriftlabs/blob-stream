@@ -14,7 +14,7 @@ use anyhow::Result;
 use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
 use bd_shutdown::ComponentShutdownTriggerHandle;
-use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
+use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::BlobStore;
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{MetadataStore, ProducerPartitionLeaseStore};
@@ -220,7 +220,10 @@ impl<'a> WriteEngineBuilder<'a> {
 
 impl WriteEngineImpl {
   fn spawn_flush_loop(&self) {
-    let flush_delay = TimeDuration::milliseconds(self.config.flush_max_delay_ms.max(1));
+    let flush_delay = self
+      .config
+      .flush_max_delay
+      .max(TimeDuration::milliseconds(1));
     let flush_context = self.flush_context.clone();
     let state = Arc::clone(&self.state);
     let topics = self.topics.clone();
@@ -244,7 +247,7 @@ impl WriteEngineImpl {
         let now = time_provider.now();
         let plans = collect_flush_plans(
           &state,
-          now.unix_timestamp_ms(),
+          now,
           flush_context.config(),
           feature_flags.as_ref(),
           &topics,

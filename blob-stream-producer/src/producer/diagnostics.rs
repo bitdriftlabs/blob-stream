@@ -9,7 +9,7 @@ use crate::config::{
   producer_writer_id,
 };
 use blob_stream_broker_discovery::{BrokerMembership, writer_virtual_partitions};
-use blob_stream_types::{VirtualPartitionId, format_unix_timestamp_ms, serialize_as_string};
+use blob_stream_types::{VirtualPartitionId, serialize_as_string};
 use parking_lot::Mutex;
 use protobuf::Chars;
 use serde::Serialize;
@@ -96,7 +96,8 @@ impl ProducerRetryDiagnostics {
 
 #[derive(Debug, Serialize)]
 pub struct ProducerStateSnapshot {
-  pub generated_at: String,
+  #[serde(with = "time::serde::rfc3339")]
+  pub generated_at: time::OffsetDateTime,
   pub writer_id: u32,
   pub max_batch_records: u32,
   pub max_batch_bytes: u32,
@@ -200,8 +201,7 @@ impl ProducerDiagnostics {
 
   #[must_use]
   pub fn state_snapshot(&self) -> ProducerStateSnapshot {
-    let generated_at_ts_ms = time::OffsetDateTime::now_utc().unix_timestamp() * 1_000;
-    let generated_at = format_unix_timestamp_ms(generated_at_ts_ms);
+    let generated_at = time::OffsetDateTime::now_utc();
     let writer_id = producer_writer_id(&self.config);
     let membership = self.membership_rx.borrow().clone();
     let mut brokers = membership

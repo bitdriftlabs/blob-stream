@@ -8,7 +8,8 @@ use crate::{
   ProducerPartitionLeaseStore,
   SequenceReservationOutcome,
 };
-use blob_stream_types::SeqRange;
+use blob_stream_types::{SeqRange, offset_datetime_from_unix_millis};
+use time::Duration;
 
 fn lease_key() -> ProducerPartitionLeaseKey {
   ProducerPartitionLeaseKey {
@@ -27,8 +28,8 @@ async fn fences_lease_holders() {
       key.clone(),
       "broker-a".to_string(),
       "session-a".to_string(),
-      1000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
     )
     .await
     .expect("acquire lease");
@@ -40,8 +41,8 @@ async fn fences_lease_holders() {
       key.clone(),
       "broker-b".to_string(),
       "session-b".to_string(),
-      1000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
     )
     .await
     .expect("acquire lease");
@@ -49,7 +50,13 @@ async fn fences_lease_holders() {
   assert!(matches!(outcome, LeaseAcquireOutcome::HeldByOther(_)));
 
   let outcome = store
-    .heartbeat_lease(&key, "broker-b", "session-b", 1000, 100)
+    .heartbeat_lease(
+      &key,
+      "broker-b",
+      "session-b",
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("heartbeat lease");
 
@@ -60,8 +67,8 @@ async fn fences_lease_holders() {
       key.clone(),
       "broker-b".to_string(),
       "session-b".to_string(),
-      1100,
-      100,
+      offset_datetime_from_unix_millis(1_100),
+      Duration::milliseconds(100),
     )
     .await
     .expect("acquire lease after expiration");
@@ -79,8 +86,8 @@ async fn fences_stale_broker_sessions() {
       key.clone(),
       "broker-a".to_string(),
       "session-1".to_string(),
-      1_000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
     )
     .await
     .expect("initial acquisition");
@@ -94,8 +101,8 @@ async fn fences_stale_broker_sessions() {
       key.clone(),
       "broker-a".to_string(),
       "session-1".to_string(),
-      1_050,
-      100,
+      offset_datetime_from_unix_millis(1_050),
+      Duration::milliseconds(100),
     )
     .await
     .expect("same session renewal");
@@ -109,8 +116,8 @@ async fn fences_stale_broker_sessions() {
       key.clone(),
       "broker-a".to_string(),
       "session-2".to_string(),
-      1_100,
-      100,
+      offset_datetime_from_unix_millis(1_100),
+      Duration::milliseconds(100),
     )
     .await
     .expect("live takeover attempt");
@@ -121,8 +128,8 @@ async fn fences_stale_broker_sessions() {
       key.clone(),
       "broker-a".to_string(),
       "session-2".to_string(),
-      1_150,
-      100,
+      offset_datetime_from_unix_millis(1_150),
+      Duration::milliseconds(100),
     )
     .await
     .expect("expired takeover");
@@ -132,13 +139,25 @@ async fn fences_stale_broker_sessions() {
   assert_eq!(takeover.fence.lease_epoch, 2);
 
   let heartbeat = store
-    .heartbeat_lease(&key, "broker-a", "session-1", 1_150, 100)
+    .heartbeat_lease(
+      &key,
+      "broker-a",
+      "session-1",
+      offset_datetime_from_unix_millis(1_150),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("stale heartbeat");
   assert!(matches!(heartbeat, LeaseHeartbeatOutcome::HeldByOther(_)));
 
   let reservation = store
-    .reserve_sequences(&key, "broker-a", "session-1", 1_150, 1)
+    .reserve_sequences(
+      &key,
+      "broker-a",
+      "session-1",
+      offset_datetime_from_unix_millis(1_150),
+      1,
+    )
     .await
     .expect("stale reservation");
   assert!(matches!(
@@ -147,7 +166,12 @@ async fn fences_stale_broker_sessions() {
   ));
 
   let release = store
-    .release_lease(&key, "broker-a", "session-1", 1_150)
+    .release_lease(
+      &key,
+      "broker-a",
+      "session-1",
+      offset_datetime_from_unix_millis(1_150),
+    )
     .await
     .expect("stale release");
   assert!(matches!(release, LeaseReleaseOutcome::HeldByOther(_)));
@@ -163,14 +187,20 @@ async fn reserves_sequences_in_order() {
       key.clone(),
       "broker-a".to_string(),
       "session-a".to_string(),
-      1000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
     )
     .await
     .expect("acquire lease");
 
   let first = store
-    .reserve_sequences(&key, "broker-a", "session-a", 1000, 5)
+    .reserve_sequences(
+      &key,
+      "broker-a",
+      "session-a",
+      offset_datetime_from_unix_millis(1_000),
+      5,
+    )
     .await
     .expect("reserve seq");
 
@@ -182,7 +212,13 @@ async fn reserves_sequences_in_order() {
   assert_eq!(first.range.end, 4);
 
   let second = store
-    .reserve_sequences(&key, "broker-a", "session-a", 1000, 3)
+    .reserve_sequences(
+      &key,
+      "broker-a",
+      "session-a",
+      offset_datetime_from_unix_millis(1_000),
+      3,
+    )
     .await
     .expect("reserve seq");
 
@@ -204,8 +240,8 @@ async fn acquires_and_reserves_sequences_in_one_operation() {
       key.clone(),
       "broker-a".to_string(),
       "session-a".to_string(),
-      1_000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
       Some(5),
     )
     .await
@@ -213,7 +249,10 @@ async fn acquires_and_reserves_sequences_in_one_operation() {
   let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = first else {
     panic!("expected acquired lease");
   };
-  assert_eq!(lease.lease_expiration_ts_ms, 1_100);
+  assert_eq!(
+    lease.lease_expiration_at,
+    offset_datetime_from_unix_millis(1_100)
+  );
   assert_eq!(lease.max_allocated_seq, Some(4));
   assert_eq!(reservation, Some(SeqRange { start: 0, end: 4 }));
 
@@ -222,8 +261,8 @@ async fn acquires_and_reserves_sequences_in_one_operation() {
       key,
       "broker-a".to_string(),
       "session-a".to_string(),
-      1_050,
-      100,
+      offset_datetime_from_unix_millis(1_050),
+      Duration::milliseconds(100),
       Some(3),
     )
     .await
@@ -231,7 +270,10 @@ async fn acquires_and_reserves_sequences_in_one_operation() {
   let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = second else {
     panic!("expected renewed lease");
   };
-  assert_eq!(lease.lease_expiration_ts_ms, 1_150);
+  assert_eq!(
+    lease.lease_expiration_at,
+    offset_datetime_from_unix_millis(1_150)
+  );
   assert_eq!(lease.max_allocated_seq, Some(7));
   assert_eq!(reservation, Some(SeqRange { start: 5, end: 7 }));
 }
@@ -246,8 +288,8 @@ async fn preserves_previous_lease_when_takeover_reservation_overflows() {
       key.clone(),
       "broker-a".to_string(),
       "session-a".to_string(),
-      1_000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
       Some(u64::MAX),
     )
     .await
@@ -258,8 +300,8 @@ async fn preserves_previous_lease_when_takeover_reservation_overflows() {
       key.clone(),
       "broker-b".to_string(),
       "session-b".to_string(),
-      1_100,
-      100,
+      offset_datetime_from_unix_millis(1_100),
+      Duration::milliseconds(100),
       Some(2),
     )
     .await
@@ -272,7 +314,10 @@ async fn preserves_previous_lease_when_takeover_reservation_overflows() {
     .expect("read lease after failed takeover")
     .expect("previous lease remains present");
   assert_eq!(lease.fence.holder_id, "broker-a");
-  assert_eq!(lease.lease_expiration_ts_ms, 1_100);
+  assert_eq!(
+    lease.lease_expiration_at,
+    offset_datetime_from_unix_millis(1_100)
+  );
   assert_eq!(lease.max_allocated_seq, Some(u64::MAX - 1));
   let fence = lease.fence;
   assert_eq!(fence.lease_epoch, 1);
@@ -289,14 +334,20 @@ async fn releases_lease_for_current_holder() {
       key.clone(),
       "broker-a".to_string(),
       "session-a".to_string(),
-      1000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
     )
     .await
     .expect("acquire lease");
 
   let reservation = store
-    .reserve_sequences(&key, "broker-a", "session-a", 1_000, 5)
+    .reserve_sequences(
+      &key,
+      "broker-a",
+      "session-a",
+      offset_datetime_from_unix_millis(1_000),
+      5,
+    )
     .await
     .expect("reserve sequences");
   assert!(matches!(
@@ -305,7 +356,12 @@ async fn releases_lease_for_current_holder() {
   ));
 
   let outcome = store
-    .release_lease(&key, "broker-a", "session-a", 1000)
+    .release_lease(
+      &key,
+      "broker-a",
+      "session-a",
+      offset_datetime_from_unix_millis(1_000),
+    )
     .await
     .expect("release lease");
   assert!(matches!(outcome, LeaseReleaseOutcome::Released));
@@ -315,7 +371,10 @@ async fn releases_lease_for_current_holder() {
     .await
     .expect("look up released lease")
     .expect("released lease row remains available");
-  assert_eq!(released_lease.lease_expiration_ts_ms, 1_000);
+  assert_eq!(
+    released_lease.lease_expiration_at,
+    offset_datetime_from_unix_millis(1_000)
+  );
   assert_eq!(released_lease.max_allocated_seq, Some(4));
 
   let reacquired = store
@@ -323,15 +382,21 @@ async fn releases_lease_for_current_holder() {
       key.clone(),
       "broker-b".to_string(),
       "session-b".to_string(),
-      1_000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
     )
     .await
     .expect("acquire after release");
   assert!(matches!(reacquired, LeaseAcquireOutcome::Acquired(_)));
 
   let reservation = store
-    .reserve_sequences(&key, "broker-b", "session-b", 1_000, 2)
+    .reserve_sequences(
+      &key,
+      "broker-b",
+      "session-b",
+      offset_datetime_from_unix_millis(1_000),
+      2,
+    )
     .await
     .expect("reserve sequences after release");
   let SequenceReservationOutcome::Reserved(reservation) = reservation else {
@@ -359,8 +424,8 @@ async fn lookup_reports_absent_and_active_leases() {
       key.clone(),
       "broker-a".to_string(),
       "session-a".to_string(),
-      1_000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
     )
     .await
     .expect("acquire lease");
@@ -371,5 +436,8 @@ async fn lookup_reports_absent_and_active_leases() {
     .expect("lookup active lease")
     .expect("active lease exists");
   assert_eq!(lease.fence.holder_id, "broker-a");
-  assert_eq!(lease.lease_expiration_ts_ms, 1_100);
+  assert_eq!(
+    lease.lease_expiration_at,
+    offset_datetime_from_unix_millis(1_100)
+  );
 }

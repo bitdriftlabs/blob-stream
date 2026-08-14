@@ -554,7 +554,7 @@ async fn diagnostics_report_buffered_partition_state() {
     .diagnostics()
     .expect("producer implementation provides diagnostics")
     .state_snapshot();
-  assert!(snapshot.generated_at.ends_with('Z'));
+  assert_eq!(snapshot.generated_at.offset(), time::UtcOffset::UTC);
   assert_eq!(snapshot.writer_id, 1);
   assert_eq!(snapshot.max_batch_records, 2);
   assert_eq!(

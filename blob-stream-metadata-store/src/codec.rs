@@ -17,6 +17,8 @@ use blob_stream_types::{
   SnowflakeId,
   TopicWindowKey,
   VirtualPartitionId,
+  offset_datetime_from_unix_millis_checked,
+  unix_millis_from_offset_datetime,
 };
 use bytes::Bytes;
 use protobuf::{EnumOrUnknown, Message};
@@ -62,8 +64,10 @@ pub fn encode(metadata: SegmentMetadata) -> Result<EncodedSegmentMetadata> {
     .collect();
   let metadata = SegmentMetadataV1 {
     blob_key: metadata.blob_key.as_str().to_string().into(),
-    created_ts_ms: metadata.created_ts_ms,
-    metadata_published_ts_ms: metadata.metadata_published_ts_ms,
+    created_ts_ms: unix_millis_from_offset_datetime(metadata.created_at)
+      .map_err(|error| anyhow!("timestamp does not fit in Unix milliseconds: {error}"))?,
+    metadata_published_ts_ms: unix_millis_from_offset_datetime(metadata.metadata_published_at)
+      .map_err(|error| anyhow!("timestamp does not fit in Unix milliseconds: {error}"))?,
     compression: Some(compression).into(),
     partitions,
     ..Default::default()
@@ -158,8 +162,23 @@ pub fn decode(partition_key: &str, sort_key: &str, payload: &Bytes) -> Result<Se
     blob_key: BlobKey::from(metadata.blob_key.to_string()),
     compression,
     segment_index,
-    created_ts_ms: metadata.created_ts_ms,
-    metadata_published_ts_ms: metadata.metadata_published_ts_ms,
+    created_at: offset_datetime_from_unix_millis_checked(metadata.created_ts_ms).map_err(
+      |error| {
+        anyhow!(
+          "invalid Unix millisecond timestamp {}: {error}",
+          metadata.created_ts_ms
+        )
+      },
+    )?,
+    metadata_published_at: offset_datetime_from_unix_millis_checked(
+      metadata.metadata_published_ts_ms,
+    )
+    .map_err(|error| {
+      anyhow!(
+        "invalid Unix millisecond timestamp {}: {error}",
+        metadata.metadata_published_ts_ms
+      )
+    })?,
   })
 }
 

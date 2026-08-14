@@ -15,7 +15,7 @@ use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, Nex
 use blob_stream_consumer::{
   ConsumerConfigFactory,
   ConsumerReadConfig,
-  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG,
 };
 use blob_stream_producer::{
   ProducerAck,
@@ -27,12 +27,7 @@ use blob_stream_producer::{
   ProducerRetrySample,
   ProducerRetrySummary,
 };
-use blob_stream_types::{
-  VirtualPartitionId,
-  now_unix_millis,
-  now_unix_seconds,
-  virtual_partition_for_key,
-};
+use blob_stream_types::{VirtualPartitionId, now_unix_millis, virtual_partition_for_key};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use parking_lot::Mutex;
@@ -1076,8 +1071,8 @@ async fn verify_all_records(
     resources.s3_blob_store(),
     resources.metadata_store(),
     &Collector::default().scope("blob_stream_stress_verifier"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    time::Duration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
   let deadline = Instant::now() + verification_timeout;
@@ -1102,7 +1097,10 @@ async fn verify_all_records(
     let remaining = deadline.saturating_duration_since(Instant::now());
     let batches = timeout(
       remaining,
-      reader.read_available(now_unix_seconds(), ReadCapacity::new(64 * 1024 * 1024)),
+      reader.read_available(
+        time::OffsetDateTime::now_utc(),
+        ReadCapacity::new(64 * 1024 * 1024),
+      ),
     )
     .await
     .map_err(|_| anyhow!("verification stage timed out waiting for a metadata/blob read"))??;

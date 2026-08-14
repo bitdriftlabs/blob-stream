@@ -20,7 +20,7 @@ impl ConsumerDriver {
   pub(in crate::iterator) fn hydrate_cursors(
     &mut self,
     recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
-    now_unix_seconds: i64,
+    now: time::OffsetDateTime,
   ) -> Result<()> {
     if recovered_cursors.is_empty() {
       return Ok(());
@@ -46,7 +46,7 @@ impl ConsumerDriver {
           partition_id,
           &recovered_cursor.committed_cursor,
           recovered_cursor.committed_ts_ms,
-          now_unix_seconds,
+          now,
         );
       }
       record_reader_diagnostics(reader, &self.shared_state);
@@ -59,7 +59,7 @@ impl ConsumerDriver {
       .ok_or_else(|| anyhow!("consumer reader is unavailable"))?
       .send(ConsumerReaderCommand::HydrateCursors {
         recovered_cursors,
-        now_unix_seconds,
+        now,
       })
       .map_err(|_| anyhow!("consumer reader worker stopped"))?;
     self.reader_command_notify.notify_one();
@@ -69,12 +69,12 @@ impl ConsumerDriver {
   pub(in crate::iterator) fn set_reader_assignment(
     &mut self,
     assignment: Vec<VirtualPartitionId>,
-    now_unix_seconds: i64,
+    now: time::OffsetDateTime,
     handoff_phase: Option<&'static str>,
     release_delivery_fence: bool,
   ) -> Result<()> {
     if let Some(reader) = &mut self.reader {
-      reader.set_assigned_virtual_partitions(&assignment, now_unix_seconds)?;
+      reader.set_assigned_virtual_partitions(&assignment, now)?;
       record_reader_diagnostics(reader, &self.shared_state);
       if release_delivery_fence {
         self
@@ -93,7 +93,7 @@ impl ConsumerDriver {
       .ok_or_else(|| anyhow!("consumer reader is unavailable"))?
       .send(ConsumerReaderCommand::SetAssignment {
         assignment,
-        now_unix_seconds,
+        now,
         handoff_phase,
         release_delivery_fence,
       })
@@ -106,14 +106,14 @@ impl ConsumerDriver {
     &mut self,
     virtual_partition_id: VirtualPartitionId,
     offset: u64,
-    now_unix_seconds: i64,
+    now: time::OffsetDateTime,
     seek_trace: SeekTrace,
     response: oneshot::Sender<Result<()>>,
   ) {
     if let Some(reader) = &mut self.reader {
       // Before the iterator starts, the driver owns the reader directly. There is no prefetch
       // worker to enter recovery, so the seek trace finishes at this synchronous application.
-      reader.seek(virtual_partition_id, offset, now_unix_seconds);
+      reader.seek(virtual_partition_id, offset, now);
       record_reader_diagnostics(reader, &self.shared_state);
       seek_trace.finish("reader_inline");
       let _ = response.send(Ok(()));
@@ -128,7 +128,7 @@ impl ConsumerDriver {
     let command = ConsumerReaderCommand::Seek {
       virtual_partition_id,
       offset,
-      now_unix_seconds,
+      now,
       seek_trace,
       response,
     };
@@ -168,8 +168,8 @@ impl ConsumerDriver {
     let shutdown = Arc::clone(&self.prefetch_shutdown);
     let metrics = self.metrics.clone();
     let diagnostics = self.diagnostics.clone();
-    let base_idle_delay_ms = self.prefetch_idle_base_delay_ms;
-    let max_idle_delay_ms = self.prefetch_idle_max_delay_ms;
+    let base_idle_delay = self.prefetch_idle_base_delay;
+    let max_idle_delay = self.prefetch_idle_max_delay;
     let time_provider = Arc::clone(&self.time_provider);
     let lifecycle_hooks = self.lifecycle_hooks.clone();
     let member_id = self.group_config.member_id.to_string();
@@ -185,8 +185,8 @@ impl ConsumerDriver {
         reader_command_notify,
         shutdown,
         metrics,
-        base_idle_delay_ms,
-        max_idle_delay_ms,
+        base_idle_delay,
+        max_idle_delay,
         time_provider,
         lifecycle_hooks,
         member_id,

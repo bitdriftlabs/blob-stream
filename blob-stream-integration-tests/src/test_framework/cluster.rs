@@ -38,7 +38,7 @@ use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode
 use blob_stream_consumer::iterator::{ConsumerIteratorBuilder, ConsumerIteratorImpl};
 use blob_stream_consumer::{
   ConsumerRuntimeConfig,
-  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG,
   MembershipCoordinationSource,
 };
 use blob_stream_metadata_store::{
@@ -547,7 +547,7 @@ impl ClusterHarness {
       coordination_source,
       Collector::default().scope("blob_stream_consumer_it"),
       1,
-      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
     )
     .lifecycle_hooks(Arc::new(self.lifecycle_hooks.clone()))
@@ -788,15 +788,15 @@ fn build_write_engine(
         partition_count,
         num_writers: topic_num_writers,
         retention_days: 7,
-        max_metadata_publication_lag_ms: 30_000,
+        max_metadata_publication_lag: time::Duration::milliseconds(30_000),
       },
     );
   }
 
   let mut config = WriteConfig::with_defaults();
   config.writer_id = 0;
-  config.flush_max_delay_ms = i64::try_from(broker_flush_max_delay.as_millis())
-    .map_err(|_| anyhow!("broker_flush_max_delay exceeds milliseconds as i64"))?;
+  config.flush_max_delay = time::Duration::try_from(broker_flush_max_delay)
+    .map_err(|_| anyhow!("broker_flush_max_delay exceeds time::Duration bounds"))?;
   config.flush_max_bytes = 1024;
   config.reservation_size = 64;
   config.fenced_metadata_writes = fenced_metadata_writes;

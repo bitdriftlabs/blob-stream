@@ -10,6 +10,7 @@ use blob_stream_types::{
   SnowflakeId,
   TopicWindowKey,
   VirtualPartitionId,
+  offset_datetime_from_unix_millis,
 };
 use bytes::Bytes;
 use protobuf::Message;
@@ -42,8 +43,8 @@ fn build_segment(compression: Compression) -> SegmentMetadata {
         payload_bytes: 1_024,
       }],
     )]),
-    1_700_000_000_000,
-    1_700_000_000_100,
+    offset_datetime_from_unix_millis(1_700_000_000_000),
+    offset_datetime_from_unix_millis(1_700_000_000_100),
   )
 }
 
@@ -158,8 +159,8 @@ fn representative_segment_metadata_fits_one_dynamodb_read_chunk() {
     BlobKey::from("example-topic/1700000000/1234567890.zst"),
     Compression::zstd(3),
     segment_index,
-    1_700_000_000_000,
-    1_700_000_000_100,
+    offset_datetime_from_unix_millis(1_700_000_000_000),
+    offset_datetime_from_unix_millis(1_700_000_000_100),
   );
   let encoded = encode(metadata).expect("encode representative metadata");
   let item_bytes = estimated_dynamo_item_bytes(&encoded);

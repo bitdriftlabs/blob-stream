@@ -11,6 +11,7 @@ use super::{
   consumer_read_runtime_settings,
 };
 use crate::consumer::ConsumerReadOutcome;
+use time::OffsetDateTime;
 
 impl ConsumerReaderImpl {
   pub(crate) fn runtime_settings(&self) -> ConsumerReadRuntimeSettings {
@@ -19,14 +20,14 @@ impl ConsumerReaderImpl {
 
   pub(crate) async fn read_available_with_capacity_and_settings(
     &mut self,
-    now_unix_seconds: i64,
+    now: OffsetDateTime,
     capacity: ReadCapacity,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<ConsumerReadOutcome> {
     // The background worker needs the empty-pass scheduling hint. Keep this internal entrypoint
     // separate so callers of the public batch-reading trait do not inherit a scheduling contract.
     self
-      .read_available_impl(now_unix_seconds, capacity, runtime_settings)
+      .read_available_impl(now, capacity, runtime_settings)
       .await
   }
 }
@@ -37,7 +38,7 @@ use async_trait::async_trait;
 impl ConsumerReader for ConsumerReaderImpl {
   async fn read_available(
     &mut self,
-    now_unix_seconds: i64,
+    now: OffsetDateTime,
     capacity: ReadCapacity,
   ) -> Result<Vec<ConsumerBatch>> {
     let runtime_settings = self.runtime_settings();
@@ -45,7 +46,7 @@ impl ConsumerReader for ConsumerReaderImpl {
     // polling, not the reader's public delivery semantics.
     Ok(
       self
-        .read_available_impl(now_unix_seconds, capacity, runtime_settings)
+        .read_available_impl(now, capacity, runtime_settings)
         .await?
         .batches,
     )

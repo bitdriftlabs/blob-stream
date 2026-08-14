@@ -17,7 +17,8 @@ use crate::config::{
   ConsumerGroupConfig,
   ConsumerReadConfig,
   ConsumerRuntimeConfig,
-  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+  consumer_max_clock_skew,
 };
 use crate::diagnostics::{
   ConsumerAssignmentPlanSnapshot,
@@ -74,9 +75,10 @@ use blob_stream_types::{
   SnowflakeId,
   TopicWindowKey,
   VirtualPartitionId,
-  format_unix_timestamp_ms,
   new_record,
   now_unix_millis,
+  offset_datetime_from_unix_millis,
+  unix_millis_from_offset_datetime,
 };
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -87,6 +89,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{SystemTime, UNIX_EPOCH};
+use time::macros::datetime;
+use time::{Duration as TimeDuration, OffsetDateTime, UtcOffset};
 use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep, timeout};
 
@@ -221,6 +225,7 @@ struct FailingReadBlobStore {
 struct RecordingMetadataStore {
   inner: InMemoryMetadataStore,
   scans: AtomicUsize,
+  scanned_windows: Mutex<Vec<i64>>,
 }
 
 struct FailingLeaseStore {
@@ -266,12 +271,12 @@ impl ConsumerGroupLeaseStore for FailingLeaseStore {
     key: ConsumerGroupLeaseKey,
     owner_id: String,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
   ) -> anyhow::Result<ConsumerGroupAssignmentOutcome> {
     self
       .inner
-      .assign_partition(key, owner_id, generation, now_ts_ms, lease_duration_ms)
+      .assign_partition(key, owner_id, generation, now, lease_duration)
       .await
   }
 
@@ -280,8 +285,8 @@ impl ConsumerGroupLeaseStore for FailingLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
     committed_cursor: Option<CommittedCursor>,
   ) -> anyhow::Result<ConsumerGroupHeartbeatOutcome> {
     self
@@ -290,8 +295,8 @@ impl ConsumerGroupLeaseStore for FailingLeaseStore {
         key,
         owner_id,
         generation,
-        now_ts_ms,
-        lease_duration_ms,
+        now,
+        lease_duration,
         committed_cursor,
       )
       .await
@@ -302,12 +307,12 @@ impl ConsumerGroupLeaseStore for FailingLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     committed_cursor: CommittedCursor,
   ) -> anyhow::Result<ConsumerGroupCommitOutcome> {
     self
       .inner
-      .commit_cursor(key, owner_id, generation, now_ts_ms, committed_cursor)
+      .commit_cursor(key, owner_id, generation, now, committed_cursor)
       .await
   }
 
@@ -316,11 +321,11 @@ impl ConsumerGroupLeaseStore for FailingLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> anyhow::Result<ConsumerGroupReleaseOutcome> {
     self
       .inner
-      .release_partition(key, owner_id, generation, now_ts_ms)
+      .release_partition(key, owner_id, generation, now)
       .await
   }
 }
@@ -340,12 +345,12 @@ impl ConsumerGroupLeaseStore for PartiallyFailingLeaseStore {
     key: ConsumerGroupLeaseKey,
     owner_id: String,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
   ) -> anyhow::Result<ConsumerGroupAssignmentOutcome> {
     self
       .inner
-      .assign_partition(key, owner_id, generation, now_ts_ms, lease_duration_ms)
+      .assign_partition(key, owner_id, generation, now, lease_duration)
       .await
   }
 
@@ -354,8 +359,8 @@ impl ConsumerGroupLeaseStore for PartiallyFailingLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
     committed_cursor: Option<CommittedCursor>,
   ) -> anyhow::Result<ConsumerGroupHeartbeatOutcome> {
     if self.failures_enabled.load(Ordering::SeqCst) {
@@ -365,8 +370,11 @@ impl ConsumerGroupLeaseStore for PartiallyFailingLeaseStore {
             key: key.clone(),
             owner_id: "member-b".to_string(),
             generation: generation.saturating_add(1),
-            lease_expiration_ts_ms: now_ts_ms.saturating_add(lease_duration_ms),
-            last_heartbeat_ts_ms: now_ts_ms,
+            lease_expiration_ts_ms: unix_millis_from_offset_datetime(
+              now.saturating_add(lease_duration),
+            )
+            .unwrap(),
+            last_heartbeat_ts_ms: unix_millis_from_offset_datetime(now).unwrap(),
             committed_cursor: None,
             committed_ts_ms: None,
           },
@@ -382,8 +390,8 @@ impl ConsumerGroupLeaseStore for PartiallyFailingLeaseStore {
         key,
         owner_id,
         generation,
-        now_ts_ms,
-        lease_duration_ms,
+        now,
+        lease_duration,
         committed_cursor,
       )
       .await
@@ -394,12 +402,12 @@ impl ConsumerGroupLeaseStore for PartiallyFailingLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     committed_cursor: CommittedCursor,
   ) -> anyhow::Result<ConsumerGroupCommitOutcome> {
     self
       .inner
-      .commit_cursor(key, owner_id, generation, now_ts_ms, committed_cursor)
+      .commit_cursor(key, owner_id, generation, now, committed_cursor)
       .await
   }
 
@@ -408,11 +416,11 @@ impl ConsumerGroupLeaseStore for PartiallyFailingLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> anyhow::Result<ConsumerGroupReleaseOutcome> {
     self
       .inner
-      .release_partition(key, owner_id, generation, now_ts_ms)
+      .release_partition(key, owner_id, generation, now)
       .await
   }
 }
@@ -486,6 +494,10 @@ impl MetadataStore for RecordingMetadataStore {
   ) -> anyhow::Result<Vec<SegmentMetadata>> {
     self.scans.fetch_add(1, Ordering::SeqCst);
     self
+      .scanned_windows
+      .lock()
+      .push(window.window_start_unix_seconds);
+    self
       .inner
       .scan_window_from_snowflake(window, min_snowflake, consistency)
       .await
@@ -514,12 +526,12 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: TimeDuration,
   ) -> anyhow::Result<()> {
     self
       .inner
-      .register_member(topic, group_id, member_id, pod_id, now_ts_ms, ttl_ms)
+      .register_member(topic, group_id, member_id, pod_id, now, ttl)
       .await
   }
 
@@ -529,8 +541,8 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: TimeDuration,
   ) -> anyhow::Result<()> {
     self.heartbeat_calls.fetch_add(1, Ordering::SeqCst);
     if self.fail_heartbeats.load(Ordering::SeqCst) {
@@ -542,7 +554,7 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     }
     self
       .inner
-      .heartbeat_member(topic, group_id, member_id, pod_id, now_ts_ms, ttl_ms)
+      .heartbeat_member(topic, group_id, member_id, pod_id, now, ttl)
       .await
   }
 
@@ -565,12 +577,9 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     &self,
     topic: &str,
     group_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> anyhow::Result<Vec<ConsumerGroupMember>> {
-    self
-      .inner
-      .list_active_members(topic, group_id, now_ts_ms)
-      .await
+    self.inner.list_active_members(topic, group_id, now).await
   }
 
   async fn get_assignment_plan(
@@ -595,19 +604,12 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     group_id: &str,
     member_id: &str,
     planner_session_id: &str,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: TimeDuration,
   ) -> anyhow::Result<ConsumerGroupPlannerLeaseOutcome> {
     self
       .inner
-      .acquire_or_renew_planner(
-        topic,
-        group_id,
-        member_id,
-        planner_session_id,
-        now_ts_ms,
-        ttl_ms,
-      )
+      .acquire_or_renew_planner(topic, group_id, member_id, planner_session_id, now, ttl)
       .await
   }
 
@@ -630,19 +632,12 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     group_id: &str,
     member_id: &str,
     planner_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     plan: ConsumerGroupAssignmentPlan,
   ) -> anyhow::Result<bool> {
     self
       .inner
-      .publish_assignment_plan(
-        topic,
-        group_id,
-        member_id,
-        planner_session_id,
-        now_ts_ms,
-        plan,
-      )
+      .publish_assignment_plan(topic, group_id, member_id, planner_session_id, now, plan)
       .await
   }
 }
@@ -792,8 +787,8 @@ async fn write_segment_with_publication_time(
             payload_bytes: summary.payload_bytes,
           }],
         )]),
-        metadata_published_ts_ms,
-        metadata_published_ts_ms,
+        OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(metadata_published_ts_ms),
+        OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(metadata_published_ts_ms),
       ),
       None,
       0,
@@ -851,7 +846,7 @@ async fn idle_prefetch_worker_processes_hydration_command_without_clock_advance(
     coordination_source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .time_provider(time_provider.clone())
@@ -872,8 +867,8 @@ async fn idle_prefetch_worker_processes_hydration_command_without_clock_advance(
       &key,
       "member-a",
       1,
-      0,
-      1_000,
+      OffsetDateTime::UNIX_EPOCH,
+      TimeDuration::milliseconds(1_000),
       Some(CommittedCursor {
         virtual_partition_id: 3,
         seq_end: 42,
@@ -918,6 +913,7 @@ async fn visibility_deferred_empty_scan_waits_until_metadata_is_eligible() {
   let metadata_store = Arc::new(RecordingMetadataStore {
     inner: InMemoryMetadataStore::new(),
     scans: AtomicUsize::new(0),
+    scanned_windows: Mutex::new(Vec::new()),
   });
   let metadata_store_for_iterator: Arc<dyn MetadataStore> = metadata_store.clone();
   let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
@@ -953,7 +949,7 @@ async fn visibility_deferred_empty_scan_waits_until_metadata_is_eligible() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .time_provider(time_provider.clone())
@@ -997,6 +993,81 @@ async fn visibility_deferred_empty_scan_waits_until_metadata_is_eligible() {
     .unwrap()
     .unwrap();
   assert!(matches!(next, NextResult::Record(_)));
+
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn iterator_builder_applies_configured_clock_skew_to_reader_scan_horizon() {
+  let time_provider = Arc::new(ManualTimeProvider::new(
+    OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(2_999),
+  ));
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(RecordingMetadataStore {
+    inner: InMemoryMetadataStore::new(),
+    scans: AtomicUsize::new(0),
+    scanned_windows: Mutex::new(Vec::new()),
+  });
+  let metadata_store_for_iterator: Arc<dyn MetadataStore> = metadata_store.clone();
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![3],
+    }));
+  let mut runtime = runtime_config();
+  let read = runtime.read.as_mut().unwrap();
+  read.window_size_seconds = Some(1);
+  read.max_clock_skew_ms = Some(1_001);
+  read.strongly_consistent_metadata_reads = Some(true);
+  let maximum_clock_skew = consumer_max_clock_skew(read);
+
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime,
+    blob_store,
+    metadata_store_for_iterator,
+    lease_store,
+    membership_store,
+    source,
+    metrics_scope(),
+    1,
+    TimeDuration::ZERO,
+    None,
+  )
+  .maximum_clock_skew(maximum_clock_skew)
+  .time_provider(time_provider.clone())
+  .build()
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[3]).await;
+  timeout(Duration::from_secs(1), async {
+    loop {
+      if !metadata_store.scanned_windows.lock().is_empty() {
+        return;
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("expected the configured reader to scan metadata");
+  time_provider.wait_until_sleeping(2).await;
+  time_provider.advance(TimeDuration::milliseconds(250));
+  timeout(Duration::from_secs(1), async {
+    while metadata_store.scanned_windows.lock().len() < 3 {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("expected the fast reader scan to cover the configured skew horizon");
+  let mut scanned_windows = metadata_store.scanned_windows.lock().clone();
+  scanned_windows.sort_unstable();
+  scanned_windows.dedup();
+  assert_eq!(scanned_windows, vec![2, 3]);
 
   Box::new(iterator).shutdown().await.unwrap();
 }
@@ -1121,7 +1192,7 @@ async fn failed_membership_heartbeats_fence_at_lease_deadline() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .time_provider(time_provider.clone())
@@ -1185,7 +1256,7 @@ async fn partial_heartbeat_failure_revokes_fenced_partition() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .time_provider(time_provider.clone())
@@ -1280,7 +1351,7 @@ async fn lifecycle_hook_gates_commit_until_released() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .time_provider(Arc::new(SystemTimeProvider))
@@ -1330,7 +1401,7 @@ async fn diagnostics_report_assignment_and_start_state() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -1340,7 +1411,7 @@ async fn diagnostics_report_assignment_and_start_state() {
     .diagnostics()
     .expect("consumer implementation provides diagnostics");
   let snapshot = diagnostics.state_snapshot();
-  assert!(snapshot.generated_at.ends_with('Z'));
+  assert_eq!(snapshot.generated_at.offset(), UtcOffset::UTC);
   assert_eq!(snapshot.topic, "telemetry");
   assert_eq!(snapshot.group_id, "group-a");
   assert_eq!(snapshot.member_id, "member-a");
@@ -1401,7 +1472,7 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -1417,8 +1488,8 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
       member_b_key.clone(),
       "member-b".to_string(),
       7,
-      now_ts_ms,
-      10_000,
+      offset_datetime_from_unix_millis(now_ts_ms),
+      TimeDuration::milliseconds(10_000),
     )
     .await
     .unwrap();
@@ -1427,8 +1498,8 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
       &member_b_key,
       "member-b",
       7,
-      now_ts_ms + 1,
-      10_000,
+      offset_datetime_from_unix_millis(now_ts_ms + 1),
+      TimeDuration::milliseconds(10_000),
       Some(CommittedCursor {
         virtual_partition_id: 1,
         seq_end: 42,
@@ -1472,7 +1543,7 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
   assert_eq!(
     member_b_partition.committed_source_checkpoint,
     Some(ConsumerSourceCheckpointSnapshot {
-      window_start: format_unix_timestamp_ms(1_000_000),
+      window_start: offset_datetime_from_unix_millis(1_000_000),
       snowflake_id: 99,
     })
   );
@@ -1507,7 +1578,7 @@ async fn state_response_reports_lease_lookup_failure_without_blocking_local_diag
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -1544,7 +1615,7 @@ fn group_lease_observation_includes_unleased_plan_partitions() {
         pod_id: None,
       },
     ],
-    published_at: "2026-07-17T00:00:00Z".to_string(),
+    published_at: datetime!(2026-07-17 0:00 UTC),
   };
   let observation = crate::diagnostics::group_lease_observation(
     Some(&plan),
@@ -1594,7 +1665,7 @@ async fn assignment_callback_replays_active_partitions() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -1611,25 +1682,31 @@ async fn assignment_callback_replays_active_partitions() {
 
 #[test]
 fn idle_poll_backoff_exponential_with_max_and_reset() {
-  let mut backoff = IdlePollBackoff::new(250, Some(2_000));
+  let mut backoff = IdlePollBackoff::new(
+    TimeDuration::milliseconds(250),
+    Some(TimeDuration::seconds(2)),
+  );
 
-  assert_eq!(backoff.next_delay_ms(), 250);
-  assert_eq!(backoff.next_delay_ms(), 500);
-  assert_eq!(backoff.next_delay_ms(), 1_000);
-  assert_eq!(backoff.next_delay_ms(), 2_000);
-  assert_eq!(backoff.next_delay_ms(), 2_000);
+  assert_eq!(backoff.next_delay(), TimeDuration::milliseconds(250));
+  assert_eq!(backoff.next_delay(), TimeDuration::milliseconds(500));
+  assert_eq!(backoff.next_delay(), TimeDuration::seconds(1));
+  assert_eq!(backoff.next_delay(), TimeDuration::seconds(2));
+  assert_eq!(backoff.next_delay(), TimeDuration::seconds(2));
 
   backoff.reset();
-  assert_eq!(backoff.next_delay_ms(), 250);
+  assert_eq!(backoff.next_delay(), TimeDuration::milliseconds(250));
 }
 
 #[test]
 fn idle_poll_backoff_with_base_max_remains_constant() {
-  let mut backoff = IdlePollBackoff::new(250, Some(250));
+  let mut backoff = IdlePollBackoff::new(
+    TimeDuration::milliseconds(250),
+    Some(TimeDuration::milliseconds(250)),
+  );
 
-  assert_eq!(backoff.next_delay_ms(), 250);
-  assert_eq!(backoff.next_delay_ms(), 250);
-  assert_eq!(backoff.next_delay_ms(), 250);
+  assert_eq!(backoff.next_delay(), TimeDuration::milliseconds(250));
+  assert_eq!(backoff.next_delay(), TimeDuration::milliseconds(250));
+  assert_eq!(backoff.next_delay(), TimeDuration::milliseconds(250));
 }
 
 #[tokio::test]
@@ -1656,7 +1733,7 @@ async fn next_returns_revocation_until_completed() {
     source.clone(),
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -1732,7 +1809,7 @@ async fn next_does_not_lose_notification_between_state_check_and_wait() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -1811,7 +1888,7 @@ async fn commit_during_revocation_persists_revoked_partition_cursor() {
     source.clone(),
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -1933,7 +2010,7 @@ async fn next_delivers_records_and_commit_renews() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -2000,7 +2077,7 @@ async fn scheduled_heartbeats_do_not_depend_on_next_polling() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -2079,7 +2156,7 @@ async fn seek_waits_for_prefetch_scan_without_stalling_heartbeats() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -2153,7 +2230,7 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -2189,8 +2266,8 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
         "group-a",
         "member-b",
         "member-b-session",
-        now_unix_millis(),
-        30_000
+        offset_datetime_from_unix_millis(now_unix_millis()),
+        TimeDuration::milliseconds(30_000)
       )
       .await
       .unwrap(),
@@ -2210,7 +2287,13 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
     virtual_partition_id: 3,
   };
   let reassigned = concrete_lease_store
-    .assign_partition(key, "member-b".to_string(), 2, now_ts_ms, 1_000)
+    .assign_partition(
+      key,
+      "member-b".to_string(),
+      2,
+      offset_datetime_from_unix_millis(now_ts_ms),
+      TimeDuration::milliseconds(1_000),
+    )
     .await
     .unwrap();
   assert!(matches!(
@@ -2255,7 +2338,7 @@ async fn seek_interrupts_prefetch_read_retries_without_clock_advance() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .time_provider(time_provider.clone())
@@ -2303,7 +2386,7 @@ fn shutdown_span_reports_success_after_all_work_completes() {
       source,
       metrics_scope(),
       1,
-      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
     )
     .await
@@ -2370,7 +2453,7 @@ fn shutdown_span_reports_best_effort_cleanup_failure() {
       source,
       metrics_scope(),
       1,
-      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
     )
     .await
@@ -2434,7 +2517,7 @@ fn revocation_handoff_span_reports_success_after_reassignment() {
       source.clone(),
       metrics_scope(),
       1,
-      DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
     )
     .lifecycle_hooks(hooks.clone())
@@ -2452,7 +2535,9 @@ fn revocation_handoff_span_reports_success_after_reassignment() {
       virtual_partitions: vec![0, 1],
     });
     driver
-      .maybe_rebalance(now_unix_millis().saturating_add(1_000))
+      .maybe_rebalance(offset_datetime_from_unix_millis(
+        now_unix_millis().saturating_add(1_000),
+      ))
       .await
       .unwrap();
 
@@ -2555,7 +2640,7 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -2690,7 +2775,7 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
     source.clone(),
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -2782,7 +2867,7 @@ async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -2851,7 +2936,7 @@ async fn cancelled_next_does_not_restart_rebalance() {
     source.clone(),
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await
@@ -2921,7 +3006,7 @@ async fn cancelled_next_preserves_prefetched_record() {
     source,
     metrics_scope(),
     1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
   .await

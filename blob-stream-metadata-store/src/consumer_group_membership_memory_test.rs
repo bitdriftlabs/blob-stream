@@ -6,6 +6,8 @@ use crate::{
   ConsumerGroupPlannerLeaseOutcome,
   InMemoryConsumerGroupMembershipStore,
 };
+use blob_stream_types::offset_datetime_from_unix_millis;
+use time::Duration;
 
 #[tokio::test]
 async fn register_heartbeat_list_and_deregister() {
@@ -17,22 +19,40 @@ async fn register_heartbeat_list_and_deregister() {
       "group-a",
       "member-a",
       Some("pod-a".to_string()),
-      1_000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
     )
     .await
     .expect("register member-a");
   store
-    .register_member("topic-a", "group-a", "member-b", None, 1_000, 100)
+    .register_member(
+      "topic-a",
+      "group-a",
+      "member-b",
+      None,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("register member-b");
   store
-    .register_member("topic-a", "group-b", "member-c", None, 1_000, 100)
+    .register_member(
+      "topic-a",
+      "group-b",
+      "member-c",
+      None,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("register member-c");
 
   let members = store
-    .list_active_members("topic-a", "group-a", 1_050)
+    .list_active_members(
+      "topic-a",
+      "group-a",
+      offset_datetime_from_unix_millis(1_050),
+    )
     .await
     .expect("list members");
   assert_eq!(
@@ -55,14 +75,18 @@ async fn register_heartbeat_list_and_deregister() {
       "group-a",
       "member-a",
       Some("pod-a".to_string()),
-      1_120,
-      100,
+      offset_datetime_from_unix_millis(1_120),
+      Duration::milliseconds(100),
     )
     .await
     .expect("heartbeat member-a");
 
   let members = store
-    .list_active_members("topic-a", "group-a", 1_150)
+    .list_active_members(
+      "topic-a",
+      "group-a",
+      offset_datetime_from_unix_millis(1_150),
+    )
     .await
     .expect("list members");
   assert_eq!(
@@ -79,7 +103,11 @@ async fn register_heartbeat_list_and_deregister() {
     .expect("deregister member-a");
 
   let members = store
-    .list_active_members("topic-a", "group-a", 1_151)
+    .list_active_members(
+      "topic-a",
+      "group-a",
+      offset_datetime_from_unix_millis(1_151),
+    )
     .await
     .expect("list members");
   assert!(members.is_empty());
@@ -89,7 +117,14 @@ async fn register_heartbeat_list_and_deregister() {
 async fn register_rejects_invalid_ttl() {
   let store = InMemoryConsumerGroupMembershipStore::new();
   let err = store
-    .register_member("topic-a", "group-a", "member-a", None, 1_000, 0)
+    .register_member(
+      "topic-a",
+      "group-a",
+      "member-a",
+      None,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::ZERO,
+    )
     .await
     .expect_err("register should reject zero ttl");
   assert!(
@@ -103,13 +138,27 @@ async fn register_rejects_invalid_ttl() {
 async fn planner_lease_fences_plan_publication() {
   let store = InMemoryConsumerGroupMembershipStore::new();
   let acquired = store
-    .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-a", 1_000, 100)
+    .acquire_or_renew_planner(
+      "topic-a",
+      "group-a",
+      "member-a",
+      "session-a",
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("acquire planner");
   assert_eq!(acquired, ConsumerGroupPlannerLeaseOutcome::Acquired);
 
   let held = store
-    .acquire_or_renew_planner("topic-a", "group-a", "member-b", "session-b", 1_050, 100)
+    .acquire_or_renew_planner(
+      "topic-a",
+      "group-a",
+      "member-b",
+      "session-b",
+      offset_datetime_from_unix_millis(1_050),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("planner held by member-a");
   assert_eq!(held, ConsumerGroupPlannerLeaseOutcome::HeldByOther);
@@ -138,7 +187,7 @@ async fn planner_lease_fences_plan_publication() {
         "group-a",
         "member-a",
         "session-a",
-        1_001,
+        offset_datetime_from_unix_millis(1_001),
         plan.clone(),
       )
       .await
@@ -151,7 +200,7 @@ async fn planner_lease_fences_plan_publication() {
         "group-a",
         "member-b",
         "session-b",
-        1_001,
+        offset_datetime_from_unix_millis(1_001),
         plan.clone(),
       )
       .await
@@ -166,7 +215,14 @@ async fn planner_lease_fences_plan_publication() {
   );
 
   let replacement = store
-    .acquire_or_renew_planner("topic-a", "group-a", "member-b", "session-b", 1_100, 100)
+    .acquire_or_renew_planner(
+      "topic-a",
+      "group-a",
+      "member-b",
+      "session-b",
+      offset_datetime_from_unix_millis(1_100),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("acquire expired planner");
   assert_eq!(replacement, ConsumerGroupPlannerLeaseOutcome::Acquired);
@@ -188,7 +244,14 @@ async fn planner_release_allows_immediate_takeover_and_preserves_successor() {
   };
   assert_eq!(
     store
-      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-a", 1_000, 1_000)
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-a",
+        offset_datetime_from_unix_millis(1_000),
+        Duration::milliseconds(1_000),
+      )
       .await
       .expect("acquire member-a planner"),
     ConsumerGroupPlannerLeaseOutcome::Acquired
@@ -200,7 +263,7 @@ async fn planner_release_allows_immediate_takeover_and_preserves_successor() {
         "group-a",
         "member-a",
         "session-a",
-        1_000,
+        offset_datetime_from_unix_millis(1_000),
         plan.clone(),
       )
       .await
@@ -221,7 +284,14 @@ async fn planner_release_allows_immediate_takeover_and_preserves_successor() {
   );
   assert_eq!(
     store
-      .acquire_or_renew_planner("topic-a", "group-a", "member-b", "session-b", 1_001, 1_000)
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        "member-b",
+        "session-b",
+        offset_datetime_from_unix_millis(1_001),
+        Duration::milliseconds(1_000),
+      )
       .await
       .expect("acquire member-b planner"),
     ConsumerGroupPlannerLeaseOutcome::Acquired
@@ -259,14 +329,28 @@ async fn planner_session_fences_stale_same_member_process() {
 
   assert_eq!(
     store
-      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-old", 1_000, 100)
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-old",
+        offset_datetime_from_unix_millis(1_000),
+        Duration::milliseconds(100),
+      )
       .await
       .expect("acquire initial session"),
     ConsumerGroupPlannerLeaseOutcome::Acquired
   );
   assert_eq!(
     store
-      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-new", 1_100, 100)
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-new",
+        offset_datetime_from_unix_millis(1_100),
+        Duration::milliseconds(100),
+      )
       .await
       .expect("acquire replacement session"),
     ConsumerGroupPlannerLeaseOutcome::Acquired
@@ -278,7 +362,7 @@ async fn planner_session_fences_stale_same_member_process() {
         "group-a",
         "member-a",
         "session-old",
-        1_101,
+        offset_datetime_from_unix_millis(1_101),
         plan.clone(),
       )
       .await
@@ -292,7 +376,14 @@ async fn planner_session_fences_stale_same_member_process() {
   );
   assert!(
     store
-      .publish_assignment_plan("topic-a", "group-a", "member-a", "session-new", 1_101, plan)
+      .publish_assignment_plan(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-new",
+        offset_datetime_from_unix_millis(1_101),
+        plan,
+      )
       .await
       .expect("accept active session publication")
   );
@@ -303,7 +394,14 @@ async fn planner_rejects_plan_declared_for_a_different_member() {
   let store = InMemoryConsumerGroupMembershipStore::new();
   assert_eq!(
     store
-      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-a", 1_000, 100)
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-a",
+        offset_datetime_from_unix_millis(1_000),
+        Duration::milliseconds(100),
+      )
       .await
       .expect("acquire planner"),
     ConsumerGroupPlannerLeaseOutcome::Acquired
@@ -326,7 +424,7 @@ async fn planner_rejects_plan_declared_for_a_different_member() {
         "group-a",
         "member-a",
         "session-a",
-        1_001,
+        offset_datetime_from_unix_millis(1_001),
         mismatched_plan,
       )
       .await

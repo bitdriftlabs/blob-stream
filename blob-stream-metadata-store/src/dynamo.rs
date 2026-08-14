@@ -31,7 +31,7 @@ use aws_sdk_dynamodb::types::{
   TransactWriteItem,
 };
 use bd_log_util::warn_every;
-use blob_stream_types::{SnowflakeId, TopicWindowKey, format_unix_timestamp_ms};
+use blob_stream_types::{SnowflakeId, TopicWindowKey, offset_datetime_from_unix_seconds};
 use bytes::Bytes;
 use log::{debug, trace};
 use protobuf::Chars;
@@ -108,7 +108,7 @@ impl DynamoMetadataStore {
     }
 
     let retention_seconds = i64::from(*retention_days).checked_mul(SECONDS_PER_DAY)?;
-    let created_seconds = metadata.created_ts_ms.checked_div(1_000)?;
+    let created_seconds = metadata.created_at.unix_timestamp();
 
     created_seconds
       .checked_add(retention_seconds)?
@@ -128,12 +128,7 @@ impl MetadataStore for DynamoMetadataStore {
       "metadata(dynamo) write_segment start: table={}, topic={}, window_start={}, snowflake_id={}",
       self.table_name,
       metadata.window.topic,
-      format_unix_timestamp_ms(
-        metadata
-          .window
-          .window_start_unix_seconds
-          .saturating_mul(1_000)
-      ),
+      offset_datetime_from_unix_seconds(metadata.window.window_start_unix_seconds),
       metadata.snowflake_id.as_u64()
     );
     if let Some(fences) = fences {
@@ -309,7 +304,7 @@ impl MetadataStore for DynamoMetadataStore {
        min_snowflake={:?}, consistency={consistency:?}",
       self.table_name,
       window.topic,
-      format_unix_timestamp_ms(window.window_start_unix_seconds.saturating_mul(1_000)),
+      offset_datetime_from_unix_seconds(window.window_start_unix_seconds),
       min_snowflake.map(SnowflakeId::as_u64)
     );
 

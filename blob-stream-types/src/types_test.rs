@@ -3,12 +3,12 @@ use bytes::Bytes;
 
 #[test]
 fn default_metadata_publication_lag_is_fifteen_seconds() {
-  assert_eq!(DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS, 15_000);
+  assert_eq!(DEFAULT_MAX_METADATA_PUBLICATION_LAG, Duration::seconds(15));
 }
 
 #[test]
 fn default_metadata_window_is_five_minutes() {
-  assert_eq!(DEFAULT_METADATA_WINDOW_SIZE_SECONDS, 300);
+  assert_eq!(DEFAULT_METADATA_WINDOW_SIZE, Duration::minutes(5));
 }
 
 #[test]
@@ -39,27 +39,68 @@ fn record_retains_bytes_payload_allocation() {
 
 #[test]
 fn window_key_formatting() {
-  let window = Window::for_timestamp(1_700_000_000, 300);
+  let window = Window::for_timestamp(
+    offset_datetime_from_unix_seconds(1_700_000_000),
+    Duration::seconds(300),
+  );
   let key = window.key("telemetry");
 
+  assert_eq!(
+    window.start,
+    offset_datetime_from_unix_seconds(1_699_999_800)
+  );
+  assert_eq!(window.size, Duration::seconds(300));
   assert_eq!(key.window_start_unix_seconds, 1_699_999_800);
   assert_eq!(key.format(), "telemetry#1699999800");
 }
 
 #[test]
-fn unix_timestamp_milliseconds_format_as_rfc3339() {
+fn window_alignment_retains_subsecond_precision() {
+  let window = Window::for_timestamp(
+    offset_datetime_from_unix_millis(1_700_000_000_375),
+    Duration::milliseconds(250),
+  );
+
   assert_eq!(
-    format_unix_timestamp_ms(1_700_000_000_000),
-    "2023-11-14T22:13:20Z"
+    window.start,
+    offset_datetime_from_unix_millis(1_700_000_000_250)
+  );
+  assert_eq!(window.size, Duration::milliseconds(250));
+}
+
+#[test]
+fn unix_timestamp_boundaries_convert_to_instants() {
+  assert_eq!(
+    offset_datetime_from_unix_millis(1_700_000_000_123),
+    OffsetDateTime::from_unix_timestamp(1_700_000_000)
+      .unwrap()
+      .saturating_add(Duration::milliseconds(123))
+  );
+  assert_eq!(
+    offset_datetime_from_unix_seconds(1_700_000_000),
+    OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
   );
 }
 
 #[test]
-fn invalid_unix_timestamp_milliseconds_are_reported() {
+fn checked_unix_millisecond_conversions_preserve_persistence_boundaries() {
+  let timestamp =
+    offset_datetime_from_unix_millis_checked(1_700_000_000_123).expect("valid persisted timestamp");
+
   assert_eq!(
-    format_unix_timestamp_ms(i64::MAX),
-    format!("invalid Unix timestamp: {} ms", i64::MAX)
+    timestamp,
+    offset_datetime_from_unix_millis(1_700_000_000_123)
   );
+  assert_eq!(
+    unix_millis_from_offset_datetime(timestamp).expect("timestamp fits persisted milliseconds"),
+    1_700_000_000_123
+  );
+  let before_epoch = OffsetDateTime::UNIX_EPOCH - Duration::nanoseconds(1);
+  assert_eq!(
+    unix_millis_from_offset_datetime(before_epoch).expect("timestamp fits persisted milliseconds"),
+    -1
+  );
+  assert!(offset_datetime_from_unix_millis_checked(i64::MAX).is_err());
 }
 
 #[test]

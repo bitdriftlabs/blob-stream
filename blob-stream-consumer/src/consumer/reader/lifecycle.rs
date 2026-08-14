@@ -6,7 +6,7 @@ use super::{
   ConsumerReaderImpl,
   ConsumerReaderMetrics,
   FeatureFlagsWatch,
-  HISTORICAL_SEEK_RECOVERY_SECONDS,
+  HISTORICAL_SEEK_RECOVERY,
   HashMap,
   HashSet,
   MetadataStore,
@@ -18,13 +18,16 @@ use super::{
   VirtualPartitionState,
   Window,
   consumer_read_runtime_settings,
-  consumer_window_size_seconds,
+  consumer_window_size,
   ensure,
-  format_unix_timestamp_seconds,
   info,
-  metadata_availability_delay_seconds,
+  offset_datetime_from_unix_seconds,
   validate_read_config,
 };
+use crate::config::ConsumerReadRuntimeSettings;
+use crate::consumer::AvailabilityHorizon;
+use blob_stream_types::offset_datetime_from_unix_millis;
+use time::{Duration, OffsetDateTime};
 
 impl ConsumerReaderImpl {
   /// Create a reader with finite retention recovery and an explicit metadata publication bound.
@@ -35,22 +38,21 @@ impl ConsumerReaderImpl {
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
     metrics_scope: &Scope,
-    retention_days: u32,
-    maximum_metadata_publication_lag_ms: u64,
+    retention: Duration,
+    maximum_metadata_publication_lag: Duration,
     feature_flags: Option<FeatureFlagsWatch>,
   ) -> Result<Self> {
     validate_read_config(&config)?;
     ensure!(
-      retention_days > 0,
+      retention.is_positive(),
       "consumer retention recovery requires topic retention_days greater than zero"
     );
     info!(
-      "consumer reader initialized: topic={}, retention_days={}, \
-       maximum_metadata_publication_lag_ms={}, max_in_flight_batch_reads={}, \
-       assigned_partitions={}, initial_cursors={}",
+      "consumer reader initialized: topic={}, retention={}, maximum_metadata_publication_lag={}, \
+       max_in_flight_batch_reads={}, assigned_partitions={}, initial_cursors={}",
       config.topic,
-      retention_days,
-      maximum_metadata_publication_lag_ms,
+      retention,
+      maximum_metadata_publication_lag,
       consumer_read_runtime_settings(&config, feature_flags.as_ref()).max_in_flight_batch_reads,
       assigned_virtual_partitions.len(),
       initial_cursors.len()
@@ -83,8 +85,9 @@ impl ConsumerReaderImpl {
 
     Ok(Self {
       virtual_partition_states,
-      retention_days,
-      maximum_metadata_publication_lag_ms,
+      retention,
+      maximum_metadata_publication_lag,
+      maximum_clock_skew: crate::config::DEFAULT_MAX_CLOCK_SKEW,
       fast_frontiers: HashMap::new(),
       recovery_scan_last_partition: None,
       recovery_metadata_cache: HashMap::new(),
@@ -96,21 +99,39 @@ impl ConsumerReaderImpl {
     })
   }
 
-  fn window_start(&self, unix_seconds: i64) -> i64 {
-    Window::for_timestamp(unix_seconds, consumer_window_size_seconds(&self.config))
-      .start_unix_seconds
+  #[must_use]
+  /// Override the typed clock-skew budget resolved from topic configuration.
+  pub(crate) fn maximum_clock_skew(mut self, maximum_clock_skew: Duration) -> Self {
+    self.maximum_clock_skew = maximum_clock_skew;
+    self
   }
 
-  fn retention_floor_window_start(&self, cutover_window_start_unix_seconds: i64) -> i64 {
-    let retention_seconds = i64::from(self.retention_days).saturating_mul(86_400);
-    self.window_start(cutover_window_start_unix_seconds.saturating_sub(retention_seconds))
+  #[must_use]
+  /// Return the bounded availability horizon for one resolved read pass.
+  pub(in crate::consumer) fn availability_horizon(
+    &self,
+    runtime_settings: ConsumerReadRuntimeSettings,
+  ) -> AvailabilityHorizon {
+    AvailabilityHorizon::new(
+      self.maximum_metadata_publication_lag,
+      self.maximum_clock_skew,
+      runtime_settings.metadata_visibility_delay,
+    )
+  }
+
+  fn window_start(&self, timestamp: OffsetDateTime) -> OffsetDateTime {
+    Window::for_timestamp(timestamp, consumer_window_size(&self.config)).start
+  }
+
+  fn retention_floor_window_start(&self, cutover_window_start: OffsetDateTime) -> OffsetDateTime {
+    self.window_start(cutover_window_start.saturating_sub(self.retention))
   }
 
   /// Replace the current assignment set.
   pub fn set_assigned_virtual_partitions(
     &mut self,
     assigned_virtual_partitions: &[VirtualPartitionId],
-    now_unix_seconds: i64,
+    now: OffsetDateTime,
   ) -> Result<()> {
     let previous_assignment = self.assigned_virtual_partition_ids();
     let assigned = assigned_virtual_partitions
@@ -136,7 +157,7 @@ impl ConsumerReaderImpl {
     self
       .virtual_partition_states
       .retain(|partition_id, _| assigned.contains(partition_id));
-    let initial_window_start_unix_seconds = self.window_start(now_unix_seconds);
+    let initial_window_start_unix_seconds = self.window_start(now).unix_timestamp();
     for partition_id in assigned_virtual_partitions {
       let state = self.virtual_partition_states.remove(partition_id);
       let state = state.map_or_else(
@@ -196,16 +217,16 @@ impl ConsumerReaderImpl {
     &mut self,
     virtual_partition_id: VirtualPartitionId,
     seq_end: u64,
-    now_unix_seconds: i64,
+    now: OffsetDateTime,
   ) {
     self.set_cursor(virtual_partition_id, seq_end);
-    let cutover_window_start_unix_seconds = self.window_start(now_unix_seconds);
-    let recovery_start_window_unix_seconds = self
-      .window_start(now_unix_seconds.saturating_sub(HISTORICAL_SEEK_RECOVERY_SECONDS))
-      .max(self.retention_floor_window_start(cutover_window_start_unix_seconds));
+    let cutover_window_start = self.window_start(now);
+    let recovery_start_window = self
+      .window_start(now.saturating_sub(HISTORICAL_SEEK_RECOVERY))
+      .max(self.retention_floor_window_start(cutover_window_start));
     let recovery_state = RecoveryState {
-      next_window_start_unix_seconds: recovery_start_window_unix_seconds,
-      cutover_window_start_unix_seconds,
+      next_window_start_unix_seconds: recovery_start_window.unix_timestamp(),
+      cutover_window_start_unix_seconds: cutover_window_start.unix_timestamp(),
       first_window_start_unix_seconds: None,
       first_window_min_snowflake: None,
     };
@@ -224,11 +245,7 @@ impl ConsumerReaderImpl {
     info!(
       "consumer historical seek recovery started: topic={}, partition={}, offset={}, \
        recovery_start_window={}, cutover_window={}",
-      self.config.topic,
-      virtual_partition_id,
-      seq_end,
-      format_unix_timestamp_seconds(recovery_start_window_unix_seconds),
-      format_unix_timestamp_seconds(cutover_window_start_unix_seconds)
+      self.config.topic, virtual_partition_id, seq_end, recovery_start_window, cutover_window_start
     );
   }
 
@@ -238,41 +255,41 @@ impl ConsumerReaderImpl {
     virtual_partition_id: VirtualPartitionId,
     committed_cursor: &CommittedCursor,
     committed_ts_ms: Option<i64>,
-    now_unix_seconds: i64,
+    now: OffsetDateTime,
   ) {
     // Hydration can arrive before assignment during a rebalance. The default Pending lifecycle
     // state retains the recovery plan without allowing the reader to scan this partition.
     // A later runtime consistency change affects new scan passes but deliberately does not rewrite
     // this hydrated source-window overlap or replay already planned recovery work.
-    let cutover_window_start_unix_seconds = self.window_start(now_unix_seconds);
+    let cutover_window_start = self.window_start(now);
     let runtime_settings =
       consumer_read_runtime_settings(&self.config, self.feature_flags.as_ref());
-    let retention_floor = self.retention_floor_window_start(cutover_window_start_unix_seconds);
+    let retention_floor = self.retention_floor_window_start(cutover_window_start);
     let source_checkpoint = committed_cursor.source_checkpoint.as_ref();
-    let source_window_start_unix_seconds = committed_cursor
+    let source_window_start = committed_cursor
       .source_checkpoint
       .as_ref()
-      .map(|checkpoint| checkpoint.window_start_unix_seconds)
-      .or_else(|| committed_ts_ms.map(|timestamp_ms| self.window_start(timestamp_ms / 1_000)))
+      .map(|checkpoint| offset_datetime_from_unix_seconds(checkpoint.window_start_unix_seconds))
+      .or_else(|| {
+        committed_ts_ms
+          .map(offset_datetime_from_unix_millis)
+          .map(|timestamp| self.window_start(timestamp))
+      })
       .unwrap_or(retention_floor)
       .max(retention_floor);
     let first_window_min_snowflake = source_checkpoint
       .filter(|checkpoint| {
-        checkpoint.window_start_unix_seconds == source_window_start_unix_seconds
-          && source_window_start_unix_seconds <= cutover_window_start_unix_seconds
+        offset_datetime_from_unix_seconds(checkpoint.window_start_unix_seconds)
+          == source_window_start
+          && source_window_start <= cutover_window_start
       })
       .and_then(|checkpoint| {
         let checkpoint_timestamp = SnowflakeId(checkpoint.snowflake_id).timestamp()?;
-        let floor_timestamp_unix_seconds = checkpoint_timestamp
-          .unix_timestamp()
-          .saturating_sub(metadata_availability_delay_seconds(
-            runtime_settings.metadata_visibility_delay_ms,
-            self.maximum_metadata_publication_lag_ms,
-          ))
-          .max(source_window_start_unix_seconds);
-        time::OffsetDateTime::from_unix_timestamp(floor_timestamp_unix_seconds)
-          .ok()
-          .map(SnowflakeId::minimum_for_timestamp)
+        Some(SnowflakeId::minimum_for_timestamp(
+          checkpoint_timestamp
+            .saturating_sub(self.availability_horizon(runtime_settings).duration())
+            .max(source_window_start),
+        ))
       });
     let hydrated_cursor = self
       .virtual_partition_states
@@ -292,14 +309,14 @@ impl ConsumerReaderImpl {
       return;
     }
     self.clear_recovery_metadata_cache(virtual_partition_id);
-    if source_window_start_unix_seconds <= cutover_window_start_unix_seconds {
+    if source_window_start <= cutover_window_start {
       self.virtual_partition_states.insert(
         virtual_partition_id,
         VirtualPartitionState::PendingRecovering {
           cursor: hydrated_cursor,
           recovery_state: RecoveryState {
-            next_window_start_unix_seconds: source_window_start_unix_seconds,
-            cutover_window_start_unix_seconds,
+            next_window_start_unix_seconds: source_window_start.unix_timestamp(),
+            cutover_window_start_unix_seconds: cutover_window_start.unix_timestamp(),
             first_window_start_unix_seconds: source_checkpoint
               .map(|checkpoint| checkpoint.window_start_unix_seconds),
             first_window_min_snowflake,
@@ -313,8 +330,8 @@ impl ConsumerReaderImpl {
         self.config.topic,
         virtual_partition_id,
         committed_cursor.seq_end,
-        format_unix_timestamp_seconds(source_window_start_unix_seconds),
-        format_unix_timestamp_seconds(cutover_window_start_unix_seconds)
+        source_window_start,
+        cutover_window_start
       );
     } else {
       self.virtual_partition_states.insert(
@@ -330,8 +347,8 @@ impl ConsumerReaderImpl {
         self.config.topic,
         virtual_partition_id,
         committed_cursor.seq_end,
-        format_unix_timestamp_seconds(source_window_start_unix_seconds),
-        format_unix_timestamp_seconds(cutover_window_start_unix_seconds)
+        source_window_start,
+        cutover_window_start
       );
     }
   }

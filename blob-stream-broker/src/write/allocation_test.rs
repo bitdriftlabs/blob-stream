@@ -6,7 +6,7 @@ use blob_stream_metadata_store::{
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
 };
-use blob_stream_types::{BatchSummary, SeqRange, new_record};
+use blob_stream_types::{BatchSummary, SeqRange, new_record, offset_datetime_from_unix_millis};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ fn fence_change_discards_buffered_batches_and_completes_them() {
         acceptance_fence: Some(Arc::new(fence(1))),
         completion: Some(completion),
       },
-      0,
+      offset_datetime_from_unix_millis(0),
     );
   }
 
@@ -49,14 +49,14 @@ fn fence_change_discards_buffered_batches_and_completes_them() {
     finished: false,
   }
   .finish(
-    LeaseExpirationUpdate::Set(Some(1_100)),
+    LeaseExpirationUpdate::Set(Some(offset_datetime_from_unix_millis(1_100))),
     Some(ProducerPartitionLease {
       key: ProducerPartitionLeaseKey {
         topic: "telemetry".into(),
         virtual_partition_id: 0,
       },
       fence: fence(2),
-      lease_expiration_ts_ms: 1_100,
+      lease_expiration_at: offset_datetime_from_unix_millis(1_100),
       max_allocated_seq: Some(0),
     }),
     None,
@@ -73,5 +73,9 @@ fn fence_change_discards_buffered_batches_and_completes_them() {
     .partition_state("telemetry", 0)
     .expect("partition exists");
   assert!(partition.buffer.batches.is_empty());
+  assert_eq!(
+    partition.lease_expiration_at,
+    Some(offset_datetime_from_unix_millis(1_100))
+  );
   assert_eq!(partition.lease_fence.as_deref(), Some(&fence(2)));
 }

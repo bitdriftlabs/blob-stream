@@ -1,10 +1,8 @@
-use super::{ConsumerDriver, ConsumerDriverCommand, HeartbeatTrigger, RETRY_MAX_DELAY_MS};
+use super::{ConsumerDriver, ConsumerDriverCommand, HeartbeatTrigger, RETRY_MAX_DELAY};
 use anyhow::{Result, ensure};
 use bd_backoff::InfiniteBackoff;
 use bd_log_util::warn_every;
-use blob_stream_types::format_unix_timestamp_ms;
 use log::{debug, info, trace};
-use std::cmp::max;
 use std::sync::Arc;
 use std::time::Instant;
 use time::ext::NumericalDuration;
@@ -48,9 +46,9 @@ impl ConsumerDriver {
           return;
         },
       };
-      let now_ts_ms = self.now_unix_millis();
+      let now = self.time_provider.now();
 
-      let heartbeat_failed = if now_ts_ms >= self.next_heartbeat_at_ms {
+      let heartbeat_failed = if now >= self.next_heartbeat_at {
         trace!(
           "consumer scheduled heartbeat due: topic={}, group_id={}, member_id={}, generation={}, \
            now={}, due_at={}, overdue_ms={}, active_partitions={:?}, pending_commits={}",
@@ -58,9 +56,9 @@ impl ConsumerDriver {
           self.group_config.group_id,
           self.group_config.member_id,
           self.coordinator.generation(),
-          format_unix_timestamp_ms(now_ts_ms),
-          format_unix_timestamp_ms(self.next_heartbeat_at_ms),
-          now_ts_ms.saturating_sub(self.next_heartbeat_at_ms),
+          now,
+          self.next_heartbeat_at,
+          (now - self.next_heartbeat_at).whole_milliseconds(),
           self.active_assignment,
           self
             .shared_state
@@ -70,28 +68,23 @@ impl ConsumerDriver {
             .filter(|state| state.pending_commit.is_some())
             .count()
         );
-        if let Err(error) = self.heartbeat(now_ts_ms, HeartbeatTrigger::Scheduled).await {
+        if let Err(error) = self.heartbeat(now, HeartbeatTrigger::Scheduled).await {
           warn_every!(
             15.seconds(),
             "consumer scheduled heartbeat retrying after error: error={error:#}"
           );
-          let retry_delay_ms = i64::try_from(
-            self
-              .heartbeat_retry_backoff
-              .next_backoff()
-              .whole_milliseconds()
-              .max(0),
-          )
-          .unwrap_or(RETRY_MAX_DELAY_MS)
-          .min(RETRY_MAX_DELAY_MS);
-          let heartbeat_retry_deadline_ms = self.heartbeat_retry_deadline_ms();
-          let retry_delay_ms = if now_ts_ms < heartbeat_retry_deadline_ms {
-            retry_delay_ms.min(heartbeat_retry_deadline_ms.saturating_sub(now_ts_ms))
+          let retry_delay = self
+            .heartbeat_retry_backoff
+            .next_backoff()
+            .min(RETRY_MAX_DELAY);
+          let heartbeat_retry_deadline = self.heartbeat_retry_deadline();
+          let retry_delay = if now < heartbeat_retry_deadline {
+            retry_delay.min(heartbeat_retry_deadline - now)
           } else {
-            retry_delay_ms
+            retry_delay
           };
           self.metrics.heartbeat_retry_attempts.inc();
-          self.next_heartbeat_at_ms = now_ts_ms.saturating_add(retry_delay_ms);
+          self.next_heartbeat_at = now.saturating_add(retry_delay);
           self.refresh_diagnostics();
           true
         } else {
@@ -104,7 +97,7 @@ impl ConsumerDriver {
 
       revocation_completed = revocation_completed && self.pending_revocation_completion.is_none();
 
-      if revocation_completed && now_ts_ms >= self.next_rebalance_at_ms {
+      if revocation_completed && now >= self.next_rebalance_at {
         if heartbeat_failed {
           debug!(
             "consumer rebalance deferred after heartbeat failure: topic={}, group_id={}, \
@@ -115,7 +108,7 @@ impl ConsumerDriver {
             self.coordinator.generation(),
           );
         } else {
-          match self.maybe_rebalance(now_ts_ms).await {
+          match self.maybe_rebalance(now).await {
             Ok(()) => self.rebalance_retry_backoff.reset(),
             Err(error) => {
               if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
@@ -127,32 +120,31 @@ impl ConsumerDriver {
                 15.seconds(),
                 "consumer rebalance retrying after error: error={error:#}"
               );
-              let retry_delay_ms = i64::try_from(
-                self
-                  .rebalance_retry_backoff
-                  .next_backoff()
-                  .whole_milliseconds()
-                  .max(0),
-              )
-              .unwrap_or(RETRY_MAX_DELAY_MS)
-              .min(RETRY_MAX_DELAY_MS);
+              let retry_delay = self
+                .rebalance_retry_backoff
+                .next_backoff()
+                .min(RETRY_MAX_DELAY);
               self.metrics.rebalance_retry_attempts.inc();
-              self.next_rebalance_at_ms = now_ts_ms.saturating_add(retry_delay_ms);
+              self.next_rebalance_at = now.saturating_add(retry_delay);
               self.refresh_rebalance_diagnostics();
             },
           }
         }
       }
 
-      let until_heartbeat_ms = (self.next_heartbeat_at_ms - now_ts_ms).max(0);
-      let until_rebalance_ms = (self.next_rebalance_at_ms - now_ts_ms).max(0);
-      let wait_ms = if revocation_completed {
-        max(1_i64, until_heartbeat_ms.min(until_rebalance_ms)).cast_unsigned()
+      let until_heartbeat = self.next_heartbeat_at - now;
+      let until_rebalance = self.next_rebalance_at - now;
+      let wait_duration = if revocation_completed {
+        until_heartbeat
+          .min(until_rebalance)
+          .max(time::Duration::milliseconds(1))
       } else {
-        until_heartbeat_ms.clamp(1, 100).cast_unsigned()
+        until_heartbeat.clamp(
+          time::Duration::milliseconds(1),
+          time::Duration::milliseconds(100),
+        )
       };
       let time_provider = Arc::clone(&self.time_provider);
-      let wait_duration = time::Duration::milliseconds(i64::try_from(wait_ms).unwrap_or(i64::MAX));
       tokio::select! {
         command = command_rx.recv() => {
           let Some(command) = command else {

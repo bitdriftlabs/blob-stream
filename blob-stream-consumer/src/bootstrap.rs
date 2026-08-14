@@ -2,7 +2,12 @@
 #[path = "./bootstrap_test.rs"]
 mod tests;
 
-use crate::config::{ConsumerRuntimeConfig, validate_runtime_config};
+use crate::config::{
+  ConsumerRuntimeConfig,
+  consumer_max_clock_skew,
+  topic_max_metadata_publication_lag,
+  validate_runtime_config,
+};
 use crate::iterator::{
   ConsumerCoordinationSource,
   ConsumerIteratorBuilder,
@@ -18,7 +23,7 @@ use aws_types::region::Region;
 use bd_pgv::proto_validate;
 use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
-use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
+use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_metadata_store::{
   ConsumerGroupLeaseStore,
@@ -269,12 +274,16 @@ impl ConsumerIteratorImpl {
       coordination,
       metrics_scope,
       config.topic.retention_days,
-      config
-        .topic
-        .max_metadata_publication_lag_ms
-        .unwrap_or(crate::config::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS),
+      topic_max_metadata_publication_lag(&config.topic),
       feature_flags,
     )
+    .maximum_clock_skew(consumer_max_clock_skew(
+      config
+        .runtime
+        .read
+        .as_ref()
+        .ok_or_else(|| anyhow!("consumer read config is required"))?,
+    ))
     .time_provider(time_provider);
     let builder = if let Some(lifecycle_hooks) = lifecycle_hooks {
       builder.lifecycle_hooks(lifecycle_hooks)
@@ -448,10 +457,10 @@ impl MembershipCoordinationSource {
 #[async_trait]
 impl ConsumerCoordinationSource for MembershipCoordinationSource {
   async fn snapshot(&self) -> Result<CoordinationSnapshot> {
-    let now_ts_ms = self.time_provider.now().unix_timestamp_ms();
+    let now = self.time_provider.now();
     let mut members = self
       .membership_store
-      .list_active_members(&self.topic, &self.group_id, now_ts_ms)
+      .list_active_members(&self.topic, &self.group_id, now)
       .await?;
 
     if !members

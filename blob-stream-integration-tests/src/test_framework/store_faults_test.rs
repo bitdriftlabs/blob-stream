@@ -19,7 +19,9 @@ use blob_stream_metadata_store::{
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
 };
+use blob_stream_types::offset_datetime_from_unix_millis;
 use std::sync::Arc;
+use time::Duration;
 
 #[tokio::test]
 async fn coalesced_reservation_honors_sequence_reservation_faults() {
@@ -49,8 +51,8 @@ async fn coalesced_reservation_honors_sequence_reservation_faults() {
       key.clone(),
       "broker-a".to_string(),
       "session-a".to_string(),
-      1_000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
       Some(1),
     )
     .await
@@ -76,7 +78,13 @@ async fn consumer_partition_release_honors_faults_without_releasing_ownership() 
     virtual_partition_id: 0,
   };
   inner
-    .assign_partition(key.clone(), "consumer-a".to_string(), 1, 1_000, 100)
+    .assign_partition(
+      key.clone(),
+      "consumer-a".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("assign partition");
   controller
@@ -92,7 +100,12 @@ async fn consumer_partition_release_honors_faults_without_releasing_ownership() 
     .await;
 
   let error = store
-    .release_partition(&key, "consumer-a", 1, 1_001)
+    .release_partition(
+      &key,
+      "consumer-a",
+      1,
+      offset_datetime_from_unix_millis(1_001),
+    )
     .await
     .expect_err("release should honor the injected fault");
   assert!(error.to_string().contains("release unavailable"));
@@ -116,7 +129,14 @@ async fn consumer_member_deregistration_honors_faults_without_removing_membershi
   let store =
     FaultInjectedConsumerGroupMembershipStore::new(Arc::clone(&inner), controller.clone());
   inner
-    .register_member("telemetry", "group-a", "consumer-a", None, 1_000, 100)
+    .register_member(
+      "telemetry",
+      "group-a",
+      "consumer-a",
+      None,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
     .await
     .expect("register member");
   controller
@@ -138,7 +158,11 @@ async fn consumer_member_deregistration_honors_faults_without_removing_membershi
   assert!(error.to_string().contains("deregistration unavailable"));
   assert_eq!(
     inner
-      .list_active_members("telemetry", "group-a", 1_001)
+      .list_active_members(
+        "telemetry",
+        "group-a",
+        offset_datetime_from_unix_millis(1_001),
+      )
       .await
       .expect("list active members"),
     vec![ConsumerGroupMember {

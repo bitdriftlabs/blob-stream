@@ -16,10 +16,11 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use blob_stream_types::CommittedCursor;
+use blob_stream_types::{CommittedCursor, unix_millis_from_offset_datetime};
 use log::trace;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use time::{Duration, OffsetDateTime};
 
 //
 // InMemoryConsumerGroupLeaseStore
@@ -59,14 +60,18 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     key: ConsumerGroupLeaseKey,
     owner_id: String,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
   ) -> Result<ConsumerGroupAssignmentOutcome> {
     trace!(
       "consumer lease(memory) assign: topic={}, group_id={}, partition={}, owner_id={}, \
        generation={}",
       key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
     );
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds in-memory millisecond range"))?;
+    let lease_duration_ms = i64::try_from(lease_duration.whole_milliseconds())
+      .map_err(|_| anyhow!("lease duration exceeds in-memory millisecond range"))?;
     let mut guard = self.leases.write();
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
 
@@ -143,8 +148,8 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
     committed_cursor: Option<CommittedCursor>,
   ) -> Result<ConsumerGroupHeartbeatOutcome> {
     trace!(
@@ -156,6 +161,10 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
       validate_cursor(key, cursor)?;
     }
 
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds in-memory millisecond range"))?;
+    let lease_duration_ms = i64::try_from(lease_duration.whole_milliseconds())
+      .map_err(|_| anyhow!("lease duration exceeds in-memory millisecond range"))?;
     let mut guard = self.leases.write();
     let Some(state) = guard.get_mut(key) else {
       return Ok(ConsumerGroupHeartbeatOutcome::Expired);
@@ -189,7 +198,7 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     committed_cursor: CommittedCursor,
   ) -> Result<ConsumerGroupCommitOutcome> {
     trace!(
@@ -204,6 +213,8 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     );
     validate_cursor(key, &committed_cursor)?;
 
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds in-memory millisecond range"))?;
     let mut guard = self.leases.write();
     let Some(state) = guard.get_mut(key) else {
       return Ok(ConsumerGroupCommitOutcome::Expired);
@@ -232,7 +243,7 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<ConsumerGroupReleaseOutcome> {
     trace!(
       "consumer lease(memory) release: topic={}, group_id={}, partition={}, owner_id={}, \
@@ -240,6 +251,8 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
       key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
     );
 
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds in-memory millisecond range"))?;
     let mut guard = self.leases.write();
     let Some(state) = guard.get_mut(key) else {
       return Ok(ConsumerGroupReleaseOutcome::Expired);

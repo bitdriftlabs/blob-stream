@@ -64,6 +64,11 @@ and `transactional_metadata_writes` model broker `fenced_metadata_writes`, inclu
 `blob_stream_broker_fenced_metadata_writes` runtime override. The fence mode is optional, but its
 holder ID, lease epoch, and session ID remain required in every producer lease row.
 
+The model's metadata-read cost is unaffected by the fact that strong reads have no visibility delay
+or by the configured consumer clock-skew horizon. The clock-skew bound can increase the scanned time
+range near a window boundary; size the model with observed page sizes and poll rates for deployments
+where that additional overlap is material.
+
 ## Calibration
 
 Use direct observed rates whenever available. The fallback segment and range-read estimates are for

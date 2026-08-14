@@ -28,6 +28,7 @@ use blob_stream_types::{
 use protobuf::Message;
 use std::collections::HashMap;
 use std::time::Duration;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -123,8 +124,8 @@ fn build_segment(
     BlobKey::from("topic/1/segment"),
     Compression::none(),
     segment_index,
-    3000,
-    3000,
+    OffsetDateTime::UNIX_EPOCH + TimeDuration::seconds(3),
+    OffsetDateTime::UNIX_EPOCH + TimeDuration::seconds(3),
   )
 }
 
@@ -278,7 +279,7 @@ async fn writes_segment_ttl_attribute() -> Result<()> {
     .and_then(|value| value.as_n().ok())
     .ok_or_else(|| anyhow!("missing ttl attribute"))?
     .parse::<i64>()?;
-  let expected = (segment.created_ts_ms / 1_000) + (7 * 24 * 60 * 60) + 3_600;
+  let expected = segment.created_at.unix_timestamp() + (7 * 24 * 60 * 60) + 3_600;
 
   assert_eq!(ttl, expected);
   assert!(

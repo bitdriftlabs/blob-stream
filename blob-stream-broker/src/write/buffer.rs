@@ -4,6 +4,7 @@ use blob_stream_metadata_store::ProducerLeaseFence;
 use blob_stream_types::{BatchSummary, Record, SeqRange, VirtualPartitionId};
 use protobuf::Chars;
 use std::sync::Arc;
+use time::{Duration, OffsetDateTime};
 use tokio::sync::oneshot;
 
 pub(super) type FlushCompletion = oneshot::Sender<Result<(), FlushCompletionError>>;
@@ -22,13 +23,13 @@ pub(super) enum FlushCompletionError {
 pub(super) struct BufferState {
   pub(super) batches: Vec<BufferedBatch>,
   pub(super) buffered_bytes: u64,
-  pub(super) first_buffered_ts_ms: Option<i64>,
+  pub(super) first_buffered_at: Option<OffsetDateTime>,
 }
 
 impl BufferState {
-  pub(super) fn push(&mut self, batch: BufferedBatch, now_ts_ms: i64) {
-    if self.first_buffered_ts_ms.is_none() {
-      self.first_buffered_ts_ms = Some(now_ts_ms);
+  pub(super) fn push(&mut self, batch: BufferedBatch, now: OffsetDateTime) {
+    if self.first_buffered_at.is_none() {
+      self.first_buffered_at = Some(now);
     }
     self.buffered_bytes = self
       .buffered_bytes
@@ -36,7 +37,11 @@ impl BufferState {
     self.batches.push(batch);
   }
 
-  pub(super) fn flush_trigger(&self, now_ts_ms: i64, config: &WriteConfig) -> Option<FlushTrigger> {
+  pub(super) fn flush_trigger(
+    &self,
+    now: OffsetDateTime,
+    config: &WriteConfig,
+  ) -> Option<FlushTrigger> {
     if self.batches.is_empty() {
       return None;
     }
@@ -44,26 +49,25 @@ impl BufferState {
       return Some(FlushTrigger::MaxBytes);
     }
 
-    let first_ts = self.first_buffered_ts_ms?;
-    (now_ts_ms.saturating_sub(first_ts) >= config.flush_max_delay_ms)
-      .then_some(FlushTrigger::MaxDelay)
+    let first_buffered_at = self.first_buffered_at?;
+    (now - first_buffered_at >= config.flush_max_delay).then_some(FlushTrigger::MaxDelay)
   }
 
-  pub(super) fn is_time_due(&self, now_ts_ms: i64, config: &WriteConfig) -> bool {
+  pub(super) fn is_time_due(&self, now: OffsetDateTime, config: &WriteConfig) -> bool {
     self
-      .first_buffered_ts_ms
-      .is_some_and(|first_ts| now_ts_ms.saturating_sub(first_ts) >= config.flush_max_delay_ms)
+      .first_buffered_at
+      .is_some_and(|first_buffered_at| now - first_buffered_at >= config.flush_max_delay)
   }
 
   pub(super) fn reset(&mut self) {
     self.batches.clear();
     self.buffered_bytes = 0;
-    self.first_buffered_ts_ms = None;
+    self.first_buffered_at = None;
   }
 
   pub(super) fn discard(&mut self) -> Vec<FlushCompletion> {
     self.buffered_bytes = 0;
-    self.first_buffered_ts_ms = None;
+    self.first_buffered_at = None;
     std::mem::take(&mut self.batches)
       .into_iter()
       .filter_map(|mut batch| batch.completion.take())
@@ -92,7 +96,7 @@ pub(super) struct BufferedBatch {
 pub(super) struct FlushPlan {
   pub(super) topic: Chars,
   pub(super) partitions: Vec<FlushPartition>,
-  pub(super) max_metadata_publication_lag_ms: u64,
+  pub(super) max_metadata_publication_lag: Duration,
   pub(super) fenced_metadata_writes: bool,
 }
 

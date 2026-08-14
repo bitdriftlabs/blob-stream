@@ -20,6 +20,7 @@ use blob_stream_types::SeqRange;
 use log::{debug, trace};
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use time::{Duration, OffsetDateTime};
 
 //
 // InMemoryProducerPartitionLeaseStore
@@ -52,16 +53,16 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     key: ProducerPartitionLeaseKey,
     holder_id: String,
     lease_session_id: String,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
   ) -> Result<LeaseAcquireOutcome> {
     match self
       .acquire_lease_and_reserve_sequences(
         key,
         holder_id,
         lease_session_id,
-        now_ts_ms,
-        lease_duration_ms,
+        now,
+        lease_duration,
         None,
       )
       .await?
@@ -87,8 +88,8 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     key: ProducerPartitionLeaseKey,
     holder_id: String,
     lease_session_id: String,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
     reservation_size: Option<u64>,
   ) -> Result<LeaseAcquireAndReserveOutcome> {
     trace!(
@@ -100,16 +101,16 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       return Err(anyhow!("reservation_size must be greater than zero"));
     }
 
-    let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
+    let expires_at = expires_at(now, lease_duration)?;
     let mut guard = self.leases.write();
     let state = guard.entry(key.clone()).or_insert_with(|| LeaseState {
       holder_id: holder_id.clone(),
       lease_epoch: 1,
       lease_session_id: lease_session_id.clone(),
-      lease_expiration_ts_ms: expires_at,
+      lease_expiration_at: expires_at,
       max_allocated_seq: None,
     });
-    if !state.is_expired(now_ts_ms)
+    if !state.is_expired(now)
       && (state.holder_id != holder_id || state.lease_session_id != lease_session_id)
     {
       return Ok(LeaseAcquireAndReserveOutcome::HeldByOther(
@@ -117,7 +118,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       ));
     }
 
-    let takeover = state.is_expired(now_ts_ms) || state.lease_session_id != lease_session_id;
+    let takeover = state.is_expired(now) || state.lease_session_id != lease_session_id;
     let lease_epoch = if takeover {
       state
         .lease_epoch
@@ -136,7 +137,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       state.lease_session_id = lease_session_id;
     }
     state.holder_id = holder_id;
-    state.lease_expiration_ts_ms = expires_at;
+    state.lease_expiration_at = expires_at;
     let reservation = if let Some((range, updated)) = reservation {
       state.max_allocated_seq = Some(updated);
       Some(range)
@@ -153,8 +154,8 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
   ) -> Result<LeaseHeartbeatOutcome> {
     trace!(
       "producer lease(memory) heartbeat: topic={}, partition={}, holder_id={}",
@@ -165,7 +166,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       return Ok(LeaseHeartbeatOutcome::Expired);
     };
 
-    if state.is_expired(now_ts_ms) {
+    if state.is_expired(now) {
       return Ok(LeaseHeartbeatOutcome::Expired);
     }
 
@@ -175,7 +176,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       ));
     }
 
-    state.lease_expiration_ts_ms = expires_at(now_ts_ms, lease_duration_ms)?;
+    state.lease_expiration_at = expires_at(now, lease_duration)?;
     Ok(LeaseHeartbeatOutcome::Renewed(state.to_lease(key.clone())))
   }
 
@@ -184,7 +185,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
     trace!(
@@ -200,7 +201,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       return Ok(SequenceReservationOutcome::Expired);
     };
 
-    if state.is_expired(now_ts_ms) {
+    if state.is_expired(now) {
       return Ok(SequenceReservationOutcome::Expired);
     }
 
@@ -224,7 +225,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<LeaseReleaseOutcome> {
     trace!(
       "producer lease(memory) release: topic={}, partition={}, holder_id={}",
@@ -235,7 +236,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       return Ok(LeaseReleaseOutcome::Expired);
     };
 
-    if state.is_expired(now_ts_ms) {
+    if state.is_expired(now) {
       return Ok(LeaseReleaseOutcome::Expired);
     }
 
@@ -245,7 +246,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       ));
     }
 
-    state.lease_expiration_ts_ms = now_ts_ms;
+    state.lease_expiration_at = now;
     guard.insert(key.clone(), state);
     Ok(LeaseReleaseOutcome::Released)
   }
@@ -260,13 +261,13 @@ struct LeaseState {
   holder_id: String,
   lease_epoch: u64,
   lease_session_id: String,
-  lease_expiration_ts_ms: i64,
+  lease_expiration_at: OffsetDateTime,
   max_allocated_seq: Option<u64>,
 }
 
 impl LeaseState {
-  fn is_expired(&self, now_ts_ms: i64) -> bool {
-    now_ts_ms >= self.lease_expiration_ts_ms
+  fn is_expired(&self, now: OffsetDateTime) -> bool {
+    now >= self.lease_expiration_at
   }
 
   fn to_lease(&self, key: ProducerPartitionLeaseKey) -> ProducerPartitionLease {
@@ -277,7 +278,7 @@ impl LeaseState {
         lease_epoch: self.lease_epoch,
         lease_session_id: self.lease_session_id.clone(),
       },
-      lease_expiration_ts_ms: self.lease_expiration_ts_ms,
+      lease_expiration_at: self.lease_expiration_at,
       max_allocated_seq: self.max_allocated_seq,
     }
   }
@@ -297,8 +298,8 @@ fn reserve_range(current: Option<u64>, reservation_size: u64) -> Result<(SeqRang
   Ok((SeqRange { start, end }, end))
 }
 
-fn expires_at(now_ts_ms: i64, lease_duration_ms: i64) -> Result<i64> {
-  now_ts_ms
-    .checked_add(lease_duration_ms)
+fn expires_at(now: OffsetDateTime, lease_duration: Duration) -> Result<OffsetDateTime> {
+  now
+    .checked_add(lease_duration)
     .ok_or_else(|| anyhow!("lease expiration overflow"))
 }

@@ -7,14 +7,13 @@ use super::{
   ReadCapacity,
   RecoveryState,
   VirtualPartitionState,
-  format_unix_timestamp_seconds,
-  metadata_availability_delay_seconds,
+  offset_datetime_from_unix_seconds,
 };
 use crate::config::{
   ConsumerReadConfig,
   ConsumerReadRuntimeSettings,
   consumer_read_runtime_settings,
-  consumer_window_size_seconds,
+  consumer_window_size,
   validate_read_config,
 };
 use anyhow::{Result, ensure};
@@ -27,12 +26,13 @@ use log::info;
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::sync::Arc;
+use time::Duration;
 
 mod diagnostics;
 mod lifecycle;
 mod runtime;
 
-const HISTORICAL_SEEK_RECOVERY_SECONDS: i64 = 10 * 60;
+const HISTORICAL_SEEK_RECOVERY: Duration = Duration::minutes(10);
 
 /// Identity of one immutable recovery metadata response retained by this reader instance.
 pub(in crate::consumer) type RecoveryMetadataCacheKey = (VirtualPartitionId, i64, Option<u64>);
@@ -101,8 +101,9 @@ pub struct ConsumerReaderImpl {
   pub(in crate::consumer) metadata_store: Arc<dyn MetadataStore>,
   pub(in crate::consumer) virtual_partition_states:
     HashMap<VirtualPartitionId, VirtualPartitionState>,
-  pub(in crate::consumer) retention_days: u32,
-  pub(in crate::consumer) maximum_metadata_publication_lag_ms: u64,
+  pub(in crate::consumer) retention: Duration,
+  pub(in crate::consumer) maximum_metadata_publication_lag: Duration,
+  pub(in crate::consumer) maximum_clock_skew: Duration,
   pub(in crate::consumer) fast_frontiers: HashMap<(VirtualPartitionId, i64), SnowflakeId>,
   pub(in crate::consumer) recovery_scan_last_partition: Option<VirtualPartitionId>,
   pub(in crate::consumer) recovery_metadata_cache:

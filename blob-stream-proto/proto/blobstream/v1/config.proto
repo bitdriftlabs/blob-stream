@@ -350,6 +350,12 @@ message ConsumerReadConfig {
   // Read metadata from DynamoDB with strong consistency. Default when unset: false.
   // Strong reads remove read-replica staleness but do not fence stale producer publication.
   optional bool strongly_consistent_metadata_reads = 11;
+
+  // Maximum pairwise amount by which this consumer clock may lead a broker clock. This must cover
+  // time-source uncertainty and is included in the metadata availability horizon.
+  // Default when unset: 10 ms. Set this to a proven, monitored deployment bound; it is not a
+  // universal NTP guarantee.
+  optional uint64 max_clock_skew_ms = 12 [(validate.rules).uint64.gt = 0];
 }
 
 // Consumer group lease and heartbeat settings.

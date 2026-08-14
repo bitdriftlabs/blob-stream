@@ -11,9 +11,11 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use blob_stream_types::unix_millis_from_offset_datetime;
 use log::trace;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use time::{Duration, OffsetDateTime};
 
 //
 // InMemoryConsumerGroupMembershipStore
@@ -39,13 +41,17 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: Duration,
   ) -> Result<()> {
     trace!(
       "consumer membership(memory) register: topic={topic}, group_id={group_id}, \
        member_id={member_id}"
     );
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds in-memory millisecond range"))?;
+    let ttl_ms = i64::try_from(ttl.whole_milliseconds())
+      .map_err(|_| anyhow!("membership ttl exceeds in-memory millisecond range"))?;
     let expires_at = expires_at(now_ts_ms, ttl_ms)?;
     let key = MemberKey::new(topic, group_id, member_id);
     let state = MemberState {
@@ -62,15 +68,15 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: Duration,
   ) -> Result<()> {
     trace!(
       "consumer membership(memory) heartbeat: topic={topic}, group_id={group_id}, \
        member_id={member_id}"
     );
     self
-      .register_member(topic, group_id, member_id, pod_id, now_ts_ms, ttl_ms)
+      .register_member(topic, group_id, member_id, pod_id, now, ttl)
       .await
   }
 
@@ -88,9 +94,11 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     &self,
     topic: &str,
     group_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<Vec<ConsumerGroupMember>> {
     trace!("consumer membership(memory) list_active_members: topic={topic}, group_id={group_id}");
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds in-memory millisecond range"))?;
     let guard = self.state.read();
     let mut members = HashSet::new();
     for (key, state) in &guard.members {
@@ -148,9 +156,13 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     group_id: &str,
     member_id: &str,
     planner_session_id: &str,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: Duration,
   ) -> Result<ConsumerGroupPlannerLeaseOutcome> {
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds in-memory millisecond range"))?;
+    let ttl_ms = i64::try_from(ttl.whole_milliseconds())
+      .map_err(|_| anyhow!("planner ttl exceeds in-memory millisecond range"))?;
     let expires_at = expires_at(now_ts_ms, ttl_ms)?;
     let group_key = GroupKey::new(topic, group_id);
     let mut state = self.state.write();
@@ -202,9 +214,11 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     group_id: &str,
     member_id: &str,
     planner_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     plan: ConsumerGroupAssignmentPlan,
   ) -> Result<bool> {
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds in-memory millisecond range"))?;
     let group_key = GroupKey::new(topic, group_id);
     let mut state = self.state.write();
     let Some(planner) = state.planners.get(&group_key) else {

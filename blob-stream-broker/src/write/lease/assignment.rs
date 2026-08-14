@@ -12,7 +12,6 @@ use super::super::state::WriteState;
 use super::super::{BrokerLifecycleHooks, TopicInfo, WriteEngineImpl};
 use super::acquire_lease_and_reserve_sequences;
 use bd_log_util::warn_every;
-use bd_time::OffsetDateTimeExt;
 use blob_stream_broker_discovery::{
   BrokerMembership,
   balanced_assignment,
@@ -32,6 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use time::ext::NumericalDuration;
+use time::{Duration, OffsetDateTime};
 use tokio::sync::watch;
 
 impl WriteEngineImpl {
@@ -64,15 +64,14 @@ impl WriteEngineImpl {
     &self,
     mut membership_rx: watch::Receiver<BrokerMembership>,
   ) {
-    let interval_ms = (self.config.lease_duration_ms / 3)
-      .max(1_000)
-      .cast_unsigned();
-    let interval = StdDuration::from_millis(interval_ms);
+    let interval =
+      StdDuration::try_from((self.config.lease_duration / 3_i32).max(Duration::seconds(1)))
+        .unwrap_or(StdDuration::from_secs(1));
     let topics = self.topics.clone();
     let holder_id = self.holder_id.clone();
     let lease_session_id = self.lease_session_id.clone();
     let writer_id = self.config.writer_id;
-    let lease_duration_ms = self.config.lease_duration_ms;
+    let lease_duration = self.config.lease_duration;
     let base_reservation_size = self.config.reservation_size;
     let lease_store = Arc::clone(&self.lease_store);
     let state = Arc::clone(&self.state);
@@ -136,7 +135,7 @@ impl WriteEngineImpl {
             &holder_id,
             &lease_session_id,
             partitions,
-            time_provider.now().unix_timestamp_ms(),
+            time_provider.now(),
             lifecycle_hooks.as_ref(),
           )
           .await;
@@ -192,7 +191,7 @@ impl WriteEngineImpl {
           &holder_id,
           &lease_session_id,
           lost_partitions,
-          time_provider.now().unix_timestamp_ms(),
+          time_provider.now(),
           lifecycle_hooks.as_ref(),
         )
         .await;
@@ -207,14 +206,13 @@ impl WriteEngineImpl {
           };
 
           let now = time_provider.now();
-          let now_ts_ms = now.unix_timestamp_ms();
           let transition = loop {
             match begin_allocation_transition(
               &state,
               &topic,
               virtual_partition_id,
               1,
-              now_ts_ms,
+              now,
               true,
               base_reservation_size,
             ) {
@@ -236,8 +234,8 @@ impl WriteEngineImpl {
             &holder_id,
             &lease_session_id,
             key,
-            now_ts_ms,
-            lease_duration_ms,
+            now,
+            lease_duration,
             reservation_request.map(|request| request.size),
             &metrics,
           )
@@ -255,7 +253,7 @@ impl WriteEngineImpl {
                 );
               }
               let lease_expiration_update =
-                LeaseExpirationUpdate::Set(Some(lease.lease_expiration_ts_ms));
+                LeaseExpirationUpdate::Set(Some(lease.lease_expiration_at));
               transition.transition.finish_lease_maintenance(
                 lease_expiration_update,
                 Some(lease),
@@ -307,7 +305,7 @@ impl WriteEngineImpl {
     lease_session_id: &str,
     topic: &Chars,
     virtual_partition_id: VirtualPartitionId,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     lifecycle_hooks: Option<&Arc<dyn BrokerLifecycleHooks>>,
   ) {
     let key = ProducerPartitionLeaseKey {
@@ -351,7 +349,7 @@ impl WriteEngineImpl {
     }
 
     match lease_store
-      .release_lease(&key, holder_id, lease_session_id, now_ts_ms)
+      .release_lease(&key, holder_id, lease_session_id, now)
       .await
     {
       Ok(
@@ -366,7 +364,7 @@ impl WriteEngineImpl {
           if let Some(partition_state) =
             state.partition_state_mut_if_present(topic, virtual_partition_id)
           {
-            partition_state.lease_expiration_ts_ms = None;
+            partition_state.lease_expiration_at = None;
             partition_state.lease_fence = None;
             partition_state.reset_sequence_allocation();
           }
@@ -394,7 +392,7 @@ impl WriteEngineImpl {
     holder_id: &str,
     lease_session_id: &str,
     partitions: Vec<(Chars, VirtualPartitionId)>,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     lifecycle_hooks: Option<&Arc<dyn BrokerLifecycleHooks>>,
   ) {
     let mut releases = FuturesUnordered::new();
@@ -409,7 +407,7 @@ impl WriteEngineImpl {
           lease_session_id,
           &topic,
           virtual_partition_id,
-          now_ts_ms,
+          now,
           lifecycle_hooks,
         )
         .await;

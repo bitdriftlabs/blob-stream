@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use blob_stream_types::{CommittedSourceCheckpoint, Record, SeqRange, VirtualPartitionId};
 use std::collections::HashMap;
+use time::OffsetDateTime;
 
 //
 // ConsumerBatch
@@ -28,10 +29,10 @@ pub struct ConsumerBatch {
 pub struct ConsumerReadOutcome {
   /// Batches ready for the prefetch worker to admit to delivery.
   pub batches: Vec<ConsumerBatch>,
-  /// Earliest whole second at which a deferred metadata row can be safely retried.
+  /// Earliest instant at which a deferred metadata row can be safely retried.
   ///
   /// This is present only when the pass has no ready batches and was not stopped by capacity.
-  pub next_visibility_eligible_unix_seconds: Option<i64>,
+  pub next_visibility_eligible_at: Option<OffsetDateTime>,
 }
 
 //
@@ -44,7 +45,7 @@ pub trait ConsumerReader: Send {
   /// Scan available windows and return batches that fit within the supplied payload capacity.
   async fn read_available(
     &mut self,
-    now_unix_seconds: i64,
+    now: OffsetDateTime,
     capacity: ReadCapacity,
   ) -> Result<Vec<ConsumerBatch>>;
   /// Return committed cursor for a virtual partition, if known.

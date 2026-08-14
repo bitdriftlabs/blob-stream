@@ -95,7 +95,7 @@ pub use config::{
   ConsumerGroupConfig,
   ConsumerReadConfig,
   ConsumerRuntimeConfig,
-  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG,
 };
 pub use coordination::{
   ConsumerGroupCoordinator,

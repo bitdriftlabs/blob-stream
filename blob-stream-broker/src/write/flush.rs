@@ -31,7 +31,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Instant;
 use time::OffsetDateTime;
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 #[cfg(test)]
 #[path = "./flush_test.rs"]
@@ -83,13 +83,13 @@ struct SegmentEnvelope {
   compression: blob_stream_types::Compression,
   segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
   record_count: u64,
-  created_ts_ms: i64,
+  created_at: OffsetDateTime,
 }
 
 impl SegmentEnvelope {
   fn into_metadata(
     self,
-    metadata_published_ts_ms: i64,
+    metadata_published_at: OffsetDateTime,
   ) -> blob_stream_metadata_store::SegmentMetadata {
     blob_stream_metadata_store::SegmentMetadata::new(
       self.window,
@@ -97,8 +97,8 @@ impl SegmentEnvelope {
       self.blob_key,
       self.compression,
       self.segment_index,
-      self.created_ts_ms,
-      metadata_published_ts_ms,
+      self.created_at,
+      metadata_published_at,
     )
   }
 }
@@ -153,7 +153,7 @@ impl FlushContext {
 
     key.push_str(topic);
     key.push('/');
-    key.push_str(&window.start_unix_seconds.to_string());
+    key.push_str(&window.start.unix_timestamp().to_string());
     key.push('/');
     key.push_str(&snowflake_id.as_u64().to_string());
     key.push('.');
@@ -244,8 +244,7 @@ impl FlushContext {
     now: OffsetDateTime,
   ) -> Result<(Bytes, SegmentEnvelope)> {
     trace!("building flush segment: topic={topic}");
-    let now_ts_ms = now.unix_timestamp_ms();
-    let window = Window::for_timestamp(now.unix_timestamp(), self.config.window_size_seconds);
+    let window = Window::for_timestamp(now, self.config.window_size);
     let snowflake_id = self.snowflake.next(now)?;
     let blob_key = self.make_blob_key(topic, &window, snowflake_id);
     let compression = self.config.compression.clone();
@@ -285,7 +284,7 @@ impl FlushContext {
       compression,
       segment_index,
       record_count,
-      created_ts_ms: now_ts_ms,
+      created_at: now,
     };
 
     debug!(
@@ -337,7 +336,8 @@ impl FlushContext {
     let record_count = envelope.record_count;
     let partition_count = envelope.segment_index.len();
 
-    let publication_budget = Duration::from_millis(plan.max_metadata_publication_lag_ms);
+    let publication_budget = std::time::Duration::try_from(plan.max_metadata_publication_lag)
+      .unwrap_or(std::time::Duration::MAX);
     let remaining_budget = publication_budget
       .checked_sub(publication_started_at.elapsed())
       .ok_or_else(|| {
@@ -345,7 +345,7 @@ impl FlushContext {
         metrics.record_metadata_publication_deadline_exhausted_before_persistence();
         anyhow::anyhow!(
           "metadata publication exceeded {} ms before segment persistence",
-          plan.max_metadata_publication_lag_ms
+          plan.max_metadata_publication_lag.whole_milliseconds()
         )
       })?;
     let persistence_result = timeout(remaining_budget, async {
@@ -365,13 +365,14 @@ impl FlushContext {
           .blob_persisted(plan.topic.as_str(), &virtual_partition_ids)
           .await;
       }
-      let metadata = envelope.into_metadata(self.time_provider.now().unix_timestamp_ms());
+      let metadata_published_at = self.time_provider.now();
+      let metadata = envelope.into_metadata(metadata_published_at);
       self
         .metadata_store
         .write_segment(
           metadata,
           fences.as_deref(),
-          self.time_provider.now().unix_timestamp_ms(),
+          metadata_published_at.unix_timestamp_ms(),
         )
         .await?;
       if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
@@ -396,7 +397,7 @@ impl FlushContext {
         return Err(
           anyhow::anyhow!(
             "metadata publication exceeded {} ms while persisting segment",
-            plan.max_metadata_publication_lag_ms
+            plan.max_metadata_publication_lag.whole_milliseconds()
           )
           .into(),
         );
