@@ -546,7 +546,7 @@ impl ClusterHarness {
       Arc::clone(&self.consumer_membership_store),
       coordination_source,
       Collector::default().scope("blob_stream_consumer_it"),
-      1,
+      time::Duration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
     )
@@ -787,7 +787,7 @@ fn build_write_engine(
         name: topic.into(),
         partition_count,
         num_writers: topic_num_writers,
-        retention_days: 7,
+        retention: time::Duration::days(7),
         max_metadata_publication_lag: time::Duration::milliseconds(30_000),
       },
     );

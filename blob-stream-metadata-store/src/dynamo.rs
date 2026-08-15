@@ -36,6 +36,7 @@ use bytes::Bytes;
 use log::{debug, trace};
 use protobuf::Chars;
 use std::collections::{HashMap, HashSet};
+use time::Duration;
 use time::ext::NumericalDuration;
 use uuid::Uuid;
 
@@ -44,7 +45,6 @@ use uuid::Uuid;
 mod tests;
 
 const ATTR_SEGMENT_METADATA_V1: &str = "segment_metadata_v1";
-const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 pub const MAX_FENCED_METADATA_PARTITIONS: usize = 99;
 
 //
@@ -56,8 +56,8 @@ pub struct DynamoMetadataStore {
   client: Client,
   table_name: String,
   producer_partition_lease_table_name: String,
-  topic_retention_days: HashMap<Chars, u32>,
-  ttl_buffer_seconds: i64,
+  topic_retention: HashMap<Chars, Duration>,
+  ttl_buffer: Duration,
   capacity_metrics: Option<DynamoCapacityMetrics>,
 }
 
@@ -67,16 +67,16 @@ impl DynamoMetadataStore {
     client: Client,
     table_name: impl Into<String>,
     producer_partition_lease_table_name: impl Into<String>,
-    topic_retention_days: HashMap<Chars, u32>,
-    ttl_buffer_seconds: u32,
+    topic_retention: HashMap<Chars, Duration>,
+    ttl_buffer: Duration,
     capacity_metrics: Option<DynamoCapacityMetrics>,
   ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
       producer_partition_lease_table_name: producer_partition_lease_table_name.into(),
-      topic_retention_days,
-      ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
+      topic_retention,
+      ttl_buffer,
       capacity_metrics,
     }
   }
@@ -100,20 +100,25 @@ impl DynamoMetadataStore {
   }
 
   fn metadata_ttl_epoch_seconds(&self, metadata: &SegmentMetadata) -> Option<i64> {
-    let retention_days = self
-      .topic_retention_days
-      .get(metadata.window.topic.as_str())?;
-    if *retention_days == 0 {
+    let retention = self.topic_retention.get(metadata.window.topic.as_str())?;
+    if !retention.is_positive() {
       return None;
     }
 
-    let retention_seconds = i64::from(*retention_days).checked_mul(SECONDS_PER_DAY)?;
+    let retention_seconds = duration_seconds_ceil(*retention)?;
+    let ttl_buffer_seconds = duration_seconds_ceil(self.ttl_buffer)?;
     let created_seconds = metadata.created_at.unix_timestamp();
 
     created_seconds
       .checked_add(retention_seconds)?
-      .checked_add(self.ttl_buffer_seconds)
+      .checked_add(ttl_buffer_seconds)
   }
+}
+
+pub fn duration_seconds_ceil(duration: Duration) -> Option<i64> {
+  duration
+    .whole_seconds()
+    .checked_add(i64::from(duration.subsec_nanoseconds() != 0))
 }
 
 #[async_trait]

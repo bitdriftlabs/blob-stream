@@ -73,6 +73,7 @@ use blob_stream_types::{
   RecordBatch,
   SeqRange,
   SnowflakeId,
+  ToProtoDuration,
   TopicWindowKey,
   VirtualPartitionId,
   new_record,
@@ -806,16 +807,16 @@ fn runtime_config_with_prefetch_max_bytes(
 ) -> ConsumerRuntimeConfig {
   let mut read = ConsumerReadConfig::new();
   read.topic = "telemetry".to_string().into();
-  read.window_size_seconds = Some(300);
+  read.window_size = TimeDuration::seconds(300).into_proto();
   read.prefetch_max_bytes = prefetch_max_bytes;
 
   let mut group = ConsumerGroupConfig::new();
   group.topic = "telemetry".to_string().into();
   group.group_id = "group-a".to_string().into();
   group.member_id = "member-a".to_string().into();
-  group.lease_duration_ms = Some(1_000);
-  group.heartbeat_interval_ms = Some(10);
-  group.rebalance_interval_ms = Some(10);
+  group.lease_duration = TimeDuration::seconds(1).into_proto();
+  group.heartbeat_interval = TimeDuration::milliseconds(10).into_proto();
+  group.rebalance_interval = TimeDuration::milliseconds(10).into_proto();
 
   let mut runtime = ConsumerRuntimeConfig::new();
   runtime.read = Some(read).into();
@@ -845,7 +846,7 @@ async fn idle_prefetch_worker_processes_hydration_command_without_clock_advance(
     membership_store,
     coordination_source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -926,7 +927,7 @@ async fn visibility_deferred_empty_scan_waits_until_metadata_is_eligible() {
       virtual_partitions: vec![3],
     }));
   let mut runtime = runtime_config();
-  runtime.read.as_mut().unwrap().metadata_visibility_delay_ms = Some(1_000);
+  runtime.read.as_mut().unwrap().metadata_visibility_delay = TimeDuration::seconds(1).into_proto();
   write_segment_with_publication_time(
     blob_store.as_ref(),
     metadata_store.as_ref(),
@@ -948,7 +949,7 @@ async fn visibility_deferred_empty_scan_waits_until_metadata_is_eligible() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -1020,8 +1021,8 @@ async fn iterator_builder_applies_configured_clock_skew_to_reader_scan_horizon()
     }));
   let mut runtime = runtime_config();
   let read = runtime.read.as_mut().unwrap();
-  read.window_size_seconds = Some(1);
-  read.max_clock_skew_ms = Some(1_001);
+  read.window_size = TimeDuration::seconds(1).into_proto();
+  read.max_clock_skew = TimeDuration::milliseconds(1_001).into_proto();
   read.strongly_consistent_metadata_reads = Some(true);
   let maximum_clock_skew = consumer_max_clock_skew(read);
 
@@ -1033,7 +1034,7 @@ async fn iterator_builder_applies_configured_clock_skew_to_reader_scan_horizon()
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     TimeDuration::ZERO,
     None,
   )
@@ -1191,7 +1192,7 @@ async fn failed_membership_heartbeats_fence_at_lease_deadline() {
     membership_store.clone(),
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -1255,7 +1256,7 @@ async fn partial_heartbeat_failure_revokes_fenced_partition() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -1350,7 +1351,7 @@ async fn lifecycle_hook_gates_commit_until_released() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -1400,7 +1401,7 @@ async fn diagnostics_report_assignment_and_start_state() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -1471,7 +1472,7 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -1577,7 +1578,7 @@ async fn state_response_reports_lease_lookup_failure_without_blocking_local_diag
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -1664,7 +1665,7 @@ async fn assignment_callback_replays_active_partitions() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -1732,7 +1733,7 @@ async fn next_returns_revocation_until_completed() {
     membership_store,
     source.clone(),
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -1808,7 +1809,7 @@ async fn next_does_not_lose_notification_between_state_check_and_wait() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -1887,7 +1888,7 @@ async fn commit_during_revocation_persists_revoked_partition_cursor() {
     membership_store,
     source.clone(),
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -2009,7 +2010,7 @@ async fn next_delivers_records_and_commit_renews() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -2066,8 +2067,8 @@ async fn scheduled_heartbeats_do_not_depend_on_next_polling() {
       virtual_partitions: vec![0],
     }));
   let mut runtime = runtime_config();
-  runtime.group.as_mut().unwrap().heartbeat_interval_ms = Some(25);
-  runtime.group.as_mut().unwrap().rebalance_interval_ms = Some(60_000);
+  runtime.group.as_mut().unwrap().heartbeat_interval = TimeDuration::milliseconds(25).into_proto();
+  runtime.group.as_mut().unwrap().rebalance_interval = TimeDuration::seconds(60).into_proto();
   let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime,
     blob_store,
@@ -2076,7 +2077,7 @@ async fn scheduled_heartbeats_do_not_depend_on_next_polling() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -2155,7 +2156,7 @@ async fn seek_waits_for_prefetch_scan_without_stalling_heartbeats() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -2229,7 +2230,7 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -2337,7 +2338,7 @@ async fn seek_interrupts_prefetch_read_retries_without_clock_advance() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -2385,7 +2386,7 @@ fn shutdown_span_reports_success_after_all_work_completes() {
       membership_store,
       source,
       metrics_scope(),
-      1,
+      TimeDuration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
     )
@@ -2452,7 +2453,7 @@ fn shutdown_span_reports_best_effort_cleanup_failure() {
       membership_store,
       source,
       metrics_scope(),
-      1,
+      TimeDuration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
     )
@@ -2516,7 +2517,7 @@ fn revocation_handoff_span_reports_success_after_reassignment() {
       membership_store,
       source.clone(),
       metrics_scope(),
-      1,
+      TimeDuration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
     )
@@ -2639,7 +2640,7 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -2774,7 +2775,7 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
     membership_store,
     source.clone(),
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -2851,8 +2852,8 @@ async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
   let heartbeat_started = membership_store.heartbeat_started.clone();
 
   let mut runtime = runtime_config();
-  runtime.group.as_mut().unwrap().heartbeat_interval_ms = Some(60_000);
-  runtime.group.as_mut().unwrap().rebalance_interval_ms = Some(60_000);
+  runtime.group.as_mut().unwrap().heartbeat_interval = TimeDuration::seconds(60).into_proto();
+  runtime.group.as_mut().unwrap().rebalance_interval = TimeDuration::seconds(60).into_proto();
   let source: Arc<dyn ConsumerCoordinationSource> =
     Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
       members: vec!["member-a".to_string()],
@@ -2866,7 +2867,7 @@ async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
     membership_store.clone(),
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -2925,8 +2926,8 @@ async fn cancelled_next_does_not_restart_rebalance() {
   }));
 
   let mut runtime = runtime_config();
-  runtime.group.as_mut().unwrap().heartbeat_interval_ms = Some(60_000);
-  runtime.group.as_mut().unwrap().rebalance_interval_ms = Some(60_000);
+  runtime.group.as_mut().unwrap().heartbeat_interval = TimeDuration::seconds(60).into_proto();
+  runtime.group.as_mut().unwrap().rebalance_interval = TimeDuration::seconds(60).into_proto();
   let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime,
     blob_store,
@@ -2935,7 +2936,7 @@ async fn cancelled_next_does_not_restart_rebalance() {
     membership_store,
     source.clone(),
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
@@ -3005,7 +3006,7 @@ async fn cancelled_next_preserves_prefetched_record() {
     membership_store,
     source,
     metrics_scope(),
-    1,
+    TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )

@@ -147,7 +147,7 @@ fn ownership_changes_with_membership() {
       name: "telemetry".into(),
       partition_count: 8,
       num_writers: 1,
-      retention_days: 7,
+      retention: Duration::days(7),
       max_metadata_publication_lag: Duration::seconds(30),
     },
   );
@@ -207,7 +207,7 @@ fn ownership_includes_only_local_producer_writer_virtual_partitions() {
       name: "telemetry".into(),
       partition_count: 2,
       num_writers: 2,
-      retention_days: 7,
+      retention: Duration::days(7),
       max_metadata_publication_lag: Duration::seconds(30),
     },
   );
@@ -246,7 +246,7 @@ fn make_topic(partition_count: u32) -> HashMap<Chars, TopicInfo> {
       name: "telemetry".into(),
       partition_count,
       num_writers: 1,
-      retention_days: 7,
+      retention: Duration::days(7),
       max_metadata_publication_lag: Duration::seconds(30),
     },
   );

@@ -24,7 +24,7 @@ use super::{
   offset_datetime_from_unix_seconds,
   validate_read_config,
 };
-use crate::config::ConsumerReadRuntimeSettings;
+use crate::config::{ConsumerReadRuntimeSettings, consumer_max_clock_skew};
 use crate::consumer::AvailabilityHorizon;
 use blob_stream_types::offset_datetime_from_unix_millis;
 use time::{Duration, OffsetDateTime};
@@ -87,7 +87,7 @@ impl ConsumerReaderImpl {
       virtual_partition_states,
       retention,
       maximum_metadata_publication_lag,
-      maximum_clock_skew: crate::config::DEFAULT_MAX_CLOCK_SKEW,
+      maximum_clock_skew: consumer_max_clock_skew(&config),
       fast_frontiers: HashMap::new(),
       recovery_scan_last_partition: None,
       recovery_metadata_cache: HashMap::new(),

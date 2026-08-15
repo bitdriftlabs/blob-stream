@@ -3,13 +3,13 @@ use super::state::ProducerState;
 use crate::config::{
   ProducerConfig,
   ProducerTopicConfig,
-  producer_flush_max_delay_ms,
+  producer_flush_max_delay,
   producer_max_batch_bytes,
   producer_max_batch_records,
   producer_writer_id,
 };
 use blob_stream_broker_discovery::{BrokerMembership, writer_virtual_partitions};
-use blob_stream_types::{VirtualPartitionId, serialize_as_string};
+use blob_stream_types::{ProtoDurationExt, VirtualPartitionId, serialize_as_string};
 use parking_lot::Mutex;
 use protobuf::Chars;
 use serde::Serialize;
@@ -227,7 +227,15 @@ impl ProducerDiagnostics {
         name: topic.name.clone(),
         partition_count: topic.partition_count,
         num_writers: topic.num_writers,
-        retention_days: topic.retention_days,
+        retention_days: u32::try_from(
+          topic
+            .retention
+            .as_ref()
+            .expect("validated producer topic config requires retention")
+            .to_time_duration()
+            .whole_days(),
+        )
+        .expect("validated producer topic retention must fit u32 days"),
       })
       .collect::<Vec<_>>();
     topics.sort_by(|left, right| left.name.cmp(&right.name));
@@ -292,7 +300,10 @@ impl ProducerDiagnostics {
       writer_id,
       max_batch_records: producer_max_batch_records(&self.config),
       max_batch_bytes: producer_max_batch_bytes(&self.config),
-      flush_max_delay_ms: producer_flush_max_delay_ms(&self.config),
+      flush_max_delay_ms: u64::try_from(
+        producer_flush_max_delay(&self.config).whole_milliseconds(),
+      )
+      .expect("producer config validation requires a positive flush max delay"),
       brokers,
       topics,
       route_map,

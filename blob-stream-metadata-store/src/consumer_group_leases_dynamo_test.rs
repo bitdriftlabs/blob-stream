@@ -132,7 +132,12 @@ async fn list_group_leases_returns_retained_rows_in_partition_order() -> Result<
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   let key_two = lease_key_for("topic-a", "group-a", 2);
   let key_ten = lease_key_for("topic-a", "group-a", 10);
   let other_group_key = lease_key_for("topic-a", "group-b", 4);
@@ -209,7 +214,12 @@ async fn fences_assignment() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   let key = lease_key();
 
   let outcome = store
@@ -278,7 +288,12 @@ async fn heartbeats_and_commits() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   let key = lease_key();
 
   store
@@ -341,7 +356,12 @@ async fn retained_assignment_preserves_committed_cursor() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   let key = lease_key();
   let committed_cursor = cursor_with_source(key.virtual_partition_id, 10);
 
@@ -395,7 +415,12 @@ async fn heartbeat_fences_other_members() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   let key = lease_key();
 
   store
@@ -435,7 +460,12 @@ async fn release_partition_allows_immediate_takeover() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
 
   let key = ConsumerGroupLeaseKey {
     topic: "topic-a".to_string(),
@@ -490,7 +520,12 @@ async fn release_partition_rejects_stale_owner_or_generation() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   let key = ConsumerGroupLeaseKey {
     topic: "topic-a".to_string(),
     group_id: "group-a".to_string(),
@@ -525,7 +560,12 @@ async fn writes_ttl_attribute_for_consumer_leases() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 120, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::seconds(120),
+    None,
+  );
   let key = lease_key();
 
   store

@@ -93,7 +93,7 @@ fn lease_key() -> ProducerPartitionLeaseKey {
 }
 
 fn default_lease_store(client: Client, table_name: String) -> DynamoProducerPartitionLeaseStore {
-  DynamoProducerPartitionLeaseStore::new(client, table_name, 3_600, None)
+  DynamoProducerPartitionLeaseStore::new(client, table_name, TimeDuration::hours(1), None)
 }
 
 #[test]
@@ -468,7 +468,12 @@ async fn writes_ttl_attribute_for_lease_rows() -> Result<()> {
   let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoProducerPartitionLeaseStore::new(client.clone(), table_name.clone(), 120, None);
+  let store = DynamoProducerPartitionLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::seconds(120),
+    None,
+  );
   let key = lease_key();
 
   store

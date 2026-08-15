@@ -827,7 +827,7 @@ fn reader_fast_scan_bound_snapshot(
 ) -> ConsumerReaderFastScanBoundSnapshot {
   ConsumerReaderFastScanBoundSnapshot {
     window_start: offset_datetime_from_unix_seconds(state.window_start_unix_seconds),
-    floor_timestamp: offset_datetime_from_unix_seconds(state.floor_timestamp_unix_seconds),
+    floor_timestamp: state.floor_timestamp,
     time_floor_snowflake_id: state.time_floor.as_u64(),
     observed_frontier_snowflake_id: state.observed_frontier.map(SnowflakeId::as_u64),
     partition_lower_bound_snowflake_id: state.partition_lower_bound.as_u64(),

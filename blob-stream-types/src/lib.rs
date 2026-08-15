@@ -5,6 +5,7 @@
 mod tests;
 
 use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
+pub use bd_time::{ProtoDurationExt, ToProtoDuration};
 pub use blob_stream_blob_store::ByteRange;
 pub use blob_stream_proto::protos::blobstream::v1::broker::Record;
 use bytes::Bytes;
@@ -328,6 +329,10 @@ impl Window {
   #[must_use]
   /// Compute the aligned window for a timestamp.
   pub fn for_timestamp(timestamp: OffsetDateTime, size: Duration) -> Self {
+    debug_assert!(
+      size.is_positive() && size.subsec_nanoseconds() == 0,
+      "durable topic window keys require positive whole-second sizes"
+    );
     let size_nanoseconds = size.whole_nanoseconds();
     let start_nanoseconds = timestamp
       .unix_timestamp_nanos()

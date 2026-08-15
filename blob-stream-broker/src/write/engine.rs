@@ -296,7 +296,7 @@ impl WriteEngine for WriteEngineImpl {
           name: topic.name.clone(),
           partition_count: topic.partition_count,
           num_writers: topic.num_writers,
-          retention_days: topic.retention_days,
+          retention_days: u32::try_from(topic.retention.whole_days()).unwrap_or(u32::MAX),
           local_partitions,
         }
       })

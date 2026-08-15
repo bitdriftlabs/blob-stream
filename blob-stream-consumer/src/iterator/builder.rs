@@ -11,6 +11,7 @@ use crate::config::{
   DEFAULT_MAX_CLOCK_SKEW,
   consumer_idle_poll_delay,
   consumer_lease_duration,
+  consumer_max_clock_skew,
   consumer_max_idle_poll_delay,
   consumer_prefetch_max_bytes,
   validate_runtime_config,
@@ -49,7 +50,7 @@ pub struct ConsumerIteratorBuilder<'a> {
   membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   coordination_source: Arc<dyn ConsumerCoordinationSource>,
   metrics_scope: Scope,
-  retention_days: u32,
+  retention: Duration,
   maximum_metadata_publication_lag: Duration,
   maximum_clock_skew: Duration,
   feature_flags: Option<FeatureFlagsWatch>,
@@ -67,7 +68,7 @@ impl<'a> ConsumerIteratorBuilder<'a> {
     membership_store: Arc<dyn ConsumerGroupMembershipStore>,
     coordination_source: Arc<dyn ConsumerCoordinationSource>,
     metrics_scope: Scope,
-    retention_days: u32,
+    retention: Duration,
     maximum_metadata_publication_lag: Duration,
     feature_flags: Option<FeatureFlagsWatch>,
   ) -> Self {
@@ -79,9 +80,12 @@ impl<'a> ConsumerIteratorBuilder<'a> {
       membership_store,
       coordination_source,
       metrics_scope,
-      retention_days,
+      retention,
       maximum_metadata_publication_lag,
-      maximum_clock_skew: DEFAULT_MAX_CLOCK_SKEW,
+      maximum_clock_skew: runtime
+        .read
+        .as_ref()
+        .map_or(DEFAULT_MAX_CLOCK_SKEW, consumer_max_clock_skew),
       feature_flags,
       time_provider: Arc::new(SystemTimeProvider),
       lifecycle_hooks: None,
@@ -119,7 +123,7 @@ impl ConsumerIteratorImpl {
     membership_store: Arc<dyn ConsumerGroupMembershipStore>,
     coordination_source: Arc<dyn ConsumerCoordinationSource>,
     metrics_scope: Scope,
-    retention_days: u32,
+    retention: Duration,
     maximum_metadata_publication_lag: Duration,
     feature_flags: Option<FeatureFlagsWatch>,
   ) -> Result<Self> {
@@ -131,7 +135,7 @@ impl ConsumerIteratorImpl {
       membership_store,
       coordination_source,
       metrics_scope,
-      retention_days,
+      retention,
       maximum_metadata_publication_lag,
       feature_flags,
     )
@@ -151,7 +155,7 @@ impl ConsumerIteratorBuilder<'_> {
       membership_store,
       coordination_source,
       metrics_scope,
-      retention_days,
+      retention,
       maximum_metadata_publication_lag,
       maximum_clock_skew,
       feature_flags,
@@ -160,8 +164,8 @@ impl ConsumerIteratorBuilder<'_> {
     } = self;
     validate_runtime_config(runtime)?;
     ensure!(
-      retention_days > 0,
-      "consumer retention recovery requires topic retention_days greater than zero"
+      retention.is_positive(),
+      "consumer retention recovery requires topic retention greater than zero"
     );
     let read_config = runtime
       .read
@@ -187,7 +191,7 @@ impl ConsumerIteratorBuilder<'_> {
       blob_store,
       metadata_store,
       &metrics_scope.scope("consumer"),
-      Duration::days(i64::from(retention_days)),
+      retention,
       maximum_metadata_publication_lag,
       feature_flags,
     )?

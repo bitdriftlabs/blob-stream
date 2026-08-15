@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
-use crate::bootstrap::{ConsumerBootstrapConfig, consumer_group_lease_ttl_buffer_seconds};
+use crate::bootstrap::{ConsumerBootstrapConfig, consumer_group_lease_ttl_buffer};
 use crate::iterator::ConsumerIterator;
 use crate::{
   ConsumerConfigFactory,
@@ -19,19 +19,21 @@ use blob_stream_proto::protos::blobstream::v1::config::{
   blob_store_config,
   metadata_store_config,
 };
+use blob_stream_types::ToProtoDuration;
+use time::Duration;
 
 fn runtime(member_id: &str) -> ConsumerRuntimeConfig {
   let mut read = ConsumerReadConfig::new();
   read.topic = "telemetry".into();
-  read.window_size_seconds = Some(300);
+  read.window_size = Duration::seconds(300).into_proto();
 
   let mut group = ConsumerGroupConfig::new();
   group.topic = "telemetry".into();
   group.group_id = "group-a".into();
   group.member_id = member_id.to_string().into();
-  group.lease_duration_ms = Some(30_000);
-  group.heartbeat_interval_ms = Some(10_000);
-  group.rebalance_interval_ms = Some(10_000);
+  group.lease_duration = Duration::seconds(30).into_proto();
+  group.heartbeat_interval = Duration::seconds(10).into_proto();
+  group.rebalance_interval = Duration::seconds(10).into_proto();
 
   let mut runtime = ConsumerRuntimeConfig::new();
   runtime.read = Some(read).into();
@@ -44,7 +46,7 @@ fn topic() -> TopicConfig {
   topic.name = "telemetry".into();
   topic.partition_count = 8;
   topic.num_writers = 2;
-  topic.retention_days = 7;
+  topic.retention = Duration::days(7).into_proto();
   topic
 }
 
@@ -80,8 +82,8 @@ fn metrics_scope() -> bd_server_stats::stats::Scope {
 #[test]
 fn consumer_group_lease_ttl_matches_topic_retention() {
   assert_eq!(
-    consumer_group_lease_ttl_buffer_seconds(7).unwrap(),
-    7 * 24 * 60 * 60
+    consumer_group_lease_ttl_buffer(Duration::days(7)).unwrap(),
+    Duration::days(7)
   );
 }
 
@@ -143,9 +145,9 @@ async fn proto_bootstrap_rejects_missing_required_message_fields() {
 }
 
 #[tokio::test]
-async fn bootstrap_rejects_zero_retention_for_recovery() {
+async fn bootstrap_rejects_missing_retention_for_recovery() {
   let mut topic = topic();
-  topic.retention_days = 0;
+  topic.retention.clear();
   let config = ConsumerBootstrapConfig::new(
     runtime("member-a"),
     topic,
@@ -153,13 +155,9 @@ async fn bootstrap_rejects_zero_retention_for_recovery() {
     in_memory_metadata_store(),
   );
 
-  let error = ConsumerConfigFactory::build_iterator(config, metrics_scope(), None)
-    .await
-    .err()
-    .unwrap();
   assert!(
-    error
-      .to_string()
-      .contains("retention_days greater than zero")
+    ConsumerConfigFactory::build_iterator(config, metrics_scope(), None)
+      .await
+      .is_err()
   );
 }

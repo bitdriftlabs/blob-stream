@@ -15,7 +15,7 @@ use crate::config::{
   ProducerRuntimeConfig,
   ProducerTopicConfig,
   into_discovery,
-  producer_flush_max_delay_ms,
+  producer_flush_max_delay,
   producer_max_batch_bytes,
   producer_max_batch_records,
   producer_max_request_concurrency,
@@ -313,7 +313,7 @@ impl ProducerClientImpl {
        max_batch_records={}, max_batch_bytes={}",
       writer_id,
       topic_map.len(),
-      producer_flush_max_delay_ms(&config),
+      producer_flush_max_delay(&config).whole_milliseconds(),
       producer_max_batch_records(&config),
       producer_max_batch_bytes(&config)
     );
@@ -366,7 +366,8 @@ impl ProducerClientImpl {
     tokio::spawn(async move {
       // Dispatches share this read-only receiver while the loop keeps its receiver for updates.
       let dispatch_membership_rx = membership_rx.clone();
-      let flush_delay = StdDuration::from_millis(producer_flush_max_delay_ms(&config));
+      let flush_delay = StdDuration::try_from(producer_flush_max_delay(&config))
+        .expect("producer config validation requires a positive flush max delay");
       let flush_sleep = tokio::time::sleep(flush_delay);
       tokio::pin!(flush_sleep);
       // Keep dispatches owned by the flush task so producer shutdown cancels queued permit waits,

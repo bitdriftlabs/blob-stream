@@ -24,7 +24,7 @@ fn topics() -> HashMap<protobuf::Chars, TopicInfo> {
       name: "telemetry".into(),
       partition_count: 100,
       num_writers: 1,
-      retention_days: 7,
+      retention: Duration::days(7),
       max_metadata_publication_lag: Duration::milliseconds(15_000),
     },
   )])

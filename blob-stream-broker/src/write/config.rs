@@ -34,6 +34,7 @@ use blob_stream_types::{
   Compression,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG,
   DEFAULT_METADATA_WINDOW_SIZE,
+  ProtoDurationExt,
   VirtualPartitionId,
 };
 use hostname::get as get_hostname;
@@ -108,8 +109,8 @@ impl WriteConfig {
       config.flush_max_bytes = u64::from(broker.flush_max_bytes);
     }
 
-    if broker.flush_max_delay_ms > 0 {
-      config.flush_max_delay = Duration::milliseconds(i64::from(broker.flush_max_delay_ms));
+    if let Some(flush_max_delay) = broker.flush_max_delay.as_ref() {
+      config.flush_max_delay = flush_max_delay.to_time_duration();
     }
 
     if let Some(sequence_reservation_size) = broker.sequence_reservation_size {
@@ -162,7 +163,7 @@ pub struct TopicInfo {
   pub name: Chars,
   pub partition_count: u32,
   pub num_writers: u32,
-  pub retention_days: u32,
+  pub retention: Duration,
   pub max_metadata_publication_lag: Duration,
 }
 
@@ -174,12 +175,15 @@ impl TopicInfo {
       name,
       partition_count: proto.partition_count,
       num_writers: proto.num_writers,
-      retention_days: proto.retention_days,
-      max_metadata_publication_lag: proto
-        .max_metadata_publication_lag_ms
-        .map(|milliseconds| i64::try_from(milliseconds).map(Duration::milliseconds))
-        .transpose()?
-        .unwrap_or(DEFAULT_MAX_METADATA_PUBLICATION_LAG),
+      retention: proto
+        .retention
+        .as_ref()
+        .ok_or_else(|| anyhow!("topic retention is required"))?
+        .to_time_duration(),
+      max_metadata_publication_lag: proto.max_metadata_publication_lag.as_ref().map_or(
+        DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+        ProtoDurationExt::to_time_duration,
+      ),
     })
   }
 
@@ -290,15 +294,14 @@ async fn build_producer_partition_lease_store(
     let shared = loader.load().await;
     let client = aws_sdk_dynamodb::Client::new(&shared);
     let ttl_buffer = dynamo
-      .lease_ttl_buffer_seconds
-      .map_or(DEFAULT_LEASE_TTL_BUFFER, |seconds| {
-        Duration::seconds(i64::from(seconds))
-      });
+      .lease_ttl_buffer
+      .as_ref()
+      .map_or(DEFAULT_LEASE_TTL_BUFFER, ProtoDurationExt::to_time_duration);
     let store: Arc<dyn ProducerPartitionLeaseStore> =
       Arc::new(DynamoProducerPartitionLeaseStore::new(
         client,
         table_name,
-        ttl_buffer_seconds(ttl_buffer),
+        ttl_buffer,
         Some(capacity_metrics),
       ));
     return Ok(store);
@@ -479,23 +482,22 @@ async fn build_metadata_store(
     let shared = loader.load().await;
     let client = aws_sdk_dynamodb::Client::new(&shared);
 
-    let retention_days_by_topic = topics
+    let retention_by_topic = topics
       .iter()
-      .map(|(topic, info)| (topic.clone(), info.retention_days))
+      .map(|(topic, info)| (topic.clone(), info.retention))
       .collect();
-    let ttl_buffer = dynamo
-      .segment_ttl_buffer_seconds
-      .map_or(DEFAULT_SEGMENT_TTL_BUFFER, |seconds| {
-        Duration::seconds(i64::from(seconds))
-      });
+    let ttl_buffer = dynamo.segment_ttl_buffer.as_ref().map_or(
+      DEFAULT_SEGMENT_TTL_BUFFER,
+      ProtoDurationExt::to_time_duration,
+    );
 
     let store: Arc<dyn MetadataStore> =
       Arc::new(blob_stream_metadata_store::DynamoMetadataStore::new(
         client,
         table_name,
         producer_partition_lease_table_name,
-        retention_days_by_topic,
-        ttl_buffer_seconds(ttl_buffer),
+        retention_by_topic,
+        ttl_buffer,
         Some(capacity_metrics),
       ));
     return Ok(store);
@@ -511,8 +513,4 @@ fn dynamo_table_name(config: &DynamoMetadataStoreConfig, purpose: DynamoTablePur
       config.producer_partition_lease_table_name.as_str()
     },
   }
-}
-
-fn ttl_buffer_seconds(ttl_buffer: Duration) -> u32 {
-  u32::try_from(ttl_buffer.whole_seconds()).unwrap_or(u32::MAX)
 }

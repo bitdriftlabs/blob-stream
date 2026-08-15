@@ -60,6 +60,7 @@ use blob_stream_types::{
   Compression,
   SeqRange,
   SnowflakeId,
+  ToProtoDuration,
   TopicWindowKey,
   VirtualPartitionId,
   Window,
@@ -1358,8 +1359,8 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      metadata_visibility_delay_ms: Some(0),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
+      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![ack.virtual_partition_id],
@@ -1411,7 +1412,7 @@ async fn fenced_metadata_write_fails_when_lease_is_invalidated_before_dynamo_tra
     .start()
     .await?;
   let mut config = producer_config();
-  config.retry_deadline_ms = Some(100);
+  config.retry_deadline = TimeDuration::milliseconds(100).into_proto();
   let producer = cluster
     .create_producer(config, vec![producer_topic()])
     .await?;
@@ -1596,8 +1597,8 @@ async fn broker_coalesces_same_partition_requests_into_one_consumer_batch() -> R
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      metadata_visibility_delay_ms: Some(0),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
+      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![virtual_partition_id],
@@ -1741,7 +1742,7 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("consumer read config missing"))?
-      .metadata_visibility_delay_ms = Some(0);
+      .strongly_consistent_metadata_reads = Some(true);
   }
 
   let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -1963,8 +1964,8 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      metadata_visibility_delay_ms: Some(0),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
+      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -2333,7 +2334,7 @@ async fn graceful_shutdown_final_checkpoint_commits_staged_record_before_release
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("shutdown final-commit read config missing"))?
-      .metadata_visibility_delay_ms = Some(0);
+      .strongly_consistent_metadata_reads = Some(true);
   }
   let group = runtime_a
     .group
@@ -2718,7 +2719,7 @@ async fn iterator_reuses_mature_recovery_metadata_across_prefetch_capacity_cycle
     .read
     .as_mut()
     .ok_or_else(|| anyhow!("recovery reader config missing"))?;
-  read.metadata_visibility_delay_ms = Some(0);
+  read.strongly_consistent_metadata_reads = Some(true);
   read.prefetch_max_bytes = Some(1);
   let runtime_group = runtime
     .group
@@ -2739,7 +2740,7 @@ async fn iterator_reuses_mature_recovery_metadata_across_prefetch_capacity_cycle
         Arc::clone(&membership_store),
       )),
       metrics_scope("blob_stream_consumer_it"),
-      1,
+      TimeDuration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
     )
@@ -2992,7 +2993,7 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
     .read
     .as_mut()
     .ok_or_else(|| anyhow!("recovery reader config missing"))?;
-  read.metadata_visibility_delay_ms = Some(0);
+  read.strongly_consistent_metadata_reads = Some(true);
   read.prefetch_max_bytes = Some(1);
   let runtime_group = runtime
     .group
@@ -3013,7 +3014,7 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
         Arc::clone(&membership_store),
       )),
       metrics_scope("blob_stream_consumer_it"),
-      1,
+      TimeDuration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
     )
@@ -3148,7 +3149,7 @@ async fn live_group_restart_recovers_retained_history_before_fast_path() -> Resu
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("retained-history read config missing"))?
-      .metadata_visibility_delay_ms = Some(0);
+      .strongly_consistent_metadata_reads = Some(true);
   }
   let group = runtime_a
     .group
@@ -3429,7 +3430,7 @@ async fn live_group_recovery_waits_for_historical_metadata_visibility_delay() ->
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("deferred-history read config missing"))?
-      .metadata_visibility_delay_ms = Some(1_000);
+      .metadata_visibility_delay = TimeDuration::milliseconds(1_000).into_proto();
   }
   let group = runtime_a
     .group
@@ -3760,7 +3761,7 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("{member_id} read config missing"))?
-      .metadata_visibility_delay_ms = Some(0);
+      .strongly_consistent_metadata_reads = Some(true);
   }
 
   let consumer_lease_store = resources.consumer_lease_store();
@@ -4130,7 +4131,7 @@ async fn active_broker_restart_continuity() -> Result<()> {
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("restart consumer read config missing"))?
-      .metadata_visibility_delay_ms = Some(0);
+      .strongly_consistent_metadata_reads = Some(true);
   }
   let (event_tx, mut event_rx) = mpsc::unbounded_channel();
   let (stop_tx_0, stop_rx_0) = watch::channel(false);
@@ -4408,7 +4409,7 @@ async fn graceful_broker_restart_waits_for_partition_drain_before_lease_release(
     .read
     .as_mut()
     .ok_or_else(|| anyhow!("restart drain consumer read config missing"))?
-    .metadata_visibility_delay_ms = Some(0);
+    .strongly_consistent_metadata_reads = Some(true);
   let group = runtime
     .group
     .as_ref()
@@ -4608,8 +4609,8 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      metadata_visibility_delay_ms: Some(0),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
+      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -4746,8 +4747,8 @@ async fn multi_topic_isolation() -> Result<()> {
   let mut topic_a_reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      metadata_visibility_delay_ms: Some(0),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
+      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -4763,8 +4764,8 @@ async fn multi_topic_isolation() -> Result<()> {
   let mut topic_b_reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: SECOND_TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      metadata_visibility_delay_ms: Some(0),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
+      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -4900,7 +4901,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
   let mut config = producer_config();
   config.max_batch_records = Some(8);
   config.max_batch_bytes = Some(4_096);
-  config.flush_max_delay_ms = Some(50);
+  config.flush_max_delay = TimeDuration::milliseconds(50).into_proto();
 
   let boundary_producer = Arc::new(
     new_producer(
@@ -4914,7 +4915,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
   let mut batching_config = producer_config();
   batching_config.max_batch_records = Some(8);
   batching_config.max_batch_bytes = Some(4_096);
-  batching_config.flush_max_delay_ms = Some(1_000);
+  batching_config.flush_max_delay = TimeDuration::milliseconds(1_000).into_proto();
   let batching_producer = Arc::new(
     new_producer(
       batching_config,
@@ -4928,7 +4929,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -5078,7 +5079,7 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -5390,7 +5391,7 @@ async fn graceful_shutdown_recovers_prefetched_undelivered_record() -> Result<()
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("prefetch-shutdown read config missing"))?;
-    read.metadata_visibility_delay_ms = Some(0);
+    read.strongly_consistent_metadata_reads = Some(true);
     read.prefetch_max_bytes = Some(1_024);
   }
   let group = runtime_a
@@ -5601,7 +5602,7 @@ async fn prefetch_rebalance_revocation_fences_buffered_record() -> Result<()> {
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("prefetch fence read config missing"))?;
-    read.metadata_visibility_delay_ms = Some(0);
+    read.strongly_consistent_metadata_reads = Some(true);
     read.prefetch_max_bytes = Some(1_024);
   }
   let group = runtime_a
@@ -6103,7 +6104,7 @@ async fn live_consumer_commit_race_is_fenced_and_redelivered() -> Result<()> {
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("commit-race consumer read config missing"))?
-      .metadata_visibility_delay_ms = Some(0);
+      .strongly_consistent_metadata_reads = Some(true);
   }
   let group = runtime_a
     .group
@@ -6316,7 +6317,7 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     virtual_partition_ids,
@@ -6463,7 +6464,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("lease-expiry consumer read config missing"))?
-      .metadata_visibility_delay_ms = Some(0);
+      .strongly_consistent_metadata_reads = Some(true);
   }
   let group = runtime_a
     .group
@@ -6686,7 +6687,7 @@ async fn consumer_crash_recovery_redelivers_only_uncommitted_record() -> Result<
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("crash recovery consumer read config missing"))?
-      .metadata_visibility_delay_ms = Some(0);
+      .strongly_consistent_metadata_reads = Some(true);
   }
 
   let committed_id = "crash-recovery-committed";
@@ -6871,12 +6872,12 @@ async fn consumer_restart_hands_active_window_visibility_deferral_to_fast() -> R
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("visibility recovery read config missing"))?
-      .metadata_visibility_delay_ms = Some(5_000);
+      .metadata_visibility_delay = TimeDuration::milliseconds(5_000).into_proto();
     runtime
       .group
       .as_mut()
       .ok_or_else(|| anyhow!("visibility recovery group config missing"))?
-      .lease_duration_ms = Some(20_000);
+      .lease_duration = TimeDuration::milliseconds(20_000).into_proto();
   }
   let group = owner_runtime
     .group

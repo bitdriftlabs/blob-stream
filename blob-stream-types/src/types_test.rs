@@ -55,17 +55,12 @@ fn window_key_formatting() {
 }
 
 #[test]
-fn window_alignment_retains_subsecond_precision() {
-  let window = Window::for_timestamp(
+#[should_panic(expected = "durable topic window keys require positive whole-second sizes")]
+fn window_rejects_subsecond_sizes() {
+  let _ = Window::for_timestamp(
     offset_datetime_from_unix_millis(1_700_000_000_375),
     Duration::milliseconds(250),
   );
-
-  assert_eq!(
-    window.start,
-    offset_datetime_from_unix_millis(1_700_000_000_250)
-  );
-  assert_eq!(window.size, Duration::milliseconds(250));
 }
 
 #[test]

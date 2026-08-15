@@ -5,7 +5,7 @@ use blob_stream_proto::protos::blobstream::v1::config::{
   SegmentCompression,
   TopicConfig,
 };
-use blob_stream_types::{CompressionCodec, DEFAULT_MAX_METADATA_PUBLICATION_LAG};
+use blob_stream_types::{CompressionCodec, DEFAULT_MAX_METADATA_PUBLICATION_LAG, ToProtoDuration};
 use std::collections::HashMap;
 use time::Duration;
 
@@ -59,7 +59,9 @@ fn defaults_segment_compression_to_zstd() {
 
 #[test]
 fn topic_defaults_metadata_publication_lag_to_fifteen_seconds() {
-  let topic = TopicInfo::from_proto(&TopicConfig::new()).unwrap();
+  let mut topic_config = TopicConfig::new();
+  topic_config.retention = Duration::days(1).into_proto();
+  let topic = TopicInfo::from_proto(&topic_config).unwrap();
 
   assert_eq!(
     topic.max_metadata_publication_lag,
@@ -149,7 +151,7 @@ fn rejects_writer_id_outside_a_topic_range() {
       name: "telemetry".into(),
       partition_count: 2,
       num_writers: 1,
-      retention_days: 7,
+      retention: Duration::days(7),
       max_metadata_publication_lag: Duration::seconds(30),
     },
   )]);

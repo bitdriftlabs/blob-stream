@@ -6,8 +6,8 @@ use super::{BrokerTransport, ProducerAck, ProducerError, ProducerRetryDiagnostic
 use crate::config::{
   ProducerConfig,
   ProducerTopicConfig,
-  producer_request_timeout_ms,
-  producer_retry_deadline_ms,
+  producer_request_timeout,
+  producer_retry_deadline,
 };
 use anyhow::anyhow;
 use bd_log_util::warn_every;
@@ -94,11 +94,12 @@ async fn send_grouped_batches_and_notify(
     batches: group.batches.iter().map(produce_batch_request).collect(),
     ..Default::default()
   };
-  let request_timeout = Duration::from_millis(
-    u64::try_from(producer_request_timeout_ms(config))
-      .expect("producer config validation requires a positive request timeout"),
-  )
-  .min(Duration::from_millis(producer_retry_deadline_ms(config)));
+  let request_timeout = Duration::try_from(producer_request_timeout(config))
+    .expect("producer config validation requires a positive request timeout")
+    .min(
+      Duration::try_from(producer_retry_deadline(config))
+        .expect("producer config validation requires a positive retry deadline"),
+    );
   let response = {
     let Ok(_permit) = dispatch_permits.clone().acquire_owned().await else {
       let result = Err(ProducerError::Shutdown);

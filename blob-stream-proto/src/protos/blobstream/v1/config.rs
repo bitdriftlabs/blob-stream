@@ -31,8 +31,8 @@ pub struct BrokerConfig {
     // message fields
     // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.flush_max_bytes)
     pub flush_max_bytes: u32,
-    // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.flush_max_delay_ms)
-    pub flush_max_delay_ms: u32,
+    // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.flush_max_delay)
+    pub flush_max_delay: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.bind_addr)
     pub bind_addr: ::protobuf::Chars,
     // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.node_identity)
@@ -73,10 +73,10 @@ impl BrokerConfig {
             |m: &BrokerConfig| { &m.flush_max_bytes },
             |m: &mut BrokerConfig| { &mut m.flush_max_bytes },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "flush_max_delay_ms",
-            |m: &BrokerConfig| { &m.flush_max_delay_ms },
-            |m: &mut BrokerConfig| { &mut m.flush_max_delay_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "flush_max_delay",
+            |m: &BrokerConfig| { &m.flush_max_delay },
+            |m: &mut BrokerConfig| { &mut m.flush_max_delay },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "bind_addr",
@@ -139,8 +139,8 @@ impl ::protobuf::Message for BrokerConfig {
                 8 => {
                     self.flush_max_bytes = is.read_uint32()?;
                 },
-                16 => {
-                    self.flush_max_delay_ms = is.read_uint32()?;
+                18 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.flush_max_delay)?;
                 },
                 26 => {
                     self.bind_addr = is.read_tokio_chars()?;
@@ -181,8 +181,9 @@ impl ::protobuf::Message for BrokerConfig {
         if self.flush_max_bytes != 0 {
             my_size += ::protobuf::rt::uint32_size(1, self.flush_max_bytes);
         }
-        if self.flush_max_delay_ms != 0 {
-            my_size += ::protobuf::rt::uint32_size(2, self.flush_max_delay_ms);
+        if let Some(v) = self.flush_max_delay.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
         if !self.bind_addr.is_empty() {
             my_size += ::protobuf::rt::string_size(3, &self.bind_addr);
@@ -220,8 +221,8 @@ impl ::protobuf::Message for BrokerConfig {
         if self.flush_max_bytes != 0 {
             os.write_uint32(1, self.flush_max_bytes)?;
         }
-        if self.flush_max_delay_ms != 0 {
-            os.write_uint32(2, self.flush_max_delay_ms)?;
+        if let Some(v) = self.flush_max_delay.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
         }
         if !self.bind_addr.is_empty() {
             os.write_string(3, &self.bind_addr)?;
@@ -265,7 +266,7 @@ impl ::protobuf::Message for BrokerConfig {
 
     fn clear(&mut self) {
         self.flush_max_bytes = 0;
-        self.flush_max_delay_ms = 0;
+        self.flush_max_delay.clear();
         self.bind_addr.clear();
         self.node_identity.clear();
         self.discovery.clear();
@@ -280,7 +281,7 @@ impl ::protobuf::Message for BrokerConfig {
     fn default_instance() -> &'static BrokerConfig {
         static instance: BrokerConfig = BrokerConfig {
             flush_max_bytes: 0,
-            flush_max_delay_ms: 0,
+            flush_max_delay: ::protobuf::MessageField::none(),
             bind_addr: ::protobuf::Chars::new(),
             node_identity: ::protobuf::MessageField::none(),
             discovery: ::protobuf::MessageField::none(),
@@ -1522,10 +1523,10 @@ pub struct TopicConfig {
     pub partition_count: u32,
     // @@protoc_insertion_point(field:blobstream.v1.TopicConfig.num_writers)
     pub num_writers: u32,
-    // @@protoc_insertion_point(field:blobstream.v1.TopicConfig.retention_days)
-    pub retention_days: u32,
-    // @@protoc_insertion_point(field:blobstream.v1.TopicConfig.max_metadata_publication_lag_ms)
-    pub max_metadata_publication_lag_ms: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.TopicConfig.retention)
+    pub retention: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.TopicConfig.max_metadata_publication_lag)
+    pub max_metadata_publication_lag: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.TopicConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -1560,15 +1561,15 @@ impl TopicConfig {
             |m: &TopicConfig| { &m.num_writers },
             |m: &mut TopicConfig| { &mut m.num_writers },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "retention_days",
-            |m: &TopicConfig| { &m.retention_days },
-            |m: &mut TopicConfig| { &mut m.retention_days },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "retention",
+            |m: &TopicConfig| { &m.retention },
+            |m: &mut TopicConfig| { &mut m.retention },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "max_metadata_publication_lag_ms",
-            |m: &TopicConfig| { &m.max_metadata_publication_lag_ms },
-            |m: &mut TopicConfig| { &mut m.max_metadata_publication_lag_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "max_metadata_publication_lag",
+            |m: &TopicConfig| { &m.max_metadata_publication_lag },
+            |m: &mut TopicConfig| { &mut m.max_metadata_publication_lag },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<TopicConfig>(
             "TopicConfig",
@@ -1597,11 +1598,11 @@ impl ::protobuf::Message for TopicConfig {
                 24 => {
                     self.num_writers = is.read_uint32()?;
                 },
-                32 => {
-                    self.retention_days = is.read_uint32()?;
+                34 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.retention)?;
                 },
-                40 => {
-                    self.max_metadata_publication_lag_ms = ::std::option::Option::Some(is.read_uint64()?);
+                42 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.max_metadata_publication_lag)?;
                 },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
@@ -1624,11 +1625,13 @@ impl ::protobuf::Message for TopicConfig {
         if self.num_writers != 0 {
             my_size += ::protobuf::rt::uint32_size(3, self.num_writers);
         }
-        if self.retention_days != 0 {
-            my_size += ::protobuf::rt::uint32_size(4, self.retention_days);
+        if let Some(v) = self.retention.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
-        if let Some(v) = self.max_metadata_publication_lag_ms {
-            my_size += ::protobuf::rt::uint64_size(5, v);
+        if let Some(v) = self.max_metadata_publication_lag.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
@@ -1645,11 +1648,11 @@ impl ::protobuf::Message for TopicConfig {
         if self.num_writers != 0 {
             os.write_uint32(3, self.num_writers)?;
         }
-        if self.retention_days != 0 {
-            os.write_uint32(4, self.retention_days)?;
+        if let Some(v) = self.retention.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(4, v, os)?;
         }
-        if let Some(v) = self.max_metadata_publication_lag_ms {
-            os.write_uint64(5, v)?;
+        if let Some(v) = self.max_metadata_publication_lag.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(5, v, os)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -1671,8 +1674,8 @@ impl ::protobuf::Message for TopicConfig {
         self.name.clear();
         self.partition_count = 0;
         self.num_writers = 0;
-        self.retention_days = 0;
-        self.max_metadata_publication_lag_ms = ::std::option::Option::None;
+        self.retention.clear();
+        self.max_metadata_publication_lag.clear();
         self.special_fields.clear();
     }
 
@@ -1681,8 +1684,8 @@ impl ::protobuf::Message for TopicConfig {
             name: ::protobuf::Chars::new(),
             partition_count: 0,
             num_writers: 0,
-            retention_days: 0,
-            max_metadata_publication_lag_ms: ::std::option::Option::None,
+            retention: ::protobuf::MessageField::none(),
+            max_metadata_publication_lag: ::protobuf::MessageField::none(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -2382,10 +2385,10 @@ pub struct DynamoMetadataStoreConfig {
     pub consumer_group_lease_table_name: ::protobuf::Chars,
     // @@protoc_insertion_point(field:blobstream.v1.DynamoMetadataStoreConfig.consumer_group_membership_table_name)
     pub consumer_group_membership_table_name: ::protobuf::Chars,
-    // @@protoc_insertion_point(field:blobstream.v1.DynamoMetadataStoreConfig.segment_ttl_buffer_seconds)
-    pub segment_ttl_buffer_seconds: ::std::option::Option<u32>,
-    // @@protoc_insertion_point(field:blobstream.v1.DynamoMetadataStoreConfig.lease_ttl_buffer_seconds)
-    pub lease_ttl_buffer_seconds: ::std::option::Option<u32>,
+    // @@protoc_insertion_point(field:blobstream.v1.DynamoMetadataStoreConfig.segment_ttl_buffer)
+    pub segment_ttl_buffer: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.DynamoMetadataStoreConfig.lease_ttl_buffer)
+    pub lease_ttl_buffer: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.DynamoMetadataStoreConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -2435,15 +2438,15 @@ impl DynamoMetadataStoreConfig {
             |m: &DynamoMetadataStoreConfig| { &m.consumer_group_membership_table_name },
             |m: &mut DynamoMetadataStoreConfig| { &mut m.consumer_group_membership_table_name },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "segment_ttl_buffer_seconds",
-            |m: &DynamoMetadataStoreConfig| { &m.segment_ttl_buffer_seconds },
-            |m: &mut DynamoMetadataStoreConfig| { &mut m.segment_ttl_buffer_seconds },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "segment_ttl_buffer",
+            |m: &DynamoMetadataStoreConfig| { &m.segment_ttl_buffer },
+            |m: &mut DynamoMetadataStoreConfig| { &mut m.segment_ttl_buffer },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "lease_ttl_buffer_seconds",
-            |m: &DynamoMetadataStoreConfig| { &m.lease_ttl_buffer_seconds },
-            |m: &mut DynamoMetadataStoreConfig| { &mut m.lease_ttl_buffer_seconds },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "lease_ttl_buffer",
+            |m: &DynamoMetadataStoreConfig| { &m.lease_ttl_buffer },
+            |m: &mut DynamoMetadataStoreConfig| { &mut m.lease_ttl_buffer },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<DynamoMetadataStoreConfig>(
             "DynamoMetadataStoreConfig",
@@ -2481,11 +2484,11 @@ impl ::protobuf::Message for DynamoMetadataStoreConfig {
                 50 => {
                     self.consumer_group_membership_table_name = is.read_tokio_chars()?;
                 },
-                56 => {
-                    self.segment_ttl_buffer_seconds = ::std::option::Option::Some(is.read_uint32()?);
+                58 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.segment_ttl_buffer)?;
                 },
-                64 => {
-                    self.lease_ttl_buffer_seconds = ::std::option::Option::Some(is.read_uint32()?);
+                66 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.lease_ttl_buffer)?;
                 },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
@@ -2517,11 +2520,13 @@ impl ::protobuf::Message for DynamoMetadataStoreConfig {
         if !self.consumer_group_membership_table_name.is_empty() {
             my_size += ::protobuf::rt::string_size(6, &self.consumer_group_membership_table_name);
         }
-        if let Some(v) = self.segment_ttl_buffer_seconds {
-            my_size += ::protobuf::rt::uint32_size(7, v);
+        if let Some(v) = self.segment_ttl_buffer.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
-        if let Some(v) = self.lease_ttl_buffer_seconds {
-            my_size += ::protobuf::rt::uint32_size(8, v);
+        if let Some(v) = self.lease_ttl_buffer.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
@@ -2547,11 +2552,11 @@ impl ::protobuf::Message for DynamoMetadataStoreConfig {
         if !self.consumer_group_membership_table_name.is_empty() {
             os.write_string(6, &self.consumer_group_membership_table_name)?;
         }
-        if let Some(v) = self.segment_ttl_buffer_seconds {
-            os.write_uint32(7, v)?;
+        if let Some(v) = self.segment_ttl_buffer.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(7, v, os)?;
         }
-        if let Some(v) = self.lease_ttl_buffer_seconds {
-            os.write_uint32(8, v)?;
+        if let Some(v) = self.lease_ttl_buffer.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(8, v, os)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -2576,8 +2581,8 @@ impl ::protobuf::Message for DynamoMetadataStoreConfig {
         self.producer_partition_lease_table_name.clear();
         self.consumer_group_lease_table_name.clear();
         self.consumer_group_membership_table_name.clear();
-        self.segment_ttl_buffer_seconds = ::std::option::Option::None;
-        self.lease_ttl_buffer_seconds = ::std::option::Option::None;
+        self.segment_ttl_buffer.clear();
+        self.lease_ttl_buffer.clear();
         self.special_fields.clear();
     }
 
@@ -2589,8 +2594,8 @@ impl ::protobuf::Message for DynamoMetadataStoreConfig {
             producer_partition_lease_table_name: ::protobuf::Chars::new(),
             consumer_group_lease_table_name: ::protobuf::Chars::new(),
             consumer_group_membership_table_name: ::protobuf::Chars::new(),
-            segment_ttl_buffer_seconds: ::std::option::Option::None,
-            lease_ttl_buffer_seconds: ::std::option::Option::None,
+            segment_ttl_buffer: ::protobuf::MessageField::none(),
+            lease_ttl_buffer: ::protobuf::MessageField::none(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -3082,22 +3087,22 @@ pub struct ProducerConfig {
     pub max_batch_records: ::std::option::Option<u32>,
     // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.max_batch_bytes)
     pub max_batch_bytes: ::std::option::Option<u32>,
-    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.flush_max_delay_ms)
-    pub flush_max_delay_ms: ::std::option::Option<u64>,
-    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.retry_base_delay_ms)
-    pub retry_base_delay_ms: ::std::option::Option<u64>,
-    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.retry_max_delay_ms)
-    pub retry_max_delay_ms: ::std::option::Option<u64>,
-    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.connect_timeout_ms)
-    pub connect_timeout_ms: ::std::option::Option<i64>,
-    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.request_timeout_ms)
-    pub request_timeout_ms: ::std::option::Option<i64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.flush_max_delay)
+    pub flush_max_delay: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.retry_base_delay)
+    pub retry_base_delay: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.retry_max_delay)
+    pub retry_max_delay: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.connect_timeout)
+    pub connect_timeout: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.request_timeout)
+    pub request_timeout: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.max_request_concurrency)
     pub max_request_concurrency: ::std::option::Option<u64>,
     // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.compression)
     pub compression: ::std::option::Option<::protobuf::EnumOrUnknown<ProducerCompression>>,
-    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.retry_deadline_ms)
-    pub retry_deadline_ms: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ProducerConfig.retry_deadline)
+    pub retry_deadline: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.ProducerConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -3132,30 +3137,30 @@ impl ProducerConfig {
             |m: &ProducerConfig| { &m.max_batch_bytes },
             |m: &mut ProducerConfig| { &mut m.max_batch_bytes },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "flush_max_delay_ms",
-            |m: &ProducerConfig| { &m.flush_max_delay_ms },
-            |m: &mut ProducerConfig| { &mut m.flush_max_delay_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "flush_max_delay",
+            |m: &ProducerConfig| { &m.flush_max_delay },
+            |m: &mut ProducerConfig| { &mut m.flush_max_delay },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "retry_base_delay_ms",
-            |m: &ProducerConfig| { &m.retry_base_delay_ms },
-            |m: &mut ProducerConfig| { &mut m.retry_base_delay_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "retry_base_delay",
+            |m: &ProducerConfig| { &m.retry_base_delay },
+            |m: &mut ProducerConfig| { &mut m.retry_base_delay },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "retry_max_delay_ms",
-            |m: &ProducerConfig| { &m.retry_max_delay_ms },
-            |m: &mut ProducerConfig| { &mut m.retry_max_delay_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "retry_max_delay",
+            |m: &ProducerConfig| { &m.retry_max_delay },
+            |m: &mut ProducerConfig| { &mut m.retry_max_delay },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "connect_timeout_ms",
-            |m: &ProducerConfig| { &m.connect_timeout_ms },
-            |m: &mut ProducerConfig| { &mut m.connect_timeout_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "connect_timeout",
+            |m: &ProducerConfig| { &m.connect_timeout },
+            |m: &mut ProducerConfig| { &mut m.connect_timeout },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "request_timeout_ms",
-            |m: &ProducerConfig| { &m.request_timeout_ms },
-            |m: &mut ProducerConfig| { &mut m.request_timeout_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "request_timeout",
+            |m: &ProducerConfig| { &m.request_timeout },
+            |m: &mut ProducerConfig| { &mut m.request_timeout },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
             "max_request_concurrency",
@@ -3167,10 +3172,10 @@ impl ProducerConfig {
             |m: &ProducerConfig| { &m.compression },
             |m: &mut ProducerConfig| { &mut m.compression },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "retry_deadline_ms",
-            |m: &ProducerConfig| { &m.retry_deadline_ms },
-            |m: &mut ProducerConfig| { &mut m.retry_deadline_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "retry_deadline",
+            |m: &ProducerConfig| { &m.retry_deadline },
+            |m: &mut ProducerConfig| { &mut m.retry_deadline },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ProducerConfig>(
             "ProducerConfig",
@@ -3199,20 +3204,20 @@ impl ::protobuf::Message for ProducerConfig {
                 24 => {
                     self.max_batch_bytes = ::std::option::Option::Some(is.read_uint32()?);
                 },
-                32 => {
-                    self.flush_max_delay_ms = ::std::option::Option::Some(is.read_uint64()?);
+                34 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.flush_max_delay)?;
                 },
-                48 => {
-                    self.retry_base_delay_ms = ::std::option::Option::Some(is.read_uint64()?);
+                50 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.retry_base_delay)?;
                 },
-                56 => {
-                    self.retry_max_delay_ms = ::std::option::Option::Some(is.read_uint64()?);
+                58 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.retry_max_delay)?;
                 },
-                64 => {
-                    self.connect_timeout_ms = ::std::option::Option::Some(is.read_int64()?);
+                66 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.connect_timeout)?;
                 },
-                72 => {
-                    self.request_timeout_ms = ::std::option::Option::Some(is.read_int64()?);
+                74 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.request_timeout)?;
                 },
                 80 => {
                     self.max_request_concurrency = ::std::option::Option::Some(is.read_uint64()?);
@@ -3220,8 +3225,8 @@ impl ::protobuf::Message for ProducerConfig {
                 88 => {
                     self.compression = ::std::option::Option::Some(is.read_enum_or_unknown()?);
                 },
-                96 => {
-                    self.retry_deadline_ms = ::std::option::Option::Some(is.read_uint64()?);
+                98 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.retry_deadline)?;
                 },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
@@ -3244,20 +3249,25 @@ impl ::protobuf::Message for ProducerConfig {
         if let Some(v) = self.max_batch_bytes {
             my_size += ::protobuf::rt::uint32_size(3, v);
         }
-        if let Some(v) = self.flush_max_delay_ms {
-            my_size += ::protobuf::rt::uint64_size(4, v);
+        if let Some(v) = self.flush_max_delay.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
-        if let Some(v) = self.retry_base_delay_ms {
-            my_size += ::protobuf::rt::uint64_size(6, v);
+        if let Some(v) = self.retry_base_delay.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
-        if let Some(v) = self.retry_max_delay_ms {
-            my_size += ::protobuf::rt::uint64_size(7, v);
+        if let Some(v) = self.retry_max_delay.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
-        if let Some(v) = self.connect_timeout_ms {
-            my_size += ::protobuf::rt::int64_size(8, v);
+        if let Some(v) = self.connect_timeout.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
-        if let Some(v) = self.request_timeout_ms {
-            my_size += ::protobuf::rt::int64_size(9, v);
+        if let Some(v) = self.request_timeout.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
         if let Some(v) = self.max_request_concurrency {
             my_size += ::protobuf::rt::uint64_size(10, v);
@@ -3265,8 +3275,9 @@ impl ::protobuf::Message for ProducerConfig {
         if let Some(v) = self.compression {
             my_size += ::protobuf::rt::int32_size(11, v.value());
         }
-        if let Some(v) = self.retry_deadline_ms {
-            my_size += ::protobuf::rt::uint64_size(12, v);
+        if let Some(v) = self.retry_deadline.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
@@ -3283,20 +3294,20 @@ impl ::protobuf::Message for ProducerConfig {
         if let Some(v) = self.max_batch_bytes {
             os.write_uint32(3, v)?;
         }
-        if let Some(v) = self.flush_max_delay_ms {
-            os.write_uint64(4, v)?;
+        if let Some(v) = self.flush_max_delay.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(4, v, os)?;
         }
-        if let Some(v) = self.retry_base_delay_ms {
-            os.write_uint64(6, v)?;
+        if let Some(v) = self.retry_base_delay.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(6, v, os)?;
         }
-        if let Some(v) = self.retry_max_delay_ms {
-            os.write_uint64(7, v)?;
+        if let Some(v) = self.retry_max_delay.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(7, v, os)?;
         }
-        if let Some(v) = self.connect_timeout_ms {
-            os.write_int64(8, v)?;
+        if let Some(v) = self.connect_timeout.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(8, v, os)?;
         }
-        if let Some(v) = self.request_timeout_ms {
-            os.write_int64(9, v)?;
+        if let Some(v) = self.request_timeout.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(9, v, os)?;
         }
         if let Some(v) = self.max_request_concurrency {
             os.write_uint64(10, v)?;
@@ -3304,8 +3315,8 @@ impl ::protobuf::Message for ProducerConfig {
         if let Some(v) = self.compression {
             os.write_enum(11, ::protobuf::EnumOrUnknown::value(&v))?;
         }
-        if let Some(v) = self.retry_deadline_ms {
-            os.write_uint64(12, v)?;
+        if let Some(v) = self.retry_deadline.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(12, v, os)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -3327,14 +3338,14 @@ impl ::protobuf::Message for ProducerConfig {
         self.writer_id = ::std::option::Option::None;
         self.max_batch_records = ::std::option::Option::None;
         self.max_batch_bytes = ::std::option::Option::None;
-        self.flush_max_delay_ms = ::std::option::Option::None;
-        self.retry_base_delay_ms = ::std::option::Option::None;
-        self.retry_max_delay_ms = ::std::option::Option::None;
-        self.connect_timeout_ms = ::std::option::Option::None;
-        self.request_timeout_ms = ::std::option::Option::None;
+        self.flush_max_delay.clear();
+        self.retry_base_delay.clear();
+        self.retry_max_delay.clear();
+        self.connect_timeout.clear();
+        self.request_timeout.clear();
         self.max_request_concurrency = ::std::option::Option::None;
         self.compression = ::std::option::Option::None;
-        self.retry_deadline_ms = ::std::option::Option::None;
+        self.retry_deadline.clear();
         self.special_fields.clear();
     }
 
@@ -3343,14 +3354,14 @@ impl ::protobuf::Message for ProducerConfig {
             writer_id: ::std::option::Option::None,
             max_batch_records: ::std::option::Option::None,
             max_batch_bytes: ::std::option::Option::None,
-            flush_max_delay_ms: ::std::option::Option::None,
-            retry_base_delay_ms: ::std::option::Option::None,
-            retry_max_delay_ms: ::std::option::Option::None,
-            connect_timeout_ms: ::std::option::Option::None,
-            request_timeout_ms: ::std::option::Option::None,
+            flush_max_delay: ::protobuf::MessageField::none(),
+            retry_base_delay: ::protobuf::MessageField::none(),
+            retry_max_delay: ::protobuf::MessageField::none(),
+            connect_timeout: ::protobuf::MessageField::none(),
+            request_timeout: ::protobuf::MessageField::none(),
             max_request_concurrency: ::std::option::Option::None,
             compression: ::std::option::Option::None,
-            retry_deadline_ms: ::std::option::Option::None,
+            retry_deadline: ::protobuf::MessageField::none(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -3541,22 +3552,22 @@ pub struct ConsumerReadConfig {
     // message fields
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.topic)
     pub topic: ::protobuf::Chars,
-    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.window_size_seconds)
-    pub window_size_seconds: ::std::option::Option<i64>,
-    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.idle_poll_delay_ms)
-    pub idle_poll_delay_ms: ::std::option::Option<u64>,
-    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.max_idle_poll_delay_ms)
-    pub max_idle_poll_delay_ms: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.window_size)
+    pub window_size: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.idle_poll_delay)
+    pub idle_poll_delay: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.max_idle_poll_delay)
+    pub max_idle_poll_delay: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.prefetch_max_bytes)
     pub prefetch_max_bytes: ::std::option::Option<u64>,
-    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.metadata_visibility_delay_ms)
-    pub metadata_visibility_delay_ms: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.metadata_visibility_delay)
+    pub metadata_visibility_delay: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.max_in_flight_batch_reads)
     pub max_in_flight_batch_reads: ::std::option::Option<u64>,
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.strongly_consistent_metadata_reads)
     pub strongly_consistent_metadata_reads: ::std::option::Option<bool>,
-    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.max_clock_skew_ms)
-    pub max_clock_skew_ms: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.max_clock_skew)
+    pub max_clock_skew: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.ConsumerReadConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -3581,30 +3592,30 @@ impl ConsumerReadConfig {
             |m: &ConsumerReadConfig| { &m.topic },
             |m: &mut ConsumerReadConfig| { &mut m.topic },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "window_size_seconds",
-            |m: &ConsumerReadConfig| { &m.window_size_seconds },
-            |m: &mut ConsumerReadConfig| { &mut m.window_size_seconds },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "window_size",
+            |m: &ConsumerReadConfig| { &m.window_size },
+            |m: &mut ConsumerReadConfig| { &mut m.window_size },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "idle_poll_delay_ms",
-            |m: &ConsumerReadConfig| { &m.idle_poll_delay_ms },
-            |m: &mut ConsumerReadConfig| { &mut m.idle_poll_delay_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "idle_poll_delay",
+            |m: &ConsumerReadConfig| { &m.idle_poll_delay },
+            |m: &mut ConsumerReadConfig| { &mut m.idle_poll_delay },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "max_idle_poll_delay_ms",
-            |m: &ConsumerReadConfig| { &m.max_idle_poll_delay_ms },
-            |m: &mut ConsumerReadConfig| { &mut m.max_idle_poll_delay_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "max_idle_poll_delay",
+            |m: &ConsumerReadConfig| { &m.max_idle_poll_delay },
+            |m: &mut ConsumerReadConfig| { &mut m.max_idle_poll_delay },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
             "prefetch_max_bytes",
             |m: &ConsumerReadConfig| { &m.prefetch_max_bytes },
             |m: &mut ConsumerReadConfig| { &mut m.prefetch_max_bytes },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "metadata_visibility_delay_ms",
-            |m: &ConsumerReadConfig| { &m.metadata_visibility_delay_ms },
-            |m: &mut ConsumerReadConfig| { &mut m.metadata_visibility_delay_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "metadata_visibility_delay",
+            |m: &ConsumerReadConfig| { &m.metadata_visibility_delay },
+            |m: &mut ConsumerReadConfig| { &mut m.metadata_visibility_delay },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
             "max_in_flight_batch_reads",
@@ -3616,10 +3627,10 @@ impl ConsumerReadConfig {
             |m: &ConsumerReadConfig| { &m.strongly_consistent_metadata_reads },
             |m: &mut ConsumerReadConfig| { &mut m.strongly_consistent_metadata_reads },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "max_clock_skew_ms",
-            |m: &ConsumerReadConfig| { &m.max_clock_skew_ms },
-            |m: &mut ConsumerReadConfig| { &mut m.max_clock_skew_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "max_clock_skew",
+            |m: &ConsumerReadConfig| { &m.max_clock_skew },
+            |m: &mut ConsumerReadConfig| { &mut m.max_clock_skew },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ConsumerReadConfig>(
             "ConsumerReadConfig",
@@ -3642,20 +3653,20 @@ impl ::protobuf::Message for ConsumerReadConfig {
                 10 => {
                     self.topic = is.read_tokio_chars()?;
                 },
-                16 => {
-                    self.window_size_seconds = ::std::option::Option::Some(is.read_int64()?);
+                18 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.window_size)?;
                 },
-                32 => {
-                    self.idle_poll_delay_ms = ::std::option::Option::Some(is.read_uint64()?);
+                34 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.idle_poll_delay)?;
                 },
-                40 => {
-                    self.max_idle_poll_delay_ms = ::std::option::Option::Some(is.read_uint64()?);
+                42 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.max_idle_poll_delay)?;
                 },
                 48 => {
                     self.prefetch_max_bytes = ::std::option::Option::Some(is.read_uint64()?);
                 },
-                72 => {
-                    self.metadata_visibility_delay_ms = ::std::option::Option::Some(is.read_uint64()?);
+                74 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.metadata_visibility_delay)?;
                 },
                 80 => {
                     self.max_in_flight_batch_reads = ::std::option::Option::Some(is.read_uint64()?);
@@ -3663,8 +3674,8 @@ impl ::protobuf::Message for ConsumerReadConfig {
                 88 => {
                     self.strongly_consistent_metadata_reads = ::std::option::Option::Some(is.read_bool()?);
                 },
-                96 => {
-                    self.max_clock_skew_ms = ::std::option::Option::Some(is.read_uint64()?);
+                98 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.max_clock_skew)?;
                 },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
@@ -3681,20 +3692,24 @@ impl ::protobuf::Message for ConsumerReadConfig {
         if !self.topic.is_empty() {
             my_size += ::protobuf::rt::string_size(1, &self.topic);
         }
-        if let Some(v) = self.window_size_seconds {
-            my_size += ::protobuf::rt::int64_size(2, v);
+        if let Some(v) = self.window_size.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
-        if let Some(v) = self.idle_poll_delay_ms {
-            my_size += ::protobuf::rt::uint64_size(4, v);
+        if let Some(v) = self.idle_poll_delay.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
-        if let Some(v) = self.max_idle_poll_delay_ms {
-            my_size += ::protobuf::rt::uint64_size(5, v);
+        if let Some(v) = self.max_idle_poll_delay.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
         if let Some(v) = self.prefetch_max_bytes {
             my_size += ::protobuf::rt::uint64_size(6, v);
         }
-        if let Some(v) = self.metadata_visibility_delay_ms {
-            my_size += ::protobuf::rt::uint64_size(9, v);
+        if let Some(v) = self.metadata_visibility_delay.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
         if let Some(v) = self.max_in_flight_batch_reads {
             my_size += ::protobuf::rt::uint64_size(10, v);
@@ -3702,8 +3717,9 @@ impl ::protobuf::Message for ConsumerReadConfig {
         if let Some(v) = self.strongly_consistent_metadata_reads {
             my_size += 1 + 1;
         }
-        if let Some(v) = self.max_clock_skew_ms {
-            my_size += ::protobuf::rt::uint64_size(12, v);
+        if let Some(v) = self.max_clock_skew.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
@@ -3714,20 +3730,20 @@ impl ::protobuf::Message for ConsumerReadConfig {
         if !self.topic.is_empty() {
             os.write_string(1, &self.topic)?;
         }
-        if let Some(v) = self.window_size_seconds {
-            os.write_int64(2, v)?;
+        if let Some(v) = self.window_size.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
         }
-        if let Some(v) = self.idle_poll_delay_ms {
-            os.write_uint64(4, v)?;
+        if let Some(v) = self.idle_poll_delay.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(4, v, os)?;
         }
-        if let Some(v) = self.max_idle_poll_delay_ms {
-            os.write_uint64(5, v)?;
+        if let Some(v) = self.max_idle_poll_delay.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(5, v, os)?;
         }
         if let Some(v) = self.prefetch_max_bytes {
             os.write_uint64(6, v)?;
         }
-        if let Some(v) = self.metadata_visibility_delay_ms {
-            os.write_uint64(9, v)?;
+        if let Some(v) = self.metadata_visibility_delay.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(9, v, os)?;
         }
         if let Some(v) = self.max_in_flight_batch_reads {
             os.write_uint64(10, v)?;
@@ -3735,8 +3751,8 @@ impl ::protobuf::Message for ConsumerReadConfig {
         if let Some(v) = self.strongly_consistent_metadata_reads {
             os.write_bool(11, v)?;
         }
-        if let Some(v) = self.max_clock_skew_ms {
-            os.write_uint64(12, v)?;
+        if let Some(v) = self.max_clock_skew.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(12, v, os)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -3756,28 +3772,28 @@ impl ::protobuf::Message for ConsumerReadConfig {
 
     fn clear(&mut self) {
         self.topic.clear();
-        self.window_size_seconds = ::std::option::Option::None;
-        self.idle_poll_delay_ms = ::std::option::Option::None;
-        self.max_idle_poll_delay_ms = ::std::option::Option::None;
+        self.window_size.clear();
+        self.idle_poll_delay.clear();
+        self.max_idle_poll_delay.clear();
         self.prefetch_max_bytes = ::std::option::Option::None;
-        self.metadata_visibility_delay_ms = ::std::option::Option::None;
+        self.metadata_visibility_delay.clear();
         self.max_in_flight_batch_reads = ::std::option::Option::None;
         self.strongly_consistent_metadata_reads = ::std::option::Option::None;
-        self.max_clock_skew_ms = ::std::option::Option::None;
+        self.max_clock_skew.clear();
         self.special_fields.clear();
     }
 
     fn default_instance() -> &'static ConsumerReadConfig {
         static instance: ConsumerReadConfig = ConsumerReadConfig {
             topic: ::protobuf::Chars::new(),
-            window_size_seconds: ::std::option::Option::None,
-            idle_poll_delay_ms: ::std::option::Option::None,
-            max_idle_poll_delay_ms: ::std::option::Option::None,
+            window_size: ::protobuf::MessageField::none(),
+            idle_poll_delay: ::protobuf::MessageField::none(),
+            max_idle_poll_delay: ::protobuf::MessageField::none(),
             prefetch_max_bytes: ::std::option::Option::None,
-            metadata_visibility_delay_ms: ::std::option::Option::None,
+            metadata_visibility_delay: ::protobuf::MessageField::none(),
             max_in_flight_batch_reads: ::std::option::Option::None,
             strongly_consistent_metadata_reads: ::std::option::Option::None,
-            max_clock_skew_ms: ::std::option::Option::None,
+            max_clock_skew: ::protobuf::MessageField::none(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -3811,12 +3827,12 @@ pub struct ConsumerGroupConfig {
     pub group_id: ::protobuf::Chars,
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.member_id)
     pub member_id: ::protobuf::Chars,
-    // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.lease_duration_ms)
-    pub lease_duration_ms: ::std::option::Option<i64>,
-    // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.heartbeat_interval_ms)
-    pub heartbeat_interval_ms: ::std::option::Option<i64>,
-    // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.rebalance_interval_ms)
-    pub rebalance_interval_ms: ::std::option::Option<i64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.lease_duration)
+    pub lease_duration: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.heartbeat_interval)
+    pub heartbeat_interval: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.rebalance_interval)
+    pub rebalance_interval: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.pod_id)
     pub pod_id: ::std::option::Option<::protobuf::Chars>,
     // special fields
@@ -3853,20 +3869,20 @@ impl ConsumerGroupConfig {
             |m: &ConsumerGroupConfig| { &m.member_id },
             |m: &mut ConsumerGroupConfig| { &mut m.member_id },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "lease_duration_ms",
-            |m: &ConsumerGroupConfig| { &m.lease_duration_ms },
-            |m: &mut ConsumerGroupConfig| { &mut m.lease_duration_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "lease_duration",
+            |m: &ConsumerGroupConfig| { &m.lease_duration },
+            |m: &mut ConsumerGroupConfig| { &mut m.lease_duration },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "heartbeat_interval_ms",
-            |m: &ConsumerGroupConfig| { &m.heartbeat_interval_ms },
-            |m: &mut ConsumerGroupConfig| { &mut m.heartbeat_interval_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "heartbeat_interval",
+            |m: &ConsumerGroupConfig| { &m.heartbeat_interval },
+            |m: &mut ConsumerGroupConfig| { &mut m.heartbeat_interval },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
-            "rebalance_interval_ms",
-            |m: &ConsumerGroupConfig| { &m.rebalance_interval_ms },
-            |m: &mut ConsumerGroupConfig| { &mut m.rebalance_interval_ms },
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "rebalance_interval",
+            |m: &ConsumerGroupConfig| { &m.rebalance_interval },
+            |m: &mut ConsumerGroupConfig| { &mut m.rebalance_interval },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
             "pod_id",
@@ -3900,14 +3916,14 @@ impl ::protobuf::Message for ConsumerGroupConfig {
                 26 => {
                     self.member_id = is.read_tokio_chars()?;
                 },
-                32 => {
-                    self.lease_duration_ms = ::std::option::Option::Some(is.read_int64()?);
+                34 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.lease_duration)?;
                 },
-                40 => {
-                    self.heartbeat_interval_ms = ::std::option::Option::Some(is.read_int64()?);
+                42 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.heartbeat_interval)?;
                 },
-                48 => {
-                    self.rebalance_interval_ms = ::std::option::Option::Some(is.read_int64()?);
+                50 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.rebalance_interval)?;
                 },
                 58 => {
                     self.pod_id = ::std::option::Option::Some(is.read_tokio_chars()?);
@@ -3933,14 +3949,17 @@ impl ::protobuf::Message for ConsumerGroupConfig {
         if !self.member_id.is_empty() {
             my_size += ::protobuf::rt::string_size(3, &self.member_id);
         }
-        if let Some(v) = self.lease_duration_ms {
-            my_size += ::protobuf::rt::int64_size(4, v);
+        if let Some(v) = self.lease_duration.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
-        if let Some(v) = self.heartbeat_interval_ms {
-            my_size += ::protobuf::rt::int64_size(5, v);
+        if let Some(v) = self.heartbeat_interval.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
-        if let Some(v) = self.rebalance_interval_ms {
-            my_size += ::protobuf::rt::int64_size(6, v);
+        if let Some(v) = self.rebalance_interval.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
         if let Some(v) = self.pod_id.as_ref() {
             my_size += ::protobuf::rt::string_size(7, &v);
@@ -3960,14 +3979,14 @@ impl ::protobuf::Message for ConsumerGroupConfig {
         if !self.member_id.is_empty() {
             os.write_string(3, &self.member_id)?;
         }
-        if let Some(v) = self.lease_duration_ms {
-            os.write_int64(4, v)?;
+        if let Some(v) = self.lease_duration.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(4, v, os)?;
         }
-        if let Some(v) = self.heartbeat_interval_ms {
-            os.write_int64(5, v)?;
+        if let Some(v) = self.heartbeat_interval.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(5, v, os)?;
         }
-        if let Some(v) = self.rebalance_interval_ms {
-            os.write_int64(6, v)?;
+        if let Some(v) = self.rebalance_interval.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(6, v, os)?;
         }
         if let Some(v) = self.pod_id.as_ref() {
             os.write_string(7, v)?;
@@ -3992,9 +4011,9 @@ impl ::protobuf::Message for ConsumerGroupConfig {
         self.topic.clear();
         self.group_id.clear();
         self.member_id.clear();
-        self.lease_duration_ms = ::std::option::Option::None;
-        self.heartbeat_interval_ms = ::std::option::Option::None;
-        self.rebalance_interval_ms = ::std::option::Option::None;
+        self.lease_duration.clear();
+        self.heartbeat_interval.clear();
+        self.rebalance_interval.clear();
         self.pod_id = ::std::option::Option::None;
         self.special_fields.clear();
     }
@@ -4004,9 +4023,9 @@ impl ::protobuf::Message for ConsumerGroupConfig {
             topic: ::protobuf::Chars::new(),
             group_id: ::protobuf::Chars::new(),
             member_id: ::protobuf::Chars::new(),
-            lease_duration_ms: ::std::option::Option::None,
-            heartbeat_interval_ms: ::std::option::Option::None,
-            rebalance_interval_ms: ::std::option::Option::None,
+            lease_duration: ::protobuf::MessageField::none(),
+            heartbeat_interval: ::protobuf::MessageField::none(),
+            rebalance_interval: ::protobuf::MessageField::none(),
             pod_id: ::std::option::Option::None,
             special_fields: ::protobuf::SpecialFields::new(),
         };
@@ -4478,70 +4497,71 @@ impl ProducerCompression {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1ablobstream/v1/config.proto\x12\rblobstream.v1\x1a\x17validate/vali\
-    date.proto\"\xbd\x05\n\x0cBrokerConfig\x12&\n\x0fflush_max_bytes\x18\x01\
-    \x20\x01(\rR\rflushMaxBytes\x12+\n\x12flush_max_delay_ms\x18\x02\x20\x01\
-    (\rR\x0fflushMaxDelayMs\x12$\n\tbind_addr\x18\x03\x20\x01(\tR\x08bindAdd\
-    rB\x07\xfaB\x04r\x02\x10\x01\x12V\n\rnode_identity\x18\x04\x20\x01(\x0b2\
-    '.blobstream.v1.BrokerNodeIdentityConfigR\x0cnodeIdentityB\x08\xfaB\x05\
-    \x8a\x01\x02\x10\x01\x12L\n\tdiscovery\x18\x05\x20\x01(\x0b2$.blobstream\
-    .v1.BrokerDiscoveryConfigR\tdiscoveryB\x08\xfaB\x05\x8a\x01\x02\x10\x01\
-    \x12a\n\x13segment_compression\x18\x06\x20\x01(\x0e2!.blobstream.v1.Segm\
-    entCompressionH\0R\x12segmentCompressionB\x08\xfaB\x05\x82\x01\x02\x10\
-    \x01\x88\x01\x01\x12\x20\n\twriter_id\x18\x07\x20\x01(\rH\x01R\x08writer\
-    Id\x88\x01\x01\x12?\n\x19sequence_reservation_size\x18\x08\x20\x01(\rH\
-    \x02R\x17sequenceReservationSize\x88\x01\x01\x124\n\x16fenced_metadata_w\
-    rites\x18\t\x20\x01(\x08R\x14fencedMetadataWrites\x12L\n\rfeature_flags\
-    \x18\n\x20\x01(\x0b2'.blobstream.v1.BrokerFeatureFlagsConfigR\x0cfeature\
-    FlagsB\x16\n\x14_segment_compressionB\x0c\n\n_writer_idB\x1c\n\x1a_seque\
-    nce_reservation_size\"R\n\x18BrokerFeatureFlagsConfig\x12\x19\n\x03dir\
-    \x18\x01\x20\x01(\tR\x03dirB\x07\xfaB\x04r\x02\x10\x01\x12\x1b\n\x04file\
-    \x18\x02\x20\x01(\tR\x04fileB\x07\xfaB\x04r\x02\x10\x01\"\x96\x01\n\x18B\
-    rokerNodeIdentityConfig\x12&\n\tstatic_id\x18\x01\x20\x01(\tH\0R\x08stat\
-    icIdB\x07\xfaB\x04r\x02\x10\x01\x12C\n\x08hostname\x18\x02\x20\x01(\x0b2\
-    %.blobstream.v1.BrokerHostnameIdentityH\0R\x08hostnameB\r\n\x06source\
-    \x12\x03\xf8B\x01\"\x18\n\x16BrokerHostnameIdentity\"\xc0\x01\n\x15Broke\
-    rDiscoveryConfig\x12D\n\x06static\x18\x01\x20\x01(\x0b2*.blobstream.v1.S\
-    taticBrokerDiscoveryConfigH\0R\x06static\x12Q\n\x0bk8s_service\x18\x02\
-    \x20\x01(\x0b2..blobstream.v1.K8sServiceBrokerDiscoveryConfigH\0R\nk8sSe\
-    rviceB\x0e\n\x07backend\x12\x03\xf8B\x01\"X\n\x1bStaticBrokerDiscoveryCo\
-    nfig\x129\n\x05nodes\x18\x01\x20\x03(\x0b2\x19.blobstream.v1.BrokerNodeR\
-    \x05nodesB\x08\xfaB\x05\x92\x01\x02\x08\x01\"Q\n\nBrokerNode\x12\x20\n\
-    \x07node_id\x18\x01\x20\x01(\tR\x06nodeIdB\x07\xfaB\x04r\x02\x10\x01\x12\
-    !\n\x07address\x18\x02\x20\x01(\tR\x07addressB\x07\xfaB\x04r\x02\x10\x01\
-    \"t\n\x1fK8sServiceBrokerDiscoveryConfig\x12%\n\tnamespace\x18\x01\x20\
-    \x01(\tR\tnamespaceB\x07\xfaB\x04r\x02\x10\x01\x12*\n\x0cservice_name\
-    \x18\x02\x20\x01(\tR\x0bserviceNameB\x07\xfaB\x04r\x02\x10\x01\"\xa5\x02\
-    \n\x0bTopicConfig\x12\x1b\n\x04name\x18\x01\x20\x01(\tR\x04nameB\x07\xfa\
-    B\x04r\x02\x10\x01\x120\n\x0fpartition_count\x18\x02\x20\x01(\rR\x0epart\
-    itionCountB\x07\xfaB\x04*\x02\x20\0\x12(\n\x0bnum_writers\x18\x03\x20\
-    \x01(\rR\nnumWritersB\x07\xfaB\x04*\x02\x20\0\x12%\n\x0eretention_days\
-    \x18\x04\x20\x01(\rR\rretentionDays\x12R\n\x1fmax_metadata_publication_l\
-    ag_ms\x18\x05\x20\x01(\x04H\0R\x1bmaxMetadataPublicationLagMsB\x07\xfaB\
-    \x042\x02\x20\0\x88\x01\x01B\"\n\x20_max_metadata_publication_lag_ms\"\
-    \x19\n\x17InMemoryBlobStoreConfig\"\x89\x01\n\x11S3BlobStoreConfig\x12\
-    \x1f\n\x06bucket\x18\x01\x20\x01(\tR\x06bucketB\x07\xfaB\x04r\x02\x10\
-    \x01\x12\x16\n\x06prefix\x18\x02\x20\x01(\tR\x06prefix\x12\x1f\n\x06regi\
-    on\x18\x03\x20\x01(\tR\x06regionB\x07\xfaB\x04r\x02\x10\x01\x12\x1a\n\
-    \x08endpoint\x18\x04\x20\x01(\tR\x08endpoint\"\x9c\x01\n\x0fBlobStoreCon\
-    fig\x12E\n\tin_memory\x18\x01\x20\x01(\x0b2&.blobstream.v1.InMemoryBlobS\
-    toreConfigH\0R\x08inMemory\x122\n\x02s3\x18\x02\x20\x01(\x0b2\x20.blobst\
-    ream.v1.S3BlobStoreConfigH\0R\x02s3B\x0e\n\x07backend\x12\x03\xf8B\x01\"\
-    \x1d\n\x1bInMemoryMetadataStoreConfig\"\xed\x04\n\x19DynamoMetadataStore\
-    Config\x12\x1f\n\x06region\x18\x01\x20\x01(\tR\x06regionB\x07\xfaB\x04r\
-    \x02\x10\x01\x12\x1a\n\x08endpoint\x18\x02\x20\x01(\tR\x08endpoint\x12F\
-    \n\x1bsegment_metadata_table_name\x18\x03\x20\x01(\tR\x18segmentMetadata\
-    TableNameB\x07\xfaB\x04r\x02\x10\x01\x12U\n#producer_partition_lease_tab\
-    le_name\x18\x04\x20\x01(\tR\x1fproducerPartitionLeaseTableNameB\x07\xfaB\
-    \x04r\x02\x10\x01\x12M\n\x1fconsumer_group_lease_table_name\x18\x05\x20\
-    \x01(\tR\x1bconsumerGroupLeaseTableNameB\x07\xfaB\x04r\x02\x10\x01\x12W\
-    \n$consumer_group_membership_table_name\x18\x06\x20\x01(\tR\x20consumerG\
-    roupMembershipTableNameB\x07\xfaB\x04r\x02\x10\x01\x12I\n\x1asegment_ttl\
-    _buffer_seconds\x18\x07\x20\x01(\rH\0R\x17segmentTtlBufferSecondsB\x07\
-    \xfaB\x04*\x02\x20\0\x88\x01\x01\x12E\n\x18lease_ttl_buffer_seconds\x18\
-    \x08\x20\x01(\rH\x01R\x15leaseTtlBufferSecondsB\x07\xfaB\x04*\x02\x20\0\
-    \x88\x01\x01B\x1d\n\x1b_segment_ttl_buffer_secondsB\x1b\n\x19_lease_ttl_\
-    buffer_seconds\"\xb4\x01\n\x13MetadataStoreConfig\x12I\n\tin_memory\x18\
+    \n\x1ablobstream/v1/config.proto\x12\rblobstream.v1\x1a\x1egoogle/protob\
+    uf/duration.proto\x1a\x17validate/validate.proto\"\xdd\x05\n\x0cBrokerCo\
+    nfig\x12&\n\x0fflush_max_bytes\x18\x01\x20\x01(\rR\rflushMaxBytes\x12K\n\
+    \x0fflush_max_delay\x18\x02\x20\x01(\x0b2\x19.google.protobuf.DurationR\
+    \rflushMaxDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12$\n\tbind_addr\x18\x03\
+    \x20\x01(\tR\x08bindAddrB\x07\xfaB\x04r\x02\x10\x01\x12V\n\rnode_identit\
+    y\x18\x04\x20\x01(\x0b2'.blobstream.v1.BrokerNodeIdentityConfigR\x0cnode\
+    IdentityB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12L\n\tdiscovery\x18\x05\x20\
+    \x01(\x0b2$.blobstream.v1.BrokerDiscoveryConfigR\tdiscoveryB\x08\xfaB\
+    \x05\x8a\x01\x02\x10\x01\x12a\n\x13segment_compression\x18\x06\x20\x01(\
+    \x0e2!.blobstream.v1.SegmentCompressionH\0R\x12segmentCompressionB\x08\
+    \xfaB\x05\x82\x01\x02\x10\x01\x88\x01\x01\x12\x20\n\twriter_id\x18\x07\
+    \x20\x01(\rH\x01R\x08writerId\x88\x01\x01\x12?\n\x19sequence_reservation\
+    _size\x18\x08\x20\x01(\rH\x02R\x17sequenceReservationSize\x88\x01\x01\
+    \x124\n\x16fenced_metadata_writes\x18\t\x20\x01(\x08R\x14fencedMetadataW\
+    rites\x12L\n\rfeature_flags\x18\n\x20\x01(\x0b2'.blobstream.v1.BrokerFea\
+    tureFlagsConfigR\x0cfeatureFlagsB\x16\n\x14_segment_compressionB\x0c\n\n\
+    _writer_idB\x1c\n\x1a_sequence_reservation_size\"R\n\x18BrokerFeatureFla\
+    gsConfig\x12\x19\n\x03dir\x18\x01\x20\x01(\tR\x03dirB\x07\xfaB\x04r\x02\
+    \x10\x01\x12\x1b\n\x04file\x18\x02\x20\x01(\tR\x04fileB\x07\xfaB\x04r\
+    \x02\x10\x01\"\x96\x01\n\x18BrokerNodeIdentityConfig\x12&\n\tstatic_id\
+    \x18\x01\x20\x01(\tH\0R\x08staticIdB\x07\xfaB\x04r\x02\x10\x01\x12C\n\
+    \x08hostname\x18\x02\x20\x01(\x0b2%.blobstream.v1.BrokerHostnameIdentity\
+    H\0R\x08hostnameB\r\n\x06source\x12\x03\xf8B\x01\"\x18\n\x16BrokerHostna\
+    meIdentity\"\xc0\x01\n\x15BrokerDiscoveryConfig\x12D\n\x06static\x18\x01\
+    \x20\x01(\x0b2*.blobstream.v1.StaticBrokerDiscoveryConfigH\0R\x06static\
+    \x12Q\n\x0bk8s_service\x18\x02\x20\x01(\x0b2..blobstream.v1.K8sServiceBr\
+    okerDiscoveryConfigH\0R\nk8sServiceB\x0e\n\x07backend\x12\x03\xf8B\x01\"\
+    X\n\x1bStaticBrokerDiscoveryConfig\x129\n\x05nodes\x18\x01\x20\x03(\x0b2\
+    \x19.blobstream.v1.BrokerNodeR\x05nodesB\x08\xfaB\x05\x92\x01\x02\x08\
+    \x01\"Q\n\nBrokerNode\x12\x20\n\x07node_id\x18\x01\x20\x01(\tR\x06nodeId\
+    B\x07\xfaB\x04r\x02\x10\x01\x12!\n\x07address\x18\x02\x20\x01(\tR\x07add\
+    ressB\x07\xfaB\x04r\x02\x10\x01\"t\n\x1fK8sServiceBrokerDiscoveryConfig\
+    \x12%\n\tnamespace\x18\x01\x20\x01(\tR\tnamespaceB\x07\xfaB\x04r\x02\x10\
+    \x01\x12*\n\x0cservice_name\x18\x02\x20\x01(\tR\x0bserviceNameB\x07\xfaB\
+    \x04r\x02\x10\x01\"\xb4\x02\n\x0bTopicConfig\x12\x1b\n\x04name\x18\x01\
+    \x20\x01(\tR\x04nameB\x07\xfaB\x04r\x02\x10\x01\x120\n\x0fpartition_coun\
+    t\x18\x02\x20\x01(\rR\x0epartitionCountB\x07\xfaB\x04*\x02\x20\0\x12(\n\
+    \x0bnum_writers\x18\x03\x20\x01(\rR\nnumWritersB\x07\xfaB\x04*\x02\x20\0\
+    \x12F\n\tretention\x18\x04\x20\x01(\x0b2\x19.google.protobuf.DurationR\t\
+    retentionB\r\xfaB\n\x8a\x01\x02\x10\x01\xaa\x01\x02*\0\x12d\n\x1cmax_met\
+    adata_publication_lag\x18\x05\x20\x01(\x0b2\x19.google.protobuf.Duration\
+    R\x19maxMetadataPublicationLagB\x08\xfaB\x05\xaa\x01\x02*\0\"\x19\n\x17I\
+    nMemoryBlobStoreConfig\"\x89\x01\n\x11S3BlobStoreConfig\x12\x1f\n\x06buc\
+    ket\x18\x01\x20\x01(\tR\x06bucketB\x07\xfaB\x04r\x02\x10\x01\x12\x16\n\
+    \x06prefix\x18\x02\x20\x01(\tR\x06prefix\x12\x1f\n\x06region\x18\x03\x20\
+    \x01(\tR\x06regionB\x07\xfaB\x04r\x02\x10\x01\x12\x1a\n\x08endpoint\x18\
+    \x04\x20\x01(\tR\x08endpoint\"\x9c\x01\n\x0fBlobStoreConfig\x12E\n\tin_m\
+    emory\x18\x01\x20\x01(\x0b2&.blobstream.v1.InMemoryBlobStoreConfigH\0R\
+    \x08inMemory\x122\n\x02s3\x18\x02\x20\x01(\x0b2\x20.blobstream.v1.S3Blob\
+    StoreConfigH\0R\x02s3B\x0e\n\x07backend\x12\x03\xf8B\x01\"\x1d\n\x1bInMe\
+    moryMetadataStoreConfig\"\xc1\x04\n\x19DynamoMetadataStoreConfig\x12\x1f\
+    \n\x06region\x18\x01\x20\x01(\tR\x06regionB\x07\xfaB\x04r\x02\x10\x01\
+    \x12\x1a\n\x08endpoint\x18\x02\x20\x01(\tR\x08endpoint\x12F\n\x1bsegment\
+    _metadata_table_name\x18\x03\x20\x01(\tR\x18segmentMetadataTableNameB\
+    \x07\xfaB\x04r\x02\x10\x01\x12U\n#producer_partition_lease_table_name\
+    \x18\x04\x20\x01(\tR\x1fproducerPartitionLeaseTableNameB\x07\xfaB\x04r\
+    \x02\x10\x01\x12M\n\x1fconsumer_group_lease_table_name\x18\x05\x20\x01(\
+    \tR\x1bconsumerGroupLeaseTableNameB\x07\xfaB\x04r\x02\x10\x01\x12W\n$con\
+    sumer_group_membership_table_name\x18\x06\x20\x01(\tR\x20consumerGroupMe\
+    mbershipTableNameB\x07\xfaB\x04r\x02\x10\x01\x12Q\n\x12segment_ttl_buffe\
+    r\x18\x07\x20\x01(\x0b2\x19.google.protobuf.DurationR\x10segmentTtlBuffe\
+    rB\x08\xfaB\x05\xaa\x01\x02*\0\x12M\n\x10lease_ttl_buffer\x18\x08\x20\
+    \x01(\x0b2\x19.google.protobuf.DurationR\x0eleaseTtlBufferB\x08\xfaB\x05\
+    \xaa\x01\x02*\0\"\xb4\x01\n\x13MetadataStoreConfig\x12I\n\tin_memory\x18\
     \x01\x20\x01(\x0b2*.blobstream.v1.InMemoryMetadataStoreConfigH\0R\x08inM\
     emory\x12B\n\x06dynamo\x18\x02\x20\x01(\x0b2(.blobstream.v1.DynamoMetada\
     taStoreConfigH\0R\x06dynamoB\x0e\n\x07backend\x12\x03\xf8B\x01\"\xaa\x02\
@@ -4552,78 +4572,75 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x0b2\x1e.blobstream.v1.BlobStoreConfigR\tblobStoreB\x08\xfaB\x05\x8a\
     \x01\x02\x10\x01\x12S\n\x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobst\
     ream.v1.MetadataStoreConfigR\rmetadataStoreB\x08\xfaB\x05\x8a\x01\x02\
-    \x10\x01\"\x90\x07\n\x0eProducerConfig\x12\x20\n\twriter_id\x18\x01\x20\
+    \x10\x01\"\xf2\x06\n\x0eProducerConfig\x12\x20\n\twriter_id\x18\x01\x20\
     \x01(\rH\0R\x08writerId\x88\x01\x01\x128\n\x11max_batch_records\x18\x02\
     \x20\x01(\rH\x01R\x0fmaxBatchRecordsB\x07\xfaB\x04*\x02\x20\0\x88\x01\
     \x01\x124\n\x0fmax_batch_bytes\x18\x03\x20\x01(\rH\x02R\rmaxBatchBytesB\
-    \x07\xfaB\x04*\x02\x20\0\x88\x01\x01\x129\n\x12flush_max_delay_ms\x18\
-    \x04\x20\x01(\x04H\x03R\x0fflushMaxDelayMsB\x07\xfaB\x042\x02\x20\0\x88\
-    \x01\x01\x12;\n\x13retry_base_delay_ms\x18\x06\x20\x01(\x04H\x04R\x10ret\
-    ryBaseDelayMsB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x129\n\x12retry_max_d\
-    elay_ms\x18\x07\x20\x01(\x04H\x05R\x0fretryMaxDelayMsB\x07\xfaB\x042\x02\
-    \x20\0\x88\x01\x01\x12:\n\x12connect_timeout_ms\x18\x08\x20\x01(\x03H\
-    \x06R\x10connectTimeoutMsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\x01\x12:\n\
-    \x12request_timeout_ms\x18\t\x20\x01(\x03H\x07R\x10requestTimeoutMsB\x07\
-    \xfaB\x04\"\x02\x20\0\x88\x01\x01\x12D\n\x17max_request_concurrency\x18\
-    \n\x20\x01(\x04H\x08R\x15maxRequestConcurrencyB\x07\xfaB\x042\x02\x20\0\
-    \x88\x01\x01\x12S\n\x0bcompression\x18\x0b\x20\x01(\x0e2\".blobstream.v1\
-    .ProducerCompressionH\tR\x0bcompressionB\x08\xfaB\x05\x82\x01\x02\x10\
-    \x01\x88\x01\x01\x128\n\x11retry_deadline_ms\x18\x0c\x20\x01(\x04H\nR\
-    \x0fretryDeadlineMsB\x07\xfaB\x042\x02\x20\0\x88\x01\x01B\x0c\n\n_writer\
-    _idB\x14\n\x12_max_batch_recordsB\x12\n\x10_max_batch_bytesB\x15\n\x13_f\
-    lush_max_delay_msB\x16\n\x14_retry_base_delay_msB\x15\n\x13_retry_max_de\
-    lay_msB\x15\n\x13_connect_timeout_msB\x15\n\x13_request_timeout_msB\x1a\
-    \n\x18_max_request_concurrencyB\x0e\n\x0c_compressionB\x14\n\x12_retry_d\
-    eadline_ms\"\xe8\x01\n\x15ProducerRuntimeConfig\x12C\n\x08producer\x18\
-    \x01\x20\x01(\x0b2\x1d.blobstream.v1.ProducerConfigR\x08producerB\x08\
-    \xfaB\x05\x8a\x01\x02\x10\x01\x12L\n\tdiscovery\x18\x02\x20\x01(\x0b2$.b\
-    lobstream.v1.BrokerDiscoveryConfigR\tdiscoveryB\x08\xfaB\x05\x8a\x01\x02\
-    \x10\x01\x12<\n\x06topics\x18\x03\x20\x03(\x0b2\x1a.blobstream.v1.TopicC\
-    onfigR\x06topicsB\x08\xfaB\x05\x92\x01\x02\x08\x01\"\x97\x06\n\x12Consum\
-    erReadConfig\x12\x1d\n\x05topic\x18\x01\x20\x01(\tR\x05topicB\x07\xfaB\
-    \x04r\x02\x10\x01\x12<\n\x13window_size_seconds\x18\x02\x20\x01(\x03H\0R\
-    \x11windowSizeSecondsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\x01\x129\n\x12id\
-    le_poll_delay_ms\x18\x04\x20\x01(\x04H\x01R\x0fidlePollDelayMsB\x07\xfaB\
-    \x042\x02\x20\0\x88\x01\x01\x127\n\x16max_idle_poll_delay_ms\x18\x05\x20\
-    \x01(\x04H\x02R\x12maxIdlePollDelayMs\x88\x01\x01\x12:\n\x12prefetch_max\
-    _bytes\x18\x06\x20\x01(\x04H\x03R\x10prefetchMaxBytesB\x07\xfaB\x042\x02\
-    \x20\0\x88\x01\x01\x12D\n\x1cmetadata_visibility_delay_ms\x18\t\x20\x01(\
-    \x04H\x04R\x19metadataVisibilityDelayMs\x88\x01\x01\x12F\n\x19max_in_fli\
-    ght_batch_reads\x18\n\x20\x01(\x04H\x05R\x15maxInFlightBatchReadsB\x07\
-    \xfaB\x042\x02\x20\0\x88\x01\x01\x12P\n\"strongly_consistent_metadata_re\
-    ads\x18\x0b\x20\x01(\x08H\x06R\x1fstronglyConsistentMetadataReads\x88\
-    \x01\x01\x127\n\x11max_clock_skew_ms\x18\x0c\x20\x01(\x04H\x07R\x0emaxCl\
-    ockSkewMsB\x07\xfaB\x042\x02\x20\0\x88\x01\x01B\x16\n\x14_window_size_se\
-    condsB\x15\n\x13_idle_poll_delay_msB\x19\n\x17_max_idle_poll_delay_msB\
-    \x15\n\x13_prefetch_max_bytesB\x1f\n\x1d_metadata_visibility_delay_msB\
-    \x1c\n\x1a_max_in_flight_batch_readsB%\n#_strongly_consistent_metadata_r\
-    eadsB\x14\n\x12_max_clock_skew_ms\"\xb6\x03\n\x13ConsumerGroupConfig\x12\
-    \x1d\n\x05topic\x18\x01\x20\x01(\tR\x05topicB\x07\xfaB\x04r\x02\x10\x01\
-    \x12\"\n\x08group_id\x18\x02\x20\x01(\tR\x07groupIdB\x07\xfaB\x04r\x02\
-    \x10\x01\x12$\n\tmember_id\x18\x03\x20\x01(\tR\x08memberIdB\x07\xfaB\x04\
-    r\x02\x10\x01\x128\n\x11lease_duration_ms\x18\x04\x20\x01(\x03H\0R\x0fle\
-    aseDurationMsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\x01\x12@\n\x15heartbeat_\
-    interval_ms\x18\x05\x20\x01(\x03H\x01R\x13heartbeatIntervalMsB\x07\xfaB\
-    \x04\"\x02\x20\0\x88\x01\x01\x12@\n\x15rebalance_interval_ms\x18\x06\x20\
-    \x01(\x03H\x02R\x13rebalanceIntervalMsB\x07\xfaB\x04\"\x02\x20\0\x88\x01\
-    \x01\x12#\n\x06pod_id\x18\x07\x20\x01(\tH\x03R\x05podIdB\x07\xfaB\x04r\
-    \x02\x10\x01\x88\x01\x01B\x14\n\x12_lease_duration_msB\x18\n\x16_heartbe\
-    at_interval_msB\x18\n\x16_rebalance_interval_msB\t\n\x07_pod_id\"\x9c\
-    \x01\n\x15ConsumerRuntimeConfig\x12?\n\x04read\x18\x01\x20\x01(\x0b2!.bl\
-    obstream.v1.ConsumerReadConfigR\x04readB\x08\xfaB\x05\x8a\x01\x02\x10\
-    \x01\x12B\n\x05group\x18\x02\x20\x01(\x0b2\".blobstream.v1.ConsumerGroup\
-    ConfigR\x05groupB\x08\xfaB\x05\x8a\x01\x02\x10\x01\"\xc5\x02\n\x1fConsum\
-    erIteratorBootstrapConfig\x12H\n\x07runtime\x18\x01\x20\x01(\x0b2$.blobs\
-    tream.v1.ConsumerRuntimeConfigR\x07runtimeB\x08\xfaB\x05\x8a\x01\x02\x10\
-    \x01\x12:\n\x05topic\x18\x02\x20\x01(\x0b2\x1a.blobstream.v1.TopicConfig\
-    R\x05topicB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12G\n\nblob_store\x18\x03\
-    \x20\x01(\x0b2\x1e.blobstream.v1.BlobStoreConfigR\tblobStoreB\x08\xfaB\
-    \x05\x8a\x01\x02\x10\x01\x12S\n\x0emetadata_store\x18\x04\x20\x01(\x0b2\
-    \".blobstream.v1.MetadataStoreConfigR\rmetadataStoreB\x08\xfaB\x05\x8a\
-    \x01\x02\x10\x01*P\n\x12SegmentCompression\x12\x1c\n\x18SEGMENT_COMPRESS\
-    ION_NONE\x10\0\x12\x1c\n\x18SEGMENT_COMPRESSION_ZSTD\x10\x01*U\n\x13Prod\
-    ucerCompression\x12\x1d\n\x19PRODUCER_COMPRESSION_NONE\x10\0\x12\x1f\n\
-    \x1bPRODUCER_COMPRESSION_SNAPPY\x10\x01b\x06proto3\
+    \x07\xfaB\x04*\x02\x20\0\x88\x01\x01\x12K\n\x0fflush_max_delay\x18\x04\
+    \x20\x01(\x0b2\x19.google.protobuf.DurationR\rflushMaxDelayB\x08\xfaB\
+    \x05\xaa\x01\x02*\0\x12M\n\x10retry_base_delay\x18\x06\x20\x01(\x0b2\x19\
+    .google.protobuf.DurationR\x0eretryBaseDelayB\x08\xfaB\x05\xaa\x01\x02*\
+    \0\x12K\n\x0fretry_max_delay\x18\x07\x20\x01(\x0b2\x19.google.protobuf.D\
+    urationR\rretryMaxDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12L\n\x0fconnect_t\
+    imeout\x18\x08\x20\x01(\x0b2\x19.google.protobuf.DurationR\x0econnectTim\
+    eoutB\x08\xfaB\x05\xaa\x01\x02*\0\x12L\n\x0frequest_timeout\x18\t\x20\
+    \x01(\x0b2\x19.google.protobuf.DurationR\x0erequestTimeoutB\x08\xfaB\x05\
+    \xaa\x01\x02*\0\x12D\n\x17max_request_concurrency\x18\n\x20\x01(\x04H\
+    \x03R\x15maxRequestConcurrencyB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x12S\
+    \n\x0bcompression\x18\x0b\x20\x01(\x0e2\".blobstream.v1.ProducerCompress\
+    ionH\x04R\x0bcompressionB\x08\xfaB\x05\x82\x01\x02\x10\x01\x88\x01\x01\
+    \x12J\n\x0eretry_deadline\x18\x0c\x20\x01(\x0b2\x19.google.protobuf.Dura\
+    tionR\rretryDeadlineB\x08\xfaB\x05\xaa\x01\x02*\0B\x0c\n\n_writer_idB\
+    \x14\n\x12_max_batch_recordsB\x12\n\x10_max_batch_bytesB\x1a\n\x18_max_r\
+    equest_concurrencyB\x0e\n\x0c_compression\"\xe8\x01\n\x15ProducerRuntime\
+    Config\x12C\n\x08producer\x18\x01\x20\x01(\x0b2\x1d.blobstream.v1.Produc\
+    erConfigR\x08producerB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12L\n\tdiscover\
+    y\x18\x02\x20\x01(\x0b2$.blobstream.v1.BrokerDiscoveryConfigR\tdiscovery\
+    B\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12<\n\x06topics\x18\x03\x20\x03(\x0b\
+    2\x1a.blobstream.v1.TopicConfigR\x06topicsB\x08\xfaB\x05\x92\x01\x02\x08\
+    \x01\"\xf8\x05\n\x12ConsumerReadConfig\x12\x1d\n\x05topic\x18\x01\x20\
+    \x01(\tR\x05topicB\x07\xfaB\x04r\x02\x10\x01\x12D\n\x0bwindow_size\x18\
+    \x02\x20\x01(\x0b2\x19.google.protobuf.DurationR\nwindowSizeB\x08\xfaB\
+    \x05\xaa\x01\x02*\0\x12K\n\x0fidle_poll_delay\x18\x04\x20\x01(\x0b2\x19.\
+    google.protobuf.DurationR\ridlePollDelayB\x08\xfaB\x05\xaa\x01\x02*\0\
+    \x12R\n\x13max_idle_poll_delay\x18\x05\x20\x01(\x0b2\x19.google.protobuf\
+    .DurationR\x10maxIdlePollDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12:\n\x12pr\
+    efetch_max_bytes\x18\x06\x20\x01(\x04H\0R\x10prefetchMaxBytesB\x07\xfaB\
+    \x042\x02\x20\0\x88\x01\x01\x12_\n\x19metadata_visibility_delay\x18\t\
+    \x20\x01(\x0b2\x19.google.protobuf.DurationR\x17metadataVisibilityDelayB\
+    \x08\xfaB\x05\xaa\x01\x02*\0\x12F\n\x19max_in_flight_batch_reads\x18\n\
+    \x20\x01(\x04H\x01R\x15maxInFlightBatchReadsB\x07\xfaB\x042\x02\x20\0\
+    \x88\x01\x01\x12P\n\"strongly_consistent_metadata_reads\x18\x0b\x20\x01(\
+    \x08H\x02R\x1fstronglyConsistentMetadataReads\x88\x01\x01\x12I\n\x0emax_\
+    clock_skew\x18\x0c\x20\x01(\x0b2\x19.google.protobuf.DurationR\x0cmaxClo\
+    ckSkewB\x08\xfaB\x05\xaa\x01\x02*\0B\x15\n\x13_prefetch_max_bytesB\x1c\n\
+    \x1a_max_in_flight_batch_readsB%\n#_strongly_consistent_metadata_reads\"\
+    \xa2\x03\n\x13ConsumerGroupConfig\x12\x1d\n\x05topic\x18\x01\x20\x01(\tR\
+    \x05topicB\x07\xfaB\x04r\x02\x10\x01\x12\"\n\x08group_id\x18\x02\x20\x01\
+    (\tR\x07groupIdB\x07\xfaB\x04r\x02\x10\x01\x12$\n\tmember_id\x18\x03\x20\
+    \x01(\tR\x08memberIdB\x07\xfaB\x04r\x02\x10\x01\x12J\n\x0elease_duration\
+    \x18\x04\x20\x01(\x0b2\x19.google.protobuf.DurationR\rleaseDurationB\x08\
+    \xfaB\x05\xaa\x01\x02*\0\x12R\n\x12heartbeat_interval\x18\x05\x20\x01(\
+    \x0b2\x19.google.protobuf.DurationR\x11heartbeatIntervalB\x08\xfaB\x05\
+    \xaa\x01\x02*\0\x12R\n\x12rebalance_interval\x18\x06\x20\x01(\x0b2\x19.g\
+    oogle.protobuf.DurationR\x11rebalanceIntervalB\x08\xfaB\x05\xaa\x01\x02*\
+    \0\x12#\n\x06pod_id\x18\x07\x20\x01(\tH\0R\x05podIdB\x07\xfaB\x04r\x02\
+    \x10\x01\x88\x01\x01B\t\n\x07_pod_id\"\x9c\x01\n\x15ConsumerRuntimeConfi\
+    g\x12?\n\x04read\x18\x01\x20\x01(\x0b2!.blobstream.v1.ConsumerReadConfig\
+    R\x04readB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12B\n\x05group\x18\x02\x20\
+    \x01(\x0b2\".blobstream.v1.ConsumerGroupConfigR\x05groupB\x08\xfaB\x05\
+    \x8a\x01\x02\x10\x01\"\xc5\x02\n\x1fConsumerIteratorBootstrapConfig\x12H\
+    \n\x07runtime\x18\x01\x20\x01(\x0b2$.blobstream.v1.ConsumerRuntimeConfig\
+    R\x07runtimeB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12:\n\x05topic\x18\x02\
+    \x20\x01(\x0b2\x1a.blobstream.v1.TopicConfigR\x05topicB\x08\xfaB\x05\x8a\
+    \x01\x02\x10\x01\x12G\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobstream\
+    .v1.BlobStoreConfigR\tblobStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12S\n\
+    \x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobstream.v1.MetadataStoreCo\
+    nfigR\rmetadataStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01*P\n\x12SegmentCom\
+    pression\x12\x1c\n\x18SEGMENT_COMPRESSION_NONE\x10\0\x12\x1c\n\x18SEGMEN\
+    T_COMPRESSION_ZSTD\x10\x01*U\n\x13ProducerCompression\x12\x1d\n\x19PRODU\
+    CER_COMPRESSION_NONE\x10\0\x12\x1f\n\x1bPRODUCER_COMPRESSION_SNAPPY\x10\
+    \x01b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -4640,7 +4657,8 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
     static file_descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::FileDescriptor> = ::protobuf::rt::Lazy::new();
     file_descriptor.get(|| {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
-            let mut deps = ::std::vec::Vec::with_capacity(1);
+            let mut deps = ::std::vec::Vec::with_capacity(2);
+            deps.push(::protobuf::well_known_types::duration::file_descriptor().clone());
             deps.push(super::validate::file_descriptor().clone());
             let mut messages = ::std::vec::Vec::with_capacity(22);
             messages.push(BrokerConfig::generated_message_descriptor_data());

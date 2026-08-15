@@ -196,7 +196,6 @@ impl ConsumerReaderImpl {
         time::OffsetDateTime::from_unix_timestamp(request.window.window_start_unix_seconds)
           .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
       let floor_timestamp = window_start.max(safe_timestamp);
-      let floor_timestamp_unix_seconds = floor_timestamp.unix_timestamp();
       let time_floor = Self::snowflake_floor(floor_timestamp);
       for &partition_id in assigned_partition_ids {
         let Some((observed_frontier, partition_lower_bound)) = self
@@ -213,7 +212,7 @@ impl ConsumerReaderImpl {
             .fast_scan_bounds
             .push(ConsumerReaderFastScanBoundState {
               window_start_unix_seconds: request.window.window_start_unix_seconds,
-              floor_timestamp_unix_seconds,
+              floor_timestamp,
               time_floor,
               observed_frontier,
               partition_lower_bound,

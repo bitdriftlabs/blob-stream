@@ -9,6 +9,7 @@ use blob_stream_integration_tests::test_framework as framework;
 use blob_stream_metadata_store::ConsumerGroupMember;
 use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerError, ProducerRecord};
 use blob_stream_types::{
+  ToProtoDuration,
   logical_partition_for_key,
   offset_datetime_from_unix_millis,
   virtual_partition_for_logical,
@@ -327,8 +328,8 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      metadata_visibility_delay_ms: Some(0),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
+      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -436,7 +437,7 @@ async fn network_response_loss_after_persistence_retries_with_duplicate_batch() 
     .read
     .as_mut()
     .ok_or_else(|| anyhow::anyhow!("response-loss consumer read config missing"))?
-    .metadata_visibility_delay_ms = Some(0);
+    .strongly_consistent_metadata_reads = Some(true);
   let group = runtime
     .group
     .as_ref()
@@ -662,7 +663,7 @@ async fn response_loss_retry_during_broker_handoff_preserves_group_delivery_cont
     .read
     .as_mut()
     .ok_or_else(|| anyhow::anyhow!("handoff consumer read config missing"))?
-    .metadata_visibility_delay_ms = Some(0);
+    .strongly_consistent_metadata_reads = Some(true);
   let group = runtime
     .group
     .as_ref()
@@ -811,7 +812,7 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     (0 .. framework::PARTITION_COUNT).collect(),
@@ -1049,8 +1050,8 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      metadata_visibility_delay_ms: Some(0),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
+      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -1120,7 +1121,7 @@ async fn producer_retry_deadline_respected_after_transport_failures() -> Result<
     .await;
 
   let mut config = producer_config();
-  config.retry_deadline_ms = Some(500);
+  config.retry_deadline = TimeDuration::milliseconds(500).into_proto();
   let retry_clock = Arc::new(ManualProducerRetryClock::new(Instant::now()));
   let producer = cluster
     .producer_builder(config, vec![producer_topic()])
@@ -1209,7 +1210,7 @@ async fn producer_retry_deadline_respected_after_transport_failures() -> Result<
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     vec![recovery_ack.virtual_partition_id],
@@ -1340,8 +1341,8 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      metadata_visibility_delay_ms: Some(0),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
+      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -1420,8 +1421,8 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      metadata_visibility_delay_ms: Some(0),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
+      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -1531,8 +1532,8 @@ async fn s3_get_not_found_consumer_skips_lost_data() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      metadata_visibility_delay_ms: Some(0),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
+      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -1608,7 +1609,7 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
     .await;
 
   let mut config = producer_config();
-  config.retry_deadline_ms = Some(50);
+  config.retry_deadline = TimeDuration::milliseconds(50).into_proto();
   let retry_clock = Arc::new(ManualProducerRetryClock::new(Instant::now()));
   let producer = cluster
     .producer_builder(config, vec![producer_topic()])
@@ -1705,7 +1706,7 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
     .read
     .as_mut()
     .ok_or_else(|| anyhow::anyhow!("metadata retry consumer read config missing"))?
-    .metadata_visibility_delay_ms = Some(0);
+    .strongly_consistent_metadata_reads = Some(true);
   let group = runtime
     .group
     .as_ref()
@@ -1820,8 +1821,8 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
-      metadata_visibility_delay_ms: Some(0),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
+      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     (0 .. framework::PARTITION_COUNT).collect(),
@@ -2060,7 +2061,7 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -2117,7 +2118,7 @@ async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
       .read
       .as_mut()
       .ok_or_else(|| anyhow::anyhow!("fit-010 consumer read config missing"))?
-      .metadata_visibility_delay_ms = Some(0);
+      .strongly_consistent_metadata_reads = Some(true);
   }
   let group = runtime_a
     .group
@@ -3005,7 +3006,7 @@ async fn bootstrap_rebalance_with_membership_and_lease_faults() -> Result<()> {
       .group
       .as_mut()
       .ok_or_else(|| anyhow::anyhow!("fit-015 consumer group config missing"))?;
-    group.lease_duration_ms = Some(10_000);
+    group.lease_duration = TimeDuration::milliseconds(10_000).into_proto();
   }
   let group = runtime_a
     .group
@@ -3437,7 +3438,7 @@ async fn combined_network_and_metadata_faults_preserve_producer_publication() ->
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(WINDOW_SIZE_SECONDS),
+      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -3587,7 +3588,7 @@ async fn run_scripted_transport_fault_scenario() -> Result<Fit012Outcome> {
     .read
     .as_mut()
     .ok_or_else(|| anyhow::anyhow!("scripted trace consumer read config missing"))?
-    .metadata_visibility_delay_ms = Some(0);
+    .strongly_consistent_metadata_reads = Some(true);
   let group = runtime
     .group
     .as_ref()

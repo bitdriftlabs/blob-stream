@@ -3,6 +3,7 @@
 mod tests;
 
 use crate::aws::{is_dynamo_transaction_conflict, retry_dynamo_transaction_conflicts};
+use crate::dynamo::duration_seconds_ceil;
 use crate::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentPlan,
@@ -60,7 +61,7 @@ const PLANNER_LEASE_SORT_KEY: &str = "__blob_stream_assignment_planner_v1__";
 pub struct DynamoConsumerGroupMembershipStore {
   client: Client,
   table_name: String,
-  ttl_buffer_seconds: i64,
+  ttl_buffer: Duration,
   capacity_metrics: Option<DynamoCapacityMetrics>,
 }
 
@@ -69,13 +70,13 @@ impl DynamoConsumerGroupMembershipStore {
   pub fn new(
     client: Client,
     table_name: impl Into<String>,
-    ttl_buffer_seconds: u32,
+    ttl_buffer: Duration,
     capacity_metrics: Option<DynamoCapacityMetrics>,
   ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
-      ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
+      ttl_buffer,
       capacity_metrics,
     }
   }
@@ -343,7 +344,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     let ttl_ms = i64::try_from(ttl.whole_milliseconds())
       .map_err(|_| anyhow!("membership ttl exceeds Dynamo millisecond range"))?;
     let expires_at = expires_at(now_ts_ms, ttl_ms)?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
 
     let mut values = HashMap::new();
     values.insert(
@@ -584,7 +585,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     let ttl_ms = i64::try_from(ttl.whole_milliseconds())
       .map_err(|_| anyhow!("planner ttl exceeds Dynamo millisecond range"))?;
     let expires_at = expires_at(now_ts_ms, ttl_ms)?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
     let mut values = HashMap::new();
     values.insert(
       ":owner".to_string(),
@@ -799,10 +800,12 @@ fn expires_at(now_ts_ms: i64, ttl_ms: i64) -> Result<i64> {
     .ok_or_else(|| anyhow!("membership expiration overflow"))
 }
 
-fn ttl_epoch_seconds(expires_at_ms: i64, ttl_buffer_seconds: i64) -> Result<i64> {
+fn ttl_epoch_seconds(expires_at_ms: i64, ttl_buffer: Duration) -> Result<i64> {
   let expires_at_seconds = expires_at_ms
     .checked_div(1_000)
     .ok_or_else(|| anyhow!("membership ttl conversion overflow"))?;
+  let ttl_buffer_seconds = duration_seconds_ceil(ttl_buffer)
+    .ok_or_else(|| anyhow!("membership ttl buffer conversion overflow"))?;
 
   expires_at_seconds
     .checked_add(ttl_buffer_seconds)

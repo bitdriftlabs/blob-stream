@@ -46,12 +46,12 @@ use blob_stream_proto::protos::blobstream::v1::config::{
   MetadataStoreConfig,
   TopicConfig,
 };
-use blob_stream_types::VirtualPartitionId;
+use blob_stream_types::{ProtoDurationExt, VirtualPartitionId};
 use std::collections::HashMap;
 use std::sync::Arc;
+use time::Duration;
 
-const DEFAULT_MEMBERSHIP_TTL_BUFFER_SECONDS: u32 = 3_600;
-const SECONDS_PER_DAY: u32 = 86_400;
+const DEFAULT_MEMBERSHIP_TTL_BUFFER: Duration = Duration::hours(1);
 
 //
 // ConsumerBootstrapConfig
@@ -228,6 +228,13 @@ impl ConsumerIteratorImpl {
     proto_validate::validate(&config.blob_store)?;
     proto_validate::validate(&config.metadata_store)?;
 
+    let retention = config
+      .topic
+      .retention
+      .as_ref()
+      .ok_or_else(|| anyhow!("consumer topic config is missing retention"))?
+      .to_time_duration();
+
     let group = config
       .runtime
       .group
@@ -239,8 +246,8 @@ impl ConsumerIteratorImpl {
       "consumer runtime topic and bootstrap topic must match"
     );
     ensure!(
-      config.topic.retention_days > 0,
-      "consumer retention recovery requires topic retention_days greater than zero"
+      retention.is_positive(),
+      "consumer retention recovery requires topic retention greater than zero"
     );
 
     let virtual_partitions = virtual_partitions_for_topic(&config.topic)?;
@@ -249,7 +256,7 @@ impl ConsumerIteratorImpl {
     let dynamo_capacity_metrics = DynamoCapacityMetrics::new(&metrics_scope.scope("dynamo"));
     let (metadata_store, lease_store, membership_store) = build_metadata_and_coordination_stores(
       &config.metadata_store,
-      config.topic.retention_days,
+      retention,
       dynamo_capacity_metrics,
     )
     .await?;
@@ -273,7 +280,7 @@ impl ConsumerIteratorImpl {
       membership_store,
       coordination,
       metrics_scope,
-      config.topic.retention_days,
+      retention,
       topic_max_metadata_publication_lag(&config.topic),
       feature_flags,
     )
@@ -342,7 +349,7 @@ async fn build_blob_store(config: &BlobStoreConfig) -> Result<Arc<dyn BlobStore>
 
 async fn build_metadata_and_coordination_stores(
   config: &MetadataStoreConfig,
-  retention_days: u32,
+  retention: Duration,
   capacity_metrics: DynamoCapacityMetrics,
 ) -> Result<(
   Arc<dyn MetadataStore>,
@@ -382,26 +389,26 @@ async fn build_metadata_and_coordination_stores(
       metadata_table,
       producer_partition_lease_table,
       HashMap::new(),
-      DEFAULT_MEMBERSHIP_TTL_BUFFER_SECONDS,
+      DEFAULT_MEMBERSHIP_TTL_BUFFER,
       Some(capacity_metrics.clone()),
     ));
-    let membership_ttl_buffer_seconds = dynamo
-      .lease_ttl_buffer_seconds
-      .unwrap_or(DEFAULT_MEMBERSHIP_TTL_BUFFER_SECONDS);
-    let consumer_lease_ttl_buffer_seconds =
-      consumer_group_lease_ttl_buffer_seconds(retention_days)?;
+    let membership_ttl_buffer = dynamo.lease_ttl_buffer.as_ref().map_or(
+      DEFAULT_MEMBERSHIP_TTL_BUFFER,
+      ProtoDurationExt::to_time_duration,
+    );
+    let consumer_lease_ttl_buffer = consumer_group_lease_ttl_buffer(retention)?;
     let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
       Arc::new(DynamoConsumerGroupLeaseStore::new(
         client.clone(),
         consumer_lease_table,
-        consumer_lease_ttl_buffer_seconds,
+        consumer_lease_ttl_buffer,
         Some(capacity_metrics.clone()),
       ));
     let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
       Arc::new(DynamoConsumerGroupMembershipStore::new(
         client,
         consumer_membership_table,
-        membership_ttl_buffer_seconds,
+        membership_ttl_buffer,
         Some(capacity_metrics),
       ));
     return Ok((metadata_store, lease_store, membership_store));
@@ -410,10 +417,12 @@ async fn build_metadata_and_coordination_stores(
   Err(anyhow!("metadata_store backend not configured"))
 }
 
-fn consumer_group_lease_ttl_buffer_seconds(retention_days: u32) -> Result<u32> {
-  retention_days.checked_mul(SECONDS_PER_DAY).ok_or_else(|| {
-    anyhow!("topic retention_days {retention_days} exceeds the maximum consumer lease retention")
-  })
+fn consumer_group_lease_ttl_buffer(retention: Duration) -> Result<Duration> {
+  ensure!(
+    retention.is_positive(),
+    "topic retention must be greater than zero for consumer lease TTL"
+  );
+  Ok(retention)
 }
 
 /// Dynamic coordination source backed by membership-store liveness entries.

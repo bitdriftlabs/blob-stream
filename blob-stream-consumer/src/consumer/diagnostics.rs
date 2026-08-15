@@ -1,5 +1,6 @@
 use blob_stream_types::{SnowflakeId, VirtualPartitionId};
 use std::sync::Arc;
+use time::OffsetDateTime;
 
 //
 // ConsumerReaderPartitionScanState
@@ -39,7 +40,7 @@ pub struct ConsumerReaderPartitionScanState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConsumerReaderFastScanBoundState {
   pub(crate) window_start_unix_seconds: i64,
-  pub(crate) floor_timestamp_unix_seconds: i64,
+  pub(crate) floor_timestamp: OffsetDateTime,
   pub(crate) time_floor: SnowflakeId,
   pub(crate) observed_frontier: Option<SnowflakeId>,
   pub(crate) partition_lower_bound: SnowflakeId,

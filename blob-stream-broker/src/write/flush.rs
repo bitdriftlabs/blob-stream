@@ -337,7 +337,11 @@ impl FlushContext {
     let partition_count = envelope.segment_index.len();
 
     let publication_budget = std::time::Duration::try_from(plan.max_metadata_publication_lag)
-      .unwrap_or(std::time::Duration::MAX);
+      .map_err(|_| {
+        WriteError::Internal(anyhow::anyhow!(
+          "metadata publication deadline must not be negative"
+        ))
+      })?;
     let remaining_budget = publication_budget
       .checked_sub(publication_started_at.elapsed())
       .ok_or_else(|| {

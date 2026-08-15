@@ -2,6 +2,7 @@
 #[path = "./consumer_group_leases_dynamo_test.rs"]
 mod tests;
 
+use crate::dynamo::duration_seconds_ceil;
 use crate::{
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupCommitOutcome,
@@ -44,7 +45,7 @@ const ATTR_TTL: &str = "ttl_epoch_seconds";
 pub struct DynamoConsumerGroupLeaseStore {
   client: Client,
   table_name: String,
-  ttl_buffer_seconds: i64,
+  ttl_buffer: Duration,
   capacity_metrics: Option<DynamoCapacityMetrics>,
 }
 
@@ -53,13 +54,13 @@ impl DynamoConsumerGroupLeaseStore {
   pub fn new(
     client: Client,
     table_name: impl Into<String>,
-    ttl_buffer_seconds: u32,
+    ttl_buffer: Duration,
     capacity_metrics: Option<DynamoCapacityMetrics>,
   ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
-      ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
+      ttl_buffer,
       capacity_metrics,
     }
   }
@@ -198,7 +199,7 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     let lease_duration_ms = i64::try_from(lease_duration.whole_milliseconds())
       .map_err(|_| anyhow!("lease duration exceeds Dynamo millisecond range"))?;
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
 
     let mut values = HashMap::new();
     values.insert(":owner".to_string(), AttributeValue::S(owner_id.clone()));
@@ -319,7 +320,7 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     let lease_duration_ms = i64::try_from(lease_duration.whole_milliseconds())
       .map_err(|_| anyhow!("lease duration exceeds Dynamo millisecond range"))?;
     let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
 
     let mut values = HashMap::new();
     values.insert(
@@ -511,7 +512,7 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
     values.insert(
       ":ttl".to_string(),
-      AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer_seconds)?.to_string()),
+      AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer)?.to_string()),
     );
     let update = format!(
       "SET {ATTR_LEASE_EXPIRES} = :now, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_GRACEFUL_RELEASE_TS} \
@@ -611,10 +612,12 @@ fn expires_at(now_ts_ms: i64, lease_duration_ms: i64) -> Result<i64> {
     .ok_or_else(|| anyhow!("lease expiration overflow"))
 }
 
-fn ttl_epoch_seconds(expires_at_ms: i64, ttl_buffer_seconds: i64) -> Result<i64> {
+fn ttl_epoch_seconds(expires_at_ms: i64, ttl_buffer: Duration) -> Result<i64> {
   let expires_at_seconds = expires_at_ms
     .checked_div(1_000)
     .ok_or_else(|| anyhow!("lease ttl conversion overflow"))?;
+  let ttl_buffer_seconds = duration_seconds_ceil(ttl_buffer)
+    .ok_or_else(|| anyhow!("lease ttl buffer conversion overflow"))?;
 
   expires_at_seconds
     .checked_add(ttl_buffer_seconds)

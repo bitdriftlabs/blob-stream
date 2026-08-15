@@ -3,6 +3,7 @@
 mod tests;
 
 use crate::aws::{is_dynamo_transaction_conflict, retry_dynamo_transaction_conflicts};
+use crate::dynamo::duration_seconds_ceil;
 use crate::dynamo_attributes::{
   ATTR_EPOCH,
   ATTR_EXPIRES,
@@ -50,7 +51,7 @@ const ATTR_MAX_SEQ: &str = "max_allocated_seq";
 pub struct DynamoProducerPartitionLeaseStore {
   client: Client,
   table_name: String,
-  ttl_buffer_seconds: i64,
+  ttl_buffer: Duration,
   capacity_metrics: Option<DynamoCapacityMetrics>,
 }
 
@@ -59,13 +60,13 @@ impl DynamoProducerPartitionLeaseStore {
   pub fn new(
     client: Client,
     table_name: impl Into<String>,
-    ttl_buffer_seconds: u32,
+    ttl_buffer: Duration,
     capacity_metrics: Option<DynamoCapacityMetrics>,
   ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
-      ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
+      ttl_buffer,
       capacity_metrics,
     }
   }
@@ -280,7 +281,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       .map_err(|_| anyhow!("lease expiration exceeds Dynamo millisecond range"))?;
     let now_ts_ms = unix_millis_from_offset_datetime(now)
       .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at_ms, self.ttl_buffer_seconds)?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at_ms, self.ttl_buffer)?;
     let pk = key.format();
 
     let mut values = HashMap::new();
@@ -394,7 +395,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       .map_err(|_| anyhow!("lease expiration exceeds Dynamo millisecond range"))?;
     let now_ts_ms = unix_millis_from_offset_datetime(now)
       .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at_ms, self.ttl_buffer_seconds)?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at_ms, self.ttl_buffer)?;
 
     let mut values = HashMap::new();
     values.insert(
@@ -611,7 +612,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     );
     values.insert(
       ":ttl".to_string(),
-      AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer_seconds)?.to_string()),
+      AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer)?.to_string()),
     );
 
     let update = format!("SET {ATTR_EXPIRES} = :expired, {ATTR_TTL} = :ttl");
@@ -745,10 +746,12 @@ fn expires_at(now: OffsetDateTime, lease_duration: Duration) -> Result<OffsetDat
     .ok_or_else(|| anyhow!("lease expiration overflow"))
 }
 
-fn ttl_epoch_seconds(expires_at_ms: i64, ttl_buffer_seconds: i64) -> Result<i64> {
+fn ttl_epoch_seconds(expires_at_ms: i64, ttl_buffer: Duration) -> Result<i64> {
   let expires_at_seconds = expires_at_ms
     .checked_div(1_000)
     .ok_or_else(|| anyhow!("lease ttl conversion overflow"))?;
+  let ttl_buffer_seconds = duration_seconds_ceil(ttl_buffer)
+    .ok_or_else(|| anyhow!("lease ttl buffer conversion overflow"))?;
 
   expires_at_seconds
     .checked_add(ttl_buffer_seconds)

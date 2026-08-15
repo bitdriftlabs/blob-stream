@@ -179,7 +179,7 @@ async fn writes_and_scans_window() -> Result<()> {
     table_name.clone(),
     "unused_producer_leases_table",
     HashMap::new(),
-    3_600,
+    TimeDuration::hours(1),
     None,
   );
   let first = build_segment("topic-a", 100, 1);
@@ -218,7 +218,7 @@ async fn scans_window_from_inclusive_snowflake() -> Result<()> {
     table_name.clone(),
     "unused_producer_leases_table",
     HashMap::new(),
-    3_600,
+    TimeDuration::hours(1),
     None,
   );
   let first = build_segment("topic-a", 100, 1);
@@ -250,14 +250,14 @@ async fn writes_segment_ttl_attribute() -> Result<()> {
   let table_name = format!("blob_segments_test_{}", Uuid::new_v4());
   create_segments_table(&client, &table_name).await?;
 
-  let mut retention_days = HashMap::new();
-  retention_days.insert("topic-a".into(), 7);
+  let mut topic_retention = HashMap::new();
+  topic_retention.insert("topic-a".into(), TimeDuration::days(7));
   let store = DynamoMetadataStore::new(
     client.clone(),
     table_name.clone(),
     "unused_producer_leases_table",
-    retention_days,
-    3_600,
+    topic_retention,
+    TimeDuration::hours(1),
     None,
   );
   let segment = build_segment("topic-a", 100, 1);
@@ -322,7 +322,7 @@ async fn skips_noncompliant_segment_rows() -> Result<()> {
     table_name.clone(),
     "unused_producer_leases_table",
     HashMap::new(),
-    3_600,
+    TimeDuration::hours(1),
     None,
   );
   let valid = build_segment("topic-a", 100, 2);
