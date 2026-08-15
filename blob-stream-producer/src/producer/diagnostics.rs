@@ -15,6 +15,7 @@ use protobuf::Chars;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 
 //
@@ -130,7 +131,8 @@ pub struct ProducerTopicSnapshot {
   pub name: Chars,
   pub partition_count: u32,
   pub num_writers: u32,
-  pub retention_days: u32,
+  #[serde(with = "humantime_serde")]
+  pub retention: Duration,
 }
 
 //
@@ -227,15 +229,14 @@ impl ProducerDiagnostics {
         name: topic.name.clone(),
         partition_count: topic.partition_count,
         num_writers: topic.num_writers,
-        retention_days: u32::try_from(
+        retention: Duration::try_from(
           topic
             .retention
             .as_ref()
             .expect("validated producer topic config requires retention")
-            .to_time_duration()
-            .whole_days(),
+            .to_time_duration(),
         )
-        .expect("validated producer topic retention must fit u32 days"),
+        .expect("validated producer topic retention must be positive"),
       })
       .collect::<Vec<_>>();
     topics.sort_by(|left, right| left.name.cmp(&right.name));

@@ -6533,7 +6533,7 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
     let id = format!("lease-expiry-recovery-{message_id}");
     produce_message(
       &producer,
-      format!("lease-expiry-recovery-key-{}", message_id % PARTITION_COUNT).into_bytes(),
+      format!("lease-expiry-key-{}", message_id % PARTITION_COUNT).into_bytes(),
       &id,
     )
     .await?;

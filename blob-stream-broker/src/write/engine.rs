@@ -296,7 +296,8 @@ impl WriteEngine for WriteEngineImpl {
           name: topic.name.clone(),
           partition_count: topic.partition_count,
           num_writers: topic.num_writers,
-          retention_days: u32::try_from(topic.retention.whole_days()).unwrap_or(u32::MAX),
+          retention: std::time::Duration::try_from(topic.retention)
+            .expect("topic retention is validated as positive"),
           local_partitions,
         }
       })

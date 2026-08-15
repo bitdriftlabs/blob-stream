@@ -120,7 +120,8 @@ pub struct BrokerTopicStateSnapshot {
   pub name: Chars,
   pub partition_count: u32,
   pub num_writers: u32,
-  pub retention_days: u32,
+  #[serde(with = "humantime_serde")]
+  pub retention: Duration,
   pub local_partitions: Vec<BrokerPartitionStateSnapshot>,
 }
 
