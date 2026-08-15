@@ -167,6 +167,14 @@ impl ConsumerIteratorBuilder<'_> {
       retention.is_positive(),
       "consumer retention recovery requires topic retention greater than zero"
     );
+    ensure!(
+      !maximum_metadata_publication_lag.is_negative(),
+      "consumer maximum metadata publication lag must not be negative"
+    );
+    ensure!(
+      !maximum_clock_skew.is_negative(),
+      "consumer maximum clock skew must not be negative"
+    );
     let read_config = runtime
       .read
       .as_ref()

@@ -400,6 +400,33 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
   );
 }
 
+#[test]
+fn reader_rejects_negative_publication_lag() {
+  let result = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    -TimeDuration::nanoseconds(1),
+    None,
+  );
+  let Err(error) = result else {
+    panic!("reader accepted a negative maximum metadata publication lag");
+  };
+
+  assert!(
+    error
+      .to_string()
+      .contains("maximum metadata publication lag must not be negative")
+  );
+}
+
 async fn write_segment(
   blob_store: &dyn BlobStore,
   metadata_store: &dyn MetadataStore,

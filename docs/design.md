@@ -343,7 +343,7 @@ query still apply their own frontier filters after the result is returned.
 
 For a usable source checkpoint that was not clamped to retention, recovery uses an inclusive lower
 bound only for its first window. Let $D$ be the broker's publication deadline plus the consumer's
-configured `max_clock_skew_ms` bound and the reader's effective visibility delay. The lower bound is
+configured `max_clock_skew` bound and the reader's effective visibility delay. The lower bound is
 the minimum Sonyflake at $max(checkpoint\_window\_start, checkpoint\_snowflake\_time - D)$,
 evaluated with millisecond precision and converted to its inclusive 10 ms Sonyflake bucket. The
 cursor remains the correctness watermark: the inclusive boundary row is replayed and skipped if its
@@ -414,12 +414,12 @@ changes remain prompt.
 ### Fast Query Bounds
 
 Let $D$ be the broker's enforced maximum metadata-publication lag plus the consumer's configured
-`max_clock_skew_ms` bound and the effective visibility delay. The Fast safe timestamp is
+`max_clock_skew` bound and the effective visibility delay. The Fast safe timestamp is
 $T_{safe} = now - D$. The reader considers the current window plus enough preceding windows to
 cover $D$, then omits every window whose end is at or before $T_{safe}$.
 
 For a configured skew bound $S$, eventual reads use $D = 15s + S + 2s$ by default, and strong
-reads use $D = 15s + S$. The unset `max_clock_skew_ms` default is $S = 10ms$, yielding 17.010s and
+reads use $D = 15s + S$. The unset `max_clock_skew` default is $S = 10ms$, yielding 17.010s and
 15.010s respectively. This is Fast's metadata-query lower-bound horizon, not a wait of that
 duration applied to every returned row: the publication deadline and clock-skew bound account for
 metadata that might not yet be safely queryable, while the visibility delay separately decides
@@ -485,7 +485,7 @@ the same window, recovery completes in one scan and the partition enters Fast. T
 consumer recovery or reassignment that overlaps a broker rolling restart.
 
 **Later recovery window.** Assume topic `telemetry` uses 300-second windows, the default
-15-second publication deadline, default `max_clock_skew_ms = 10ms`, and default 2-second
+15-second publication deadline, default `max_clock_skew = 10ms`, and default 2-second
 visibility delay, making $D = 17.010s$. At
 `now = 1,350`, the cutover window is `[1,200, 1,500)`. Partition 7 restores a usable source
 checkpoint from timestamp 1,020 in the earlier `[900, 1,200)` window. Its source-window query is
@@ -528,7 +528,7 @@ to close while preserving the normal visibility and cursor protections; it is co
 
 **Constantly producing Fast partition.** Assume one Fast partition in topic `telemetry` produces
 segments continuously in the `[900, 1,200)` window. With the default 15-second publication
-deadline, default `max_clock_skew_ms = 10ms`, and 2-second visibility delay, at `now = 1,020`
+deadline, default `max_clock_skew = 10ms`, and 2-second visibility delay, at `now = 1,020`
 $D = 17.010s$ and $T_{safe} = 1,002.990$.
 Suppose an earlier scan already observed a visibility-eligible segment at Sonyflake timestamp
 1,015, so its inclusive frontier is 1,015. The next query uses
@@ -542,7 +542,7 @@ separately deferred until 1,021. Thus 17.010 seconds controls how far back Fast 
 controls whether a returned metadata row is accepted on that pass.
 
 **Fast time floor and frontiers.** Assume topic `telemetry` uses 300-second windows, the default
-15-second publication deadline, default `max_clock_skew_ms = 10ms`, and default 2-second
+15-second publication deadline, default `max_clock_skew = 10ms`, and default 2-second
 visibility delay. At `now = 1,020`, the current window is `[900, 1,200)` and $D = 17.010s$, so
 $T_{safe} = 1,002.990$. The preceding window
 `[600, 900)` ended before $T_{safe}$ and is omitted. In the current window, partition 7 has an
@@ -563,7 +563,7 @@ trades data transfer for one fewer object-store request.
 
 The broker starts `max_metadata_publication_lag_ms` before segment construction and requires both
 blob upload and metadata persistence to finish within the remaining budget. The unset topic default
-is 15 seconds. Consumers add their configured `max_clock_skew_ms` bound (10 ms only when unset)
+is 15 seconds. Consumers add their configured `max_clock_skew` bound (10 ms only when unset)
 and their effective visibility delay to form $D$. Eventual reads use
 `metadata_visibility_delay_ms` (two seconds by default); strong reads use zero delay even when
 that setting is nonzero.
@@ -603,7 +603,7 @@ frontiers, replaying cursors, or retroactively changing a hydrated recovery sour
 Operational flag changes are expected to be infrequent: a strong-to-eventual change after hydration
 retains the shorter strong-mode overlap for that recovery. Strong mode ignores a configured nonzero
 `metadata_visibility_delay_ms` and accepts a row at its publication timestamp. The broker
-publication deadline and configured `max_clock_skew_ms` remain part of Fast and checkpoint-recovery
+publication deadline and configured `max_clock_skew` remain part of Fast and checkpoint-recovery
 overlap calculations in both modes.
 
 The delay is needed even though Fast retains a per-partition observed snowflake frontier. That
@@ -780,7 +780,7 @@ defaults are:
 | Producer retry deadline | 30 seconds |
 | Consumer metadata window | 300 seconds |
 | Broker metadata publication deadline | 15 seconds |
-| Consumer `max_clock_skew_ms` | 10 ms when unset |
+| Consumer `max_clock_skew` | 10 ms when unset |
 | Consumer metadata visibility delay | 2 seconds |
 | Consumer strong metadata reads | Disabled |
 | Consumer recovery slice | Up to 32 metadata windows per scan pass |
@@ -817,7 +817,7 @@ risks must use the stronger mechanisms described below.
 ### Clock Synchronization
 
 Fast scans and checkpoint-overlap recovery require a bounded pairwise clock offset between brokers
-and consumers. Configure `ConsumerReadConfig.max_clock_skew_ms` to a proven, monitored deployment
+and consumers. Configure `ConsumerReadConfig.max_clock_skew` to a proven, monitored deployment
 bound; it defaults to 10 ms only when unset and is not a generic NTP guarantee. A consumer that leads a broker beyond
 this bound can floor out a segment that is still publishing, while a broker that leads is
 conservative but adds latency. Managed time services are appropriate only when their documented or

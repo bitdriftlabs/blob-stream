@@ -833,6 +833,46 @@ fn runtime_config_with_prefetch_max_bytes(
   runtime
 }
 
+async fn build_iterator_with_clock_skew(
+  maximum_clock_skew: TimeDuration,
+) -> anyhow::Result<ConsumerIteratorImpl> {
+  let runtime = runtime_config();
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![3],
+    }));
+  ConsumerIteratorBuilder::new(
+    &runtime,
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    Arc::new(InMemoryConsumerGroupLeaseStore::new()),
+    Arc::new(InMemoryConsumerGroupMembershipStore::new()),
+    source,
+    metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )
+  .maximum_clock_skew(maximum_clock_skew)
+  .build()
+  .await
+}
+
+#[tokio::test]
+async fn iterator_builder_rejects_negative_clock_skew() {
+  let result = build_iterator_with_clock_skew(-TimeDuration::nanoseconds(1)).await;
+  let Err(error) = result else {
+    panic!("iterator builder accepted negative maximum clock skew");
+  };
+
+  assert!(
+    error
+      .to_string()
+      .contains("consumer maximum clock skew must not be negative")
+  );
+}
+
 #[tokio::test]
 async fn idle_prefetch_worker_processes_hydration_command_without_clock_advance() {
   let time_provider = Arc::new(ManualTimeProvider::new(time::OffsetDateTime::UNIX_EPOCH));

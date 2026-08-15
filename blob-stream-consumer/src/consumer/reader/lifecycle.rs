@@ -45,7 +45,11 @@ impl ConsumerReaderImpl {
     validate_read_config(&config)?;
     ensure!(
       retention.is_positive(),
-      "consumer retention recovery requires topic retention_days greater than zero"
+      "consumer retention recovery requires topic retention greater than zero"
+    );
+    ensure!(
+      !maximum_metadata_publication_lag.is_negative(),
+      "consumer maximum metadata publication lag must not be negative"
     );
     info!(
       "consumer reader initialized: topic={}, retention={}, maximum_metadata_publication_lag={}, \

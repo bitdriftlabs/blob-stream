@@ -21,13 +21,13 @@ transactional writes and reads at twice the normal capacity-unit rate.
 # What time source is required to operate blob-stream correctly?
 
 All brokers and consumers for a topic need a shared, continuously monitored time service with a
-bounded pairwise clock offset. Configure each consumer's `max_clock_skew_ms` to that bound; it
+bounded pairwise clock offset. Configure each consumer's `max_clock_skew` to that bound; it
 defaults to 10 ms only when unset. It is safe to retain the default only when the deployment can
 demonstrate and alert on a broker-to-consumer offset no greater than 10 ms; ordinary best-effort NTP
 synchronization is not itself an adequate guarantee.
 
 Use an infrastructure time source with a documented uncertainty or measure the actual offset and
-include its measurement, propagation, and alerting allowance in `max_clock_skew_ms`. Keep brokers
+include its measurement, propagation, and alerting allowance in `max_clock_skew`. Keep brokers
 and consumers in the same bounded-time domain. When the measured envelope exceeds the configured
 value, raise the consumer setting before operating the deployment. A consumer clock that leads a
 broker beyond this bound can omit a segment from the Fast or checkpoint-recovery floor; a leading

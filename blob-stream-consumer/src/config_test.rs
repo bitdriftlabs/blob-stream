@@ -63,6 +63,18 @@ fn candidate_windows_cover_publication_and_visibility_delay() {
 }
 
 #[test]
+fn candidate_windows_round_sub_millisecond_horizons_up() {
+  let mut read = read_config();
+  read.window_size = Duration::seconds(300).into_proto();
+  read.metadata_visibility_delay = (Duration::seconds(300) + Duration::nanoseconds(1)).into_proto();
+
+  assert_eq!(
+    consumer_candidate_window_count(&read, Duration::ZERO).unwrap(),
+    3
+  );
+}
+
+#[test]
 fn candidate_windows_rejects_unbounded_scan_horizon() {
   let mut read = read_config();
   read.window_size = Duration::seconds(300).into_proto();

@@ -213,13 +213,14 @@ pub fn consumer_candidate_window_count_with_availability_horizon(
   config: &ConsumerReadConfig,
   availability_horizon: Duration,
 ) -> Result<usize> {
-  let window_size_ms = u64::try_from(consumer_window_size(config).whole_milliseconds())
-    .map_err(|_| anyhow!("consumer.read.window_size_seconds must be positive"))?;
-  let coverage_ms = u64::try_from(availability_horizon.whole_milliseconds()).unwrap_or(u64::MAX);
-  let trailing_windows = coverage_ms
-    .checked_add(window_size_ms.saturating_sub(1))
+  let window_size_ns = u128::try_from(consumer_window_size(config).whole_nanoseconds())
+    .map_err(|_| anyhow!("consumer.read.window_size must be positive"))?;
+  let coverage_ns = u128::try_from(availability_horizon.whole_nanoseconds())
+    .map_err(|_| anyhow!("metadata availability horizon must not be negative"))?;
+  let trailing_windows = coverage_ns
+    .checked_add(window_size_ns.saturating_sub(1))
     .ok_or_else(|| anyhow!("metadata availability horizon is too large"))?
-    / window_size_ms;
+    / window_size_ns;
   let candidate_windows = usize::try_from(trailing_windows.saturating_add(1))
     .map_err(|_| anyhow!("metadata availability horizon has too many windows"))?;
   ensure!(

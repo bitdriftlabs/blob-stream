@@ -15,7 +15,7 @@ failure modes and can be enabled independently.
 | `fenced_metadata_writes` or `blob_stream_broker_fenced_metadata_writes` | `false` | A former producer-lease holder publishing after replacement | Each publication becomes a DynamoDB transaction. It conditions metadata publication on every current lease, requires additional IAM actions, and is limited to 99 producer-lease checks per plan. |
 
 Strong reads remove the eventual-read visibility margin; the broker's metadata publication deadline
-and the consumer's configured `max_clock_skew_ms` still apply to the Fast and checkpoint horizon.
+and the consumer's configured `max_clock_skew` still apply to the Fast and checkpoint horizon.
 Fenced writes retain a durable holder ID, lease epoch, and session ID in every producer lease row
 regardless of whether the mode is enabled.
 
@@ -85,7 +85,7 @@ capacity or routing.
 4. For eventual-read consumers, decide whether the configured visibility margin is adequate; enable
    strong metadata reads only when replica staleness is the relevant risk and the RRU increase is
    acceptable.
-5. Verify that broker and consumer clocks remain within the consumer's `max_clock_skew_ms` bound;
+5. Verify that broker and consumer clocks remain within the consumer's `max_clock_skew` bound;
    investigate time-source or clock-health alerts before widening the availability horizon.
 
 ### Stale Producer Publication Must Be Rejected
@@ -101,6 +101,6 @@ capacity or routing.
 1. Inspect consumer metadata scan and blob-range metrics in the embedding application's
    `bd-server-stats` registry.
 2. Compare recovery work with topic retention and the availability horizon: publication lag,
-   the consumer's `max_clock_skew_ms`, and the effective visibility delay.
+   the consumer's `max_clock_skew`, and the effective visibility delay.
 3. Use [Cost analysis](cost-analysis.md) with observed page and range-read rates before changing
    strong-read or transactional-publication modes.
