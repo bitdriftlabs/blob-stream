@@ -4608,7 +4608,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     efetch_max_bytes\x18\x06\x20\x01(\x04H\0R\x10prefetchMaxBytesB\x07\xfaB\
     \x042\x02\x20\0\x88\x01\x01\x12_\n\x19metadata_visibility_delay\x18\t\
     \x20\x01(\x0b2\x19.google.protobuf.DurationR\x17metadataVisibilityDelayB\
-    \x08\xfaB\x05\xaa\x01\x02*\0\x12F\n\x19max_in_flight_batch_reads\x18\n\
+    \x08\xfaB\x05\xaa\x01\x022\0\x12F\n\x19max_in_flight_batch_reads\x18\n\
     \x20\x01(\x04H\x01R\x15maxInFlightBatchReadsB\x07\xfaB\x042\x02\x20\0\
     \x88\x01\x01\x12P\n\"strongly_consistent_metadata_reads\x18\x0b\x20\x01(\
     \x08H\x02R\x1fstronglyConsistentMetadataReads\x88\x01\x01\x12I\n\x0emax_\

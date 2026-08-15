@@ -100,6 +100,14 @@ fn metadata_visibility_delay_uses_explicit_value() {
 }
 
 #[test]
+fn validate_read_config_accepts_zero_metadata_visibility_delay() {
+  let mut read = read_config();
+  read.metadata_visibility_delay = Duration::ZERO.into_proto();
+
+  validate_read_config(&read).unwrap();
+}
+
+#[test]
 fn consumer_clock_skew_uses_default_and_explicit_values() {
   let mut read = read_config();
   assert_eq!(consumer_max_clock_skew(&read), Duration::milliseconds(10));

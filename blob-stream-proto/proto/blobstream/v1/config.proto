@@ -335,7 +335,7 @@ message ConsumerReadConfig {
   // Delay accepting recently published metadata rows while using eventually consistent reads.
   // Default when unset: 2,000 ms. This is a best-effort staleness margin, not a
   // consistency guarantee because the metadata store has no bounded replication delay.
-  google.protobuf.Duration metadata_visibility_delay = 9 [(validate.rules).duration.gt = {}];
+  google.protobuf.Duration metadata_visibility_delay = 9 [(validate.rules).duration.gte = {}];
 
   // Maximum number of batch byte-range reads and decodes that may run concurrently.
   // Default when unset: 32.
