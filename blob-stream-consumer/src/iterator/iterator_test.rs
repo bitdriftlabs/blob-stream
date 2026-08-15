@@ -144,6 +144,15 @@ fn seek_trace_records_cancellation_and_parents_recovery() {
   );
 }
 
+#[test]
+fn lease_expiration_deadline_matches_store_millisecond_precision() {
+  let now = OffsetDateTime::UNIX_EPOCH + TimeDuration::seconds(1) + TimeDuration::microseconds(999);
+  let deadline = super::driver::persisted_lease_expires_at(now, TimeDuration::seconds(30)).unwrap();
+
+  assert_eq!(deadline, offset_datetime_from_unix_millis(31_000));
+  assert!(deadline < now.saturating_add(TimeDuration::seconds(30)));
+}
+
 #[async_trait::async_trait]
 impl ConsumerLifecycleHooks for CommitGateHooks {
   async fn before_commit(&self, _member_id: &str, _generation: u64) {

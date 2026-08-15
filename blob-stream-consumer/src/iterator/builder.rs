@@ -1,4 +1,4 @@
-use super::driver::{ConsumerDriver, retry_backoff};
+use super::driver::{ConsumerDriver, persisted_lease_expires_at, retry_backoff};
 use super::shared::ConsumerIteratorMetrics;
 use super::{
   ConsumerCoordinationSource,
@@ -204,6 +204,7 @@ impl ConsumerIteratorBuilder<'_> {
     let now = time_provider.now();
     let now_ts_ms = now.unix_timestamp_ms();
     let membership_lease_duration = consumer_lease_duration(&group_config);
+    let membership_lease_expires_at = persisted_lease_expires_at(now, membership_lease_duration)?;
     let delivery_notify = Arc::new(Notify::new());
     let prefetch_space_notify = Arc::new(Notify::new());
     let reader_command_notify = Arc::new(Notify::new());
@@ -248,8 +249,8 @@ impl ConsumerIteratorBuilder<'_> {
       revocation_notify,
       lifecycle_hooks,
       time_provider,
-      membership_lease_expires_at: now.saturating_add(membership_lease_duration),
-      active_partition_lease_expiration_deadline: now.saturating_add(membership_lease_duration),
+      membership_lease_expires_at,
+      active_partition_lease_expiration_deadline: membership_lease_expires_at,
       next_heartbeat_at: now,
       next_rebalance_at: now,
       heartbeat_retry_backoff: retry_backoff(),

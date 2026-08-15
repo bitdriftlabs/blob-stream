@@ -193,7 +193,7 @@ impl ConsumerDriver {
     }
     if matches!(trigger, HeartbeatTrigger::Scheduled) {
       self.membership_lease_expires_at =
-        now.saturating_add(consumer_lease_duration(&self.group_config));
+        super::persisted_lease_expires_at(now, consumer_lease_duration(&self.group_config))?;
     }
 
     let committed_cursors = pending_commits
@@ -251,7 +251,7 @@ impl ConsumerDriver {
 
     if matches!(trigger, HeartbeatTrigger::Scheduled) {
       self.active_partition_lease_expiration_deadline =
-        now.saturating_add(consumer_lease_duration(&self.group_config));
+        super::persisted_lease_expires_at(now, consumer_lease_duration(&self.group_config))?;
     }
     self.record_successful_heartbeat(now_ts_ms, trigger, &report, &pending_commits, started_at);
 

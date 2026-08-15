@@ -36,7 +36,7 @@ use crate::diagnostics::{
 };
 use anyhow::{Result, anyhow, ensure};
 use bd_backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
-use bd_time::TimeProvider;
+use bd_time::{OffsetDateTimeExt, TimeProvider};
 use blob_stream_metadata_store::{ConsumerGroupAssignmentPlan, ConsumerGroupMembershipStore};
 use blob_stream_types::{CommittedCursor, VirtualPartitionId, offset_datetime_from_unix_millis};
 use log::{debug, info, trace};
@@ -67,6 +67,19 @@ pub(in crate::iterator) fn retry_backoff() -> ExponentialBackoff {
     .with_multiplier(2.0)
     .with_max_interval(RETRY_MAX_DELAY)
     .build()
+}
+
+pub(in crate::iterator) fn persisted_lease_expires_at(
+  now: OffsetDateTime,
+  lease_duration: TimeDuration,
+) -> Result<OffsetDateTime> {
+  let lease_duration_ms = i64::try_from(lease_duration.whole_milliseconds())
+    .map_err(|_| anyhow!("consumer lease duration exceeds millisecond range"))?;
+  let expires_at_ms = now
+    .unix_timestamp_ms()
+    .checked_add(lease_duration_ms)
+    .ok_or_else(|| anyhow!("consumer lease expiration exceeds millisecond range"))?;
+  Ok(offset_datetime_from_unix_millis(expires_at_ms))
 }
 
 //
