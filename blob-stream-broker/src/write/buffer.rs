@@ -97,6 +97,7 @@ pub(super) struct FlushPlan {
   pub(super) topic: Chars,
   pub(super) partitions: Vec<FlushPartition>,
   pub(super) max_metadata_publication_lag: Duration,
+  pub(super) metadata_window_size: Duration,
   pub(super) fenced_metadata_writes: bool,
 }
 

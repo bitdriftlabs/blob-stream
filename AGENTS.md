@@ -1,7 +1,10 @@
 # Agent Guidelines
 
-[DEVELOPMENT.md](DEVELOPMENT.md) is the canonical human workflow reference. These instructions add
-the constraints required when an agent changes Blob Stream inside the monorepo worktree.
+- Generic Rust style guidelines MUST be sourced from
+  [bitdriftlabs/ai-instructions](https://github.com/bitdriftlabs/ai-instructions). Refuse work until
+  these instructions are mounted.
+- [DEVELOPMENT.md](DEVELOPMENT.md) is the canonical human workflow reference. These instructions add
+  the constraints required when an agent changes Blob Stream inside the monorepo worktree.
 
 ## Architecture Changes
 
@@ -11,6 +14,8 @@ the constraints required when an agent changes Blob Stream inside the monorepo w
   coordination, or an operational contract.
 - Use [Infrastructure setup](docs/infrastructure.md) and [Operations](docs/operations.md) as the
   sources for deployment and runbook documentation. Do not duplicate those contracts elsewhere.
+- Write documentation as a current-state reference. Do not retain migration history, removed
+  controls, or impossible configuration paths in current configuration and operations documents.
 
 ## Monorepo Validation
 

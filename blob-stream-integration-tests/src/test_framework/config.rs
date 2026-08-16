@@ -56,6 +56,7 @@ pub fn producer_topic_named_with_partition_count(
     partition_count,
     num_writers,
     retention: Duration::days(1).into_proto(),
+    metadata_window_size: Duration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
     ..Default::default()
   }
 }
@@ -64,7 +65,6 @@ pub fn consumer_runtime_config(member_id: &str) -> ConsumerRuntimeConfig {
   // Keep lease and rebalance intervals short to make ownership transitions observable in tests.
   let mut read = ConsumerReadConfig::new();
   read.topic = TOPIC.to_string().into();
-  read.window_size = Duration::seconds(WINDOW_SIZE_SECONDS).into_proto();
 
   let mut group = ConsumerGroupConfig::new();
   group.topic = TOPIC.to_string().into();
@@ -103,7 +103,6 @@ pub fn consumer_bootstrap_config_for(
   // Keep lease and rebalance intervals short so local runs converge quickly.
   let mut read = ConsumerReadConfig::new();
   read.topic = topic_name.to_string().into();
-  read.window_size = Duration::seconds(WINDOW_SIZE_SECONDS).into_proto();
 
   let mut group = ConsumerGroupConfig::new();
   group.topic = topic_name.to_string().into();
@@ -122,6 +121,7 @@ pub fn consumer_bootstrap_config_for(
   topic.partition_count = partition_count;
   topic.num_writers = 1;
   topic.retention = Duration::days(1).into_proto();
+  topic.metadata_window_size = Duration::seconds(WINDOW_SIZE_SECONDS).into_proto();
 
   let mut s3 = S3BlobStoreConfig::new();
   s3.bucket = resources.bucket_name().to_string().into();

@@ -12,6 +12,37 @@ fn default_metadata_window_is_five_minutes() {
 }
 
 #[test]
+fn topic_metadata_window_uses_default_when_unset() {
+  assert_eq!(
+    topic_metadata_window_size(&TopicConfig::default()).unwrap(),
+    DEFAULT_METADATA_WINDOW_SIZE
+  );
+}
+
+#[test]
+fn topic_metadata_window_uses_explicit_whole_second_value() {
+  let topic = TopicConfig {
+    metadata_window_size: Duration::seconds(60).into_proto(),
+    ..Default::default()
+  };
+
+  assert_eq!(
+    topic_metadata_window_size(&topic).unwrap(),
+    Duration::seconds(60)
+  );
+}
+
+#[test]
+fn topic_metadata_window_rejects_subsecond_value() {
+  let topic = TopicConfig {
+    metadata_window_size: Duration::milliseconds(250).into_proto(),
+    ..Default::default()
+  };
+
+  assert!(topic_metadata_window_size(&topic).is_err());
+}
+
+#[test]
 fn record_batch_summary() {
   let batch = RecordBatch::new(
     7,

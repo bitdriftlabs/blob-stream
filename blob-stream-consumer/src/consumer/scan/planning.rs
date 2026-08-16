@@ -15,7 +15,6 @@ use super::{
   VirtualPartitionId,
   VirtualPartitionState,
   Window,
-  consumer_window_size,
   offset_datetime_from_unix_seconds,
   trace,
 };
@@ -39,7 +38,7 @@ impl ConsumerReaderImpl {
     let window_end_unix_seconds = request
       .window
       .window_start_unix_seconds
-      .saturating_add(consumer_window_size(&self.config).whole_seconds());
+      .saturating_add(self.metadata_window_size.whole_seconds());
     if !request.recovery_scan
       || request.eligibility.fast
       || request.eligibility.fresh
@@ -63,15 +62,15 @@ impl ConsumerReaderImpl {
     // Anchor scans to the current window and cover the enforced publication deadline plus the
     // effective visibility delay. Oldest -> newest ordering keeps traversal deterministic.
     let now_unix_seconds = now.unix_timestamp();
-    let current_window = Window::for_timestamp(now, consumer_window_size(&self.config))
+    let current_window = Window::for_timestamp(now, self.metadata_window_size)
       .start
       .unix_timestamp();
 
     let candidate_windows = consumer_candidate_window_count_with_availability_horizon(
-      &self.config,
+      self.metadata_window_size,
       self.availability_horizon(runtime_settings).duration(),
     )?;
-    let window_size_seconds = consumer_window_size(&self.config).whole_seconds();
+    let window_size_seconds = self.metadata_window_size.whole_seconds();
     let mut windows = Vec::with_capacity(candidate_windows);
     for offset in (0 .. candidate_windows).rev() {
       let offset = i64::try_from(offset).unwrap_or(i64::MAX);
@@ -255,7 +254,7 @@ impl ConsumerReaderImpl {
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<Vec<(TopicWindowKey, SnowflakeId)>> {
     let safe_timestamp = self.fast_scan_safe_timestamp(now, runtime_settings);
-    let window_size_seconds = consumer_window_size(&self.config).whole_seconds();
+    let window_size_seconds = self.metadata_window_size.whole_seconds();
     let windows = self
       .scan_windows(now, runtime_settings)?
       .into_iter()
@@ -367,7 +366,7 @@ impl ConsumerReaderImpl {
       let (partition_id, recovery_start_window, recovery_cutover_window) =
         recovering_partitions[next_partition_index];
       self.recovery_scan_last_partition = Some(partition_id);
-      let window_size_seconds = consumer_window_size(&self.config).whole_seconds();
+      let window_size_seconds = self.metadata_window_size.whole_seconds();
       for offset in 0 .. MAX_RECOVERY_WINDOWS_PER_SCAN {
         let offset = i64::try_from(offset).unwrap_or(i64::MAX);
         let window_start =

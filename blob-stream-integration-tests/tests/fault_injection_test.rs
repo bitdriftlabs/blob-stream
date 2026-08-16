@@ -30,7 +30,6 @@ use framework::{
   TOPIC,
   TestConsumerReader,
   TestEventMatcher,
-  WINDOW_SIZE_SECONDS,
   append_reader_delivery_traces,
   consumer_runtime_config,
   drain_reader_until_with_trace,
@@ -328,7 +327,6 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -812,7 +810,6 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     (0 .. framework::PARTITION_COUNT).collect(),
@@ -1050,7 +1047,6 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -1210,7 +1206,6 @@ async fn producer_retry_deadline_respected_after_transport_failures() -> Result<
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     vec![recovery_ack.virtual_partition_id],
@@ -1341,7 +1336,6 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -1421,7 +1415,6 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -1532,7 +1525,6 @@ async fn s3_get_not_found_consumer_skips_lost_data() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -1821,7 +1813,6 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -2061,7 +2052,6 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -3438,7 +3428,6 @@ async fn combined_network_and_metadata_faults_preserve_producer_publication() ->
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),

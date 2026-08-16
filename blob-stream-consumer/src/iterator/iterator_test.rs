@@ -816,7 +816,6 @@ fn runtime_config_with_prefetch_max_bytes(
 ) -> ConsumerRuntimeConfig {
   let mut read = ConsumerReadConfig::new();
   read.topic = "telemetry".to_string().into();
-  read.window_size = TimeDuration::seconds(300).into_proto();
   read.prefetch_max_bytes = prefetch_max_bytes;
 
   let mut group = ConsumerGroupConfig::new();
@@ -1070,7 +1069,6 @@ async fn iterator_builder_applies_configured_clock_skew_to_reader_scan_horizon()
     }));
   let mut runtime = runtime_config();
   let read = runtime.read.as_mut().unwrap();
-  read.window_size = TimeDuration::seconds(1).into_proto();
   read.max_clock_skew = TimeDuration::milliseconds(1_001).into_proto();
   read.strongly_consistent_metadata_reads = Some(true);
   let maximum_clock_skew = consumer_max_clock_skew(read);
@@ -1088,6 +1086,7 @@ async fn iterator_builder_applies_configured_clock_skew_to_reader_scan_horizon()
     None,
   )
   .maximum_clock_skew(maximum_clock_skew)
+  .metadata_window_size(TimeDuration::seconds(1))
   .time_provider(time_provider.clone())
   .build()
   .await

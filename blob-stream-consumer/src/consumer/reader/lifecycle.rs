@@ -18,7 +18,6 @@ use super::{
   VirtualPartitionState,
   Window,
   consumer_read_runtime_settings,
-  consumer_window_size,
   ensure,
   info,
   offset_datetime_from_unix_seconds,
@@ -91,6 +90,7 @@ impl ConsumerReaderImpl {
       virtual_partition_states,
       retention,
       maximum_metadata_publication_lag,
+      metadata_window_size: blob_stream_types::DEFAULT_METADATA_WINDOW_SIZE,
       maximum_clock_skew: consumer_max_clock_skew(&config),
       fast_frontiers: HashMap::new(),
       recovery_scan_last_partition: None,
@@ -111,6 +111,13 @@ impl ConsumerReaderImpl {
   }
 
   #[must_use]
+  /// Override the shared topic metadata-window contract for this reader.
+  pub(crate) fn metadata_window_size(mut self, metadata_window_size: Duration) -> Self {
+    self.metadata_window_size = metadata_window_size;
+    self
+  }
+
+  #[must_use]
   /// Return the bounded availability horizon for one resolved read pass.
   pub(in crate::consumer) fn availability_horizon(
     &self,
@@ -124,7 +131,7 @@ impl ConsumerReaderImpl {
   }
 
   fn window_start(&self, timestamp: OffsetDateTime) -> OffsetDateTime {
-    Window::for_timestamp(timestamp, consumer_window_size(&self.config)).start
+    Window::for_timestamp(timestamp, self.metadata_window_size).start
   }
 
   fn retention_floor_window_start(&self, cutover_window_start: OffsetDateTime) -> OffsetDateTime {

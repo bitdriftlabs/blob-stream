@@ -2,12 +2,21 @@
 
 # blob-stream
 
-`blob-stream` is a Kafka-like streaming system for high-throughput telemetry workloads that
-prioritizes storage cost over ultra-low latency. Brokers accept producer batches, persist compressed
+`blob-stream` is a Kafka-like streaming system for high-throughput workloads that prioritizes total
+cost of ownership over ultra-low latency. Brokers accept producer batches, persist compressed
 payload segments in blob storage, and publish metadata indexes for pull-based consumers.
 
 Delivery is at least once. Producers can retry ambiguous requests and consumers can replay records
 after interrupted commits or rebalances, so applications must tolerate duplicates.
+
+# Goals
+
+- Zero cross-AZ traffic.
+- Stateless brokers with zero local storage.
+- Brokers can autoscale at will without downtime.
+- No independent control plane or cluster manager. Producers, brokers, and consumers coordinate
+  entirely either through K8s service discovery and the DynamoDB metadata store.
+- Excellent observability via metrics, OTLP traces, and admin HTTP state snapshots.
 
 ## System At A Glance
 
@@ -19,6 +28,12 @@ after interrupted commits or rebalances, so applications must tolerate duplicate
   segment blobs with metadata indexes.
 - Consumers scan metadata windows, range-read selected blob batches, and commit progress per
   virtual partition.
+
+## Requirements
+
+- Blob-stream **requires** a shared accurate clock between brokers and consumers. See the
+  [FAQ](docs/faq.md) for more information. This system was designed and implemented around the
+  AWS Time Sync Service and assumes accurate clocks.
 
 ## Project Layout
 

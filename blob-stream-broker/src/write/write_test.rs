@@ -64,6 +64,8 @@ use std::time::Duration as StdDuration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::{Semaphore, mpsc, watch};
 
+const DEFAULT_TEST_METADATA_WINDOW_SIZE: TimeDuration = TimeDuration::minutes(5);
+
 struct GatedBlobStore {
   entered_tx: mpsc::UnboundedSender<String>,
   release_first: Arc<Semaphore>,
@@ -616,14 +618,34 @@ fn make_engine(
   config: WriteConfig,
   shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
 ) -> Result<(Arc<WriteEngineImpl>, Arc<InMemoryMetadataStore>)> {
+  make_engine_with_metadata_window_size(
+    time_provider,
+    config,
+    DEFAULT_TEST_METADATA_WINDOW_SIZE,
+    shutdown_trigger_handle,
+  )
+}
+
+fn make_engine_with_metadata_window_size(
+  time_provider: Arc<ManualTimeProvider>,
+  config: WriteConfig,
+  metadata_window_size: TimeDuration,
+  shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
+) -> Result<(Arc<WriteEngineImpl>, Arc<InMemoryMetadataStore>)> {
   let (engine, metadata_store, _lease_store) =
-    make_engine_with_lease_store(time_provider, config, shutdown_trigger_handle)?;
+    make_engine_with_lease_store_and_metadata_window_size(
+      time_provider,
+      config,
+      metadata_window_size,
+      shutdown_trigger_handle,
+    )?;
   Ok((engine, metadata_store))
 }
 
-fn make_two_partition_engine(
+fn make_two_partition_engine_with_metadata_window_size(
   time_provider: Arc<ManualTimeProvider>,
   config: WriteConfig,
+  metadata_window_size: TimeDuration,
   shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
 ) -> Result<(Arc<WriteEngineImpl>, Arc<InMemoryMetadataStore>)> {
   let mut topics = HashMap::new();
@@ -635,6 +657,7 @@ fn make_two_partition_engine(
       num_writers: 1,
       retention: TimeDuration::days(7),
       max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+      metadata_window_size,
     },
   );
 
@@ -664,13 +687,57 @@ fn make_engine_with_lease_store(
   Arc<InMemoryMetadataStore>,
   Arc<InMemoryProducerPartitionLeaseStore>,
 )> {
+  make_engine_with_lease_store_and_metadata_window_size(
+    time_provider,
+    config,
+    DEFAULT_TEST_METADATA_WINDOW_SIZE,
+    shutdown_trigger_handle,
+  )
+}
+
+fn make_engine_with_lease_store_and_metadata_window_size(
+  time_provider: Arc<ManualTimeProvider>,
+  config: WriteConfig,
+  metadata_window_size: TimeDuration,
+  shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
+) -> Result<(
+  Arc<WriteEngineImpl>,
+  Arc<InMemoryMetadataStore>,
+  Arc<InMemoryProducerPartitionLeaseStore>,
+)> {
   let scope = metrics_scope();
-  make_engine_with_lease_store_and_scope(time_provider, config, &scope, shutdown_trigger_handle)
+  make_engine_with_lease_store_and_scope_and_metadata_window_size(
+    time_provider,
+    config,
+    metadata_window_size,
+    &scope,
+    shutdown_trigger_handle,
+  )
 }
 
 fn make_engine_with_lease_store_and_scope(
   time_provider: Arc<ManualTimeProvider>,
   config: WriteConfig,
+  metrics_scope: &Scope,
+  shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
+) -> Result<(
+  Arc<WriteEngineImpl>,
+  Arc<InMemoryMetadataStore>,
+  Arc<InMemoryProducerPartitionLeaseStore>,
+)> {
+  make_engine_with_lease_store_and_scope_and_metadata_window_size(
+    time_provider,
+    config,
+    DEFAULT_TEST_METADATA_WINDOW_SIZE,
+    metrics_scope,
+    shutdown_trigger_handle,
+  )
+}
+
+fn make_engine_with_lease_store_and_scope_and_metadata_window_size(
+  time_provider: Arc<ManualTimeProvider>,
+  config: WriteConfig,
+  metadata_window_size: TimeDuration,
   metrics_scope: &Scope,
   shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
 ) -> Result<(
@@ -687,6 +754,7 @@ fn make_engine_with_lease_store_and_scope(
       num_writers: 1,
       retention: TimeDuration::days(7),
       max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+      metadata_window_size,
     },
   );
 
@@ -982,11 +1050,12 @@ async fn buffers_until_size_rollover() -> Result<()> {
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 10;
   config.flush_max_delay = TimeDuration::milliseconds(60_000);
-  config.window_size = TimeDuration::seconds(60);
+  let metadata_window_size = TimeDuration::seconds(60);
 
-  let (engine, metadata_store) = make_engine(
+  let (engine, metadata_store) = make_engine_with_metadata_window_size(
     time_provider.clone(),
     config.clone(),
+    metadata_window_size,
     shutdown_trigger.make_handle(),
   )?;
 
@@ -1002,7 +1071,7 @@ async fn buffers_until_size_rollover() -> Result<()> {
   tokio::task::yield_now().await;
   assert!(!first.is_finished());
 
-  let window = Window::for_timestamp(time_provider.now(), config.window_size);
+  let window = Window::for_timestamp(time_provider.now(), metadata_window_size);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -1067,6 +1136,7 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
           num_writers: 1,
           retention: TimeDuration::days(7),
           max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+          metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
         },
       )]),
       Arc::new(InMemoryBlobStore::new()),
@@ -1146,6 +1216,7 @@ async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
           num_writers: 1,
           retention: TimeDuration::days(7),
           max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+          metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
         },
       )]),
       Arc::new(InMemoryBlobStore::new()),
@@ -1207,11 +1278,12 @@ async fn flushes_on_time_rollover() -> Result<()> {
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1024;
   config.flush_max_delay = TimeDuration::milliseconds(500);
-  config.window_size = TimeDuration::seconds(60);
+  let metadata_window_size = TimeDuration::seconds(60);
 
-  let (engine, metadata_store) = make_engine(
+  let (engine, metadata_store) = make_engine_with_metadata_window_size(
     time_provider.clone(),
     config.clone(),
+    metadata_window_size,
     shutdown_trigger.make_handle(),
   )?;
 
@@ -1233,7 +1305,7 @@ async fn flushes_on_time_rollover() -> Result<()> {
 
   first.await??;
 
-  let window = Window::for_timestamp(time_provider.now(), config.window_size);
+  let window = Window::for_timestamp(time_provider.now(), metadata_window_size);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -1255,11 +1327,12 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
   config.flush_max_delay = TimeDuration::milliseconds(10);
-  config.window_size = TimeDuration::seconds(60);
+  let metadata_window_size = TimeDuration::seconds(60);
 
-  let (engine, metadata_store) = make_two_partition_engine(
+  let (engine, metadata_store) = make_two_partition_engine_with_metadata_window_size(
     time_provider.clone(),
     config.clone(),
+    metadata_window_size,
     shutdown_trigger.make_handle(),
   )?;
 
@@ -1318,7 +1391,7 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
   first.await??;
   second.await??;
 
-  let window = Window::for_timestamp(time_provider.now(), config.window_size);
+  let window = Window::for_timestamp(time_provider.now(), metadata_window_size);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -1414,11 +1487,12 @@ async fn time_due_flush_completes_before_later_byte_flush() -> Result<()> {
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 2;
   config.flush_max_delay = TimeDuration::milliseconds(10);
-  config.window_size = TimeDuration::seconds(60);
+  let metadata_window_size = TimeDuration::seconds(60);
 
-  let (engine, metadata_store) = make_two_partition_engine(
+  let (engine, metadata_store) = make_two_partition_engine_with_metadata_window_size(
     time_provider.clone(),
     config.clone(),
+    metadata_window_size,
     shutdown_trigger.make_handle(),
   )?;
   time_provider.wait_until_sleeping(1).await;
@@ -1486,7 +1560,7 @@ async fn time_due_flush_completes_before_later_byte_flush() -> Result<()> {
   });
   byte_due.await??;
 
-  let window = Window::for_timestamp(time_provider.now(), config.window_size);
+  let window = Window::for_timestamp(time_provider.now(), metadata_window_size);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -1518,11 +1592,12 @@ async fn byte_flush_does_not_coalesce_buffered_topic_peers() -> Result<()> {
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 2;
   config.flush_max_delay = TimeDuration::milliseconds(10);
-  config.window_size = TimeDuration::seconds(60);
+  let metadata_window_size = TimeDuration::seconds(60);
 
-  let (engine, metadata_store) = make_two_partition_engine(
+  let (engine, metadata_store) = make_two_partition_engine_with_metadata_window_size(
     time_provider.clone(),
     config.clone(),
+    metadata_window_size,
     shutdown_trigger.make_handle(),
   )?;
   let peer_engine = Arc::clone(&engine);
@@ -1557,7 +1632,7 @@ async fn byte_flush_does_not_coalesce_buffered_topic_peers() -> Result<()> {
     .await?;
   assert!(!peer.is_finished());
 
-  let window = Window::for_timestamp(time_provider.now(), config.window_size);
+  let window = Window::for_timestamp(time_provider.now(), metadata_window_size);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -1676,6 +1751,7 @@ async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
           num_writers: 1,
           retention: TimeDuration::days(7),
           max_metadata_publication_lag: TimeDuration::milliseconds(1),
+          metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
         },
       )]),
       Arc::new(BlockingBlobStore {
@@ -1741,6 +1817,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
         num_writers: 1,
         retention: TimeDuration::days(7),
         max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+        metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
       },
     );
   }
@@ -1834,6 +1911,7 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
           num_writers: 1,
           retention: TimeDuration::days(7),
           max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+          metadata_window_size: TimeDuration::seconds(60),
         },
       )]),
       Arc::new(GatedBlobStore {
@@ -1882,7 +1960,7 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
   receive_blob_write(&mut entered_rx).await;
   second.await??;
 
-  let window = Window::for_timestamp(time_provider.now(), config.window_size);
+  let window = Window::for_timestamp(time_provider.now(), TimeDuration::seconds(60));
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -1936,6 +2014,7 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
           num_writers: 1,
           retention: TimeDuration::days(7),
           max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+          metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
         },
       )]),
       Arc::new(BlockingBlobStore {
@@ -2052,10 +2131,7 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   }
   assert!(acquired_by_b, "lease was not released after drain");
 
-  let window = Window::for_timestamp(
-    time_provider.now(),
-    WriteConfig::with_defaults().window_size,
-  );
+  let window = Window::for_timestamp(time_provider.now(), DEFAULT_TEST_METADATA_WINDOW_SIZE);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -2096,6 +2172,7 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
           num_writers: 1,
           retention: TimeDuration::days(7),
           max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+          metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
         },
       )]),
       Arc::new(BlockingBlobStore {
@@ -2186,6 +2263,7 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
         num_writers: 1,
         retention: TimeDuration::days(7),
         max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+        metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
       },
     );
   }
@@ -2267,6 +2345,7 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
           num_writers: 1,
           retention: TimeDuration::days(7),
           max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+          metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
         },
       )
     })
@@ -2368,6 +2447,7 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
         num_writers: 1,
         retention: TimeDuration::days(7),
         max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+        metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
       },
     );
   }
@@ -2465,11 +2545,12 @@ async fn writes_compressed_metadata() -> Result<()> {
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 5;
   config.flush_max_delay = TimeDuration::milliseconds(60_000);
-  config.window_size = TimeDuration::seconds(60);
+  let metadata_window_size = TimeDuration::seconds(60);
 
-  let (engine, metadata_store) = make_engine(
+  let (engine, metadata_store) = make_engine_with_metadata_window_size(
     time_provider.clone(),
     config.clone(),
+    metadata_window_size,
     shutdown_trigger.make_handle(),
   )?;
 
@@ -2481,7 +2562,7 @@ async fn writes_compressed_metadata() -> Result<()> {
 
   engine.produce_batch(request).await?;
 
-  let window = Window::for_timestamp(time_provider.now(), config.window_size);
+  let window = Window::for_timestamp(time_provider.now(), metadata_window_size);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -2534,6 +2615,7 @@ async fn returns_error_when_flush_fails() -> Result<()> {
       num_writers: 1,
       retention: TimeDuration::days(7),
       max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+      metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
     },
   );
 

@@ -1359,7 +1359,6 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -1597,7 +1596,6 @@ async fn broker_coalesces_same_partition_requests_into_one_consumer_batch() -> R
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -1964,7 +1962,6 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -4609,7 +4606,6 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -4747,7 +4743,6 @@ async fn multi_topic_isolation() -> Result<()> {
   let mut topic_a_reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -4764,7 +4759,6 @@ async fn multi_topic_isolation() -> Result<()> {
   let mut topic_b_reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: SECOND_TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -4929,7 +4923,6 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -5079,7 +5072,6 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -6317,7 +6309,6 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     virtual_partition_ids,

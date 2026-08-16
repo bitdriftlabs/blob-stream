@@ -29,6 +29,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupMembershipStore,
   MetadataStore,
 };
+use blob_stream_types::DEFAULT_METADATA_WINDOW_SIZE;
 use log::info;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -52,6 +53,7 @@ pub struct ConsumerIteratorBuilder<'a> {
   metrics_scope: Scope,
   retention: Duration,
   maximum_metadata_publication_lag: Duration,
+  metadata_window_size: Duration,
   maximum_clock_skew: Duration,
   feature_flags: Option<FeatureFlagsWatch>,
   time_provider: Arc<dyn TimeProvider>,
@@ -82,6 +84,7 @@ impl<'a> ConsumerIteratorBuilder<'a> {
       metrics_scope,
       retention,
       maximum_metadata_publication_lag,
+      metadata_window_size: DEFAULT_METADATA_WINDOW_SIZE,
       maximum_clock_skew: runtime
         .read
         .as_ref()
@@ -102,6 +105,13 @@ impl<'a> ConsumerIteratorBuilder<'a> {
   /// Supply the typed clock-skew budget resolved from the topic configuration.
   pub fn maximum_clock_skew(mut self, maximum_clock_skew: Duration) -> Self {
     self.maximum_clock_skew = maximum_clock_skew;
+    self
+  }
+
+  #[must_use]
+  /// Supply the shared topic metadata-window contract used for segment keys and scans.
+  pub fn metadata_window_size(mut self, metadata_window_size: Duration) -> Self {
+    self.metadata_window_size = metadata_window_size;
     self
   }
 
@@ -157,6 +167,7 @@ impl ConsumerIteratorBuilder<'_> {
       metrics_scope,
       retention,
       maximum_metadata_publication_lag,
+      metadata_window_size,
       maximum_clock_skew,
       feature_flags,
       time_provider,
@@ -203,6 +214,7 @@ impl ConsumerIteratorBuilder<'_> {
       maximum_metadata_publication_lag,
       feature_flags,
     )?
+    .metadata_window_size(metadata_window_size)
     .maximum_clock_skew(maximum_clock_skew);
     let coordinator = ConsumerGroupCoordinatorImpl::new(
       group_config.clone(),

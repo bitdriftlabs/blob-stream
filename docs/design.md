@@ -778,7 +778,7 @@ defaults are:
 | Producer batch payload bytes | 1 MiB |
 | Producer flush delay | 200 ms |
 | Producer retry deadline | 30 seconds |
-| Consumer metadata window | 300 seconds |
+| Topic metadata window | 300 seconds; fixed broker/consumer metadata-key layout contract |
 | Broker metadata publication deadline | 15 seconds |
 | Consumer `max_clock_skew` | 10 ms when unset |
 | Consumer metadata visibility delay | 2 seconds |

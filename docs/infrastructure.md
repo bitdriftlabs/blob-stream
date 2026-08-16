@@ -57,8 +57,9 @@ Important broker defaults are 64 MiB `flush_max_bytes`, 1 second `flush_max_dela
 Topics default `max_metadata_publication_lag` to 15 seconds when unset. Consumers default
 `max_clock_skew` to 10 ms when unset. Configure the skew bound to the proven, monitored pairwise
 broker-to-consumer clock offset for the deployment; it is a consumer read setting.
-Producer and consumer defaults, including batching, retry, read-window, and prefetch values, are
-documented in the protobuf schema.
+The topic `metadata_window_size` defines the durable metadata-key layout that brokers publish and
+consumers scan. Producer and consumer defaults, including batching, retry, polling, and prefetch
+values, are documented in the protobuf schema.
 
 ### Feature-Flag Mounts
 
@@ -71,10 +72,13 @@ broker:
     file: "/etc/blob-stream/feature_flags/feature_flags.yaml"
 ```
 
-The feature flags `blob_stream_broker_fenced_metadata_writes`,
+Feature flags affect local process behavior. `blob_stream_broker_fenced_metadata_writes` remains a
+broker control. Consumer reader flags
 `blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`, and
-`blob_stream_consumer_max_in_flight_batch_reads` override their configured fallback values. See
-[Operations](operations.md) for their runtime effects.
+`blob_stream_consumer_max_in_flight_batch_reads` are live. Consumer polling and group scheduling
+flags are sampled when a consumer is constructed. Producer batching, retry, timeout, concurrency,
+and compression flags are sampled when a producer is constructed. See [Operations](operations.md)
+for the complete inventory and rollout behavior.
 
 ## S3
 

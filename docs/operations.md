@@ -22,6 +22,21 @@ regardless of whether the mode is enabled.
 A lost publication fence after blob upload leaves an unreferenced blob but does not publish its
 metadata. The broker returns a retryable failure. There is no unfenced fallback for that plan.
 
+## Runtime Feature Flags
+
+Feature flags are local process controls. `TopicConfig.metadata_window_size` defines the durable
+metadata-key layout used by broker publication and consumer scans.
+
+| Scope | Flags | Adoption | Operational effect |
+| --- | --- | --- | --- |
+| Consumer reader | `blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads` | Live | Changes metadata-read consistency, prefetch target, or concurrent blob reads for subsequent reader work. |
+| Consumer startup | `blob_stream_consumer_idle_poll_delay_ms`, `blob_stream_consumer_max_idle_poll_delay_ms`, `blob_stream_consumer_lease_duration_ms`, `blob_stream_consumer_heartbeat_interval_ms`, `blob_stream_consumer_rebalance_interval_ms` | Rebuild or restart the iterator | Changes local polling and consumer-group scheduling. Persistent lease state stores absolute expiry timestamps, so members may use different local durations. |
+| Producer startup | `blob_stream_producer_max_batch_records`, `blob_stream_producer_max_batch_bytes`, `blob_stream_producer_flush_max_delay_ms`, `blob_stream_producer_retry_base_delay_ms`, `blob_stream_producer_retry_max_delay_ms`, `blob_stream_producer_connect_timeout_ms`, `blob_stream_producer_request_timeout_ms`, `blob_stream_producer_max_request_concurrency`, `blob_stream_producer_compression` | Recreate or restart the producer | Changes local batching, retry, request, concurrency, and compression behavior. |
+
+Validate feature-flag rollouts against the configured fallback values. Invalid producer duration or
+integer overrides fail producer construction; invalid consumer startup duration overrides fail
+iterator construction. A running consumer continues with its already-applied startup settings.
+
 ## HTTP Endpoints
 
 The broker listener serves gRPC plus these HTTP endpoints:

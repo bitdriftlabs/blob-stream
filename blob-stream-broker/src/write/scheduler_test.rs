@@ -26,6 +26,7 @@ fn topics() -> HashMap<protobuf::Chars, TopicInfo> {
       num_writers: 1,
       retention: Duration::days(7),
       max_metadata_publication_lag: Duration::milliseconds(15_000),
+      metadata_window_size: Duration::minutes(5),
     },
   )])
 }

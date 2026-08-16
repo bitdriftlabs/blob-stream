@@ -8,6 +8,7 @@ use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 pub use bd_time::{ProtoDurationExt, ToProtoDuration};
 pub use blob_stream_blob_store::ByteRange;
 pub use blob_stream_proto::protos::blobstream::v1::broker::Record;
+use blob_stream_proto::protos::blobstream::v1::config::TopicConfig;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::hash_map::DefaultHasher;
@@ -21,6 +22,43 @@ pub type VirtualPartitionId = u32;
 
 /// Default duration of a metadata window used for segment keys and consumer scans.
 pub const DEFAULT_METADATA_WINDOW_SIZE: Duration = Duration::minutes(5);
+
+/// Error returned when a topic cannot produce stable metadata window keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopicMetadataWindowError {
+  NonPositive,
+  SubSecond,
+}
+
+impl std::fmt::Display for TopicMetadataWindowError {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::NonPositive => formatter.write_str("topic metadata_window_size must be positive"),
+      Self::SubSecond => {
+        formatter.write_str("topic metadata_window_size must be a whole-second duration")
+      },
+    }
+  }
+}
+
+impl std::error::Error for TopicMetadataWindowError {}
+
+/// Resolve the fixed metadata-key window for a topic.
+pub fn topic_metadata_window_size(
+  config: &TopicConfig,
+) -> Result<Duration, TopicMetadataWindowError> {
+  let metadata_window_size = config.metadata_window_size.as_ref().map_or(
+    DEFAULT_METADATA_WINDOW_SIZE,
+    ProtoDurationExt::to_time_duration,
+  );
+  if !metadata_window_size.is_positive() {
+    return Err(TopicMetadataWindowError::NonPositive);
+  }
+  if metadata_window_size.subsec_nanoseconds() != 0 {
+    return Err(TopicMetadataWindowError::SubSecond);
+  }
+  Ok(metadata_window_size)
+}
 
 /// Default maximum elapsed time for segment construction and durable metadata publication.
 ///

@@ -25,7 +25,6 @@ use time::Duration;
 fn runtime(member_id: &str) -> ConsumerRuntimeConfig {
   let mut read = ConsumerReadConfig::new();
   read.topic = "telemetry".into();
-  read.window_size = Duration::seconds(300).into_proto();
 
   let mut group = ConsumerGroupConfig::new();
   group.topic = "telemetry".into();

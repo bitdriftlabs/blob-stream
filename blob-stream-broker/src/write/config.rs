@@ -33,9 +33,9 @@ use blob_stream_proto::protos::blobstream::v1::config::{
 use blob_stream_types::{
   Compression,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-  DEFAULT_METADATA_WINDOW_SIZE,
   ProtoDurationExt,
   VirtualPartitionId,
+  topic_metadata_window_size,
 };
 use hostname::get as get_hostname;
 use log::{debug, trace};
@@ -75,7 +75,6 @@ pub struct WriteConfig {
   pub flush_max_delay: Duration,
   pub lease_duration: Duration,
   pub reservation_size: u64,
-  pub window_size: Duration,
   pub writer_id: u32,
   pub compression: blob_stream_types::Compression,
   pub blob_prefix: Option<String>,
@@ -90,7 +89,6 @@ impl WriteConfig {
       flush_max_delay: DEFAULT_FLUSH_MAX_DELAY,
       lease_duration: DEFAULT_LEASE_DURATION,
       reservation_size: DEFAULT_RESERVATION_SIZE,
-      window_size: DEFAULT_METADATA_WINDOW_SIZE,
       writer_id: 0,
       compression: Compression::zstd(DEFAULT_ZSTD_LEVEL),
       blob_prefix: None,
@@ -165,6 +163,7 @@ pub struct TopicInfo {
   pub num_writers: u32,
   pub retention: Duration,
   pub max_metadata_publication_lag: Duration,
+  pub metadata_window_size: Duration,
 }
 
 impl TopicInfo {
@@ -184,6 +183,7 @@ impl TopicInfo {
         DEFAULT_MAX_METADATA_PUBLICATION_LAG,
         ProtoDurationExt::to_time_duration,
       ),
+      metadata_window_size: topic_metadata_window_size(proto)?,
     })
   }
 
