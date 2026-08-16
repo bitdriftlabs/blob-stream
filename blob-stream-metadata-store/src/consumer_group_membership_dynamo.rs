@@ -3,6 +3,7 @@
 mod tests;
 
 use crate::aws::{is_dynamo_transaction_conflict, retry_dynamo_transaction_conflicts};
+use crate::dynamo::duration_seconds_ceil;
 use crate::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentPlan,
@@ -23,8 +24,10 @@ use aws_sdk_dynamodb::types::{
   TransactWriteItem,
   Update,
 };
+use blob_stream_types::unix_millis_from_offset_datetime;
 use log::trace;
 use std::collections::{HashMap, HashSet};
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 const ATTR_PK: &str = "pk";
@@ -58,7 +61,7 @@ const PLANNER_LEASE_SORT_KEY: &str = "__blob_stream_assignment_planner_v1__";
 pub struct DynamoConsumerGroupMembershipStore {
   client: Client,
   table_name: String,
-  ttl_buffer_seconds: i64,
+  ttl_buffer: Duration,
   capacity_metrics: Option<DynamoCapacityMetrics>,
 }
 
@@ -67,13 +70,13 @@ impl DynamoConsumerGroupMembershipStore {
   pub fn new(
     client: Client,
     table_name: impl Into<String>,
-    ttl_buffer_seconds: u32,
+    ttl_buffer: Duration,
     capacity_metrics: Option<DynamoCapacityMetrics>,
   ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
-      ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
+      ttl_buffer,
       capacity_metrics,
     }
   }
@@ -329,15 +332,19 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: Duration,
   ) -> Result<()> {
     trace!(
       "consumer membership(dynamo) register: table={}, topic={}, group_id={}, member_id={}",
       self.table_name, topic, group_id, member_id
     );
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+    let ttl_ms = i64::try_from(ttl.whole_milliseconds())
+      .map_err(|_| anyhow!("membership ttl exceeds Dynamo millisecond range"))?;
     let expires_at = expires_at(now_ts_ms, ttl_ms)?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
 
     let mut values = HashMap::new();
     values.insert(
@@ -392,15 +399,15 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: Duration,
   ) -> Result<()> {
     trace!(
       "consumer membership(dynamo) heartbeat: table={}, topic={}, group_id={}, member_id={}",
       self.table_name, topic, group_id, member_id
     );
     self
-      .register_member(topic, group_id, member_id, pod_id, now_ts_ms, ttl_ms)
+      .register_member(topic, group_id, member_id, pod_id, now, ttl)
       .await
   }
 
@@ -428,13 +435,15 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     &self,
     topic: &str,
     group_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<Vec<ConsumerGroupMember>> {
     trace!(
       "consumer membership(dynamo) list_active_members: table={}, topic={}, group_id={}",
       self.table_name, topic, group_id
     );
 
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
     let mut members = HashSet::new();
     let mut start_key: Option<HashMap<String, AttributeValue>> = None;
 
@@ -568,11 +577,15 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     group_id: &str,
     member_id: &str,
     planner_session_id: &str,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: Duration,
   ) -> Result<ConsumerGroupPlannerLeaseOutcome> {
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+    let ttl_ms = i64::try_from(ttl.whole_milliseconds())
+      .map_err(|_| anyhow!("planner ttl exceeds Dynamo millisecond range"))?;
     let expires_at = expires_at(now_ts_ms, ttl_ms)?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
     let mut values = HashMap::new();
     values.insert(
       ":owner".to_string(),
@@ -694,13 +707,15 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     group_id: &str,
     member_id: &str,
     planner_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     plan: ConsumerGroupAssignmentPlan,
   ) -> Result<bool> {
     if plan.planner_member_id != member_id {
       return Ok(false);
     }
 
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
     let mut planner_values = HashMap::new();
     planner_values.insert(
       ":owner".to_string(),
@@ -785,10 +800,12 @@ fn expires_at(now_ts_ms: i64, ttl_ms: i64) -> Result<i64> {
     .ok_or_else(|| anyhow!("membership expiration overflow"))
 }
 
-fn ttl_epoch_seconds(expires_at_ms: i64, ttl_buffer_seconds: i64) -> Result<i64> {
+fn ttl_epoch_seconds(expires_at_ms: i64, ttl_buffer: Duration) -> Result<i64> {
   let expires_at_seconds = expires_at_ms
     .checked_div(1_000)
     .ok_or_else(|| anyhow!("membership ttl conversion overflow"))?;
+  let ttl_buffer_seconds = duration_seconds_ceil(ttl_buffer)
+    .ok_or_else(|| anyhow!("membership ttl buffer conversion overflow"))?;
 
   expires_at_seconds
     .checked_add(ttl_buffer_seconds)

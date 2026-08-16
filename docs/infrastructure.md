@@ -29,7 +29,7 @@ topics:
   - name: "telemetry"
     partition_count: 128
     num_writers: 1
-    retention_days: 7
+    retention: "604800s"
 
 blob_store:
   s3:
@@ -52,10 +52,13 @@ Every broker, producer, and consumer using a topic must use the same `name`, `pa
 must be in range for every configured topic, and its broker discovery must contain only brokers in
 that domain.
 
-Important broker defaults are 64 MiB `flush_max_bytes`, 1 second `flush_max_delay_ms`, 10,000
+Important broker defaults are 64 MiB `flush_max_bytes`, 1 second `flush_max_delay`, 10,000
 `sequence_reservation_size`, zstd segment compression, and disabled `fenced_metadata_writes`.
-Topics default `max_metadata_publication_lag_ms` to 15 seconds. Producer and consumer defaults,
-including batching, retry, read-window, and prefetch values, are documented in the protobuf schema.
+Topics default `max_metadata_publication_lag` to 15 seconds when unset. Consumers default
+`max_clock_skew` to 10 ms when unset. Configure the skew bound to the proven, monitored pairwise
+broker-to-consumer clock offset for the deployment; it is a consumer read setting.
+Producer and consumer defaults, including batching, retry, read-window, and prefetch values, are
+documented in the protobuf schema.
 
 ### Feature-Flag Mounts
 
@@ -102,8 +105,8 @@ only.
 | Consumer membership | `pk = <topic>#<group_id>`, `sk = <member_id>` | Member liveness and assignment coordination |
 
 Enable TTL on `ttl_epoch_seconds` for every table. Segment metadata TTL is topic retention plus
-`segment_ttl_buffer_seconds` (default 3,600 seconds). Producer leases and consumer membership use
-lease expiration plus `lease_ttl_buffer_seconds` (default 3,600 seconds). Consumer lease rows retain
+`segment_ttl_buffer` (default 3,600 seconds). Producer leases and consumer membership use
+lease expiration plus `lease_ttl_buffer` (default 3,600 seconds). Consumer lease rows retain
 committed cursors through the readable-data retention period.
 
 The membership table also holds reserved assignment-control rows under

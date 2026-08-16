@@ -15,12 +15,11 @@ use super::{
   VirtualPartitionId,
   VirtualPartitionState,
   Window,
-  consumer_candidate_window_count_with_visibility_delay,
-  consumer_window_size_seconds,
-  format_unix_timestamp_seconds,
-  metadata_availability_delay_seconds,
+  consumer_window_size,
+  offset_datetime_from_unix_seconds,
   trace,
 };
+use crate::config::consumer_candidate_window_count_with_availability_horizon;
 use crate::consumer::reader::RecoveryMetadataCacheKey;
 
 impl ConsumerReaderImpl {
@@ -31,7 +30,7 @@ impl ConsumerReaderImpl {
   pub(in crate::consumer) fn mature_recovery_metadata_cache_key(
     &self,
     request: &ScanRequest,
-    now_unix_seconds: i64,
+    now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Option<RecoveryMetadataCacheKey> {
     let &[partition_id] = request.eligibility.recovering_partitions.as_slice() else {
@@ -40,12 +39,11 @@ impl ConsumerReaderImpl {
     let window_end_unix_seconds = request
       .window
       .window_start_unix_seconds
-      .saturating_add(consumer_window_size_seconds(&self.config));
+      .saturating_add(consumer_window_size(&self.config).whole_seconds());
     if !request.recovery_scan
       || request.eligibility.fast
       || request.eligibility.fresh
-      || window_end_unix_seconds
-        > self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds, runtime_settings)
+      || window_end_unix_seconds > self.fast_scan_safe_timestamp_unix_seconds(now, runtime_settings)
     {
       return None;
     }
@@ -59,21 +57,21 @@ impl ConsumerReaderImpl {
   /// Return the bounded current-window horizon, from oldest candidate to newest.
   pub(in crate::consumer) fn scan_windows(
     &self,
-    now_unix_seconds: i64,
+    now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<Vec<TopicWindowKey>> {
     // Anchor scans to the current window and cover the enforced publication deadline plus the
     // effective visibility delay. Oldest -> newest ordering keeps traversal deterministic.
-    let current_window =
-      Window::for_timestamp(now_unix_seconds, consumer_window_size_seconds(&self.config))
-        .start_unix_seconds;
+    let now_unix_seconds = now.unix_timestamp();
+    let current_window = Window::for_timestamp(now, consumer_window_size(&self.config))
+      .start
+      .unix_timestamp();
 
-    let candidate_windows = consumer_candidate_window_count_with_visibility_delay(
+    let candidate_windows = consumer_candidate_window_count_with_availability_horizon(
       &self.config,
-      self.maximum_metadata_publication_lag_ms,
-      runtime_settings.metadata_visibility_delay_ms,
+      self.availability_horizon(runtime_settings).duration(),
     )?;
-    let window_size_seconds = consumer_window_size_seconds(&self.config);
+    let window_size_seconds = consumer_window_size(&self.config).whole_seconds();
     let mut windows = Vec::with_capacity(candidate_windows);
     for offset in (0 .. candidate_windows).rev() {
       let offset = i64::try_from(offset).unwrap_or(i64::MAX);
@@ -88,7 +86,7 @@ impl ConsumerReaderImpl {
       "consumer scan windows computed: topic={}, count={}, now={}",
       self.config.topic,
       windows.len(),
-      format_unix_timestamp_seconds(now_unix_seconds)
+      offset_datetime_from_unix_seconds(now_unix_seconds)
     );
 
     Ok(windows)
@@ -185,21 +183,20 @@ impl ConsumerReaderImpl {
     &self,
     scan_requests: &[ScanRequest],
     assigned_partition_ids: &[VirtualPartitionId],
-    now_unix_seconds: i64,
+    now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
     scan_states: &mut HashMap<VirtualPartitionId, ConsumerReaderPartitionScanState>,
   ) {
-    let safe_timestamp_unix_seconds =
-      self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds, runtime_settings);
+    let safe_timestamp = self.fast_scan_safe_timestamp(now, runtime_settings);
     for request in scan_requests {
       if !request.eligibility.fast {
         continue;
       }
-      let floor_timestamp_unix_seconds = request
-        .window
-        .window_start_unix_seconds
-        .max(safe_timestamp_unix_seconds);
-      let time_floor = Self::snowflake_floor(floor_timestamp_unix_seconds);
+      let window_start =
+        time::OffsetDateTime::from_unix_timestamp(request.window.window_start_unix_seconds)
+          .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+      let floor_timestamp = window_start.max(safe_timestamp);
+      let time_floor = Self::snowflake_floor(floor_timestamp);
       for &partition_id in assigned_partition_ids {
         let Some((observed_frontier, partition_lower_bound)) = self
           .fast_scan_partition_lower_bound(
@@ -215,7 +212,7 @@ impl ConsumerReaderImpl {
             .fast_scan_bounds
             .push(ConsumerReaderFastScanBoundState {
               window_start_unix_seconds: request.window.window_start_unix_seconds,
-              floor_timestamp_unix_seconds,
+              floor_timestamp,
               time_floor,
               observed_frontier,
               partition_lower_bound,
@@ -229,47 +226,55 @@ impl ConsumerReaderImpl {
   /// Return the oldest timestamp whose metadata may still be unpublished or invisible.
   pub(in crate::consumer) fn fast_scan_safe_timestamp_unix_seconds(
     &self,
-    now_unix_seconds: i64,
+    now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> i64 {
-    // T_safe = now - D, where D combines the broker publication deadline and reader visibility
-    // delay. This relies on synchronized broker and consumer clocks; keep the bounds together so
-    // a future skew margin has one obvious place to join the safety calculation.
-    now_unix_seconds.saturating_sub(metadata_availability_delay_seconds(
-      runtime_settings.metadata_visibility_delay_ms,
-      self.maximum_metadata_publication_lag_ms,
-    ))
+    self
+      .fast_scan_safe_timestamp(now, runtime_settings)
+      .unix_timestamp()
+  }
+
+  /// Return the exact oldest instant whose metadata may still be unpublished or invisible.
+  pub(in crate::consumer) fn fast_scan_safe_timestamp(
+    &self,
+    now: time::OffsetDateTime,
+    runtime_settings: ConsumerReadRuntimeSettings,
+  ) -> time::OffsetDateTime {
+    now.saturating_sub(self.availability_horizon(runtime_settings).duration())
   }
 
   /// Return the lowest possible segment ID for a timestamp, preserving safety for invalid input.
-  pub(in crate::consumer) fn snowflake_floor(timestamp_unix_seconds: i64) -> SnowflakeId {
-    time::OffsetDateTime::from_unix_timestamp(timestamp_unix_seconds)
-      .map_or(SnowflakeId(0), SnowflakeId::minimum_for_timestamp)
+  pub(in crate::consumer) fn snowflake_floor(timestamp: time::OffsetDateTime) -> SnowflakeId {
+    SnowflakeId::minimum_for_timestamp(timestamp)
   }
 
   /// Return Fast windows that can still contain unpublished or invisible metadata and their floors.
   pub(in crate::consumer) fn eligible_fast_scan_windows(
     &self,
-    now_unix_seconds: i64,
+    now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<Vec<(TopicWindowKey, SnowflakeId)>> {
-    let safe_timestamp_unix_seconds =
-      self.fast_scan_safe_timestamp_unix_seconds(now_unix_seconds, runtime_settings);
-    let window_size_seconds = consumer_window_size_seconds(&self.config);
+    let safe_timestamp = self.fast_scan_safe_timestamp(now, runtime_settings);
+    let window_size_seconds = consumer_window_size(&self.config).whole_seconds();
     let windows = self
-      .scan_windows(now_unix_seconds, runtime_settings)?
+      .scan_windows(now, runtime_settings)?
       .into_iter()
       .filter(|window| {
-        window
-          .window_start_unix_seconds
-          .saturating_add(window_size_seconds)
-          > safe_timestamp_unix_seconds
+        time::OffsetDateTime::from_unix_timestamp(
+          window
+            .window_start_unix_seconds
+            .saturating_add(window_size_seconds),
+        )
+        .is_ok_and(|window_end| window_end > safe_timestamp)
       })
       .map(|window| {
-        let floor_timestamp_unix_seconds = window
-          .window_start_unix_seconds
-          .max(safe_timestamp_unix_seconds);
-        (window, Self::snowflake_floor(floor_timestamp_unix_seconds))
+        let window_start =
+          time::OffsetDateTime::from_unix_timestamp(window.window_start_unix_seconds)
+            .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+        (
+          window,
+          Self::snowflake_floor(window_start.max(safe_timestamp)),
+        )
       })
       .collect();
     Ok(windows)
@@ -300,7 +305,7 @@ impl ConsumerReaderImpl {
   /// Build a scan pass that prioritizes bounded recovery before using the fast path.
   pub(in crate::consumer) fn scan_requests(
     &mut self,
-    now_unix_seconds: i64,
+    now: time::OffsetDateTime,
     assigned_partition_ids: &[VirtualPartitionId],
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<(Vec<ScanRequest>, bool)> {
@@ -362,7 +367,7 @@ impl ConsumerReaderImpl {
       let (partition_id, recovery_start_window, recovery_cutover_window) =
         recovering_partitions[next_partition_index];
       self.recovery_scan_last_partition = Some(partition_id);
-      let window_size_seconds = consumer_window_size_seconds(&self.config);
+      let window_size_seconds = consumer_window_size(&self.config).whole_seconds();
       for offset in 0 .. MAX_RECOVERY_WINDOWS_PER_SCAN {
         let offset = i64::try_from(offset).unwrap_or(i64::MAX);
         let window_start =
@@ -417,9 +422,7 @@ impl ConsumerReaderImpl {
       .values()
       .any(|state| state.is_assigned() && matches!(state, VirtualPartitionState::Fast { .. }))
     {
-      for (window, safe_floor) in
-        self.eligible_fast_scan_windows(now_unix_seconds, runtime_settings)?
-      {
+      for (window, safe_floor) in self.eligible_fast_scan_windows(now, runtime_settings)? {
         Self::insert_scan_request(
           &mut scan_requests,
           self.config.topic.as_str(),
@@ -445,11 +448,11 @@ impl ConsumerReaderImpl {
   /// Discard frontiers for windows that Fast scans no longer query.
   pub(in crate::consumer) fn prune_fast_frontiers(
     &mut self,
-    now_unix_seconds: i64,
+    now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<()> {
     let eligible_window_starts = self
-      .eligible_fast_scan_windows(now_unix_seconds, runtime_settings)?
+      .eligible_fast_scan_windows(now, runtime_settings)?
       .into_iter()
       .map(|(window, _)| window.window_start_unix_seconds)
       .collect::<HashSet<_>>();

@@ -1,4 +1,4 @@
-use super::driver::{ConsumerDriver, retry_backoff};
+use super::driver::{ConsumerDriver, persisted_lease_expires_at, retry_backoff};
 use super::shared::ConsumerIteratorMetrics;
 use super::{
   ConsumerCoordinationSource,
@@ -8,9 +8,11 @@ use super::{
 };
 use crate::config::{
   ConsumerRuntimeConfig,
-  consumer_idle_poll_delay_ms,
-  consumer_lease_duration_ms,
-  consumer_max_idle_poll_delay_ms,
+  DEFAULT_MAX_CLOCK_SKEW,
+  consumer_idle_poll_delay,
+  consumer_lease_duration,
+  consumer_max_clock_skew,
+  consumer_max_idle_poll_delay,
   consumer_prefetch_max_bytes,
   validate_runtime_config,
 };
@@ -32,6 +34,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use time::Duration;
 use tokio::sync::Notify;
 
 //
@@ -47,8 +50,9 @@ pub struct ConsumerIteratorBuilder<'a> {
   membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   coordination_source: Arc<dyn ConsumerCoordinationSource>,
   metrics_scope: Scope,
-  retention_days: u32,
-  maximum_metadata_publication_lag_ms: u64,
+  retention: Duration,
+  maximum_metadata_publication_lag: Duration,
+  maximum_clock_skew: Duration,
   feature_flags: Option<FeatureFlagsWatch>,
   time_provider: Arc<dyn TimeProvider>,
   lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
@@ -64,8 +68,8 @@ impl<'a> ConsumerIteratorBuilder<'a> {
     membership_store: Arc<dyn ConsumerGroupMembershipStore>,
     coordination_source: Arc<dyn ConsumerCoordinationSource>,
     metrics_scope: Scope,
-    retention_days: u32,
-    maximum_metadata_publication_lag_ms: u64,
+    retention: Duration,
+    maximum_metadata_publication_lag: Duration,
     feature_flags: Option<FeatureFlagsWatch>,
   ) -> Self {
     Self {
@@ -76,8 +80,12 @@ impl<'a> ConsumerIteratorBuilder<'a> {
       membership_store,
       coordination_source,
       metrics_scope,
-      retention_days,
-      maximum_metadata_publication_lag_ms,
+      retention,
+      maximum_metadata_publication_lag,
+      maximum_clock_skew: runtime
+        .read
+        .as_ref()
+        .map_or(DEFAULT_MAX_CLOCK_SKEW, consumer_max_clock_skew),
       feature_flags,
       time_provider: Arc::new(SystemTimeProvider),
       lifecycle_hooks: None,
@@ -87,6 +95,13 @@ impl<'a> ConsumerIteratorBuilder<'a> {
   #[must_use]
   pub fn time_provider(mut self, time_provider: Arc<dyn TimeProvider>) -> Self {
     self.time_provider = time_provider;
+    self
+  }
+
+  #[must_use]
+  /// Supply the typed clock-skew budget resolved from the topic configuration.
+  pub fn maximum_clock_skew(mut self, maximum_clock_skew: Duration) -> Self {
+    self.maximum_clock_skew = maximum_clock_skew;
     self
   }
 
@@ -108,8 +123,8 @@ impl ConsumerIteratorImpl {
     membership_store: Arc<dyn ConsumerGroupMembershipStore>,
     coordination_source: Arc<dyn ConsumerCoordinationSource>,
     metrics_scope: Scope,
-    retention_days: u32,
-    maximum_metadata_publication_lag_ms: u64,
+    retention: Duration,
+    maximum_metadata_publication_lag: Duration,
     feature_flags: Option<FeatureFlagsWatch>,
   ) -> Result<Self> {
     ConsumerIteratorBuilder::new(
@@ -120,8 +135,8 @@ impl ConsumerIteratorImpl {
       membership_store,
       coordination_source,
       metrics_scope,
-      retention_days,
-      maximum_metadata_publication_lag_ms,
+      retention,
+      maximum_metadata_publication_lag,
       feature_flags,
     )
     .build()
@@ -140,16 +155,25 @@ impl ConsumerIteratorBuilder<'_> {
       membership_store,
       coordination_source,
       metrics_scope,
-      retention_days,
-      maximum_metadata_publication_lag_ms,
+      retention,
+      maximum_metadata_publication_lag,
+      maximum_clock_skew,
       feature_flags,
       time_provider,
       lifecycle_hooks,
     } = self;
     validate_runtime_config(runtime)?;
     ensure!(
-      retention_days > 0,
-      "consumer retention recovery requires topic retention_days greater than zero"
+      retention.is_positive(),
+      "consumer retention recovery requires topic retention greater than zero"
+    );
+    ensure!(
+      !maximum_metadata_publication_lag.is_negative(),
+      "consumer maximum metadata publication lag must not be negative"
+    );
+    ensure!(
+      !maximum_clock_skew.is_negative(),
+      "consumer maximum clock skew must not be negative"
     );
     let read_config = runtime
       .read
@@ -161,8 +185,8 @@ impl ConsumerIteratorBuilder<'_> {
       .as_ref()
       .ok_or_else(|| anyhow!("consumer group config is required"))?
       .clone();
-    let idle_poll_delay_ms = consumer_idle_poll_delay_ms(&read_config);
-    let max_idle_poll_delay_ms = Some(consumer_max_idle_poll_delay_ms(&read_config));
+    let idle_poll_delay = consumer_idle_poll_delay(&read_config);
+    let max_idle_poll_delay = Some(consumer_max_idle_poll_delay(&read_config));
     let prefetch_max_bytes = consumer_prefetch_max_bytes(&read_config);
 
     let active_assignment = HashSet::new();
@@ -175,17 +199,20 @@ impl ConsumerIteratorBuilder<'_> {
       blob_store,
       metadata_store,
       &metrics_scope.scope("consumer"),
-      retention_days,
-      maximum_metadata_publication_lag_ms,
+      retention,
+      maximum_metadata_publication_lag,
       feature_flags,
-    )?;
+    )?
+    .maximum_clock_skew(maximum_clock_skew);
     let coordinator = ConsumerGroupCoordinatorImpl::new(
       group_config.clone(),
       Arc::clone(&lease_store),
       Arc::clone(&membership_store),
     )?;
-    let now_ts_ms = time_provider.now().unix_timestamp_ms();
-    let membership_lease_duration_ms = consumer_lease_duration_ms(&group_config);
+    let now = time_provider.now();
+    let now_ts_ms = now.unix_timestamp_ms();
+    let membership_lease_duration = consumer_lease_duration(&group_config);
+    let membership_lease_expires_at = persisted_lease_expires_at(now, membership_lease_duration)?;
     let delivery_notify = Arc::new(Notify::new());
     let prefetch_space_notify = Arc::new(Notify::new());
     let reader_command_notify = Arc::new(Notify::new());
@@ -218,8 +245,8 @@ impl ConsumerIteratorBuilder<'_> {
       reader_command_notify: Arc::clone(&reader_command_notify),
       prefetch_shutdown,
       prefetch_task: None,
-      prefetch_idle_base_delay_ms: idle_poll_delay_ms,
-      prefetch_idle_max_delay_ms: max_idle_poll_delay_ms,
+      prefetch_idle_base_delay: idle_poll_delay,
+      prefetch_idle_max_delay: max_idle_poll_delay,
       active_assignment,
       assignment_callback: Arc::clone(&assignment_callback),
       pending_assignment: None,
@@ -230,11 +257,10 @@ impl ConsumerIteratorBuilder<'_> {
       revocation_notify,
       lifecycle_hooks,
       time_provider,
-      membership_lease_expires_at_ms: now_ts_ms.saturating_add(membership_lease_duration_ms),
-      active_partition_lease_expiration_deadline_ms: now_ts_ms
-        .saturating_add(membership_lease_duration_ms),
-      next_heartbeat_at_ms: now_ts_ms,
-      next_rebalance_at_ms: now_ts_ms,
+      membership_lease_expires_at,
+      active_partition_lease_expiration_deadline: membership_lease_expires_at,
+      next_heartbeat_at: now,
+      next_rebalance_at: now,
       heartbeat_retry_backoff: retry_backoff(),
       rebalance_retry_backoff: retry_backoff(),
       diagnostics,
@@ -247,8 +273,8 @@ impl ConsumerIteratorBuilder<'_> {
         &driver.group_config.group_id,
         &driver.group_config.member_id,
         driver.group_config.pod_id.as_ref().map(ToString::to_string),
-        now_ts_ms,
-        consumer_lease_duration_ms(&driver.group_config),
+        now,
+        consumer_lease_duration(&driver.group_config),
       )
       .await?;
     let snapshot = driver.coordination_source.snapshot().await?;
@@ -256,7 +282,7 @@ impl ConsumerIteratorBuilder<'_> {
     driver.metrics.rebalances_total.inc();
     let report = driver
       .coordinator
-      .rebalance(snapshot.members, snapshot.virtual_partitions, now_ts_ms)
+      .rebalance(snapshot.members, snapshot.virtual_partitions, now)
       .await;
     let report = match report {
       Ok(report) => report,

@@ -12,18 +12,22 @@ pub use blob_stream_proto::protos::blobstream::v1::config::{
   ProducerRuntimeConfig,
   TopicConfig,
 };
+use blob_stream_types::ProtoDurationExt;
+#[cfg(test)]
+use blob_stream_types::ToProtoDuration;
 use log::{debug, trace};
 use std::collections::HashSet;
 use std::sync::Arc;
+use time::Duration;
 
 const DEFAULT_MAX_BATCH_RECORDS: u32 = 1_000;
 const DEFAULT_MAX_BATCH_BYTES: u32 = 1_048_576;
-const DEFAULT_FLUSH_MAX_DELAY_MS: u64 = 200;
-const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 25;
-const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 1_000;
-const DEFAULT_RETRY_DEADLINE_MS: u64 = 30_000;
-const DEFAULT_CONNECT_TIMEOUT_MS: i64 = 2_000;
-const DEFAULT_REQUEST_TIMEOUT_MS: i64 = 5_000;
+const DEFAULT_FLUSH_MAX_DELAY: Duration = Duration::milliseconds(200);
+const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::milliseconds(25);
+const DEFAULT_RETRY_MAX_DELAY: Duration = Duration::seconds(1);
+const DEFAULT_RETRY_DEADLINE: Duration = Duration::seconds(30);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::seconds(2);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::seconds(5);
 const DEFAULT_MAX_REQUEST_CONCURRENCY: u64 = 64;
 
 /// Topic configuration message used by the producer runtime config.
@@ -38,12 +42,12 @@ pub fn producer_config_with_defaults() -> ProducerConfig {
   config.writer_id = Some(0);
   config.max_batch_records = Some(DEFAULT_MAX_BATCH_RECORDS);
   config.max_batch_bytes = Some(DEFAULT_MAX_BATCH_BYTES);
-  config.flush_max_delay_ms = Some(DEFAULT_FLUSH_MAX_DELAY_MS);
-  config.retry_base_delay_ms = Some(DEFAULT_RETRY_BASE_DELAY_MS);
-  config.retry_max_delay_ms = Some(DEFAULT_RETRY_MAX_DELAY_MS);
-  config.retry_deadline_ms = Some(DEFAULT_RETRY_DEADLINE_MS);
-  config.connect_timeout_ms = Some(DEFAULT_CONNECT_TIMEOUT_MS);
-  config.request_timeout_ms = Some(DEFAULT_REQUEST_TIMEOUT_MS);
+  config.flush_max_delay = DEFAULT_FLUSH_MAX_DELAY.into_proto();
+  config.retry_base_delay = DEFAULT_RETRY_BASE_DELAY.into_proto();
+  config.retry_max_delay = DEFAULT_RETRY_MAX_DELAY.into_proto();
+  config.retry_deadline = DEFAULT_RETRY_DEADLINE.into_proto();
+  config.connect_timeout = DEFAULT_CONNECT_TIMEOUT.into_proto();
+  config.request_timeout = DEFAULT_REQUEST_TIMEOUT.into_proto();
   config.max_request_concurrency = Some(DEFAULT_MAX_REQUEST_CONCURRENCY);
   config.compression = Some(ProducerCompression::PRODUCER_COMPRESSION_NONE.into());
   config
@@ -67,45 +71,51 @@ pub fn producer_max_batch_bytes(config: &ProducerConfig) -> u32 {
 }
 
 #[must_use]
-pub fn producer_flush_max_delay_ms(config: &ProducerConfig) -> u64 {
+pub fn producer_flush_max_delay(config: &ProducerConfig) -> Duration {
   config
-    .flush_max_delay_ms
-    .unwrap_or(DEFAULT_FLUSH_MAX_DELAY_MS)
+    .flush_max_delay
+    .as_ref()
+    .map_or(DEFAULT_FLUSH_MAX_DELAY, ProtoDurationExt::to_time_duration)
 }
 
 #[must_use]
-pub fn producer_retry_base_delay_ms(config: &ProducerConfig) -> u64 {
+pub fn producer_retry_base_delay(config: &ProducerConfig) -> Duration {
   config
-    .retry_base_delay_ms
-    .unwrap_or(DEFAULT_RETRY_BASE_DELAY_MS)
+    .retry_base_delay
+    .as_ref()
+    .map_or(DEFAULT_RETRY_BASE_DELAY, ProtoDurationExt::to_time_duration)
 }
 
 #[must_use]
-pub fn producer_retry_max_delay_ms(config: &ProducerConfig) -> u64 {
+pub fn producer_retry_max_delay(config: &ProducerConfig) -> Duration {
   config
-    .retry_max_delay_ms
-    .unwrap_or(DEFAULT_RETRY_MAX_DELAY_MS)
+    .retry_max_delay
+    .as_ref()
+    .map_or(DEFAULT_RETRY_MAX_DELAY, ProtoDurationExt::to_time_duration)
 }
 
 #[must_use]
-pub fn producer_retry_deadline_ms(config: &ProducerConfig) -> u64 {
+pub fn producer_retry_deadline(config: &ProducerConfig) -> Duration {
   config
-    .retry_deadline_ms
-    .unwrap_or(DEFAULT_RETRY_DEADLINE_MS)
+    .retry_deadline
+    .as_ref()
+    .map_or(DEFAULT_RETRY_DEADLINE, ProtoDurationExt::to_time_duration)
 }
 
 #[must_use]
-pub fn producer_connect_timeout_ms(config: &ProducerConfig) -> i64 {
+pub fn producer_connect_timeout(config: &ProducerConfig) -> Duration {
   config
-    .connect_timeout_ms
-    .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS)
+    .connect_timeout
+    .as_ref()
+    .map_or(DEFAULT_CONNECT_TIMEOUT, ProtoDurationExt::to_time_duration)
 }
 
 #[must_use]
-pub fn producer_request_timeout_ms(config: &ProducerConfig) -> i64 {
+pub fn producer_request_timeout(config: &ProducerConfig) -> Duration {
   config
-    .request_timeout_ms
-    .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS)
+    .request_timeout
+    .as_ref()
+    .map_or(DEFAULT_REQUEST_TIMEOUT, ProtoDurationExt::to_time_duration)
 }
 
 #[must_use]
@@ -135,8 +145,8 @@ pub fn validate_producer_config(config: &ProducerConfig) -> Result<()> {
   trace!("validating producer config");
   proto_validate::validate(config)?;
   ensure!(
-    producer_retry_base_delay_ms(config) <= producer_retry_max_delay_ms(config),
-    "producer retry_base_delay_ms must not exceed retry_max_delay_ms"
+    producer_retry_base_delay(config) <= producer_retry_max_delay(config),
+    "producer retry_base_delay must not exceed retry_max_delay"
   );
   Ok(())
 }

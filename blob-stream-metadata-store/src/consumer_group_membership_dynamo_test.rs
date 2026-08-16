@@ -17,7 +17,9 @@ use aws_sdk_dynamodb::types::{
   KeyType,
   ScalarAttributeType,
 };
+use blob_stream_types::offset_datetime_from_unix_millis;
 use std::time::Duration;
+use time::Duration as TimeDuration;
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -99,8 +101,12 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
   create_membership_table(&client, &table_name).await?;
 
-  let store =
-    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupMembershipStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
 
   store
     .register_member(
@@ -108,19 +114,37 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
       "group-a",
       "member-a",
       Some("pod-a".to_string()),
-      1_000,
-      100,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
     )
     .await?;
   store
-    .register_member("topic-a", "group-a", "member-b", None, 1_000, 100)
+    .register_member(
+      "topic-a",
+      "group-a",
+      "member-b",
+      None,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
   store
-    .register_member("topic-a", "group-b", "member-c", None, 1_000, 100)
+    .register_member(
+      "topic-a",
+      "group-b",
+      "member-c",
+      None,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
 
   let members = store
-    .list_active_members("topic-a", "group-a", 1_050)
+    .list_active_members(
+      "topic-a",
+      "group-a",
+      offset_datetime_from_unix_millis(1_050),
+    )
     .await?;
   assert_eq!(
     members,
@@ -142,13 +166,17 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
       "group-a",
       "member-a",
       Some("pod-a".to_string()),
-      1_120,
-      100,
+      offset_datetime_from_unix_millis(1_120),
+      TimeDuration::milliseconds(100),
     )
     .await?;
 
   let members = store
-    .list_active_members("topic-a", "group-a", 1_150)
+    .list_active_members(
+      "topic-a",
+      "group-a",
+      offset_datetime_from_unix_millis(1_150),
+    )
     .await?;
   assert_eq!(
     members,
@@ -163,7 +191,11 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
     .await?;
 
   let members = store
-    .list_active_members("topic-a", "group-a", 1_151)
+    .list_active_members(
+      "topic-a",
+      "group-a",
+      offset_datetime_from_unix_millis(1_151),
+    )
     .await?;
   assert!(members.is_empty());
 
@@ -177,10 +209,21 @@ async fn register_rejects_invalid_ttl() -> Result<()> {
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
   create_membership_table(&client, &table_name).await?;
 
-  let store =
-    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupMembershipStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   let err = store
-    .register_member("topic-a", "group-a", "member-a", None, 1_000, 0)
+    .register_member(
+      "topic-a",
+      "group-a",
+      "member-a",
+      None,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::ZERO,
+    )
     .await
     .expect_err("expected invalid ttl error");
   assert!(
@@ -199,8 +242,12 @@ async fn writes_ttl_attribute_for_membership_rows() -> Result<()> {
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
   create_membership_table(&client, &table_name).await?;
 
-  let store =
-    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 120, None);
+  let store = DynamoConsumerGroupMembershipStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::seconds(120),
+    None,
+  );
 
   store
     .register_member(
@@ -208,8 +255,8 @@ async fn writes_ttl_attribute_for_membership_rows() -> Result<()> {
       "group-a",
       "member-a",
       Some("pod-a".to_string()),
-      1_000,
-      1_000,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(1_000),
     )
     .await?;
 
@@ -259,11 +306,22 @@ async fn planner_release_allows_immediate_takeover_and_fences_stale_owner() -> R
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
   create_membership_table(&client, &table_name).await?;
 
-  let store =
-    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupMembershipStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   assert_eq!(
     store
-      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-a", 1_000, 1_000)
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-a",
+        offset_datetime_from_unix_millis(1_000),
+        TimeDuration::milliseconds(1_000),
+      )
       .await?,
     ConsumerGroupPlannerLeaseOutcome::Acquired
   );
@@ -274,7 +332,14 @@ async fn planner_release_allows_immediate_takeover_and_fences_stale_owner() -> R
   );
   assert_eq!(
     store
-      .acquire_or_renew_planner("topic-a", "group-a", "member-b", "session-b", 1_001, 1_000)
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        "member-b",
+        "session-b",
+        offset_datetime_from_unix_millis(1_001),
+        TimeDuration::milliseconds(1_000),
+      )
       .await?,
     ConsumerGroupPlannerLeaseOutcome::Acquired
   );
@@ -301,14 +366,32 @@ async fn planner_records_do_not_appear_in_legacy_member_partition() -> Result<()
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
   create_membership_table(&client, &table_name).await?;
 
-  let store =
-    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupMembershipStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   store
-    .register_member("topic-a", "group-a", "member-a", None, 1_000, 1_000)
+    .register_member(
+      "topic-a",
+      "group-a",
+      "member-a",
+      None,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(1_000),
+    )
     .await?;
   assert_eq!(
     store
-      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-a", 1_000, 1_000)
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-a",
+        offset_datetime_from_unix_millis(1_000),
+        TimeDuration::milliseconds(1_000),
+      )
       .await?,
     ConsumerGroupPlannerLeaseOutcome::Acquired
   );
@@ -319,7 +402,7 @@ async fn planner_records_do_not_appear_in_legacy_member_partition() -> Result<()
         "group-a",
         "member-a",
         "session-a",
-        1_000,
+        offset_datetime_from_unix_millis(1_000),
         ConsumerGroupAssignmentPlan {
           version: 1,
           planner_member_id: "member-a".to_string(),
@@ -362,11 +445,22 @@ async fn assignment_plan_topology_round_trips_and_is_removed_for_flat_plan() -> 
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
   create_membership_table(&client, &table_name).await?;
 
-  let store =
-    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupMembershipStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   assert_eq!(
     store
-      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-a", 1_000, 1_000)
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-a",
+        offset_datetime_from_unix_millis(1_000),
+        TimeDuration::milliseconds(1_000),
+      )
       .await?,
     ConsumerGroupPlannerLeaseOutcome::Acquired
   );
@@ -397,7 +491,7 @@ async fn assignment_plan_topology_round_trips_and_is_removed_for_flat_plan() -> 
         "group-a",
         "member-a",
         "session-a",
-        1_000,
+        offset_datetime_from_unix_millis(1_000),
         ConsumerGroupAssignmentPlan {
           version: 1,
           planner_member_id: "member-a".to_string(),
@@ -424,7 +518,7 @@ async fn assignment_plan_topology_round_trips_and_is_removed_for_flat_plan() -> 
         "group-a",
         "member-a",
         "session-a",
-        1_001,
+        offset_datetime_from_unix_millis(1_001),
         ConsumerGroupAssignmentPlan {
           version: 2,
           planner_member_id: "member-a".to_string(),
@@ -479,17 +573,35 @@ async fn planner_session_fences_stale_process_and_mismatched_plan_publisher() ->
   let table_name = format!("consumer_membership_test_{}", Uuid::new_v4());
   create_membership_table(&client, &table_name).await?;
 
-  let store =
-    DynamoConsumerGroupMembershipStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupMembershipStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   assert_eq!(
     store
-      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-old", 1_000, 100)
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-old",
+        offset_datetime_from_unix_millis(1_000),
+        TimeDuration::milliseconds(100),
+      )
       .await?,
     ConsumerGroupPlannerLeaseOutcome::Acquired
   );
   assert_eq!(
     store
-      .acquire_or_renew_planner("topic-a", "group-a", "member-a", "session-new", 1_100, 100)
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-new",
+        offset_datetime_from_unix_millis(1_100),
+        TimeDuration::milliseconds(100),
+      )
       .await?,
     ConsumerGroupPlannerLeaseOutcome::Acquired
   );
@@ -512,7 +624,7 @@ async fn planner_session_fences_stale_process_and_mismatched_plan_publisher() ->
         "group-a",
         "member-a",
         "session-old",
-        1_101,
+        offset_datetime_from_unix_millis(1_101),
         plan.clone(),
       )
       .await?
@@ -532,14 +644,21 @@ async fn planner_session_fences_stale_process_and_mismatched_plan_publisher() ->
         "group-a",
         "member-a",
         "session-new",
-        1_101,
+        offset_datetime_from_unix_millis(1_101),
         mismatched_plan,
       )
       .await?
   );
   assert!(
     store
-      .publish_assignment_plan("topic-a", "group-a", "member-a", "session-new", 1_101, plan)
+      .publish_assignment_plan(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "session-new",
+        offset_datetime_from_unix_millis(1_101),
+        plan,
+      )
       .await?
   );
 

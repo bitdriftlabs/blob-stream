@@ -9,6 +9,7 @@ use blob_stream_types::{SeqRange, VirtualPartitionId};
 use log::trace;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use time::OffsetDateTime;
 use tokio::sync::futures::OwnedNotified;
 
 const MAINTENANCE_TARGET_HIGH_UTILIZATION_PERCENT: u64 = 75;
@@ -79,8 +80,8 @@ impl AllocationTransition {
       let mut state = self.state.lock();
       let partition_state = state.partition_state_mut(&self.topic, self.virtual_partition_id);
       let mut stale_completions = Vec::new();
-      if let LeaseExpirationUpdate::Set(lease_expiration_ts_ms) = lease_expiration_update {
-        partition_state.lease_expiration_ts_ms = lease_expiration_ts_ms;
+      if let LeaseExpirationUpdate::Set(lease_expiration_at) = lease_expiration_update {
+        partition_state.lease_expiration_at = lease_expiration_at;
       }
       if let Some(lease) = lease {
         let lease_fence = Some(Arc::new(lease.fence));
@@ -112,7 +113,7 @@ impl AllocationTransition {
           .saturating_sub(records_allocated_since_last_maintenance);
       }
       partition_state.allocation_in_flight = false;
-      partition_state.allocation_started_ts_ms = None;
+      partition_state.allocation_started_at = None;
       (
         Arc::clone(&partition_state.allocation_notify),
         Arc::clone(&partition_state.drain_notify),
@@ -146,7 +147,7 @@ impl Drop for AllocationTransition {
 #[derive(Clone, Copy)]
 pub(super) enum LeaseExpirationUpdate {
   Preserve,
-  Set(Option<i64>),
+  Set(Option<OffsetDateTime>),
 }
 
 //
@@ -205,7 +206,7 @@ pub(super) fn begin_allocation_transition(
   topic: &str,
   virtual_partition_id: VirtualPartitionId,
   record_count: u64,
-  now_ts_ms: i64,
+  now: OffsetDateTime,
   renew_lease: bool,
   base_reservation_size: u64,
 ) -> AllocationTransitionDecision {
@@ -220,7 +221,7 @@ pub(super) fn begin_allocation_transition(
     );
   }
 
-  let lease_was_expired = partition_state.needs_lease(now_ts_ms);
+  let lease_was_expired = partition_state.needs_lease(now);
   let needs_lease = renew_lease || lease_was_expired;
   let remaining_capacity = partition_state.seq_allocator.remaining_capacity();
   let records_allocated_since_last_maintenance =
@@ -284,7 +285,7 @@ pub(super) fn begin_allocation_transition(
   }
 
   partition_state.allocation_in_flight = true;
-  partition_state.allocation_started_ts_ms = Some(now_ts_ms);
+  partition_state.allocation_started_at = Some(now);
   trace!(
     "broker allocation transition claimed: topic={topic}, \
      virtual_partition_id={virtual_partition_id}, renew_lease={renew_lease}, \

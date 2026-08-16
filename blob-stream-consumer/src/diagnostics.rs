@@ -8,15 +8,17 @@ use blob_stream_metadata_store::{
 use blob_stream_types::{
   CommittedSourceCheckpoint,
   VirtualPartitionId,
-  format_unix_timestamp_ms,
   now_unix_millis,
+  offset_datetime_from_unix_millis,
+  offset_datetime_from_unix_seconds,
 };
 use log::debug;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use time::OffsetDateTime;
 use tracing::Span;
 
 //
@@ -37,7 +39,8 @@ pub struct ConsumerStateResponse {
 #[derive(Clone, Debug, Serialize)]
 /// Immutable local state that is available without awaiting external work.
 pub struct ConsumerStateSnapshot {
-  pub generated_at: String,
+  #[serde(with = "time::serde::rfc3339")]
+  pub generated_at: OffsetDateTime,
   pub topic: String,
   pub group_id: String,
   pub member_id: String,
@@ -46,8 +49,10 @@ pub struct ConsumerStateSnapshot {
   pub accepted_assignment_plan_version: u64,
   pub assignment_plan: Option<ConsumerAssignmentPlanSnapshot>,
   pub local: ConsumerLocalStateSnapshot,
-  pub next_heartbeat_at: String,
-  pub next_rebalance_at: String,
+  #[serde(with = "time::serde::rfc3339")]
+  pub next_heartbeat_at: OffsetDateTime,
+  #[serde(with = "time::serde::rfc3339")]
+  pub next_rebalance_at: OffsetDateTime,
   pub prefetch_buffered_batch_count: usize,
   pub prefetch_buffered_record_count: usize,
   pub prefetch_buffered_bytes: u64,
@@ -67,7 +72,8 @@ pub struct ConsumerStateSnapshot {
 pub struct ConsumerLocalStateSnapshot {
   pub pending_revocation: bool,
   pub delivery_state: ConsumerDeliveryState,
-  pub last_successful_heartbeat_at: Option<String>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub last_successful_heartbeat_at: Option<OffsetDateTime>,
   pub partitions: Vec<ConsumerLocalPartitionSnapshot>,
 }
 
@@ -85,7 +91,8 @@ pub struct ConsumerLocalPartitionSnapshot {
   pub pending_commit_offset: Option<u64>,
   pub last_committed_offset: Option<u64>,
   pub last_committed_source_checkpoint: Option<ConsumerSourceCheckpointSnapshot>,
-  pub last_committed_at: Option<String>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub last_committed_at: Option<OffsetDateTime>,
   pub cursor: Option<u64>,
   pub reader: Option<ConsumerReaderStateSnapshot>,
   pub last_scan: Option<ConsumerReaderScanSnapshot>,
@@ -101,8 +108,10 @@ pub struct ConsumerLocalPartitionSnapshot {
 /// Reader scan state for a local virtual partition.
 pub struct ConsumerReaderStateSnapshot {
   pub mode: ConsumerPartitionReadMode,
-  pub recovery_next_window_start: Option<String>,
-  pub recovery_cutover_window_start: Option<String>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub recovery_next_window_start: Option<OffsetDateTime>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub recovery_cutover_window_start: Option<OffsetDateTime>,
 }
 
 //
@@ -112,8 +121,10 @@ pub struct ConsumerReaderStateSnapshot {
 /// Most recent successful scan outcome for one local reader partition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConsumerReaderScanSnapshot {
-  pub completed_at: String,
-  pub scanned_window_starts: Vec<String>,
+  #[serde(with = "time::serde::rfc3339")]
+  pub completed_at: OffsetDateTime,
+  #[serde(serialize_with = "serialize_rfc3339_timestamp_vec")]
+  pub scanned_window_starts: Vec<OffsetDateTime>,
   pub scanned_window_starts_truncated: bool,
   pub fast_scan_bounds: Vec<ConsumerReaderFastScanBoundSnapshot>,
   pub fast_scan_bounds_truncated: bool,
@@ -144,8 +155,10 @@ pub struct ConsumerReaderScanSnapshot {
 /// Human-readable pre-query Fast-path lower-bound inputs and resulting metadata-query lower bound.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConsumerReaderFastScanBoundSnapshot {
-  pub window_start: String,
-  pub floor_timestamp: String,
+  #[serde(with = "time::serde::rfc3339")]
+  pub window_start: OffsetDateTime,
+  #[serde(with = "time::serde::rfc3339")]
+  pub floor_timestamp: OffsetDateTime,
   pub time_floor_snowflake_id: u64,
   pub observed_frontier_snowflake_id: Option<u64>,
   pub partition_lower_bound_snowflake_id: u64,
@@ -160,7 +173,8 @@ pub struct ConsumerReaderFastScanBoundSnapshot {
 /// window.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConsumerReaderFastFrontierSnapshot {
-  pub window_start: String,
+  #[serde(with = "time::serde::rfc3339")]
+  pub window_start: OffsetDateTime,
   pub snowflake_id: u64,
 }
 
@@ -187,7 +201,8 @@ pub enum ConsumerGroupLeaseObservation {
 // Human-readable source checkpoint attached to a committed group lease.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConsumerSourceCheckpointSnapshot {
-  pub window_start: String,
+  #[serde(with = "time::serde::rfc3339")]
+  pub window_start: OffsetDateTime,
   pub snowflake_id: u64,
 }
 
@@ -205,11 +220,14 @@ pub struct ConsumerGroupPartitionLeaseSnapshot {
   pub desired_owner_id: Option<String>,
   pub owner_id: Option<String>,
   pub generation: Option<u64>,
-  pub lease_expiration_at: Option<String>,
-  pub last_heartbeat_at: Option<String>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub lease_expiration_at: Option<OffsetDateTime>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub last_heartbeat_at: Option<OffsetDateTime>,
   pub committed_offset: Option<u64>,
   pub committed_source_checkpoint: Option<ConsumerSourceCheckpointSnapshot>,
-  pub committed_at: Option<String>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub committed_at: Option<OffsetDateTime>,
 }
 
 //
@@ -226,7 +244,8 @@ pub struct ConsumerAssignmentPlanSnapshot {
   pub member_topology: Vec<ConsumerMemberTopologySnapshot>,
   pub pod_loads: Vec<ConsumerPodLoadSnapshot>,
   pub assignments: Vec<ConsumerPartitionAssignmentSnapshot>,
-  pub published_at: String,
+  #[serde(with = "time::serde::rfc3339")]
+  pub published_at: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -284,8 +303,10 @@ pub struct ConsumerOffsetSnapshot {
 pub struct ConsumerReaderPartitionSnapshot {
   pub virtual_partition_id: VirtualPartitionId,
   pub mode: ConsumerPartitionReadMode,
-  pub recovery_next_window_start: Option<String>,
-  pub recovery_cutover_window_start: Option<String>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub recovery_next_window_start: Option<OffsetDateTime>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub recovery_cutover_window_start: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Default)]
@@ -403,7 +424,7 @@ impl ConsumerDiagnostics {
         .map(source_checkpoint_snapshot);
       partition.last_committed_at = committed_cursor
         .committed_at_ms
-        .map(format_unix_timestamp_ms);
+        .map(offset_datetime_from_unix_millis);
     }
     for cursor in runtime_state.cursors {
       local_partition_snapshot(&mut local_partitions, cursor.virtual_partition_id).cursor =
@@ -449,7 +470,7 @@ impl ConsumerDiagnostics {
       .saturating_add(current_batch.map_or(0, |(_, record_count)| record_count));
 
     ConsumerStateSnapshot {
-      generated_at: format_unix_timestamp_ms(now_unix_millis()),
+      generated_at: offset_datetime_from_unix_millis(now_unix_millis()),
       topic: self.group_config.topic.to_string(),
       group_id: self.group_config.group_id.to_string(),
       member_id: self.group_config.member_id.to_string(),
@@ -465,11 +486,11 @@ impl ConsumerDiagnostics {
         },
         last_successful_heartbeat_at: runtime_state
           .last_successful_heartbeat_at_ms
-          .map(format_unix_timestamp_ms),
+          .map(offset_datetime_from_unix_millis),
         partitions: local_partitions.into_values().collect(),
       },
-      next_heartbeat_at: format_unix_timestamp_ms(runtime_state.next_heartbeat_at_ms),
-      next_rebalance_at: format_unix_timestamp_ms(runtime_state.next_rebalance_at_ms),
+      next_heartbeat_at: offset_datetime_from_unix_millis(runtime_state.next_heartbeat_at_ms),
+      next_rebalance_at: offset_datetime_from_unix_millis(runtime_state.next_rebalance_at_ms),
       prefetch_buffered_batch_count: buffered_batches.len(),
       prefetch_buffered_record_count,
       prefetch_buffered_bytes,
@@ -512,7 +533,7 @@ impl ConsumerDiagnostics {
       },
     };
 
-    state.generated_at = format_unix_timestamp_ms(now_unix_millis());
+    state.generated_at = offset_datetime_from_unix_millis(now_unix_millis());
     ConsumerStateResponse {
       state,
       group_lease_observation,
@@ -583,7 +604,7 @@ pub fn assignment_plan_snapshot(
         member_id: assignment.member_id,
       })
       .collect(),
-    published_at: format_unix_timestamp_ms(plan.published_ts_ms),
+    published_at: offset_datetime_from_unix_millis(plan.published_ts_ms),
   }
 }
 
@@ -657,19 +678,19 @@ fn group_partition_lease_snapshot(
     desired_owner_id,
     owner_id: Some(lease.owner_id),
     generation: Some(lease.generation),
-    lease_expiration_at: Some(format_unix_timestamp_ms(lease.lease_expiration_ts_ms)),
-    last_heartbeat_at: Some(format_unix_timestamp_ms(lease.last_heartbeat_ts_ms)),
+    lease_expiration_at: Some(offset_datetime_from_unix_millis(
+      lease.lease_expiration_ts_ms,
+    )),
+    last_heartbeat_at: Some(offset_datetime_from_unix_millis(lease.last_heartbeat_ts_ms)),
     committed_offset: lease.committed_cursor.as_ref().map(|cursor| cursor.seq_end),
     committed_source_checkpoint: lease
       .committed_cursor
       .and_then(|cursor| cursor.source_checkpoint)
       .map(|checkpoint| ConsumerSourceCheckpointSnapshot {
-        window_start: format_unix_timestamp_ms(
-          checkpoint.window_start_unix_seconds.saturating_mul(1_000),
-        ),
+        window_start: offset_datetime_from_unix_seconds(checkpoint.window_start_unix_seconds),
         snowflake_id: checkpoint.snowflake_id,
       }),
-    committed_at: lease.committed_ts_ms.map(format_unix_timestamp_ms),
+    committed_at: lease.committed_ts_ms.map(offset_datetime_from_unix_millis),
   }
 }
 
@@ -677,9 +698,7 @@ fn source_checkpoint_snapshot(
   checkpoint: &CommittedSourceCheckpoint,
 ) -> ConsumerSourceCheckpointSnapshot {
   ConsumerSourceCheckpointSnapshot {
-    window_start: format_unix_timestamp_ms(
-      checkpoint.window_start_unix_seconds.saturating_mul(1_000),
-    ),
+    window_start: offset_datetime_from_unix_seconds(checkpoint.window_start_unix_seconds),
     snowflake_id: checkpoint.snowflake_id,
   }
 }
@@ -705,6 +724,31 @@ fn local_partition_snapshot(
       prefetch_buffered_batch_count: 0,
       prefetch_buffered_record_count: 0,
     })
+}
+
+fn serialize_rfc3339_timestamp_vec<S>(
+  timestamps: &[OffsetDateTime],
+  serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+  S: Serializer,
+{
+  timestamps
+    .iter()
+    .map(Rfc3339Timestamp)
+    .collect::<Vec<_>>()
+    .serialize(serializer)
+}
+
+struct Rfc3339Timestamp<'a>(&'a OffsetDateTime);
+
+impl Serialize for Rfc3339Timestamp<'_> {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
+    time::serde::rfc3339::serialize(self.0, serializer)
+  }
 }
 
 pub fn offsets_from_map(offsets: &HashMap<VirtualPartitionId, u64>) -> Vec<ConsumerOffsetSnapshot> {

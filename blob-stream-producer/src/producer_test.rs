@@ -41,12 +41,13 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceStatus,
   Record,
 };
-use blob_stream_types::{MAX_PRODUCE_BATCHES_REQUEST_BYTES, VirtualPartitionId};
+use blob_stream_types::{MAX_PRODUCE_BATCHES_REQUEST_BYTES, ToProtoDuration, VirtualPartitionId};
 use bytes::Bytes;
 use protobuf::Chars;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
+use time::Duration as TimeDuration;
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use tokio::time::{Instant, timeout};
 
@@ -294,7 +295,7 @@ fn topic_config() -> ProducerTopicConfig {
     name: "telemetry".into(),
     partition_count: 16,
     num_writers: 2,
-    retention_days: 0,
+    retention: TimeDuration::days(1).into_proto(),
     ..Default::default()
   }
 }
@@ -304,12 +305,12 @@ fn default_config() -> ProducerConfig {
   config.writer_id = Some(1);
   config.max_batch_records = Some(1);
   config.max_batch_bytes = Some(1_024);
-  config.flush_max_delay_ms = Some(1_000);
-  config.retry_base_delay_ms = Some(1);
-  config.retry_max_delay_ms = Some(8);
-  config.retry_deadline_ms = Some(1_000);
-  config.connect_timeout_ms = Some(1_000);
-  config.request_timeout_ms = Some(1_000);
+  config.flush_max_delay = TimeDuration::milliseconds(1_000).into_proto();
+  config.retry_base_delay = TimeDuration::milliseconds(1).into_proto();
+  config.retry_max_delay = TimeDuration::milliseconds(8).into_proto();
+  config.retry_deadline = TimeDuration::milliseconds(1_000).into_proto();
+  config.connect_timeout = TimeDuration::milliseconds(1_000).into_proto();
+  config.request_timeout = TimeDuration::milliseconds(1_000).into_proto();
   config.max_request_concurrency = Some(16);
   config.compression = Some(ProducerCompression::PRODUCER_COMPRESSION_SNAPPY.into());
   config
@@ -520,7 +521,7 @@ fn enqueue_distinct_partition_batches(
 async fn diagnostics_report_buffered_partition_state() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(60_000);
+  config.flush_max_delay = TimeDuration::milliseconds(60_000).into_proto();
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
   let transport = Arc::new(FakeBrokerTransport::default());
@@ -554,7 +555,7 @@ async fn diagnostics_report_buffered_partition_state() {
     .diagnostics()
     .expect("producer implementation provides diagnostics")
     .state_snapshot();
-  assert!(snapshot.generated_at.ends_with('Z'));
+  assert_eq!(snapshot.generated_at.offset(), time::UtcOffset::UTC);
   assert_eq!(snapshot.writer_id, 1);
   assert_eq!(snapshot.max_batch_records, 2);
   assert_eq!(
@@ -950,7 +951,7 @@ async fn not_lease_holder_membership_update_refreshes_cached_route_for_retry() {
 async fn membership_update_refreshes_routes_without_flushing_partial_batches() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(60_000);
+  config.flush_max_delay = TimeDuration::milliseconds(60_000).into_proto();
 
   let (discovery, membership_tx) = TestBrokerDiscovery::with_updates(membership());
   let transport = Arc::new(FakeBrokerTransport::default());
@@ -1096,7 +1097,7 @@ async fn not_lease_holder_refresh_uses_the_latest_membership_snapshot() {
 async fn batches_by_partition_and_acks_waiters() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(10_000);
+  config.flush_max_delay = TimeDuration::milliseconds(10_000).into_proto();
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
   let transport = Arc::new(FakeBrokerTransport::default());
@@ -1153,7 +1154,7 @@ async fn batches_by_partition_and_acks_waiters() {
 async fn max_size_flush_resets_the_max_delay_timer() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(10);
+  config.flush_max_delay = TimeDuration::milliseconds(10).into_proto();
 
   let collector = Collector::default();
   let transport = Arc::new(FakeBrokerTransport::default());
@@ -1298,7 +1299,7 @@ async fn rejects_records_larger_than_the_grouped_request_limit() {
 async fn dropped_size_triggering_produce_does_not_cancel_batch_dispatch() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(60_000);
+  config.flush_max_delay = TimeDuration::milliseconds(60_000).into_proto();
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
@@ -1363,7 +1364,7 @@ async fn dropped_size_triggering_produce_does_not_cancel_batch_dispatch() {
 async fn flush_groups_distinct_partition_batches_for_one_broker() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(60_000);
+  config.flush_max_delay = TimeDuration::milliseconds(60_000).into_proto();
 
   let discovery = Arc::new(TestBrokerDiscovery::new(BrokerMembership::new(vec![
     BrokerNode {
@@ -1399,7 +1400,7 @@ async fn flush_groups_distinct_partition_batches_for_one_broker() {
 #[tokio::test]
 async fn surfaces_retry_exhaustion_for_transport_errors() {
   let mut config = default_config();
-  config.retry_deadline_ms = Some(10);
+  config.retry_deadline = TimeDuration::milliseconds(10).into_proto();
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
   let transport = Arc::new(FakeBrokerTransport::default());
@@ -1434,8 +1435,8 @@ async fn surfaces_retry_exhaustion_for_transport_errors() {
 #[tokio::test]
 async fn retry_deadline_bounds_a_blocked_transport_attempt() {
   let mut config = default_config();
-  config.request_timeout_ms = Some(1_000);
-  config.retry_deadline_ms = Some(20);
+  config.request_timeout = TimeDuration::milliseconds(1_000).into_proto();
+  config.retry_deadline = TimeDuration::milliseconds(20).into_proto();
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
@@ -1472,8 +1473,8 @@ async fn retry_deadline_bounds_a_blocked_transport_attempt() {
 async fn flush_returns_batch_failure_after_notifying_waiters() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(60_000);
-  config.retry_deadline_ms = Some(10);
+  config.flush_max_delay = TimeDuration::milliseconds(60_000).into_proto();
+  config.retry_deadline = TimeDuration::milliseconds(10).into_proto();
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
   let transport = Arc::new(FakeBrokerTransport::default());
@@ -1521,7 +1522,7 @@ async fn flush_returns_batch_failure_after_notifying_waiters() {
 async fn flush_returns_no_brokers_after_notifying_waiters() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(60_000);
+  config.flush_max_delay = TimeDuration::milliseconds(60_000).into_proto();
 
   let discovery = Arc::new(TestBrokerDiscovery::new(BrokerMembership::new(vec![])));
   let producer = Arc::new(
@@ -1563,7 +1564,7 @@ async fn flush_returns_no_brokers_after_notifying_waiters() {
 async fn flush_dispatches_distinct_partition_batches_concurrently() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(60_000);
+  config.flush_max_delay = TimeDuration::milliseconds(60_000).into_proto();
   config.max_request_concurrency = Some(2);
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
@@ -1616,7 +1617,7 @@ async fn flush_dispatches_distinct_partition_batches_concurrently() {
 async fn flush_retries_grouped_batches_concurrently() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(60_000);
+  config.flush_max_delay = TimeDuration::milliseconds(60_000).into_proto();
 
   let discovery = Arc::new(TestBrokerDiscovery::new(single_broker_membership()));
   let (retry_entered_tx, mut retry_entered_rx) = mpsc::unbounded_channel();
@@ -1663,7 +1664,7 @@ async fn flush_retries_grouped_batches_concurrently() {
 async fn retries_respect_the_shared_concurrency_limit() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(60_000);
+  config.flush_max_delay = TimeDuration::milliseconds(60_000).into_proto();
   config.max_request_concurrency = Some(1);
 
   let discovery = Arc::new(TestBrokerDiscovery::new(single_broker_membership()));
@@ -1719,7 +1720,7 @@ async fn retries_respect_the_shared_concurrency_limit() {
 async fn timed_flush_dispatches_distinct_partition_batches_concurrently() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(10);
+  config.flush_max_delay = TimeDuration::milliseconds(10).into_proto();
   config.max_request_concurrency = Some(2);
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
@@ -1762,7 +1763,7 @@ async fn timed_flush_dispatches_distinct_partition_batches_concurrently() {
 async fn timed_flush_collects_later_batches_while_a_prior_batch_is_in_flight() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(10);
+  config.flush_max_delay = TimeDuration::milliseconds(10).into_proto();
   config.max_request_concurrency = Some(2);
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
@@ -1830,7 +1831,7 @@ async fn timed_flush_collects_later_batches_while_a_prior_batch_is_in_flight() {
 async fn size_triggered_flush_packs_all_buffered_partitions() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(60_000);
+  config.flush_max_delay = TimeDuration::milliseconds(60_000).into_proto();
 
   let discovery = Arc::new(TestBrokerDiscovery::new(single_broker_membership()));
   let transport = Arc::new(FakeBrokerTransport::default());
@@ -1899,7 +1900,7 @@ async fn size_triggered_flush_packs_all_buffered_partitions() {
 async fn dispatch_completion_does_not_flush_a_later_partial_batch() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(60_000);
+  config.flush_max_delay = TimeDuration::milliseconds(60_000).into_proto();
 
   let discovery = Arc::new(TestBrokerDiscovery::new(single_broker_membership()));
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
@@ -1989,7 +1990,7 @@ async fn dispatch_completion_does_not_flush_a_later_partial_batch() {
 async fn producer_dispatch_respects_the_shared_concurrency_limit() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
-  config.flush_max_delay_ms = Some(60_000);
+  config.flush_max_delay = TimeDuration::milliseconds(60_000).into_proto();
   config.max_request_concurrency = Some(1);
 
   let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
@@ -2094,8 +2095,8 @@ impl ProducerRetryClock for FixedRetryClock {
 #[test]
 fn retry_backoff_respects_configured_maximum() {
   let mut config = default_config();
-  config.retry_base_delay_ms = Some(1);
-  config.retry_max_delay_ms = Some(8);
+  config.retry_base_delay = TimeDuration::milliseconds(1).into_proto();
+  config.retry_max_delay = TimeDuration::milliseconds(8).into_proto();
   let mut backoff = producer_retry_backoff(&config);
 
   for _ in 0 .. 10 {
@@ -2106,8 +2107,8 @@ fn retry_backoff_respects_configured_maximum() {
 #[test]
 fn rejects_retry_backoff_with_base_above_maximum() {
   let mut config = default_config();
-  config.retry_base_delay_ms = Some(9);
-  config.retry_max_delay_ms = Some(8);
+  config.retry_base_delay = TimeDuration::milliseconds(9).into_proto();
+  config.retry_max_delay = TimeDuration::milliseconds(8).into_proto();
 
   let error = validate_producer_config(&config).unwrap_err();
   assert!(error.to_string().contains("must not exceed"));
@@ -2116,9 +2117,9 @@ fn rejects_retry_backoff_with_base_above_maximum() {
 #[tokio::test]
 async fn retry_deadline_clips_the_retry_delay() {
   let mut config = default_config();
-  config.retry_base_delay_ms = Some(100);
-  config.retry_max_delay_ms = Some(100);
-  config.retry_deadline_ms = Some(10);
+  config.retry_base_delay = TimeDuration::milliseconds(100).into_proto();
+  config.retry_max_delay = TimeDuration::milliseconds(100).into_proto();
+  config.retry_deadline = TimeDuration::milliseconds(10).into_proto();
 
   let transport = FakeBrokerTransport::default();
   transport

@@ -1,11 +1,12 @@
 use super::{
   ConsumerReadConfig,
-  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG,
   consumer_candidate_window_count,
-  consumer_idle_poll_delay_ms,
-  consumer_max_idle_poll_delay_ms,
+  consumer_idle_poll_delay,
+  consumer_max_clock_skew,
+  consumer_max_idle_poll_delay,
   consumer_max_in_flight_batch_reads,
-  consumer_metadata_visibility_delay_ms,
+  consumer_metadata_visibility_delay,
   consumer_prefetch_max_bytes,
   consumer_read_runtime_settings,
   consumer_strongly_consistent_metadata_reads,
@@ -16,8 +17,12 @@ use crate::config::ConsumerGroupConfig;
 use bd_runtime_config::loader::Loader;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_metadata_store::MetadataReadConsistency;
-use blob_stream_types::DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS as SHARED_PUBLICATION_LAG_MS;
+use blob_stream_types::{
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG as SHARED_PUBLICATION_LAG,
+  ToProtoDuration,
+};
 use std::sync::Arc;
+use time::Duration;
 
 fn read_config() -> ConsumerReadConfig {
   let mut read = ConsumerReadConfig::new();
@@ -28,18 +33,19 @@ fn read_config() -> ConsumerReadConfig {
 #[test]
 fn read_defaults_derive_two_candidate_windows_and_two_second_idle_cap() {
   let read = read_config();
+  assert_eq!(DEFAULT_MAX_METADATA_PUBLICATION_LAG, SHARED_PUBLICATION_LAG);
+  assert_eq!(DEFAULT_MAX_METADATA_PUBLICATION_LAG, Duration::seconds(15));
   assert_eq!(
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
-    SHARED_PUBLICATION_LAG_MS
-  );
-  assert_eq!(
-    consumer_candidate_window_count(&read, DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS).unwrap(),
+    consumer_candidate_window_count(&read, DEFAULT_MAX_METADATA_PUBLICATION_LAG).unwrap(),
     2
   );
-  assert_eq!(consumer_idle_poll_delay_ms(&read), 250);
-  assert_eq!(consumer_max_idle_poll_delay_ms(&read), 2_000);
+  assert_eq!(consumer_idle_poll_delay(&read), Duration::milliseconds(250));
+  assert_eq!(consumer_max_idle_poll_delay(&read), Duration::seconds(2));
   assert_eq!(consumer_prefetch_max_bytes(&read), 64 * 1024 * 1024);
-  assert_eq!(consumer_metadata_visibility_delay_ms(&read), 2_000);
+  assert_eq!(
+    consumer_metadata_visibility_delay(&read),
+    Duration::milliseconds(2_000)
+  );
   assert!(!consumer_strongly_consistent_metadata_reads(&read));
   assert_eq!(consumer_max_in_flight_batch_reads(&read), 32);
 }
@@ -47,19 +53,34 @@ fn read_defaults_derive_two_candidate_windows_and_two_second_idle_cap() {
 #[test]
 fn candidate_windows_cover_publication_and_visibility_delay() {
   let mut read = read_config();
-  read.window_size_seconds = Some(300);
-  read.metadata_visibility_delay_ms = Some(300_000);
+  read.window_size = Duration::seconds(300).into_proto();
+  read.metadata_visibility_delay = Duration::seconds(300).into_proto();
 
-  assert_eq!(consumer_candidate_window_count(&read, 30_000).unwrap(), 3);
+  assert_eq!(
+    consumer_candidate_window_count(&read, Duration::seconds(30)).unwrap(),
+    3
+  );
+}
+
+#[test]
+fn candidate_windows_round_sub_millisecond_horizons_up() {
+  let mut read = read_config();
+  read.window_size = Duration::seconds(300).into_proto();
+  read.metadata_visibility_delay = (Duration::seconds(300) + Duration::nanoseconds(1)).into_proto();
+
+  assert_eq!(
+    consumer_candidate_window_count(&read, Duration::ZERO).unwrap(),
+    3
+  );
 }
 
 #[test]
 fn candidate_windows_rejects_unbounded_scan_horizon() {
   let mut read = read_config();
-  read.window_size_seconds = Some(300);
-  read.metadata_visibility_delay_ms = Some(9_600_000);
+  read.window_size = Duration::seconds(300).into_proto();
+  read.metadata_visibility_delay = Duration::minutes(160).into_proto();
 
-  let error = consumer_candidate_window_count(&read, 300_000).unwrap_err();
+  let error = consumer_candidate_window_count(&read, Duration::seconds(300)).unwrap_err();
   assert!(
     error
       .to_string()
@@ -70,9 +91,29 @@ fn candidate_windows_rejects_unbounded_scan_horizon() {
 #[test]
 fn metadata_visibility_delay_uses_explicit_value() {
   let mut read = read_config();
-  read.metadata_visibility_delay_ms = Some(1_500);
+  read.metadata_visibility_delay = Duration::milliseconds(1_500).into_proto();
 
-  assert_eq!(consumer_metadata_visibility_delay_ms(&read), 1_500);
+  assert_eq!(
+    consumer_metadata_visibility_delay(&read),
+    Duration::milliseconds(1_500)
+  );
+}
+
+#[test]
+fn validate_read_config_accepts_zero_metadata_visibility_delay() {
+  let mut read = read_config();
+  read.metadata_visibility_delay = Duration::ZERO.into_proto();
+
+  validate_read_config(&read).unwrap();
+}
+
+#[test]
+fn consumer_clock_skew_uses_default_and_explicit_values() {
+  let mut read = read_config();
+  assert_eq!(consumer_max_clock_skew(&read), Duration::milliseconds(10));
+
+  read.max_clock_skew = Duration::milliseconds(25).into_proto();
+  assert_eq!(consumer_max_clock_skew(&read), Duration::milliseconds(25));
 }
 
 #[test]
@@ -118,15 +159,15 @@ fn runtime_feature_flags_override_configured_reader_settings() {
       prefetch_max_bytes: 32,
       max_in_flight_batch_reads: 4,
       metadata_read_consistency: MetadataReadConsistency::Eventual,
-      metadata_visibility_delay_ms: 2_000,
+      metadata_visibility_delay: Duration::milliseconds(2_000),
     }
   );
 }
 
 #[test]
-fn strong_metadata_reads_use_zero_effective_visibility_delay() {
+fn strong_metadata_reads_ignore_the_configured_visibility_delay() {
   let mut read = read_config();
-  read.metadata_visibility_delay_ms = Some(1_500);
+  read.metadata_visibility_delay = Duration::milliseconds(1_500).into_proto();
   read.strongly_consistent_metadata_reads = Some(true);
 
   let runtime_settings = consumer_read_runtime_settings(&read, None);
@@ -136,7 +177,7 @@ fn strong_metadata_reads_use_zero_effective_visibility_delay() {
     runtime_settings.metadata_read_consistency,
     MetadataReadConsistency::Strong
   );
-  assert_eq!(runtime_settings.metadata_visibility_delay_ms, 0);
+  assert_eq!(runtime_settings.metadata_visibility_delay, Duration::ZERO);
 }
 
 #[test]
@@ -155,28 +196,31 @@ fn runtime_feature_flag_overrides_configured_metadata_read_consistency() {
     runtime_settings.metadata_read_consistency,
     MetadataReadConsistency::Eventual
   );
-  assert_eq!(runtime_settings.metadata_visibility_delay_ms, 2_000);
+  assert_eq!(
+    runtime_settings.metadata_visibility_delay,
+    Duration::milliseconds(2_000)
+  );
 }
 
 #[test]
 fn validate_read_config_rejects_max_idle_backoff_less_than_base() {
   let mut read = read_config();
-  read.idle_poll_delay_ms = Some(500);
-  read.max_idle_poll_delay_ms = Some(400);
+  read.idle_poll_delay = Duration::milliseconds(500).into_proto();
+  read.max_idle_poll_delay = Duration::milliseconds(400).into_proto();
 
   let error = validate_read_config(&read).unwrap_err();
   assert!(
     error
       .to_string()
-      .contains("consumer.read.max_idle_poll_delay_ms must be greater than or equal to")
+      .contains("consumer.read.max_idle_poll_delay must be greater than or equal to")
   );
 }
 
 #[test]
 fn validate_read_config_accepts_idle_backoff_range() {
   let mut read = read_config();
-  read.idle_poll_delay_ms = Some(250);
-  read.max_idle_poll_delay_ms = Some(2_000);
+  read.idle_poll_delay = Duration::milliseconds(250).into_proto();
+  read.max_idle_poll_delay = Duration::seconds(2).into_proto();
 
   validate_read_config(&read).unwrap();
 }

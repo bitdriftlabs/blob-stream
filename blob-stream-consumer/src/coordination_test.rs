@@ -31,10 +31,11 @@ use blob_stream_metadata_store::{
   InMemoryConsumerGroupLeaseStore,
   InMemoryConsumerGroupMembershipStore,
 };
-use blob_stream_types::CommittedCursor;
+use blob_stream_types::{CommittedCursor, ToProtoDuration, offset_datetime_from_unix_millis};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
 
@@ -79,15 +80,15 @@ impl ConsumerGroupLeaseStore for PartialHeartbeatFailureLeaseStore {
     key: ConsumerGroupLeaseKey,
     owner_id: String,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
   ) -> anyhow::Result<ConsumerGroupAssignmentOutcome> {
     if self.failing_assignment_partition == Some(key.virtual_partition_id) {
       return Err(anyhow::anyhow!("injected assignment failure"));
     }
     self
       .inner
-      .assign_partition(key, owner_id, generation, now_ts_ms, lease_duration_ms)
+      .assign_partition(key, owner_id, generation, now, lease_duration)
       .await
   }
 
@@ -96,8 +97,8 @@ impl ConsumerGroupLeaseStore for PartialHeartbeatFailureLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
     committed_cursor: Option<CommittedCursor>,
   ) -> anyhow::Result<ConsumerGroupHeartbeatOutcome> {
     if key.virtual_partition_id == self.failing_partition {
@@ -109,8 +110,8 @@ impl ConsumerGroupLeaseStore for PartialHeartbeatFailureLeaseStore {
         key,
         owner_id,
         generation,
-        now_ts_ms,
-        lease_duration_ms,
+        now,
+        lease_duration,
         committed_cursor,
       )
       .await
@@ -121,12 +122,12 @@ impl ConsumerGroupLeaseStore for PartialHeartbeatFailureLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     committed_cursor: CommittedCursor,
   ) -> anyhow::Result<ConsumerGroupCommitOutcome> {
     self
       .inner
-      .commit_cursor(key, owner_id, generation, now_ts_ms, committed_cursor)
+      .commit_cursor(key, owner_id, generation, now, committed_cursor)
       .await
   }
 
@@ -135,11 +136,11 @@ impl ConsumerGroupLeaseStore for PartialHeartbeatFailureLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> anyhow::Result<ConsumerGroupReleaseOutcome> {
     self
       .inner
-      .release_partition(key, owner_id, generation, now_ts_ms)
+      .release_partition(key, owner_id, generation, now)
       .await
   }
 }
@@ -159,8 +160,8 @@ impl ConsumerGroupLeaseStore for BlockingAssignmentLeaseStore {
     key: ConsumerGroupLeaseKey,
     owner_id: String,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
   ) -> anyhow::Result<ConsumerGroupAssignmentOutcome> {
     self.assignment_started.fetch_add(1, Ordering::SeqCst);
     self.assignment_started_notify.notify_waiters();
@@ -172,7 +173,7 @@ impl ConsumerGroupLeaseStore for BlockingAssignmentLeaseStore {
     }
     self
       .inner
-      .assign_partition(key, owner_id, generation, now_ts_ms, lease_duration_ms)
+      .assign_partition(key, owner_id, generation, now, lease_duration)
       .await
   }
 
@@ -181,8 +182,8 @@ impl ConsumerGroupLeaseStore for BlockingAssignmentLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
     committed_cursor: Option<CommittedCursor>,
   ) -> anyhow::Result<ConsumerGroupHeartbeatOutcome> {
     self
@@ -191,8 +192,8 @@ impl ConsumerGroupLeaseStore for BlockingAssignmentLeaseStore {
         key,
         owner_id,
         generation,
-        now_ts_ms,
-        lease_duration_ms,
+        now,
+        lease_duration,
         committed_cursor,
       )
       .await
@@ -203,12 +204,12 @@ impl ConsumerGroupLeaseStore for BlockingAssignmentLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     committed_cursor: CommittedCursor,
   ) -> anyhow::Result<ConsumerGroupCommitOutcome> {
     self
       .inner
-      .commit_cursor(key, owner_id, generation, now_ts_ms, committed_cursor)
+      .commit_cursor(key, owner_id, generation, now, committed_cursor)
       .await
   }
 
@@ -217,11 +218,11 @@ impl ConsumerGroupLeaseStore for BlockingAssignmentLeaseStore {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> anyhow::Result<ConsumerGroupReleaseOutcome> {
     self
       .inner
-      .release_partition(key, owner_id, generation, now_ts_ms)
+      .release_partition(key, owner_id, generation, now)
       .await
   }
 }
@@ -475,9 +476,9 @@ async fn oversubscribed_consumers_keep_stable_assignments_without_fencing() {
           topic: "topic-a".to_string().into(),
           group_id: "group-a".to_string().into(),
           member_id: member_id.clone().into(),
-          lease_duration_ms: Some(1_000),
-          heartbeat_interval_ms: Some(50),
-          rebalance_interval_ms: Some(50),
+          lease_duration: TimeDuration::milliseconds(1_000).into_proto(),
+          heartbeat_interval: TimeDuration::milliseconds(50).into_proto(),
+          rebalance_interval: TimeDuration::milliseconds(50).into_proto(),
           ..Default::default()
         },
         Arc::clone(&store),
@@ -490,7 +491,11 @@ async fn oversubscribed_consumers_keep_stable_assignments_without_fencing() {
   let mut expected_ownership = Vec::with_capacity(coordinators.len());
   for coordinator in &mut coordinators {
     let report = coordinator
-      .rebalance(members.clone(), partitions.clone(), 1_000)
+      .rebalance(
+        members.clone(),
+        partitions.clone(),
+        offset_datetime_from_unix_millis(1_000),
+      )
       .await
       .unwrap();
     expected_ownership.push(report.owned_partitions);
@@ -515,7 +520,7 @@ async fn oversubscribed_consumers_keep_stable_assignments_without_fencing() {
 
   for coordinator in &mut coordinators {
     let report = coordinator
-      .heartbeat_and_commit(1_010, &HashMap::new())
+      .heartbeat_and_commit(offset_datetime_from_unix_millis(1_010), &HashMap::new())
       .await
       .unwrap();
     assert!(report.fenced_partitions.is_empty());
@@ -523,14 +528,18 @@ async fn oversubscribed_consumers_keep_stable_assignments_without_fencing() {
 
   for (coordinator, ownership) in coordinators.iter_mut().zip(&expected_ownership) {
     let report = coordinator
-      .rebalance(members.clone(), partitions.clone(), 1_020)
+      .rebalance(
+        members.clone(),
+        partitions.clone(),
+        offset_datetime_from_unix_millis(1_020),
+      )
       .await
       .unwrap();
     assert_eq!(report.owned_partitions, *ownership);
     assert_eq!(coordinator.generation(), 1);
 
     let heartbeat = coordinator
-      .heartbeat_and_commit(1_030, &HashMap::new())
+      .heartbeat_and_commit(offset_datetime_from_unix_millis(1_030), &HashMap::new())
       .await
       .unwrap();
     assert_eq!(heartbeat.renewed_partitions, *ownership);
@@ -556,9 +565,9 @@ async fn shared_plan_covers_every_partition_despite_divergent_member_snapshots()
           topic: "topic-a".to_string().into(),
           group_id: "group-a".to_string().into(),
           member_id: member_id.clone().into(),
-          lease_duration_ms: Some(1_000),
-          heartbeat_interval_ms: Some(50),
-          rebalance_interval_ms: Some(50),
+          lease_duration: TimeDuration::milliseconds(1_000).into_proto(),
+          heartbeat_interval: TimeDuration::milliseconds(50).into_proto(),
+          rebalance_interval: TimeDuration::milliseconds(50).into_proto(),
           ..Default::default()
         },
         Arc::clone(&lease_store),
@@ -572,7 +581,11 @@ async fn shared_plan_covers_every_partition_despite_divergent_member_snapshots()
   // different incomplete snapshots, matching the stale local-view failure that left partitions
   // uncovered before plans were shared.
   let mut owned = coordinators[0]
-    .rebalance(members.clone(), partitions.clone(), 1_000)
+    .rebalance(
+      members.clone(),
+      partitions.clone(),
+      offset_datetime_from_unix_millis(1_000),
+    )
     .await
     .unwrap()
     .owned_partitions;
@@ -583,7 +596,11 @@ async fn shared_plan_covers_every_partition_despite_divergent_member_snapshots()
   ]) {
     owned.extend(
       coordinator
-        .rebalance(snapshot, partitions.clone(), 1_010)
+        .rebalance(
+          snapshot,
+          partitions.clone(),
+          offset_datetime_from_unix_millis(1_010),
+        )
         .await
         .unwrap()
         .owned_partitions,
@@ -612,8 +629,8 @@ async fn coordinator_does_not_create_local_assignment_without_shared_plan() {
         "group-a",
         "member-b",
         "member-b-session",
-        1_000,
-        1_000,
+        offset_datetime_from_unix_millis(1_000),
+        TimeDuration::milliseconds(1_000),
       )
       .await
       .unwrap(),
@@ -624,9 +641,9 @@ async fn coordinator_does_not_create_local_assignment_without_shared_plan() {
       topic: "topic-a".to_string().into(),
       group_id: "group-a".to_string().into(),
       member_id: "member-a".to_string().into(),
-      lease_duration_ms: Some(1_000),
-      heartbeat_interval_ms: Some(50),
-      rebalance_interval_ms: Some(50),
+      lease_duration: TimeDuration::milliseconds(1_000).into_proto(),
+      heartbeat_interval: TimeDuration::milliseconds(50).into_proto(),
+      rebalance_interval: TimeDuration::milliseconds(50).into_proto(),
       ..Default::default()
     },
     lease_store,
@@ -635,7 +652,11 @@ async fn coordinator_does_not_create_local_assignment_without_shared_plan() {
   .unwrap();
 
   let report = coordinator
-    .rebalance(vec!["member-a".to_string()], vec![0, 1], 1_001)
+    .rebalance(
+      vec!["member-a".to_string()],
+      vec![0, 1],
+      offset_datetime_from_unix_millis(1_001),
+    )
     .await
     .unwrap();
 
@@ -652,9 +673,9 @@ async fn heartbeat_commit_renews_and_commits_cursor() {
       topic: "topic-a".to_string().into(),
       group_id: "group-a".to_string().into(),
       member_id: "member-a".to_string().into(),
-      lease_duration_ms: Some(100),
-      heartbeat_interval_ms: Some(50),
-      rebalance_interval_ms: Some(50),
+      lease_duration: TimeDuration::milliseconds(100).into_proto(),
+      heartbeat_interval: TimeDuration::milliseconds(50).into_proto(),
+      rebalance_interval: TimeDuration::milliseconds(50).into_proto(),
       ..Default::default()
     },
     Arc::clone(&store),
@@ -663,14 +684,21 @@ async fn heartbeat_commit_renews_and_commits_cursor() {
   .unwrap();
 
   let owned = coordinator
-    .rebalance(vec!["member-a".to_string()], vec![7], 1_000)
+    .rebalance(
+      vec!["member-a".to_string()],
+      vec![7],
+      offset_datetime_from_unix_millis(1_000),
+    )
     .await
     .unwrap();
   assert_eq!(owned.owned_partitions, vec![7]);
   assert!(owned.recovered_cursors.is_empty());
 
   let report = coordinator
-    .heartbeat_and_commit(1_010, &HashMap::from([(7_u32, committed_cursor(7, 10))]))
+    .heartbeat_and_commit(
+      offset_datetime_from_unix_millis(1_010),
+      &HashMap::from([(7_u32, committed_cursor(7, 10))]),
+    )
     .await
     .unwrap();
   assert_eq!(report.renewed_partitions, vec![7]);
@@ -686,9 +714,9 @@ async fn commit_cursors_does_not_renew_partition_leases() {
       topic: "topic-a".to_string().into(),
       group_id: "group-a".to_string().into(),
       member_id: "member-a".to_string().into(),
-      lease_duration_ms: Some(100),
-      heartbeat_interval_ms: Some(50),
-      rebalance_interval_ms: Some(50),
+      lease_duration: TimeDuration::milliseconds(100).into_proto(),
+      heartbeat_interval: TimeDuration::milliseconds(50).into_proto(),
+      rebalance_interval: TimeDuration::milliseconds(50).into_proto(),
       ..Default::default()
     },
     store,
@@ -697,12 +725,19 @@ async fn commit_cursors_does_not_renew_partition_leases() {
   .unwrap();
 
   coordinator
-    .rebalance(vec!["member-a".to_string()], vec![7, 8], 1_000)
+    .rebalance(
+      vec!["member-a".to_string()],
+      vec![7, 8],
+      offset_datetime_from_unix_millis(1_000),
+    )
     .await
     .unwrap();
 
   let report = coordinator
-    .commit_cursors(1_010, &HashMap::from([(7_u32, committed_cursor(7, 10))]))
+    .commit_cursors(
+      offset_datetime_from_unix_millis(1_010),
+      &HashMap::from([(7_u32, committed_cursor(7, 10))]),
+    )
     .await
     .unwrap();
   assert_eq!(report.renewed_partitions, vec![7]);
@@ -746,9 +781,9 @@ async fn rebalance_acquires_partition_leases_concurrently() {
       topic: "topic-a".to_string().into(),
       group_id: "group-a".to_string().into(),
       member_id: "member-a".to_string().into(),
-      lease_duration_ms: Some(1_000),
-      heartbeat_interval_ms: Some(50),
-      rebalance_interval_ms: Some(50),
+      lease_duration: TimeDuration::milliseconds(1_000).into_proto(),
+      heartbeat_interval: TimeDuration::milliseconds(50).into_proto(),
+      rebalance_interval: TimeDuration::milliseconds(50).into_proto(),
       ..Default::default()
     },
     store,
@@ -758,7 +793,11 @@ async fn rebalance_acquires_partition_leases_concurrently() {
 
   let rebalance = tokio::spawn(async move {
     coordinator
-      .rebalance(vec!["member-a".to_string()], vec![0, 1, 2], 1_000)
+      .rebalance(
+        vec!["member-a".to_string()],
+        vec![0, 1, 2],
+        offset_datetime_from_unix_millis(1_000),
+      )
       .await
   });
 
@@ -787,9 +826,9 @@ async fn stable_rebalance_preserves_owned_partitions_and_committed_cursor() {
       topic: "topic-a".to_string().into(),
       group_id: "group-a".to_string().into(),
       member_id: "member-a".to_string().into(),
-      lease_duration_ms: Some(100),
-      heartbeat_interval_ms: Some(50),
-      rebalance_interval_ms: Some(50),
+      lease_duration: TimeDuration::milliseconds(100).into_proto(),
+      heartbeat_interval: TimeDuration::milliseconds(50).into_proto(),
+      rebalance_interval: TimeDuration::milliseconds(50).into_proto(),
       ..Default::default()
     },
     Arc::clone(&store),
@@ -798,16 +837,27 @@ async fn stable_rebalance_preserves_owned_partitions_and_committed_cursor() {
   .unwrap();
 
   coordinator
-    .rebalance(vec!["member-a".to_string()], vec![7], 1_000)
+    .rebalance(
+      vec!["member-a".to_string()],
+      vec![7],
+      offset_datetime_from_unix_millis(1_000),
+    )
     .await
     .unwrap();
   coordinator
-    .heartbeat_and_commit(1_010, &HashMap::from([(7_u32, committed_cursor(7, 10))]))
+    .heartbeat_and_commit(
+      offset_datetime_from_unix_millis(1_010),
+      &HashMap::from([(7_u32, committed_cursor(7, 10))]),
+    )
     .await
     .unwrap();
 
   let report = coordinator
-    .rebalance(vec!["member-a".to_string()], vec![7], 1_020)
+    .rebalance(
+      vec!["member-a".to_string()],
+      vec![7],
+      offset_datetime_from_unix_millis(1_020),
+    )
     .await
     .unwrap();
 
@@ -826,9 +876,9 @@ async fn heartbeat_detects_fencing_by_new_generation() {
       topic: "topic-a".to_string().into(),
       group_id: "group-a".to_string().into(),
       member_id: "member-a".to_string().into(),
-      lease_duration_ms: Some(100),
-      heartbeat_interval_ms: Some(50),
-      rebalance_interval_ms: Some(50),
+      lease_duration: TimeDuration::milliseconds(100).into_proto(),
+      heartbeat_interval: TimeDuration::milliseconds(50).into_proto(),
+      rebalance_interval: TimeDuration::milliseconds(50).into_proto(),
       ..Default::default()
     },
     Arc::clone(&store),
@@ -840,7 +890,7 @@ async fn heartbeat_detects_fencing_by_new_generation() {
     .rebalance(
       vec!["member-a".to_string(), "member-b".to_string()],
       vec![7],
-      1_000,
+      offset_datetime_from_unix_millis(1_000),
     )
     .await
     .unwrap();
@@ -853,12 +903,21 @@ async fn heartbeat_detects_fencing_by_new_generation() {
   };
 
   concrete_store
-    .assign_partition(key, "member-b".to_string(), 2, 1_120, 100)
+    .assign_partition(
+      key,
+      "member-b".to_string(),
+      2,
+      offset_datetime_from_unix_millis(1_120),
+      TimeDuration::milliseconds(100),
+    )
     .await
     .unwrap();
 
   let report = coordinator
-    .heartbeat_and_commit(1_130, &HashMap::from([(7_u32, committed_cursor(7, 12))]))
+    .heartbeat_and_commit(
+      offset_datetime_from_unix_millis(1_130),
+      &HashMap::from([(7_u32, committed_cursor(7, 12))]),
+    )
     .await
     .unwrap();
 
@@ -881,9 +940,9 @@ async fn heartbeat_reconciles_fencing_when_another_partition_errors() {
       topic: "topic-a".to_string().into(),
       group_id: "group-a".to_string().into(),
       member_id: "member-a".to_string().into(),
-      lease_duration_ms: Some(100),
-      heartbeat_interval_ms: Some(50),
-      rebalance_interval_ms: Some(50),
+      lease_duration: TimeDuration::milliseconds(100).into_proto(),
+      heartbeat_interval: TimeDuration::milliseconds(50).into_proto(),
+      rebalance_interval: TimeDuration::milliseconds(50).into_proto(),
       ..Default::default()
     },
     store,
@@ -892,7 +951,11 @@ async fn heartbeat_reconciles_fencing_when_another_partition_errors() {
   .unwrap();
 
   coordinator
-    .rebalance(vec!["member-a".to_string()], vec![7, 8], 1_000)
+    .rebalance(
+      vec!["member-a".to_string()],
+      vec![7, 8],
+      offset_datetime_from_unix_millis(1_000),
+    )
     .await
     .unwrap();
   assert_eq!(coordinator.owned_partitions(), vec![7, 8]);
@@ -907,15 +970,15 @@ async fn heartbeat_reconciles_fencing_when_another_partition_errors() {
       },
       "member-b".to_string(),
       2,
-      1_120,
-      100,
+      offset_datetime_from_unix_millis(1_120),
+      TimeDuration::milliseconds(100),
     )
     .await
     .unwrap();
 
   assert!(
     coordinator
-      .heartbeat_and_commit(1_130, &HashMap::new())
+      .heartbeat_and_commit(offset_datetime_from_unix_millis(1_130), &HashMap::new())
       .await
       .is_err()
   );
@@ -936,7 +999,13 @@ async fn rebalance_preserves_successful_claims_when_a_sibling_claim_fails() {
   };
   concrete_store
     .inner
-    .assign_partition(key.clone(), "member-b".to_string(), 1, 1_000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-b".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
     .await
     .unwrap();
   concrete_store
@@ -945,8 +1014,8 @@ async fn rebalance_preserves_successful_claims_when_a_sibling_claim_fails() {
       &key,
       "member-b",
       1,
-      1_010,
-      100,
+      offset_datetime_from_unix_millis(1_010),
+      TimeDuration::milliseconds(100),
       Some(committed_cursor(7, 42)),
     )
     .await
@@ -958,9 +1027,9 @@ async fn rebalance_preserves_successful_claims_when_a_sibling_claim_fails() {
       topic: "topic-a".to_string().into(),
       group_id: "group-a".to_string().into(),
       member_id: "member-a".to_string().into(),
-      lease_duration_ms: Some(100),
-      heartbeat_interval_ms: Some(50),
-      rebalance_interval_ms: Some(50),
+      lease_duration: TimeDuration::milliseconds(100).into_proto(),
+      heartbeat_interval: TimeDuration::milliseconds(50).into_proto(),
+      rebalance_interval: TimeDuration::milliseconds(50).into_proto(),
       ..Default::default()
     },
     store,
@@ -969,7 +1038,11 @@ async fn rebalance_preserves_successful_claims_when_a_sibling_claim_fails() {
   .unwrap();
 
   let report = coordinator
-    .rebalance(vec!["member-a".to_string()], vec![7, 8], 1_120)
+    .rebalance(
+      vec!["member-a".to_string()],
+      vec![7, 8],
+      offset_datetime_from_unix_millis(1_120),
+    )
     .await
     .unwrap();
 
@@ -1000,9 +1073,9 @@ async fn release_owned_releases_partitions_for_fast_takeover() {
       topic: "topic-a".to_string().into(),
       group_id: "group-a".to_string().into(),
       member_id: "member-a".to_string().into(),
-      lease_duration_ms: Some(1_000),
-      heartbeat_interval_ms: Some(50),
-      rebalance_interval_ms: Some(50),
+      lease_duration: TimeDuration::milliseconds(1_000).into_proto(),
+      heartbeat_interval: TimeDuration::milliseconds(50).into_proto(),
+      rebalance_interval: TimeDuration::milliseconds(50).into_proto(),
       ..Default::default()
     },
     Arc::clone(&store),
@@ -1011,12 +1084,19 @@ async fn release_owned_releases_partitions_for_fast_takeover() {
   .unwrap();
 
   coordinator
-    .rebalance(vec!["member-a".to_string()], vec![7], 1_000)
+    .rebalance(
+      vec!["member-a".to_string()],
+      vec![7],
+      offset_datetime_from_unix_millis(1_000),
+    )
     .await
     .unwrap();
   assert_eq!(coordinator.owned_partitions(), vec![7]);
 
-  let released = coordinator.release_owned(1_010).await.unwrap();
+  let released = coordinator
+    .release_owned(offset_datetime_from_unix_millis(1_010))
+    .await
+    .unwrap();
   assert_eq!(released, vec![7]);
   assert!(coordinator.owned_partitions().is_empty());
 
@@ -1026,7 +1106,13 @@ async fn release_owned_releases_partitions_for_fast_takeover() {
     virtual_partition_id: 7,
   };
   let reassigned = concrete_store
-    .assign_partition(key, "member-b".to_string(), 2, 1_010, 1_000)
+    .assign_partition(
+      key,
+      "member-b".to_string(),
+      2,
+      offset_datetime_from_unix_millis(1_010),
+      TimeDuration::milliseconds(1_000),
+    )
     .await
     .unwrap();
   assert!(matches!(

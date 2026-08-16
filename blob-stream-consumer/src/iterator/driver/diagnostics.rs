@@ -1,14 +1,7 @@
-use super::{ConsumerDriver, ConsumerSharedState, CoordinationSnapshot, OffsetDateTimeExt, info};
+use super::{ConsumerDriver, ConsumerSharedState, CoordinationSnapshot, info};
+use bd_time::OffsetDateTimeExt;
 
 impl ConsumerDriver {
-  pub(in crate::iterator) fn now_unix_millis(&self) -> i64 {
-    self.time_provider.now().unix_timestamp_ms()
-  }
-
-  pub(in crate::iterator) fn now_unix_seconds(&self) -> i64 {
-    self.time_provider.now().unix_timestamp()
-  }
-
   pub(in crate::iterator) fn record_coordination_snapshot(
     &mut self,
     snapshot: &CoordinationSnapshot,
@@ -75,8 +68,8 @@ impl ConsumerDriver {
       .pending_assignment
       .clone_from(&self.pending_assignment);
     diagnostics.pending_revocation = self.pending_revocation_completion.is_some();
-    diagnostics.next_heartbeat_at_ms = self.next_heartbeat_at_ms;
-    diagnostics.next_rebalance_at_ms = self.next_rebalance_at_ms;
+    diagnostics.next_heartbeat_at_ms = self.next_heartbeat_at.unix_timestamp_ms();
+    diagnostics.next_rebalance_at_ms = self.next_rebalance_at.unix_timestamp_ms();
     diagnostics.started = self.started;
     diagnostics.prefetch_worker_running = self.prefetch_task.is_some();
   }
@@ -85,7 +78,7 @@ impl ConsumerDriver {
     let mut shared_state = self.shared_state.lock();
     let diagnostics = &mut shared_state.diagnostics;
     diagnostics.accepted_assignment_plan_version = self.coordinator.generation();
-    diagnostics.next_rebalance_at_ms = self.next_rebalance_at_ms;
+    diagnostics.next_rebalance_at_ms = self.next_rebalance_at.unix_timestamp_ms();
     diagnostics.started = self.started;
     diagnostics.prefetch_worker_running = self.prefetch_task.is_some();
   }

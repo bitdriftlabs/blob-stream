@@ -44,7 +44,7 @@ use anyhow::Result;
 use bd_backoff::{ExponentialBackoff, ExponentialBackoffBuilder, InfiniteBackoff as _};
 use bd_log_util::warn_every;
 use bd_time::TimeProvider;
-use blob_stream_types::{SnowflakeId, VirtualPartitionId, format_unix_timestamp_ms};
+use blob_stream_types::{SnowflakeId, VirtualPartitionId, offset_datetime_from_unix_seconds};
 use log::debug;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
@@ -68,28 +68,22 @@ pub(super) struct IdlePollBackoff {
 }
 
 impl IdlePollBackoff {
-  pub(super) fn new(base_delay_ms: u64, max_delay_ms: Option<u64>) -> Self {
+  pub(super) fn new(base_delay: time::Duration, max_delay: Option<time::Duration>) -> Self {
     Self {
       inner: ExponentialBackoffBuilder::new_infinite()
-        .with_initial_interval(
-          time::Duration::try_from(std::time::Duration::from_millis(base_delay_ms))
-            .unwrap_or(time::Duration::MAX),
-        )
+        .with_initial_interval(base_delay)
         .with_randomization_factor(0.0)
         .with_multiplier(2.0)
-        .with_max_interval(
-          time::Duration::try_from(std::time::Duration::from_millis(
-            max_delay_ms.unwrap_or(base_delay_ms),
-          ))
-          .unwrap_or(time::Duration::MAX),
-        )
+        .with_max_interval(max_delay.unwrap_or(base_delay))
         .build(),
     }
   }
 
   /// Return the current delay before increasing it for the next consecutive empty read.
-  pub(super) fn next_delay_ms(&mut self) -> u64 {
-    u64::try_from(self.inner.next_backoff().whole_milliseconds()).unwrap_or(u64::MAX)
+  pub(super) fn next_delay(&mut self) -> time::Duration {
+    time::Duration::milliseconds(
+      i64::try_from(self.inner.next_backoff().whole_milliseconds()).unwrap_or(i64::MAX),
+    )
   }
 
   /// A nonempty reader result restores the configured base poll delay.
@@ -106,18 +100,18 @@ impl IdlePollBackoff {
 pub(super) enum ConsumerReaderCommand {
   HydrateCursors {
     recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
-    now_unix_seconds: i64,
+    now: OffsetDateTime,
   },
   SetAssignment {
     assignment: Vec<VirtualPartitionId>,
-    now_unix_seconds: i64,
+    now: OffsetDateTime,
     handoff_phase: Option<&'static str>,
     release_delivery_fence: bool,
   },
   Seek {
     virtual_partition_id: VirtualPartitionId,
     offset: u64,
-    now_unix_seconds: i64,
+    now: OffsetDateTime,
     seek_trace: SeekTrace,
     response: oneshot::Sender<Result<()>>,
   },
@@ -192,8 +186,8 @@ pub(super) struct PrefetchWorker {
   reader_command_notify: Arc<Notify>,
   prefetch_shutdown: Arc<AtomicBool>,
   metrics: ConsumerIteratorMetrics,
-  base_idle_delay_ms: u64,
-  max_idle_delay_ms: Option<u64>,
+  base_idle_delay: time::Duration,
+  max_idle_delay: Option<time::Duration>,
   recovery_traces: HashMap<VirtualPartitionId, RecoveryTrace>,
   pending_seek_traces: HashMap<VirtualPartitionId, SeekTrace>,
   time_provider: Arc<dyn TimeProvider>,
@@ -213,8 +207,8 @@ impl PrefetchWorker {
     reader_command_notify: Arc<Notify>,
     prefetch_shutdown: Arc<AtomicBool>,
     metrics: ConsumerIteratorMetrics,
-    base_idle_delay_ms: u64,
-    max_idle_delay_ms: Option<u64>,
+    base_idle_delay: time::Duration,
+    max_idle_delay: Option<time::Duration>,
     time_provider: Arc<dyn TimeProvider>,
     lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
     member_id: String,
@@ -229,8 +223,8 @@ impl PrefetchWorker {
       reader_command_notify,
       prefetch_shutdown,
       metrics,
-      base_idle_delay_ms,
-      max_idle_delay_ms,
+      base_idle_delay,
+      max_idle_delay,
       recovery_traces: HashMap::new(),
       pending_seek_traces: HashMap::new(),
       time_provider,
@@ -241,8 +235,7 @@ impl PrefetchWorker {
 
   /// Run until shutdown, a reader command failure, or the driver drops the command channel.
   pub(super) async fn run(mut self) {
-    let mut idle_poll_backoff =
-      IdlePollBackoff::new(self.base_idle_delay_ms, self.max_idle_delay_ms);
+    let mut idle_poll_backoff = IdlePollBackoff::new(self.base_idle_delay, self.max_idle_delay);
     let mut pending = VecDeque::<ConsumerBatch>::new();
     let mut pending_record_count = 0_usize;
     let mut pending_bytes = 0_u64;
@@ -316,16 +309,11 @@ impl PrefetchWorker {
         // delay. If the deadline has arrived, retain the fallback rather than tight-looping.
         let now = self.time_provider.now();
         let idle_delay = read_outcome
-          .next_visibility_eligible_unix_seconds
-          .and_then(|deadline| OffsetDateTime::from_unix_timestamp(deadline).ok())
+          .next_visibility_eligible_at
           .map(|deadline| deadline - now)
           .filter(|delay| delay.is_positive())
           .and_then(|delay| time::Duration::try_from(delay.unsigned_abs()).ok())
-          .unwrap_or_else(|| {
-            time::Duration::milliseconds(
-              i64::try_from(idle_poll_backoff.next_delay_ms()).unwrap_or(i64::MAX),
-            )
-          });
+          .unwrap_or_else(|| idle_poll_backoff.next_delay());
         tokio::select! {
           () = self.time_provider.sleep(idle_delay) => {},
           // Configuration, assignment, hydration, and seek commands must not wait for metadata
@@ -721,10 +709,10 @@ impl PrefetchWorker {
   ) -> ReadAvailableOutcome {
     let mut read_attempt: u8 = 0;
     loop {
-      let now_s = self.time_provider.now().unix_timestamp();
+      let now = self.time_provider.now();
       match self
         .reader
-        .read_available_with_capacity_and_settings(now_s, capacity, runtime_settings)
+        .read_available_with_capacity_and_settings(now, capacity, runtime_settings)
         .await
       {
         Ok(batches) => return ReadAvailableOutcome::Batches(batches),
@@ -745,9 +733,7 @@ impl PrefetchWorker {
             "consumer prefetch read failed after retry: error={read_error:#}"
           );
           tokio::select! {
-            () = self.time_provider.sleep(time::Duration::milliseconds(
-              i64::try_from(self.base_idle_delay_ms).unwrap_or(i64::MAX),
-            )) => {},
+            () = self.time_provider.sleep(self.base_idle_delay) => {},
             () = self.reader_command_notify.notified() => {
               return ReadAvailableOutcome::CommandPending;
             },
@@ -794,12 +780,12 @@ fn reader_partition_scan_snapshot(
   state: &ConsumerReaderPartitionScanState,
 ) -> ConsumerReaderScanSnapshot {
   ConsumerReaderScanSnapshot {
-    completed_at: format_unix_timestamp_ms(state.completed_at_unix_seconds.saturating_mul(1_000)),
+    completed_at: offset_datetime_from_unix_seconds(state.completed_at_unix_seconds),
     scanned_window_starts: state
       .scanned_window_starts
       .iter()
       .take(MAX_SCAN_DETAIL_ENTRIES)
-      .map(|window_start| format_unix_timestamp_ms(window_start.saturating_mul(1_000)))
+      .map(|window_start| offset_datetime_from_unix_seconds(*window_start))
       .collect(),
     scanned_window_starts_truncated: state.scanned_window_starts.len() > MAX_SCAN_DETAIL_ENTRIES,
     fast_scan_bounds: state
@@ -840,10 +826,8 @@ fn reader_fast_scan_bound_snapshot(
   state: &ConsumerReaderFastScanBoundState,
 ) -> ConsumerReaderFastScanBoundSnapshot {
   ConsumerReaderFastScanBoundSnapshot {
-    window_start: format_unix_timestamp_ms(state.window_start_unix_seconds.saturating_mul(1_000)),
-    floor_timestamp: format_unix_timestamp_ms(
-      state.floor_timestamp_unix_seconds.saturating_mul(1_000),
-    ),
+    window_start: offset_datetime_from_unix_seconds(state.window_start_unix_seconds),
+    floor_timestamp: state.floor_timestamp,
     time_floor_snowflake_id: state.time_floor.as_u64(),
     observed_frontier_snowflake_id: state.observed_frontier.map(SnowflakeId::as_u64),
     partition_lower_bound_snowflake_id: state.partition_lower_bound.as_u64(),
@@ -855,7 +839,7 @@ fn reader_fast_frontier_snapshot(
   state: &ConsumerReaderFastFrontierState,
 ) -> ConsumerReaderFastFrontierSnapshot {
   ConsumerReaderFastFrontierSnapshot {
-    window_start: format_unix_timestamp_ms(state.window_start_unix_seconds.saturating_mul(1_000)),
+    window_start: offset_datetime_from_unix_seconds(state.window_start_unix_seconds),
     snowflake_id: state.snowflake_id.as_u64(),
   }
 }
@@ -883,25 +867,25 @@ fn process_reader_commands(
     let seek_response = match command {
       ConsumerReaderCommand::HydrateCursors {
         recovered_cursors,
-        now_unix_seconds,
+        now,
       } => {
         for (partition_id, recovered_cursor) in recovered_cursors {
           reader.hydrate_cursor_with_source(
             partition_id,
             &recovered_cursor.committed_cursor,
             recovered_cursor.committed_ts_ms,
-            now_unix_seconds,
+            now,
           );
         }
         None
       },
       ConsumerReaderCommand::SetAssignment {
         assignment,
-        now_unix_seconds,
+        now,
         handoff_phase,
         release_delivery_fence,
       } => {
-        if let Err(error) = reader.set_assigned_virtual_partitions(&assignment, now_unix_seconds) {
+        if let Err(error) = reader.set_assigned_virtual_partitions(&assignment, now) {
           shared_state.lock().terminal_error = Some(format!("{error:#}"));
           return false;
         }
@@ -922,7 +906,7 @@ fn process_reader_commands(
       ConsumerReaderCommand::Seek {
         virtual_partition_id,
         offset,
-        now_unix_seconds,
+        now,
         seek_trace,
         response,
       } => {
@@ -935,7 +919,7 @@ fn process_reader_commands(
           seek_trace.finish("superseded");
         }
         pending_seek_traces.insert(virtual_partition_id, seek_trace);
-        reader.seek(virtual_partition_id, offset, now_unix_seconds);
+        reader.seek(virtual_partition_id, offset, now);
         // A seek invalidates all unread reader output for that partition, including batches that
         // have not crossed the shared byte-budget boundary yet.
         pending.retain(|batch| {
@@ -1029,8 +1013,8 @@ fn reader_partition_snapshot(
     } => ConsumerReaderPartitionSnapshot {
       virtual_partition_id,
       mode: ConsumerPartitionReadMode::Fresh,
-      recovery_next_window_start: Some(format_unix_timestamp_ms(
-        initial_window_start_unix_seconds.saturating_mul(1_000),
+      recovery_next_window_start: Some(offset_datetime_from_unix_seconds(
+        initial_window_start_unix_seconds,
       )),
       recovery_cutover_window_start: None,
     },
@@ -1040,11 +1024,11 @@ fn reader_partition_snapshot(
     } => ConsumerReaderPartitionSnapshot {
       virtual_partition_id,
       mode: ConsumerPartitionReadMode::Recovering,
-      recovery_next_window_start: Some(format_unix_timestamp_ms(
-        next_window_start_unix_seconds.saturating_mul(1_000),
+      recovery_next_window_start: Some(offset_datetime_from_unix_seconds(
+        next_window_start_unix_seconds,
       )),
-      recovery_cutover_window_start: Some(format_unix_timestamp_ms(
-        cutover_window_start_unix_seconds.saturating_mul(1_000),
+      recovery_cutover_window_start: Some(offset_datetime_from_unix_seconds(
+        cutover_window_start_unix_seconds,
       )),
     },
     ConsumerReaderPartitionMode::Fast => ConsumerReaderPartitionSnapshot {

@@ -15,7 +15,7 @@ use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, Nex
 use blob_stream_consumer::{
   ConsumerConfigFactory,
   ConsumerReadConfig,
-  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG,
 };
 use blob_stream_producer::{
   ProducerAck,
@@ -28,9 +28,9 @@ use blob_stream_producer::{
   ProducerRetrySummary,
 };
 use blob_stream_types::{
+  ToProtoDuration,
   VirtualPartitionId,
   now_unix_millis,
-  now_unix_seconds,
   virtual_partition_for_key,
 };
 use futures::StreamExt;
@@ -41,6 +41,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use time::Duration as TimeDuration;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, timeout};
 use uuid::Uuid;
@@ -508,12 +509,17 @@ async fn run_with_resources(
       .as_mut()
       .and_then(|runtime| runtime.group.as_mut())
       .ok_or_else(|| anyhow!("stress consumer bootstrap config is missing group settings"))?;
-    consumer_group_config.lease_duration_ms =
-      Some(duration_millis(config.consumer_lease_duration)?);
-    consumer_group_config.heartbeat_interval_ms =
-      Some(duration_millis(config.consumer_heartbeat_interval)?);
-    consumer_group_config.rebalance_interval_ms =
-      Some(duration_millis(config.consumer_rebalance_interval)?);
+    consumer_group_config.lease_duration = TimeDuration::try_from(config.consumer_lease_duration)
+      .map_err(|_| anyhow!("stress consumer lease duration exceeds time::Duration bounds"))?
+      .into_proto();
+    consumer_group_config.heartbeat_interval =
+      TimeDuration::try_from(config.consumer_heartbeat_interval)
+        .map_err(|_| anyhow!("stress consumer heartbeat interval exceeds time::Duration bounds"))?
+        .into_proto();
+    consumer_group_config.rebalance_interval =
+      TimeDuration::try_from(config.consumer_rebalance_interval)
+        .map_err(|_| anyhow!("stress consumer rebalance interval exceeds time::Duration bounds"))?
+        .into_proto();
     let mut consumer = ConsumerConfigFactory::build_iterator_from_proto_config(
       consumer_config,
       Collector::default().scope("blob_stream_stress_consumer"),
@@ -732,11 +738,6 @@ async fn run_with_resources(
   })
 }
 
-fn duration_millis(duration: Duration) -> Result<i64> {
-  i64::try_from(duration.as_millis())
-    .map_err(|_| anyhow!("stress duration exceeds milliseconds as i64"))
-}
-
 async fn run_producer(
   producer: blob_stream_producer::ProducerClientImpl,
   run_id: Uuid,
@@ -854,11 +855,11 @@ fn stress_producer_config(config: &StressConfig) -> Result<ProducerConfig> {
   let mut producer_config = ProducerConfig::new();
   producer_config.max_batch_records = config.producer_max_batch_records;
   producer_config.max_batch_bytes = config.producer_max_batch_bytes;
-  producer_config.flush_max_delay_ms = config
-    .producer_flush_max_delay
-    .map(|flush_max_delay| u64::try_from(flush_max_delay.as_millis()))
-    .transpose()
-    .map_err(|_| anyhow!("producer flush max delay exceeds milliseconds as u64"))?;
+  if let Some(flush_max_delay) = config.producer_flush_max_delay {
+    producer_config.flush_max_delay = TimeDuration::try_from(flush_max_delay)
+      .map_err(|_| anyhow!("producer flush max delay exceeds time::Duration bounds"))?
+      .into_proto();
+  }
   producer_config.max_request_concurrency = config.producer_max_request_concurrency;
   Ok(producer_config)
 }
@@ -1068,7 +1069,7 @@ async fn verify_all_records(
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size_seconds: Some(crate::test_framework::WINDOW_SIZE_SECONDS),
+      window_size: TimeDuration::seconds(crate::test_framework::WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     (0 .. partition_count).collect(),
@@ -1076,8 +1077,8 @@ async fn verify_all_records(
     resources.s3_blob_store(),
     resources.metadata_store(),
     &Collector::default().scope("blob_stream_stress_verifier"),
-    1,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+    time::Duration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
   let deadline = Instant::now() + verification_timeout;
@@ -1102,7 +1103,10 @@ async fn verify_all_records(
     let remaining = deadline.saturating_duration_since(Instant::now());
     let batches = timeout(
       remaining,
-      reader.read_available(now_unix_seconds(), ReadCapacity::new(64 * 1024 * 1024)),
+      reader.read_available(
+        time::OffsetDateTime::now_utc(),
+        ReadCapacity::new(64 * 1024 * 1024),
+      ),
     )
     .await
     .map_err(|_| anyhow!("verification stage timed out waiting for a metadata/blob read"))??;

@@ -13,7 +13,7 @@ use crate::{
 use anyhow::Result;
 use async_trait::async_trait;
 use bd_log_util::warn_every;
-use blob_stream_types::{SnowflakeId, TopicWindowKey, format_unix_timestamp_ms};
+use blob_stream_types::{SnowflakeId, TopicWindowKey, offset_datetime_from_unix_seconds};
 use log::trace;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -51,12 +51,7 @@ impl MetadataStore for InMemoryMetadataStore {
     trace!(
       "metadata(memory) write_segment: topic={}, window_start={}, snowflake_id={}",
       metadata.window.topic,
-      format_unix_timestamp_ms(
-        metadata
-          .window
-          .window_start_unix_seconds
-          .saturating_mul(1_000)
-      ),
+      offset_datetime_from_unix_seconds(metadata.window.window_start_unix_seconds),
       metadata.snowflake_id.as_u64()
     );
     let encoded = crate::codec::encode(metadata)?;
@@ -77,7 +72,7 @@ impl MetadataStore for InMemoryMetadataStore {
     trace!(
       "metadata(memory) scan_window: topic={}, window_start={}, min_snowflake={:?}",
       window.topic,
-      format_unix_timestamp_ms(window.window_start_unix_seconds.saturating_mul(1_000)),
+      offset_datetime_from_unix_seconds(window.window_start_unix_seconds),
       min_snowflake.map(SnowflakeId::as_u64)
     );
     let guard = self.windows.read();

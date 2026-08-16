@@ -5,13 +5,14 @@
 mod tests;
 
 use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
+pub use bd_time::{ProtoDurationExt, ToProtoDuration};
 pub use blob_stream_blob_store::ByteRange;
 pub use blob_stream_proto::protos::blobstream::v1::broker::Record;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use time::format_description::well_known::Rfc3339;
+use std::num::TryFromIntError;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -19,13 +20,13 @@ use time::{Duration, OffsetDateTime};
 pub type VirtualPartitionId = u32;
 
 /// Default duration of a metadata window used for segment keys and consumer scans.
-pub const DEFAULT_METADATA_WINDOW_SIZE_SECONDS: i64 = 300;
+pub const DEFAULT_METADATA_WINDOW_SIZE: Duration = Duration::minutes(5);
 
 /// Default maximum elapsed time for segment construction and durable metadata publication.
 ///
 /// Brokers enforce this value for topic configurations that leave the deadline unset. Consumers
 /// use the same value when deriving their metadata availability horizon.
-pub const DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS: u64 = 15_000;
+pub const DEFAULT_MAX_METADATA_PUBLICATION_LAG: Duration = Duration::seconds(15);
 
 /// Maximum decoded bytes accepted for one broker produce RPC.
 pub const MAX_PRODUCE_BATCHES_REQUEST_BYTES: usize = 16 * 1024 * 1024;
@@ -71,17 +72,27 @@ pub fn now_unix_seconds() -> i64 {
 }
 
 #[must_use]
-/// Format a Unix timestamp in milliseconds as an RFC 3339 UTC timestamp for diagnostics.
-pub fn format_unix_timestamp_ms(timestamp_ms: i64) -> String {
-  let Some(timestamp_ns) = i128::from(timestamp_ms).checked_mul(1_000_000) else {
-    return format!("invalid Unix timestamp: {timestamp_ms} ms");
-  };
-  let Ok(timestamp) = OffsetDateTime::from_unix_timestamp_nanos(timestamp_ns) else {
-    return format!("invalid Unix timestamp: {timestamp_ms} ms");
-  };
-  timestamp
-    .format(&Rfc3339)
-    .unwrap_or_else(|_| format!("invalid Unix timestamp: {timestamp_ms} ms"))
+/// Convert a persisted Unix millisecond timestamp into an instant.
+pub fn offset_datetime_from_unix_millis(timestamp_ms: i64) -> OffsetDateTime {
+  OffsetDateTime::UNIX_EPOCH.saturating_add(Duration::milliseconds(timestamp_ms))
+}
+
+/// Strictly convert a persisted Unix millisecond timestamp into an instant.
+pub fn offset_datetime_from_unix_millis_checked(
+  timestamp_ms: i64,
+) -> Result<OffsetDateTime, time::error::ComponentRange> {
+  OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp_ms) * 1_000_000)
+}
+
+/// Strictly convert an instant to a Unix millisecond timestamp for persistence.
+pub fn unix_millis_from_offset_datetime(timestamp: OffsetDateTime) -> Result<i64, TryFromIntError> {
+  i64::try_from(timestamp.unix_timestamp_nanos().div_euclid(1_000_000))
+}
+
+#[must_use]
+/// Convert a Unix second timestamp into an instant.
+pub fn offset_datetime_from_unix_seconds(timestamp_seconds: i64) -> OffsetDateTime {
+  OffsetDateTime::UNIX_EPOCH.saturating_add(Duration::seconds(timestamp_seconds))
 }
 
 #[must_use]
@@ -308,20 +319,29 @@ pub struct BatchMetadata {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Fixed-size time window.
 pub struct Window {
-  /// Window start Unix timestamp in seconds.
-  pub start_unix_seconds: i64,
-  /// Window size in seconds.
-  pub size_seconds: i64,
+  /// Window start instant.
+  pub start: OffsetDateTime,
+  /// Window duration.
+  pub size: Duration,
 }
 
 impl Window {
   #[must_use]
   /// Compute the aligned window for a timestamp.
-  pub fn for_timestamp(unix_seconds: i64, size_seconds: i64) -> Self {
-    let start_unix_seconds = unix_seconds.div_euclid(size_seconds) * size_seconds;
+  pub fn for_timestamp(timestamp: OffsetDateTime, size: Duration) -> Self {
+    debug_assert!(
+      size.is_positive() && size.subsec_nanoseconds() == 0,
+      "durable topic window keys require positive whole-second sizes"
+    );
+    let size_nanoseconds = size.whole_nanoseconds();
+    let start_nanoseconds = timestamp
+      .unix_timestamp_nanos()
+      .div_euclid(size_nanoseconds)
+      * size_nanoseconds;
     Self {
-      start_unix_seconds,
-      size_seconds,
+      start: OffsetDateTime::from_unix_timestamp_nanos(start_nanoseconds)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+      size,
     }
   }
 
@@ -330,7 +350,7 @@ impl Window {
   pub fn key(self, topic: impl Into<String>) -> TopicWindowKey {
     TopicWindowKey {
       topic: topic.into(),
-      window_start_unix_seconds: self.start_unix_seconds,
+      window_start_unix_seconds: self.start.unix_timestamp(),
     }
   }
 }

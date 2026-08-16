@@ -10,8 +10,9 @@ use blob_stream_types::{
 };
 use protobuf::Chars;
 use serde::Serialize;
-use std::time::Duration as StdDuration;
+use std::time::Duration;
 use thiserror::Error;
+use time::OffsetDateTime;
 
 //
 // WriteRequest
@@ -39,11 +40,13 @@ pub struct WriteResponse {
 
 #[derive(Debug, Serialize)]
 pub struct BrokerStateSnapshot {
-  pub generated_at: String,
+  #[serde(with = "time::serde::rfc3339")]
+  pub generated_at: OffsetDateTime,
   pub holder_id: String,
   pub writer_id: u32,
   pub flush_max_bytes: u64,
-  pub flush_max_delay_ms: i64,
+  #[serde(with = "humantime_serde")]
+  pub flush_max_delay: Duration,
   pub membership: Vec<BrokerNodeSnapshot>,
   pub ownership: Vec<BrokerPartitionOwnershipSnapshot>,
   pub topics: Vec<BrokerTopicStateSnapshot>,
@@ -102,7 +105,8 @@ pub struct BrokerLeaseSnapshot {
   pub holder_id: String,
   #[serde(serialize_with = "serialize_optional_as_string")]
   pub holder_address: Option<Chars>,
-  pub expires_at: String,
+  #[serde(with = "time::serde::rfc3339")]
+  pub expires_at: OffsetDateTime,
   pub is_active: bool,
 }
 
@@ -116,7 +120,8 @@ pub struct BrokerTopicStateSnapshot {
   pub name: Chars,
   pub partition_count: u32,
   pub num_writers: u32,
-  pub retention_days: u32,
+  #[serde(with = "humantime_serde")]
+  pub retention: Duration,
   pub local_partitions: Vec<BrokerPartitionStateSnapshot>,
 }
 
@@ -127,13 +132,16 @@ pub struct BrokerTopicStateSnapshot {
 #[derive(Debug, Serialize)]
 pub struct BrokerPartitionStateSnapshot {
   pub virtual_partition_id: VirtualPartitionId,
-  pub lease_expires_at: Option<String>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub lease_expires_at: Option<OffsetDateTime>,
   pub allocation_in_flight: bool,
-  pub allocation_started_at: Option<String>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub allocation_started_at: Option<OffsetDateTime>,
   pub buffered_batch_count: usize,
   pub buffered_record_count: usize,
   pub buffered_bytes: u64,
-  pub first_buffered_at: Option<String>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub first_buffered_at: Option<OffsetDateTime>,
   pub sequence_reservation: Option<SequenceReservationSnapshot>,
   pub next_sequence: u64,
 }
@@ -203,7 +211,7 @@ pub trait WriteEngine: Send + Sync {
   async fn produce_batch(&self, request: WriteRequest) -> Result<WriteResponse, WriteError>;
 
   /// Returns the maximum time an incoming produce RPC may wait for this engine.
-  fn produce_request_timeout(&self) -> StdDuration;
+  fn produce_request_timeout(&self) -> Duration;
 
   /// Returns a best-effort snapshot of state held by this broker process.
   async fn state_snapshot(&self) -> BrokerStateSnapshot;

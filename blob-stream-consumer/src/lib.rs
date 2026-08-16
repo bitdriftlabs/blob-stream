@@ -21,21 +21,23 @@
 //!   blob_store_config,
 //!   metadata_store_config,
 //! };
+//! use blob_stream_types::ToProtoDuration;
+//! use time::Duration;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<()> {
 //!   let mut runtime = ConsumerRuntimeConfig::new();
 //!   let mut read = ConsumerReadConfig::new();
 //!   read.topic = "telemetry".into();
-//!   read.window_size_seconds = Some(300);
+//!   read.window_size = Duration::seconds(300).into_proto();
 //!
 //!   let mut group = ConsumerGroupConfig::new();
 //!   group.topic = "telemetry".into();
 //!   group.group_id = "group-a".into();
 //!   group.member_id = "member-a".into();
-//!   group.lease_duration_ms = Some(30_000);
-//!   group.heartbeat_interval_ms = Some(10_000);
-//!   group.rebalance_interval_ms = Some(10_000);
+//!   group.lease_duration = Duration::seconds(30).into_proto();
+//!   group.heartbeat_interval = Duration::seconds(10).into_proto();
+//!   group.rebalance_interval = Duration::seconds(10).into_proto();
 //!
 //!   runtime.read = Some(read).into();
 //!   runtime.group = Some(group).into();
@@ -44,8 +46,8 @@
 //!   topic.name = "telemetry".into();
 //!   topic.partition_count = 128;
 //!   topic.num_writers = 1;
-//!   topic.retention_days = 7;
-//!   topic.max_metadata_publication_lag_ms = Some(15_000);
+//!   topic.retention = Duration::days(7).into_proto();
+//!   topic.max_metadata_publication_lag = Duration::seconds(15).into_proto();
 //!
 //!   let mut in_memory_blob = BlobStoreConfig::new();
 //!   in_memory_blob.backend = Some(blob_store_config::Backend::InMemory(Default::default()));
@@ -95,7 +97,7 @@ pub use config::{
   ConsumerGroupConfig,
   ConsumerReadConfig,
   ConsumerRuntimeConfig,
-  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG,
 };
 pub use coordination::{
   ConsumerGroupCoordinator,

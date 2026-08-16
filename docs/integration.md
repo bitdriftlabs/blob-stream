@@ -111,7 +111,7 @@ perform the final commit and release membership and leases during controlled ter
 
 | Surface | Responsibility |
 | --- | --- |
-| `runtime.read` | Metadata window, idle polling, visibility delay, prefetch memory, batch-read concurrency, and strong-read setting. |
+| `runtime.read` | Metadata window, idle polling, visibility delay, clock-skew horizon, prefetch memory, batch-read concurrency, and strong-read setting. |
 | `runtime.group` | Topic, consumer-group ID, stable member ID, optional pod ID, lease duration, heartbeat interval, and rebalance interval. |
 | `topic` | The shared topic contract used to derive the complete virtual partition space. |
 | `blob_store` and `metadata_store` | S3/DynamoDB production stores or in-memory local/test stores. |

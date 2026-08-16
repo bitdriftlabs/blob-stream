@@ -6,6 +6,7 @@ use log::debug;
 use protobuf::Chars;
 use std::collections::HashMap;
 use std::sync::Arc;
+use time::OffsetDateTime;
 use tokio::sync::Notify;
 
 //
@@ -99,21 +100,21 @@ pub(super) struct PartitionState {
   pub(super) seq_allocator: SeqAllocator,
   pub(super) adaptive_reservation_size: Option<u64>,
   pub(super) records_allocated_since_lease_maintenance: u64,
-  pub(super) lease_expiration_ts_ms: Option<i64>,
+  pub(super) lease_expiration_at: Option<OffsetDateTime>,
   pub(super) lease_fence: Option<Arc<ProducerLeaseFence>>,
   pub(super) flush_in_flight: bool,
   pub(super) allocation_in_flight: bool,
-  pub(super) allocation_started_ts_ms: Option<i64>,
+  pub(super) allocation_started_at: Option<OffsetDateTime>,
   pub(super) allocation_notify: Arc<Notify>,
   pub(super) draining: bool,
   pub(super) drain_notify: Arc<Notify>,
 }
 
 impl PartitionState {
-  pub(super) fn needs_lease(&self, now_ts_ms: i64) -> bool {
+  pub(super) fn needs_lease(&self, now: OffsetDateTime) -> bool {
     self
-      .lease_expiration_ts_ms
-      .is_none_or(|expires_at| now_ts_ms >= expires_at)
+      .lease_expiration_at
+      .is_none_or(|expires_at| now >= expires_at)
   }
 
   pub(super) fn is_drained(&self) -> bool {

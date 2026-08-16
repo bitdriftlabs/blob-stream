@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package blobstream.v1;
 
+import "google/protobuf/duration.proto";
 import "validate/validate.proto";
 
 // Broker process configuration shared across all topics.
@@ -18,8 +19,8 @@ message BrokerConfig {
   uint32 flush_max_bytes = 1;
 
   // Maximum time to wait before flushing buffered records, even if size is low.
-  // Default when unset/zero: 1,000 ms.
-  uint32 flush_max_delay_ms = 2;
+  // Default when unset: 1 second.
+  google.protobuf.Duration flush_max_delay = 2 [(validate.rules).duration.gt = {}];
 
   // Address to bind the broker listener (e.g. "0.0.0.0:8080").
   string bind_addr = 3 [(validate.rules).string.min_len = 1];
@@ -131,15 +132,18 @@ message TopicConfig {
   // No default; must be explicitly set to > 0.
   uint32 num_writers = 3 [(validate.rules).uint32.gt = 0];
 
-  // Retention window in days (used to drive storage TTL and lifecycle policies).
-  // Default when unset: 0 days.
-  uint32 retention_days = 4;
+  // Retention window used to drive storage TTL and lifecycle policies.
+  // Required and must be greater than zero.
+  google.protobuf.Duration retention = 4 [
+    (validate.rules).message.required = true,
+    (validate.rules).duration.gt = {}
+  ];
 
   // Maximum time from beginning segment construction until its metadata is durably written.
   // This includes segment encoding/compression, blob upload, and metadata persistence.
-  // Default when unset: 15,000 ms. Brokers enforce this deadline and consumers use it to derive
+  // Default when unset: 15 seconds. Brokers enforce this deadline and consumers use it to derive
   // the finite steady-state metadata scan horizon.
-  optional uint64 max_metadata_publication_lag_ms = 5 [(validate.rules).uint64.gt = 0];
+  google.protobuf.Duration max_metadata_publication_lag = 5 [(validate.rules).duration.gt = {}];
 }
 
 // In-memory blob store configuration (used for tests/local runs).
@@ -193,13 +197,13 @@ message DynamoMetadataStoreConfig {
   // DynamoDB table name for consumer group membership (`consumer_group_membership`).
   string consumer_group_membership_table_name = 6 [(validate.rules).string.min_len = 1];
 
-  // Additional seconds added to segment metadata TTL beyond topic retention_days.
-  // Default when unset: 3,600 seconds.
-  optional uint32 segment_ttl_buffer_seconds = 7 [(validate.rules).uint32.gt = 0];
+  // Additional time added to segment metadata TTL beyond topic retention.
+  // Default when unset: 1 hour.
+  google.protobuf.Duration segment_ttl_buffer = 7 [(validate.rules).duration.gt = {}];
 
-  // Additional seconds added to lease/membership TTL beyond lease expiration.
-  // Default when unset: 3,600 seconds.
-  optional uint32 lease_ttl_buffer_seconds = 8 [(validate.rules).uint32.gt = 0];
+  // Additional time added to lease/membership TTL beyond lease expiration.
+  // Default when unset: 1 hour.
+  google.protobuf.Duration lease_ttl_buffer = 8 [(validate.rules).duration.gt = {}];
 }
 
 // Metadata store configuration selection.
@@ -247,25 +251,20 @@ message ProducerConfig {
   // Default when unset: 1,048,576 bytes (1 MiB).
   optional uint32 max_batch_bytes = 3 [(validate.rules).uint32.gt = 0];
 
-  // Maximum delay before time-based flush.
-  // Default when unset: 200 ms.
-  optional uint64 flush_max_delay_ms = 4 [(validate.rules).uint64.gt = 0];
+  // Maximum delay before time-based flush. Default when unset: 200 ms.
+  google.protobuf.Duration flush_max_delay = 4 [(validate.rules).duration.gt = {}];
 
-  // Exponential backoff base delay.
-  // Default when unset: 25 ms.
-  optional uint64 retry_base_delay_ms = 6 [(validate.rules).uint64.gt = 0];
+  // Exponential backoff base delay. Default when unset: 25 ms.
+  google.protobuf.Duration retry_base_delay = 6 [(validate.rules).duration.gt = {}];
 
-  // Exponential backoff max delay.
-  // Default when unset: 1,000 ms.
-  optional uint64 retry_max_delay_ms = 7 [(validate.rules).uint64.gt = 0];
+  // Exponential backoff max delay. Default when unset: 1 second.
+  google.protobuf.Duration retry_max_delay = 7 [(validate.rules).duration.gt = {}];
 
-  // gRPC connect timeout.
-  // Default when unset: 2,000 ms.
-  optional int64 connect_timeout_ms = 8 [(validate.rules).int64.gt = 0];
+  // gRPC connect timeout. Default when unset: 2 seconds.
+  google.protobuf.Duration connect_timeout = 8 [(validate.rules).duration.gt = {}];
 
-  // gRPC request timeout.
-  // Default when unset: 5,000 ms.
-  optional int64 request_timeout_ms = 9 [(validate.rules).int64.gt = 0];
+  // gRPC request timeout. Default when unset: 5 seconds.
+  google.protobuf.Duration request_timeout = 9 [(validate.rules).duration.gt = {}];
 
   // Maximum in-flight request concurrency.
   // Default when unset: 64.
@@ -276,8 +275,8 @@ message ProducerConfig {
   optional ProducerCompression compression = 11 [(validate.rules).enum.defined_only = true];
 
   // Maximum total time spent retrying one producer batch, including retry delays and RPCs.
-  // Default when unset: 30,000 ms.
-  optional uint64 retry_deadline_ms = 12 [(validate.rules).uint64.gt = 0];
+  // Default when unset: 30 seconds.
+  google.protobuf.Duration retry_deadline = 12 [(validate.rules).duration.gt = {}];
 }
 
 // Runtime configuration for producer clients.
@@ -311,16 +310,15 @@ message ConsumerReadConfig {
   //   more metadata scan overhead.
   // - Increase (e.g., 600-900s) if throughput is very high and you want fewer Dynamo
   //   partition-key scans, accepting coarser scan buckets.
-  optional int64 window_size_seconds = 2 [(validate.rules).int64.gt = 0];
+  google.protobuf.Duration window_size = 2 [(validate.rules).duration.gt = {}];
 
-  // Base idle poll delay in milliseconds when no batches are available.
-  // Default when unset: 250 ms.
-  optional uint64 idle_poll_delay_ms = 4 [(validate.rules).uint64.gt = 0];
+  // Base idle poll delay when no batches are available. Default when unset: 250 ms.
+  google.protobuf.Duration idle_poll_delay = 4 [(validate.rules).duration.gt = {}];
 
-  // Optional max idle poll delay in milliseconds for exponential backoff.
+  // Optional max idle poll delay for exponential backoff.
   // Default when unset: 2,000 ms. With the default base delay, empty polls wait 250 ms, 500 ms,
   // 1,000 ms, then 2,000 ms until data arrives.
-  optional uint64 max_idle_poll_delay_ms = 5;
+  google.protobuf.Duration max_idle_poll_delay = 5 [(validate.rules).duration.gt = {}];
 
   // RAM budget for consumer-owned decoded payload buffering.
   // Default when unset: 67,108,864 bytes (64 MiB).
@@ -337,7 +335,7 @@ message ConsumerReadConfig {
   // Delay accepting recently published metadata rows while using eventually consistent reads.
   // Default when unset: 2,000 ms. This is a best-effort staleness margin, not a
   // consistency guarantee because the metadata store has no bounded replication delay.
-  optional uint64 metadata_visibility_delay_ms = 9;
+  google.protobuf.Duration metadata_visibility_delay = 9 [(validate.rules).duration.gte = {}];
 
   // Maximum number of batch byte-range reads and decodes that may run concurrently.
   // Default when unset: 32.
@@ -350,6 +348,12 @@ message ConsumerReadConfig {
   // Read metadata from DynamoDB with strong consistency. Default when unset: false.
   // Strong reads remove read-replica staleness but do not fence stale producer publication.
   optional bool strongly_consistent_metadata_reads = 11;
+
+  // Maximum pairwise amount by which this consumer clock may lead a broker clock. This must cover
+  // time-source uncertainty and is included in the metadata availability horizon.
+  // Default when unset: 10 ms. Set this to a proven, monitored deployment bound; it is not a
+  // universal NTP guarantee.
+  google.protobuf.Duration max_clock_skew = 12 [(validate.rules).duration.gt = {}];
 }
 
 // Consumer group lease and heartbeat settings.
@@ -363,17 +367,14 @@ message ConsumerGroupConfig {
   // Stable member id for this consumer instance.
   string member_id = 3 [(validate.rules).string.min_len = 1];
 
-  // Lease duration in milliseconds.
-  // Default when unset: 30,000 ms.
-  optional int64 lease_duration_ms = 4 [(validate.rules).int64.gt = 0];
+  // Lease duration. Default when unset: 30 seconds.
+  google.protobuf.Duration lease_duration = 4 [(validate.rules).duration.gt = {}];
 
-  // Heartbeat interval in milliseconds.
-  // Default when unset: 10,000 ms.
-  optional int64 heartbeat_interval_ms = 5 [(validate.rules).int64.gt = 0];
+  // Heartbeat interval. Default when unset: 10 seconds.
+  google.protobuf.Duration heartbeat_interval = 5 [(validate.rules).duration.gt = {}];
 
-  // Rebalance interval in milliseconds.
-  // Default when unset: 10,000 ms.
-  optional int64 rebalance_interval_ms = 6 [(validate.rules).int64.gt = 0];
+  // Rebalance interval. Default when unset: 10 seconds.
+  google.protobuf.Duration rebalance_interval = 6 [(validate.rules).duration.gt = {}];
 
   // Stable physical pod identity for hierarchical consumer assignment.
   // When unset, the group uses member-only assignment for compatibility.

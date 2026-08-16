@@ -18,7 +18,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bd_server_stats::stats::{Collector, Scope};
 use bd_shutdown::ComponentShutdownTrigger;
-use bd_time::{OffsetDateTimeExt, TimeProvider};
+use bd_time::TimeProvider;
 use blob_stream_blob_store::{
   BlobKey,
   BlobStore,
@@ -46,7 +46,14 @@ use blob_stream_metadata_store::{
   SequenceReservationOutcome,
 };
 use blob_stream_test_utils::ManualTimeProvider;
-use blob_stream_types::{CompressionCodec, SeqRange, SnowflakeId, Window, new_record};
+use blob_stream_types::{
+  CompressionCodec,
+  SeqRange,
+  SnowflakeId,
+  Window,
+  new_record,
+  offset_datetime_from_unix_millis,
+};
 use bytes::Bytes;
 use protobuf::Chars;
 use serde_json::to_value;
@@ -171,18 +178,12 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     key: ProducerPartitionLeaseKey,
     holder_id: String,
     lease_session_id: String,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
   ) -> Result<LeaseAcquireOutcome> {
     self
       .inner
-      .acquire_lease(
-        key,
-        holder_id,
-        lease_session_id,
-        now_ts_ms,
-        lease_duration_ms,
-      )
+      .acquire_lease(key, holder_id, lease_session_id, now, lease_duration)
       .await
   }
 
@@ -191,8 +192,8 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     key: ProducerPartitionLeaseKey,
     holder_id: String,
     lease_session_id: String,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
     reservation_size: Option<u64>,
   ) -> Result<LeaseAcquireAndReserveOutcome> {
     if reservation_size.is_some() {
@@ -215,8 +216,8 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
         key,
         holder_id,
         lease_session_id,
-        now_ts_ms,
-        lease_duration_ms,
+        now,
+        lease_duration,
         reservation_size,
       )
       .await
@@ -227,18 +228,12 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
   ) -> Result<LeaseHeartbeatOutcome> {
     self
       .inner
-      .heartbeat_lease(
-        key,
-        holder_id,
-        lease_session_id,
-        now_ts_ms,
-        lease_duration_ms,
-      )
+      .heartbeat_lease(key, holder_id, lease_session_id, now, lease_duration)
       .await
   }
 
@@ -247,7 +242,7 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
     self
@@ -264,13 +259,7 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     }
     self
       .inner
-      .reserve_sequences(
-        key,
-        holder_id,
-        lease_session_id,
-        now_ts_ms,
-        reservation_size,
-      )
+      .reserve_sequences(key, holder_id, lease_session_id, now, reservation_size)
       .await
   }
 
@@ -279,18 +268,17 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<LeaseReleaseOutcome> {
     self
       .inner
-      .release_lease(key, holder_id, lease_session_id, now_ts_ms)
+      .release_lease(key, holder_id, lease_session_id, now)
       .await
   }
 }
 
-fn time_from_ms(ms: i64) -> OffsetDateTime {
-  OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
-    .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+fn std_duration(duration: TimeDuration) -> StdDuration {
+  StdDuration::try_from(duration).unwrap()
 }
 
 fn metrics_scope() -> bd_server_stats::stats::Scope {
@@ -300,7 +288,15 @@ fn metrics_scope() -> bd_server_stats::stats::Scope {
 #[test]
 fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
   let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
-  let initial = begin_allocation_transition(&state, "telemetry", 0, 1, 1_000, false, 4);
+  let initial = begin_allocation_transition(
+    &state,
+    "telemetry",
+    0,
+    1,
+    offset_datetime_from_unix_millis(1_000),
+    false,
+    4,
+  );
   let AllocationTransitionDecision::Claimed(initial) = initial else {
     panic!("expected initial reservation transition");
   };
@@ -311,7 +307,7 @@ fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
     super::allocation::ReservationReason::Initial
   ));
   initial.transition.finish(
-    LeaseExpirationUpdate::Set(Some(2_000)),
+    LeaseExpirationUpdate::Set(Some(offset_datetime_from_unix_millis(2_000))),
     None,
     Some(SeqRange { start: 0, end: 3 }),
   );
@@ -324,7 +320,15 @@ fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
       Some(SeqRange { start: 0, end: 3 })
     );
   }
-  let refill = begin_allocation_transition(&state, "telemetry", 0, 1, 1_001, false, 4);
+  let refill = begin_allocation_transition(
+    &state,
+    "telemetry",
+    0,
+    1,
+    offset_datetime_from_unix_millis(1_001),
+    false,
+    4,
+  );
   let AllocationTransitionDecision::Claimed(refill) = refill else {
     panic!("expected foreground refill transition");
   };
@@ -339,12 +343,20 @@ fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
 #[test]
 fn maintenance_top_up_extends_the_current_reservation() {
   let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
-  let initial = begin_allocation_transition(&state, "telemetry", 0, 1, 1_000, true, 100);
+  let initial = begin_allocation_transition(
+    &state,
+    "telemetry",
+    0,
+    1,
+    offset_datetime_from_unix_millis(1_000),
+    true,
+    100,
+  );
   let AllocationTransitionDecision::Claimed(initial) = initial else {
     panic!("expected initial reservation transition");
   };
   initial.transition.finish_lease_maintenance(
-    LeaseExpirationUpdate::Set(Some(2_000)),
+    LeaseExpirationUpdate::Set(Some(offset_datetime_from_unix_millis(2_000))),
     None,
     Some(SeqRange { start: 0, end: 99 }),
     0,
@@ -360,7 +372,15 @@ fn maintenance_top_up_extends_the_current_reservation() {
     partition.records_allocated_since_lease_maintenance = 74;
   }
 
-  let top_up = begin_allocation_transition(&state, "telemetry", 0, 1, 1_100, true, 100);
+  let top_up = begin_allocation_transition(
+    &state,
+    "telemetry",
+    0,
+    1,
+    offset_datetime_from_unix_millis(1_100),
+    true,
+    100,
+  );
   let AllocationTransitionDecision::Claimed(top_up) = top_up else {
     panic!("expected maintenance top-up transition");
   };
@@ -371,7 +391,7 @@ fn maintenance_top_up_extends_the_current_reservation() {
     super::allocation::ReservationReason::MaintenanceTopUp
   ));
   top_up.transition.finish_lease_maintenance(
-    LeaseExpirationUpdate::Set(Some(2_100)),
+    LeaseExpirationUpdate::Set(Some(offset_datetime_from_unix_millis(2_100))),
     None,
     Some(SeqRange {
       start: 100,
@@ -398,12 +418,20 @@ fn maintenance_top_up_extends_the_current_reservation() {
 #[test]
 fn maintenance_high_utilization_doubles_the_adaptive_reservation_target() {
   let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
-  let initial = begin_allocation_transition(&state, "telemetry", 0, 1, 1_000, true, 100);
+  let initial = begin_allocation_transition(
+    &state,
+    "telemetry",
+    0,
+    1,
+    offset_datetime_from_unix_millis(1_000),
+    true,
+    100,
+  );
   let AllocationTransitionDecision::Claimed(initial) = initial else {
     panic!("expected initial reservation transition");
   };
   initial.transition.finish_lease_maintenance(
-    LeaseExpirationUpdate::Set(Some(2_000)),
+    LeaseExpirationUpdate::Set(Some(offset_datetime_from_unix_millis(2_000))),
     None,
     Some(SeqRange { start: 0, end: 99 }),
     0,
@@ -419,7 +447,15 @@ fn maintenance_high_utilization_doubles_the_adaptive_reservation_target() {
     partition.records_allocated_since_lease_maintenance = 75;
   }
 
-  let refill = begin_allocation_transition(&state, "telemetry", 0, 1, 1_100, true, 100);
+  let refill = begin_allocation_transition(
+    &state,
+    "telemetry",
+    0,
+    1,
+    offset_datetime_from_unix_millis(1_100),
+    true,
+    100,
+  );
   let AllocationTransitionDecision::Claimed(refill) = refill else {
     panic!("expected maintenance refill transition");
   };
@@ -436,12 +472,20 @@ fn maintenance_high_utilization_doubles_the_adaptive_reservation_target() {
 #[test]
 fn maintenance_high_utilization_waits_until_another_window_is_needed() {
   let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
-  let initial = begin_allocation_transition(&state, "telemetry", 0, 1, 1_000, true, 100);
+  let initial = begin_allocation_transition(
+    &state,
+    "telemetry",
+    0,
+    1,
+    offset_datetime_from_unix_millis(1_000),
+    true,
+    100,
+  );
   let AllocationTransitionDecision::Claimed(initial) = initial else {
     panic!("expected initial reservation transition");
   };
   initial.transition.finish_lease_maintenance(
-    LeaseExpirationUpdate::Set(Some(2_000)),
+    LeaseExpirationUpdate::Set(Some(offset_datetime_from_unix_millis(2_000))),
     None,
     Some(SeqRange { start: 0, end: 199 }),
     0,
@@ -457,7 +501,15 @@ fn maintenance_high_utilization_waits_until_another_window_is_needed() {
     partition.records_allocated_since_lease_maintenance = 75;
   }
 
-  let maintenance = begin_allocation_transition(&state, "telemetry", 0, 1, 1_100, true, 100);
+  let maintenance = begin_allocation_transition(
+    &state,
+    "telemetry",
+    0,
+    1,
+    offset_datetime_from_unix_millis(1_100),
+    true,
+    100,
+  );
   let AllocationTransitionDecision::Claimed(maintenance) = maintenance else {
     panic!("expected lease-maintenance transition");
   };
@@ -475,12 +527,20 @@ fn maintenance_high_utilization_waits_until_another_window_is_needed() {
 #[test]
 fn lease_reacquisition_discards_stale_sequence_capacity() {
   let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
-  let initial = begin_allocation_transition(&state, "telemetry", 0, 1, 1_000, false, 10);
+  let initial = begin_allocation_transition(
+    &state,
+    "telemetry",
+    0,
+    1,
+    offset_datetime_from_unix_millis(1_000),
+    false,
+    10,
+  );
   let AllocationTransitionDecision::Claimed(initial) = initial else {
     panic!("expected initial reservation transition");
   };
   initial.transition.finish(
-    LeaseExpirationUpdate::Set(Some(2_000)),
+    LeaseExpirationUpdate::Set(Some(offset_datetime_from_unix_millis(2_000))),
     None,
     Some(SeqRange { start: 0, end: 9 }),
   );
@@ -494,16 +554,34 @@ fn lease_reacquisition_discards_stale_sequence_capacity() {
     );
   }
 
-  let reacquire = begin_allocation_transition(&state, "telemetry", 0, 1, 2_000, false, 10);
+  let reacquire = begin_allocation_transition(
+    &state,
+    "telemetry",
+    0,
+    1,
+    offset_datetime_from_unix_millis(2_000),
+    false,
+    10,
+  );
   let AllocationTransitionDecision::Claimed(reacquire) = reacquire else {
     panic!("expected lease reacquisition transition");
   };
   assert!(reacquire.reservation.is_none());
-  reacquire
-    .transition
-    .finish(LeaseExpirationUpdate::Set(Some(3_000)), None, None);
+  reacquire.transition.finish(
+    LeaseExpirationUpdate::Set(Some(offset_datetime_from_unix_millis(3_000))),
+    None,
+    None,
+  );
 
-  let reservation = begin_allocation_transition(&state, "telemetry", 0, 1, 2_001, false, 10);
+  let reservation = begin_allocation_transition(
+    &state,
+    "telemetry",
+    0,
+    1,
+    offset_datetime_from_unix_millis(2_001),
+    false,
+    10,
+  );
   let AllocationTransitionDecision::Claimed(reservation) = reservation else {
     panic!("expected reservation transition after reacquisition");
   };
@@ -555,8 +633,8 @@ fn make_two_partition_engine(
       name: "telemetry".into(),
       partition_count: 2,
       num_writers: 1,
-      retention_days: 7,
-      max_metadata_publication_lag_ms: 30_000,
+      retention: TimeDuration::days(7),
+      max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
     },
   );
 
@@ -607,8 +685,8 @@ fn make_engine_with_lease_store_and_scope(
       name: "telemetry".into(),
       partition_count: 1,
       num_writers: 1,
-      retention_days: 7,
-      max_metadata_publication_lag_ms: 30_000,
+      retention: TimeDuration::days(7),
+      max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
     },
   );
 
@@ -663,12 +741,14 @@ async fn wait_for_partition_draining_start(engine: &WriteEngineImpl) {
 #[tokio::test]
 async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.writer_id = 0;
   config.flush_max_bytes = 1024;
-  config.flush_max_delay_ms = 60_000;
+  config.flush_max_delay = TimeDuration::milliseconds(60_000);
 
   let (engine, _metadata_store) =
     make_engine(time_provider, config, shutdown_trigger.make_handle())?;
@@ -686,7 +766,10 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   tokio::task::yield_now().await;
 
   let snapshot = engine.state_snapshot().await;
-  assert_eq!(snapshot.generated_at, "2023-11-14T22:13:20Z");
+  assert_eq!(
+    snapshot.generated_at,
+    offset_datetime_from_unix_millis(1_700_000_000_000)
+  );
   assert_eq!(snapshot.holder_id, "test-node");
   assert_eq!(snapshot.writer_id, 0);
   assert_eq!(snapshot.membership.len(), 1);
@@ -709,15 +792,15 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   let partition = &topic.local_partitions[0];
   assert_eq!(partition.virtual_partition_id, 0);
   assert_eq!(
-    partition.lease_expires_at.as_deref(),
-    Some("2023-11-14T22:13:50Z")
+    partition.lease_expires_at,
+    Some(offset_datetime_from_unix_millis(1_700_000_030_000))
   );
   assert_eq!(partition.buffered_batch_count, 1);
   assert_eq!(partition.buffered_record_count, 1);
   assert_eq!(partition.buffered_bytes, 3);
   assert_eq!(
-    partition.first_buffered_at.as_deref(),
-    Some("2023-11-14T22:13:20Z")
+    partition.first_buffered_at,
+    Some(offset_datetime_from_unix_millis(1_700_000_000_000))
   );
   assert_eq!(partition.next_sequence, 1);
   assert_eq!(
@@ -731,6 +814,7 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   let state_dump = to_value(&snapshot)?;
   assert_eq!(state_dump["generated_at"], "2023-11-14T22:13:20Z");
   assert!(state_dump.get("generated_at_ts_ms").is_none());
+  assert_eq!(state_dump["flush_max_delay"], "1m");
   assert_eq!(state_dump["topics"][0]["name"], "telemetry");
   assert_eq!(state_dump["ownership"][0]["topic"], "telemetry");
   assert_eq!(
@@ -750,7 +834,9 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
 #[tokio::test]
 async fn state_snapshot_reports_expired_observed_lease() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.writer_id = 0;
@@ -766,8 +852,8 @@ async fn state_snapshot_reports_expired_observed_lease() -> Result<()> {
       key,
       "former-owner".to_string(),
       "former-owner-session".to_string(),
-      now_ms - 1_000,
-      100,
+      offset_datetime_from_unix_millis(now_ms - 1_000),
+      TimeDuration::milliseconds(100),
     )
     .await?;
 
@@ -792,11 +878,13 @@ async fn state_snapshot_reports_expired_observed_lease() -> Result<()> {
 
 #[tokio::test]
 async fn successful_sequence_reservation_records_metrics() -> Result<()> {
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
-  config.flush_max_delay_ms = 60_000;
+  config.flush_max_delay = TimeDuration::milliseconds(60_000);
 
   let collector = Collector::default();
   let scope = collector.scope("blob_stream_broker_test");
@@ -835,7 +923,9 @@ async fn successful_sequence_reservation_records_metrics() -> Result<()> {
 #[tokio::test]
 async fn fenced_sequence_reservations_do_not_record_failure_metrics() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let collector = Collector::default();
   let scope = collector.scope("blob_stream_broker_test");
@@ -855,8 +945,8 @@ async fn fenced_sequence_reservations_do_not_record_failure_metrics() -> Result<
       key,
       "other-broker".to_string(),
       "other-broker-session".to_string(),
-      now_ms,
-      30_000,
+      offset_datetime_from_unix_millis(now_ms),
+      TimeDuration::milliseconds(30_000),
     )
     .await?;
   let error = engine
@@ -870,7 +960,7 @@ async fn fenced_sequence_reservations_do_not_record_failure_metrics() -> Result<
   assert!(matches!(error, super::WriteError::NotLeaseHolder { .. }));
 
   let error = engine
-    .reserve_sequences("telemetry", 1, now_ms, 1)
+    .reserve_sequences("telemetry", 1, offset_datetime_from_unix_millis(now_ms), 1)
     .await
     .expect_err("missing lease should fence the direct sequence reservation");
   assert!(matches!(error, super::WriteError::NotLeaseHolder { .. }));
@@ -885,12 +975,14 @@ async fn fenced_sequence_reservations_do_not_record_failure_metrics() -> Result<
 
 #[tokio::test]
 async fn buffers_until_size_rollover() -> Result<()> {
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 10;
-  config.flush_max_delay_ms = 60_000;
-  config.window_size_seconds = 60;
+  config.flush_max_delay = TimeDuration::milliseconds(60_000);
+  config.window_size = TimeDuration::seconds(60);
 
   let (engine, metadata_store) = make_engine(
     time_provider.clone(),
@@ -910,10 +1002,7 @@ async fn buffers_until_size_rollover() -> Result<()> {
   tokio::task::yield_now().await;
   assert!(!first.is_finished());
 
-  let window = Window::for_timestamp(
-    time_provider.now().unix_timestamp_ms() / 1_000,
-    config.window_size_seconds,
-  );
+  let window = Window::for_timestamp(time_provider.now(), config.window_size);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -951,7 +1040,9 @@ async fn buffers_until_size_rollover() -> Result<()> {
 
 #[tokio::test]
 async fn same_partition_requests_serialize_sequence_reservations() -> Result<()> {
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
@@ -974,8 +1065,8 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
           name: "telemetry".into(),
           partition_count: 1,
           num_writers: 1,
-          retention_days: 7,
-          max_metadata_publication_lag_ms: 30_000,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
         },
       )]),
       Arc::new(InMemoryBlobStore::new()),
@@ -1029,7 +1120,9 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
 
 #[tokio::test]
 async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
@@ -1051,8 +1144,8 @@ async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
           name: "telemetry".into(),
           partition_count: 1,
           num_writers: 1,
-          retention_days: 7,
-          max_metadata_publication_lag_ms: 30_000,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
         },
       )]),
       Arc::new(InMemoryBlobStore::new()),
@@ -1084,8 +1177,8 @@ async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
   let partition = &snapshot.topics[0].local_partitions[0];
   assert!(partition.allocation_in_flight);
   assert_eq!(
-    partition.allocation_started_at.as_deref(),
-    Some("2023-11-14T22:13:20Z")
+    partition.allocation_started_at,
+    Some(offset_datetime_from_unix_millis(1_700_000_000_000))
   );
 
   first.abort();
@@ -1107,12 +1200,14 @@ async fn cancelled_reservation_releases_allocation_transition() -> Result<()> {
 
 #[tokio::test(start_paused = true)]
 async fn flushes_on_time_rollover() -> Result<()> {
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1024;
-  config.flush_max_delay_ms = 500;
-  config.window_size_seconds = 60;
+  config.flush_max_delay = TimeDuration::milliseconds(500);
+  config.window_size = TimeDuration::seconds(60);
 
   let (engine, metadata_store) = make_engine(
     time_provider.clone(),
@@ -1131,20 +1226,14 @@ async fn flushes_on_time_rollover() -> Result<()> {
   tokio::task::yield_now().await;
   assert!(!first.is_finished());
 
-  let advance = TimeDuration::milliseconds(config.flush_max_delay_ms + 10);
+  let advance = config.flush_max_delay + TimeDuration::milliseconds(10);
   time_provider.advance(advance);
-  tokio::time::advance(StdDuration::from_millis(
-    (config.flush_max_delay_ms + 10).cast_unsigned(),
-  ))
-  .await;
+  tokio::time::advance(std_duration(advance)).await;
   tokio::task::yield_now().await;
 
   first.await??;
 
-  let window = Window::for_timestamp(
-    time_provider.now().unix_timestamp_ms() / 1_000,
-    config.window_size_seconds,
-  );
+  let window = Window::for_timestamp(time_provider.now(), config.window_size);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -1159,12 +1248,14 @@ async fn flushes_on_time_rollover() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
-  config.flush_max_delay_ms = 10;
-  config.window_size_seconds = 60;
+  config.flush_max_delay = TimeDuration::milliseconds(10);
+  config.window_size = TimeDuration::seconds(60);
 
   let (engine, metadata_store) = make_two_partition_engine(
     time_provider.clone(),
@@ -1221,19 +1312,13 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
   }
 
   time_provider.advance(TimeDuration::milliseconds(5));
-  tokio::time::advance(StdDuration::from_millis(
-    config.flush_max_delay_ms.cast_unsigned(),
-  ))
-  .await;
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
   tokio::task::yield_now().await;
 
   first.await??;
   second.await??;
 
-  let window = Window::for_timestamp(
-    time_provider.now().unix_timestamp_ms() / 1_000,
-    config.window_size_seconds,
-  );
+  let window = Window::for_timestamp(time_provider.now(), config.window_size);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -1298,10 +1383,7 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
   }
 
   time_provider.advance(TimeDuration::milliseconds(5));
-  tokio::time::advance(StdDuration::from_millis(
-    config.flush_max_delay_ms.cast_unsigned(),
-  ))
-  .await;
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
   tokio::task::yield_now().await;
   next_first.await??;
   next_second.await??;
@@ -1325,12 +1407,14 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn time_due_flush_completes_before_later_byte_flush() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 2;
-  config.flush_max_delay_ms = 10;
-  config.window_size_seconds = 60;
+  config.flush_max_delay = TimeDuration::milliseconds(10);
+  config.window_size = TimeDuration::seconds(60);
 
   let (engine, metadata_store) = make_two_partition_engine(
     time_provider.clone(),
@@ -1402,10 +1486,7 @@ async fn time_due_flush_completes_before_later_byte_flush() -> Result<()> {
   });
   byte_due.await??;
 
-  let window = Window::for_timestamp(
-    time_provider.now().unix_timestamp_ms() / 1_000,
-    config.window_size_seconds,
-  );
+  let window = Window::for_timestamp(time_provider.now(), config.window_size);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -1430,12 +1511,14 @@ async fn time_due_flush_completes_before_later_byte_flush() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn byte_flush_does_not_coalesce_buffered_topic_peers() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 2;
-  config.flush_max_delay_ms = 10;
-  config.window_size_seconds = 60;
+  config.flush_max_delay = TimeDuration::milliseconds(10);
+  config.window_size = TimeDuration::seconds(60);
 
   let (engine, metadata_store) = make_two_partition_engine(
     time_provider.clone(),
@@ -1474,10 +1557,7 @@ async fn byte_flush_does_not_coalesce_buffered_topic_peers() -> Result<()> {
     .await?;
   assert!(!peer.is_finished());
 
-  let window = Window::for_timestamp(
-    time_provider.now().unix_timestamp_ms() / 1_000,
-    config.window_size_seconds,
-  );
+  let window = Window::for_timestamp(time_provider.now(), config.window_size);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -1489,11 +1569,8 @@ async fn byte_flush_does_not_coalesce_buffered_topic_peers() -> Result<()> {
   assert_eq!(segments[0].segment_index.len(), 1);
   assert!(segments[0].segment_index.contains_key(&0));
 
-  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
-  tokio::time::advance(StdDuration::from_millis(
-    config.flush_max_delay_ms.cast_unsigned(),
-  ))
-  .await;
+  time_provider.advance(config.flush_max_delay);
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
   peer.await??;
   Ok(())
 }
@@ -1504,10 +1581,12 @@ async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> 
   let scope = collector.scope("blob_stream_broker_test");
   let shutdown_trigger = ComponentShutdownTrigger::default();
 
-  let size_time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let size_time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
   let mut size_config = WriteConfig::with_defaults();
   size_config.flush_max_bytes = 1;
-  size_config.flush_max_delay_ms = 60_000;
+  size_config.flush_max_delay = TimeDuration::milliseconds(60_000);
   let (size_engine, _metadata_store, _lease_store) = make_engine_with_lease_store_and_scope(
     size_time_provider,
     size_config,
@@ -1522,10 +1601,12 @@ async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> 
     })
     .await?;
 
-  let delay_time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let delay_time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
   let mut delay_config = WriteConfig::with_defaults();
   delay_config.flush_max_bytes = 1_024;
-  delay_config.flush_max_delay_ms = 10;
+  delay_config.flush_max_delay = TimeDuration::milliseconds(10);
   let (delay_engine, _metadata_store, _lease_store) = make_engine_with_lease_store_and_scope(
     Arc::clone(&delay_time_provider),
     delay_config.clone(),
@@ -1542,11 +1623,8 @@ async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> 
       .await
   });
   tokio::task::yield_now().await;
-  delay_time_provider.advance(TimeDuration::milliseconds(delay_config.flush_max_delay_ms));
-  tokio::time::advance(StdDuration::from_millis(
-    delay_config.flush_max_delay_ms.cast_unsigned(),
-  ))
-  .await;
+  delay_time_provider.advance(delay_config.flush_max_delay);
+  tokio::time::advance(std_duration(delay_config.flush_max_delay)).await;
   delayed_write.await??;
 
   let metrics = String::from_utf8(collector.prometheus_output())?;
@@ -1577,11 +1655,13 @@ async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> 
 async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
   let collector = Collector::default();
   let scope = collector.scope("blob_stream_broker_test");
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
-  config.flush_max_delay_ms = 60_000;
+  config.flush_max_delay = TimeDuration::milliseconds(60_000);
 
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release = Arc::new(Semaphore::new(0));
@@ -1594,8 +1674,8 @@ async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
           name: "telemetry".into(),
           partition_count: 1,
           num_writers: 1,
-          retention_days: 7,
-          max_metadata_publication_lag_ms: 1,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::milliseconds(1),
         },
       )]),
       Arc::new(BlockingBlobStore {
@@ -1643,11 +1723,13 @@ async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
-  config.flush_max_delay_ms = 10;
+  config.flush_max_delay = TimeDuration::milliseconds(10);
 
   let mut topics = HashMap::new();
   for topic in ["first", "second"] {
@@ -1657,8 +1739,8 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
         name: topic.into(),
         partition_count: 1,
         num_writers: 1,
-        retention_days: 7,
-        max_metadata_publication_lag_ms: 30_000,
+        retention: TimeDuration::days(7),
+        max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
       },
     );
   }
@@ -1695,11 +1777,8 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
       .await
   });
   tokio::task::yield_now().await;
-  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
-  tokio::time::advance(StdDuration::from_millis(
-    config.flush_max_delay_ms.cast_unsigned(),
-  ))
-  .await;
+  time_provider.advance(config.flush_max_delay);
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
   assert!(receive_blob_write(&mut entered_rx).await.contains("first/"));
 
   let second_engine = Arc::clone(&engine);
@@ -1713,11 +1792,8 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
       .await
   });
   tokio::task::yield_now().await;
-  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
-  tokio::time::advance(StdDuration::from_millis(
-    config.flush_max_delay_ms.cast_unsigned(),
-  ))
-  .await;
+  time_provider.advance(config.flush_max_delay);
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
 
   assert!(
     receive_blob_write(&mut entered_rx)
@@ -1736,11 +1812,13 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
 #[tokio::test(start_paused = true)]
 async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
-  config.flush_max_delay_ms = 10;
+  config.flush_max_delay = TimeDuration::milliseconds(10);
 
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release_first = Arc::new(Semaphore::new(0));
@@ -1754,8 +1832,8 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
           name: "telemetry".into(),
           partition_count: 1,
           num_writers: 1,
-          retention_days: 7,
-          max_metadata_publication_lag_ms: 30_000,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
         },
       )]),
       Arc::new(GatedBlobStore {
@@ -1804,10 +1882,7 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
   receive_blob_write(&mut entered_rx).await;
   second.await??;
 
-  let window = Window::for_timestamp(
-    time_provider.now().unix_timestamp_ms() / 1_000,
-    config.window_size_seconds,
-  );
+  let window = Window::for_timestamp(time_provider.now(), config.window_size);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -1834,11 +1909,13 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
 #[tokio::test]
 async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
-  config.flush_max_delay_ms = 60_000;
+  config.flush_max_delay = TimeDuration::milliseconds(60_000);
 
   let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
     node_id: "node-a".into(),
@@ -1857,8 +1934,8 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
           name: "telemetry".into(),
           partition_count: 1,
           num_writers: 1,
-          retention_days: 7,
-          max_metadata_publication_lag_ms: 30_000,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
         },
       )]),
       Arc::new(BlockingBlobStore {
@@ -1929,8 +2006,8 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
       key.clone(),
       "node-b".to_string(),
       "node-b-session".to_string(),
-      now_ms,
-      30_000,
+      offset_datetime_from_unix_millis(now_ms),
+      TimeDuration::milliseconds(30_000),
     )
     .await?;
   assert!(matches!(held_by_a, LeaseAcquireOutcome::HeldByOther(_)));
@@ -1944,8 +2021,8 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
       key.clone(),
       "node-b".to_string(),
       "node-b-session".to_string(),
-      now_ms,
-      30_000,
+      offset_datetime_from_unix_millis(now_ms),
+      TimeDuration::milliseconds(30_000),
     )
     .await?;
   assert!(matches!(
@@ -1963,8 +2040,8 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
         key.clone(),
         "node-b".to_string(),
         "node-b-session".to_string(),
-        now_ms,
-        30_000,
+        offset_datetime_from_unix_millis(now_ms),
+        TimeDuration::milliseconds(30_000),
       )
       .await?;
     if matches!(outcome, LeaseAcquireOutcome::Acquired(_)) {
@@ -1976,8 +2053,8 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
   assert!(acquired_by_b, "lease was not released after drain");
 
   let window = Window::for_timestamp(
-    time_provider.now().unix_timestamp_ms() / 1_000,
-    WriteConfig::with_defaults().window_size_seconds,
+    time_provider.now(),
+    WriteConfig::with_defaults().window_size,
   );
   let segments = metadata_store
     .scan_window_from_snowflake(
@@ -1993,10 +2070,12 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
 #[tokio::test]
 async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
-  config.flush_max_delay_ms = 60_000;
+  config.flush_max_delay = TimeDuration::milliseconds(60_000);
 
   let (_membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
     node_id: "node-a".into(),
@@ -2015,8 +2094,8 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
           name: "telemetry".into(),
           partition_count: 1,
           num_writers: 1,
-          retention_days: 7,
-          max_metadata_publication_lag_ms: 30_000,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
         },
       )]),
       Arc::new(BlockingBlobStore {
@@ -2060,8 +2139,8 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
       key.clone(),
       "node-b".to_string(),
       "node-b-session".to_string(),
-      now_ms,
-      30_000,
+      offset_datetime_from_unix_millis(now_ms),
+      TimeDuration::milliseconds(30_000),
     )
     .await?;
   assert!(matches!(held_by_a, LeaseAcquireOutcome::HeldByOther(_)));
@@ -2078,8 +2157,8 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
       key,
       "node-b".to_string(),
       "node-b-session".to_string(),
-      now_ms,
-      30_000,
+      offset_datetime_from_unix_millis(now_ms),
+      TimeDuration::milliseconds(30_000),
     )
     .await?;
   assert!(matches!(acquired_by_b, LeaseAcquireOutcome::Acquired(_)));
@@ -2089,11 +2168,13 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
 #[tokio::test(start_paused = true)]
 async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
-  config.flush_max_delay_ms = 10;
+  config.flush_max_delay = TimeDuration::milliseconds(10);
 
   let mut topics = HashMap::new();
   for topic in ["first", "second"] {
@@ -2103,8 +2184,8 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
         name: topic.into(),
         partition_count: 1,
         num_writers: 1,
-        retention_days: 7,
-        max_metadata_publication_lag_ms: 30_000,
+        retention: TimeDuration::days(7),
+        max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
       },
     );
   }
@@ -2151,11 +2232,8 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
       .await
   });
   tokio::task::yield_now().await;
-  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
-  tokio::time::advance(StdDuration::from_millis(
-    config.flush_max_delay_ms.cast_unsigned(),
-  ))
-  .await;
+  time_provider.advance(config.flush_max_delay);
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
 
   let first_blob_key = receive_blob_write(&mut entered_rx).await;
   let second_blob_key = receive_blob_write(&mut entered_rx).await;
@@ -2170,11 +2248,13 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
 #[tokio::test(start_paused = true)]
 async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
-  config.flush_max_delay_ms = 10;
+  config.flush_max_delay = TimeDuration::milliseconds(10);
 
   let topics = (0 .. 5)
     .map(|index| {
@@ -2185,8 +2265,8 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
           name: topic,
           partition_count: 1,
           num_writers: 1,
-          retention_days: 7,
-          max_metadata_publication_lag_ms: 30_000,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
         },
       )
     })
@@ -2239,11 +2319,8 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
     tokio::task::yield_now().await;
   }
 
-  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
-  tokio::time::advance(StdDuration::from_millis(
-    config.flush_max_delay_ms.cast_unsigned(),
-  ))
-  .await;
+  time_provider.advance(config.flush_max_delay);
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
 
   let mut first_topics = Vec::new();
   for _ in 0 .. 4 {
@@ -2273,11 +2350,13 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
 #[tokio::test(start_paused = true)]
 async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
   let now_ms = 1_700_000_000_000;
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(now_ms)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
-  config.flush_max_delay_ms = 10;
+  config.flush_max_delay = TimeDuration::milliseconds(10);
 
   let mut topics = HashMap::new();
   for topic in ["first", "second"] {
@@ -2287,8 +2366,8 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
         name: topic.into(),
         partition_count: 1,
         num_writers: 1,
-        retention_days: 7,
-        max_metadata_publication_lag_ms: 30_000,
+        retention: TimeDuration::days(7),
+        max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
       },
     );
   }
@@ -2333,11 +2412,8 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
   });
 
   tokio::task::yield_now().await;
-  time_provider.advance(TimeDuration::milliseconds(config.flush_max_delay_ms));
-  tokio::time::advance(StdDuration::from_millis(
-    config.flush_max_delay_ms.cast_unsigned(),
-  ))
-  .await;
+  time_provider.advance(config.flush_max_delay);
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
 
   first.await??;
   assert!(second.await?.is_err());
@@ -2346,11 +2422,13 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
 
 #[tokio::test]
 async fn assigns_monotonic_sequences() -> Result<()> {
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
-  config.flush_max_delay_ms = 60_000;
+  config.flush_max_delay = TimeDuration::milliseconds(60_000);
 
   let (engine, _metadata_store) = make_engine(
     time_provider.clone(),
@@ -2380,12 +2458,14 @@ async fn assigns_monotonic_sequences() -> Result<()> {
 
 #[tokio::test]
 async fn writes_compressed_metadata() -> Result<()> {
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 5;
-  config.flush_max_delay_ms = 60_000;
-  config.window_size_seconds = 60;
+  config.flush_max_delay = TimeDuration::milliseconds(60_000);
+  config.window_size = TimeDuration::seconds(60);
 
   let (engine, metadata_store) = make_engine(
     time_provider.clone(),
@@ -2401,10 +2481,7 @@ async fn writes_compressed_metadata() -> Result<()> {
 
   engine.produce_batch(request).await?;
 
-  let window = Window::for_timestamp(
-    time_provider.now().unix_timestamp_ms() / 1_000,
-    config.window_size_seconds,
-  );
+  let window = Window::for_timestamp(time_provider.now(), config.window_size);
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -2444,7 +2521,9 @@ impl MetadataStore for FailingMetadataStore {
 
 #[tokio::test]
 async fn returns_error_when_flush_fails() -> Result<()> {
-  let time_provider = Arc::new(ManualTimeProvider::new(time_from_ms(1_700_000_000_000)));
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut topics = HashMap::new();
   topics.insert(
@@ -2453,14 +2532,14 @@ async fn returns_error_when_flush_fails() -> Result<()> {
       name: "telemetry".into(),
       partition_count: 1,
       num_writers: 1,
-      retention_days: 7,
-      max_metadata_publication_lag_ms: 30_000,
+      retention: TimeDuration::days(7),
+      max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
     },
   );
 
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
-  config.flush_max_delay_ms = 60_000;
+  config.flush_max_delay = TimeDuration::milliseconds(60_000);
 
   let engine = WriteEngineBuilder::new(
     config,

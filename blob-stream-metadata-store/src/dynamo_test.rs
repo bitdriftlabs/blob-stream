@@ -28,6 +28,7 @@ use blob_stream_types::{
 use protobuf::Message;
 use std::collections::HashMap;
 use std::time::Duration;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -123,8 +124,8 @@ fn build_segment(
     BlobKey::from("topic/1/segment"),
     Compression::none(),
     segment_index,
-    3000,
-    3000,
+    OffsetDateTime::UNIX_EPOCH + TimeDuration::seconds(3),
+    OffsetDateTime::UNIX_EPOCH + TimeDuration::seconds(3),
   )
 }
 
@@ -178,7 +179,7 @@ async fn writes_and_scans_window() -> Result<()> {
     table_name.clone(),
     "unused_producer_leases_table",
     HashMap::new(),
-    3_600,
+    TimeDuration::hours(1),
     None,
   );
   let first = build_segment("topic-a", 100, 1);
@@ -217,7 +218,7 @@ async fn scans_window_from_inclusive_snowflake() -> Result<()> {
     table_name.clone(),
     "unused_producer_leases_table",
     HashMap::new(),
-    3_600,
+    TimeDuration::hours(1),
     None,
   );
   let first = build_segment("topic-a", 100, 1);
@@ -249,14 +250,14 @@ async fn writes_segment_ttl_attribute() -> Result<()> {
   let table_name = format!("blob_segments_test_{}", Uuid::new_v4());
   create_segments_table(&client, &table_name).await?;
 
-  let mut retention_days = HashMap::new();
-  retention_days.insert("topic-a".into(), 7);
+  let mut topic_retention = HashMap::new();
+  topic_retention.insert("topic-a".into(), TimeDuration::days(7));
   let store = DynamoMetadataStore::new(
     client.clone(),
     table_name.clone(),
     "unused_producer_leases_table",
-    retention_days,
-    3_600,
+    topic_retention,
+    TimeDuration::hours(1),
     None,
   );
   let segment = build_segment("topic-a", 100, 1);
@@ -278,7 +279,7 @@ async fn writes_segment_ttl_attribute() -> Result<()> {
     .and_then(|value| value.as_n().ok())
     .ok_or_else(|| anyhow!("missing ttl attribute"))?
     .parse::<i64>()?;
-  let expected = (segment.created_ts_ms / 1_000) + (7 * 24 * 60 * 60) + 3_600;
+  let expected = segment.created_at.unix_timestamp() + (7 * 24 * 60 * 60) + 3_600;
 
   assert_eq!(ttl, expected);
   assert!(
@@ -321,7 +322,7 @@ async fn skips_noncompliant_segment_rows() -> Result<()> {
     table_name.clone(),
     "unused_producer_leases_table",
     HashMap::new(),
-    3_600,
+    TimeDuration::hours(1),
     None,
   );
   let valid = build_segment("topic-a", 100, 2);

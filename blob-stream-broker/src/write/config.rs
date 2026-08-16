@@ -32,8 +32,9 @@ use blob_stream_proto::protos::blobstream::v1::config::{
 };
 use blob_stream_types::{
   Compression,
-  DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS,
-  DEFAULT_METADATA_WINDOW_SIZE_SECONDS,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+  DEFAULT_METADATA_WINDOW_SIZE,
+  ProtoDurationExt,
   VirtualPartitionId,
 };
 use hostname::get as get_hostname;
@@ -41,16 +42,17 @@ use log::{debug, trace};
 use protobuf::{Chars, EnumOrUnknown};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::Duration as StdDuration;
+use time::Duration;
 use tokio::sync::watch;
 
 const DEFAULT_FLUSH_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const DEFAULT_FLUSH_MAX_DELAY_MS: i64 = 1_000;
-const DEFAULT_LEASE_DURATION_MS: i64 = 30_000;
+const DEFAULT_FLUSH_MAX_DELAY: Duration = Duration::seconds(1);
+const DEFAULT_LEASE_DURATION: Duration = Duration::seconds(30);
 const DEFAULT_RESERVATION_SIZE: u64 = 10_000;
-const DEFAULT_SEGMENT_TTL_BUFFER_SECONDS: u32 = 3_600;
-const DEFAULT_LEASE_TTL_BUFFER_SECONDS: u32 = 3_600;
-const PRODUCE_REQUEST_TIMEOUT_FLUSH_DELAY_MULTIPLIER: u64 = 10;
+const DEFAULT_SEGMENT_TTL_BUFFER: Duration = Duration::hours(1);
+const DEFAULT_LEASE_TTL_BUFFER: Duration = Duration::hours(1);
+const PRODUCE_REQUEST_TIMEOUT_FLUSH_DELAY_MULTIPLIER: i32 = 10;
 pub const FENCED_METADATA_WRITES_FEATURE_FLAG: &str = "blob_stream_broker_fenced_metadata_writes";
 
 #[cfg(test)]
@@ -70,10 +72,10 @@ enum DynamoTablePurpose {
 #[derive(Clone, Debug)]
 pub struct WriteConfig {
   pub flush_max_bytes: u64,
-  pub flush_max_delay_ms: i64,
-  pub lease_duration_ms: i64,
+  pub flush_max_delay: Duration,
+  pub lease_duration: Duration,
   pub reservation_size: u64,
-  pub window_size_seconds: i64,
+  pub window_size: Duration,
   pub writer_id: u32,
   pub compression: blob_stream_types::Compression,
   pub blob_prefix: Option<String>,
@@ -85,10 +87,10 @@ impl WriteConfig {
   pub fn with_defaults() -> Self {
     Self {
       flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
-      flush_max_delay_ms: DEFAULT_FLUSH_MAX_DELAY_MS,
-      lease_duration_ms: DEFAULT_LEASE_DURATION_MS,
+      flush_max_delay: DEFAULT_FLUSH_MAX_DELAY,
+      lease_duration: DEFAULT_LEASE_DURATION,
       reservation_size: DEFAULT_RESERVATION_SIZE,
-      window_size_seconds: DEFAULT_METADATA_WINDOW_SIZE_SECONDS,
+      window_size: DEFAULT_METADATA_WINDOW_SIZE,
       writer_id: 0,
       compression: Compression::zstd(DEFAULT_ZSTD_LEVEL),
       blob_prefix: None,
@@ -107,8 +109,8 @@ impl WriteConfig {
       config.flush_max_bytes = u64::from(broker.flush_max_bytes);
     }
 
-    if broker.flush_max_delay_ms > 0 {
-      config.flush_max_delay_ms = i64::from(broker.flush_max_delay_ms);
+    if let Some(flush_max_delay) = broker.flush_max_delay.as_ref() {
+      config.flush_max_delay = flush_max_delay.to_time_duration();
     }
 
     if let Some(sequence_reservation_size) = broker.sequence_reservation_size {
@@ -133,11 +135,12 @@ impl WriteConfig {
   }
 
   #[must_use]
-  pub fn produce_request_timeout(&self) -> Duration {
-    let flush_delay_ms = self.flush_max_delay_ms.max(1).unsigned_abs();
-    Duration::from_millis(
-      flush_delay_ms.saturating_mul(PRODUCE_REQUEST_TIMEOUT_FLUSH_DELAY_MULTIPLIER),
-    )
+  pub fn produce_request_timeout(&self) -> StdDuration {
+    let flush_delay = self.flush_max_delay.max(Duration::milliseconds(1));
+    let timeout = flush_delay
+      .checked_mul(PRODUCE_REQUEST_TIMEOUT_FLUSH_DELAY_MULTIPLIER)
+      .unwrap_or(Duration::MAX);
+    StdDuration::try_from(timeout).unwrap_or(StdDuration::MAX)
   }
 
   #[must_use]
@@ -160,8 +163,8 @@ pub struct TopicInfo {
   pub name: Chars,
   pub partition_count: u32,
   pub num_writers: u32,
-  pub retention_days: u32,
-  pub max_metadata_publication_lag_ms: u64,
+  pub retention: Duration,
+  pub max_metadata_publication_lag: Duration,
 }
 
 impl TopicInfo {
@@ -172,10 +175,15 @@ impl TopicInfo {
       name,
       partition_count: proto.partition_count,
       num_writers: proto.num_writers,
-      retention_days: proto.retention_days,
-      max_metadata_publication_lag_ms: proto
-        .max_metadata_publication_lag_ms
-        .unwrap_or(DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS),
+      retention: proto
+        .retention
+        .as_ref()
+        .ok_or_else(|| anyhow!("topic retention is required"))?
+        .to_time_duration(),
+      max_metadata_publication_lag: proto.max_metadata_publication_lag.as_ref().map_or(
+        DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+        ProtoDurationExt::to_time_duration,
+      ),
     })
   }
 
@@ -285,14 +293,15 @@ async fn build_producer_partition_lease_store(
 
     let shared = loader.load().await;
     let client = aws_sdk_dynamodb::Client::new(&shared);
-    let ttl_buffer_seconds = dynamo
-      .lease_ttl_buffer_seconds
-      .unwrap_or(DEFAULT_LEASE_TTL_BUFFER_SECONDS);
+    let ttl_buffer = dynamo
+      .lease_ttl_buffer
+      .as_ref()
+      .map_or(DEFAULT_LEASE_TTL_BUFFER, ProtoDurationExt::to_time_duration);
     let store: Arc<dyn ProducerPartitionLeaseStore> =
       Arc::new(DynamoProducerPartitionLeaseStore::new(
         client,
         table_name,
-        ttl_buffer_seconds,
+        ttl_buffer,
         Some(capacity_metrics),
       ));
     return Ok(store);
@@ -473,21 +482,22 @@ async fn build_metadata_store(
     let shared = loader.load().await;
     let client = aws_sdk_dynamodb::Client::new(&shared);
 
-    let retention_days_by_topic = topics
+    let retention_by_topic = topics
       .iter()
-      .map(|(topic, info)| (topic.clone(), info.retention_days))
+      .map(|(topic, info)| (topic.clone(), info.retention))
       .collect();
-    let ttl_buffer_seconds = dynamo
-      .segment_ttl_buffer_seconds
-      .unwrap_or(DEFAULT_SEGMENT_TTL_BUFFER_SECONDS);
+    let ttl_buffer = dynamo.segment_ttl_buffer.as_ref().map_or(
+      DEFAULT_SEGMENT_TTL_BUFFER,
+      ProtoDurationExt::to_time_duration,
+    );
 
     let store: Arc<dyn MetadataStore> =
       Arc::new(blob_stream_metadata_store::DynamoMetadataStore::new(
         client,
         table_name,
         producer_partition_lease_table_name,
-        retention_days_by_topic,
-        ttl_buffer_seconds,
+        retention_by_topic,
+        ttl_buffer,
         Some(capacity_metrics),
       ));
     return Ok(store);

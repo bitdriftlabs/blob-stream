@@ -24,6 +24,7 @@ blob-stream-proto.path            = "../blob-stream-proto"
 blob-stream-types.path            = "../blob-stream-types"
 bytes.workspace                   = true
 futures.workspace                 = true
+humantime-serde.workspace         = true
 hyper-util.workspace              = true
 log.workspace                     = true
 parking_lot.workspace             = true

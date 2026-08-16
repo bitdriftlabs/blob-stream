@@ -3,6 +3,7 @@
 mod tests;
 
 use crate::aws::{is_dynamo_transaction_conflict, retry_dynamo_transaction_conflicts};
+use crate::dynamo::duration_seconds_ceil;
 use crate::dynamo_attributes::{
   ATTR_EPOCH,
   ATTR_EXPIRES,
@@ -30,10 +31,15 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemOutput;
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnConsumedCapacity, ReturnValue};
-use blob_stream_types::SeqRange;
+use blob_stream_types::{
+  SeqRange,
+  offset_datetime_from_unix_millis,
+  unix_millis_from_offset_datetime,
+};
 use log::{debug, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use time::{Duration, OffsetDateTime};
 
 const ATTR_MAX_SEQ: &str = "max_allocated_seq";
 
@@ -45,7 +51,7 @@ const ATTR_MAX_SEQ: &str = "max_allocated_seq";
 pub struct DynamoProducerPartitionLeaseStore {
   client: Client,
   table_name: String,
-  ttl_buffer_seconds: i64,
+  ttl_buffer: Duration,
   capacity_metrics: Option<DynamoCapacityMetrics>,
 }
 
@@ -54,13 +60,13 @@ impl DynamoProducerPartitionLeaseStore {
   pub fn new(
     client: Client,
     table_name: impl Into<String>,
-    ttl_buffer_seconds: u32,
+    ttl_buffer: Duration,
     capacity_metrics: Option<DynamoCapacityMetrics>,
   ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
-      ttl_buffer_seconds: i64::from(ttl_buffer_seconds),
+      ttl_buffer,
       capacity_metrics,
     }
   }
@@ -223,16 +229,16 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     key: ProducerPartitionLeaseKey,
     holder_id: String,
     lease_session_id: String,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
   ) -> Result<LeaseAcquireOutcome> {
     match self
       .acquire_lease_and_reserve_sequences(
         key,
         holder_id,
         lease_session_id,
-        now_ts_ms,
-        lease_duration_ms,
+        now,
+        lease_duration,
         None,
       )
       .await?
@@ -258,8 +264,8 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     key: ProducerPartitionLeaseKey,
     holder_id: String,
     lease_session_id: String,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
     reservation_size: Option<u64>,
   ) -> Result<LeaseAcquireAndReserveOutcome> {
     trace!(
@@ -270,8 +276,12 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     if reservation_size == Some(0) {
       return Err(anyhow!("reservation_size must be greater than zero"));
     }
-    let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
+    let expires_at = expires_at(now, lease_duration)?;
+    let expires_at_ms = unix_millis_from_offset_datetime(expires_at)
+      .map_err(|_| anyhow!("lease expiration exceeds Dynamo millisecond range"))?;
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at_ms, self.ttl_buffer)?;
     let pk = key.format();
 
     let mut values = HashMap::new();
@@ -282,7 +292,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     );
     values.insert(
       ":expires".to_string(),
-      AttributeValue::N(expires_at.to_string()),
+      AttributeValue::N(expires_at_ms.to_string()),
     );
     values.insert(
       ":ttl".to_string(),
@@ -356,7 +366,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
             &lease,
             &holder_id,
             &lease_session_id,
-            now_ts_ms,
+            now,
             reservation_size,
           ) {
             return Err(anyhow!("sequence range overflow"));
@@ -373,15 +383,19 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
   ) -> Result<LeaseHeartbeatOutcome> {
     trace!(
       "producer lease(dynamo) heartbeat: table={}, topic={}, partition={}, holder_id={}",
       self.table_name, key.topic, key.virtual_partition_id, holder_id
     );
-    let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer_seconds)?;
+    let expires_at = expires_at(now, lease_duration)?;
+    let expires_at_ms = unix_millis_from_offset_datetime(expires_at)
+      .map_err(|_| anyhow!("lease expiration exceeds Dynamo millisecond range"))?;
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at_ms, self.ttl_buffer)?;
 
     let mut values = HashMap::new();
     values.insert(
@@ -394,7 +408,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     );
     values.insert(
       ":expires".to_string(),
-      AttributeValue::N(expires_at.to_string()),
+      AttributeValue::N(expires_at_ms.to_string()),
     );
     values.insert(
       ":ttl".to_string(),
@@ -442,7 +456,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
           debug!("producer lease(dynamo) heartbeat result: expired");
           return Ok(LeaseHeartbeatOutcome::Expired);
         };
-        if lease.lease_expiration_ts_ms <= now_ts_ms {
+        if lease.lease_expiration_at <= now {
           debug!("producer lease(dynamo) heartbeat result: expired");
           Ok(LeaseHeartbeatOutcome::Expired)
         } else {
@@ -459,7 +473,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome> {
     trace!(
@@ -469,6 +483,8 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     if reservation_size == 0 {
       return Err(anyhow!("reservation_size must be greater than zero"));
     }
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
 
     let mut values = HashMap::new();
     values.insert(
@@ -551,12 +567,12 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
           &lease,
           holder_id,
           lease_session_id,
-          now_ts_ms,
+          now,
           Some(reservation_size),
         ) {
           return Err(anyhow!("sequence range overflow"));
         }
-        if lease.lease_expiration_ts_ms <= now_ts_ms {
+        if lease.lease_expiration_at <= now {
           debug!("producer lease(dynamo) reserve result: expired");
           Ok(SequenceReservationOutcome::Expired)
         } else {
@@ -573,12 +589,14 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<LeaseReleaseOutcome> {
     trace!(
       "producer lease(dynamo) release: table={}, topic={}, partition={}, holder_id={}",
       self.table_name, key.topic, key.virtual_partition_id, holder_id
     );
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
     let mut values = HashMap::new();
     values.insert(
       ":holder".to_string(),
@@ -594,7 +612,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     );
     values.insert(
       ":ttl".to_string(),
-      AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer_seconds)?.to_string()),
+      AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer)?.to_string()),
     );
 
     let update = format!("SET {ATTR_EXPIRES} = :expired, {ATTR_TTL} = :ttl");
@@ -631,7 +649,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
           debug!("producer lease(dynamo) release result: expired");
           return Ok(LeaseReleaseOutcome::Expired);
         };
-        if lease.lease_expiration_ts_ms <= now_ts_ms {
+        if lease.lease_expiration_at <= now {
           debug!("producer lease(dynamo) release result: expired");
           Ok(LeaseReleaseOutcome::Expired)
         } else {
@@ -666,7 +684,7 @@ impl DynamoLeaseItem {
         lease_epoch: self.lease_epoch,
         lease_session_id: self.lease_session_id,
       },
-      lease_expiration_ts_ms: self.lease_expiration_ts_ms,
+      lease_expiration_at: offset_datetime_from_unix_millis(self.lease_expiration_ts_ms),
       max_allocated_seq: self.max_allocated_seq,
     }
   }
@@ -709,29 +727,31 @@ fn reservation_would_overflow(
   lease: &ProducerPartitionLease,
   holder_id: &str,
   lease_session_id: &str,
-  now_ts_ms: i64,
+  now: OffsetDateTime,
   reservation_size: Option<u64>,
 ) -> bool {
   reservation_size.is_some_and(|size| {
     lease.fence.holder_id == holder_id
       && lease.fence.lease_session_id == lease_session_id
-      && lease.lease_expiration_ts_ms > now_ts_ms
+      && lease.lease_expiration_at > now
       && lease
         .max_allocated_seq
         .is_some_and(|max_allocated_seq| max_allocated_seq > u64::MAX - size)
   })
 }
 
-fn expires_at(now_ts_ms: i64, lease_duration_ms: i64) -> Result<i64> {
-  now_ts_ms
-    .checked_add(lease_duration_ms)
+fn expires_at(now: OffsetDateTime, lease_duration: Duration) -> Result<OffsetDateTime> {
+  now
+    .checked_add(lease_duration)
     .ok_or_else(|| anyhow!("lease expiration overflow"))
 }
 
-fn ttl_epoch_seconds(expires_at_ms: i64, ttl_buffer_seconds: i64) -> Result<i64> {
+fn ttl_epoch_seconds(expires_at_ms: i64, ttl_buffer: Duration) -> Result<i64> {
   let expires_at_seconds = expires_at_ms
     .checked_div(1_000)
     .ok_or_else(|| anyhow!("lease ttl conversion overflow"))?;
+  let ttl_buffer_seconds = duration_seconds_ceil(ttl_buffer)
+    .ok_or_else(|| anyhow!("lease ttl buffer conversion overflow"))?;
 
   expires_at_seconds
     .checked_add(ttl_buffer_seconds)

@@ -2,7 +2,7 @@ use crate::config::{
   ProducerConfig,
   compression_as_grpc,
   producer_compression,
-  producer_connect_timeout_ms,
+  producer_connect_timeout,
   producer_max_request_concurrency,
 };
 use anyhow::{Result, anyhow};
@@ -72,7 +72,7 @@ impl GrpcBrokerTransport {
       return Ok(Arc::clone(client));
     }
 
-    let connect_timeout = TimeDuration::milliseconds(producer_connect_timeout_ms(&self.config));
+    let connect_timeout = producer_connect_timeout(&self.config);
     let client = Arc::new(GrpcClient::new_http(
       broker_address.as_str(),
       connect_timeout,

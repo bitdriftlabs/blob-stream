@@ -19,8 +19,13 @@ use aws_sdk_dynamodb::types::{
   KeyType,
   ScalarAttributeType,
 };
-use blob_stream_types::{CommittedCursor, CommittedSourceCheckpoint};
+use blob_stream_types::{
+  CommittedCursor,
+  CommittedSourceCheckpoint,
+  offset_datetime_from_unix_millis,
+};
 use std::time::Duration;
+use time::Duration as TimeDuration;
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -127,34 +132,62 @@ async fn list_group_leases_returns_retained_rows_in_partition_order() -> Result<
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   let key_two = lease_key_for("topic-a", "group-a", 2);
   let key_ten = lease_key_for("topic-a", "group-a", 10);
   let other_group_key = lease_key_for("topic-a", "group-b", 4);
   store
-    .assign_partition(key_ten.clone(), "member-b".to_string(), 3, 1_000, 100)
+    .assign_partition(
+      key_ten.clone(),
+      "member-b".to_string(),
+      3,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
   store
     .heartbeat_partition(
       &key_ten,
       "member-b",
       3,
-      1_010,
-      100,
+      offset_datetime_from_unix_millis(1_010),
+      TimeDuration::milliseconds(100),
       Some(cursor_with_source(10, 42)),
     )
     .await?;
   store
-    .assign_partition(key_two.clone(), "member-a".to_string(), 2, 1_000, 100)
+    .assign_partition(
+      key_two.clone(),
+      "member-a".to_string(),
+      2,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
   assert_eq!(
     store
-      .release_partition(&key_two, "member-a", 2, 1_020)
+      .release_partition(
+        &key_two,
+        "member-a",
+        2,
+        offset_datetime_from_unix_millis(1_020)
+      )
       .await?,
     ConsumerGroupReleaseOutcome::Released
   );
   store
-    .assign_partition(other_group_key, "member-c".to_string(), 1, 1_000, 100)
+    .assign_partition(
+      other_group_key,
+      "member-c".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
 
   let leases = store.list_group_leases("topic-a", "group-a").await?;
@@ -181,11 +214,22 @@ async fn fences_assignment() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   let key = lease_key();
 
   let outcome = store
-    .assign_partition(key.clone(), "member-a".to_string(), 1, 1000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
 
   assert!(matches!(
@@ -197,7 +241,13 @@ async fn fences_assignment() -> Result<()> {
   ));
 
   let outcome = store
-    .assign_partition(key.clone(), "member-b".to_string(), 1, 1000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-b".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
 
   assert!(matches!(
@@ -206,7 +256,13 @@ async fn fences_assignment() -> Result<()> {
   ));
 
   let outcome = store
-    .assign_partition(key.clone(), "member-b".to_string(), 2, 1100, 100)
+    .assign_partition(
+      key.clone(),
+      "member-b".to_string(),
+      2,
+      offset_datetime_from_unix_millis(1_100),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
 
   assert!(matches!(
@@ -232,11 +288,22 @@ async fn heartbeats_and_commits() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   let key = lease_key();
 
   store
-    .assign_partition(key.clone(), "member-a".to_string(), 1, 1000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
 
   let outcome = store
@@ -244,8 +311,8 @@ async fn heartbeats_and_commits() -> Result<()> {
       &key,
       "member-a",
       1,
-      1010,
-      100,
+      offset_datetime_from_unix_millis(1_010),
+      TimeDuration::milliseconds(100),
       Some(cursor_with_source(key.virtual_partition_id, 10)),
     )
     .await?;
@@ -264,7 +331,7 @@ async fn heartbeats_and_commits() -> Result<()> {
       &key,
       "member-a",
       1,
-      1020,
+      offset_datetime_from_unix_millis(1_020),
       cursor_with_source(key.virtual_partition_id, 12),
     )
     .await?;
@@ -289,26 +356,43 @@ async fn retained_assignment_preserves_committed_cursor() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   let key = lease_key();
   let committed_cursor = cursor_with_source(key.virtual_partition_id, 10);
 
   store
-    .assign_partition(key.clone(), "member-a".to_string(), 1, 1_000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
   store
     .heartbeat_partition(
       &key,
       "member-a",
       1,
-      1_010,
-      100,
+      offset_datetime_from_unix_millis(1_010),
+      TimeDuration::milliseconds(100),
       Some(committed_cursor.clone()),
     )
     .await?;
 
   let outcome = store
-    .assign_partition(key, "member-a".to_string(), 2, 1_020, 100)
+    .assign_partition(
+      key,
+      "member-a".to_string(),
+      2,
+      offset_datetime_from_unix_millis(1_020),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
 
   assert!(matches!(
@@ -331,15 +415,33 @@ async fn heartbeat_fences_other_members() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   let key = lease_key();
 
   store
-    .assign_partition(key.clone(), "member-a".to_string(), 1, 1000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
 
   let outcome = store
-    .heartbeat_partition(&key, "member-b", 1, 1010, 100, None)
+    .heartbeat_partition(
+      &key,
+      "member-b",
+      1,
+      offset_datetime_from_unix_millis(1_010),
+      TimeDuration::milliseconds(100),
+      None,
+    )
     .await?;
 
   assert!(matches!(
@@ -358,7 +460,12 @@ async fn release_partition_allows_immediate_takeover() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
 
   let key = ConsumerGroupLeaseKey {
     topic: "topic-a".to_string(),
@@ -367,14 +474,28 @@ async fn release_partition_allows_immediate_takeover() -> Result<()> {
   };
 
   store
-    .assign_partition(key.clone(), "member-a".to_string(), 2, 1000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      2,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
 
-  let release = store.release_partition(&key, "member-a", 2, 1010).await?;
+  let release = store
+    .release_partition(&key, "member-a", 2, offset_datetime_from_unix_millis(1_010))
+    .await?;
   assert_eq!(release, ConsumerGroupReleaseOutcome::Released);
 
   let reassigned = store
-    .assign_partition(key, "member-b".to_string(), 3, 1010, 100)
+    .assign_partition(
+      key,
+      "member-b".to_string(),
+      3,
+      offset_datetime_from_unix_millis(1_010),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
   assert!(matches!(
     reassigned,
@@ -399,7 +520,12 @@ async fn release_partition_rejects_stale_owner_or_generation() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 3_600, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
   let key = ConsumerGroupLeaseKey {
     topic: "topic-a".to_string(),
     group_id: "group-a".to_string(),
@@ -407,10 +533,18 @@ async fn release_partition_rejects_stale_owner_or_generation() -> Result<()> {
   };
 
   store
-    .assign_partition(key.clone(), "member-a".to_string(), 2, 1000, 100)
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      2,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
     .await?;
 
-  let release = store.release_partition(&key, "member-b", 2, 1010).await?;
+  let release = store
+    .release_partition(&key, "member-b", 2, offset_datetime_from_unix_millis(1_010))
+    .await?;
   assert!(matches!(
     release,
     ConsumerGroupReleaseOutcome::HeldByOther(_)
@@ -426,11 +560,22 @@ async fn writes_ttl_attribute_for_consumer_leases() -> Result<()> {
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
   create_leases_table(&client, &table_name).await?;
 
-  let store = DynamoConsumerGroupLeaseStore::new(client.clone(), table_name.clone(), 120, None);
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::seconds(120),
+    None,
+  );
   let key = lease_key();
 
   store
-    .assign_partition(key.clone(), "member-a".to_string(), 1, 1_000, 1_000)
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(1_000),
+    )
     .await?;
 
   let item = client

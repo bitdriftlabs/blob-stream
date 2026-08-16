@@ -26,10 +26,9 @@ use async_trait::async_trait;
 use bd_log_util::warn_every;
 use bd_server_stats::stats::Scope;
 use bd_shutdown::ComponentShutdownTriggerHandle;
-use bd_time::OffsetDateTimeExt;
 use blob_stream_broker_discovery::{balanced_assignment, writer_virtual_partitions};
 use blob_stream_metadata_store::ProducerPartitionLeaseKey;
-use blob_stream_types::{RecordBatch, format_unix_timestamp_ms};
+use blob_stream_types::RecordBatch;
 pub use core::{WriteEngineBuilder, WriteEngineImpl};
 use log::trace;
 use std::collections::HashMap;
@@ -83,7 +82,7 @@ impl WriteEngine for WriteEngineImpl {
     let mut summary = Some(summary);
 
     let (completion_rx, seq_range) = loop {
-      let now_ts_ms = self.time_provider.now().unix_timestamp_ms();
+      let now = self.time_provider.now();
       let buffered = {
         let mut state = self.state.lock();
         let partition_state = state.partition_state_mut(topic.as_str(), virtual_partition_id);
@@ -96,7 +95,7 @@ impl WriteEngine for WriteEngineImpl {
         }
 
         if partition_state.allocation_in_flight
-          || partition_state.needs_lease(now_ts_ms)
+          || partition_state.needs_lease(now)
           || !partition_state.seq_allocator.can_allocate(record_count)
         {
           None
@@ -125,7 +124,7 @@ impl WriteEngine for WriteEngineImpl {
               acceptance_fence: partition_state.lease_fence.clone(),
               completion: Some(completion_tx),
             },
-            now_ts_ms,
+            now,
           );
           Some((completion_rx, seq_range))
         }
@@ -139,7 +138,7 @@ impl WriteEngine for WriteEngineImpl {
         topic.as_str(),
         virtual_partition_id,
         record_count,
-        now_ts_ms,
+        now,
         false,
         self.config.reservation_size,
       );
@@ -161,12 +160,7 @@ impl WriteEngine for WriteEngineImpl {
           let mut reservation = None;
           match (work.needs_lease, work.reservation) {
             (true, Some(request)) => match self
-              .acquire_lease_and_reserve_sequences(
-                &topic,
-                virtual_partition_id,
-                now_ts_ms,
-                request.size,
-              )
+              .acquire_lease_and_reserve_sequences(&topic, virtual_partition_id, now, request.size)
               .await
             {
               Ok((lease, range)) => {
@@ -180,10 +174,7 @@ impl WriteEngine for WriteEngineImpl {
                 return Err(error);
               },
             },
-            (true, None) => match self
-              .ensure_lease(&topic, virtual_partition_id, now_ts_ms)
-              .await
-            {
+            (true, None) => match self.ensure_lease(&topic, virtual_partition_id, now).await {
               Ok(lease) => acquired_lease = Some(lease),
               Err(error) => {
                 work
@@ -193,7 +184,7 @@ impl WriteEngine for WriteEngineImpl {
               },
             },
             (false, Some(request)) => match self
-              .reserve_sequences(&topic, virtual_partition_id, now_ts_ms, request.size)
+              .reserve_sequences(&topic, virtual_partition_id, now, request.size)
               .await
             {
               Ok(range) => reservation = Some(range),
@@ -209,7 +200,7 @@ impl WriteEngine for WriteEngineImpl {
           let lease_expiration_update = acquired_lease
             .as_ref()
             .map_or(LeaseExpirationUpdate::Preserve, |lease| {
-              LeaseExpirationUpdate::Set(Some(lease.lease_expiration_ts_ms))
+              LeaseExpirationUpdate::Set(Some(lease.lease_expiration_at))
             });
           work
             .transition
@@ -242,8 +233,7 @@ impl WriteEngine for WriteEngineImpl {
   }
 
   async fn state_snapshot(&self) -> BrokerStateSnapshot {
-    let generated_at_ts_ms = self.time_provider.now().unix_timestamp_ms();
-    let generated_at = format_unix_timestamp_ms(generated_at_ts_ms);
+    let generated_at = self.time_provider.now();
     let (membership, mut local_partitions_by_topic) = {
       let state = self.state.lock();
       let mut local_partitions_by_topic = HashMap::new();
@@ -254,13 +244,9 @@ impl WriteEngine for WriteEngineImpl {
             .or_insert_with(Vec::new)
             .push(BrokerPartitionStateSnapshot {
               virtual_partition_id: *virtual_partition_id,
-              lease_expires_at: partition_state
-                .lease_expiration_ts_ms
-                .map(format_unix_timestamp_ms),
+              lease_expires_at: partition_state.lease_expiration_at,
               allocation_in_flight: partition_state.allocation_in_flight,
-              allocation_started_at: partition_state
-                .allocation_started_ts_ms
-                .map(format_unix_timestamp_ms),
+              allocation_started_at: partition_state.allocation_started_at,
               buffered_batch_count: partition_state.buffer.batches.len(),
               buffered_record_count: partition_state
                 .buffer
@@ -269,10 +255,7 @@ impl WriteEngine for WriteEngineImpl {
                 .map(|batch| batch.records.len())
                 .sum(),
               buffered_bytes: partition_state.buffer.buffered_bytes,
-              first_buffered_at: partition_state
-                .buffer
-                .first_buffered_ts_ms
-                .map(format_unix_timestamp_ms),
+              first_buffered_at: partition_state.buffer.first_buffered_at,
               sequence_reservation: partition_state.seq_allocator.reservation.as_ref().map(
                 |reservation| SequenceReservationSnapshot {
                   start: reservation.start,
@@ -313,7 +296,8 @@ impl WriteEngine for WriteEngineImpl {
           name: topic.name.clone(),
           partition_count: topic.partition_count,
           num_writers: topic.num_writers,
-          retention_days: topic.retention_days,
+          retention: std::time::Duration::try_from(topic.retention)
+            .expect("topic retention is validated as positive"),
           local_partitions,
         }
       })
@@ -349,7 +333,7 @@ impl WriteEngine for WriteEngineImpl {
 
       let (lease_status, observed_lease) = match lease {
         Ok(Some(lease)) => {
-          let is_active = lease.lease_expiration_ts_ms > generated_at_ts_ms;
+          let is_active = lease.lease_expiration_at > generated_at;
           let holder_address = membership
             .nodes()
             .unwrap_or_default()
@@ -368,7 +352,7 @@ impl WriteEngine for WriteEngineImpl {
             Some(BrokerLeaseSnapshot {
               holder_id: lease.fence.holder_id,
               holder_address,
-              expires_at: format_unix_timestamp_ms(lease.lease_expiration_ts_ms),
+              expires_at: lease.lease_expiration_at,
               is_active,
             }),
           )
@@ -412,7 +396,8 @@ impl WriteEngine for WriteEngineImpl {
       holder_id: self.holder_id.clone(),
       writer_id: self.config.writer_id,
       flush_max_bytes: self.config.flush_max_bytes,
-      flush_max_delay_ms: self.config.flush_max_delay_ms,
+      flush_max_delay: StdDuration::try_from(self.config.flush_max_delay)
+        .unwrap_or(StdDuration::MAX),
       membership: membership_snapshot,
       ownership,
       topics,

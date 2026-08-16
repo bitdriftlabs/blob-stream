@@ -2,6 +2,7 @@ use crate::SegmentMetadata;
 use blob_stream_blob_store::BlobKey;
 use blob_stream_types::{BatchMetadata, Compression, SeqRange, SnowflakeId, TopicWindowKey};
 use std::collections::HashMap;
+use time::{Duration, OffsetDateTime};
 
 #[test]
 fn formats_partition_and_snowflake_keys() {
@@ -22,8 +23,8 @@ fn formats_partition_and_snowflake_keys() {
     BlobKey::from("topic/300/42"),
     Compression::none(),
     segment_index,
-    400,
-    400,
+    OffsetDateTime::UNIX_EPOCH + Duration::milliseconds(400),
+    OffsetDateTime::UNIX_EPOCH + Duration::milliseconds(400),
   );
 
   assert_eq!(metadata.partition_key(), "topic#300");

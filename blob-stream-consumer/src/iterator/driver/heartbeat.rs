@@ -9,18 +9,18 @@ use super::{
   PendingCommit,
   Result,
   VirtualPartitionId,
-  consumer_heartbeat_interval_ms,
-  consumer_lease_duration_ms,
+  consumer_heartbeat_interval,
+  consumer_lease_duration,
   debug,
-  format_unix_timestamp_ms,
   trace,
 };
+use bd_time::OffsetDateTimeExt;
 
 impl ConsumerDriver {
-  pub(in crate::iterator) fn heartbeat_retry_deadline_ms(&self) -> i64 {
+  pub(in crate::iterator) fn heartbeat_retry_deadline(&self) -> time::OffsetDateTime {
     self
-      .membership_lease_expires_at_ms
-      .min(self.active_partition_lease_expiration_deadline_ms)
+      .membership_lease_expires_at
+      .min(self.active_partition_lease_expiration_deadline)
   }
 
   pub(in crate::iterator) fn record_heartbeat_failure(&self, started_at: Instant) {
@@ -107,9 +107,10 @@ impl ConsumerDriver {
 
   pub(in crate::iterator) async fn heartbeat(
     &mut self,
-    now_ts_ms: i64,
+    now: time::OffsetDateTime,
     trigger: HeartbeatTrigger,
   ) -> Result<HeartbeatReport> {
+    let now_ts_ms = now.unix_timestamp_ms();
     let started_at = Instant::now();
     let pending_commits = self
       .shared_state
@@ -156,8 +157,8 @@ impl ConsumerDriver {
           &self.group_config.group_id,
           &self.group_config.member_id,
           self.group_config.pod_id.as_ref().map(ToString::to_string),
-          now_ts_ms,
-          consumer_lease_duration_ms(&self.group_config),
+          now,
+          consumer_lease_duration(&self.group_config),
         )
         .await
     {
@@ -173,9 +174,9 @@ impl ConsumerDriver {
       );
       self.record_membership_heartbeat_failure();
       self.record_heartbeat_failure(started_at);
-      if now_ts_ms >= self.heartbeat_retry_deadline_ms() {
+      if now >= self.heartbeat_retry_deadline() {
         self
-          .fence_active_partitions_after_heartbeat_failure(now_ts_ms)
+          .fence_active_partitions_after_heartbeat_failure(now)
           .await?;
       } else {
         debug!(
@@ -185,14 +186,14 @@ impl ConsumerDriver {
           self.group_config.group_id,
           self.group_config.member_id,
           self.coordinator.generation(),
-          format_unix_timestamp_ms(self.membership_lease_expires_at_ms),
+          self.membership_lease_expires_at,
         );
       }
       return Err(error);
     }
     if matches!(trigger, HeartbeatTrigger::Scheduled) {
-      self.membership_lease_expires_at_ms =
-        now_ts_ms.saturating_add(consumer_lease_duration_ms(&self.group_config));
+      self.membership_lease_expires_at =
+        super::persisted_lease_expires_at(now, consumer_lease_duration(&self.group_config))?;
     }
 
     let committed_cursors = pending_commits
@@ -212,25 +213,24 @@ impl ConsumerDriver {
       HeartbeatTrigger::Scheduled => {
         self
           .coordinator
-          .heartbeat_and_commit(now_ts_ms, &committed_cursors)
+          .heartbeat_and_commit(now, &committed_cursors)
           .await
       },
       HeartbeatTrigger::Commit => {
         self
           .coordinator
-          .commit_cursors(now_ts_ms, &committed_cursors)
+          .commit_cursors(now, &committed_cursors)
           .await
       },
     };
     let report = match coordinator_result {
       Ok(report) => report,
       Err(error) => {
-        self.reconcile_fenced_partitions(now_ts_ms).await?;
-        if matches!(trigger, HeartbeatTrigger::Scheduled)
-          && now_ts_ms >= self.heartbeat_retry_deadline_ms()
+        self.reconcile_fenced_partitions(now).await?;
+        if matches!(trigger, HeartbeatTrigger::Scheduled) && now >= self.heartbeat_retry_deadline()
         {
           self
-            .fence_active_partitions_after_heartbeat_failure(now_ts_ms)
+            .fence_active_partitions_after_heartbeat_failure(now)
             .await?;
         }
         debug!(
@@ -250,15 +250,15 @@ impl ConsumerDriver {
     };
 
     if matches!(trigger, HeartbeatTrigger::Scheduled) {
-      self.active_partition_lease_expiration_deadline_ms =
-        now_ts_ms.saturating_add(consumer_lease_duration_ms(&self.group_config));
+      self.active_partition_lease_expiration_deadline =
+        super::persisted_lease_expires_at(now, consumer_lease_duration(&self.group_config))?;
     }
     self.record_successful_heartbeat(now_ts_ms, trigger, &report, &pending_commits, started_at);
 
-    self.remove_fenced_partitions(&report.fenced_partitions, now_ts_ms)?;
+    self.remove_fenced_partitions(&report.fenced_partitions, now)?;
 
     if matches!(trigger, HeartbeatTrigger::Scheduled) {
-      self.next_heartbeat_at_ms = now_ts_ms + consumer_heartbeat_interval_ms(&self.group_config);
+      self.next_heartbeat_at = now.saturating_add(consumer_heartbeat_interval(&self.group_config));
     }
     self.refresh_diagnostics();
     let committed_offsets = report
@@ -279,7 +279,7 @@ impl ConsumerDriver {
       report.fenced_partitions,
       committed_offsets,
       started_at.elapsed().as_millis(),
-      format_unix_timestamp_ms(self.next_heartbeat_at_ms)
+      self.next_heartbeat_at
     );
     Ok(report)
   }

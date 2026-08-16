@@ -5,8 +5,9 @@ use blob_stream_proto::protos::blobstream::v1::config::{
   SegmentCompression,
   TopicConfig,
 };
-use blob_stream_types::{CompressionCodec, DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS};
+use blob_stream_types::{CompressionCodec, DEFAULT_MAX_METADATA_PUBLICATION_LAG, ToProtoDuration};
 use std::collections::HashMap;
+use time::Duration;
 
 fn dynamo_config() -> DynamoMetadataStoreConfig {
   let mut config = DynamoMetadataStoreConfig::new();
@@ -58,11 +59,13 @@ fn defaults_segment_compression_to_zstd() {
 
 #[test]
 fn topic_defaults_metadata_publication_lag_to_fifteen_seconds() {
-  let topic = TopicInfo::from_proto(&TopicConfig::new()).unwrap();
+  let mut topic_config = TopicConfig::new();
+  topic_config.retention = Duration::days(1).into_proto();
+  let topic = TopicInfo::from_proto(&topic_config).unwrap();
 
   assert_eq!(
-    topic.max_metadata_publication_lag_ms,
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG_MS
+    topic.max_metadata_publication_lag,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG
   );
 }
 
@@ -99,7 +102,7 @@ fn fenced_metadata_writes_defaults_to_static_config_without_feature_flags() {
 #[test]
 fn derives_produce_request_timeout_from_flush_delay() {
   let mut config = WriteConfig::with_defaults();
-  config.flush_max_delay_ms = 250;
+  config.flush_max_delay = Duration::milliseconds(250);
 
   assert_eq!(config.produce_request_timeout().as_millis(), 2_500);
 }
@@ -148,8 +151,8 @@ fn rejects_writer_id_outside_a_topic_range() {
       name: "telemetry".into(),
       partition_count: 2,
       num_writers: 1,
-      retention_days: 7,
-      max_metadata_publication_lag_ms: 30_000,
+      retention: Duration::days(7),
+      max_metadata_publication_lag: Duration::seconds(30),
     },
   )]);
 

@@ -202,7 +202,7 @@ async fn lost_fence_does_not_fall_back_to_ordinary_metadata_write() -> Result<()
       }],
       trigger: FlushTrigger::MaxBytes,
     }],
-    max_metadata_publication_lag_ms: 1_000,
+    max_metadata_publication_lag: time::Duration::seconds(1),
     fenced_metadata_writes: true,
   };
 
@@ -216,8 +216,7 @@ async fn lost_fence_does_not_fall_back_to_ordinary_metadata_write() -> Result<()
   );
   assert_eq!(publisher.calls.load(Ordering::Relaxed), 1);
 
-  let window =
-    Window::for_timestamp(now.unix_timestamp(), config.window_size_seconds).key("telemetry");
+  let window = Window::for_timestamp(now, config.window_size).key("telemetry");
   assert!(
     metadata_store
       .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Eventual)

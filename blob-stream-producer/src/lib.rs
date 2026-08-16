@@ -20,6 +20,8 @@
 //!   ProducerTopicConfig,
 //! };
 //! use blob_stream_proto::protos::blobstream::v1::config::StaticBrokerDiscoveryConfig;
+//! use blob_stream_types::ToProtoDuration;
+//! use time::Duration;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<()> {
@@ -29,12 +31,12 @@
 //!   producer.writer_id = Some(0);
 //!   producer.max_batch_records = Some(1000);
 //!   producer.max_batch_bytes = Some(1_048_576);
-//!   producer.flush_max_delay_ms = Some(200);
-//!   producer.retry_base_delay_ms = Some(25);
-//!   producer.retry_max_delay_ms = Some(1000);
-//!   producer.retry_deadline_ms = Some(30_000);
-//!   producer.connect_timeout_ms = Some(2000);
-//!   producer.request_timeout_ms = Some(5000);
+//!   producer.flush_max_delay = Duration::milliseconds(200).into_proto();
+//!   producer.retry_base_delay = Duration::milliseconds(25).into_proto();
+//!   producer.retry_max_delay = Duration::seconds(1).into_proto();
+//!   producer.retry_deadline = Duration::seconds(30).into_proto();
+//!   producer.connect_timeout = Duration::seconds(2).into_proto();
+//!   producer.request_timeout = Duration::seconds(5).into_proto();
 //!   producer.max_request_concurrency = Some(64);
 //!   producer.compression = Some(ProducerCompression::PRODUCER_COMPRESSION_SNAPPY.into());
 //!
@@ -50,7 +52,7 @@
 //!   topic.name = "telemetry".into();
 //!   topic.partition_count = 128;
 //!   topic.num_writers = 1;
-//!   topic.retention_days = 7;
+//!   topic.retention = Duration::days(7).into_proto();
 //!
 //!   runtime.producer = Some(producer).into();
 //!   runtime.discovery = Some(discovery).into();

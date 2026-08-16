@@ -12,14 +12,9 @@ use super::{
   ConsumerReaderPartitionScanState,
   ReadCapacity,
   VirtualPartitionState,
-  format_unix_timestamp_seconds,
-  metadata_availability_delay_seconds,
+  offset_datetime_from_unix_seconds,
 };
-use crate::config::{
-  ConsumerReadRuntimeSettings,
-  consumer_candidate_window_count_with_visibility_delay,
-  consumer_window_size_seconds,
-};
+use crate::config::{ConsumerReadRuntimeSettings, consumer_window_size};
 use anyhow::{Context, Error, Result, ensure};
 use blob_stream_blob_store::{BlobKey, ByteRange};
 use blob_stream_metadata_store::SegmentMetadata;
@@ -32,7 +27,6 @@ use blob_stream_types::{
   TopicWindowKey,
   VirtualPartitionId,
   Window,
-  format_unix_timestamp_ms,
   now_unix_seconds as system_now_unix_seconds,
 };
 use futures::future::try_join_all;

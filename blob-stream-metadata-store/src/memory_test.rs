@@ -11,6 +11,7 @@ use blob_stream_types::{
 };
 use protobuf::Message;
 use std::collections::HashMap;
+use time::{Duration, OffsetDateTime};
 
 fn build_segment(
   topic: &str,
@@ -34,8 +35,8 @@ fn build_segment(
     BlobKey::from("topic/1/segment"),
     Compression::none(),
     segment_index,
-    3000,
-    3000,
+    OffsetDateTime::UNIX_EPOCH + Duration::seconds(3),
+    OffsetDateTime::UNIX_EPOCH + Duration::seconds(3),
   )
 }
 

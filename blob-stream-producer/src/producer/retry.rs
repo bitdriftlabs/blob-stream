@@ -11,10 +11,10 @@ use super::{
 use crate::config::{
   ProducerConfig,
   ProducerTopicConfig,
-  producer_request_timeout_ms,
-  producer_retry_base_delay_ms,
-  producer_retry_deadline_ms,
-  producer_retry_max_delay_ms,
+  producer_request_timeout,
+  producer_retry_base_delay,
+  producer_retry_deadline,
+  producer_retry_max_delay,
 };
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -66,7 +66,9 @@ pub(super) async fn send_batch_with_retry(
   let mut previous_owner: Option<Chars> = None;
   let mut membership_updates = membership_rx.clone();
   let mut retried_after_not_lease_holder = None;
-  let retry_deadline = retry_started_at + Duration::from_millis(producer_retry_deadline_ms(config));
+  let retry_deadline = retry_started_at
+    + Duration::try_from(producer_retry_deadline(config))
+      .expect("producer config validation requires a positive retry deadline");
   loop {
     let remaining = retry_deadline.saturating_duration_since(retry_clock.now());
     if remaining.is_zero() {
@@ -79,7 +81,7 @@ pub(super) async fn send_batch_with_retry(
       );
       return Err(ProducerError::RetriesExhausted(format!(
         "retry deadline of {} ms elapsed",
-        producer_retry_deadline_ms(config)
+        producer_retry_deadline(config).whole_milliseconds()
       )));
     }
 
@@ -213,7 +215,8 @@ pub(super) async fn send_batch_with_retry(
     } else {
       next_retry_delay(
         &mut retry_backoff,
-        Duration::from_millis(producer_retry_max_delay_ms(config)),
+        Duration::try_from(producer_retry_max_delay(config))
+          .expect("producer config validation requires a positive retry max delay"),
       )
     };
     let delay = retry_delay.min(retry_deadline.saturating_duration_since(retry_clock.now()));
@@ -290,11 +293,9 @@ async fn send_single_batch_request(
   metrics: &ProducerMetrics,
   remaining: Duration,
 ) -> Result<ProduceBatchResponse, ProducerError> {
-  let request_timeout = Duration::from_millis(
-    u64::try_from(producer_request_timeout_ms(config))
-      .expect("producer config validation requires a positive request timeout"),
-  )
-  .min(remaining);
+  let request_timeout = Duration::try_from(producer_request_timeout(config))
+    .expect("producer config validation requires a positive request timeout")
+    .min(remaining);
   let request = ProduceBatchesRequest {
     batches: vec![produce_batch_request(batch)],
     ..Default::default()
@@ -330,13 +331,13 @@ async fn send_single_batch_request(
 }
 
 pub(super) fn producer_retry_backoff(config: &ProducerConfig) -> ExponentialBackoff {
-  let base_delay = Duration::from_millis(producer_retry_base_delay_ms(config));
-  let max_delay = Duration::from_millis(producer_retry_max_delay_ms(config));
+  let base_delay = producer_retry_base_delay(config);
+  let max_delay = producer_retry_max_delay(config);
   ExponentialBackoffBuilder::new_infinite()
-    .with_initial_interval(TimeDuration::try_from(base_delay).unwrap_or(TimeDuration::MAX))
+    .with_initial_interval(base_delay)
     .with_randomization_factor(0.5)
     .with_multiplier(2.0)
-    .with_max_interval(TimeDuration::try_from(max_delay).unwrap_or(TimeDuration::MAX))
+    .with_max_interval(max_delay)
     .build()
 }
 

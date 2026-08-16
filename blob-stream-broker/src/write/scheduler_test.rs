@@ -3,10 +3,11 @@ use crate::write::buffer::{BufferedBatch, FlushCompletionError};
 use crate::write::state::WriteState;
 use crate::write::{TopicInfo, WriteConfig};
 use blob_stream_metadata_store::ProducerLeaseFence;
-use blob_stream_types::{BatchSummary, SeqRange, new_record};
+use blob_stream_types::{BatchSummary, SeqRange, new_record, offset_datetime_from_unix_millis};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use time::Duration;
 
 fn fence() -> ProducerLeaseFence {
   ProducerLeaseFence {
@@ -23,8 +24,8 @@ fn topics() -> HashMap<protobuf::Chars, TopicInfo> {
       name: "telemetry".into(),
       partition_count: 100,
       num_writers: 1,
-      retention_days: 7,
-      max_metadata_publication_lag_ms: 15_000,
+      retention: Duration::days(7),
+      max_metadata_publication_lag: Duration::milliseconds(15_000),
     },
   )])
 }
@@ -51,14 +52,21 @@ fn fenced_flushes_split_at_ninety_nine_flushable_partitions() {
           acceptance_fence: Some(Arc::new(fence())),
           completion: None,
         },
-        0,
+        offset_datetime_from_unix_millis(0),
       );
     }
   }
 
   let mut config = WriteConfig::with_defaults();
   config.fenced_metadata_writes = true;
-  let plans = collect_flush_plans(&state, 1_000, &config, None, &topics(), 4);
+  let plans = collect_flush_plans(
+    &state,
+    offset_datetime_from_unix_millis(1_000),
+    &config,
+    None,
+    &topics(),
+    4,
+  );
 
   assert_eq!(plans.len(), 2);
   assert_eq!(plans[0].partitions.len(), 99);
@@ -89,13 +97,20 @@ fn fenced_flush_uses_the_batches_acceptance_fence() {
         acceptance_fence: Some(Arc::new(acceptance_fence.clone())),
         completion: None,
       },
-      0,
+      offset_datetime_from_unix_millis(0),
     );
   }
 
   let mut config = WriteConfig::with_defaults();
   config.fenced_metadata_writes = true;
-  let plans = collect_flush_plans(&state, 1_000, &config, None, &topics(), 1);
+  let plans = collect_flush_plans(
+    &state,
+    offset_datetime_from_unix_millis(1_000),
+    &config,
+    None,
+    &topics(),
+    1,
+  );
 
   assert_eq!(plans.len(), 1);
   assert_eq!(
@@ -123,13 +138,23 @@ fn fenced_flush_drops_batches_without_an_acceptance_fence() {
         acceptance_fence: None,
         completion: Some(completion),
       },
-      0,
+      offset_datetime_from_unix_millis(0),
     );
   }
 
   let mut config = WriteConfig::with_defaults();
   config.fenced_metadata_writes = true;
-  assert!(collect_flush_plans(&state, 1_000, &config, None, &topics(), 1).is_empty());
+  assert!(
+    collect_flush_plans(
+      &state,
+      offset_datetime_from_unix_millis(1_000),
+      &config,
+      None,
+      &topics(),
+      1,
+    )
+    .is_empty()
+  );
   assert_eq!(
     completion_rx
       .try_recv()

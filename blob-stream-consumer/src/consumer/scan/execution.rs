@@ -20,11 +20,10 @@ use super::{
   TryStreamExt,
   VirtualPartitionId,
   VirtualPartitionState,
-  consumer_window_size_seconds,
+  consumer_window_size,
   debug,
-  format_unix_timestamp_ms,
-  format_unix_timestamp_seconds,
   info,
+  offset_datetime_from_unix_seconds,
   stream,
   system_now_unix_seconds,
   trace,
@@ -32,14 +31,13 @@ use super::{
 };
 use crate::consumer::ConsumerReadOutcome;
 use bd_log_util::warn_every;
-use blob_stream_metadata_store::MetadataReadConsistency;
 use time::ext::NumericalDuration;
 
 impl ConsumerReaderImpl {
   /// Execute one metadata scan pass, retaining no progress when a batch cannot reach the caller.
   pub(in crate::consumer) async fn read_available_impl(
     &mut self,
-    now_unix_seconds: i64,
+    now: time::OffsetDateTime,
     capacity: ReadCapacity,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<ConsumerReadOutcome> {
@@ -48,7 +46,7 @@ impl ConsumerReaderImpl {
     let virtual_partition_states = self.virtual_partition_states.clone();
     let fast_frontiers = self.fast_frontiers.clone();
     let result = self
-      .read_available_impl_once(now_unix_seconds, capacity, runtime_settings)
+      .read_available_impl_once(now, capacity, runtime_settings)
       .await;
     if result.is_err() {
       self.virtual_partition_states = virtual_partition_states;
@@ -60,7 +58,7 @@ impl ConsumerReaderImpl {
   /// Execute one metadata scan pass, then advance scan modes only for windows fully observed.
   pub(in crate::consumer) async fn read_available_impl_once(
     &mut self,
-    now_unix_seconds: i64,
+    now: time::OffsetDateTime,
     mut capacity: ReadCapacity,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<ConsumerReadOutcome> {
@@ -75,29 +73,23 @@ impl ConsumerReaderImpl {
     let mut output = Vec::new();
     let mut metadata_batches_scanned = 0_usize;
     let mut metadata_batches_skipped_by_cursor = 0_usize;
-    // Metadata publication timestamps have millisecond precision while reader passes use whole
-    // seconds. Keep the visibility comparison in milliseconds, then round retry deadlines up so
-    // a worker never wakes in the second before a row becomes eligible.
-    let visibility_delay_ms =
-      i64::try_from(runtime_settings.metadata_visibility_delay_ms).unwrap_or(i64::MAX);
-    let visibility_cutoff_ts_ms = now_unix_seconds
-      .saturating_mul(1_000)
-      .saturating_sub(visibility_delay_ms);
+    let now_unix_seconds = now.unix_timestamp();
+    let visibility_cutoff = now.saturating_sub(runtime_settings.metadata_visibility_delay);
     // A pass can defer several sources. The worker needs only the first safe retry, not a
     // per-source timer, because rescanning then will reconsider every deferred source.
-    let mut next_visibility_eligible_unix_seconds = None;
+    let mut next_visibility_eligible_at = None::<time::OffsetDateTime>;
 
     // Requests merge partitions sharing a metadata window. Recovery scans catch late
     // lower-snowflake rows, while fast scans avoid rereading metadata outside its visibility
     // horizon; per-partition filtering is reapplied after each shared query.
     let (scan_requests, recovery_scan) =
-      self.scan_requests(now_unix_seconds, &assigned_partition_ids, runtime_settings)?;
+      self.scan_requests(now, &assigned_partition_ids, runtime_settings)?;
     for request in &scan_requests {
       trace!(
         "consumer metadata scan planned: topic={}, window_start={}, recovery={}, fast={}, \
          fresh={}, min_snowflake={:?}",
         request.window.topic,
-        format_unix_timestamp_seconds(request.window.window_start_unix_seconds),
+        offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
         !request.eligibility.recovering_partitions.is_empty(),
         request.eligibility.fast,
         request.eligibility.fresh,
@@ -131,7 +123,7 @@ impl ConsumerReaderImpl {
     self.record_fast_scan_bounds(
       &scan_requests,
       &assigned_partition_ids,
-      now_unix_seconds,
+      now,
       runtime_settings,
       &mut scan_states,
     );
@@ -154,8 +146,7 @@ impl ConsumerReaderImpl {
     let mut cached_window_results = Vec::new();
     let mut scan_futures = Vec::new();
     for (request_index, request) in scan_requests.iter().cloned().enumerate() {
-      let cache_key =
-        self.mature_recovery_metadata_cache_key(&request, now_unix_seconds, runtime_settings);
+      let cache_key = self.mature_recovery_metadata_cache_key(&request, now, runtime_settings);
       if let Some(cache_key) = cache_key
         && let Some(segments) = self.recovery_metadata_cache.get(&cache_key)
       {
@@ -169,7 +160,7 @@ impl ConsumerReaderImpl {
            segments={}",
           self.config.topic,
           cache_key.0,
-          format_unix_timestamp_seconds(request.window.window_start_unix_seconds),
+          offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
           segments.len()
         );
         cached_window_results.push((request_index, request, Arc::clone(segments)));
@@ -202,7 +193,7 @@ impl ConsumerReaderImpl {
               "consumer metadata scan failed: topic={}, window_start={}, recovery={}, fast={}, \
                fresh={}, min_snowflake={:?}",
               request.window.topic,
-              format_unix_timestamp_seconds(request.window.window_start_unix_seconds),
+              offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
               !request.eligibility.recovering_partitions.is_empty(),
               request.eligibility.fast,
               request.eligibility.fresh,
@@ -229,7 +220,7 @@ impl ConsumerReaderImpl {
         let partition_id = cache_key.0;
         let has_visibility_deferred_segment = segments.iter().any(|segment| {
           segment.segment_index.contains_key(&partition_id)
-            && segment.metadata_published_ts_ms > visibility_cutoff_ts_ms
+            && segment.metadata_published_at > visibility_cutoff
         });
         if has_visibility_deferred_segment {
           let mut segments = segments;
@@ -254,7 +245,7 @@ impl ConsumerReaderImpl {
              segments={}",
             self.config.topic,
             partition_id,
-            format_unix_timestamp_seconds(request.window.window_start_unix_seconds),
+            offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
             cached_segments.len()
           );
           self
@@ -288,7 +279,7 @@ impl ConsumerReaderImpl {
     // Recovery can hand an active publication-horizon window to Fast. Fast retains the same
     // visibility safety check and replays its inclusive time floor once the row becomes eligible.
     let fast_horizon_windows = self
-      .eligible_fast_scan_windows(now_unix_seconds, runtime_settings)?
+      .eligible_fast_scan_windows(now, runtime_settings)?
       .into_iter()
       .map(|(window, _)| window.window_start_unix_seconds)
       .collect::<HashSet<_>>();
@@ -300,7 +291,7 @@ impl ConsumerReaderImpl {
       trace!(
         "consumer scanned window: topic={}, window_start={}, segments={}",
         window.topic,
-        format_unix_timestamp_seconds(window.window_start_unix_seconds),
+        offset_datetime_from_unix_seconds(window.window_start_unix_seconds),
         segments.len()
       );
 
@@ -355,7 +346,7 @@ impl ConsumerReaderImpl {
                window_start={}, snowflake_id={}",
               self.config.topic,
               partition_id,
-              format_unix_timestamp_seconds(window.window_start_unix_seconds),
+              offset_datetime_from_unix_seconds(window.window_start_unix_seconds),
               segment.snowflake_id.as_u64()
             );
             scan_state.metadata_segments_without_partition_batches = scan_state
@@ -377,7 +368,7 @@ impl ConsumerReaderImpl {
                  partition={}, window_start={}, snowflake_id={}",
                 self.config.topic,
                 partition_id,
-                format_unix_timestamp_seconds(window.window_start_unix_seconds),
+                offset_datetime_from_unix_seconds(window.window_start_unix_seconds),
                 segment.snowflake_id.as_u64()
               );
               scan_state.metadata_segments_blocked_by_visibility = scan_state
@@ -398,7 +389,7 @@ impl ConsumerReaderImpl {
                  window_start={}, snowflake_id={}, frontier={}",
                 self.config.topic,
                 partition_id,
-                format_unix_timestamp_seconds(window.window_start_unix_seconds),
+                offset_datetime_from_unix_seconds(window.window_start_unix_seconds),
                 segment.snowflake_id.as_u64(),
                 next_fast_frontiers
                   .get(&frontier_key)
@@ -411,12 +402,8 @@ impl ConsumerReaderImpl {
             }
           }
 
-          // Strong DynamoDB reads return committed metadata immediately. The publication horizon
-          // still plans rescans for rows that have not been written yet, but returned rows need
-          // no replica-visibility delay.
-          if runtime_settings.metadata_read_consistency == MetadataReadConsistency::Eventual
-            && segment.metadata_published_ts_ms > visibility_cutoff_ts_ms
-          {
+          let published_at = segment.metadata_published_at;
+          if published_at > visibility_cutoff {
             self
               .metrics
               .metadata_segments_deferred_by_visibility_delay
@@ -424,29 +411,22 @@ impl ConsumerReaderImpl {
             scan_state.metadata_segments_deferred_by_visibility = scan_state
               .metadata_segments_deferred_by_visibility
               .saturating_add(1);
-            // `metadata_published_ts_ms + delay` is the exact eligibility time. The reader
-            // accepts only whole-second `now` values, so ceiling division avoids a premature
-            // retry when that exact time falls inside a later second.
-            let visibility_eligible_unix_seconds = segment
-              .metadata_published_ts_ms
-              .saturating_add(visibility_delay_ms)
-              .saturating_add(999)
-              / 1_000;
-            next_visibility_eligible_unix_seconds = Some(
-              next_visibility_eligible_unix_seconds
-                .map_or(visibility_eligible_unix_seconds, |current: i64| {
-                  current.min(visibility_eligible_unix_seconds)
-                }),
+            let visibility_eligible_at =
+              published_at.saturating_add(runtime_settings.metadata_visibility_delay);
+            next_visibility_eligible_at = Some(
+              next_visibility_eligible_at.map_or(visibility_eligible_at, |current| {
+                current.min(visibility_eligible_at)
+              }),
             );
             trace!(
               "consumer deferred metadata by visibility delay: topic={}, partition={}, \
                window_start={}, snowflake_id={}, published_at={}, visibility_cutoff={}",
               self.config.topic,
               partition_id,
-              format_unix_timestamp_seconds(window.window_start_unix_seconds),
+              offset_datetime_from_unix_seconds(window.window_start_unix_seconds),
               segment.snowflake_id.as_u64(),
-              format_unix_timestamp_ms(segment.metadata_published_ts_ms),
-              format_unix_timestamp_ms(visibility_cutoff_ts_ms)
+              published_at,
+              visibility_cutoff
             );
             if fast_partition {
               blocked_fast_sources.insert(frontier_key);
@@ -696,7 +676,6 @@ impl ConsumerReaderImpl {
       }
     }
 
-    let window_size_seconds = consumer_window_size_seconds(&self.config);
     let mut initial_scans_completed = Vec::new();
     let mut recoveries_completed = Vec::new();
     for (partition_id, state) in &mut self.virtual_partition_states {
@@ -727,22 +706,24 @@ impl ConsumerReaderImpl {
           let recovery_window_end = deferred_recovery_windows.get(partition_id).map_or(
             recovery_window_end,
             |deferred_window| {
-              recovery_window_end
-                .min(deferred_window.saturating_sub(consumer_window_size_seconds(&self.config)))
+              recovery_window_end.min(
+                deferred_window.saturating_sub(consumer_window_size(&self.config).whole_seconds()),
+              )
             },
           );
           let recovery_window_end = capacity_deferred_recovery_windows.get(partition_id).map_or(
             recovery_window_end,
             |deferred_window| {
-              recovery_window_end
-                .min(deferred_window.saturating_sub(consumer_window_size_seconds(&self.config)))
+              recovery_window_end.min(
+                deferred_window.saturating_sub(consumer_window_size(&self.config).whole_seconds()),
+              )
             },
           );
           if recovery_state.next_window_start_unix_seconds > recovery_window_end {
             continue;
           }
           recovery_state.next_window_start_unix_seconds =
-            recovery_window_end.saturating_add(window_size_seconds);
+            recovery_window_end.saturating_add(consumer_window_size(&self.config).whole_seconds());
           if recovery_state.next_window_start_unix_seconds
             > recovery_state.cutover_window_start_unix_seconds
           {
@@ -772,7 +753,7 @@ impl ConsumerReaderImpl {
          initial_window={}",
         self.config.topic,
         partition_id,
-        format_unix_timestamp_seconds(initial_window_start_unix_seconds)
+        offset_datetime_from_unix_seconds(initial_window_start_unix_seconds)
       );
     }
     for (partition_id, cutover_window_start_unix_seconds) in recoveries_completed {
@@ -781,7 +762,7 @@ impl ConsumerReaderImpl {
          cutover_window={}",
         self.config.topic,
         partition_id,
-        format_unix_timestamp_seconds(cutover_window_start_unix_seconds)
+        offset_datetime_from_unix_seconds(cutover_window_start_unix_seconds)
       );
     }
 
@@ -806,7 +787,7 @@ impl ConsumerReaderImpl {
     );
 
     self.fast_frontiers = next_fast_frontiers;
-    self.prune_fast_frontiers(now_unix_seconds, runtime_settings)?;
+    self.prune_fast_frontiers(now, runtime_settings)?;
     let completed_at_unix_seconds = system_now_unix_seconds();
     for ((partition_id, window_start_unix_seconds), snowflake_id) in &self.fast_frontiers {
       if let Some(scan_state) = scan_states.get_mut(partition_id) {
@@ -878,11 +859,11 @@ impl ConsumerReaderImpl {
     // no work. Ready output must keep the refill loop hot, and a capacity stop means unscanned
     // metadata could be ready now, so either case falls back to normal worker behavior.
     Ok(ConsumerReadOutcome {
-      next_visibility_eligible_unix_seconds: output
+      next_visibility_eligible_at: output
         .is_empty()
-        .then_some(next_visibility_eligible_unix_seconds)
+        .then_some(next_visibility_eligible_at)
         .flatten()
-        .filter(|deadline| !capacity_exhausted && *deadline > now_unix_seconds),
+        .filter(|deadline| !capacity_exhausted && *deadline > now),
       batches: output,
     })
   }

@@ -16,9 +16,9 @@ use super::{
 };
 use crate::config::{
   ConsumerGroupConfig,
-  consumer_heartbeat_interval_ms,
-  consumer_lease_duration_ms,
-  consumer_rebalance_interval_ms,
+  consumer_heartbeat_interval,
+  consumer_lease_duration,
+  consumer_rebalance_interval,
 };
 use crate::consumer::ConsumerReaderImpl;
 use crate::coordination::{
@@ -38,14 +38,14 @@ use anyhow::{Result, anyhow, ensure};
 use bd_backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
 use bd_time::{OffsetDateTimeExt, TimeProvider};
 use blob_stream_metadata_store::{ConsumerGroupAssignmentPlan, ConsumerGroupMembershipStore};
-use blob_stream_types::{CommittedCursor, VirtualPartitionId, format_unix_timestamp_ms};
+use blob_stream_types::{CommittedCursor, VirtualPartitionId, offset_datetime_from_unix_millis};
 use log::{debug, info, trace};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
-use time::Duration as TimeDuration;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{Span, field};
@@ -57,16 +57,29 @@ mod lifecycle;
 mod reader;
 mod runtime;
 
-const RETRY_INITIAL_DELAY_MS: i64 = 500;
-const RETRY_MAX_DELAY_MS: i64 = 30_000;
+const RETRY_INITIAL_DELAY: TimeDuration = TimeDuration::milliseconds(500);
+pub(in crate::iterator) const RETRY_MAX_DELAY: TimeDuration = TimeDuration::seconds(30);
 
 pub(in crate::iterator) fn retry_backoff() -> ExponentialBackoff {
   ExponentialBackoffBuilder::new_infinite()
-    .with_initial_interval(TimeDuration::milliseconds(RETRY_INITIAL_DELAY_MS))
+    .with_initial_interval(RETRY_INITIAL_DELAY)
     .with_randomization_factor(0.5)
     .with_multiplier(2.0)
-    .with_max_interval(TimeDuration::milliseconds(RETRY_MAX_DELAY_MS))
+    .with_max_interval(RETRY_MAX_DELAY)
     .build()
+}
+
+pub(in crate::iterator) fn persisted_lease_expires_at(
+  now: OffsetDateTime,
+  lease_duration: TimeDuration,
+) -> Result<OffsetDateTime> {
+  let lease_duration_ms = i64::try_from(lease_duration.whole_milliseconds())
+    .map_err(|_| anyhow!("consumer lease duration exceeds millisecond range"))?;
+  let expires_at_ms = now
+    .unix_timestamp_ms()
+    .checked_add(lease_duration_ms)
+    .ok_or_else(|| anyhow!("consumer lease expiration exceeds millisecond range"))?;
+  Ok(offset_datetime_from_unix_millis(expires_at_ms))
 }
 
 //
@@ -109,8 +122,8 @@ pub(in crate::iterator) struct ConsumerDriver {
   pub(in crate::iterator) reader_command_notify: Arc<Notify>,
   pub(in crate::iterator) prefetch_shutdown: Arc<AtomicBool>,
   pub(in crate::iterator) prefetch_task: Option<JoinHandle<()>>,
-  pub(in crate::iterator) prefetch_idle_base_delay_ms: u64,
-  pub(in crate::iterator) prefetch_idle_max_delay_ms: Option<u64>,
+  pub(in crate::iterator) prefetch_idle_base_delay: TimeDuration,
+  pub(in crate::iterator) prefetch_idle_max_delay: Option<TimeDuration>,
   pub(in crate::iterator) active_assignment: HashSet<VirtualPartitionId>,
   pub(in crate::iterator) assignment_callback: Arc<Mutex<Option<AssignmentCallback>>>,
   pub(in crate::iterator) pending_assignment: Option<Vec<VirtualPartitionId>>,
@@ -121,14 +134,14 @@ pub(in crate::iterator) struct ConsumerDriver {
   pub(in crate::iterator) revocation_notify: Arc<Notify>,
   pub(in crate::iterator) lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
   pub(in crate::iterator) time_provider: Arc<dyn TimeProvider>,
-  pub(in crate::iterator) membership_lease_expires_at_ms: i64,
+  pub(in crate::iterator) membership_lease_expires_at: OffsetDateTime,
   /// Earliest expiration among this driver's active partition leases.
   ///
   /// This driver-wide safety deadline bounds heartbeat retries so it never continues delivery
   /// beyond a lease that may no longer be valid.
-  pub(in crate::iterator) active_partition_lease_expiration_deadline_ms: i64,
-  pub(in crate::iterator) next_heartbeat_at_ms: i64,
-  pub(in crate::iterator) next_rebalance_at_ms: i64,
+  pub(in crate::iterator) active_partition_lease_expiration_deadline: OffsetDateTime,
+  pub(in crate::iterator) next_heartbeat_at: OffsetDateTime,
+  pub(in crate::iterator) next_rebalance_at: OffsetDateTime,
   pub(in crate::iterator) heartbeat_retry_backoff: ExponentialBackoff,
   pub(in crate::iterator) rebalance_retry_backoff: ExponentialBackoff,
   pub(in crate::iterator) diagnostics: ConsumerDiagnostics,

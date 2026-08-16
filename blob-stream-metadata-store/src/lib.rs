@@ -18,6 +18,7 @@ use blob_stream_types::{
 };
 use protobuf::Chars;
 use std::collections::HashMap;
+use time::{Duration, OffsetDateTime};
 
 mod aws;
 mod codec;
@@ -78,10 +79,10 @@ pub struct SegmentMetadata {
   pub compression: Compression,
   /// Per-partition batch index for byte-range and sequence lookups.
   pub segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
-  /// Creation timestamp in milliseconds.
-  pub created_ts_ms: i64,
-  /// Timestamp immediately before the metadata row was written, in milliseconds.
-  pub metadata_published_ts_ms: i64,
+  /// Creation instant.
+  pub created_at: OffsetDateTime,
+  /// Instant immediately before the metadata row was written.
+  pub metadata_published_at: OffsetDateTime,
 }
 
 impl SegmentMetadata {
@@ -93,8 +94,8 @@ impl SegmentMetadata {
     blob_key: BlobKey,
     compression: Compression,
     segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
-    created_ts_ms: i64,
-    metadata_published_ts_ms: i64,
+    created_at: OffsetDateTime,
+    metadata_published_at: OffsetDateTime,
   ) -> Self {
     Self {
       window,
@@ -102,8 +103,8 @@ impl SegmentMetadata {
       blob_key,
       compression,
       segment_index,
-      created_ts_ms,
-      metadata_published_ts_ms,
+      created_at,
+      metadata_published_at,
     }
   }
 
@@ -196,8 +197,8 @@ pub struct ProducerPartitionLease {
   pub key: ProducerPartitionLeaseKey,
   /// Durable identity that authorizes metadata publication.
   pub fence: ProducerLeaseFence,
-  /// Lease expiration timestamp in milliseconds.
-  pub lease_expiration_ts_ms: i64,
+  /// Instant at which the lease expires.
+  pub lease_expiration_at: OffsetDateTime,
   /// High watermark for allocated sequence numbers.
   pub max_allocated_seq: Option<u64>,
 }
@@ -314,8 +315,8 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     key: ProducerPartitionLeaseKey,
     holder_id: String,
     lease_session_id: String,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
   ) -> Result<LeaseAcquireOutcome>;
 
   /// Atomically acquire or renew a lease and optionally reserve a Hi-Lo sequence block.
@@ -324,8 +325,8 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     key: ProducerPartitionLeaseKey,
     holder_id: String,
     lease_session_id: String,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
     reservation_size: Option<u64>,
   ) -> Result<LeaseAcquireAndReserveOutcome>;
 
@@ -335,8 +336,8 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
   ) -> Result<LeaseHeartbeatOutcome>;
 
   /// Reserve a sequence block for a virtual partition using Hi-Lo semantics.
@@ -345,7 +346,7 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     reservation_size: u64,
   ) -> Result<SequenceReservationOutcome>;
 
@@ -355,7 +356,7 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<LeaseReleaseOutcome>;
 }
 
@@ -557,8 +558,8 @@ pub trait ConsumerGroupLeaseStore: Send + Sync {
     key: ConsumerGroupLeaseKey,
     owner_id: String,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
   ) -> Result<ConsumerGroupAssignmentOutcome>;
 
   /// Heartbeat a partition lease and optionally commit a cursor.
@@ -567,8 +568,8 @@ pub trait ConsumerGroupLeaseStore: Send + Sync {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
-    lease_duration_ms: i64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
     committed_cursor: Option<CommittedCursor>,
   ) -> Result<ConsumerGroupHeartbeatOutcome>;
 
@@ -578,7 +579,7 @@ pub trait ConsumerGroupLeaseStore: Send + Sync {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     committed_cursor: CommittedCursor,
   ) -> Result<ConsumerGroupCommitOutcome>;
 
@@ -588,7 +589,7 @@ pub trait ConsumerGroupLeaseStore: Send + Sync {
     key: &ConsumerGroupLeaseKey,
     owner_id: &str,
     generation: u64,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<ConsumerGroupReleaseOutcome>;
 }
 
@@ -607,8 +608,8 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: Duration,
   ) -> Result<()>;
 
   /// Heartbeat an existing member liveness entry.
@@ -618,8 +619,8 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: Duration,
   ) -> Result<()>;
 
   /// Deregister a member from this consumer group.
@@ -630,7 +631,7 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
     &self,
     topic: &str,
     group_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
   ) -> Result<Vec<ConsumerGroupMember>>;
 
   /// Return the last published complete assignment plan for this group.
@@ -654,8 +655,8 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
     group_id: &str,
     member_id: &str,
     planner_session_id: &str,
-    now_ts_ms: i64,
-    ttl_ms: i64,
+    now: OffsetDateTime,
+    ttl: Duration,
   ) -> Result<ConsumerGroupPlannerLeaseOutcome>;
 
   /// Release the planner lease when it is still held by this member.
@@ -674,7 +675,7 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
     group_id: &str,
     member_id: &str,
     planner_session_id: &str,
-    now_ts_ms: i64,
+    now: OffsetDateTime,
     plan: ConsumerGroupAssignmentPlan,
   ) -> Result<bool>;
 }

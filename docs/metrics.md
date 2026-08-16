@@ -58,7 +58,7 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 | `metadata_fast_scan_without_lower_bound` | Counter | Fast scans that could not use a derived metadata lower bound. |
 | `metadata_fast_scan_segments_below_partition_frontier` | Counter | Segment rows skipped because they precede the retained partition frontier. |
 | `metadata_fast_scan_segments_without_assigned_batches` | Counter | Segment rows examined that contain no batches for this virtual partition. |
-| `metadata_segments_deferred_by_visibility_delay` | Counter | Segment rows deferred by the eventual-read visibility delay. |
+| `metadata_segments_deferred_by_visibility_delay` | Counter | Segment rows deferred by the resolved visibility maturity delay. Strong reads resolve that delay to zero, so only rows timestamped after the reader's current time are deferred. |
 | `metadata_batches_scanned`, `metadata_batches_skipped_by_cursor` | Counters | Batches decoded from metadata and batches skipped because the committed cursor had already passed them. |
 | `blob_range_requests`, `blob_range_bytes`, `blob_range_latency_seconds` | Counters, histogram | S3/object-store byte-range reads, bytes read, and range-read latency. |
 | `blob_batch_ranges`, `blob_batch_range_bytes` | Counters | Byte ranges planned for individual encoded batches and their total bytes. |
