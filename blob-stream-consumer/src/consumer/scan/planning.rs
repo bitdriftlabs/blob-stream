@@ -458,9 +458,6 @@ impl ConsumerReaderImpl {
     self
       .fast_frontiers
       .retain(|(_, window_start), _| eligible_window_starts.contains(window_start));
-    self
-      .metrics
-      .record_fast_frontiers(self.fast_frontiers.len());
     Ok(())
   }
 }

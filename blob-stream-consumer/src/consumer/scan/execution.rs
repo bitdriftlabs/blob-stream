@@ -652,7 +652,6 @@ impl ConsumerReaderImpl {
 
       for segment in segments.iter() {
         // Restrict work to currently assigned virtual partitions only.
-        let mut segment_has_assigned_batches = false;
         let mut segment_read_candidates = Vec::new();
         for &partition_id in &assigned_partition_ids {
           let partition_state = self.virtual_partition_states.get(&partition_id);
@@ -709,8 +708,6 @@ impl ConsumerReaderImpl {
               .saturating_add(1);
             continue;
           };
-          segment_has_assigned_batches = true;
-
           let frontier_key = (partition_id, window.window_start_unix_seconds);
           let fast_partition = matches!(partition_state, Some(VirtualPartitionState::Fast { .. }));
           if fast_partition {
@@ -735,10 +732,6 @@ impl ConsumerReaderImpl {
               .get(&frontier_key)
               .is_some_and(|frontier| segment.snowflake_id < *frontier)
             {
-              self
-                .metrics
-                .metadata_fast_scan_segments_below_partition_frontier
-                .inc();
               trace!(
                 "consumer metadata segment skipped by fast frontier: topic={}, partition={}, \
                  window_start={}, snowflake_id={}, frontier={}",
@@ -896,12 +889,6 @@ impl ConsumerReaderImpl {
               .and_modify(|frontier| *frontier = (*frontier).max(segment.snowflake_id))
               .or_insert(segment.snowflake_id);
           }
-        }
-        if !segment_has_assigned_batches {
-          self
-            .metrics
-            .metadata_fast_scan_segments_without_assigned_batches
-            .inc();
         }
         if !segment_read_candidates.is_empty() {
           segment_read_plans.push(SegmentReadPlan::new(

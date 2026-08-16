@@ -75,10 +75,12 @@ impl ConsumerDriver {
       .metrics
       .heartbeat_committed_offsets
       .inc_by(u64::try_from(committed_cursors.len()).unwrap_or(u64::MAX));
-    self
-      .metrics
-      .cursor_commit_partitions
-      .inc_by(u64::try_from(committed_cursors.len()).unwrap_or(u64::MAX));
+    if matches!(trigger, HeartbeatTrigger::Commit) {
+      self
+        .metrics
+        .cursor_commit_partitions
+        .inc_by(u64::try_from(committed_cursors.len()).unwrap_or(u64::MAX));
+    }
     self
       .metrics
       .heartbeat_latency_seconds
