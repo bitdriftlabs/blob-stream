@@ -153,6 +153,7 @@ fn rejects_writer_id_outside_a_topic_range() {
       num_writers: 1,
       retention: Duration::days(7),
       max_metadata_publication_lag: Duration::seconds(30),
+      metadata_window_size: Duration::minutes(5),
     },
   )]);
 

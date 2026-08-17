@@ -1,0 +1,16 @@
+[package]
+edition = "2024"
+license = "Apache-2.0"
+name    = "blob-stream-runtime-config"
+publish = false
+version = "0.1.0"
+
+[lib]
+doctest = true
+
+[dependencies]
+anyhow.workspace            = true
+bd-runtime-config.workspace = true
+bd-time.workspace           = true
+protobuf.workspace          = true
+time.workspace              = true

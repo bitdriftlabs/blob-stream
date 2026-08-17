@@ -74,9 +74,9 @@ that.
 
 This is not currently planned but it is something we would like to do in the future. Brokers,
 producers, and consumers still receive their configuration independently, and the shared topic shape
-remains a deployment contract. Broker and consumer runtime feature flags can override selected
-operational settings, but they are not a configuration-distribution API. See [Infrastructure
-setup](infrastructure.md) for the configuration contract.
+remains a deployment contract. Broker, producer, and consumer runtime feature flags override
+selected local operational settings. See [Infrastructure setup](infrastructure.md) for the
+configuration contract.
 
 # Will you provide broker docker images?
 

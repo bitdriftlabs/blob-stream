@@ -241,10 +241,11 @@ impl FlushContext {
     &self,
     topic: &str,
     partitions: Vec<FlushPartition>,
+    metadata_window_size: time::Duration,
     now: OffsetDateTime,
   ) -> Result<(Bytes, SegmentEnvelope)> {
     trace!("building flush segment: topic={topic}");
-    let window = Window::for_timestamp(now, self.config.window_size);
+    let window = Window::for_timestamp(now, metadata_window_size);
     let snowflake_id = self.snowflake.next(now)?;
     let blob_key = self.make_blob_key(topic, &window, snowflake_id);
     let compression = self.config.compression.clone();
@@ -331,7 +332,12 @@ impl FlushContext {
     } else {
       None
     };
-    let (payload, envelope) = self.build_segment(plan.topic.as_str(), partitions, now)?;
+    let (payload, envelope) = self.build_segment(
+      plan.topic.as_str(),
+      partitions,
+      plan.metadata_window_size,
+      now,
+    )?;
     let payload_bytes = payload.len();
     let record_count = envelope.record_count;
     let partition_count = envelope.segment_index.len();

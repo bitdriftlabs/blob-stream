@@ -13,9 +13,10 @@ pub use blob_stream_proto::protos::blobstream::v1::config::{
   ConsumerRuntimeConfig,
   TopicConfig,
 };
+use blob_stream_runtime_config::feature_flag_duration_milliseconds;
 pub use blob_stream_types::DEFAULT_MAX_METADATA_PUBLICATION_LAG;
-use blob_stream_types::{DEFAULT_METADATA_WINDOW_SIZE, ProtoDurationExt};
-use log::{debug, trace};
+use blob_stream_types::ProtoDurationExt;
+use log::{debug, info, trace};
 use time::Duration;
 use time::ext::NumericalDuration;
 
@@ -34,6 +35,11 @@ const PREFETCH_MAX_BYTES_FEATURE_FLAG: &str = "blob_stream_consumer_prefetch_max
 const MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG: &str =
   "blob_stream_consumer_max_in_flight_batch_reads";
 const STRONG_METADATA_READS_FEATURE_FLAG: &str = "blob_stream_consumer_strong_metadata_reads";
+const IDLE_POLL_DELAY_FEATURE_FLAG: &str = "blob_stream_consumer_idle_poll_delay_ms";
+const MAX_IDLE_POLL_DELAY_FEATURE_FLAG: &str = "blob_stream_consumer_max_idle_poll_delay_ms";
+const LEASE_DURATION_FEATURE_FLAG: &str = "blob_stream_consumer_lease_duration_ms";
+const HEARTBEAT_INTERVAL_FEATURE_FLAG: &str = "blob_stream_consumer_heartbeat_interval_ms";
+const REBALANCE_INTERVAL_FEATURE_FLAG: &str = "blob_stream_consumer_rebalance_interval_ms";
 
 //
 // ConsumerReadConfig
@@ -47,13 +53,47 @@ pub struct ConsumerReadRuntimeSettings {
   pub(crate) metadata_visibility_delay: Duration,
 }
 
-#[must_use]
-/// Return the configured read window size, applying defaults when omitted.
-pub fn consumer_window_size(config: &ConsumerReadConfig) -> Duration {
-  config.window_size.as_ref().map_or(
-    DEFAULT_METADATA_WINDOW_SIZE,
-    ProtoDurationExt::to_time_duration,
-  )
+/// Apply startup-only feature flags that affect this consumer process's local scheduling.
+pub fn apply_consumer_startup_overrides(
+  feature_flags: &FeatureFlagsWatch,
+  runtime: &mut ConsumerRuntimeConfig,
+) -> Result<()> {
+  let read = runtime
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow!("consumer runtime config is missing read config"))?;
+  let group = runtime
+    .group
+    .as_mut()
+    .ok_or_else(|| anyhow!("consumer runtime config is missing group config"))?;
+
+  read.idle_poll_delay = feature_flag_duration_milliseconds(
+    feature_flags,
+    IDLE_POLL_DELAY_FEATURE_FLAG,
+    consumer_idle_poll_delay(read),
+  )?;
+  read.max_idle_poll_delay = feature_flag_duration_milliseconds(
+    feature_flags,
+    MAX_IDLE_POLL_DELAY_FEATURE_FLAG,
+    consumer_max_idle_poll_delay(read),
+  )?;
+  group.lease_duration = feature_flag_duration_milliseconds(
+    feature_flags,
+    LEASE_DURATION_FEATURE_FLAG,
+    consumer_lease_duration(group),
+  )?;
+  group.heartbeat_interval = feature_flag_duration_milliseconds(
+    feature_flags,
+    HEARTBEAT_INTERVAL_FEATURE_FLAG,
+    consumer_heartbeat_interval(group),
+  )?;
+  group.rebalance_interval = feature_flag_duration_milliseconds(
+    feature_flags,
+    REBALANCE_INTERVAL_FEATURE_FLAG,
+    consumer_rebalance_interval(group),
+  )?;
+  info!("blob-stream consumer runtime config after applying feature flag overrides: {runtime}");
+  Ok(())
 }
 
 #[must_use]
@@ -197,24 +237,25 @@ pub fn consumer_read_runtime_settings(
 pub fn consumer_candidate_window_count(
   config: &ConsumerReadConfig,
   maximum_metadata_publication_lag: Duration,
+  metadata_window_size: Duration,
 ) -> Result<usize> {
   let metadata_visibility_delay = crate::consumer::metadata_visibility_delay(
     consumer_metadata_visibility_delay(config),
     consumer_strongly_consistent_metadata_reads(config),
   );
   consumer_candidate_window_count_with_availability_horizon(
-    config,
+    metadata_window_size,
     maximum_metadata_publication_lag.saturating_add(metadata_visibility_delay),
   )
 }
 
 /// Derive candidate windows for an already combined, typed availability horizon.
 pub fn consumer_candidate_window_count_with_availability_horizon(
-  config: &ConsumerReadConfig,
+  metadata_window_size: Duration,
   availability_horizon: Duration,
 ) -> Result<usize> {
-  let window_size_ns = u128::try_from(consumer_window_size(config).whole_nanoseconds())
-    .map_err(|_| anyhow!("consumer.read.window_size must be positive"))?;
+  let window_size_ns = u128::try_from(metadata_window_size.whole_nanoseconds())
+    .map_err(|_| anyhow!("topic metadata_window_size must be positive"))?;
   let coverage_ns = u128::try_from(availability_horizon.whole_nanoseconds())
     .map_err(|_| anyhow!("metadata availability horizon must not be negative"))?;
   let trailing_windows = coverage_ns
@@ -269,11 +310,6 @@ pub fn validate_read_config(config: &ConsumerReadConfig) -> Result<()> {
     "consumer.read.max_idle_poll_delay must be greater than or equal to \
      consumer.read.idle_poll_delay"
   );
-  ensure!(
-    consumer_window_size(config).subsec_nanoseconds() == 0,
-    "consumer.read.window_size must be a whole-second duration"
-  );
-
   Ok(())
 }
 

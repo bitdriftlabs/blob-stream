@@ -200,8 +200,7 @@ pub(super) fn collect_flush_plans(
       .or_insert_with(Vec::new)
       .push(*virtual_partition_id);
   }
-  let last_flush_topic = state.last_flush_topic.clone();
-  let start = last_flush_topic.as_ref().map_or(0, |last_topic| {
+  let start = state.last_flush_topic.as_ref().map_or(0, |last_topic| {
     partition_keys
       .iter()
       .position(|(topic, _)| topic > last_topic)
@@ -292,12 +291,14 @@ pub(super) fn collect_flush_plans(
   plans_by_topic
     .into_iter()
     .flat_map(|(topic, plans)| {
-      let max_metadata_publication_lag = topics
+      let topic_info = topics
         .get(topic.as_str())
-        .expect("flush plans are created only for configured topics")
-        .max_metadata_publication_lag;
+        .expect("flush plans are created only for configured topics");
+      let max_metadata_publication_lag = topic_info.max_metadata_publication_lag;
+      let metadata_window_size = topic_info.metadata_window_size;
       plans.into_iter().map(move |partitions| FlushPlan {
         max_metadata_publication_lag,
+        metadata_window_size,
         topic: topic.clone(),
         partitions,
         fenced_metadata_writes,

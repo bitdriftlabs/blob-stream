@@ -144,6 +144,25 @@ message TopicConfig {
   // Default when unset: 15 seconds. Brokers enforce this deadline and consumers use it to derive
   // the finite steady-state metadata scan horizon.
   google.protobuf.Duration max_metadata_publication_lag = 5 [(validate.rules).duration.gt = {}];
+
+  // Fixed window size used to construct durable metadata keys. Brokers publish and consumers scan
+  // using this shared topic value. It defines the metadata-key layout for the topic.
+  //
+  // Default when unset: 300 seconds (5 minutes).
+  //
+  // This controls how segment metadata is bucketed and therefore how many distinct Dynamo partition
+  // keys are touched by reads:
+  // - Smaller windows => more keys/windows to scan per hour, lower per-window fan-in.
+  // - Larger windows => fewer keys/windows to scan per hour, higher per-window fan-in.
+  //
+  // Practical tuning:
+  // - Keep this at 300s unless you have a clear need; it is a good cost/latency baseline.
+  // - Decrease (e.g., 60-120s) if you need tighter visibility granularity and can accept more
+  //   metadata scan overhead.
+  // - Increase (e.g., 600-900s) if throughput is very high and you want fewer Dynamo partition-key
+  //   scans, accepting coarser scan buckets.
+  //
+  google.protobuf.Duration metadata_window_size = 6 [(validate.rules).duration.gt = {}];
 }
 
 // In-memory blob store configuration (used for tests/local runs).
@@ -295,22 +314,6 @@ message ProducerRuntimeConfig {
 message ConsumerReadConfig {
   // Topic to scan for segment metadata.
   string topic = 1 [(validate.rules).string.min_len = 1];
-
-  // Fixed window size used for metadata scanning.
-  // Default when unset: 300 seconds (5 minutes).
-  //
-  // This controls how segment metadata is bucketed and therefore how many distinct
-  // Dynamo partition keys are touched by reads:
-  // - Smaller windows => more keys/windows to scan per hour, lower per-window fan-in.
-  // - Larger windows => fewer keys/windows to scan per hour, higher per-window fan-in.
-  //
-  // Practical tuning:
-  // - Keep this at 300s unless you have a clear need; it is a good cost/latency baseline.
-  // - Decrease (e.g., 60-120s) if you need tighter visibility granularity and can accept
-  //   more metadata scan overhead.
-  // - Increase (e.g., 600-900s) if throughput is very high and you want fewer Dynamo
-  //   partition-key scans, accepting coarser scan buckets.
-  google.protobuf.Duration window_size = 2 [(validate.rules).duration.gt = {}];
 
   // Base idle poll delay when no batches are available. Default when unset: 250 ms.
   google.protobuf.Duration idle_poll_delay = 4 [(validate.rules).duration.gt = {}];

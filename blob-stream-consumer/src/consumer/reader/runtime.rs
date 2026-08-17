@@ -11,6 +11,7 @@ use super::{
   consumer_read_runtime_settings,
 };
 use crate::consumer::ConsumerReadOutcome;
+use async_trait::async_trait;
 use time::OffsetDateTime;
 
 impl ConsumerReaderImpl {
@@ -31,8 +32,6 @@ impl ConsumerReaderImpl {
       .await
   }
 }
-
-use async_trait::async_trait;
 
 #[async_trait]
 impl ConsumerReader for ConsumerReaderImpl {

@@ -1527,6 +1527,8 @@ pub struct TopicConfig {
     pub retention: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // @@protoc_insertion_point(field:blobstream.v1.TopicConfig.max_metadata_publication_lag)
     pub max_metadata_publication_lag: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.TopicConfig.metadata_window_size)
+    pub metadata_window_size: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.TopicConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -1544,7 +1546,7 @@ impl TopicConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(5);
+        let mut fields = ::std::vec::Vec::with_capacity(6);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "name",
@@ -1570,6 +1572,11 @@ impl TopicConfig {
             "max_metadata_publication_lag",
             |m: &TopicConfig| { &m.max_metadata_publication_lag },
             |m: &mut TopicConfig| { &mut m.max_metadata_publication_lag },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "metadata_window_size",
+            |m: &TopicConfig| { &m.metadata_window_size },
+            |m: &mut TopicConfig| { &mut m.metadata_window_size },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<TopicConfig>(
             "TopicConfig",
@@ -1604,6 +1611,9 @@ impl ::protobuf::Message for TopicConfig {
                 42 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.max_metadata_publication_lag)?;
                 },
+                50 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.metadata_window_size)?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -1633,6 +1643,10 @@ impl ::protobuf::Message for TopicConfig {
             let len = v.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
+        if let Some(v) = self.metadata_window_size.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -1653,6 +1667,9 @@ impl ::protobuf::Message for TopicConfig {
         }
         if let Some(v) = self.max_metadata_publication_lag.as_ref() {
             ::protobuf::rt::write_message_field_with_cached_size(5, v, os)?;
+        }
+        if let Some(v) = self.metadata_window_size.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(6, v, os)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -1676,6 +1693,7 @@ impl ::protobuf::Message for TopicConfig {
         self.num_writers = 0;
         self.retention.clear();
         self.max_metadata_publication_lag.clear();
+        self.metadata_window_size.clear();
         self.special_fields.clear();
     }
 
@@ -1686,6 +1704,7 @@ impl ::protobuf::Message for TopicConfig {
             num_writers: 0,
             retention: ::protobuf::MessageField::none(),
             max_metadata_publication_lag: ::protobuf::MessageField::none(),
+            metadata_window_size: ::protobuf::MessageField::none(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -3552,8 +3571,6 @@ pub struct ConsumerReadConfig {
     // message fields
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.topic)
     pub topic: ::protobuf::Chars,
-    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.window_size)
-    pub window_size: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.idle_poll_delay)
     pub idle_poll_delay: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.max_idle_poll_delay)
@@ -3585,17 +3602,12 @@ impl ConsumerReadConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(9);
+        let mut fields = ::std::vec::Vec::with_capacity(8);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "topic",
             |m: &ConsumerReadConfig| { &m.topic },
             |m: &mut ConsumerReadConfig| { &mut m.topic },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
-            "window_size",
-            |m: &ConsumerReadConfig| { &m.window_size },
-            |m: &mut ConsumerReadConfig| { &mut m.window_size },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
             "idle_poll_delay",
@@ -3653,9 +3665,6 @@ impl ::protobuf::Message for ConsumerReadConfig {
                 10 => {
                     self.topic = is.read_tokio_chars()?;
                 },
-                18 => {
-                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.window_size)?;
-                },
                 34 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.idle_poll_delay)?;
                 },
@@ -3692,10 +3701,6 @@ impl ::protobuf::Message for ConsumerReadConfig {
         if !self.topic.is_empty() {
             my_size += ::protobuf::rt::string_size(1, &self.topic);
         }
-        if let Some(v) = self.window_size.as_ref() {
-            let len = v.compute_size();
-            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
-        }
         if let Some(v) = self.idle_poll_delay.as_ref() {
             let len = v.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
@@ -3729,9 +3734,6 @@ impl ::protobuf::Message for ConsumerReadConfig {
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
         if !self.topic.is_empty() {
             os.write_string(1, &self.topic)?;
-        }
-        if let Some(v) = self.window_size.as_ref() {
-            ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
         }
         if let Some(v) = self.idle_poll_delay.as_ref() {
             ::protobuf::rt::write_message_field_with_cached_size(4, v, os)?;
@@ -3772,7 +3774,6 @@ impl ::protobuf::Message for ConsumerReadConfig {
 
     fn clear(&mut self) {
         self.topic.clear();
-        self.window_size.clear();
         self.idle_poll_delay.clear();
         self.max_idle_poll_delay.clear();
         self.prefetch_max_bytes = ::std::option::Option::None;
@@ -3786,7 +3787,6 @@ impl ::protobuf::Message for ConsumerReadConfig {
     fn default_instance() -> &'static ConsumerReadConfig {
         static instance: ConsumerReadConfig = ConsumerReadConfig {
             topic: ::protobuf::Chars::new(),
-            window_size: ::protobuf::MessageField::none(),
             idle_poll_delay: ::protobuf::MessageField::none(),
             max_idle_poll_delay: ::protobuf::MessageField::none(),
             prefetch_max_bytes: ::std::option::Option::None,
@@ -4532,81 +4532,81 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     ressB\x07\xfaB\x04r\x02\x10\x01\"t\n\x1fK8sServiceBrokerDiscoveryConfig\
     \x12%\n\tnamespace\x18\x01\x20\x01(\tR\tnamespaceB\x07\xfaB\x04r\x02\x10\
     \x01\x12*\n\x0cservice_name\x18\x02\x20\x01(\tR\x0bserviceNameB\x07\xfaB\
-    \x04r\x02\x10\x01\"\xb4\x02\n\x0bTopicConfig\x12\x1b\n\x04name\x18\x01\
+    \x04r\x02\x10\x01\"\x8b\x03\n\x0bTopicConfig\x12\x1b\n\x04name\x18\x01\
     \x20\x01(\tR\x04nameB\x07\xfaB\x04r\x02\x10\x01\x120\n\x0fpartition_coun\
     t\x18\x02\x20\x01(\rR\x0epartitionCountB\x07\xfaB\x04*\x02\x20\0\x12(\n\
     \x0bnum_writers\x18\x03\x20\x01(\rR\nnumWritersB\x07\xfaB\x04*\x02\x20\0\
     \x12F\n\tretention\x18\x04\x20\x01(\x0b2\x19.google.protobuf.DurationR\t\
     retentionB\r\xfaB\n\x8a\x01\x02\x10\x01\xaa\x01\x02*\0\x12d\n\x1cmax_met\
     adata_publication_lag\x18\x05\x20\x01(\x0b2\x19.google.protobuf.Duration\
-    R\x19maxMetadataPublicationLagB\x08\xfaB\x05\xaa\x01\x02*\0\"\x19\n\x17I\
-    nMemoryBlobStoreConfig\"\x89\x01\n\x11S3BlobStoreConfig\x12\x1f\n\x06buc\
-    ket\x18\x01\x20\x01(\tR\x06bucketB\x07\xfaB\x04r\x02\x10\x01\x12\x16\n\
-    \x06prefix\x18\x02\x20\x01(\tR\x06prefix\x12\x1f\n\x06region\x18\x03\x20\
-    \x01(\tR\x06regionB\x07\xfaB\x04r\x02\x10\x01\x12\x1a\n\x08endpoint\x18\
-    \x04\x20\x01(\tR\x08endpoint\"\x9c\x01\n\x0fBlobStoreConfig\x12E\n\tin_m\
-    emory\x18\x01\x20\x01(\x0b2&.blobstream.v1.InMemoryBlobStoreConfigH\0R\
-    \x08inMemory\x122\n\x02s3\x18\x02\x20\x01(\x0b2\x20.blobstream.v1.S3Blob\
-    StoreConfigH\0R\x02s3B\x0e\n\x07backend\x12\x03\xf8B\x01\"\x1d\n\x1bInMe\
-    moryMetadataStoreConfig\"\xc1\x04\n\x19DynamoMetadataStoreConfig\x12\x1f\
-    \n\x06region\x18\x01\x20\x01(\tR\x06regionB\x07\xfaB\x04r\x02\x10\x01\
-    \x12\x1a\n\x08endpoint\x18\x02\x20\x01(\tR\x08endpoint\x12F\n\x1bsegment\
-    _metadata_table_name\x18\x03\x20\x01(\tR\x18segmentMetadataTableNameB\
-    \x07\xfaB\x04r\x02\x10\x01\x12U\n#producer_partition_lease_table_name\
-    \x18\x04\x20\x01(\tR\x1fproducerPartitionLeaseTableNameB\x07\xfaB\x04r\
-    \x02\x10\x01\x12M\n\x1fconsumer_group_lease_table_name\x18\x05\x20\x01(\
-    \tR\x1bconsumerGroupLeaseTableNameB\x07\xfaB\x04r\x02\x10\x01\x12W\n$con\
-    sumer_group_membership_table_name\x18\x06\x20\x01(\tR\x20consumerGroupMe\
-    mbershipTableNameB\x07\xfaB\x04r\x02\x10\x01\x12Q\n\x12segment_ttl_buffe\
-    r\x18\x07\x20\x01(\x0b2\x19.google.protobuf.DurationR\x10segmentTtlBuffe\
-    rB\x08\xfaB\x05\xaa\x01\x02*\0\x12M\n\x10lease_ttl_buffer\x18\x08\x20\
-    \x01(\x0b2\x19.google.protobuf.DurationR\x0eleaseTtlBufferB\x08\xfaB\x05\
-    \xaa\x01\x02*\0\"\xb4\x01\n\x13MetadataStoreConfig\x12I\n\tin_memory\x18\
-    \x01\x20\x01(\x0b2*.blobstream.v1.InMemoryMetadataStoreConfigH\0R\x08inM\
-    emory\x12B\n\x06dynamo\x18\x02\x20\x01(\x0b2(.blobstream.v1.DynamoMetada\
-    taStoreConfigH\0R\x06dynamoB\x0e\n\x07backend\x12\x03\xf8B\x01\"\xaa\x02\
-    \n\rRuntimeConfig\x12=\n\x06broker\x18\x01\x20\x01(\x0b2\x1b.blobstream.\
-    v1.BrokerConfigR\x06brokerB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12<\n\x06t\
-    opics\x18\x02\x20\x03(\x0b2\x1a.blobstream.v1.TopicConfigR\x06topicsB\
-    \x08\xfaB\x05\x92\x01\x02\x08\x01\x12G\n\nblob_store\x18\x03\x20\x01(\
-    \x0b2\x1e.blobstream.v1.BlobStoreConfigR\tblobStoreB\x08\xfaB\x05\x8a\
-    \x01\x02\x10\x01\x12S\n\x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobst\
-    ream.v1.MetadataStoreConfigR\rmetadataStoreB\x08\xfaB\x05\x8a\x01\x02\
-    \x10\x01\"\xf2\x06\n\x0eProducerConfig\x12\x20\n\twriter_id\x18\x01\x20\
-    \x01(\rH\0R\x08writerId\x88\x01\x01\x128\n\x11max_batch_records\x18\x02\
-    \x20\x01(\rH\x01R\x0fmaxBatchRecordsB\x07\xfaB\x04*\x02\x20\0\x88\x01\
-    \x01\x124\n\x0fmax_batch_bytes\x18\x03\x20\x01(\rH\x02R\rmaxBatchBytesB\
-    \x07\xfaB\x04*\x02\x20\0\x88\x01\x01\x12K\n\x0fflush_max_delay\x18\x04\
-    \x20\x01(\x0b2\x19.google.protobuf.DurationR\rflushMaxDelayB\x08\xfaB\
-    \x05\xaa\x01\x02*\0\x12M\n\x10retry_base_delay\x18\x06\x20\x01(\x0b2\x19\
-    .google.protobuf.DurationR\x0eretryBaseDelayB\x08\xfaB\x05\xaa\x01\x02*\
-    \0\x12K\n\x0fretry_max_delay\x18\x07\x20\x01(\x0b2\x19.google.protobuf.D\
-    urationR\rretryMaxDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12L\n\x0fconnect_t\
-    imeout\x18\x08\x20\x01(\x0b2\x19.google.protobuf.DurationR\x0econnectTim\
-    eoutB\x08\xfaB\x05\xaa\x01\x02*\0\x12L\n\x0frequest_timeout\x18\t\x20\
-    \x01(\x0b2\x19.google.protobuf.DurationR\x0erequestTimeoutB\x08\xfaB\x05\
-    \xaa\x01\x02*\0\x12D\n\x17max_request_concurrency\x18\n\x20\x01(\x04H\
-    \x03R\x15maxRequestConcurrencyB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x12S\
-    \n\x0bcompression\x18\x0b\x20\x01(\x0e2\".blobstream.v1.ProducerCompress\
-    ionH\x04R\x0bcompressionB\x08\xfaB\x05\x82\x01\x02\x10\x01\x88\x01\x01\
-    \x12J\n\x0eretry_deadline\x18\x0c\x20\x01(\x0b2\x19.google.protobuf.Dura\
-    tionR\rretryDeadlineB\x08\xfaB\x05\xaa\x01\x02*\0B\x0c\n\n_writer_idB\
-    \x14\n\x12_max_batch_recordsB\x12\n\x10_max_batch_bytesB\x1a\n\x18_max_r\
-    equest_concurrencyB\x0e\n\x0c_compression\"\xe8\x01\n\x15ProducerRuntime\
-    Config\x12C\n\x08producer\x18\x01\x20\x01(\x0b2\x1d.blobstream.v1.Produc\
-    erConfigR\x08producerB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12L\n\tdiscover\
-    y\x18\x02\x20\x01(\x0b2$.blobstream.v1.BrokerDiscoveryConfigR\tdiscovery\
-    B\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12<\n\x06topics\x18\x03\x20\x03(\x0b\
-    2\x1a.blobstream.v1.TopicConfigR\x06topicsB\x08\xfaB\x05\x92\x01\x02\x08\
-    \x01\"\xf8\x05\n\x12ConsumerReadConfig\x12\x1d\n\x05topic\x18\x01\x20\
-    \x01(\tR\x05topicB\x07\xfaB\x04r\x02\x10\x01\x12D\n\x0bwindow_size\x18\
-    \x02\x20\x01(\x0b2\x19.google.protobuf.DurationR\nwindowSizeB\x08\xfaB\
-    \x05\xaa\x01\x02*\0\x12K\n\x0fidle_poll_delay\x18\x04\x20\x01(\x0b2\x19.\
-    google.protobuf.DurationR\ridlePollDelayB\x08\xfaB\x05\xaa\x01\x02*\0\
-    \x12R\n\x13max_idle_poll_delay\x18\x05\x20\x01(\x0b2\x19.google.protobuf\
-    .DurationR\x10maxIdlePollDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12:\n\x12pr\
-    efetch_max_bytes\x18\x06\x20\x01(\x04H\0R\x10prefetchMaxBytesB\x07\xfaB\
-    \x042\x02\x20\0\x88\x01\x01\x12_\n\x19metadata_visibility_delay\x18\t\
+    R\x19maxMetadataPublicationLagB\x08\xfaB\x05\xaa\x01\x02*\0\x12U\n\x14me\
+    tadata_window_size\x18\x06\x20\x01(\x0b2\x19.google.protobuf.DurationR\
+    \x12metadataWindowSizeB\x08\xfaB\x05\xaa\x01\x02*\0\"\x19\n\x17InMemoryB\
+    lobStoreConfig\"\x89\x01\n\x11S3BlobStoreConfig\x12\x1f\n\x06bucket\x18\
+    \x01\x20\x01(\tR\x06bucketB\x07\xfaB\x04r\x02\x10\x01\x12\x16\n\x06prefi\
+    x\x18\x02\x20\x01(\tR\x06prefix\x12\x1f\n\x06region\x18\x03\x20\x01(\tR\
+    \x06regionB\x07\xfaB\x04r\x02\x10\x01\x12\x1a\n\x08endpoint\x18\x04\x20\
+    \x01(\tR\x08endpoint\"\x9c\x01\n\x0fBlobStoreConfig\x12E\n\tin_memory\
+    \x18\x01\x20\x01(\x0b2&.blobstream.v1.InMemoryBlobStoreConfigH\0R\x08inM\
+    emory\x122\n\x02s3\x18\x02\x20\x01(\x0b2\x20.blobstream.v1.S3BlobStoreCo\
+    nfigH\0R\x02s3B\x0e\n\x07backend\x12\x03\xf8B\x01\"\x1d\n\x1bInMemoryMet\
+    adataStoreConfig\"\xc1\x04\n\x19DynamoMetadataStoreConfig\x12\x1f\n\x06r\
+    egion\x18\x01\x20\x01(\tR\x06regionB\x07\xfaB\x04r\x02\x10\x01\x12\x1a\n\
+    \x08endpoint\x18\x02\x20\x01(\tR\x08endpoint\x12F\n\x1bsegment_metadata_\
+    table_name\x18\x03\x20\x01(\tR\x18segmentMetadataTableNameB\x07\xfaB\x04\
+    r\x02\x10\x01\x12U\n#producer_partition_lease_table_name\x18\x04\x20\x01\
+    (\tR\x1fproducerPartitionLeaseTableNameB\x07\xfaB\x04r\x02\x10\x01\x12M\
+    \n\x1fconsumer_group_lease_table_name\x18\x05\x20\x01(\tR\x1bconsumerGro\
+    upLeaseTableNameB\x07\xfaB\x04r\x02\x10\x01\x12W\n$consumer_group_member\
+    ship_table_name\x18\x06\x20\x01(\tR\x20consumerGroupMembershipTableNameB\
+    \x07\xfaB\x04r\x02\x10\x01\x12Q\n\x12segment_ttl_buffer\x18\x07\x20\x01(\
+    \x0b2\x19.google.protobuf.DurationR\x10segmentTtlBufferB\x08\xfaB\x05\
+    \xaa\x01\x02*\0\x12M\n\x10lease_ttl_buffer\x18\x08\x20\x01(\x0b2\x19.goo\
+    gle.protobuf.DurationR\x0eleaseTtlBufferB\x08\xfaB\x05\xaa\x01\x02*\0\"\
+    \xb4\x01\n\x13MetadataStoreConfig\x12I\n\tin_memory\x18\x01\x20\x01(\x0b\
+    2*.blobstream.v1.InMemoryMetadataStoreConfigH\0R\x08inMemory\x12B\n\x06d\
+    ynamo\x18\x02\x20\x01(\x0b2(.blobstream.v1.DynamoMetadataStoreConfigH\0R\
+    \x06dynamoB\x0e\n\x07backend\x12\x03\xf8B\x01\"\xaa\x02\n\rRuntimeConfig\
+    \x12=\n\x06broker\x18\x01\x20\x01(\x0b2\x1b.blobstream.v1.BrokerConfigR\
+    \x06brokerB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12<\n\x06topics\x18\x02\
+    \x20\x03(\x0b2\x1a.blobstream.v1.TopicConfigR\x06topicsB\x08\xfaB\x05\
+    \x92\x01\x02\x08\x01\x12G\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobst\
+    ream.v1.BlobStoreConfigR\tblobStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\
+    \x12S\n\x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobstream.v1.Metadata\
+    StoreConfigR\rmetadataStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\"\xf2\x06\
+    \n\x0eProducerConfig\x12\x20\n\twriter_id\x18\x01\x20\x01(\rH\0R\x08writ\
+    erId\x88\x01\x01\x128\n\x11max_batch_records\x18\x02\x20\x01(\rH\x01R\
+    \x0fmaxBatchRecordsB\x07\xfaB\x04*\x02\x20\0\x88\x01\x01\x124\n\x0fmax_b\
+    atch_bytes\x18\x03\x20\x01(\rH\x02R\rmaxBatchBytesB\x07\xfaB\x04*\x02\
+    \x20\0\x88\x01\x01\x12K\n\x0fflush_max_delay\x18\x04\x20\x01(\x0b2\x19.g\
+    oogle.protobuf.DurationR\rflushMaxDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12\
+    M\n\x10retry_base_delay\x18\x06\x20\x01(\x0b2\x19.google.protobuf.Durati\
+    onR\x0eretryBaseDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12K\n\x0fretry_max_d\
+    elay\x18\x07\x20\x01(\x0b2\x19.google.protobuf.DurationR\rretryMaxDelayB\
+    \x08\xfaB\x05\xaa\x01\x02*\0\x12L\n\x0fconnect_timeout\x18\x08\x20\x01(\
+    \x0b2\x19.google.protobuf.DurationR\x0econnectTimeoutB\x08\xfaB\x05\xaa\
+    \x01\x02*\0\x12L\n\x0frequest_timeout\x18\t\x20\x01(\x0b2\x19.google.pro\
+    tobuf.DurationR\x0erequestTimeoutB\x08\xfaB\x05\xaa\x01\x02*\0\x12D\n\
+    \x17max_request_concurrency\x18\n\x20\x01(\x04H\x03R\x15maxRequestConcur\
+    rencyB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x12S\n\x0bcompression\x18\x0b\
+    \x20\x01(\x0e2\".blobstream.v1.ProducerCompressionH\x04R\x0bcompressionB\
+    \x08\xfaB\x05\x82\x01\x02\x10\x01\x88\x01\x01\x12J\n\x0eretry_deadline\
+    \x18\x0c\x20\x01(\x0b2\x19.google.protobuf.DurationR\rretryDeadlineB\x08\
+    \xfaB\x05\xaa\x01\x02*\0B\x0c\n\n_writer_idB\x14\n\x12_max_batch_records\
+    B\x12\n\x10_max_batch_bytesB\x1a\n\x18_max_request_concurrencyB\x0e\n\
+    \x0c_compression\"\xe8\x01\n\x15ProducerRuntimeConfig\x12C\n\x08producer\
+    \x18\x01\x20\x01(\x0b2\x1d.blobstream.v1.ProducerConfigR\x08producerB\
+    \x08\xfaB\x05\x8a\x01\x02\x10\x01\x12L\n\tdiscovery\x18\x02\x20\x01(\x0b\
+    2$.blobstream.v1.BrokerDiscoveryConfigR\tdiscoveryB\x08\xfaB\x05\x8a\x01\
+    \x02\x10\x01\x12<\n\x06topics\x18\x03\x20\x03(\x0b2\x1a.blobstream.v1.To\
+    picConfigR\x06topicsB\x08\xfaB\x05\x92\x01\x02\x08\x01\"\xb2\x05\n\x12Co\
+    nsumerReadConfig\x12\x1d\n\x05topic\x18\x01\x20\x01(\tR\x05topicB\x07\
+    \xfaB\x04r\x02\x10\x01\x12K\n\x0fidle_poll_delay\x18\x04\x20\x01(\x0b2\
+    \x19.google.protobuf.DurationR\ridlePollDelayB\x08\xfaB\x05\xaa\x01\x02*\
+    \0\x12R\n\x13max_idle_poll_delay\x18\x05\x20\x01(\x0b2\x19.google.protob\
+    uf.DurationR\x10maxIdlePollDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12:\n\x12\
+    prefetch_max_bytes\x18\x06\x20\x01(\x04H\0R\x10prefetchMaxBytesB\x07\xfa\
+    B\x042\x02\x20\0\x88\x01\x01\x12_\n\x19metadata_visibility_delay\x18\t\
     \x20\x01(\x0b2\x19.google.protobuf.DurationR\x17metadataVisibilityDelayB\
     \x08\xfaB\x05\xaa\x01\x022\0\x12F\n\x19max_in_flight_batch_reads\x18\n\
     \x20\x01(\x04H\x01R\x15maxInFlightBatchReadsB\x07\xfaB\x042\x02\x20\0\

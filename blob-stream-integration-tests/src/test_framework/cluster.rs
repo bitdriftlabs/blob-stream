@@ -18,7 +18,7 @@ use super::transport::{
   InMemoryTestTransport,
   NetworkFaultController,
 };
-use crate::test_framework::{PARTITION_COUNT, SECOND_TOPIC, TOPIC};
+use crate::test_framework::{PARTITION_COUNT, SECOND_TOPIC, TOPIC, WINDOW_SIZE_SECONDS};
 use anyhow::{Result, anyhow};
 use bd_server_stats::stats::Collector;
 use bd_shutdown::{ComponentShutdownTrigger, ComponentShutdownTriggerHandle};
@@ -789,6 +789,7 @@ fn build_write_engine(
         num_writers: topic_num_writers,
         retention: time::Duration::days(7),
         max_metadata_publication_lag: time::Duration::milliseconds(30_000),
+        metadata_window_size: time::Duration::seconds(WINDOW_SIZE_SECONDS),
       },
     );
   }

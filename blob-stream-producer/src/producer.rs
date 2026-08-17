@@ -14,6 +14,7 @@ use crate::config::{
   ProducerConfig,
   ProducerRuntimeConfig,
   ProducerTopicConfig,
+  apply_producer_startup_overrides,
   into_discovery,
   producer_flush_max_delay,
   producer_max_batch_bytes,
@@ -26,6 +27,7 @@ use crate::config::{
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use async_trait::async_trait;
+use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership};
 use blob_stream_proto::protos::blobstream::v1::broker::Record;
@@ -238,6 +240,17 @@ impl ProducerClientImpl {
     ProducerClientBuilder::new(config, runtime.topics, discovery, transport, metrics_scope)
       .build()
       .await
+  }
+
+  /// Construct a producer after applying its startup-only feature flag overrides.
+  pub async fn from_runtime_config_with_feature_flags(
+    mut runtime: ProducerRuntimeConfig,
+    metrics_scope: Scope,
+    feature_flags: &FeatureFlagsWatch,
+  ) -> Result<Self> {
+    apply_producer_startup_overrides(feature_flags, &mut runtime)?;
+    debug!("constructing producer after applying startup-only feature flag overrides");
+    Self::from_runtime_config(runtime, metrics_scope).await
   }
 
   /// Construct a producer from explicit configuration and runtime dependencies.

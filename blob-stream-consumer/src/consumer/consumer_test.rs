@@ -623,7 +623,6 @@ async fn visibility_delay_defers_newly_published_metadata() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
       ..Default::default()
     },
@@ -695,7 +694,6 @@ async fn strong_metadata_reads_accept_metadata_at_its_publication_timestamp() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
@@ -784,7 +782,6 @@ async fn runtime_strong_metadata_reads_apply_on_the_next_scan() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
       ..Default::default()
     },
@@ -903,7 +900,6 @@ async fn derived_horizon_retries_visibility_deferred_metadata_across_window_boun
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       metadata_visibility_delay: TimeDuration::milliseconds(300_000).into_proto(),
       ..Default::default()
     },
@@ -958,7 +954,6 @@ async fn retention_recovery_scans_from_checkpoint_before_fast_path() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     Vec::new(),
@@ -1050,7 +1045,6 @@ async fn recovery_scans_single_checkpoint_window_with_overlap_bound() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
@@ -1108,7 +1102,6 @@ fn recovery_only_bounds_its_checkpoint_window() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -1165,7 +1158,6 @@ async fn assignment_activates_hydrated_state_and_removes_revoked_state() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     Vec::new(),
@@ -1222,7 +1214,6 @@ async fn retention_recovery_clamps_legacy_cursor_to_retention_floor() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     Vec::new(),
@@ -1287,7 +1278,6 @@ async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(window_size_seconds).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -1342,7 +1332,6 @@ async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
 async fn recovery_waits_for_visibility_deferred_window_before_advancing() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
-  let window_size_seconds = 300;
   let cutover_window_start = 12_000;
   let deferred_window_start = 9_600;
 
@@ -1375,7 +1364,6 @@ async fn recovery_waits_for_visibility_deferred_window_before_advancing() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(window_size_seconds).into_proto(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
       ..Default::default()
     },
@@ -1452,7 +1440,6 @@ async fn recovery_waits_for_visibility_deferred_window_before_advancing() {
 async fn recovery_does_not_advance_cursor_past_visibility_deferred_window() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
-  let window_size_seconds = 300;
   let first_recovery_window = 300;
   let later_recovery_window = 600;
   let cutover_window = 900;
@@ -1486,7 +1473,6 @@ async fn recovery_does_not_advance_cursor_past_visibility_deferred_window() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(window_size_seconds).into_proto(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
       ..Default::default()
     },
@@ -1561,7 +1547,6 @@ async fn recovery_hands_active_window_visibility_deferral_to_fast() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
       ..Default::default()
     },
@@ -1631,7 +1616,6 @@ async fn advances_cursor_and_dedupes_on_rescan() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     vec![7],
@@ -1684,7 +1668,6 @@ async fn failed_scan_restores_cursor_before_retrying_undelivered_batches() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     vec![7],
@@ -1744,7 +1727,6 @@ async fn missing_blob_range_is_counted_and_skipped() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     vec![7],
@@ -1777,7 +1759,6 @@ async fn metadata_scan_error_preserves_aws_source_chain() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     vec![7],
@@ -1829,7 +1810,6 @@ async fn byte_capacity_defers_later_batches_until_the_next_scan() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     vec![7],
@@ -1898,7 +1878,6 @@ async fn recovery_capacity_resumes_at_the_first_deferred_window() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(window_size_seconds).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -1995,7 +1974,6 @@ async fn recovery_capacity_deferral_keeps_unprocessed_cutover_partitions_recover
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -2090,7 +2068,6 @@ async fn fresh_capacity_deferral_retries_the_initial_window_before_fast_path() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -2172,7 +2149,6 @@ async fn mature_recovery_metadata_is_scanned_once_across_capacity_cycles() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -2287,7 +2263,6 @@ async fn mature_recovery_metadata_caches_after_visibility_deferral() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
       ..Default::default()
     },
@@ -2400,7 +2375,6 @@ async fn mature_recovery_metadata_survives_blob_read_failure() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -2484,7 +2458,6 @@ fn recovery_metadata_cache_is_invalidated_by_lifecycle_resets() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     Vec::new(),
@@ -2537,7 +2510,6 @@ fn recovery_planning_rotates_between_partitions() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     Vec::new(),
@@ -2621,7 +2593,6 @@ async fn coalesces_owned_ranges_from_one_segment() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     vec![7, 9],
@@ -2667,7 +2638,6 @@ fn recovery_planning_batches_active_cutover_partitions() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     Vec::new(),
@@ -2741,7 +2711,6 @@ async fn capacity_limited_segment_read_excludes_deferred_batches() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     vec![7, 9],
@@ -2819,7 +2788,6 @@ async fn failed_slice_in_segment_read_does_not_advance_cursor() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     vec![7],
@@ -2866,7 +2834,6 @@ async fn bounded_parallel_reads_respect_configured_limit() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       max_in_flight_batch_reads: Some(2),
       ..Default::default()
     },
@@ -2920,7 +2887,6 @@ async fn catches_late_metadata_with_derived_candidate_horizon() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     vec![11],
@@ -2978,7 +2944,6 @@ async fn decodes_zstd_compressed_batches() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     vec![3],
@@ -3021,7 +2986,6 @@ async fn fast_scan_uses_per_partition_inclusive_frontier() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -3081,7 +3045,6 @@ async fn fast_scan_uses_lowest_partition_frontier_for_cross_partition_ordering()
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -3153,7 +3116,6 @@ async fn seek_resets_partition_fast_frontier() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -3214,7 +3176,6 @@ async fn historical_seek_recovers_recent_windows_then_returns_to_fast_path() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -3303,7 +3264,6 @@ async fn fast_scan_uses_per_window_frontiers_across_candidate_window_boundary() 
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -3376,7 +3336,6 @@ async fn fast_scan_omits_windows_before_the_safe_publication_floor() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     vec![7],
@@ -3435,7 +3394,6 @@ async fn fast_scan_prunes_frontiers_for_windows_before_the_safe_publication_floo
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
@@ -3629,7 +3587,6 @@ async fn fast_scan_bounds_sparse_partitions_with_the_safe_publication_floor() {
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      window_size: TimeDuration::seconds(300).into_proto(),
       ..Default::default()
     },
     vec![7, 8],

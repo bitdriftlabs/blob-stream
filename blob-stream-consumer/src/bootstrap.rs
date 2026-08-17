@@ -4,6 +4,7 @@ mod tests;
 
 use crate::config::{
   ConsumerRuntimeConfig,
+  apply_consumer_startup_overrides,
   consumer_max_clock_skew,
   topic_max_metadata_publication_lag,
   validate_runtime_config,
@@ -46,7 +47,7 @@ use blob_stream_proto::protos::blobstream::v1::config::{
   MetadataStoreConfig,
   TopicConfig,
 };
-use blob_stream_types::{ProtoDurationExt, VirtualPartitionId};
+use blob_stream_types::{ProtoDurationExt, VirtualPartitionId, topic_metadata_window_size};
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::Duration;
@@ -217,12 +218,15 @@ impl ConsumerIteratorImpl {
   }
 
   async fn build_from_bootstrap(
-    config: ConsumerBootstrapConfig,
+    mut config: ConsumerBootstrapConfig,
     metrics_scope: Scope,
     feature_flags: Option<FeatureFlagsWatch>,
     time_provider: Arc<dyn TimeProvider>,
     lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
   ) -> Result<Self> {
+    if let Some(feature_flags) = feature_flags.as_ref() {
+      apply_consumer_startup_overrides(feature_flags, &mut config.runtime)?;
+    }
     validate_runtime_config(&config.runtime)?;
     proto_validate::validate(&config.topic)?;
     proto_validate::validate(&config.blob_store)?;
@@ -234,6 +238,7 @@ impl ConsumerIteratorImpl {
       .as_ref()
       .ok_or_else(|| anyhow!("consumer topic config is missing retention"))?
       .to_time_duration();
+    let metadata_window_size = topic_metadata_window_size(&config.topic)?;
 
     let group = config
       .runtime
@@ -284,6 +289,7 @@ impl ConsumerIteratorImpl {
       topic_max_metadata_publication_lag(&config.topic),
       feature_flags,
     )
+    .metadata_window_size(metadata_window_size)
     .maximum_clock_skew(consumer_max_clock_skew(
       config
         .runtime

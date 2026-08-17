@@ -26,6 +26,7 @@ bd-time.workspace               = true
 blob-stream-blob-store.path     = "../blob-stream-blob-store"
 blob-stream-metadata-store.path = "../blob-stream-metadata-store"
 blob-stream-proto.path          = "../blob-stream-proto"
+blob-stream-runtime-config.path = "../blob-stream-runtime-config"
 blob-stream-types.path          = "../blob-stream-types"
 bytes.workspace                 = true
 futures.workspace               = true

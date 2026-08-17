@@ -1069,7 +1069,6 @@ async fn verify_all_records(
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      window_size: TimeDuration::seconds(crate::test_framework::WINDOW_SIZE_SECONDS).into_proto(),
       ..Default::default()
     },
     (0 .. partition_count).collect(),

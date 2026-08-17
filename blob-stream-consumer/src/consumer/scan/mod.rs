@@ -14,7 +14,7 @@ use super::{
   VirtualPartitionState,
   offset_datetime_from_unix_seconds,
 };
-use crate::config::{ConsumerReadRuntimeSettings, consumer_window_size};
+use crate::config::ConsumerReadRuntimeSettings;
 use anyhow::{Context, Error, Result, ensure};
 use blob_stream_blob_store::{BlobKey, ByteRange};
 use blob_stream_metadata_store::SegmentMetadata;

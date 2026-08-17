@@ -13,7 +13,6 @@ use crate::config::{
   ConsumerReadConfig,
   ConsumerReadRuntimeSettings,
   consumer_read_runtime_settings,
-  consumer_window_size,
   validate_read_config,
 };
 use anyhow::{Result, ensure};
@@ -103,6 +102,7 @@ pub struct ConsumerReaderImpl {
     HashMap<VirtualPartitionId, VirtualPartitionState>,
   pub(in crate::consumer) retention: Duration,
   pub(in crate::consumer) maximum_metadata_publication_lag: Duration,
+  pub(in crate::consumer) metadata_window_size: Duration,
   pub(in crate::consumer) maximum_clock_skew: Duration,
   pub(in crate::consumer) fast_frontiers: HashMap<(VirtualPartitionId, i64), SnowflakeId>,
   pub(in crate::consumer) recovery_scan_last_partition: Option<VirtualPartitionId>,
