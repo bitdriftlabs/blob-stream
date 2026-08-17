@@ -2050,6 +2050,7 @@ async fn next_delivers_records_and_commit_renews() {
       members: vec!["member-a".to_string()],
       virtual_partitions: vec![3],
     }));
+  let collector = Collector::default();
   let mut iterator = ConsumerIteratorImpl::from_config(
     &runtime,
     blob_store,
@@ -2057,7 +2058,7 @@ async fn next_delivers_records_and_commit_renews() {
     lease_store,
     membership_store,
     source,
-    metrics_scope(),
+    collector.scope("blob_stream_consumer_test"),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
@@ -2099,6 +2100,11 @@ async fn next_delivers_records_and_commit_renews() {
   assert!(partition.last_committed_source_checkpoint.is_some());
   assert!(partition.last_committed_at.is_some());
   assert!(state.local.last_successful_heartbeat_at.is_some());
+  let metrics = String::from_utf8(collector.prometheus_output()).unwrap();
+  assert!(
+    metrics.contains("blob_stream_consumer_test:consumer:iterator:cursor_commit_partitions 1"),
+    "{metrics}"
+  );
 }
 
 #[tokio::test]

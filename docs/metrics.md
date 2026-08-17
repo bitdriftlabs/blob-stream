@@ -54,10 +54,7 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 | `metadata_recovery_scan_hits`, `metadata_recovery_scan_batches_read` | Counters | Recovery scans that returned any batch and the batches returned by them. |
 | `recovery_metadata_cache_hits`, `recovery_metadata_cache_misses`, `recovery_metadata_cache_inserts`, `recovery_metadata_cache_invalidations` | Counters | Recovery metadata-cache effectiveness and maintenance. |
 | `recovery_metadata_cache_entries`, `recovery_metadata_cache_retained_bytes` | Gauges | Current retained recovery cache entry count and bytes. |
-| `metadata_fast_scan_frontiers` | Gauge | Number of retained per-window fast-path metadata frontiers. |
 | `metadata_fast_scan_without_lower_bound` | Counter | Fast scans that could not use a derived metadata lower bound. |
-| `metadata_fast_scan_segments_below_partition_frontier` | Counter | Segment rows skipped because they precede the retained partition frontier. |
-| `metadata_fast_scan_segments_without_assigned_batches` | Counter | Segment rows examined that contain no batches for this virtual partition. |
 | `metadata_segments_deferred_by_visibility_delay` | Counter | Segment rows deferred by the resolved visibility maturity delay. Strong reads resolve that delay to zero, so only rows timestamped after the reader's current time are deferred. |
 | `metadata_batches_scanned`, `metadata_batches_skipped_by_cursor` | Counters | Batches decoded from metadata and batches skipped because the committed cursor had already passed them. |
 | `blob_range_requests`, `blob_range_bytes`, `blob_range_latency_seconds` | Counters, histogram | S3/object-store byte-range reads, bytes read, and range-read latency. |
@@ -73,7 +70,7 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 | `next_latency_seconds`, `commit_latency_seconds` | Histograms | Application-visible `next()` and explicit `commit()` operation latency. |
 | `retries`, `failures`, `seeks`, `revocations` | Counters | Iterator retry attempts, terminal failures, explicit cursor seeks, and revocation events surfaced to the application. |
 | `rebalances_total`, `rebalance_failures_total` | Counters | Rebalance attempts and attempts that failed before an assignment applied. |
-| `assignment_plans_applied_total`, `assignment_plan_rejections_total`, `assignment_applications_total` | Counters | Accepted assignment plans, rejected plans, and successful local assignment applications. |
+| `assignment_plans_applied_total`, `assignment_plan_rejections_total`, `assignment_applications_total` | Counters | Accepted assignment plans, rejected plan versions, and local assignment changes that reached the reader. |
 | `lease_claims_initial`, `lease_claims_retained`, `lease_claims_graceful_handoff`, `lease_claims_expiry_takeover` | Counters | Partition claims classified by initial ownership, retention, cooperative handoff, or takeover after owner expiry. |
 | `desired_partitions`, `owned_partitions`, `active_partitions` | Gauges | Partitions assigned by the plan, currently leased by this member, and currently active for reading. |
 | `prefetch_buffered_batches`, `prefetch_buffered_bytes` | Gauges | Fully prefetched batches and bytes ready for delivery. |
@@ -83,7 +80,7 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 | `heartbeat_calls`, `heartbeat_scheduled_calls`, `heartbeat_commit_calls` | Counters | All coordination heartbeats, scheduled renewals, and heartbeats caused by an explicit commit. |
 | `heartbeat_failures`, `membership_heartbeat_failures`, `lease_heartbeat_failures` | Counters | Heartbeat failures overall, failures updating member liveness, and failures renewing partition leases. |
 | `heartbeat_retry_attempts`, `rebalance_retry_attempts` | Counters | Retries scheduled after heartbeat or rebalance failures. |
-| `heartbeat_committed_offsets`, `heartbeat_renewed_partitions`, `lease_renewed_partitions`, `cursor_commit_partitions` | Counters | Offsets committed, partitions renewed by a heartbeat, successful lease renewals, and partitions included in explicit cursor commits. |
+| `heartbeat_committed_offsets`, `heartbeat_renewed_partitions`, `lease_renewed_partitions`, `cursor_commit_partitions` | Counters | Partitions with staged cursors successfully submitted by any heartbeat, partitions renewed by any heartbeat, partitions renewed by scheduled heartbeats, and partitions included in explicit cursor commits. |
 | `heartbeat_fenced_partitions` | Counter | Partitions lost because the consumer was fenced during heartbeat processing. |
 | `heartbeat_latency_seconds` | Histogram | End-to-end heartbeat latency. |
 

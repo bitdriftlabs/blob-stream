@@ -27,10 +27,7 @@ pub(in crate::consumer) struct ConsumerReaderMetrics {
   recovery_metadata_cache_invalidations: IntCounter,
   recovery_metadata_cache_entries: ContributionGauge,
   recovery_metadata_cache_retained_bytes: ContributionGauge,
-  metadata_fast_scan_frontiers: ContributionGauge,
   pub(in crate::consumer) metadata_fast_scan_without_lower_bound: IntCounter,
-  pub(in crate::consumer) metadata_fast_scan_segments_below_partition_frontier: IntCounter,
-  pub(in crate::consumer) metadata_fast_scan_segments_without_assigned_batches: IntCounter,
   pub(in crate::consumer) metadata_segments_deferred_by_visibility_delay: IntCounter,
   metadata_batches_scanned: IntCounter,
   metadata_batches_skipped_by_cursor: IntCounter,
@@ -72,15 +69,8 @@ impl ConsumerReaderMetrics {
       recovery_metadata_cache_retained_bytes: ContributionGauge::new(
         scope.gauge("recovery_metadata_cache_retained_bytes"),
       ),
-      metadata_fast_scan_frontiers: ContributionGauge::new(
-        scope.gauge("metadata_fast_scan_frontiers"),
-      ),
       metadata_fast_scan_without_lower_bound: scope
         .counter("metadata_fast_scan_without_lower_bound"),
-      metadata_fast_scan_segments_below_partition_frontier: scope
-        .counter("metadata_fast_scan_segments_below_partition_frontier"),
-      metadata_fast_scan_segments_without_assigned_batches: scope
-        .counter("metadata_fast_scan_segments_without_assigned_batches"),
       metadata_segments_deferred_by_visibility_delay: scope
         .counter("metadata_segments_deferred_by_visibility_delay"),
       metadata_batches_scanned: scope.counter("metadata_batches_scanned"),
@@ -123,12 +113,6 @@ impl ConsumerReaderMetrics {
     self
       .metadata_scan_latency_seconds
       .observe(started_at.elapsed().as_secs_f64());
-  }
-
-  pub(in crate::consumer) fn record_fast_frontiers(&self, frontier_count: usize) {
-    self
-      .metadata_fast_scan_frontiers
-      .set(i64::try_from(frontier_count).unwrap_or(i64::MAX));
   }
 
   pub(in crate::consumer) fn record_recovery_metadata_cache_hit(&self) {
