@@ -30,8 +30,8 @@ use protobuf::Chars;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
+use time::OffsetDateTime;
 use time::ext::NumericalDuration;
-use time::{Duration, OffsetDateTime};
 use tokio::sync::watch;
 
 impl WriteEngineImpl {
@@ -65,8 +65,7 @@ impl WriteEngineImpl {
     mut membership_rx: watch::Receiver<BrokerMembership>,
   ) {
     let interval =
-      StdDuration::try_from((self.config.lease_duration / 3_i32).max(Duration::seconds(1)))
-        .unwrap_or(StdDuration::from_secs(1));
+      StdDuration::try_from(self.config.heartbeat_interval).unwrap_or(StdDuration::from_secs(1));
     let topics = self.topics.clone();
     let holder_id = self.holder_id.clone();
     let lease_session_id = self.lease_session_id.clone();

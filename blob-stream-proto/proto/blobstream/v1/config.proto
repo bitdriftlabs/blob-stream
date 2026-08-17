@@ -50,6 +50,13 @@ message BrokerConfig {
 
   // Optional filesystem-backed runtime feature flags for the broker.
   BrokerFeatureFlagsConfig feature_flags = 10;
+
+  // Producer-partition lease duration. Default when unset: 30 seconds.
+  google.protobuf.Duration lease_duration = 11 [(validate.rules).duration.gt = {}];
+
+  // Interval for renewing assigned producer-partition leases. Default when unset: 10 seconds.
+  // This must be shorter than lease_duration.
+  google.protobuf.Duration heartbeat_interval = 12 [(validate.rules).duration.gt = {}];
 }
 
 // Filesystem paths used to reload broker feature flags.

@@ -53,10 +53,14 @@ must be in range for every configured topic, and its broker discovery must conta
 that domain.
 
 Important broker defaults are 64 MiB `flush_max_bytes`, 1 second `flush_max_delay`, 10,000
-`sequence_reservation_size`, zstd segment compression, and disabled `fenced_metadata_writes`.
-Topics default `max_metadata_publication_lag` to 15 seconds when unset. Consumers default
-`max_clock_skew` to 10 ms when unset. Configure the skew bound to the proven, monitored pairwise
-broker-to-consumer clock offset for the deployment; it is a consumer read setting.
+`sequence_reservation_size`, a 30-second producer-partition `lease_duration`, a 10-second
+`heartbeat_interval`, zstd segment compression, and disabled `fenced_metadata_writes`. The
+heartbeat interval must be shorter than the lease duration. Increasing both reduces DynamoDB lease
+renewal writes but delays recovery after an ungraceful broker loss; graceful membership changes
+release moved leases explicitly. Topics default `max_metadata_publication_lag` to 15 seconds when
+unset. Consumers default `max_clock_skew` to 10 ms when unset. Configure the skew bound to the
+proven, monitored pairwise broker-to-consumer clock offset for the deployment; it is a consumer
+read setting.
 The topic `metadata_window_size` defines the durable metadata-key layout that brokers publish and
 consumers scan. Producer and consumer defaults, including batching, retry, polling, and prefetch
 values, are documented in the protobuf schema.

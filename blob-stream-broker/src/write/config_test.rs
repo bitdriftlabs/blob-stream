@@ -53,8 +53,38 @@ fn defaults_segment_compression_to_zstd() {
   assert_eq!(config.compression.codec, CompressionCodec::Zstd);
   assert_eq!(config.compression.level, Some(3));
   assert_eq!(config.writer_id, 0);
+  assert_eq!(config.lease_duration, Duration::seconds(30));
+  assert_eq!(config.heartbeat_interval, Duration::seconds(10));
   assert_eq!(config.reservation_size, 10_000);
   assert!(!config.fenced_metadata_writes);
+}
+
+#[test]
+fn respects_explicit_lease_timing_configuration() {
+  let mut broker_config = BrokerConfig::new();
+  broker_config.writer_id = Some(0);
+  broker_config.lease_duration = Duration::seconds(120).into_proto();
+  broker_config.heartbeat_interval = Duration::seconds(40).into_proto();
+
+  let config = WriteConfig::from_broker_config(&broker_config).unwrap();
+
+  assert_eq!(config.lease_duration, Duration::seconds(120));
+  assert_eq!(config.heartbeat_interval, Duration::seconds(40));
+}
+
+#[test]
+fn rejects_heartbeat_interval_at_or_above_lease_duration() {
+  let mut broker_config = BrokerConfig::new();
+  broker_config.writer_id = Some(0);
+  broker_config.lease_duration = Duration::seconds(30).into_proto();
+  broker_config.heartbeat_interval = Duration::seconds(30).into_proto();
+
+  let error = WriteConfig::from_broker_config(&broker_config).unwrap_err();
+
+  assert_eq!(
+    error.to_string(),
+    "broker heartbeat_interval must be less than lease_duration"
+  );
 }
 
 #[test]
