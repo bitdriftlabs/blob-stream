@@ -1423,16 +1423,20 @@ async fn broker_recovery_delivery_preserves_batches_and_cursor() {
     .await
     .unwrap();
   metadata_store.scans.lock().clear();
+  let mut recovery_response =
+    broker_metadata_response(&recovery_segments, timestamp(window_start + 300));
+  if let Some(read_metadata_window_response::Result::Success(success)) =
+    recovery_response.result.as_mut()
+  {
+    success.refill_floor = None;
+  }
   let broker_query = Arc::new(FixedBrokerMetadataQuery {
     responses: HashMap::from([
       (
         window_start,
         broker_metadata_response(&checkpoint_segments, timestamp(window_start + 300)),
       ),
-      (
-        window_start + 300,
-        broker_metadata_response(&recovery_segments, timestamp(window_start + 300)),
-      ),
+      (window_start + 300, recovery_response),
     ]),
   });
   let feature_flags = FakeLoader::new(Arc::new(

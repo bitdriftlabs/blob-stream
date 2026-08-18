@@ -244,6 +244,7 @@ impl ConsumerIteratorImpl {
     proto_validate::validate(&config.topic)?;
     proto_validate::validate(&config.blob_store)?;
     proto_validate::validate(&config.metadata_store)?;
+    proto_validate::validate(&config.broker_discovery)?;
 
     let retention = config
       .topic

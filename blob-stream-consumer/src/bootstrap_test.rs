@@ -135,6 +135,23 @@ async fn bootstrap_builds_iterator_without_static_members() {
 }
 
 #[tokio::test]
+async fn bootstrap_rejects_invalid_broker_discovery() {
+  let config = ConsumerBootstrapConfig::new(
+    runtime("member-a"),
+    topic(),
+    in_memory_blob_store(),
+    in_memory_metadata_store(),
+    BrokerDiscoveryConfig::new(),
+  );
+
+  assert!(
+    ConsumerConfigFactory::build_iterator(config, metrics_scope(), None)
+      .await
+      .is_err()
+  );
+}
+
+#[tokio::test]
 async fn proto_bootstrap_builds_iterator_for_in_memory_backends() {
   let config = proto_bootstrap_config("member-a");
 

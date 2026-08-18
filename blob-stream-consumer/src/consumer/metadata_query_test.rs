@@ -220,6 +220,35 @@ fn full_recovery_response_rejects_unrequested_partitions() {
 }
 
 #[test]
+fn full_recovery_response_rejects_partial_refill_floor() {
+  let response = ReadMetadataWindowResponse {
+    result: Some(read_metadata_window_response::Result::Success(
+      MetadataReadSuccess {
+        observed_at_unix_ms: 0,
+        refill_floor: Some(100),
+        generation: 1,
+        ..Default::default()
+      },
+    )),
+    ..Default::default()
+  };
+
+  let error = decode_metadata_response(
+    &full_recovery_request(),
+    response,
+    OffsetDateTime::UNIX_EPOCH,
+    Duration::seconds(1),
+  )
+  .unwrap_err();
+
+  assert!(
+    error
+      .to_string()
+      .contains("broker full recovery response has a refill floor")
+  );
+}
+
+#[test]
 fn canonical_shadow_comparison_detects_immutable_metadata_differences() {
   let expected = segment();
 

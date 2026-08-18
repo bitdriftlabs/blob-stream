@@ -3,6 +3,7 @@
 mod tests;
 
 use anyhow::{Result, anyhow, ensure};
+use bd_log_util::warn_every;
 use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
 use blob_stream_metadata_store::{
   MetadataReadConsistency as StoreConsistency,
@@ -30,7 +31,7 @@ use blob_stream_types::{
   TopicWindowKey,
   topic_metadata_window_size,
 };
-use log::{debug, warn};
+use log::debug;
 use moka::future::Cache;
 use parking_lot::Mutex;
 use protobuf::Message;
@@ -40,6 +41,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration as StdDuration;
+use time::ext::NumericalDuration;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::{Notify, Semaphore};
 
@@ -273,6 +275,8 @@ pub struct MetadataCache {
   in_flight: Mutex<HashMap<CacheKey, Arc<PendingRefill>>>,
   active_waiters: Arc<AtomicUsize>,
   refill_permits: Arc<Semaphore>,
+  tail_retained_metrics: RetainedCacheMetrics,
+  recovery_retained_metrics: RetainedCacheMetrics,
   generation: AtomicU64,
   failures: AtomicU64,
   metrics: MetadataCacheMetrics,
@@ -339,6 +343,74 @@ impl MetadataCacheMetrics {
 }
 
 //
+// RetainedCacheMetrics
+//
+
+/// Cheap cache-capacity accounting for Prometheus scrapes.
+///
+/// Moka applies policy maintenance asynchronously, so exact cache introspection belongs to the
+/// admin snapshot. Insertions and eviction callbacks keep these gauges current enough for normal
+/// metrics collection without forcing maintenance in the metadata read hot path.
+#[derive(Clone)]
+struct RetainedCacheMetrics {
+  entries: Arc<AtomicUsize>,
+  retained_bytes: Arc<AtomicU64>,
+  entries_gauge: prometheus::IntGauge,
+  retained_bytes_gauge: prometheus::IntGauge,
+}
+
+impl RetainedCacheMetrics {
+  fn new(entries_gauge: prometheus::IntGauge, retained_bytes_gauge: prometheus::IntGauge) -> Self {
+    Self {
+      entries: Arc::new(AtomicUsize::new(0)),
+      retained_bytes: Arc::new(AtomicU64::new(0)),
+      entries_gauge,
+      retained_bytes_gauge,
+    }
+  }
+
+  fn record_insert(&self, retained_bytes: u32) {
+    self.entries.fetch_add(1, Ordering::Relaxed);
+    self
+      .retained_bytes
+      .fetch_add(u64::from(retained_bytes), Ordering::Relaxed);
+    self.record_gauges();
+  }
+
+  fn record_eviction(&self, retained_bytes: u32) {
+    let _ = self
+      .entries
+      .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |entries| {
+        Some(entries.saturating_sub(1))
+      });
+    let _ = self
+      .retained_bytes
+      .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
+        Some(bytes.saturating_sub(u64::from(retained_bytes)))
+      });
+    self.record_gauges();
+  }
+
+  fn record_exact(&self, entries: u64, retained_bytes: u64) {
+    self.entries.store(
+      usize::try_from(entries).unwrap_or(usize::MAX),
+      Ordering::Relaxed,
+    );
+    self.retained_bytes.store(retained_bytes, Ordering::Relaxed);
+    self.record_gauges();
+  }
+
+  fn record_gauges(&self) {
+    self
+      .entries_gauge
+      .set(i64::try_from(self.entries.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
+    self
+      .retained_bytes_gauge
+      .set(i64::try_from(self.retained_bytes.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
+  }
+}
+
+//
 // MetadataCacheSnapshot
 //
 
@@ -378,19 +450,35 @@ impl MetadataCache {
   ) -> Self {
     let max_refills = config.max_refills;
     let metrics = MetadataCacheMetrics::new(metrics_scope);
+    let tail_retained_metrics = RetainedCacheMetrics::new(
+      metrics.tail_entries.clone(),
+      metrics.tail_retained_bytes.clone(),
+    );
     let tail_evictions = metrics.evictions.clone();
+    let tail_eviction_metrics = tail_retained_metrics.clone();
     let eventual_tail_entries = Cache::builder()
       .max_capacity(config.tail_max_bytes)
       .time_to_idle(CACHE_IDLE_TTL)
       .weigher(|_key: &CacheKey, entry: &Arc<CacheEntry>| entry.retained_bytes)
-      .eviction_listener(move |_key, _entry, _cause| tail_evictions.inc())
+      .eviction_listener(move |_key, entry, _cause| {
+        tail_evictions.inc();
+        tail_eviction_metrics.record_eviction(entry.retained_bytes);
+      })
       .build();
+    let recovery_retained_metrics = RetainedCacheMetrics::new(
+      metrics.recovery_entries.clone(),
+      metrics.recovery_retained_bytes.clone(),
+    );
     let recovery_evictions = metrics.evictions.clone();
+    let recovery_eviction_metrics = recovery_retained_metrics.clone();
     let eventual_recovery_entries = Cache::builder()
       .max_capacity(config.recovery_max_bytes)
       .time_to_idle(CACHE_IDLE_TTL)
       .weigher(|_key: &CacheKey, entry: &Arc<CacheEntry>| entry.retained_bytes)
-      .eviction_listener(move |_key, _entry, _cause| recovery_evictions.inc())
+      .eviction_listener(move |_key, entry, _cause| {
+        recovery_evictions.inc();
+        recovery_eviction_metrics.record_eviction(entry.retained_bytes);
+      })
       .build();
     Self {
       metadata_store,
@@ -400,6 +488,8 @@ impl MetadataCache {
       in_flight: Mutex::new(HashMap::new()),
       active_waiters: Arc::new(AtomicUsize::new(0)),
       refill_permits: Arc::new(Semaphore::new(max_refills)),
+      tail_retained_metrics,
+      recovery_retained_metrics,
       generation: AtomicU64::new(0),
       failures: AtomicU64::new(0),
       metrics,
@@ -564,17 +654,8 @@ impl MetadataCache {
 
       self.metrics.misses.inc();
 
-      let pending = self.join_or_start_refill(&specification);
-      let _waiter = pending.try_add_waiter(
-        Arc::clone(&self.active_waiters),
-        self.config.max_waiters_per_key,
-        self.config.max_waiters,
-      )?;
+      let (pending, _waiter) = self.join_or_start_refill(&specification)?;
       self.metrics.waiters_admitted.inc();
-      self
-        .metrics
-        .active_waiters
-        .set(i64::try_from(self.active_waiters.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
       let entry = pending.wait().await?;
       if entry.covers(&specification) {
         return Ok(LoadedCacheEntry {
@@ -590,11 +671,17 @@ impl MetadataCache {
   fn join_or_start_refill(
     self: &Arc<Self>,
     specification: &ReadSpecification,
-  ) -> Arc<PendingRefill> {
+  ) -> Result<(Arc<PendingRefill>, PendingWaiter)> {
     let mut in_flight = self.in_flight.lock();
     if let Some(pending) = in_flight.get(&specification.key).cloned()
       && !pending.is_complete()
     {
+      let waiter = pending.try_add_waiter(
+        Arc::clone(&self.active_waiters),
+        self.metrics.active_waiters.clone(),
+        self.config.max_waiters_per_key,
+        self.config.max_waiters,
+      )?;
       // Tail requests arriving during the coalescing window lower per-partition bounds before the
       // worker snapshots them, allowing one scan to cover all admitted waiters.
       pending.admit(specification);
@@ -607,7 +694,7 @@ impl MetadataCache {
         specification.coverage,
         specification.partitions.len(),
       );
-      return pending;
+      return Ok((pending, waiter));
     }
 
     // A completed worker can notify a narrower late waiter before it removes itself from the
@@ -616,6 +703,14 @@ impl MetadataCache {
     in_flight.remove(&specification.key);
 
     let pending = Arc::new(PendingRefill::new(specification));
+    // Reserve capacity before publishing or spawning a refill. A rejected unique key must not
+    // create background storage work while the cache is already overloaded.
+    let waiter = pending.try_add_waiter(
+      Arc::clone(&self.active_waiters),
+      self.metrics.active_waiters.clone(),
+      self.config.max_waiters_per_key,
+      self.config.max_waiters,
+    )?;
     in_flight.insert(specification.key.clone(), Arc::clone(&pending));
     debug!(
       "broker metadata cache started pending refill: topic={}, window_start={}, consistency={:?}, \
@@ -652,7 +747,7 @@ impl MetadataCache {
       worker.complete(result);
       cache.remove_pending_refill(&key, &worker);
     });
-    pending
+    Ok((pending, waiter))
   }
 
   fn remove_pending_refill(&self, key: &CacheKey, completed: &Arc<PendingRefill>) {
@@ -709,6 +804,9 @@ impl MetadataCache {
             .eventual_tail_entries
             .insert(specification.key, Arc::clone(&entry))
             .await;
+          self
+            .tail_retained_metrics
+            .record_insert(entry.retained_bytes);
         },
         ReadCoverage::FullRecovery => {
           self.metrics.recovery_baselines.inc();
@@ -717,6 +815,9 @@ impl MetadataCache {
             .eventual_recovery_entries
             .insert(specification.key, Arc::clone(&entry))
             .await;
+          self
+            .recovery_retained_metrics
+            .record_insert(entry.retained_bytes);
         },
       }
     }
@@ -740,21 +841,12 @@ impl MetadataCache {
 
   fn record_cache_state(&self, snapshot: &MetadataCacheSnapshot) {
     self
-      .metrics
-      .tail_entries
-      .set(i64::try_from(snapshot.tail_entry_count).unwrap_or(i64::MAX));
-    self
-      .metrics
-      .recovery_entries
-      .set(i64::try_from(snapshot.recovery_entry_count).unwrap_or(i64::MAX));
-    self
-      .metrics
-      .tail_retained_bytes
-      .set(i64::try_from(snapshot.tail_retained_bytes).unwrap_or(i64::MAX));
-    self
-      .metrics
-      .recovery_retained_bytes
-      .set(i64::try_from(snapshot.recovery_retained_bytes).unwrap_or(i64::MAX));
+      .tail_retained_metrics
+      .record_exact(snapshot.tail_entry_count, snapshot.tail_retained_bytes);
+    self.recovery_retained_metrics.record_exact(
+      snapshot.recovery_entry_count,
+      snapshot.recovery_retained_bytes,
+    );
     self
       .metrics
       .active_waiters
@@ -1015,6 +1107,7 @@ impl PendingRefill {
   fn try_add_waiter(
     self: &Arc<Self>,
     active_waiters: Arc<AtomicUsize>,
+    active_waiters_gauge: prometheus::IntGauge,
     max_waiters_per_key: usize,
     max_waiters: usize,
   ) -> Result<PendingWaiter> {
@@ -1033,9 +1126,12 @@ impl PendingRefill {
       ));
     }
     state.waiter_count = state.waiter_count.saturating_add(1);
+    active_waiters_gauge
+      .set(i64::try_from(active_waiters.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
     Ok(PendingWaiter {
       pending: Arc::clone(self),
       active_waiters,
+      active_waiters_gauge,
     })
   }
 
@@ -1070,6 +1166,7 @@ impl PendingRefill {
 struct PendingWaiter {
   pending: Arc<PendingRefill>,
   active_waiters: Arc<AtomicUsize>,
+  active_waiters_gauge: prometheus::IntGauge,
 }
 
 impl Drop for PendingWaiter {
@@ -1077,6 +1174,9 @@ impl Drop for PendingWaiter {
     let mut state = self.pending.state.lock();
     state.waiter_count = state.waiter_count.saturating_sub(1);
     self.active_waiters.fetch_sub(1, Ordering::Relaxed);
+    self
+      .active_waiters_gauge
+      .set(i64::try_from(self.active_waiters.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
   }
 }
 
@@ -1182,16 +1282,22 @@ fn response_error(
   status: MetadataReadFailureStatus,
   error: impl std::fmt::Display,
 ) -> ReadMetadataWindowResponse {
-  warn!(
+  warn_every!(
+    5.seconds(),
     "broker metadata cache request failed: topic={}, window_start={}, status={status:?}, \
      error={error}",
-    request.topic, request.window_start_unix_seconds
+    request.topic,
+    request.window_start_unix_seconds
   );
   ReadMetadataWindowResponse {
     result: Some(read_metadata_window_response::Result::Failure(
       MetadataReadFailure {
         status: status.into(),
-        error_message: error.to_string().into(),
+        error_message: if status == MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_FAILED {
+          "metadata cache request failed".into()
+        } else {
+          error.to_string().into()
+        },
         ..Default::default()
       },
     )),

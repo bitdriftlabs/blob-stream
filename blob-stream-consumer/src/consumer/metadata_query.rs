@@ -251,6 +251,10 @@ pub(super) fn decode_metadata_response(
       virtual_partition_ids,
       ..
     })) => {
+      ensure!(
+        success.refill_floor.is_none(),
+        "broker full recovery response has a refill floor"
+      );
       let partitions = virtual_partition_ids
         .iter()
         .copied()

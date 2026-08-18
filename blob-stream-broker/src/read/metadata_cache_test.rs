@@ -37,6 +37,8 @@ struct GatedMetadataStore {
   release_scan: Semaphore,
 }
 
+struct FailingMetadataStore;
+
 #[async_trait]
 impl MetadataStore for CountingMetadataStore {
   async fn write_segment(
@@ -82,6 +84,29 @@ impl MetadataStore for GatedMetadataStore {
     self.scan_started.add_permits(1);
     let _permit = self.release_scan.acquire().await.unwrap();
     Ok(self.segments.clone())
+  }
+}
+
+#[async_trait]
+impl MetadataStore for FailingMetadataStore {
+  async fn write_segment(
+    &self,
+    _metadata: SegmentMetadata,
+    _fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
+    _now_ts_ms: i64,
+  ) -> MetadataWriteResult {
+    Ok(())
+  }
+
+  async fn scan_window_from_snowflake(
+    &self,
+    _window: &TopicWindowKey,
+    _min_snowflake: Option<SnowflakeId>,
+    _consistency: StoreConsistency,
+  ) -> Result<Vec<SegmentMetadata>> {
+    Err(anyhow!(
+      "DynamoDB table private-segment-metadata unavailable"
+    ))
   }
 }
 
@@ -340,6 +365,55 @@ async fn narrower_strong_request_after_refill_start_runs_a_follow_up_refill() {
 }
 
 #[tokio::test]
+async fn rejected_waiter_does_not_start_an_unowned_refill() {
+  let store = Arc::new(GatedMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: vec![segment()],
+    scan_started: Semaphore::new(0),
+    release_scan: Semaphore::new(0),
+  });
+  let mut config = cache_config(Duration::seconds(1), StdDuration::ZERO);
+  config.max_waiters = 1;
+  let cache = Arc::new(MetadataCache::new(store.clone(), config));
+
+  let first_cache = cache.clone();
+  let first = tokio::spawn(async move {
+    first_cache
+      .read(tail_request(
+        100,
+        MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL,
+      ))
+      .await
+  });
+  let _first_scan = timeout(StdDuration::from_secs(1), store.scan_started.acquire())
+    .await
+    .unwrap()
+    .unwrap();
+
+  let mut rejected_request = tail_request(
+    100,
+    MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL,
+  );
+  rejected_request.window_start_unix_seconds = 300;
+  let rejected = cache.read(rejected_request).await;
+  let Some(read_metadata_window_response::Result::Failure(failure)) = rejected.result else {
+    panic!("overloaded waiter must receive a failure response");
+  };
+  assert_eq!(
+    failure.status,
+    MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_OVERLOADED.into()
+  );
+  assert_eq!(store.scans.load(Ordering::Relaxed), 1);
+
+  store.release_scan.add_permits(1);
+  assert!(matches!(
+    first.await.unwrap().result,
+    Some(read_metadata_window_response::Result::Success(_))
+  ));
+}
+
+#[tokio::test]
 async fn tail_response_filters_each_partition_at_its_requested_bound() {
   let segments = vec![SegmentMetadata::new(
     TopicWindowKey {
@@ -565,6 +639,33 @@ async fn rejects_oversized_cache_generation_without_retention() {
 }
 
 #[tokio::test]
+async fn sanitizes_internal_storage_failures() {
+  let cache = Arc::new(MetadataCache::new(
+    Arc::new(FailingMetadataStore),
+    cache_config(Duration::seconds(1), StdDuration::ZERO),
+  ));
+
+  let response = cache
+    .read(tail_request(
+      100,
+      MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL,
+    ))
+    .await;
+  let Some(read_metadata_window_response::Result::Failure(failure)) = response.result else {
+    panic!("storage failure must return a failure response");
+  };
+  assert_eq!(
+    failure.status,
+    MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_FAILED.into()
+  );
+  assert_eq!(
+    failure.error_message.to_string(),
+    "metadata cache request failed"
+  );
+  assert!(!failure.error_message.contains("private-segment-metadata"));
+}
+
+#[tokio::test]
 async fn records_cache_hit_miss_refill_and_response_metrics() {
   let collector = Collector::default();
   let metrics = Helper::new_with_collector(collector.clone());
@@ -618,8 +719,13 @@ async fn records_cache_hit_miss_refill_and_response_metrics() {
     &labels!(),
   );
   metrics.assert_gauge_eq(
-    0,
+    1,
     "blob_stream_broker_test:metadata_cache:tail_entries",
+    &labels!(),
+  );
+  metrics.assert_gauge_eq(
+    0,
+    "blob_stream_broker_test:metadata_cache:active_waiters",
     &labels!(),
   );
   let _snapshot = cache.snapshot().await;
