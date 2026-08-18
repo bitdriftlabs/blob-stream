@@ -95,6 +95,11 @@ virtual partition ID. The virtual partition calculation already includes writer 
 broker writer ID is not duplicated in the key. Only the active lease holder can reserve sequences
 and accept writes for that lease key.
 
+Broker configuration sets both the lease duration and the producer-lease heartbeat interval. The
+heartbeat must be shorter than the lease duration; it renews every producer-partition lease owned
+by the broker. Increasing both reduces DynamoDB renewal writes but extends recovery after an
+ungraceful broker loss. Graceful membership changes release moved leases explicitly.
+
 Broker admin state reports its configured writer ID, local membership as `{node_id, address}`,
 and one ownership row per local writer-scoped virtual partition. Each row distinguishes the
 deterministic planned owner from the observed lease holder. Producer state reports the same local

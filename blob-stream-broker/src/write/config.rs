@@ -49,6 +49,7 @@ use tokio::sync::watch;
 const DEFAULT_FLUSH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_FLUSH_MAX_DELAY: Duration = Duration::seconds(1);
 const DEFAULT_LEASE_DURATION: Duration = Duration::seconds(30);
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::seconds(10);
 const DEFAULT_RESERVATION_SIZE: u64 = 10_000;
 const DEFAULT_SEGMENT_TTL_BUFFER: Duration = Duration::hours(1);
 const DEFAULT_LEASE_TTL_BUFFER: Duration = Duration::hours(1);
@@ -74,6 +75,7 @@ pub struct WriteConfig {
   pub flush_max_bytes: u64,
   pub flush_max_delay: Duration,
   pub lease_duration: Duration,
+  pub heartbeat_interval: Duration,
   pub reservation_size: u64,
   pub writer_id: u32,
   pub compression: blob_stream_types::Compression,
@@ -88,6 +90,7 @@ impl WriteConfig {
       flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
       flush_max_delay: DEFAULT_FLUSH_MAX_DELAY,
       lease_duration: DEFAULT_LEASE_DURATION,
+      heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
       reservation_size: DEFAULT_RESERVATION_SIZE,
       writer_id: 0,
       compression: Compression::zstd(DEFAULT_ZSTD_LEVEL),
@@ -110,6 +113,19 @@ impl WriteConfig {
     if let Some(flush_max_delay) = broker.flush_max_delay.as_ref() {
       config.flush_max_delay = flush_max_delay.to_time_duration();
     }
+
+    config.lease_duration = broker
+      .lease_duration
+      .as_ref()
+      .map_or(DEFAULT_LEASE_DURATION, ProtoDurationExt::to_time_duration);
+    config.heartbeat_interval = broker.heartbeat_interval.as_ref().map_or(
+      DEFAULT_HEARTBEAT_INTERVAL,
+      ProtoDurationExt::to_time_duration,
+    );
+    ensure!(
+      config.heartbeat_interval < config.lease_duration,
+      "broker heartbeat_interval must be less than lease_duration"
+    );
 
     if let Some(sequence_reservation_size) = broker.sequence_reservation_size {
       ensure!(

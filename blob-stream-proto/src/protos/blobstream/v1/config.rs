@@ -49,6 +49,10 @@ pub struct BrokerConfig {
     pub fenced_metadata_writes: bool,
     // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.feature_flags)
     pub feature_flags: ::protobuf::MessageField<BrokerFeatureFlagsConfig>,
+    // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.lease_duration)
+    pub lease_duration: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.heartbeat_interval)
+    pub heartbeat_interval: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.BrokerConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -66,7 +70,7 @@ impl BrokerConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(10);
+        let mut fields = ::std::vec::Vec::with_capacity(12);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "flush_max_bytes",
@@ -118,6 +122,16 @@ impl BrokerConfig {
             |m: &BrokerConfig| { &m.feature_flags },
             |m: &mut BrokerConfig| { &mut m.feature_flags },
         ));
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "lease_duration",
+            |m: &BrokerConfig| { &m.lease_duration },
+            |m: &mut BrokerConfig| { &mut m.lease_duration },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "heartbeat_interval",
+            |m: &BrokerConfig| { &m.heartbeat_interval },
+            |m: &mut BrokerConfig| { &mut m.heartbeat_interval },
+        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<BrokerConfig>(
             "BrokerConfig",
             fields,
@@ -166,6 +180,12 @@ impl ::protobuf::Message for BrokerConfig {
                 82 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.feature_flags)?;
                 },
+                90 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.lease_duration)?;
+                },
+                98 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.heartbeat_interval)?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -212,6 +232,14 @@ impl ::protobuf::Message for BrokerConfig {
             let len = v.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
+        if let Some(v) = self.lease_duration.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
+        if let Some(v) = self.heartbeat_interval.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -248,6 +276,12 @@ impl ::protobuf::Message for BrokerConfig {
         if let Some(v) = self.feature_flags.as_ref() {
             ::protobuf::rt::write_message_field_with_cached_size(10, v, os)?;
         }
+        if let Some(v) = self.lease_duration.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(11, v, os)?;
+        }
+        if let Some(v) = self.heartbeat_interval.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(12, v, os)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -275,6 +309,8 @@ impl ::protobuf::Message for BrokerConfig {
         self.sequence_reservation_size = ::std::option::Option::None;
         self.fenced_metadata_writes = false;
         self.feature_flags.clear();
+        self.lease_duration.clear();
+        self.heartbeat_interval.clear();
         self.special_fields.clear();
     }
 
@@ -290,6 +326,8 @@ impl ::protobuf::Message for BrokerConfig {
             sequence_reservation_size: ::std::option::Option::None,
             fenced_metadata_writes: false,
             feature_flags: ::protobuf::MessageField::none(),
+            lease_duration: ::protobuf::MessageField::none(),
+            heartbeat_interval: ::protobuf::MessageField::none(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -4498,7 +4536,7 @@ impl ProducerCompression {
 
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x1ablobstream/v1/config.proto\x12\rblobstream.v1\x1a\x1egoogle/protob\
-    uf/duration.proto\x1a\x17validate/validate.proto\"\xdd\x05\n\x0cBrokerCo\
+    uf/duration.proto\x1a\x17validate/validate.proto\"\xfd\x06\n\x0cBrokerCo\
     nfig\x12&\n\x0fflush_max_bytes\x18\x01\x20\x01(\rR\rflushMaxBytes\x12K\n\
     \x0fflush_max_delay\x18\x02\x20\x01(\x0b2\x19.google.protobuf.DurationR\
     \rflushMaxDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12$\n\tbind_addr\x18\x03\
@@ -4513,134 +4551,137 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     _size\x18\x08\x20\x01(\rH\x02R\x17sequenceReservationSize\x88\x01\x01\
     \x124\n\x16fenced_metadata_writes\x18\t\x20\x01(\x08R\x14fencedMetadataW\
     rites\x12L\n\rfeature_flags\x18\n\x20\x01(\x0b2'.blobstream.v1.BrokerFea\
-    tureFlagsConfigR\x0cfeatureFlagsB\x16\n\x14_segment_compressionB\x0c\n\n\
-    _writer_idB\x1c\n\x1a_sequence_reservation_size\"R\n\x18BrokerFeatureFla\
-    gsConfig\x12\x19\n\x03dir\x18\x01\x20\x01(\tR\x03dirB\x07\xfaB\x04r\x02\
-    \x10\x01\x12\x1b\n\x04file\x18\x02\x20\x01(\tR\x04fileB\x07\xfaB\x04r\
-    \x02\x10\x01\"\x96\x01\n\x18BrokerNodeIdentityConfig\x12&\n\tstatic_id\
-    \x18\x01\x20\x01(\tH\0R\x08staticIdB\x07\xfaB\x04r\x02\x10\x01\x12C\n\
-    \x08hostname\x18\x02\x20\x01(\x0b2%.blobstream.v1.BrokerHostnameIdentity\
-    H\0R\x08hostnameB\r\n\x06source\x12\x03\xf8B\x01\"\x18\n\x16BrokerHostna\
-    meIdentity\"\xc0\x01\n\x15BrokerDiscoveryConfig\x12D\n\x06static\x18\x01\
-    \x20\x01(\x0b2*.blobstream.v1.StaticBrokerDiscoveryConfigH\0R\x06static\
-    \x12Q\n\x0bk8s_service\x18\x02\x20\x01(\x0b2..blobstream.v1.K8sServiceBr\
-    okerDiscoveryConfigH\0R\nk8sServiceB\x0e\n\x07backend\x12\x03\xf8B\x01\"\
-    X\n\x1bStaticBrokerDiscoveryConfig\x129\n\x05nodes\x18\x01\x20\x03(\x0b2\
-    \x19.blobstream.v1.BrokerNodeR\x05nodesB\x08\xfaB\x05\x92\x01\x02\x08\
-    \x01\"Q\n\nBrokerNode\x12\x20\n\x07node_id\x18\x01\x20\x01(\tR\x06nodeId\
-    B\x07\xfaB\x04r\x02\x10\x01\x12!\n\x07address\x18\x02\x20\x01(\tR\x07add\
-    ressB\x07\xfaB\x04r\x02\x10\x01\"t\n\x1fK8sServiceBrokerDiscoveryConfig\
-    \x12%\n\tnamespace\x18\x01\x20\x01(\tR\tnamespaceB\x07\xfaB\x04r\x02\x10\
-    \x01\x12*\n\x0cservice_name\x18\x02\x20\x01(\tR\x0bserviceNameB\x07\xfaB\
-    \x04r\x02\x10\x01\"\x8b\x03\n\x0bTopicConfig\x12\x1b\n\x04name\x18\x01\
-    \x20\x01(\tR\x04nameB\x07\xfaB\x04r\x02\x10\x01\x120\n\x0fpartition_coun\
-    t\x18\x02\x20\x01(\rR\x0epartitionCountB\x07\xfaB\x04*\x02\x20\0\x12(\n\
-    \x0bnum_writers\x18\x03\x20\x01(\rR\nnumWritersB\x07\xfaB\x04*\x02\x20\0\
-    \x12F\n\tretention\x18\x04\x20\x01(\x0b2\x19.google.protobuf.DurationR\t\
-    retentionB\r\xfaB\n\x8a\x01\x02\x10\x01\xaa\x01\x02*\0\x12d\n\x1cmax_met\
-    adata_publication_lag\x18\x05\x20\x01(\x0b2\x19.google.protobuf.Duration\
-    R\x19maxMetadataPublicationLagB\x08\xfaB\x05\xaa\x01\x02*\0\x12U\n\x14me\
-    tadata_window_size\x18\x06\x20\x01(\x0b2\x19.google.protobuf.DurationR\
-    \x12metadataWindowSizeB\x08\xfaB\x05\xaa\x01\x02*\0\"\x19\n\x17InMemoryB\
-    lobStoreConfig\"\x89\x01\n\x11S3BlobStoreConfig\x12\x1f\n\x06bucket\x18\
-    \x01\x20\x01(\tR\x06bucketB\x07\xfaB\x04r\x02\x10\x01\x12\x16\n\x06prefi\
-    x\x18\x02\x20\x01(\tR\x06prefix\x12\x1f\n\x06region\x18\x03\x20\x01(\tR\
-    \x06regionB\x07\xfaB\x04r\x02\x10\x01\x12\x1a\n\x08endpoint\x18\x04\x20\
-    \x01(\tR\x08endpoint\"\x9c\x01\n\x0fBlobStoreConfig\x12E\n\tin_memory\
-    \x18\x01\x20\x01(\x0b2&.blobstream.v1.InMemoryBlobStoreConfigH\0R\x08inM\
-    emory\x122\n\x02s3\x18\x02\x20\x01(\x0b2\x20.blobstream.v1.S3BlobStoreCo\
-    nfigH\0R\x02s3B\x0e\n\x07backend\x12\x03\xf8B\x01\"\x1d\n\x1bInMemoryMet\
-    adataStoreConfig\"\xc1\x04\n\x19DynamoMetadataStoreConfig\x12\x1f\n\x06r\
-    egion\x18\x01\x20\x01(\tR\x06regionB\x07\xfaB\x04r\x02\x10\x01\x12\x1a\n\
-    \x08endpoint\x18\x02\x20\x01(\tR\x08endpoint\x12F\n\x1bsegment_metadata_\
-    table_name\x18\x03\x20\x01(\tR\x18segmentMetadataTableNameB\x07\xfaB\x04\
-    r\x02\x10\x01\x12U\n#producer_partition_lease_table_name\x18\x04\x20\x01\
-    (\tR\x1fproducerPartitionLeaseTableNameB\x07\xfaB\x04r\x02\x10\x01\x12M\
-    \n\x1fconsumer_group_lease_table_name\x18\x05\x20\x01(\tR\x1bconsumerGro\
-    upLeaseTableNameB\x07\xfaB\x04r\x02\x10\x01\x12W\n$consumer_group_member\
-    ship_table_name\x18\x06\x20\x01(\tR\x20consumerGroupMembershipTableNameB\
-    \x07\xfaB\x04r\x02\x10\x01\x12Q\n\x12segment_ttl_buffer\x18\x07\x20\x01(\
-    \x0b2\x19.google.protobuf.DurationR\x10segmentTtlBufferB\x08\xfaB\x05\
-    \xaa\x01\x02*\0\x12M\n\x10lease_ttl_buffer\x18\x08\x20\x01(\x0b2\x19.goo\
-    gle.protobuf.DurationR\x0eleaseTtlBufferB\x08\xfaB\x05\xaa\x01\x02*\0\"\
-    \xb4\x01\n\x13MetadataStoreConfig\x12I\n\tin_memory\x18\x01\x20\x01(\x0b\
-    2*.blobstream.v1.InMemoryMetadataStoreConfigH\0R\x08inMemory\x12B\n\x06d\
-    ynamo\x18\x02\x20\x01(\x0b2(.blobstream.v1.DynamoMetadataStoreConfigH\0R\
-    \x06dynamoB\x0e\n\x07backend\x12\x03\xf8B\x01\"\xaa\x02\n\rRuntimeConfig\
-    \x12=\n\x06broker\x18\x01\x20\x01(\x0b2\x1b.blobstream.v1.BrokerConfigR\
-    \x06brokerB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12<\n\x06topics\x18\x02\
-    \x20\x03(\x0b2\x1a.blobstream.v1.TopicConfigR\x06topicsB\x08\xfaB\x05\
-    \x92\x01\x02\x08\x01\x12G\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobst\
-    ream.v1.BlobStoreConfigR\tblobStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\
-    \x12S\n\x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobstream.v1.Metadata\
-    StoreConfigR\rmetadataStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\"\xf2\x06\
-    \n\x0eProducerConfig\x12\x20\n\twriter_id\x18\x01\x20\x01(\rH\0R\x08writ\
-    erId\x88\x01\x01\x128\n\x11max_batch_records\x18\x02\x20\x01(\rH\x01R\
-    \x0fmaxBatchRecordsB\x07\xfaB\x04*\x02\x20\0\x88\x01\x01\x124\n\x0fmax_b\
-    atch_bytes\x18\x03\x20\x01(\rH\x02R\rmaxBatchBytesB\x07\xfaB\x04*\x02\
-    \x20\0\x88\x01\x01\x12K\n\x0fflush_max_delay\x18\x04\x20\x01(\x0b2\x19.g\
-    oogle.protobuf.DurationR\rflushMaxDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12\
-    M\n\x10retry_base_delay\x18\x06\x20\x01(\x0b2\x19.google.protobuf.Durati\
-    onR\x0eretryBaseDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12K\n\x0fretry_max_d\
-    elay\x18\x07\x20\x01(\x0b2\x19.google.protobuf.DurationR\rretryMaxDelayB\
-    \x08\xfaB\x05\xaa\x01\x02*\0\x12L\n\x0fconnect_timeout\x18\x08\x20\x01(\
-    \x0b2\x19.google.protobuf.DurationR\x0econnectTimeoutB\x08\xfaB\x05\xaa\
-    \x01\x02*\0\x12L\n\x0frequest_timeout\x18\t\x20\x01(\x0b2\x19.google.pro\
-    tobuf.DurationR\x0erequestTimeoutB\x08\xfaB\x05\xaa\x01\x02*\0\x12D\n\
-    \x17max_request_concurrency\x18\n\x20\x01(\x04H\x03R\x15maxRequestConcur\
-    rencyB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x12S\n\x0bcompression\x18\x0b\
-    \x20\x01(\x0e2\".blobstream.v1.ProducerCompressionH\x04R\x0bcompressionB\
-    \x08\xfaB\x05\x82\x01\x02\x10\x01\x88\x01\x01\x12J\n\x0eretry_deadline\
-    \x18\x0c\x20\x01(\x0b2\x19.google.protobuf.DurationR\rretryDeadlineB\x08\
-    \xfaB\x05\xaa\x01\x02*\0B\x0c\n\n_writer_idB\x14\n\x12_max_batch_records\
-    B\x12\n\x10_max_batch_bytesB\x1a\n\x18_max_request_concurrencyB\x0e\n\
-    \x0c_compression\"\xe8\x01\n\x15ProducerRuntimeConfig\x12C\n\x08producer\
-    \x18\x01\x20\x01(\x0b2\x1d.blobstream.v1.ProducerConfigR\x08producerB\
-    \x08\xfaB\x05\x8a\x01\x02\x10\x01\x12L\n\tdiscovery\x18\x02\x20\x01(\x0b\
-    2$.blobstream.v1.BrokerDiscoveryConfigR\tdiscoveryB\x08\xfaB\x05\x8a\x01\
-    \x02\x10\x01\x12<\n\x06topics\x18\x03\x20\x03(\x0b2\x1a.blobstream.v1.To\
-    picConfigR\x06topicsB\x08\xfaB\x05\x92\x01\x02\x08\x01\"\xb2\x05\n\x12Co\
-    nsumerReadConfig\x12\x1d\n\x05topic\x18\x01\x20\x01(\tR\x05topicB\x07\
-    \xfaB\x04r\x02\x10\x01\x12K\n\x0fidle_poll_delay\x18\x04\x20\x01(\x0b2\
-    \x19.google.protobuf.DurationR\ridlePollDelayB\x08\xfaB\x05\xaa\x01\x02*\
-    \0\x12R\n\x13max_idle_poll_delay\x18\x05\x20\x01(\x0b2\x19.google.protob\
-    uf.DurationR\x10maxIdlePollDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12:\n\x12\
-    prefetch_max_bytes\x18\x06\x20\x01(\x04H\0R\x10prefetchMaxBytesB\x07\xfa\
-    B\x042\x02\x20\0\x88\x01\x01\x12_\n\x19metadata_visibility_delay\x18\t\
-    \x20\x01(\x0b2\x19.google.protobuf.DurationR\x17metadataVisibilityDelayB\
-    \x08\xfaB\x05\xaa\x01\x022\0\x12F\n\x19max_in_flight_batch_reads\x18\n\
-    \x20\x01(\x04H\x01R\x15maxInFlightBatchReadsB\x07\xfaB\x042\x02\x20\0\
-    \x88\x01\x01\x12P\n\"strongly_consistent_metadata_reads\x18\x0b\x20\x01(\
-    \x08H\x02R\x1fstronglyConsistentMetadataReads\x88\x01\x01\x12I\n\x0emax_\
-    clock_skew\x18\x0c\x20\x01(\x0b2\x19.google.protobuf.DurationR\x0cmaxClo\
-    ckSkewB\x08\xfaB\x05\xaa\x01\x02*\0B\x15\n\x13_prefetch_max_bytesB\x1c\n\
-    \x1a_max_in_flight_batch_readsB%\n#_strongly_consistent_metadata_reads\"\
-    \xa2\x03\n\x13ConsumerGroupConfig\x12\x1d\n\x05topic\x18\x01\x20\x01(\tR\
-    \x05topicB\x07\xfaB\x04r\x02\x10\x01\x12\"\n\x08group_id\x18\x02\x20\x01\
-    (\tR\x07groupIdB\x07\xfaB\x04r\x02\x10\x01\x12$\n\tmember_id\x18\x03\x20\
-    \x01(\tR\x08memberIdB\x07\xfaB\x04r\x02\x10\x01\x12J\n\x0elease_duration\
-    \x18\x04\x20\x01(\x0b2\x19.google.protobuf.DurationR\rleaseDurationB\x08\
-    \xfaB\x05\xaa\x01\x02*\0\x12R\n\x12heartbeat_interval\x18\x05\x20\x01(\
-    \x0b2\x19.google.protobuf.DurationR\x11heartbeatIntervalB\x08\xfaB\x05\
-    \xaa\x01\x02*\0\x12R\n\x12rebalance_interval\x18\x06\x20\x01(\x0b2\x19.g\
-    oogle.protobuf.DurationR\x11rebalanceIntervalB\x08\xfaB\x05\xaa\x01\x02*\
-    \0\x12#\n\x06pod_id\x18\x07\x20\x01(\tH\0R\x05podIdB\x07\xfaB\x04r\x02\
-    \x10\x01\x88\x01\x01B\t\n\x07_pod_id\"\x9c\x01\n\x15ConsumerRuntimeConfi\
-    g\x12?\n\x04read\x18\x01\x20\x01(\x0b2!.blobstream.v1.ConsumerReadConfig\
-    R\x04readB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12B\n\x05group\x18\x02\x20\
-    \x01(\x0b2\".blobstream.v1.ConsumerGroupConfigR\x05groupB\x08\xfaB\x05\
-    \x8a\x01\x02\x10\x01\"\xc5\x02\n\x1fConsumerIteratorBootstrapConfig\x12H\
-    \n\x07runtime\x18\x01\x20\x01(\x0b2$.blobstream.v1.ConsumerRuntimeConfig\
-    R\x07runtimeB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12:\n\x05topic\x18\x02\
-    \x20\x01(\x0b2\x1a.blobstream.v1.TopicConfigR\x05topicB\x08\xfaB\x05\x8a\
-    \x01\x02\x10\x01\x12G\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobstream\
-    .v1.BlobStoreConfigR\tblobStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12S\n\
-    \x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobstream.v1.MetadataStoreCo\
-    nfigR\rmetadataStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01*P\n\x12SegmentCom\
-    pression\x12\x1c\n\x18SEGMENT_COMPRESSION_NONE\x10\0\x12\x1c\n\x18SEGMEN\
-    T_COMPRESSION_ZSTD\x10\x01*U\n\x13ProducerCompression\x12\x1d\n\x19PRODU\
-    CER_COMPRESSION_NONE\x10\0\x12\x1f\n\x1bPRODUCER_COMPRESSION_SNAPPY\x10\
-    \x01b\x06proto3\
+    tureFlagsConfigR\x0cfeatureFlags\x12J\n\x0elease_duration\x18\x0b\x20\
+    \x01(\x0b2\x19.google.protobuf.DurationR\rleaseDurationB\x08\xfaB\x05\
+    \xaa\x01\x02*\0\x12R\n\x12heartbeat_interval\x18\x0c\x20\x01(\x0b2\x19.g\
+    oogle.protobuf.DurationR\x11heartbeatIntervalB\x08\xfaB\x05\xaa\x01\x02*\
+    \0B\x16\n\x14_segment_compressionB\x0c\n\n_writer_idB\x1c\n\x1a_sequence\
+    _reservation_size\"R\n\x18BrokerFeatureFlagsConfig\x12\x19\n\x03dir\x18\
+    \x01\x20\x01(\tR\x03dirB\x07\xfaB\x04r\x02\x10\x01\x12\x1b\n\x04file\x18\
+    \x02\x20\x01(\tR\x04fileB\x07\xfaB\x04r\x02\x10\x01\"\x96\x01\n\x18Broke\
+    rNodeIdentityConfig\x12&\n\tstatic_id\x18\x01\x20\x01(\tH\0R\x08staticId\
+    B\x07\xfaB\x04r\x02\x10\x01\x12C\n\x08hostname\x18\x02\x20\x01(\x0b2%.bl\
+    obstream.v1.BrokerHostnameIdentityH\0R\x08hostnameB\r\n\x06source\x12\
+    \x03\xf8B\x01\"\x18\n\x16BrokerHostnameIdentity\"\xc0\x01\n\x15BrokerDis\
+    coveryConfig\x12D\n\x06static\x18\x01\x20\x01(\x0b2*.blobstream.v1.Stati\
+    cBrokerDiscoveryConfigH\0R\x06static\x12Q\n\x0bk8s_service\x18\x02\x20\
+    \x01(\x0b2..blobstream.v1.K8sServiceBrokerDiscoveryConfigH\0R\nk8sServic\
+    eB\x0e\n\x07backend\x12\x03\xf8B\x01\"X\n\x1bStaticBrokerDiscoveryConfig\
+    \x129\n\x05nodes\x18\x01\x20\x03(\x0b2\x19.blobstream.v1.BrokerNodeR\x05\
+    nodesB\x08\xfaB\x05\x92\x01\x02\x08\x01\"Q\n\nBrokerNode\x12\x20\n\x07no\
+    de_id\x18\x01\x20\x01(\tR\x06nodeIdB\x07\xfaB\x04r\x02\x10\x01\x12!\n\
+    \x07address\x18\x02\x20\x01(\tR\x07addressB\x07\xfaB\x04r\x02\x10\x01\"t\
+    \n\x1fK8sServiceBrokerDiscoveryConfig\x12%\n\tnamespace\x18\x01\x20\x01(\
+    \tR\tnamespaceB\x07\xfaB\x04r\x02\x10\x01\x12*\n\x0cservice_name\x18\x02\
+    \x20\x01(\tR\x0bserviceNameB\x07\xfaB\x04r\x02\x10\x01\"\x8b\x03\n\x0bTo\
+    picConfig\x12\x1b\n\x04name\x18\x01\x20\x01(\tR\x04nameB\x07\xfaB\x04r\
+    \x02\x10\x01\x120\n\x0fpartition_count\x18\x02\x20\x01(\rR\x0epartitionC\
+    ountB\x07\xfaB\x04*\x02\x20\0\x12(\n\x0bnum_writers\x18\x03\x20\x01(\rR\
+    \nnumWritersB\x07\xfaB\x04*\x02\x20\0\x12F\n\tretention\x18\x04\x20\x01(\
+    \x0b2\x19.google.protobuf.DurationR\tretentionB\r\xfaB\n\x8a\x01\x02\x10\
+    \x01\xaa\x01\x02*\0\x12d\n\x1cmax_metadata_publication_lag\x18\x05\x20\
+    \x01(\x0b2\x19.google.protobuf.DurationR\x19maxMetadataPublicationLagB\
+    \x08\xfaB\x05\xaa\x01\x02*\0\x12U\n\x14metadata_window_size\x18\x06\x20\
+    \x01(\x0b2\x19.google.protobuf.DurationR\x12metadataWindowSizeB\x08\xfaB\
+    \x05\xaa\x01\x02*\0\"\x19\n\x17InMemoryBlobStoreConfig\"\x89\x01\n\x11S3\
+    BlobStoreConfig\x12\x1f\n\x06bucket\x18\x01\x20\x01(\tR\x06bucketB\x07\
+    \xfaB\x04r\x02\x10\x01\x12\x16\n\x06prefix\x18\x02\x20\x01(\tR\x06prefix\
+    \x12\x1f\n\x06region\x18\x03\x20\x01(\tR\x06regionB\x07\xfaB\x04r\x02\
+    \x10\x01\x12\x1a\n\x08endpoint\x18\x04\x20\x01(\tR\x08endpoint\"\x9c\x01\
+    \n\x0fBlobStoreConfig\x12E\n\tin_memory\x18\x01\x20\x01(\x0b2&.blobstrea\
+    m.v1.InMemoryBlobStoreConfigH\0R\x08inMemory\x122\n\x02s3\x18\x02\x20\
+    \x01(\x0b2\x20.blobstream.v1.S3BlobStoreConfigH\0R\x02s3B\x0e\n\x07backe\
+    nd\x12\x03\xf8B\x01\"\x1d\n\x1bInMemoryMetadataStoreConfig\"\xc1\x04\n\
+    \x19DynamoMetadataStoreConfig\x12\x1f\n\x06region\x18\x01\x20\x01(\tR\
+    \x06regionB\x07\xfaB\x04r\x02\x10\x01\x12\x1a\n\x08endpoint\x18\x02\x20\
+    \x01(\tR\x08endpoint\x12F\n\x1bsegment_metadata_table_name\x18\x03\x20\
+    \x01(\tR\x18segmentMetadataTableNameB\x07\xfaB\x04r\x02\x10\x01\x12U\n#p\
+    roducer_partition_lease_table_name\x18\x04\x20\x01(\tR\x1fproducerPartit\
+    ionLeaseTableNameB\x07\xfaB\x04r\x02\x10\x01\x12M\n\x1fconsumer_group_le\
+    ase_table_name\x18\x05\x20\x01(\tR\x1bconsumerGroupLeaseTableNameB\x07\
+    \xfaB\x04r\x02\x10\x01\x12W\n$consumer_group_membership_table_name\x18\
+    \x06\x20\x01(\tR\x20consumerGroupMembershipTableNameB\x07\xfaB\x04r\x02\
+    \x10\x01\x12Q\n\x12segment_ttl_buffer\x18\x07\x20\x01(\x0b2\x19.google.p\
+    rotobuf.DurationR\x10segmentTtlBufferB\x08\xfaB\x05\xaa\x01\x02*\0\x12M\
+    \n\x10lease_ttl_buffer\x18\x08\x20\x01(\x0b2\x19.google.protobuf.Duratio\
+    nR\x0eleaseTtlBufferB\x08\xfaB\x05\xaa\x01\x02*\0\"\xb4\x01\n\x13Metadat\
+    aStoreConfig\x12I\n\tin_memory\x18\x01\x20\x01(\x0b2*.blobstream.v1.InMe\
+    moryMetadataStoreConfigH\0R\x08inMemory\x12B\n\x06dynamo\x18\x02\x20\x01\
+    (\x0b2(.blobstream.v1.DynamoMetadataStoreConfigH\0R\x06dynamoB\x0e\n\x07\
+    backend\x12\x03\xf8B\x01\"\xaa\x02\n\rRuntimeConfig\x12=\n\x06broker\x18\
+    \x01\x20\x01(\x0b2\x1b.blobstream.v1.BrokerConfigR\x06brokerB\x08\xfaB\
+    \x05\x8a\x01\x02\x10\x01\x12<\n\x06topics\x18\x02\x20\x03(\x0b2\x1a.blob\
+    stream.v1.TopicConfigR\x06topicsB\x08\xfaB\x05\x92\x01\x02\x08\x01\x12G\
+    \n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobstream.v1.BlobStoreConfigR\
+    \tblobStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12S\n\x0emetadata_store\
+    \x18\x04\x20\x01(\x0b2\".blobstream.v1.MetadataStoreConfigR\rmetadataSto\
+    reB\x08\xfaB\x05\x8a\x01\x02\x10\x01\"\xf2\x06\n\x0eProducerConfig\x12\
+    \x20\n\twriter_id\x18\x01\x20\x01(\rH\0R\x08writerId\x88\x01\x01\x128\n\
+    \x11max_batch_records\x18\x02\x20\x01(\rH\x01R\x0fmaxBatchRecordsB\x07\
+    \xfaB\x04*\x02\x20\0\x88\x01\x01\x124\n\x0fmax_batch_bytes\x18\x03\x20\
+    \x01(\rH\x02R\rmaxBatchBytesB\x07\xfaB\x04*\x02\x20\0\x88\x01\x01\x12K\n\
+    \x0fflush_max_delay\x18\x04\x20\x01(\x0b2\x19.google.protobuf.DurationR\
+    \rflushMaxDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12M\n\x10retry_base_delay\
+    \x18\x06\x20\x01(\x0b2\x19.google.protobuf.DurationR\x0eretryBaseDelayB\
+    \x08\xfaB\x05\xaa\x01\x02*\0\x12K\n\x0fretry_max_delay\x18\x07\x20\x01(\
+    \x0b2\x19.google.protobuf.DurationR\rretryMaxDelayB\x08\xfaB\x05\xaa\x01\
+    \x02*\0\x12L\n\x0fconnect_timeout\x18\x08\x20\x01(\x0b2\x19.google.proto\
+    buf.DurationR\x0econnectTimeoutB\x08\xfaB\x05\xaa\x01\x02*\0\x12L\n\x0fr\
+    equest_timeout\x18\t\x20\x01(\x0b2\x19.google.protobuf.DurationR\x0erequ\
+    estTimeoutB\x08\xfaB\x05\xaa\x01\x02*\0\x12D\n\x17max_request_concurrenc\
+    y\x18\n\x20\x01(\x04H\x03R\x15maxRequestConcurrencyB\x07\xfaB\x042\x02\
+    \x20\0\x88\x01\x01\x12S\n\x0bcompression\x18\x0b\x20\x01(\x0e2\".blobstr\
+    eam.v1.ProducerCompressionH\x04R\x0bcompressionB\x08\xfaB\x05\x82\x01\
+    \x02\x10\x01\x88\x01\x01\x12J\n\x0eretry_deadline\x18\x0c\x20\x01(\x0b2\
+    \x19.google.protobuf.DurationR\rretryDeadlineB\x08\xfaB\x05\xaa\x01\x02*\
+    \0B\x0c\n\n_writer_idB\x14\n\x12_max_batch_recordsB\x12\n\x10_max_batch_\
+    bytesB\x1a\n\x18_max_request_concurrencyB\x0e\n\x0c_compression\"\xe8\
+    \x01\n\x15ProducerRuntimeConfig\x12C\n\x08producer\x18\x01\x20\x01(\x0b2\
+    \x1d.blobstream.v1.ProducerConfigR\x08producerB\x08\xfaB\x05\x8a\x01\x02\
+    \x10\x01\x12L\n\tdiscovery\x18\x02\x20\x01(\x0b2$.blobstream.v1.BrokerDi\
+    scoveryConfigR\tdiscoveryB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12<\n\x06to\
+    pics\x18\x03\x20\x03(\x0b2\x1a.blobstream.v1.TopicConfigR\x06topicsB\x08\
+    \xfaB\x05\x92\x01\x02\x08\x01\"\xb2\x05\n\x12ConsumerReadConfig\x12\x1d\
+    \n\x05topic\x18\x01\x20\x01(\tR\x05topicB\x07\xfaB\x04r\x02\x10\x01\x12K\
+    \n\x0fidle_poll_delay\x18\x04\x20\x01(\x0b2\x19.google.protobuf.Duration\
+    R\ridlePollDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12R\n\x13max_idle_poll_de\
+    lay\x18\x05\x20\x01(\x0b2\x19.google.protobuf.DurationR\x10maxIdlePollDe\
+    layB\x08\xfaB\x05\xaa\x01\x02*\0\x12:\n\x12prefetch_max_bytes\x18\x06\
+    \x20\x01(\x04H\0R\x10prefetchMaxBytesB\x07\xfaB\x042\x02\x20\0\x88\x01\
+    \x01\x12_\n\x19metadata_visibility_delay\x18\t\x20\x01(\x0b2\x19.google.\
+    protobuf.DurationR\x17metadataVisibilityDelayB\x08\xfaB\x05\xaa\x01\x022\
+    \0\x12F\n\x19max_in_flight_batch_reads\x18\n\x20\x01(\x04H\x01R\x15maxIn\
+    FlightBatchReadsB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x12P\n\"strongly_c\
+    onsistent_metadata_reads\x18\x0b\x20\x01(\x08H\x02R\x1fstronglyConsisten\
+    tMetadataReads\x88\x01\x01\x12I\n\x0emax_clock_skew\x18\x0c\x20\x01(\x0b\
+    2\x19.google.protobuf.DurationR\x0cmaxClockSkewB\x08\xfaB\x05\xaa\x01\
+    \x02*\0B\x15\n\x13_prefetch_max_bytesB\x1c\n\x1a_max_in_flight_batch_rea\
+    dsB%\n#_strongly_consistent_metadata_reads\"\xa2\x03\n\x13ConsumerGroupC\
+    onfig\x12\x1d\n\x05topic\x18\x01\x20\x01(\tR\x05topicB\x07\xfaB\x04r\x02\
+    \x10\x01\x12\"\n\x08group_id\x18\x02\x20\x01(\tR\x07groupIdB\x07\xfaB\
+    \x04r\x02\x10\x01\x12$\n\tmember_id\x18\x03\x20\x01(\tR\x08memberIdB\x07\
+    \xfaB\x04r\x02\x10\x01\x12J\n\x0elease_duration\x18\x04\x20\x01(\x0b2\
+    \x19.google.protobuf.DurationR\rleaseDurationB\x08\xfaB\x05\xaa\x01\x02*\
+    \0\x12R\n\x12heartbeat_interval\x18\x05\x20\x01(\x0b2\x19.google.protobu\
+    f.DurationR\x11heartbeatIntervalB\x08\xfaB\x05\xaa\x01\x02*\0\x12R\n\x12\
+    rebalance_interval\x18\x06\x20\x01(\x0b2\x19.google.protobuf.DurationR\
+    \x11rebalanceIntervalB\x08\xfaB\x05\xaa\x01\x02*\0\x12#\n\x06pod_id\x18\
+    \x07\x20\x01(\tH\0R\x05podIdB\x07\xfaB\x04r\x02\x10\x01\x88\x01\x01B\t\n\
+    \x07_pod_id\"\x9c\x01\n\x15ConsumerRuntimeConfig\x12?\n\x04read\x18\x01\
+    \x20\x01(\x0b2!.blobstream.v1.ConsumerReadConfigR\x04readB\x08\xfaB\x05\
+    \x8a\x01\x02\x10\x01\x12B\n\x05group\x18\x02\x20\x01(\x0b2\".blobstream.\
+    v1.ConsumerGroupConfigR\x05groupB\x08\xfaB\x05\x8a\x01\x02\x10\x01\"\xc5\
+    \x02\n\x1fConsumerIteratorBootstrapConfig\x12H\n\x07runtime\x18\x01\x20\
+    \x01(\x0b2$.blobstream.v1.ConsumerRuntimeConfigR\x07runtimeB\x08\xfaB\
+    \x05\x8a\x01\x02\x10\x01\x12:\n\x05topic\x18\x02\x20\x01(\x0b2\x1a.blobs\
+    tream.v1.TopicConfigR\x05topicB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12G\n\
+    \nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobstream.v1.BlobStoreConfigR\tb\
+    lobStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12S\n\x0emetadata_store\x18\
+    \x04\x20\x01(\x0b2\".blobstream.v1.MetadataStoreConfigR\rmetadataStoreB\
+    \x08\xfaB\x05\x8a\x01\x02\x10\x01*P\n\x12SegmentCompression\x12\x1c\n\
+    \x18SEGMENT_COMPRESSION_NONE\x10\0\x12\x1c\n\x18SEGMENT_COMPRESSION_ZSTD\
+    \x10\x01*U\n\x13ProducerCompression\x12\x1d\n\x19PRODUCER_COMPRESSION_NO\
+    NE\x10\0\x12\x1f\n\x1bPRODUCER_COMPRESSION_SNAPPY\x10\x01b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
