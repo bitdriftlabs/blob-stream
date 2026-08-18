@@ -17,6 +17,7 @@ use super::{
 use anyhow::Result;
 use async_trait::async_trait;
 use bd_server_stats::stats::{Collector, Scope};
+use bd_server_stats::test::util::stats::Helper;
 use bd_shutdown::ComponentShutdownTrigger;
 use bd_time::TimeProvider;
 use blob_stream_blob_store::{
@@ -55,6 +56,7 @@ use blob_stream_types::{
   offset_datetime_from_unix_millis,
 };
 use bytes::Bytes;
+use prometheus::labels;
 use protobuf::Chars;
 use serde_json::to_value;
 use std::collections::HashMap;
@@ -2330,6 +2332,9 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
     now_ms,
   )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
+  let collector = Collector::default();
+  let metrics = Helper::new_with_collector(collector.clone());
+  let scope = collector.scope("blob_stream_broker_test");
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1_024;
   config.flush_max_delay = TimeDuration::milliseconds(10);
@@ -2364,7 +2369,7 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
       Arc::new(InMemoryProducerPartitionLeaseStore::new()),
       "test-node".to_string(),
       shutdown_trigger.make_handle(),
-      &metrics_scope(),
+      &scope,
     )
     .time_provider(time_provider.clone())
     .build()?,
@@ -2412,6 +2417,11 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
       .zip(0 .. 4)
       .all(|(key, expected_topic)| key.contains(&format!("topic-{expected_topic}/")))
   );
+  metrics.assert_gauge_eq(
+    4,
+    "blob_stream_broker_test:write:active_flush_plans",
+    &labels!(),
+  );
   release.add_permits(1);
   assert!(
     receive_blob_write(&mut entered_rx)
@@ -2423,6 +2433,11 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
   for write in writes {
     write.await??;
   }
+  metrics.assert_gauge_eq(
+    0,
+    "blob_stream_broker_test:write:active_flush_plans",
+    &labels!(),
+  );
   Ok(())
 }
 

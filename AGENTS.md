@@ -64,6 +64,8 @@ Follow [plans/TEST_AUDIT.md](plans/TEST_AUDIT.md). In addition:
 
 - Add focused debug or trace logs around unclear asynchronous, concurrent, or lifecycle transitions.
   Keep logs that provide durable operational observability.
+- Assert metrics in tests through `bd_server_stats::test::util::stats::Helper`; do not serialize
+  Prometheus output and match raw text.
 - Exported OTEL spans support at most 16 attributes. Put additional correlated recovery or handoff
   state in a bounded JSON attribute such as `recovery.summary_json` or `handoff.snapshot_json`.
 - Add a metric only when it has operational value that cannot be derived from existing metrics.

@@ -1,14 +1,10 @@
-use super::{
-  BrokerGrpc,
-  BrokerGrpcMetrics,
-  MAX_CONCURRENT_BATCHES_PER_GROUPED_REQUEST,
-  produce_request_config,
-};
+use super::{BrokerGrpc, BrokerGrpcMetrics, produce_request_config};
 use crate::write::{AdmissionController, TopicInfo, WriteConfig, WriteEngineBuilder};
 use anyhow::Result;
 use async_trait::async_trait;
 use bd_grpc::Handler;
 use bd_server_stats::stats::Collector;
+use bd_server_stats::test::util::stats::Helper;
 use bd_shutdown::ComponentShutdownTrigger;
 use blob_stream_blob_store::InMemoryBlobStore;
 use blob_stream_metadata_store::{InMemoryMetadataStore, InMemoryProducerPartitionLeaseStore};
@@ -20,6 +16,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::{MAX_PRODUCE_BATCHES_REQUEST_BYTES, SeqRange, new_record};
 use http::{Extensions, HeaderMap};
+use prometheus::labels;
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
@@ -412,13 +409,13 @@ async fn produces_batched_results_in_request_order() -> Result<()> {
 }
 
 #[tokio::test]
-async fn limits_concurrent_batches_per_grouped_request() -> Result<()> {
+async fn starts_all_batches_in_grouped_request_concurrently() -> Result<()> {
   let collector = Collector::default();
+  let metrics = Helper::new_with_collector(collector.clone());
   let scope = collector.scope("blob_stream_broker_test");
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
   let release = Arc::new(Semaphore::new(0));
-  let max_concurrent_batches = u32::try_from(MAX_CONCURRENT_BATCHES_PER_GROUPED_REQUEST)
-    .expect("grouped batch concurrency limit fits in u32");
+  let batch_count = 17;
   let grpc = Arc::new(BrokerGrpc::new(
     Arc::new(GatedWriteEngine {
       entered_tx,
@@ -427,7 +424,7 @@ async fn limits_concurrent_batches_per_grouped_request() -> Result<()> {
     &scope,
   ));
   let request = ProduceBatchesRequest {
-    batches: (0 ..= max_concurrent_batches)
+    batches: (0 .. batch_count)
       .map(|virtual_partition_id| ProduceBatchRequest {
         topic: "telemetry".into(),
         virtual_partition_id,
@@ -449,20 +446,37 @@ async fn limits_concurrent_batches_per_grouped_request() -> Result<()> {
     .await
   });
 
-  for virtual_partition_id in 0 .. max_concurrent_batches {
+  for virtual_partition_id in 0 .. batch_count {
     assert_eq!(entered_rx.recv().await, Some(virtual_partition_id));
   }
   assert!(entered_rx.try_recv().is_err());
-  let metrics = String::from_utf8(collector.prometheus_output())?;
-  assert!(metrics.contains("blob_stream_broker_test:grpc:active_batches 16"));
+  metrics.assert_gauge_eq(
+    17,
+    "blob_stream_broker_test:grpc:active_batches",
+    &labels!(),
+  );
 
-  release.add_permits(MAX_CONCURRENT_BATCHES_PER_GROUPED_REQUEST);
-  assert_eq!(entered_rx.recv().await, Some(max_concurrent_batches));
-  release.add_permits(1);
+  release.add_permits(batch_count as usize);
 
-  assert_eq!(
-    handle.await??.results.len(),
-    MAX_CONCURRENT_BATCHES_PER_GROUPED_REQUEST + 1
+  let response = handle.await??;
+  assert_eq!(response.results.len(), batch_count as usize);
+  assert!(
+    response
+      .results
+      .iter()
+      .all(|response| { response.status == ProduceStatus::PRODUCE_STATUS_OK.into() })
+  );
+
+  metrics.assert_gauge_eq(0, "blob_stream_broker_test:grpc:active_batches", &labels!());
+  metrics.assert_histogram_count(
+    1,
+    "blob_stream_broker_test:grpc:grouped_request_batches",
+    &labels!(),
+  );
+  metrics.assert_histogram_count(
+    1,
+    "blob_stream_broker_test:grpc:grouped_request_latency_seconds",
+    &labels!(),
   );
   Ok(())
 }
