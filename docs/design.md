@@ -199,8 +199,9 @@ invariant.
    route map but do not force an early drain; completed dispatches only advance queued work under
    the request-concurrency limit. The producer dispatches RPCs concurrently up to its configured
    request limit and does not preserve producer submission order, including within one virtual
-   partition. The broker assigns sequence ranges in the order that it accepts requests and
-   preserves that durable order.
+  partition. The broker starts all logical batches in a grouped request concurrently and returns
+  their results in request order. It assigns sequence ranges in the order that it accepts
+  requests and preserves that durable order.
 3. `ProduceBatches` returns one ordered result per submitted partition batch. The producer
    resolves successful entries independently and retries only entries that were rejected or whose
    request outcome is ambiguous. It retains the legacy `ProduceBatch` RPC only for a staged
@@ -216,7 +217,9 @@ invariant.
    blobs and fewer metadata rows. Byte-threshold and lease-drain flushes remain partition-local.
    A partition with a durable plan in progress continues buffering its next epoch until that prior
    plan completes. A single bounded flush scheduler wakes for eligible writes, timer ticks, and
-   durable-plan completions; a completion immediately promotes an eligible successor epoch.
+  durable-plan completions; a completion immediately promotes an eligible successor epoch. It
+  runs at most four durable flush plans concurrently; `write:active_flush_plans` reports its
+  current occupancy.
 6. A flush coalesces each virtual partition's accepted batches into one `StoredRecordBatch`,
   compresses each serialized partition batch independently, concatenates the stored bytes into a
   segment blob, uploads the blob, and then writes the segment metadata row. With fenced metadata
