@@ -17,6 +17,7 @@ aws-sdk-dynamodb.workspace        = true
 aws-sdk-s3.workspace              = true
 aws-types.workspace               = true
 axum.workspace                    = true
+bd-runtime-config.workspace       = true
 bd-server-stats.workspace         = true
 bd-shutdown.workspace             = true
 bd-test-helpers-core.workspace    = true

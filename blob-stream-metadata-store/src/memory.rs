@@ -54,7 +54,7 @@ impl MetadataStore for InMemoryMetadataStore {
       offset_datetime_from_unix_seconds(metadata.window.window_start_unix_seconds),
       metadata.snowflake_id.as_u64()
     );
-    let encoded = crate::codec::encode(metadata)?;
+    let encoded = crate::codec::encode(&metadata)?;
     let mut guard = self.windows.write();
     guard
       .entry(encoded.partition_key.clone())

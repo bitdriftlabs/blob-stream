@@ -57,6 +57,17 @@ message BrokerConfig {
   // Interval for renewing assigned producer-partition leases. Default when unset: 10 seconds.
   // This must be shorter than lease_duration.
   google.protobuf.Duration heartbeat_interval = 12 [(validate.rules).duration.gt = {}];
+
+  // Maximum retained broker metadata-cache bytes. Default when unset: 64 MiB.
+  optional uint64 metadata_cache_max_bytes = 14 [(validate.rules).uint64.gt = 0];
+
+  // Maximum time to collect compatible metadata reads before a cache refill. Default when unset:
+  // 250 ms. Set zero to retain only naturally concurrent singleflight collapsing.
+  google.protobuf.Duration metadata_cache_coalescing_window = 15 [(validate.rules).duration.gte = {}];
+
+  // Deadline for one metadata-cache RPC, including coalescing, DynamoDB, and encoding. Default
+  // when unset: 5 seconds.
+  google.protobuf.Duration metadata_cache_request_timeout = 16 [(validate.rules).duration.gt = {}];
 }
 
 // Filesystem paths used to reload broker feature flags.
@@ -170,6 +181,11 @@ message TopicConfig {
   //   scans, accepting coarser scan buckets.
   //
   google.protobuf.Duration metadata_window_size = 6 [(validate.rules).duration.gt = {}];
+
+  // Maximum age of retained eventual broker metadata. Default when unset: 250 ms. This shared
+  // topic contract is included in consumer availability planning and enforced by brokers before
+  // serving a cache hit.
+  google.protobuf.Duration metadata_cache_max_age = 7 [(validate.rules).duration.gte = {}];
 }
 
 // In-memory blob store configuration (used for tests/local runs).
@@ -413,4 +429,8 @@ message ConsumerIteratorBootstrapConfig {
 
   // Metadata and lease storage backend used by reads/coordination.
   MetadataStoreConfig metadata_store = 4 [(validate.rules).message.required = true];
+
+  // Broker discovery used by the optional consumer-side broker metadata-cache feature.
+  // Discovery is always configured so the feature can be enabled without rebuilding consumers.
+  BrokerDiscoveryConfig broker_discovery = 5 [(validate.rules).message.required = true];
 }

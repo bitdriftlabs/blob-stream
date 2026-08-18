@@ -2,12 +2,16 @@ syntax = "proto3";
 
 package blobstream.v1;
 
+import "blobstream/v1/metadata.proto";
+
 // Broker gRPC API used by producers to append batches of records.
 service BrokerService {
   // Append a batch of records to a virtual partition and report persisted acceptance status.
   rpc ProduceBatch(ProduceBatchRequest) returns (ProduceBatchResponse);
   // Append multiple topic/virtual-partition batches to this broker.
   rpc ProduceBatches(ProduceBatchesRequest) returns (ProduceBatchesResponse);
+  // Read bounded segment metadata for one topic window through the local broker cache.
+  rpc ReadMetadataWindow(ReadMetadataWindowRequest) returns (ReadMetadataWindowResponse);
 }
 
 // A single record in a producer batch.
@@ -68,4 +72,97 @@ enum ProduceStatus {
   PRODUCE_STATUS_OVERLOADED = 3;
   // Request is invalid; producer should not retry it.
   PRODUCE_STATUS_BAD_REQUEST = 4;
+}
+
+// DynamoDB consistency required for one broker metadata read.
+enum MetadataReadConsistency {
+  METADATA_READ_CONSISTENCY_EVENTUAL = 0;
+  METADATA_READ_CONSISTENCY_STRONG = 1;
+}
+
+// Failure class for one broker metadata read.
+enum MetadataReadFailureStatus {
+  // The request does not satisfy the metadata-cache contract and must not be retried unchanged.
+  METADATA_READ_FAILURE_STATUS_BAD_REQUEST = 0;
+  // The broker could not finish within its capacity or deadline budget; callers may retry.
+  METADATA_READ_FAILURE_STATUS_OVERLOADED = 1;
+  // The broker failed while reading or encoding metadata; callers may retry or fall back.
+  METADATA_READ_FAILURE_STATUS_FAILED = 2;
+}
+
+// One virtual partition's inclusive lower Snowflake bound for a live-tail request.
+message MetadataPartitionBound {
+  // Virtual partition whose metadata must be included in the response.
+  uint32 virtual_partition_id = 1;
+  // Inclusive Snowflake lower bound for this virtual partition.
+  uint64 min_snowflake = 2;
+}
+
+// Live-tail request coverage. The broker returns metadata at or after each partition's bound.
+message TailMetadataCoverage {
+  // One bound for every requested virtual partition. Duplicate partition identifiers are invalid.
+  repeated MetadataPartitionBound partition_bounds = 1;
+}
+
+// Recovery request coverage. The broker returns the complete window for these partitions.
+message FullRecoveryMetadataCoverage {
+  // Requested virtual partitions. Duplicate partition identifiers are invalid.
+  repeated uint32 virtual_partition_ids = 1;
+}
+
+// Broker metadata cache request for one aligned topic window.
+message ReadMetadataWindowRequest {
+  // Topic that owns the aligned metadata window.
+  string topic = 1;
+  // Start of the metadata window in Unix seconds. It must align to the topic window size.
+  int64 window_start_unix_seconds = 2;
+  // DynamoDB consistency required when the broker refills this coverage.
+  MetadataReadConsistency consistency = 3;
+  // Exactly one coverage mode is required. Tail bounds and recovery partitions are intentionally
+  // separate because only a tail request has Snowflake lower bounds.
+  oneof coverage {
+    TailMetadataCoverage tail = 5;
+    FullRecoveryMetadataCoverage full_recovery = 6;
+  }
+  // The caller's response budget. The server additionally enforces its configured maximum.
+  uint64 max_response_bytes = 7;
+}
+
+// Metadata row returned by a broker read.
+message BrokerSegmentMetadata {
+  // Snowflake identifier used to order rows and apply tail lower bounds.
+  uint64 snowflake_id = 1;
+  // Lossless segment metadata payload used by the consumer read path.
+  SegmentMetadataV1 metadata = 2;
+}
+
+// Successful broker metadata read result.
+message MetadataReadSuccess {
+  // Broker wall-clock time at which the backing store observation completed, in Unix milliseconds.
+  int64 observed_at_unix_ms = 1;
+  // Lowest Snowflake included by the backing-store refill, when the result is tail coverage.
+  optional uint64 refill_floor = 2;
+  // Monotonic broker-local cache generation that produced this result.
+  uint64 generation = 3;
+  // True when an eventual result came from retained cache coverage instead of a fresh refill.
+  bool retained_coverage = 4;
+  // Segment rows matching the requested partition coverage and caller response budget.
+  repeated BrokerSegmentMetadata segments = 5;
+}
+
+// Failed broker metadata read result.
+message MetadataReadFailure {
+  // Typed failure class for fallback and retry decisions.
+  MetadataReadFailureStatus status = 1;
+  // Diagnostic detail. It is not stable for programmatic matching.
+  string error_message = 2;
+}
+
+// Broker metadata cache response for one bounded request.
+message ReadMetadataWindowResponse {
+  // Exactly one result branch is present. A missing result is an invalid response.
+  oneof result {
+    MetadataReadSuccess success = 1;
+    MetadataReadFailure failure = 2;
+  }
 }

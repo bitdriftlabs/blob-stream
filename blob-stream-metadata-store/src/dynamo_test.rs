@@ -327,7 +327,7 @@ async fn skips_noncompliant_segment_rows() -> Result<()> {
   );
   let valid = build_segment("topic-a", 100, 2);
   store.write_segment(valid.clone(), None, 0).await?;
-  let encoded = crate::codec::encode(valid.clone())?;
+  let encoded = crate::codec::encode(&valid)?;
   let mut invalid_metadata = SegmentMetadataV1::parse_from_tokio_bytes(&encoded.payload)?;
   invalid_metadata.partitions[0].batches[0].byte_end = 0;
   client

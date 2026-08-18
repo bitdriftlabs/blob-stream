@@ -25,11 +25,14 @@ metadata. The broker returns a retryable failure. There is no unfenced fallback 
 ## Runtime Feature Flags
 
 Feature flags are local process controls. `TopicConfig.metadata_window_size` defines the durable
-metadata-key layout used by broker publication and consumer scans.
+metadata-key layout used by broker publication and consumer scans. Broker metadata caching is
+always served and `ConsumerIteratorBootstrapConfig.broker_discovery` is required; consumer flags
+alone select direct, shadow, or broker-delivery reads.
 
 | Scope | Flags | Adoption | Operational effect |
 | --- | --- | --- | --- |
-| Consumer reader | `blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads` | Live | Changes metadata-read consistency, prefetch target, or concurrent blob reads for subsequent reader work. |
+| Consumer reader | `blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads`, `blob_stream_consumer_broker_metadata_cache_enabled`, `blob_stream_consumer_broker_metadata_cache_shadow` | Live | Enables broker-collapsed metadata reads or shadow validation. Delivery remains direct in shadow mode and falls back directly on broker failure. |
+| Broker metadata-cache startup | `blob_stream_broker_metadata_recovery_cache_max_bytes`, `blob_stream_broker_metadata_cache_max_waiters_per_key`, `blob_stream_broker_metadata_cache_max_waiters`, `blob_stream_broker_metadata_cache_max_refills`, `blob_stream_broker_metadata_cache_max_request_partitions`, `blob_stream_broker_metadata_cache_max_response_items`, `blob_stream_broker_metadata_cache_max_response_bytes`, `blob_stream_broker_metadata_cache_max_entry_items` | Restart the broker | Overrides the internal cache defaults when a feature-flag loader is configured. Values must be positive; the per-key waiter limit cannot exceed the global waiter limit, and the response-byte limit is capped at the gRPC request maximum. |
 | Consumer startup | `blob_stream_consumer_idle_poll_delay_ms`, `blob_stream_consumer_max_idle_poll_delay_ms`, `blob_stream_consumer_lease_duration_ms`, `blob_stream_consumer_heartbeat_interval_ms`, `blob_stream_consumer_rebalance_interval_ms` | Rebuild or restart the iterator | Changes local polling and consumer-group scheduling. Persistent lease state stores absolute expiry timestamps, so members may use different local durations. |
 | Producer startup | `blob_stream_producer_max_batch_records`, `blob_stream_producer_max_batch_bytes`, `blob_stream_producer_flush_max_delay_ms`, `blob_stream_producer_retry_base_delay_ms`, `blob_stream_producer_retry_max_delay_ms`, `blob_stream_producer_connect_timeout_ms`, `blob_stream_producer_request_timeout_ms`, `blob_stream_producer_max_request_concurrency`, `blob_stream_producer_compression` | Recreate or restart the producer | Changes local batching, retry, request, concurrency, and compression behavior. |
 
@@ -45,6 +48,7 @@ The broker listener serves gRPC plus these HTTP endpoints:
 | --- | --- |
 | `GET /metrics` | Prometheus text format (`text/plain; version=0.0.4`) |
 | `GET /admin/state` | JSON snapshot of broker configuration, discovery, ownership, and local buffers |
+| `GET /admin/metadata-cache` | Aggregate bounded metadata-cache capacity, age, refill, waiter, and failure state |
 | `POST /admin/log?rust_log=<filter>` | Replaces the active Rust log filter without restarting the broker |
 
 Protect the admin listener according to the deployment's network policy. `/admin/log` accepts a log
@@ -71,15 +75,26 @@ usually points to blob-store, DynamoDB, or publication-latency problems. An unex
 assignment without `local_active` is expected briefly during discovery or lease convergence; pair it
 with lease status and error metrics before treating it as an incident.
 
+### Metadata Cache State
+
+`/admin/metadata-cache` reports only aggregate cache state: Tail and Full Recovery entry counts,
+retained bytes and byte budgets, oldest retained-entry ages, in-flight refills, active waiters,
+available refill permits, and total failures. It intentionally contains no topic, window, or
+partition identifiers. Use sustained full byte budgets, eviction growth, exhausted refill permits,
+or overload failures to decide whether the configured cache limits need capacity or workload
+changes. A broker cache overload is safe for delivery because consumers retry the original direct
+metadata scan.
+
 ## Metrics
 
 The broker serves its Prometheus registry at `GET /metrics`. Producer and consumer libraries add
 metrics to the `bd-server-stats` scope supplied by their embedding application. See the complete
 [Metrics reference](metrics.md) for names, scopes, types, and meanings.
 
-For broker alerts, focus on gRPC timeouts and status failures, write admission rejections and
-flush failures, metadata-publication deadline exhaustion, sequence-reservation failures, and
-memory admission state. Pair ownership or admission failures with `/admin/state` before changing
+For broker alerts, focus on gRPC timeouts and status failures, metadata-cache overloads and
+evictions, write admission rejections and flush failures, metadata-publication deadline exhaustion,
+sequence-reservation failures, and memory admission state. Pair ownership or write-admission
+failures with `/admin/state`, and cache pressure with `/admin/metadata-cache`, before changing
 capacity or routing.
 
 ## Diagnostic Runbooks

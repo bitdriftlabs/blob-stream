@@ -284,6 +284,8 @@ fn runtime_feature_flags_override_configured_reader_settings() {
       max_in_flight_batch_reads: 4,
       metadata_read_consistency: MetadataReadConsistency::Eventual,
       metadata_visibility_delay: Duration::milliseconds(2_000),
+      broker_metadata_cache_enabled: false,
+      broker_metadata_cache_shadow: false,
     }
   );
 }

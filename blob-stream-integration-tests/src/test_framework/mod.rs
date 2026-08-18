@@ -4,11 +4,13 @@
 
 mod cluster;
 mod config;
+mod consumer;
 mod discovery;
 mod event_log;
 mod helpers;
 mod lifecycle;
 mod manual_time;
+mod metadata;
 mod resources;
 mod runtime;
 mod store_faults;
@@ -32,6 +34,21 @@ pub use config::{
   producer_topic_named_with_partition_count,
   producer_topic_named_with_writers,
 };
+pub use consumer::{
+  ConsumerDeliveryTrace,
+  ConsumerDeliveryTraces,
+  ConsumerTaskEvent,
+  ControlledConsumer,
+  delivery_counts,
+  delivery_members,
+  handle_consumer_event_with_offsets,
+  handle_consumer_event_with_trace,
+  maximum_delivery_offsets,
+  poll_consumer_once,
+  run_consumer_task,
+  stop_aware_revocation_consumer,
+  wait_for_group_offsets_committed,
+};
 pub use discovery::DynamicBrokerDiscovery;
 pub use event_log::{TestEvent, TestEventLog, TestEventMatcher};
 pub use helpers::{
@@ -52,6 +69,19 @@ pub use lifecycle::{
   advance_manual_time_until_lifecycle_gate,
 };
 pub use manual_time::ManualProducerRetryClock;
+pub use metadata::{
+  CountingWindowMetadataStore,
+  DeferredWindowPublicationMetadataStore,
+  DelayedVisibilityMetadataStore,
+  FenceInvalidatingMetadataStore,
+  GatedMetadataStore,
+  broker_metadata_cache_reader,
+  consume_next_record,
+  consume_one_record,
+  produce_message_at_manual_time,
+  write_recovery_segment,
+  write_recovery_segment_for_partitions,
+};
 pub use resources::IntegrationResources;
 pub use runtime::now_unix_seconds;
 pub use store_faults::{

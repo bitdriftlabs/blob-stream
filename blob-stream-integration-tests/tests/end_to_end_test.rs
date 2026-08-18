@@ -1,23 +1,17 @@
 use anyhow::{Result, anyhow};
 use bd_server_stats::stats::{Collector, Scope};
 use bd_time::{OffsetDateTimeExt, TimeProvider};
-use blob_stream_blob_store::{BlobKey, BlobStore};
+use blob_stream_blob_store::BlobKey;
 use blob_stream_broker::write::{BrokerLeaseStatus, WriteRequest};
 use blob_stream_broker_discovery::BrokerDiscovery;
 use blob_stream_consumer::consumer::ConsumerReaderImpl;
-use blob_stream_consumer::iterator::{
-  ConsumerIterator,
-  ConsumerIteratorImpl,
-  NextResult,
-  RevokedPartitions,
-};
+use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, NextResult};
 use blob_stream_consumer::{
   ConsumerBootstrapConfig,
   ConsumerBootstrapIteratorBuilder,
   ConsumerPartitionReadMode,
   ConsumerReadConfig,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-  HeartbeatReport,
   MembershipCoordinationSource,
 };
 use blob_stream_integration_tests::test_framework::{self as framework, TestConsumerReader};
@@ -36,8 +30,6 @@ use blob_stream_metadata_store::{
   MAX_FENCED_METADATA_PARTITIONS,
   MetadataReadConsistency,
   MetadataStore,
-  MetadataWriteError,
-  MetadataWriteResult,
   ProducerPartitionFence,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
@@ -52,7 +44,6 @@ use blob_stream_producer::{
   ProducerRecord,
   ProducerTopicConfig,
 };
-use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
 use blob_stream_types::{
   BatchMetadata,
   CommittedCursor,
@@ -70,9 +61,16 @@ use blob_stream_types::{
   offset_datetime_from_unix_millis,
   virtual_partition_for_logical,
 };
-use bytes::Bytes;
 use framework::{
   ClusterHarness,
+  ConsumerDeliveryTrace,
+  ConsumerDeliveryTraces,
+  ConsumerTaskEvent,
+  ControlledConsumer,
+  CountingWindowMetadataStore,
+  DeferredWindowPublicationMetadataStore,
+  DelayedVisibilityMetadataStore,
+  FenceInvalidatingMetadataStore,
   IntegrationResources,
   LifecycleEvent,
   PARTITION_COUNT,
@@ -82,9 +80,16 @@ use framework::{
   append_reader_delivery_traces,
   consumer_bootstrap_config,
   consumer_runtime_config,
+  delivery_counts,
+  delivery_members,
   drain_reader_until_with_trace,
+  handle_consumer_event_with_offsets,
+  handle_consumer_event_with_trace,
+  maximum_delivery_offsets,
   now_unix_seconds,
+  poll_consumer_once,
   produce_message,
+  produce_message_at_manual_time,
   produce_message_for_topic,
   producer_config,
   producer_config_with_writer_id,
@@ -93,14 +98,17 @@ use framework::{
   producer_topic_named_with_partition_count,
   producer_topic_named_with_writers,
   reader_delivery_counts,
+  run_consumer_task,
+  stop_aware_revocation_consumer,
+  wait_for_group_offsets_committed,
+  write_recovery_segment,
 };
-use protobuf::Message;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::sync::{Barrier, Mutex, Notify, mpsc, oneshot, watch};
+use tokio::sync::{Barrier, mpsc, watch};
 use tokio::time::{Instant, timeout};
 
 fn member_ids(members: &[ConsumerGroupMember]) -> Vec<String> {
@@ -509,79 +517,6 @@ async fn dynamo_sequence_reservation_rejects_stale_same_holder_session_before_ov
   Ok(())
 }
 
-struct FenceInvalidatingMetadataStore {
-  inner: Arc<dyn MetadataStore>,
-  lease_store: Arc<dyn ProducerPartitionLeaseStore>,
-  attempted_window: Mutex<Option<TopicWindowKey>>,
-  rejected_fenced_write: AtomicBool,
-}
-
-impl FenceInvalidatingMetadataStore {
-  fn new(inner: Arc<dyn MetadataStore>, lease_store: Arc<dyn ProducerPartitionLeaseStore>) -> Self {
-    Self {
-      inner,
-      lease_store,
-      attempted_window: Mutex::new(None),
-      rejected_fenced_write: AtomicBool::new(false),
-    }
-  }
-
-  async fn attempted_window(&self) -> Option<TopicWindowKey> {
-    self.attempted_window.lock().await.clone()
-  }
-
-  fn rejected_fenced_write(&self) -> bool {
-    self.rejected_fenced_write.load(Ordering::Acquire)
-  }
-}
-
-#[async_trait::async_trait]
-impl MetadataStore for FenceInvalidatingMetadataStore {
-  async fn write_segment(
-    &self,
-    metadata: SegmentMetadata,
-    fences: Option<&[ProducerPartitionFence]>,
-    now_ts_ms: i64,
-  ) -> MetadataWriteResult {
-    let fence = fences
-      .and_then(|fences| fences.first())
-      .cloned()
-      .ok_or_else(|| anyhow!("fenced metadata write did not include a producer lease fence"))?;
-    *self.attempted_window.lock().await = Some(metadata.window.clone());
-
-    let release = self
-      .lease_store
-      .release_lease(
-        &fence.key,
-        &fence.fence.holder_id,
-        &fence.fence.lease_session_id,
-        offset_datetime_from_unix_millis(now_ts_ms),
-      )
-      .await?;
-    if release != LeaseReleaseOutcome::Released {
-      return Err(anyhow!("test fault could not invalidate producer lease: {release:?}").into());
-    }
-
-    let result = self.inner.write_segment(metadata, fences, now_ts_ms).await;
-    if matches!(&result, Err(MetadataWriteError::ProducerLeaseFenceLost)) {
-      self.rejected_fenced_write.store(true, Ordering::Release);
-    }
-    result
-  }
-
-  async fn scan_window_from_snowflake(
-    &self,
-    window: &TopicWindowKey,
-    min_snowflake: Option<SnowflakeId>,
-    consistency: MetadataReadConsistency,
-  ) -> Result<Vec<SegmentMetadata>> {
-    self
-      .inner
-      .scan_window_from_snowflake(window, min_snowflake, consistency)
-      .await
-  }
-}
-
 async fn new_producer(
   config: ProducerConfig,
   topics: Vec<ProducerTopicConfig>,
@@ -592,488 +527,9 @@ async fn new_producer(
   ProducerClientImpl::new(config, topics, discovery, transport, metrics_scope).await
 }
 
-async fn produce_message_at_manual_time(
-  cluster: &ClusterHarness,
-  producer: &Arc<ProducerClientImpl>,
-  manual_time: &framework::ManualTimeProvider,
-  key: Vec<u8>,
-  id: &str,
-) -> Result<blob_stream_producer::ProducerAck> {
-  let event_timestamp_ms = manual_time.now().unix_timestamp_ms();
-  let payload = id.as_bytes().to_vec();
-  let producer = Arc::clone(producer);
-  let produce_task = tokio::spawn(async move {
-    producer
-      .produce(ProducerRecord::new(
-        TOPIC.into(),
-        key,
-        payload.into(),
-        event_timestamp_ms,
-      ))
-      .await
-  });
-
-  timeout(Duration::from_secs(5), async {
-    loop {
-      let buffered = cluster
-        .broker_state_snapshots()
-        .await
-        .iter()
-        .any(|snapshot| {
-          snapshot.topics.iter().any(|topic| {
-            topic
-              .local_partitions
-              .iter()
-              .any(|partition| partition.buffered_batch_count > 0)
-          })
-        });
-      if buffered {
-        return Ok::<_, anyhow::Error>(());
-      }
-      tokio::task::yield_now().await;
-    }
-  })
-  .await
-  .map_err(|_| anyhow!("producer request did not enter the broker buffer"))??;
-  manual_time.advance(TimeDuration::seconds(60));
-
-  Ok(
-    produce_task
-      .await
-      .map_err(|error| anyhow!("manual-time producer task join error: {error}"))??,
-  )
-}
-
-async fn write_recovery_segment(
-  blob_store: &dyn BlobStore,
-  metadata_store: &dyn MetadataStore,
-  virtual_partition_id: VirtualPartitionId,
-  window_start_unix_seconds: i64,
-  snowflake_id: u64,
-  sequence: u64,
-  payload: &str,
-  published_ts_ms: i64,
-) -> Result<()> {
-  let record = new_record(
-    payload.as_bytes().to_vec(),
-    window_start_unix_seconds * 1_000,
-  );
-  let encoded = StoredRecordBatch {
-    virtual_partition_id,
-    records: vec![record.clone()],
-    ..Default::default()
-  }
-  .write_to_bytes()?;
-  let blob_key = BlobKey::new(format!(
-    "recovery/{window_start_unix_seconds}/{snowflake_id}.bin"
-  ));
-  blob_store
-    .put(&blob_key, Bytes::from(encoded.clone()))
-    .await?;
-
-  metadata_store
-    .write_segment(
-      SegmentMetadata::new(
-        TopicWindowKey {
-          topic: TOPIC.to_string(),
-          window_start_unix_seconds,
-        },
-        SnowflakeId(snowflake_id),
-        blob_key,
-        Compression::none(),
-        HashMap::from([(
-          virtual_partition_id,
-          vec![BatchMetadata {
-            seq_range: SeqRange {
-              start: sequence,
-              end: sequence,
-            },
-            byte_range: blob_stream_types::ByteRange {
-              start: 0,
-              end: u64::try_from(encoded.len())?,
-            },
-            payload_bytes: u64::try_from(encoded.len())?,
-          }],
-        )]),
-        OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(window_start_unix_seconds * 1_000),
-        OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(published_ts_ms),
-      ),
-      None,
-      0,
-    )
-    .await
-    .map_err(anyhow::Error::new)
-}
-
-type PendingMetadataWrite = (
-  Instant,
-  SegmentMetadata,
-  Option<Vec<blob_stream_metadata_store::ProducerPartitionFence>>,
-  i64,
-);
-
-struct DelayedVisibilityMetadataStore {
-  inner: Arc<dyn MetadataStore>,
-  delay: Duration,
-  pending: Mutex<Vec<PendingMetadataWrite>>,
-  visibility_held: AtomicBool,
-}
-
-impl DelayedVisibilityMetadataStore {
-  fn new(inner: Arc<dyn MetadataStore>, delay: Duration) -> Self {
-    Self {
-      inner,
-      delay,
-      pending: Mutex::new(Vec::new()),
-      visibility_held: AtomicBool::new(false),
-    }
-  }
-
-  fn hold_visibility(&self) {
-    self.visibility_held.store(true, Ordering::Release);
-  }
-
-  fn release_visibility(&self) {
-    self.visibility_held.store(false, Ordering::Release);
-  }
-
-  async fn flush_visible_segments(&self) -> Result<()> {
-    if self.visibility_held.load(Ordering::Acquire) {
-      return Ok(());
-    }
-
-    let now = Instant::now();
-    let mut pending = self.pending.lock().await;
-    let mut ready = Vec::new();
-    let mut future = Vec::new();
-
-    for (visible_at, metadata, fences, now_ts_ms) in pending.drain(..) {
-      if visible_at <= now {
-        ready.push((metadata, fences, now_ts_ms));
-      } else {
-        future.push((visible_at, metadata, fences, now_ts_ms));
-      }
-    }
-    *pending = future;
-    drop(pending);
-
-    for (metadata, fences, now_ts_ms) in ready {
-      self
-        .inner
-        .write_segment(metadata, fences.as_deref(), now_ts_ms)
-        .await?;
-    }
-    Ok(())
-  }
-}
-
-#[async_trait::async_trait]
-impl MetadataStore for DelayedVisibilityMetadataStore {
-  async fn write_segment(
-    &self,
-    metadata: SegmentMetadata,
-    fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
-    now_ts_ms: i64,
-  ) -> MetadataWriteResult {
-    let mut pending = self.pending.lock().await;
-    pending.push((
-      Instant::now() + self.delay,
-      metadata,
-      fences.map(ToOwned::to_owned),
-      now_ts_ms,
-    ));
-    Ok(())
-  }
-
-  async fn scan_window_from_snowflake(
-    &self,
-    window: &blob_stream_types::TopicWindowKey,
-    min_snowflake: Option<SnowflakeId>,
-    consistency: MetadataReadConsistency,
-  ) -> Result<Vec<SegmentMetadata>> {
-    self.flush_visible_segments().await?;
-    self
-      .inner
-      .scan_window_from_snowflake(window, min_snowflake, consistency)
-      .await
-  }
-}
-
-struct CountingWindowMetadataStore {
-  inner: Arc<dyn MetadataStore>,
-  counted_window_start: i64,
-  scan_count: AtomicUsize,
-}
-
-impl CountingWindowMetadataStore {
-  fn new(inner: Arc<dyn MetadataStore>, counted_window_start: i64) -> Self {
-    Self {
-      inner,
-      counted_window_start,
-      scan_count: AtomicUsize::new(0),
-    }
-  }
-
-  fn scan_count(&self) -> usize {
-    self.scan_count.load(Ordering::Acquire)
-  }
-}
-
-#[async_trait::async_trait]
-impl MetadataStore for CountingWindowMetadataStore {
-  async fn write_segment(
-    &self,
-    metadata: SegmentMetadata,
-    fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
-    now_ts_ms: i64,
-  ) -> MetadataWriteResult {
-    self.inner.write_segment(metadata, fences, now_ts_ms).await
-  }
-
-  async fn scan_window_from_snowflake(
-    &self,
-    window: &TopicWindowKey,
-    min_snowflake: Option<SnowflakeId>,
-    consistency: MetadataReadConsistency,
-  ) -> Result<Vec<SegmentMetadata>> {
-    if window.window_start_unix_seconds == self.counted_window_start {
-      self.scan_count.fetch_add(1, Ordering::AcqRel);
-    }
-    self
-      .inner
-      .scan_window_from_snowflake(window, min_snowflake, consistency)
-      .await
-  }
-}
-
-struct DeferredWindowPublicationMetadataStore {
-  inner: Arc<dyn MetadataStore>,
-  deferred_window_start: Arc<AtomicI64>,
-  deferred_window_published_ts_ms: AtomicI64,
-  deferred_window_scanned: AtomicBool,
-  deferred_window_scan: Notify,
-}
-
-impl DeferredWindowPublicationMetadataStore {
-  fn new(inner: Arc<dyn MetadataStore>, deferred_window_start: Arc<AtomicI64>) -> Self {
-    Self {
-      inner,
-      deferred_window_start,
-      deferred_window_published_ts_ms: AtomicI64::new(0),
-      deferred_window_scanned: AtomicBool::new(false),
-      deferred_window_scan: Notify::new(),
-    }
-  }
-
-  fn set_deferred_window_published_ts_ms(&self, published_ts_ms: i64) {
-    self
-      .deferred_window_published_ts_ms
-      .store(published_ts_ms, Ordering::Release);
-  }
-
-  async fn wait_until_deferred_window_scanned(&self) {
-    loop {
-      let notified = self.deferred_window_scan.notified();
-      if self.deferred_window_scanned.load(Ordering::Acquire) {
-        return;
-      }
-      notified.await;
-    }
-  }
-}
-
-#[async_trait::async_trait]
-impl MetadataStore for DeferredWindowPublicationMetadataStore {
-  async fn write_segment(
-    &self,
-    metadata: SegmentMetadata,
-    fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
-    now_ts_ms: i64,
-  ) -> MetadataWriteResult {
-    self.inner.write_segment(metadata, fences, now_ts_ms).await
-  }
-
-  async fn scan_window_from_snowflake(
-    &self,
-    window: &TopicWindowKey,
-    min_snowflake: Option<SnowflakeId>,
-    consistency: MetadataReadConsistency,
-  ) -> Result<Vec<SegmentMetadata>> {
-    let mut segments = self
-      .inner
-      .scan_window_from_snowflake(window, min_snowflake, consistency)
-      .await?;
-    if window.window_start_unix_seconds == self.deferred_window_start.load(Ordering::Acquire) {
-      for segment in &mut segments {
-        segment.metadata_published_at = OffsetDateTime::UNIX_EPOCH
-          + TimeDuration::milliseconds(
-            self.deferred_window_published_ts_ms.load(Ordering::Acquire),
-          );
-      }
-      self.deferred_window_scanned.store(true, Ordering::Release);
-      self.deferred_window_scan.notify_waiters();
-    }
-    Ok(segments)
-  }
-}
-
-enum ConsumerTaskEvent {
-  Batch {
-    member_id: String,
-    ids: Vec<String>,
-    virtual_partition_id: VirtualPartitionId,
-    offset: u64,
-  },
-  Revoked {
-    ack: oneshot::Sender<()>,
-  },
-  CommitSucceeded,
-}
-
-async fn run_consumer_task(
-  mut consumer: Box<dyn ConsumerIterator>,
-  mut stop_rx: watch::Receiver<bool>,
-  event_tx: mpsc::UnboundedSender<ConsumerTaskEvent>,
-) -> Result<()> {
-  consumer.start()?;
-  let member_id = consumer.diagnostics().map_or_else(
-    || "test-consumer".to_string(),
-    |diagnostics| diagnostics.state_snapshot().member_id,
-  );
-
-  loop {
-    if *stop_rx.borrow() {
-      break;
-    }
-
-    tokio::select! {
-      changed = stop_rx.changed() => {
-        if changed.is_ok() && *stop_rx.borrow() {
-          break;
-        }
-      }
-      next_result = consumer.next() => {
-        let next_result = next_result
-          .map_err(|error| anyhow!("consumer task {member_id} next failed: {error}"))?;
-
-        match next_result {
-          NextResult::Revoked(revoked) => {
-            let (ack_tx, ack_rx) = oneshot::channel();
-            if event_tx.send(ConsumerTaskEvent::Revoked { ack: ack_tx }).is_err() {
-              revoked.complete().await;
-              break;
-            }
-
-            let acknowledged = {
-              tokio::pin!(ack_rx);
-              loop {
-                tokio::select! {
-                  result = &mut ack_rx => break result.is_ok(),
-                  changed = stop_rx.changed() => {
-                    if changed.is_err() || *stop_rx.borrow() {
-                      break false;
-                    }
-                  }
-                }
-              }
-            };
-            revoked.complete().await;
-            if !acknowledged {
-              break;
-            }
-          },
-          NextResult::Record(record) => {
-            let id = String::from_utf8(record.record.payload.to_vec())
-              .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
-
-            let _ = event_tx.send(ConsumerTaskEvent::Batch {
-              member_id: member_id.clone(),
-              ids: vec![id],
-              virtual_partition_id: record.virtual_partition_id,
-              offset: record.offset,
-            });
-            consumer.store_offset(record.virtual_partition_id, record.offset)?;
-            let _ = consumer.commit().await?;
-            let _ = event_tx.send(ConsumerTaskEvent::CommitSucceeded);
-          },
-        }
-      }
-    }
-  }
-
-  let _ = consumer.shutdown().await;
-  Ok(())
-}
-
-//
-// StopAwareRevocationTestConsumer
-//
-
-struct StopAwareRevocationTestConsumer {
-  revocation_completed: Arc<AtomicBool>,
-  sent_revocation: bool,
-}
-
-struct StopAwareRevokedPartitions {
-  revocation_completed: Arc<AtomicBool>,
-}
-
-#[async_trait::async_trait]
-impl RevokedPartitions for StopAwareRevokedPartitions {
-  fn partitions(&self) -> Vec<VirtualPartitionId> {
-    vec![0]
-  }
-
-  async fn complete(self: Box<Self>) {
-    self.revocation_completed.store(true, Ordering::Release);
-  }
-}
-
-#[async_trait::async_trait]
-impl ConsumerIterator for StopAwareRevocationTestConsumer {
-  fn start(&mut self) -> Result<()> {
-    Ok(())
-  }
-
-  async fn next(&mut self) -> Result<NextResult> {
-    if self.sent_revocation {
-      std::future::pending().await
-    } else {
-      self.sent_revocation = true;
-      Ok(NextResult::Revoked(Box::new(StopAwareRevokedPartitions {
-        revocation_completed: Arc::clone(&self.revocation_completed),
-      })))
-    }
-  }
-
-  fn store_offset(
-    &mut self,
-    _virtual_partition_id: VirtualPartitionId,
-    _offset: u64,
-  ) -> Result<()> {
-    Ok(())
-  }
-
-  async fn commit(&mut self) -> Result<HeartbeatReport> {
-    unreachable!("revocation-only test consumer does not commit records")
-  }
-
-  async fn shutdown(self: Box<Self>) -> Result<()> {
-    Ok(())
-  }
-
-  async fn seek(&mut self, _virtual_partition_id: VirtualPartitionId, _offset: u64) -> Result<()> {
-    Ok(())
-  }
-}
-
 #[tokio::test]
 async fn consumer_task_stops_while_waiting_for_revocation_ack() -> Result<()> {
-  let revocation_completed = Arc::new(AtomicBool::new(false));
-  let consumer = Box::new(StopAwareRevocationTestConsumer {
-    revocation_completed: Arc::clone(&revocation_completed),
-    sent_revocation: false,
-  });
+  let (consumer, revocation_completed) = stop_aware_revocation_consumer();
   let (event_tx, mut event_rx) = mpsc::unbounded_channel();
   let (stop_tx, stop_rx) = watch::channel(false);
   let task = tokio::spawn(run_consumer_task(consumer, stop_rx, event_tx));
@@ -1098,240 +554,6 @@ async fn consumer_task_stops_while_waiting_for_revocation_ack() -> Result<()> {
   assert!(revocation_completed.load(Ordering::Acquire));
   drop(ack);
   Ok(())
-}
-
-#[derive(Clone, Debug)]
-struct ConsumerDeliveryTrace {
-  member_id: String,
-  virtual_partition_id: VirtualPartitionId,
-  offset: u64,
-}
-
-type ConsumerDeliveryTraces = HashMap<String, Vec<ConsumerDeliveryTrace>>;
-
-//
-// ControlledConsumer
-//
-
-struct ControlledConsumer {
-  member_id: String,
-  iterator: ConsumerIteratorImpl,
-  delivery_traces: ConsumerDeliveryTraces,
-}
-
-impl ControlledConsumer {
-  fn new(member_id: impl Into<String>, iterator: ConsumerIteratorImpl) -> Self {
-    Self {
-      member_id: member_id.into(),
-      iterator,
-      delivery_traces: ConsumerDeliveryTraces::new(),
-    }
-  }
-
-  fn start(&mut self) -> Result<()> {
-    self.iterator.start()
-  }
-
-  async fn next(&mut self) -> Result<NextResult> {
-    let next_result = self.iterator.next().await?;
-    if let NextResult::Record(record) = &next_result {
-      let id = String::from_utf8(record.record.payload.to_vec())
-        .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
-      self
-        .delivery_traces
-        .entry(id)
-        .or_default()
-        .push(ConsumerDeliveryTrace {
-          member_id: self.member_id.clone(),
-          virtual_partition_id: record.virtual_partition_id,
-          offset: record.offset,
-        });
-    }
-    Ok(next_result)
-  }
-
-  fn store_offset(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()> {
-    self.iterator.store_offset(virtual_partition_id, offset)
-  }
-
-  async fn commit(&mut self) -> Result<HeartbeatReport> {
-    self.iterator.commit().await
-  }
-
-  async fn abort_for_test(&mut self) -> Result<()> {
-    self.iterator.abort_for_test().await
-  }
-
-  async fn shutdown(self) -> Result<()> {
-    Box::new(self.iterator).shutdown().await
-  }
-
-  fn delivery_traces(&self) -> &ConsumerDeliveryTraces {
-    &self.delivery_traces
-  }
-}
-
-fn handle_consumer_event_with_trace(
-  event: ConsumerTaskEvent,
-  delivery_traces: &mut ConsumerDeliveryTraces,
-  revocation_count: &mut usize,
-) {
-  match event {
-    ConsumerTaskEvent::Batch {
-      member_id,
-      ids,
-      virtual_partition_id,
-      offset,
-    } => {
-      for id in ids {
-        delivery_traces
-          .entry(id)
-          .or_default()
-          .push(ConsumerDeliveryTrace {
-            member_id: member_id.clone(),
-            virtual_partition_id,
-            offset,
-          });
-      }
-    },
-    ConsumerTaskEvent::Revoked { ack } => {
-      *revocation_count += 1;
-      let _ = ack.send(());
-    },
-    ConsumerTaskEvent::CommitSucceeded => {},
-  }
-}
-
-fn delivery_counts(delivery_traces: &ConsumerDeliveryTraces) -> HashMap<String, usize> {
-  delivery_traces
-    .iter()
-    .map(|(id, deliveries)| (id.clone(), deliveries.len()))
-    .collect()
-}
-
-fn maximum_delivery_offsets(
-  delivery_traces: &ConsumerDeliveryTraces,
-) -> HashMap<VirtualPartitionId, u64> {
-  let mut maximum_offsets = HashMap::<VirtualPartitionId, u64>::new();
-  for delivery in delivery_traces.values().flatten() {
-    maximum_offsets
-      .entry(delivery.virtual_partition_id)
-      .and_modify(|offset| *offset = (*offset).max(delivery.offset))
-      .or_insert(delivery.offset);
-  }
-  maximum_offsets
-}
-
-async fn wait_for_group_offsets_committed(
-  cluster: &ClusterHarness,
-  maximum_offsets: &HashMap<VirtualPartitionId, u64>,
-  boundary: &str,
-) -> Result<()> {
-  timeout(Duration::from_secs(5), async {
-    loop {
-      let leases = cluster
-        .consumer_lease_store()
-        .list_group_leases(TOPIC, "integration-group")
-        .await?;
-      if maximum_offsets
-        .iter()
-        .all(|(partition_id, maximum_offset)| {
-          leases
-            .iter()
-            .find(|lease| lease.key.virtual_partition_id == *partition_id)
-            .is_some_and(|lease| {
-              lease.committed_cursor.as_ref().is_some_and(|cursor| {
-                cursor.seq_end >= *maximum_offset && cursor.source_checkpoint.is_some()
-              })
-            })
-        })
-      {
-        return Ok::<_, anyhow::Error>(());
-      }
-      tokio::task::yield_now().await;
-    }
-  })
-  .await
-  .map_err(|_| anyhow!("{boundary}"))??;
-  Ok(())
-}
-
-fn delivery_members(delivery_traces: &ConsumerDeliveryTraces) -> HashSet<String> {
-  delivery_traces
-    .values()
-    .flatten()
-    .map(|delivery| delivery.member_id.clone())
-    .collect()
-}
-
-fn handle_consumer_event_with_offsets(
-  event: ConsumerTaskEvent,
-  delivered_id_counts: &mut HashMap<String, usize>,
-  last_offsets: &mut HashMap<VirtualPartitionId, u64>,
-  revocation_count: &mut usize,
-) {
-  match event {
-    ConsumerTaskEvent::Batch {
-      ids,
-      virtual_partition_id,
-      offset,
-      ..
-    } => {
-      if let Some(previous_offset) = last_offsets.insert(virtual_partition_id, offset) {
-        assert!(
-          offset >= previous_offset,
-          "consumer cursor moved backwards for partition {virtual_partition_id}: \
-           previous={previous_offset}, current={offset}"
-        );
-      }
-      for id in ids {
-        *delivered_id_counts.entry(id).or_insert(0) += 1;
-      }
-    },
-    ConsumerTaskEvent::Revoked { ack } => {
-      *revocation_count += 1;
-      let _ = ack.send(());
-    },
-    ConsumerTaskEvent::CommitSucceeded => {},
-  }
-}
-
-async fn poll_consumer_once(
-  consumer: &mut ConsumerIteratorImpl,
-  member_id: &str,
-  delivery_traces: &mut ConsumerDeliveryTraces,
-) -> Result<(bool, bool)> {
-  let next_result = timeout(Duration::from_secs(2), consumer.next()).await;
-  let next_result = match next_result {
-    Err(_) => return Ok((false, false)),
-    Ok(Err(error)) => {
-      return Err(anyhow!("consumer next failed: {error}"));
-    },
-    Ok(Ok(next_result)) => next_result,
-  };
-
-  match next_result {
-    NextResult::Revoked(revoked) => {
-      revoked.complete().await;
-      Ok((false, true))
-    },
-    NextResult::Record(record) => {
-      let id = String::from_utf8(record.record.payload.to_vec())
-        .map_err(|error| anyhow!("consumer payload was not utf-8: {error}"))?;
-      delivery_traces
-        .entry(id)
-        .or_default()
-        .push(ConsumerDeliveryTrace {
-          member_id: member_id.to_string(),
-          virtual_partition_id: record.virtual_partition_id,
-          offset: record.offset,
-        });
-
-      consumer.store_offset(record.virtual_partition_id, record.offset)?;
-      let _ = consumer.commit().await?;
-      Ok((true, false))
-    },
-  }
 }
 
 // High-level: verifies the baseline single-broker produce/read path and duplicate-scan dedupe.
@@ -3600,7 +2822,7 @@ async fn live_group_recovery_waits_for_historical_metadata_visibility_delay() ->
   .map_err(|_| anyhow!("consumer did not deliver the visible historical window"))??;
 
   let deferred_snapshot = consumer_b
-    .iterator
+    .iterator()
     .diagnostics()
     .ok_or_else(|| anyhow!("concrete consumer did not provide diagnostics"))?
     .state_snapshot();

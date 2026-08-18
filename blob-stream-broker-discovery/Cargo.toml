@@ -13,6 +13,7 @@ anyhow.workspace       = true
 async-trait.workspace  = true
 bd-log.workspace       = true
 bd-log-util.workspace  = true
+blob-stream-proto.path = "../blob-stream-proto"
 futures.workspace      = true
 k8s-openapi.workspace  = true
 kube.workspace         = true

@@ -52,6 +52,8 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 | `metadata_fast_scan_requests`, `metadata_fast_scan_segments` | Counters | Metadata work on the steady-state fast path. |
 | `metadata_recovery_scan_requests`, `metadata_recovery_scan_segments`, `metadata_recovery_scan_failures` | Counters | Metadata work and failures while replaying retained history. |
 | `metadata_recovery_scan_hits`, `metadata_recovery_scan_batches_read` | Counters | Recovery scans that returned any batch and the batches returned by them. |
+| `broker_metadata_offload_requests`, `broker_metadata_offload_deliveries`, `broker_metadata_offload_fallbacks` | Counters | Broker metadata RPCs attempted, non-shadow scans delivered from a validated broker response, and non-shadow scans that retried their original direct query after an attempted broker response was unusable. With shadow disabled, requests equal deliveries plus fallbacks. |
+| `broker_metadata_shadow_matches`, `broker_metadata_shadow_mismatches`, `broker_metadata_shadow_comparison_failures` | Counters | Valid broker/direct metadata comparisons that matched, valid comparisons with a canonical gap or conflict, and comparisons unavailable because the broker transport or response validation failed. Shadow mode always delivers the direct result. |
 | `recovery_metadata_cache_hits`, `recovery_metadata_cache_misses`, `recovery_metadata_cache_inserts`, `recovery_metadata_cache_invalidations` | Counters | Recovery metadata-cache effectiveness and maintenance. |
 | `recovery_metadata_cache_entries`, `recovery_metadata_cache_retained_bytes` | Gauges | Current retained recovery cache entry count and bytes. |
 | `metadata_fast_scan_without_lower_bound` | Counter | Fast scans that could not use a derived metadata lower bound. |
@@ -87,6 +89,23 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 ## Broker Metrics
 
 Broker metrics use `blob_stream_broker` with the component scopes below.
+
+### Metadata Cache: `blob_stream_broker:metadata_cache`
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `requests_total`, `misses_total`, `tail_hits_total`, `recovery_hits_total` | Counters | Metadata-cache requests, cache misses, and retained Tail or Full Recovery hits. |
+| `tail_refills_total`, `recovery_baselines_total`, `recovery_seals_total` | Counters | Tail refills and complete Full Recovery snapshots installed. Full Recovery is unpaged, so its baseline and final seal are recorded together. |
+| `invalidations_total`, `evictions_total` | Counters | Retained entries removed because they no longer satisfy a request and entries evicted by cache policy. |
+| `failures_total`, `overloads_total` | Counters | Rejected or failed metadata-cache reads and the subset caused by admission, size, or timeout overload. |
+| `response_items_total`, `response_bytes_total` | Counters | Metadata segments and encoded metadata bytes returned in successful broker responses. |
+| `waiters_admitted_total` | Counter | Requests admitted to wait for an in-flight refill. |
+| `observation_age_seconds`, `coalescing_delay_seconds` | Histograms | Age of a retained hit and the configured delay before a refill begins. |
+| `active_waiters`, `active_refills` | Gauges | Requests currently waiting on refill work and refills holding concurrency permits. |
+| `tail_entries`, `recovery_entries`, `tail_retained_bytes`, `recovery_retained_bytes` | Gauges | Current retained entry count and weighted bytes for each cache. |
+
+These metrics have no topic, metadata-window, partition, or consumer-group labels. Inspect
+aggregate capacity and current admission state through `/admin/metadata-cache`.
 
 ### gRPC: `blob_stream_broker:grpc`
 

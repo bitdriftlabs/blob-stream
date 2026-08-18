@@ -7,8 +7,10 @@ use crate::config::{
   apply_consumer_startup_overrides,
   consumer_max_clock_skew,
   topic_max_metadata_publication_lag,
+  topic_metadata_cache_max_age,
   validate_runtime_config,
 };
+use crate::consumer::GrpcBrokerMetadataQuery;
 use crate::iterator::{
   ConsumerCoordinationSource,
   ConsumerIteratorBuilder,
@@ -43,6 +45,7 @@ use blob_stream_metadata_store::{
 };
 use blob_stream_proto::protos::blobstream::v1::config::{
   BlobStoreConfig,
+  BrokerDiscoveryConfig,
   ConsumerIteratorBootstrapConfig,
   MetadataStoreConfig,
   TopicConfig,
@@ -69,6 +72,8 @@ pub struct ConsumerBootstrapConfig {
   pub blob_store: BlobStoreConfig,
   /// Metadata/coordination backend configuration.
   pub metadata_store: MetadataStoreConfig,
+  /// Broker discovery for optional broker-collapsed metadata queries.
+  pub broker_discovery: BrokerDiscoveryConfig,
 }
 
 //
@@ -163,12 +168,14 @@ impl ConsumerBootstrapConfig {
     topic: TopicConfig,
     blob_store: BlobStoreConfig,
     metadata_store: MetadataStoreConfig,
+    broker_discovery: BrokerDiscoveryConfig,
   ) -> Self {
     Self {
       runtime,
       topic,
       blob_store,
       metadata_store,
+      broker_discovery,
     }
   }
 
@@ -196,12 +203,18 @@ impl ConsumerBootstrapConfig {
       .as_ref()
       .ok_or_else(|| anyhow!("consumer bootstrap metadata_store is required"))?
       .clone();
+    let broker_discovery = config
+      .broker_discovery
+      .as_ref()
+      .ok_or_else(|| anyhow!("consumer bootstrap broker_discovery is required"))?
+      .clone();
 
     Ok(Self {
       runtime,
       topic,
       blob_store,
       metadata_store,
+      broker_discovery,
     })
   }
 }
@@ -231,6 +244,7 @@ impl ConsumerIteratorImpl {
     proto_validate::validate(&config.topic)?;
     proto_validate::validate(&config.blob_store)?;
     proto_validate::validate(&config.metadata_store)?;
+    proto_validate::validate(&config.broker_discovery)?;
 
     let retention = config
       .topic
@@ -290,6 +304,7 @@ impl ConsumerIteratorImpl {
       feature_flags,
     )
     .metadata_window_size(metadata_window_size)
+    .metadata_cache_max_age(topic_metadata_cache_max_age(&config.topic))
     .maximum_clock_skew(consumer_max_clock_skew(
       config
         .runtime
@@ -298,6 +313,9 @@ impl ConsumerIteratorImpl {
         .ok_or_else(|| anyhow!("consumer read config is required"))?,
     ))
     .time_provider(time_provider);
+    let builder = builder.broker_metadata_query(Arc::new(
+      GrpcBrokerMetadataQuery::from_config(&config.broker_discovery).await?,
+    ));
     let builder = if let Some(lifecycle_hooks) = lifecycle_hooks {
       builder.lifecycle_hooks(lifecycle_hooks)
     } else {

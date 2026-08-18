@@ -47,7 +47,7 @@ use bd_time::TimeProvider;
 use blob_stream_types::{SnowflakeId, VirtualPartitionId, offset_datetime_from_unix_seconds};
 use log::debug;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -189,6 +189,7 @@ pub(super) struct PrefetchWorker {
   base_idle_delay: time::Duration,
   max_idle_delay: Option<time::Duration>,
   recovery_traces: HashMap<VirtualPartitionId, RecoveryTrace>,
+  initial_fast_path_partitions: HashSet<VirtualPartitionId>,
   pending_seek_traces: HashMap<VirtualPartitionId, SeekTrace>,
   time_provider: Arc<dyn TimeProvider>,
   lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
@@ -226,6 +227,7 @@ impl PrefetchWorker {
       base_idle_delay,
       max_idle_delay,
       recovery_traces: HashMap::new(),
+      initial_fast_path_partitions: HashSet::new(),
       pending_seek_traces: HashMap::new(),
       time_provider,
       lifecycle_hooks,
@@ -296,6 +298,7 @@ impl PrefetchWorker {
         ReadAvailableOutcome::CommandPending => continue,
       };
       record_reader_diagnostics(&self.reader, &self.shared_state);
+      self.record_initial_fast_path_progress().await;
       self.record_recovery_progress().await;
 
       self
@@ -434,6 +437,36 @@ impl PrefetchWorker {
           records_accepted: 0,
         },
       );
+    }
+  }
+
+  async fn record_initial_fast_path_progress(&mut self) {
+    let initial_fast_partitions = self
+      .reader
+      .partition_read_states()
+      .into_iter()
+      .filter_map(|state| {
+        (matches!(state.mode, ConsumerReaderPartitionMode::Fast)
+          && !self
+            .recovery_traces
+            .contains_key(&state.virtual_partition_id)
+          && self
+            .initial_fast_path_partitions
+            .insert(state.virtual_partition_id))
+        .then_some(state.virtual_partition_id)
+      })
+      .collect::<Vec<_>>();
+    let Some(lifecycle_hooks) = self.lifecycle_hooks.as_ref() else {
+      return;
+    };
+    let generation = self
+      .diagnostics
+      .state_snapshot()
+      .accepted_assignment_plan_version;
+    for partition_id in initial_fast_partitions {
+      lifecycle_hooks
+        .initial_fast_path_active(&self.member_id, generation, partition_id)
+        .await;
     }
   }
 

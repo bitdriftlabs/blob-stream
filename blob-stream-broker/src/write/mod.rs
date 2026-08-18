@@ -29,7 +29,7 @@ pub use api::{
   WriteRequest,
   WriteResponse,
 };
-pub use config::{TopicInfo, WriteConfig, build_write_engine};
+pub use config::{TopicInfo, WriteConfig, build_runtime_metadata_store, build_write_engine};
 pub use engine::{
   AdmissionController,
   MemoryPressureAdmissionController,

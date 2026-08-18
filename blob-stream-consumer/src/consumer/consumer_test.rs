@@ -2,6 +2,8 @@
 
 use super::state::{RecoveryState, VirtualPartitionState};
 use super::{
+  BrokerMetadataQuery,
+  ConsumerBatch,
   ConsumerReader as BoundedConsumerReader,
   ConsumerReaderFastFrontierState,
   ConsumerReaderFastScanBoundState,
@@ -11,12 +13,14 @@ use super::{
 use crate::config::{
   ConsumerReadConfig,
   ConsumerReadRuntimeSettings,
+  DEFAULT_MAX_CLOCK_SKEW,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
+use bd_server_stats::test::util::stats::Helper;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_blob_store::{
   BlobKey,
@@ -32,8 +36,17 @@ use blob_stream_metadata_store::{
   MetadataStore,
   MetadataWriteResult,
   SegmentMetadata,
+  encode_segment_metadata_v1,
 };
-use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
+use blob_stream_proto::protos::blobstream::v1::broker::{
+  BrokerSegmentMetadata,
+  MetadataReadSuccess,
+  ReadMetadataWindowRequest,
+  ReadMetadataWindowResponse,
+  StoredRecordBatch,
+  read_metadata_window_request,
+  read_metadata_window_response,
+};
 use blob_stream_types::{
   BatchMetadata,
   CommittedCursor,
@@ -52,6 +65,7 @@ use blob_stream_types::{
 };
 use bytes::Bytes;
 use parking_lot::Mutex;
+use prometheus::labels;
 use protobuf::Message;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -143,6 +157,89 @@ impl MetadataStore for FailingMetadataStore {
     _consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
     Err(anyhow!("injected DynamoDB dispatch error").context("injected DynamoDB service error"))
+  }
+}
+
+//
+// RecordingBrokerMetadataQuery
+//
+
+struct RecordingBrokerMetadataQuery {
+  requests: Mutex<Vec<ReadMetadataWindowRequest>>,
+}
+
+//
+// FixedBrokerMetadataQuery
+//
+
+struct FixedBrokerMetadataQuery {
+  responses: HashMap<i64, ReadMetadataWindowResponse>,
+}
+
+//
+// ShadowBrokerResponse
+//
+
+enum ShadowBrokerResponse {
+  Valid,
+  TransportFailure,
+  Malformed,
+}
+
+#[async_trait]
+impl BrokerMetadataQuery for FixedBrokerMetadataQuery {
+  async fn read_metadata_window(
+    &self,
+    request: ReadMetadataWindowRequest,
+  ) -> Result<ReadMetadataWindowResponse> {
+    self
+      .responses
+      .get(&request.window_start_unix_seconds)
+      .cloned()
+      .ok_or_else(|| anyhow!("missing scripted broker response"))
+  }
+}
+
+fn broker_metadata_response(
+  segments: &[SegmentMetadata],
+  observed_at: OffsetDateTime,
+) -> ReadMetadataWindowResponse {
+  ReadMetadataWindowResponse {
+    result: Some(read_metadata_window_response::Result::Success(
+      MetadataReadSuccess {
+        observed_at_unix_ms: observed_at.unix_timestamp() * 1_000,
+        refill_floor: Some(0),
+        generation: 1,
+        retained_coverage: false,
+        segments: segments
+          .iter()
+          .map(|segment| BrokerSegmentMetadata {
+            snowflake_id: segment.snowflake_id.as_u64(),
+            metadata: Some(encode_segment_metadata_v1(segment).unwrap()).into(),
+            ..Default::default()
+          })
+          .collect(),
+        ..Default::default()
+      },
+    )),
+    ..Default::default()
+  }
+}
+
+impl RecordingBrokerMetadataQuery {
+  fn requests(&self) -> Vec<ReadMetadataWindowRequest> {
+    self.requests.lock().clone()
+  }
+}
+
+#[async_trait]
+impl BrokerMetadataQuery for RecordingBrokerMetadataQuery {
+  async fn read_metadata_window(
+    &self,
+    request: ReadMetadataWindowRequest,
+  ) -> Result<ReadMetadataWindowResponse> {
+    self.requests.lock().push(request);
+    Err(anyhow!("injected broker metadata transport failure"))
   }
 }
 
@@ -380,6 +477,8 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
       max_in_flight_batch_reads: 2,
       metadata_read_consistency: MetadataReadConsistency::Eventual,
       metadata_visibility_delay: time::Duration::milliseconds(2_000),
+      broker_metadata_cache_enabled: false,
+      broker_metadata_cache_shadow: false,
     }
   );
 
@@ -396,7 +495,43 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
       max_in_flight_batch_reads: 4,
       metadata_read_consistency: MetadataReadConsistency::Strong,
       metadata_visibility_delay: time::Duration::ZERO,
+      broker_metadata_cache_enabled: false,
+      broker_metadata_cache_shadow: false,
     }
+  );
+}
+
+#[test]
+fn eventual_broker_reads_include_cache_age_in_availability_horizon() {
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_broker_metadata_cache_enabled", true),
+  ));
+  let reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .metadata_cache_max_age(TimeDuration::milliseconds(250));
+
+  assert_eq!(
+    reader
+      .availability_horizon(reader.runtime_settings())
+      .duration(),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG
+      .saturating_add(DEFAULT_MAX_CLOCK_SKEW)
+      .saturating_add(TimeDuration::milliseconds(2_000))
+      .saturating_add(TimeDuration::milliseconds(250))
   );
 }
 
@@ -1149,6 +1284,209 @@ fn recovery_only_bounds_its_checkpoint_window() {
     window_start + 300
   );
   assert_eq!(requests[1].min_snowflake, None);
+}
+
+#[tokio::test]
+async fn broker_recovery_uses_tail_for_checkpoint_and_full_recovery_afterward() {
+  let window_start = 1_700_000_100;
+  let checkpoint_timestamp = OffsetDateTime::from_unix_timestamp(window_start + 120).unwrap();
+  let checkpoint_snowflake = SnowflakeId::minimum_for_timestamp(checkpoint_timestamp);
+  let expected_floor = SnowflakeId::minimum_for_timestamp(
+    OffsetDateTime::from_unix_timestamp(window_start + 104)
+      .unwrap()
+      .saturating_add(time::Duration::milliseconds(990)),
+  );
+  let broker_query = Arc::new(RecordingBrokerMetadataQuery {
+    requests: Mutex::new(Vec::new()),
+  });
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true)
+      .with_bool_flag("blob_stream_consumer_broker_metadata_cache_enabled", true),
+  ));
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .broker_metadata_query(broker_query.clone());
+  reader.hydrate_cursor_with_source(
+    7,
+    &CommittedCursor {
+      virtual_partition_id: 7,
+      seq_end: 10,
+      source_checkpoint: Some(CommittedSourceCheckpoint {
+        window_start_unix_seconds: window_start,
+        snowflake_id: checkpoint_snowflake.as_u64(),
+      }),
+    },
+    Some(window_start * 1_000),
+    timestamp(window_start + 300),
+  );
+  reader
+    .set_assigned_virtual_partitions(&[7], timestamp(window_start + 300))
+    .unwrap();
+
+  assert!(
+    reader
+      .read_available(window_start + 300)
+      .await
+      .unwrap()
+      .is_empty()
+  );
+  let requests = broker_query.requests();
+  let checkpoint_request = requests
+    .iter()
+    .find(|request| request.window_start_unix_seconds == window_start)
+    .expect("broker receives the checkpoint recovery window");
+  let Some(read_metadata_window_request::Coverage::Tail(tail)) =
+    checkpoint_request.coverage.as_ref()
+  else {
+    panic!("checkpoint recovery uses Tail coverage");
+  };
+  assert_eq!(
+    tail
+      .partition_bounds
+      .iter()
+      .map(|bound| (bound.virtual_partition_id, bound.min_snowflake))
+      .collect::<HashMap<_, _>>(),
+    HashMap::from([(7, expected_floor.as_u64())])
+  );
+  let recovery_request = requests
+    .iter()
+    .find(|request| request.window_start_unix_seconds == window_start + 300)
+    .expect("broker receives the unbounded recovery window");
+  let Some(read_metadata_window_request::Coverage::FullRecovery(recovery)) =
+    recovery_request.coverage.as_ref()
+  else {
+    panic!("unbounded recovery uses Full Recovery coverage");
+  };
+  assert_eq!(recovery.virtual_partition_ids, vec![7]);
+}
+
+#[tokio::test]
+async fn broker_recovery_delivery_preserves_batches_and_cursor() {
+  let window_start = 1_700_000_100;
+  let checkpoint_timestamp = OffsetDateTime::from_unix_timestamp(window_start + 120).unwrap();
+  let checkpoint_snowflake = SnowflakeId::minimum_for_timestamp(checkpoint_timestamp);
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store_dyn.as_ref(),
+    "telemetry",
+    window_start,
+    checkpoint_snowflake.as_u64(),
+    7,
+    SeqRange { start: 11, end: 11 },
+    vec![new_record(vec![11], window_start * 1_000)],
+    Compression::none(),
+  )
+  .await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store_dyn.as_ref(),
+    "telemetry",
+    window_start + 300,
+    SnowflakeId::minimum_for_timestamp(timestamp(window_start + 301)).as_u64(),
+    7,
+    SeqRange { start: 12, end: 12 },
+    vec![new_record(vec![12], (window_start + 300) * 1_000)],
+    Compression::none(),
+  )
+  .await;
+  let checkpoint_window = TopicWindowKey {
+    topic: "telemetry".to_string(),
+    window_start_unix_seconds: window_start,
+  };
+  let recovery_window = TopicWindowKey {
+    topic: "telemetry".to_string(),
+    window_start_unix_seconds: window_start + 300,
+  };
+  let checkpoint_segments = metadata_store
+    .scan_window_from_snowflake(&checkpoint_window, None, MetadataReadConsistency::Strong)
+    .await
+    .unwrap();
+  let recovery_segments = metadata_store
+    .scan_window_from_snowflake(&recovery_window, None, MetadataReadConsistency::Strong)
+    .await
+    .unwrap();
+  metadata_store.scans.lock().clear();
+  let mut recovery_response =
+    broker_metadata_response(&recovery_segments, timestamp(window_start + 300));
+  if let Some(read_metadata_window_response::Result::Success(success)) =
+    recovery_response.result.as_mut()
+  {
+    success.refill_floor = None;
+  }
+  let broker_query = Arc::new(FixedBrokerMetadataQuery {
+    responses: HashMap::from([
+      (
+        window_start,
+        broker_metadata_response(&checkpoint_segments, timestamp(window_start + 300)),
+      ),
+      (window_start + 300, recovery_response),
+    ]),
+  });
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true)
+      .with_bool_flag("blob_stream_consumer_broker_metadata_cache_enabled", true),
+  ));
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    blob_store,
+    metadata_store_dyn,
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .broker_metadata_query(broker_query);
+  reader.hydrate_cursor_with_source(
+    7,
+    &CommittedCursor {
+      virtual_partition_id: 7,
+      seq_end: 10,
+      source_checkpoint: Some(CommittedSourceCheckpoint {
+        window_start_unix_seconds: window_start,
+        snowflake_id: checkpoint_snowflake.as_u64(),
+      }),
+    },
+    Some(window_start * 1_000),
+    timestamp(window_start + 300),
+  );
+  reader
+    .set_assigned_virtual_partitions(&[7], timestamp(window_start + 300))
+    .unwrap();
+
+  let batches = reader.read_available(window_start + 300).await.unwrap();
+  assert_eq!(
+    batches
+      .iter()
+      .map(|batch| batch.seq_range.end)
+      .collect::<Vec<_>>(),
+    vec![11, 12]
+  );
+  assert_eq!(reader.cursor(7), Some(12));
+  assert!(metadata_store.scans.lock().is_empty());
 }
 
 #[tokio::test]
@@ -3083,6 +3421,315 @@ async fn fast_scan_uses_lowest_partition_frontier_for_cross_partition_ordering()
       .scans
       .lock()
       .contains(&(900, Some(SnowflakeId(1))))
+  );
+}
+
+#[tokio::test]
+async fn broker_tail_request_keeps_each_fast_partition_frontier() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let recording_metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = recording_metadata_store.clone();
+  let broker_query = Arc::new(RecordingBrokerMetadataQuery {
+    requests: Mutex::new(Vec::new()),
+  });
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true)
+      .with_bool_flag("blob_stream_consumer_broker_metadata_cache_enabled", true),
+  ));
+
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    100,
+    7,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![7], 901_000)],
+    Compression::none(),
+  )
+  .await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    8,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![8], 901_000)],
+    Compression::none(),
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    Arc::clone(&blob_store),
+    Arc::clone(&metadata_store),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .broker_metadata_query(broker_query.clone());
+
+  assert_eq!(reader.read_available(901).await.unwrap().len(), 2);
+  broker_query.requests.lock().clear();
+  recording_metadata_store.scans.lock().clear();
+
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    2,
+    8,
+    SeqRange { start: 2, end: 2 },
+    vec![new_record(vec![9], 902_000)],
+    Compression::none(),
+  )
+  .await;
+
+  assert_eq!(reader.read_available(902).await.unwrap().len(), 1);
+  let request = broker_query
+    .requests()
+    .into_iter()
+    .find(|request| request.window_start_unix_seconds == 900)
+    .expect("broker receives the active Fast window");
+  let Some(read_metadata_window_request::Coverage::Tail(tail)) = request.coverage else {
+    panic!("Fast broker request must use Tail coverage");
+  };
+  assert_eq!(
+    tail
+      .partition_bounds
+      .iter()
+      .map(|bound| (bound.virtual_partition_id, bound.min_snowflake))
+      .collect::<HashMap<_, _>>(),
+    HashMap::from([(7, 100), (8, 1)])
+  );
+  assert!(
+    recording_metadata_store
+      .scans
+      .lock()
+      .contains(&(900, Some(SnowflakeId(1))))
+  );
+}
+
+async fn shadow_read(
+  mutate_broker_segment: impl FnOnce(&mut SegmentMetadata),
+  broker_response: ShadowBrokerResponse,
+  shadow: bool,
+) -> (Vec<ConsumerBatch>, Option<u64>, Helper) {
+  let metrics = Helper::new();
+  let metrics_scope = metrics
+    .collector()
+    .scope("blob_stream_consumer_shadow_test");
+  let blob_store = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(InMemoryMetadataStore::new());
+  let snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(901));
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    snowflake_id.as_u64(),
+    7,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![7], 901_000)],
+    Compression::none(),
+  )
+  .await;
+  let window = TopicWindowKey {
+    topic: "telemetry".to_string(),
+    window_start_unix_seconds: 900,
+  };
+  let direct_segments = metadata_store
+    .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Strong)
+    .await
+    .unwrap();
+  let mut broker_segments = direct_segments.clone();
+  mutate_broker_segment(&mut broker_segments[0]);
+  let mut empty_response = broker_metadata_response(&[], timestamp(901));
+  let mut segments_response = broker_metadata_response(&broker_segments, timestamp(901));
+  if matches!(broker_response, ShadowBrokerResponse::Malformed) {
+    for response in [&mut empty_response, &mut segments_response] {
+      if let Some(read_metadata_window_response::Result::Success(success)) =
+        response.result.as_mut()
+      {
+        success.generation = 0;
+      }
+    }
+  }
+  let broker_query = Arc::new(FixedBrokerMetadataQuery {
+    responses: match broker_response {
+      ShadowBrokerResponse::Valid | ShadowBrokerResponse::Malformed => {
+        HashMap::from([(600, empty_response), (900, segments_response)])
+      },
+      ShadowBrokerResponse::TransportFailure => HashMap::new(),
+    },
+  });
+  let mut feature_flags = DefaultFeatureFlags::default()
+    .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true)
+    .with_bool_flag("blob_stream_consumer_broker_metadata_cache_enabled", true);
+  if shadow {
+    feature_flags =
+      feature_flags.with_bool_flag("blob_stream_consumer_broker_metadata_cache_shadow", true);
+  }
+  let feature_flags = FakeLoader::new(Arc::new(feature_flags));
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    &metrics_scope,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .broker_metadata_query(broker_query);
+
+  let batches = reader.read_available(901).await.unwrap();
+  (batches, reader.cursor(7), metrics)
+}
+
+#[tokio::test]
+async fn shadow_match_delivers_direct_metadata_and_records_match() {
+  let (batches, cursor, metrics) = shadow_read(|_| {}, ShadowBrokerResponse::Valid, true).await;
+
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].records[0].payload, vec![7]);
+  assert_eq!(cursor, Some(1));
+  metrics.assert_counter_eq(
+    2,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_shadow_matches",
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    0,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_shadow_mismatches",
+    &labels!(),
+  );
+}
+
+#[tokio::test]
+async fn shadow_mismatch_keeps_direct_delivery_and_records_mismatch() {
+  let (batches, cursor, metrics) = shadow_read(
+    |segment| {
+      segment.blob_key = BlobKey::from("telemetry/different");
+    },
+    ShadowBrokerResponse::Valid,
+    true,
+  )
+  .await;
+
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].records[0].payload, vec![7]);
+  assert_eq!(cursor, Some(1));
+  metrics.assert_counter_eq(
+    1,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_shadow_matches",
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    1,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_shadow_mismatches",
+    &labels!(),
+  );
+}
+
+#[tokio::test]
+async fn shadow_transport_failure_keeps_direct_delivery_and_records_comparison_failure() {
+  let (batches, cursor, metrics) =
+    shadow_read(|_| {}, ShadowBrokerResponse::TransportFailure, true).await;
+
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].records[0].payload, vec![7]);
+  assert_eq!(cursor, Some(1));
+  metrics.assert_counter_eq(
+    2,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_shadow_comparison_failures",
+    &labels!(),
+  );
+}
+
+#[tokio::test]
+async fn shadow_malformed_response_keeps_direct_delivery_and_records_comparison_failure() {
+  let (batches, cursor, metrics) = shadow_read(|_| {}, ShadowBrokerResponse::Malformed, true).await;
+
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].records[0].payload, vec![7]);
+  assert_eq!(cursor, Some(1));
+  metrics.assert_counter_eq(
+    2,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_shadow_comparison_failures",
+    &labels!(),
+  );
+}
+
+#[tokio::test]
+async fn broker_offload_metrics_distinguish_delivery_from_direct_fallback() {
+  let (_, _, delivered_metrics) = shadow_read(|_| {}, ShadowBrokerResponse::Valid, false).await;
+  delivered_metrics.assert_counter_eq(
+    2,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_requests",
+    &labels!(),
+  );
+  delivered_metrics.assert_counter_eq(
+    2,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_deliveries",
+    &labels!(),
+  );
+  delivered_metrics.assert_counter_eq(
+    0,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_fallbacks",
+    &labels!(),
+  );
+
+  let (_, _, fallback_metrics) =
+    shadow_read(|_| {}, ShadowBrokerResponse::TransportFailure, false).await;
+  fallback_metrics.assert_counter_eq(
+    2,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_requests",
+    &labels!(),
+  );
+  fallback_metrics.assert_counter_eq(
+    0,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_deliveries",
+    &labels!(),
+  );
+  fallback_metrics.assert_counter_eq(
+    2,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_fallbacks",
+    &labels!(),
+  );
+
+  let (_, _, rejected_metrics) = shadow_read(|_| {}, ShadowBrokerResponse::Malformed, false).await;
+  rejected_metrics.assert_counter_eq(
+    2,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_requests",
+    &labels!(),
+  );
+  rejected_metrics.assert_counter_eq(
+    0,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_deliveries",
+    &labels!(),
+  );
+  rejected_metrics.assert_counter_eq(
+    2,
+    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_fallbacks",
+    &labels!(),
   );
 }
 

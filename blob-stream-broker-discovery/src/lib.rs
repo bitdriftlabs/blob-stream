@@ -10,13 +10,19 @@ mod tests;
 pub mod k8s;
 pub mod r#static;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use blob_stream_proto::protos::blobstream::v1::config::BrokerDiscoveryConfig;
 use protobuf::Chars;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
+
+/// Maximum startup delay while waiting for discovery's authoritative initial snapshot.
+pub const INITIAL_MEMBERSHIP_TIMEOUT: Duration = Duration::from_secs(10);
 
 //
 // BrokerNode
@@ -148,6 +154,52 @@ pub fn balanced_assignment(
   assignments
 }
 
+/// Build the configured static or Kubernetes discovery source used by all broker clients.
+pub fn discovery_from_config(config: &BrokerDiscoveryConfig) -> Result<Arc<dyn BrokerDiscovery>> {
+  if config.has_static() {
+    let nodes = config
+      .static_()
+      .nodes
+      .iter()
+      .map(|node| BrokerNode {
+        node_id: node.node_id.clone(),
+        address: node.address.clone(),
+      })
+      .collect();
+    return Ok(Arc::new(r#static::StaticBrokerDiscovery::new(nodes)));
+  }
+  if config.has_k8s_service() {
+    let k8s = config.k8s_service();
+    return Ok(Arc::new(k8s::K8sServiceBrokerDiscovery::new(
+      k8s.namespace.to_string(),
+      k8s.service_name.to_string(),
+    )));
+  }
+  Err(anyhow::anyhow!(
+    "broker discovery backend is required (static or k8s_service)"
+  ))
+}
+
+/// Select one stable local broker owner for a metadata window.
+#[must_use]
+pub fn metadata_window_owner(
+  topic: &str,
+  window_start_unix_seconds: i64,
+  membership: &BrokerMembership,
+) -> Option<BrokerNode> {
+  canonical_nodes(membership)
+    .into_iter()
+    .max_by(|left, right| {
+      metadata_window_score(topic, window_start_unix_seconds, &left.node_id)
+        .cmp(&metadata_window_score(
+          topic,
+          window_start_unix_seconds,
+          &right.node_id,
+        ))
+        .then_with(|| right.node_id.cmp(&left.node_id))
+    })
+}
+
 fn canonical_nodes(membership: &BrokerMembership) -> Vec<BrokerNode> {
   let mut nodes = membership.nodes().unwrap_or_default().to_vec();
   nodes.sort_unstable_by(|left, right| {
@@ -168,6 +220,14 @@ fn rendezvous_score(partition: &BrokerPartition, node_id: &str) -> u64 {
   hasher.finish()
 }
 
+fn metadata_window_score(topic: &str, window_start_unix_seconds: i64, node_id: &str) -> u64 {
+  let mut hasher = DefaultHasher::new();
+  topic.hash(&mut hasher);
+  window_start_unix_seconds.hash(&mut hasher);
+  node_id.hash(&mut hasher);
+  hasher.finish()
+}
+
 //
 // BrokerDiscovery
 //
@@ -180,4 +240,22 @@ pub trait BrokerDiscovery: Send + Sync {
   /// A receiver may initially contain [`BrokerMembership::Pending`]. Callers must wait for an
   /// [`BrokerMembership::Initialized`] snapshot before treating membership as authoritative.
   async fn watch_membership(&self) -> Result<watch::Receiver<BrokerMembership>>;
+}
+
+/// Wait for the first authoritative membership snapshot from a discovery watch.
+pub async fn wait_for_initialized_membership(
+  membership_rx: &mut watch::Receiver<BrokerMembership>,
+) -> Result<BrokerMembership> {
+  loop {
+    // Pending is not an authoritative empty membership, so routes must not be created from it.
+    let membership = membership_rx.borrow_and_update().clone();
+    if matches!(membership, BrokerMembership::Initialized(_)) {
+      return Ok(membership);
+    }
+
+    membership_rx
+      .changed()
+      .await
+      .map_err(|_| anyhow!("broker discovery closed before initial membership was available"))?;
+  }
 }

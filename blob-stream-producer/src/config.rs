@@ -6,9 +6,7 @@ use anyhow::{Result, anyhow, ensure};
 use bd_grpc::compression::Compression;
 use bd_pgv::proto_validate;
 use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
-use blob_stream_broker_discovery::k8s::K8sServiceBrokerDiscovery;
-use blob_stream_broker_discovery::r#static::StaticBrokerDiscovery;
-use blob_stream_broker_discovery::{BrokerDiscovery, BrokerNode};
+use blob_stream_broker_discovery::{BrokerDiscovery, discovery_from_config};
 pub use blob_stream_proto::protos::blobstream::v1::config::{
   BrokerDiscoveryConfig,
   BrokerNode as ProducerNodeConfig,
@@ -303,30 +301,6 @@ pub fn validate_discovery_config(discovery: &ProducerDiscoveryConfig) -> Result<
 }
 
 pub fn into_discovery(discovery: &ProducerDiscoveryConfig) -> Result<Arc<dyn BrokerDiscovery>> {
-  if discovery.has_static() {
-    debug!("constructing static producer discovery backend");
-    let nodes = discovery
-      .static_()
-      .nodes
-      .iter()
-      .map(|node| BrokerNode {
-        node_id: node.node_id.clone(),
-        address: node.address.clone(),
-      })
-      .collect();
-    return Ok(Arc::new(StaticBrokerDiscovery::new(nodes)));
-  }
-
-  if discovery.has_k8s_service() {
-    debug!("constructing k8s producer discovery backend");
-    let k8s = discovery.k8s_service();
-    return Ok(Arc::new(K8sServiceBrokerDiscovery::new(
-      k8s.namespace.to_string(),
-      k8s.service_name.to_string(),
-    )));
-  }
-
-  Err(anyhow!(
-    "producer discovery backend is required (static or k8s_service)"
-  ))
+  debug!("constructing producer broker discovery backend");
+  discovery_from_config(discovery)
 }

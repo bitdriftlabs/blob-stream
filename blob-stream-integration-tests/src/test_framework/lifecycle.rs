@@ -30,6 +30,7 @@ pub enum LifecycleEvent {
   ConsumerRevocationEmitted,
   ConsumerPrefetchBatchBuffered,
   ConsumerRecoveryFastPathActive,
+  ConsumerInitialFastPathActive,
   ConsumerBeforeScheduledHeartbeat,
   ConsumerBeforeRebalance,
   ConsumerRebalanceFailed,
@@ -400,6 +401,22 @@ impl ConsumerLifecycleHooks for TestLifecycleHooks {
     self
       .reach_consumer(
         LifecycleEvent::ConsumerRecoveryFastPathActive,
+        member_id,
+        generation,
+        &[virtual_partition_id],
+      )
+      .await;
+  }
+
+  async fn initial_fast_path_active(
+    &self,
+    member_id: &str,
+    generation: u64,
+    virtual_partition_id: VirtualPartitionId,
+  ) {
+    self
+      .reach_consumer(
+        LifecycleEvent::ConsumerInitialFastPathActive,
         member_id,
         generation,
         &[virtual_partition_id],

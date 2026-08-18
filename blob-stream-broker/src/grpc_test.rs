@@ -1,4 +1,5 @@
 use super::{BrokerGrpc, BrokerGrpcMetrics, produce_request_config};
+use crate::read::metadata_cache::{MetadataCache, MetadataCacheConfig};
 use crate::write::{AdmissionController, TopicInfo, WriteConfig, WriteEngineBuilder};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -13,14 +14,32 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchesRequest,
   ProduceStatus,
 };
+use blob_stream_proto::protos::blobstream::v1::config::{BrokerConfig, RuntimeConfig, TopicConfig};
 use blob_stream_test_utils::ManualTimeProvider;
-use blob_stream_types::{MAX_PRODUCE_BATCHES_REQUEST_BYTES, SeqRange, new_record};
+use blob_stream_types::{MAX_PRODUCE_BATCHES_REQUEST_BYTES, SeqRange, ToProtoDuration, new_record};
 use http::{Extensions, HeaderMap};
 use prometheus::labels;
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::{Semaphore, mpsc};
+
+fn metadata_cache() -> Arc<MetadataCache> {
+  let mut runtime = RuntimeConfig::new();
+  runtime.broker = Some(BrokerConfig::new()).into();
+  let mut topic = TopicConfig::new();
+  topic.name = "telemetry".into();
+  topic.partition_count = 1;
+  topic.num_writers = 1;
+  topic.metadata_window_size = Duration::minutes(5).into_proto();
+  runtime.topics.push(topic);
+  let config = MetadataCacheConfig::from_runtime_config(&runtime, None)
+    .expect("test metadata cache config is valid");
+  Arc::new(MetadataCache::new(
+    Arc::new(InMemoryMetadataStore::new()),
+    config,
+  ))
+}
 
 struct OverloadedAdmissionController;
 
@@ -151,7 +170,11 @@ async fn sanitizes_internal_write_errors_and_preserves_fence_loss() -> Result<()
     ..Default::default()
   };
 
-  let internal_grpc = BrokerGrpc::new(Arc::new(FailingWriteEngine { fence_lost: false }), &scope);
+  let internal_grpc = BrokerGrpc::new(
+    Arc::new(FailingWriteEngine { fence_lost: false }),
+    metadata_cache(),
+    &scope,
+  );
   let internal_response = internal_grpc
     .handle(HeaderMap::new(), Extensions::new(), request.clone())
     .await?;
@@ -169,7 +192,11 @@ async fn sanitizes_internal_write_errors_and_preserves_fence_loss() -> Result<()
       .contains("private-metadata-table")
   );
 
-  let fence_grpc = BrokerGrpc::new(Arc::new(FailingWriteEngine { fence_lost: true }), &scope);
+  let fence_grpc = BrokerGrpc::new(
+    Arc::new(FailingWriteEngine { fence_lost: true }),
+    metadata_cache(),
+    &scope,
+  );
   let fence_response = fence_grpc
     .handle(HeaderMap::new(), Extensions::new(), request)
     .await?;
@@ -216,7 +243,7 @@ async fn returns_overloaded_when_admission_controller_rejects() -> Result<()> {
     )))
     .build()?,
   );
-  let grpc = BrokerGrpc::new(engine, &scope);
+  let grpc = BrokerGrpc::new(engine, metadata_cache(), &scope);
 
   let response = grpc
     .handle(
@@ -276,7 +303,7 @@ async fn successful_batches_record_accepted_write_volume() -> Result<()> {
     )))
     .build()?,
   );
-  let grpc = BrokerGrpc::new(engine, &scope);
+  let grpc = BrokerGrpc::new(engine, metadata_cache(), &scope);
 
   let response = grpc
     .handle(
@@ -330,7 +357,7 @@ async fn empty_logical_batches_return_bad_request() -> Result<()> {
     )))
     .build()?,
   );
-  let grpc = BrokerGrpc::new(engine, &scope);
+  let grpc = BrokerGrpc::new(engine, metadata_cache(), &scope);
   let empty_batch = ProduceBatchRequest {
     topic: "telemetry".into(),
     virtual_partition_id: 0,
@@ -370,7 +397,11 @@ async fn empty_logical_batches_return_bad_request() -> Result<()> {
 #[tokio::test]
 async fn produces_batched_results_in_request_order() -> Result<()> {
   let scope = Collector::default().scope("blob_stream_broker_test");
-  let grpc = BrokerGrpc::new(Arc::new(PartialResponseWriteEngine), &scope);
+  let grpc = BrokerGrpc::new(
+    Arc::new(PartialResponseWriteEngine),
+    metadata_cache(),
+    &scope,
+  );
 
   let response = <BrokerGrpc as Handler<ProduceBatchesRequest, _>>::handle(
     &grpc,
@@ -421,6 +452,7 @@ async fn starts_all_batches_in_grouped_request_concurrently() -> Result<()> {
       entered_tx,
       release: Arc::clone(&release),
     }),
+    metadata_cache(),
     &scope,
   ));
   let request = ProduceBatchesRequest {

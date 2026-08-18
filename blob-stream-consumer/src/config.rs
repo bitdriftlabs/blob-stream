@@ -24,6 +24,7 @@ const DEFAULT_IDLE_POLL_DELAY: Duration = Duration::milliseconds(250);
 const DEFAULT_MAX_IDLE_POLL_DELAY: Duration = Duration::seconds(2);
 const DEFAULT_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_METADATA_VISIBILITY_DELAY: Duration = Duration::milliseconds(2_000);
+const DEFAULT_METADATA_CACHE_MAX_AGE: Duration = Duration::milliseconds(250);
 const DEFAULT_MAX_IN_FLIGHT_BATCH_READS: u64 = 32;
 pub const DEFAULT_MAX_CLOCK_SKEW: Duration = Duration::milliseconds(10);
 const MAX_CANDIDATE_WINDOWS: usize = 32;
@@ -35,6 +36,10 @@ const PREFETCH_MAX_BYTES_FEATURE_FLAG: &str = "blob_stream_consumer_prefetch_max
 const MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG: &str =
   "blob_stream_consumer_max_in_flight_batch_reads";
 const STRONG_METADATA_READS_FEATURE_FLAG: &str = "blob_stream_consumer_strong_metadata_reads";
+const BROKER_METADATA_CACHE_ENABLED_FEATURE_FLAG: &str =
+  "blob_stream_consumer_broker_metadata_cache_enabled";
+const BROKER_METADATA_CACHE_SHADOW_FEATURE_FLAG: &str =
+  "blob_stream_consumer_broker_metadata_cache_shadow";
 const IDLE_POLL_DELAY_FEATURE_FLAG: &str = "blob_stream_consumer_idle_poll_delay_ms";
 const MAX_IDLE_POLL_DELAY_FEATURE_FLAG: &str = "blob_stream_consumer_max_idle_poll_delay_ms";
 const LEASE_DURATION_FEATURE_FLAG: &str = "blob_stream_consumer_lease_duration_ms";
@@ -51,6 +56,8 @@ pub struct ConsumerReadRuntimeSettings {
   pub(crate) max_in_flight_batch_reads: usize,
   pub(crate) metadata_read_consistency: MetadataReadConsistency,
   pub(crate) metadata_visibility_delay: Duration,
+  pub(crate) broker_metadata_cache_enabled: bool,
+  pub(crate) broker_metadata_cache_shadow: bool,
 }
 
 /// Apply startup-only feature flags that affect this consumer process's local scheduling.
@@ -142,6 +149,15 @@ pub fn topic_max_metadata_publication_lag(config: &TopicConfig) -> Duration {
 }
 
 #[must_use]
+/// Return the shared maximum age for retained eventual broker metadata.
+pub fn topic_metadata_cache_max_age(config: &TopicConfig) -> Duration {
+  config.metadata_cache_max_age.as_ref().map_or(
+    DEFAULT_METADATA_CACHE_MAX_AGE,
+    ProtoDurationExt::to_time_duration,
+  )
+}
+
+#[must_use]
 /// Return the consumer clock-skew budget as a typed duration, applying the 10 ms default.
 pub fn consumer_max_clock_skew(config: &ConsumerReadConfig) -> Duration {
   config
@@ -223,12 +239,19 @@ pub fn consumer_read_runtime_settings(
     consumer_metadata_visibility_delay(config),
     strong_metadata_reads,
   );
+  let broker_metadata_cache_enabled = feature_flags
+    .is_some_and(|flags| flags.get_bool(BROKER_METADATA_CACHE_ENABLED_FEATURE_FLAG, false));
+  let broker_metadata_cache_shadow = broker_metadata_cache_enabled
+    && feature_flags
+      .is_some_and(|flags| flags.get_bool(BROKER_METADATA_CACHE_SHADOW_FEATURE_FLAG, false));
 
   ConsumerReadRuntimeSettings {
     prefetch_max_bytes,
     max_in_flight_batch_reads,
     metadata_read_consistency,
     metadata_visibility_delay,
+    broker_metadata_cache_enabled,
+    broker_metadata_cache_shadow,
   }
 }
 

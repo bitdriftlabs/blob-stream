@@ -4,6 +4,7 @@ mod tests;
 
 mod api;
 mod diagnostics;
+mod metadata_query;
 mod metrics;
 mod reader;
 mod scan;
@@ -17,6 +18,7 @@ pub(crate) use diagnostics::{
   ConsumerReaderFastScanBoundState,
   ConsumerReaderPartitionScanState,
 };
+pub use metadata_query::{BrokerMetadataQuery, GrpcBrokerMetadataQuery};
 use metrics::ConsumerReaderMetrics;
 pub use reader::ConsumerReaderImpl;
 pub(crate) use state::{

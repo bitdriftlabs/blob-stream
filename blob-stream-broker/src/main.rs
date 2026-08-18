@@ -5,11 +5,14 @@ use bd_shutdown::{ComponentShutdownTrigger, real_graceful_shutdown};
 use blob_stream_broker::config::load_runtime_config;
 use blob_stream_broker::grpc::make_broker_router;
 use blob_stream_broker::metrics::BrokerMetrics;
-use blob_stream_broker::write::build_write_engine;
+use blob_stream_broker::read::metadata_cache::{MetadataCache, MetadataCacheConfig};
+use blob_stream_broker::write::{build_runtime_metadata_store, build_write_engine};
+use blob_stream_metadata_store::DynamoCapacityMetrics;
 use clap::Parser;
 use log::info;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Parser)]
 #[command(name = "blob-stream-broker", about = "Blob stream broker")]
@@ -62,8 +65,20 @@ async fn async_main() -> Result<()> {
     .as_ref()
     .map(|feature_flags| feature_flags.snapshot_watch());
   let broker_shutdown_trigger = ComponentShutdownTrigger::default();
+  let dynamo_capacity_metrics = DynamoCapacityMetrics::new(&metrics_scope.scope("dynamo"));
+  let metadata_store =
+    build_runtime_metadata_store(&config, dynamo_capacity_metrics.clone()).await?;
+  let metadata_cache_config =
+    MetadataCacheConfig::from_runtime_config(&config, feature_flags_watch.as_ref())?;
+  let metadata_cache = Arc::new(MetadataCache::new_with_metrics(
+    Arc::clone(&metadata_store),
+    metadata_cache_config,
+    &metrics_scope,
+  ));
   let write_engine = build_write_engine(
     &config,
+    metadata_store,
+    dynamo_capacity_metrics,
     broker_shutdown_trigger.make_handle(),
     &metrics_scope,
     feature_flags_watch,
@@ -75,9 +90,12 @@ async fn async_main() -> Result<()> {
   let listener_shutdown_trigger = ComponentShutdownTrigger::default();
   let mut listener_shutdown = listener_shutdown_trigger.make_shutdown();
   let server = tokio::spawn(async move {
-    axum::serve(listener, make_broker_router(write_engine, &metrics))
-      .with_graceful_shutdown(async move { listener_shutdown.cancelled().await })
-      .await
+    axum::serve(
+      listener,
+      make_broker_router(write_engine, metadata_cache, &metrics),
+    )
+    .with_graceful_shutdown(async move { listener_shutdown.cancelled().await })
+    .await
   });
 
   real_graceful_shutdown().await;

@@ -36,6 +36,24 @@ substitute for deterministic synchronization.
 
 ## Already Hardened
 
+- [x] Production broker-metadata routing, collapse, fallback, and shadow boundaries use real TCP
+  discovery and lifecycle/store gates.
+  - Covered: independent consumer groups collapse compatible eventual and strong Fast Tail reads
+    into one broker metadata scan; an unavailable metadata owner takes the direct-read path; and
+    shadow mode issues broker reads while retaining direct metadata as the delivery authority for
+    every initial-recovery window. A broker Tail request that exceeds its configured deadline also
+    takes the original direct-read path while the held broker scan remains in flight. A replacement
+    member recovers through the broker transport after a graceful restart and only delivers work
+    published after its predecessor's committed source checkpoint; retained recovery across two
+    historical windows likewise queries through the broker cache and skips that checkpoint.
+    A consumer whose injected metadata membership loses its initially healthy owner also falls
+    back directly for the next Tail query without disrupting the producer's live route.
+    A one-byte Tail-cache budget forces an over-budget generation to evict, and the next Tail
+    request reloads through the broker cache before delivering the later record.
+    Real TCP reader transport verifies equal Fast frontiers retain their exact shared Tail bound,
+    while mixed frontiers use the lowest bound. A zero-age eventual cache refills after an empty
+    observation, defers late metadata before its publication time, and delivers it at the
+    observation-aware visibility boundary.
 - [x] `consumer_restart_resume_from_committed_offsets`: gates graceful shutdown so the test proves
   commit, lease release, and member deregistration ordering.
 - [x] `autoscaling_rebalance_and_failover_preserves_progress`: drains its terminal result through

@@ -15,6 +15,7 @@ use crate::config::{
   consumer_read_runtime_settings,
   validate_read_config,
 };
+use crate::consumer::metadata_query::BrokerMetadataQuery;
 use anyhow::{Result, ensure};
 use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
@@ -98,12 +99,14 @@ pub struct ConsumerReaderImpl {
   pub(in crate::consumer) config: ConsumerReadConfig,
   pub(in crate::consumer) blob_store: Arc<dyn BlobStore>,
   pub(in crate::consumer) metadata_store: Arc<dyn MetadataStore>,
+  pub(in crate::consumer) broker_metadata_query: Option<Arc<dyn BrokerMetadataQuery>>,
   pub(in crate::consumer) virtual_partition_states:
     HashMap<VirtualPartitionId, VirtualPartitionState>,
   pub(in crate::consumer) retention: Duration,
   pub(in crate::consumer) maximum_metadata_publication_lag: Duration,
   pub(in crate::consumer) metadata_window_size: Duration,
   pub(in crate::consumer) maximum_clock_skew: Duration,
+  pub(in crate::consumer) metadata_cache_max_age: Duration,
   pub(in crate::consumer) fast_frontiers: HashMap<(VirtualPartitionId, i64), SnowflakeId>,
   pub(in crate::consumer) recovery_scan_last_partition: Option<VirtualPartitionId>,
   pub(in crate::consumer) recovery_metadata_cache:
