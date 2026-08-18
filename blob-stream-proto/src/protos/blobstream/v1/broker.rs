@@ -851,6 +851,1495 @@ impl ::protobuf::reflect::ProtobufValue for ProduceBatchesResponse {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
+// @@protoc_insertion_point(message:blobstream.v1.MetadataPartitionBound)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct MetadataPartitionBound {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.MetadataPartitionBound.virtual_partition_id)
+    pub virtual_partition_id: u32,
+    // @@protoc_insertion_point(field:blobstream.v1.MetadataPartitionBound.min_snowflake)
+    pub min_snowflake: u64,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.MetadataPartitionBound.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a MetadataPartitionBound {
+    fn default() -> &'a MetadataPartitionBound {
+        <MetadataPartitionBound as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl MetadataPartitionBound {
+    pub fn new() -> MetadataPartitionBound {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "virtual_partition_id",
+            |m: &MetadataPartitionBound| { &m.virtual_partition_id },
+            |m: &mut MetadataPartitionBound| { &mut m.virtual_partition_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "min_snowflake",
+            |m: &MetadataPartitionBound| { &m.min_snowflake },
+            |m: &mut MetadataPartitionBound| { &mut m.min_snowflake },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MetadataPartitionBound>(
+            "MetadataPartitionBound",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for MetadataPartitionBound {
+    const NAME: &'static str = "MetadataPartitionBound";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                8 => {
+                    self.virtual_partition_id = is.read_uint32()?;
+                },
+                16 => {
+                    self.min_snowflake = is.read_uint64()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if self.virtual_partition_id != 0 {
+            my_size += ::protobuf::rt::uint32_size(1, self.virtual_partition_id);
+        }
+        if self.min_snowflake != 0 {
+            my_size += ::protobuf::rt::uint64_size(2, self.min_snowflake);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if self.virtual_partition_id != 0 {
+            os.write_uint32(1, self.virtual_partition_id)?;
+        }
+        if self.min_snowflake != 0 {
+            os.write_uint64(2, self.min_snowflake)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> MetadataPartitionBound {
+        MetadataPartitionBound::new()
+    }
+
+    fn clear(&mut self) {
+        self.virtual_partition_id = 0;
+        self.min_snowflake = 0;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static MetadataPartitionBound {
+        static instance: MetadataPartitionBound = MetadataPartitionBound {
+            virtual_partition_id: 0,
+            min_snowflake: 0,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for MetadataPartitionBound {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("MetadataPartitionBound").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for MetadataPartitionBound {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for MetadataPartitionBound {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.TailMetadataCoverage)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct TailMetadataCoverage {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.TailMetadataCoverage.partition_bounds)
+    pub partition_bounds: ::std::vec::Vec<MetadataPartitionBound>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.TailMetadataCoverage.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a TailMetadataCoverage {
+    fn default() -> &'a TailMetadataCoverage {
+        <TailMetadataCoverage as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl TailMetadataCoverage {
+    pub fn new() -> TailMetadataCoverage {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(1);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
+            "partition_bounds",
+            |m: &TailMetadataCoverage| { &m.partition_bounds },
+            |m: &mut TailMetadataCoverage| { &mut m.partition_bounds },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<TailMetadataCoverage>(
+            "TailMetadataCoverage",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for TailMetadataCoverage {
+    const NAME: &'static str = "TailMetadataCoverage";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.partition_bounds.push(is.read_message()?);
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        for value in &self.partition_bounds {
+            let len = value.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        };
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        for v in &self.partition_bounds {
+            ::protobuf::rt::write_message_field_with_cached_size(1, v, os)?;
+        };
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> TailMetadataCoverage {
+        TailMetadataCoverage::new()
+    }
+
+    fn clear(&mut self) {
+        self.partition_bounds.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static TailMetadataCoverage {
+        static instance: TailMetadataCoverage = TailMetadataCoverage {
+            partition_bounds: ::std::vec::Vec::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for TailMetadataCoverage {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("TailMetadataCoverage").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for TailMetadataCoverage {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for TailMetadataCoverage {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.FullRecoveryMetadataCoverage)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct FullRecoveryMetadataCoverage {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.FullRecoveryMetadataCoverage.virtual_partition_ids)
+    pub virtual_partition_ids: ::std::vec::Vec<u32>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.FullRecoveryMetadataCoverage.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a FullRecoveryMetadataCoverage {
+    fn default() -> &'a FullRecoveryMetadataCoverage {
+        <FullRecoveryMetadataCoverage as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl FullRecoveryMetadataCoverage {
+    pub fn new() -> FullRecoveryMetadataCoverage {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(1);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
+            "virtual_partition_ids",
+            |m: &FullRecoveryMetadataCoverage| { &m.virtual_partition_ids },
+            |m: &mut FullRecoveryMetadataCoverage| { &mut m.virtual_partition_ids },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<FullRecoveryMetadataCoverage>(
+            "FullRecoveryMetadataCoverage",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for FullRecoveryMetadataCoverage {
+    const NAME: &'static str = "FullRecoveryMetadataCoverage";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    is.read_repeated_packed_uint32_into(&mut self.virtual_partition_ids)?;
+                },
+                8 => {
+                    self.virtual_partition_ids.push(is.read_uint32()?);
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        my_size += ::protobuf::rt::vec_packed_uint32_size(1, &self.virtual_partition_ids);
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        os.write_repeated_packed_uint32(1, &self.virtual_partition_ids)?;
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> FullRecoveryMetadataCoverage {
+        FullRecoveryMetadataCoverage::new()
+    }
+
+    fn clear(&mut self) {
+        self.virtual_partition_ids.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static FullRecoveryMetadataCoverage {
+        static instance: FullRecoveryMetadataCoverage = FullRecoveryMetadataCoverage {
+            virtual_partition_ids: ::std::vec::Vec::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for FullRecoveryMetadataCoverage {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("FullRecoveryMetadataCoverage").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for FullRecoveryMetadataCoverage {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for FullRecoveryMetadataCoverage {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.ReadMetadataWindowRequest)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct ReadMetadataWindowRequest {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.ReadMetadataWindowRequest.topic)
+    pub topic: ::protobuf::Chars,
+    // @@protoc_insertion_point(field:blobstream.v1.ReadMetadataWindowRequest.window_start_unix_seconds)
+    pub window_start_unix_seconds: i64,
+    // @@protoc_insertion_point(field:blobstream.v1.ReadMetadataWindowRequest.consistency)
+    pub consistency: ::protobuf::EnumOrUnknown<MetadataReadConsistency>,
+    // @@protoc_insertion_point(field:blobstream.v1.ReadMetadataWindowRequest.max_response_bytes)
+    pub max_response_bytes: u64,
+    // message oneof groups
+    pub coverage: ::std::option::Option<read_metadata_window_request::Coverage>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.ReadMetadataWindowRequest.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a ReadMetadataWindowRequest {
+    fn default() -> &'a ReadMetadataWindowRequest {
+        <ReadMetadataWindowRequest as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl ReadMetadataWindowRequest {
+    pub fn new() -> ReadMetadataWindowRequest {
+        ::std::default::Default::default()
+    }
+
+    // .blobstream.v1.TailMetadataCoverage tail = 5;
+
+    pub fn tail(&self) -> &TailMetadataCoverage {
+        match self.coverage {
+            ::std::option::Option::Some(read_metadata_window_request::Coverage::Tail(ref v)) => v,
+            _ => <TailMetadataCoverage as ::protobuf::Message>::default_instance(),
+        }
+    }
+
+    pub fn clear_tail(&mut self) {
+        self.coverage = ::std::option::Option::None;
+    }
+
+    pub fn has_tail(&self) -> bool {
+        match self.coverage {
+            ::std::option::Option::Some(read_metadata_window_request::Coverage::Tail(..)) => true,
+            _ => false,
+        }
+    }
+
+    // Param is passed by value, moved
+    pub fn set_tail(&mut self, v: TailMetadataCoverage) {
+        self.coverage = ::std::option::Option::Some(read_metadata_window_request::Coverage::Tail(v))
+    }
+
+    // Mutable pointer to the field.
+    pub fn mut_tail(&mut self) -> &mut TailMetadataCoverage {
+        if let ::std::option::Option::Some(read_metadata_window_request::Coverage::Tail(_)) = self.coverage {
+        } else {
+            self.coverage = ::std::option::Option::Some(read_metadata_window_request::Coverage::Tail(TailMetadataCoverage::new()));
+        }
+        match self.coverage {
+            ::std::option::Option::Some(read_metadata_window_request::Coverage::Tail(ref mut v)) => v,
+            _ => panic!(),
+        }
+    }
+
+    // Take field
+    pub fn take_tail(&mut self) -> TailMetadataCoverage {
+        if self.has_tail() {
+            match self.coverage.take() {
+                ::std::option::Option::Some(read_metadata_window_request::Coverage::Tail(v)) => v,
+                _ => panic!(),
+            }
+        } else {
+            TailMetadataCoverage::new()
+        }
+    }
+
+    // .blobstream.v1.FullRecoveryMetadataCoverage full_recovery = 6;
+
+    pub fn full_recovery(&self) -> &FullRecoveryMetadataCoverage {
+        match self.coverage {
+            ::std::option::Option::Some(read_metadata_window_request::Coverage::FullRecovery(ref v)) => v,
+            _ => <FullRecoveryMetadataCoverage as ::protobuf::Message>::default_instance(),
+        }
+    }
+
+    pub fn clear_full_recovery(&mut self) {
+        self.coverage = ::std::option::Option::None;
+    }
+
+    pub fn has_full_recovery(&self) -> bool {
+        match self.coverage {
+            ::std::option::Option::Some(read_metadata_window_request::Coverage::FullRecovery(..)) => true,
+            _ => false,
+        }
+    }
+
+    // Param is passed by value, moved
+    pub fn set_full_recovery(&mut self, v: FullRecoveryMetadataCoverage) {
+        self.coverage = ::std::option::Option::Some(read_metadata_window_request::Coverage::FullRecovery(v))
+    }
+
+    // Mutable pointer to the field.
+    pub fn mut_full_recovery(&mut self) -> &mut FullRecoveryMetadataCoverage {
+        if let ::std::option::Option::Some(read_metadata_window_request::Coverage::FullRecovery(_)) = self.coverage {
+        } else {
+            self.coverage = ::std::option::Option::Some(read_metadata_window_request::Coverage::FullRecovery(FullRecoveryMetadataCoverage::new()));
+        }
+        match self.coverage {
+            ::std::option::Option::Some(read_metadata_window_request::Coverage::FullRecovery(ref mut v)) => v,
+            _ => panic!(),
+        }
+    }
+
+    // Take field
+    pub fn take_full_recovery(&mut self) -> FullRecoveryMetadataCoverage {
+        if self.has_full_recovery() {
+            match self.coverage.take() {
+                ::std::option::Option::Some(read_metadata_window_request::Coverage::FullRecovery(v)) => v,
+                _ => panic!(),
+            }
+        } else {
+            FullRecoveryMetadataCoverage::new()
+        }
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(6);
+        let mut oneofs = ::std::vec::Vec::with_capacity(1);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "topic",
+            |m: &ReadMetadataWindowRequest| { &m.topic },
+            |m: &mut ReadMetadataWindowRequest| { &mut m.topic },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "window_start_unix_seconds",
+            |m: &ReadMetadataWindowRequest| { &m.window_start_unix_seconds },
+            |m: &mut ReadMetadataWindowRequest| { &mut m.window_start_unix_seconds },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "consistency",
+            |m: &ReadMetadataWindowRequest| { &m.consistency },
+            |m: &mut ReadMetadataWindowRequest| { &mut m.consistency },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_oneof_message_has_get_mut_set_accessor::<_, TailMetadataCoverage>(
+            "tail",
+            ReadMetadataWindowRequest::has_tail,
+            ReadMetadataWindowRequest::tail,
+            ReadMetadataWindowRequest::mut_tail,
+            ReadMetadataWindowRequest::set_tail,
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_oneof_message_has_get_mut_set_accessor::<_, FullRecoveryMetadataCoverage>(
+            "full_recovery",
+            ReadMetadataWindowRequest::has_full_recovery,
+            ReadMetadataWindowRequest::full_recovery,
+            ReadMetadataWindowRequest::mut_full_recovery,
+            ReadMetadataWindowRequest::set_full_recovery,
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "max_response_bytes",
+            |m: &ReadMetadataWindowRequest| { &m.max_response_bytes },
+            |m: &mut ReadMetadataWindowRequest| { &mut m.max_response_bytes },
+        ));
+        oneofs.push(read_metadata_window_request::Coverage::generated_oneof_descriptor_data());
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ReadMetadataWindowRequest>(
+            "ReadMetadataWindowRequest",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for ReadMetadataWindowRequest {
+    const NAME: &'static str = "ReadMetadataWindowRequest";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.topic = is.read_tokio_chars()?;
+                },
+                16 => {
+                    self.window_start_unix_seconds = is.read_int64()?;
+                },
+                24 => {
+                    self.consistency = is.read_enum_or_unknown()?;
+                },
+                42 => {
+                    self.coverage = ::std::option::Option::Some(read_metadata_window_request::Coverage::Tail(is.read_message()?));
+                },
+                50 => {
+                    self.coverage = ::std::option::Option::Some(read_metadata_window_request::Coverage::FullRecovery(is.read_message()?));
+                },
+                56 => {
+                    self.max_response_bytes = is.read_uint64()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if !self.topic.is_empty() {
+            my_size += ::protobuf::rt::string_size(1, &self.topic);
+        }
+        if self.window_start_unix_seconds != 0 {
+            my_size += ::protobuf::rt::int64_size(2, self.window_start_unix_seconds);
+        }
+        if self.consistency != ::protobuf::EnumOrUnknown::new(MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL) {
+            my_size += ::protobuf::rt::int32_size(3, self.consistency.value());
+        }
+        if self.max_response_bytes != 0 {
+            my_size += ::protobuf::rt::uint64_size(7, self.max_response_bytes);
+        }
+        if let ::std::option::Option::Some(ref v) = self.coverage {
+            match v {
+                &read_metadata_window_request::Coverage::Tail(ref v) => {
+                    let len = v.compute_size();
+                    my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+                },
+                &read_metadata_window_request::Coverage::FullRecovery(ref v) => {
+                    let len = v.compute_size();
+                    my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+                },
+            };
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if !self.topic.is_empty() {
+            os.write_string(1, &self.topic)?;
+        }
+        if self.window_start_unix_seconds != 0 {
+            os.write_int64(2, self.window_start_unix_seconds)?;
+        }
+        if self.consistency != ::protobuf::EnumOrUnknown::new(MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL) {
+            os.write_enum(3, ::protobuf::EnumOrUnknown::value(&self.consistency))?;
+        }
+        if self.max_response_bytes != 0 {
+            os.write_uint64(7, self.max_response_bytes)?;
+        }
+        if let ::std::option::Option::Some(ref v) = self.coverage {
+            match v {
+                &read_metadata_window_request::Coverage::Tail(ref v) => {
+                    ::protobuf::rt::write_message_field_with_cached_size(5, v, os)?;
+                },
+                &read_metadata_window_request::Coverage::FullRecovery(ref v) => {
+                    ::protobuf::rt::write_message_field_with_cached_size(6, v, os)?;
+                },
+            };
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> ReadMetadataWindowRequest {
+        ReadMetadataWindowRequest::new()
+    }
+
+    fn clear(&mut self) {
+        self.topic.clear();
+        self.window_start_unix_seconds = 0;
+        self.consistency = ::protobuf::EnumOrUnknown::new(MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL);
+        self.coverage = ::std::option::Option::None;
+        self.coverage = ::std::option::Option::None;
+        self.max_response_bytes = 0;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static ReadMetadataWindowRequest {
+        static instance: ReadMetadataWindowRequest = ReadMetadataWindowRequest {
+            topic: ::protobuf::Chars::new(),
+            window_start_unix_seconds: 0,
+            consistency: ::protobuf::EnumOrUnknown::from_i32(0),
+            max_response_bytes: 0,
+            coverage: ::std::option::Option::None,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for ReadMetadataWindowRequest {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("ReadMetadataWindowRequest").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for ReadMetadataWindowRequest {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for ReadMetadataWindowRequest {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+/// Nested message and enums of message `ReadMetadataWindowRequest`
+pub mod read_metadata_window_request {
+
+    #[derive(Clone,PartialEq,Debug)]
+    // @@protoc_insertion_point(oneof:blobstream.v1.ReadMetadataWindowRequest.coverage)
+    pub enum Coverage {
+        // @@protoc_insertion_point(oneof_field:blobstream.v1.ReadMetadataWindowRequest.tail)
+        Tail(super::TailMetadataCoverage),
+        // @@protoc_insertion_point(oneof_field:blobstream.v1.ReadMetadataWindowRequest.full_recovery)
+        FullRecovery(super::FullRecoveryMetadataCoverage),
+    }
+
+    impl ::protobuf::Oneof for Coverage {
+    }
+
+    impl ::protobuf::OneofFull for Coverage {
+        fn descriptor() -> ::protobuf::reflect::OneofDescriptor {
+            static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::OneofDescriptor> = ::protobuf::rt::Lazy::new();
+            descriptor.get(|| <super::ReadMetadataWindowRequest as ::protobuf::MessageFull>::descriptor().oneof_by_name("coverage").unwrap()).clone()
+        }
+    }
+
+    impl Coverage {
+        pub(in super) fn generated_oneof_descriptor_data() -> ::protobuf::reflect::GeneratedOneofDescriptorData {
+            ::protobuf::reflect::GeneratedOneofDescriptorData::new::<Coverage>("coverage")
+        }
+    }
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.BrokerSegmentMetadata)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct BrokerSegmentMetadata {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.BrokerSegmentMetadata.snowflake_id)
+    pub snowflake_id: u64,
+    // @@protoc_insertion_point(field:blobstream.v1.BrokerSegmentMetadata.metadata)
+    pub metadata: ::protobuf::MessageField<super::metadata::SegmentMetadataV1>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.BrokerSegmentMetadata.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a BrokerSegmentMetadata {
+    fn default() -> &'a BrokerSegmentMetadata {
+        <BrokerSegmentMetadata as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl BrokerSegmentMetadata {
+    pub fn new() -> BrokerSegmentMetadata {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "snowflake_id",
+            |m: &BrokerSegmentMetadata| { &m.snowflake_id },
+            |m: &mut BrokerSegmentMetadata| { &mut m.snowflake_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, super::metadata::SegmentMetadataV1>(
+            "metadata",
+            |m: &BrokerSegmentMetadata| { &m.metadata },
+            |m: &mut BrokerSegmentMetadata| { &mut m.metadata },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<BrokerSegmentMetadata>(
+            "BrokerSegmentMetadata",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for BrokerSegmentMetadata {
+    const NAME: &'static str = "BrokerSegmentMetadata";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                8 => {
+                    self.snowflake_id = is.read_uint64()?;
+                },
+                18 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.metadata)?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if self.snowflake_id != 0 {
+            my_size += ::protobuf::rt::uint64_size(1, self.snowflake_id);
+        }
+        if let Some(v) = self.metadata.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if self.snowflake_id != 0 {
+            os.write_uint64(1, self.snowflake_id)?;
+        }
+        if let Some(v) = self.metadata.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> BrokerSegmentMetadata {
+        BrokerSegmentMetadata::new()
+    }
+
+    fn clear(&mut self) {
+        self.snowflake_id = 0;
+        self.metadata.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static BrokerSegmentMetadata {
+        static instance: BrokerSegmentMetadata = BrokerSegmentMetadata {
+            snowflake_id: 0,
+            metadata: ::protobuf::MessageField::none(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for BrokerSegmentMetadata {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("BrokerSegmentMetadata").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for BrokerSegmentMetadata {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for BrokerSegmentMetadata {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.MetadataReadSuccess)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct MetadataReadSuccess {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.MetadataReadSuccess.observed_at_unix_ms)
+    pub observed_at_unix_ms: i64,
+    // @@protoc_insertion_point(field:blobstream.v1.MetadataReadSuccess.refill_floor)
+    pub refill_floor: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.MetadataReadSuccess.generation)
+    pub generation: u64,
+    // @@protoc_insertion_point(field:blobstream.v1.MetadataReadSuccess.retained_coverage)
+    pub retained_coverage: bool,
+    // @@protoc_insertion_point(field:blobstream.v1.MetadataReadSuccess.segments)
+    pub segments: ::std::vec::Vec<BrokerSegmentMetadata>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.MetadataReadSuccess.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a MetadataReadSuccess {
+    fn default() -> &'a MetadataReadSuccess {
+        <MetadataReadSuccess as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl MetadataReadSuccess {
+    pub fn new() -> MetadataReadSuccess {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(5);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "observed_at_unix_ms",
+            |m: &MetadataReadSuccess| { &m.observed_at_unix_ms },
+            |m: &mut MetadataReadSuccess| { &mut m.observed_at_unix_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "refill_floor",
+            |m: &MetadataReadSuccess| { &m.refill_floor },
+            |m: &mut MetadataReadSuccess| { &mut m.refill_floor },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "generation",
+            |m: &MetadataReadSuccess| { &m.generation },
+            |m: &mut MetadataReadSuccess| { &mut m.generation },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "retained_coverage",
+            |m: &MetadataReadSuccess| { &m.retained_coverage },
+            |m: &mut MetadataReadSuccess| { &mut m.retained_coverage },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
+            "segments",
+            |m: &MetadataReadSuccess| { &m.segments },
+            |m: &mut MetadataReadSuccess| { &mut m.segments },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MetadataReadSuccess>(
+            "MetadataReadSuccess",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for MetadataReadSuccess {
+    const NAME: &'static str = "MetadataReadSuccess";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                8 => {
+                    self.observed_at_unix_ms = is.read_int64()?;
+                },
+                16 => {
+                    self.refill_floor = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                24 => {
+                    self.generation = is.read_uint64()?;
+                },
+                32 => {
+                    self.retained_coverage = is.read_bool()?;
+                },
+                42 => {
+                    self.segments.push(is.read_message()?);
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if self.observed_at_unix_ms != 0 {
+            my_size += ::protobuf::rt::int64_size(1, self.observed_at_unix_ms);
+        }
+        if let Some(v) = self.refill_floor {
+            my_size += ::protobuf::rt::uint64_size(2, v);
+        }
+        if self.generation != 0 {
+            my_size += ::protobuf::rt::uint64_size(3, self.generation);
+        }
+        if self.retained_coverage != false {
+            my_size += 1 + 1;
+        }
+        for value in &self.segments {
+            let len = value.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        };
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if self.observed_at_unix_ms != 0 {
+            os.write_int64(1, self.observed_at_unix_ms)?;
+        }
+        if let Some(v) = self.refill_floor {
+            os.write_uint64(2, v)?;
+        }
+        if self.generation != 0 {
+            os.write_uint64(3, self.generation)?;
+        }
+        if self.retained_coverage != false {
+            os.write_bool(4, self.retained_coverage)?;
+        }
+        for v in &self.segments {
+            ::protobuf::rt::write_message_field_with_cached_size(5, v, os)?;
+        };
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> MetadataReadSuccess {
+        MetadataReadSuccess::new()
+    }
+
+    fn clear(&mut self) {
+        self.observed_at_unix_ms = 0;
+        self.refill_floor = ::std::option::Option::None;
+        self.generation = 0;
+        self.retained_coverage = false;
+        self.segments.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static MetadataReadSuccess {
+        static instance: MetadataReadSuccess = MetadataReadSuccess {
+            observed_at_unix_ms: 0,
+            refill_floor: ::std::option::Option::None,
+            generation: 0,
+            retained_coverage: false,
+            segments: ::std::vec::Vec::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for MetadataReadSuccess {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("MetadataReadSuccess").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for MetadataReadSuccess {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for MetadataReadSuccess {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.MetadataReadFailure)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct MetadataReadFailure {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.MetadataReadFailure.status)
+    pub status: ::protobuf::EnumOrUnknown<MetadataReadFailureStatus>,
+    // @@protoc_insertion_point(field:blobstream.v1.MetadataReadFailure.error_message)
+    pub error_message: ::protobuf::Chars,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.MetadataReadFailure.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a MetadataReadFailure {
+    fn default() -> &'a MetadataReadFailure {
+        <MetadataReadFailure as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl MetadataReadFailure {
+    pub fn new() -> MetadataReadFailure {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "status",
+            |m: &MetadataReadFailure| { &m.status },
+            |m: &mut MetadataReadFailure| { &mut m.status },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "error_message",
+            |m: &MetadataReadFailure| { &m.error_message },
+            |m: &mut MetadataReadFailure| { &mut m.error_message },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MetadataReadFailure>(
+            "MetadataReadFailure",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for MetadataReadFailure {
+    const NAME: &'static str = "MetadataReadFailure";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                8 => {
+                    self.status = is.read_enum_or_unknown()?;
+                },
+                18 => {
+                    self.error_message = is.read_tokio_chars()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if self.status != ::protobuf::EnumOrUnknown::new(MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_BAD_REQUEST) {
+            my_size += ::protobuf::rt::int32_size(1, self.status.value());
+        }
+        if !self.error_message.is_empty() {
+            my_size += ::protobuf::rt::string_size(2, &self.error_message);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if self.status != ::protobuf::EnumOrUnknown::new(MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_BAD_REQUEST) {
+            os.write_enum(1, ::protobuf::EnumOrUnknown::value(&self.status))?;
+        }
+        if !self.error_message.is_empty() {
+            os.write_string(2, &self.error_message)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> MetadataReadFailure {
+        MetadataReadFailure::new()
+    }
+
+    fn clear(&mut self) {
+        self.status = ::protobuf::EnumOrUnknown::new(MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_BAD_REQUEST);
+        self.error_message.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static MetadataReadFailure {
+        static instance: MetadataReadFailure = MetadataReadFailure {
+            status: ::protobuf::EnumOrUnknown::from_i32(0),
+            error_message: ::protobuf::Chars::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for MetadataReadFailure {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("MetadataReadFailure").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for MetadataReadFailure {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for MetadataReadFailure {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.ReadMetadataWindowResponse)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct ReadMetadataWindowResponse {
+    // message oneof groups
+    pub result: ::std::option::Option<read_metadata_window_response::Result>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.ReadMetadataWindowResponse.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a ReadMetadataWindowResponse {
+    fn default() -> &'a ReadMetadataWindowResponse {
+        <ReadMetadataWindowResponse as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl ReadMetadataWindowResponse {
+    pub fn new() -> ReadMetadataWindowResponse {
+        ::std::default::Default::default()
+    }
+
+    // .blobstream.v1.MetadataReadSuccess success = 1;
+
+    pub fn success(&self) -> &MetadataReadSuccess {
+        match self.result {
+            ::std::option::Option::Some(read_metadata_window_response::Result::Success(ref v)) => v,
+            _ => <MetadataReadSuccess as ::protobuf::Message>::default_instance(),
+        }
+    }
+
+    pub fn clear_success(&mut self) {
+        self.result = ::std::option::Option::None;
+    }
+
+    pub fn has_success(&self) -> bool {
+        match self.result {
+            ::std::option::Option::Some(read_metadata_window_response::Result::Success(..)) => true,
+            _ => false,
+        }
+    }
+
+    // Param is passed by value, moved
+    pub fn set_success(&mut self, v: MetadataReadSuccess) {
+        self.result = ::std::option::Option::Some(read_metadata_window_response::Result::Success(v))
+    }
+
+    // Mutable pointer to the field.
+    pub fn mut_success(&mut self) -> &mut MetadataReadSuccess {
+        if let ::std::option::Option::Some(read_metadata_window_response::Result::Success(_)) = self.result {
+        } else {
+            self.result = ::std::option::Option::Some(read_metadata_window_response::Result::Success(MetadataReadSuccess::new()));
+        }
+        match self.result {
+            ::std::option::Option::Some(read_metadata_window_response::Result::Success(ref mut v)) => v,
+            _ => panic!(),
+        }
+    }
+
+    // Take field
+    pub fn take_success(&mut self) -> MetadataReadSuccess {
+        if self.has_success() {
+            match self.result.take() {
+                ::std::option::Option::Some(read_metadata_window_response::Result::Success(v)) => v,
+                _ => panic!(),
+            }
+        } else {
+            MetadataReadSuccess::new()
+        }
+    }
+
+    // .blobstream.v1.MetadataReadFailure failure = 2;
+
+    pub fn failure(&self) -> &MetadataReadFailure {
+        match self.result {
+            ::std::option::Option::Some(read_metadata_window_response::Result::Failure(ref v)) => v,
+            _ => <MetadataReadFailure as ::protobuf::Message>::default_instance(),
+        }
+    }
+
+    pub fn clear_failure(&mut self) {
+        self.result = ::std::option::Option::None;
+    }
+
+    pub fn has_failure(&self) -> bool {
+        match self.result {
+            ::std::option::Option::Some(read_metadata_window_response::Result::Failure(..)) => true,
+            _ => false,
+        }
+    }
+
+    // Param is passed by value, moved
+    pub fn set_failure(&mut self, v: MetadataReadFailure) {
+        self.result = ::std::option::Option::Some(read_metadata_window_response::Result::Failure(v))
+    }
+
+    // Mutable pointer to the field.
+    pub fn mut_failure(&mut self) -> &mut MetadataReadFailure {
+        if let ::std::option::Option::Some(read_metadata_window_response::Result::Failure(_)) = self.result {
+        } else {
+            self.result = ::std::option::Option::Some(read_metadata_window_response::Result::Failure(MetadataReadFailure::new()));
+        }
+        match self.result {
+            ::std::option::Option::Some(read_metadata_window_response::Result::Failure(ref mut v)) => v,
+            _ => panic!(),
+        }
+    }
+
+    // Take field
+    pub fn take_failure(&mut self) -> MetadataReadFailure {
+        if self.has_failure() {
+            match self.result.take() {
+                ::std::option::Option::Some(read_metadata_window_response::Result::Failure(v)) => v,
+                _ => panic!(),
+            }
+        } else {
+            MetadataReadFailure::new()
+        }
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(1);
+        fields.push(::protobuf::reflect::rt::v2::make_oneof_message_has_get_mut_set_accessor::<_, MetadataReadSuccess>(
+            "success",
+            ReadMetadataWindowResponse::has_success,
+            ReadMetadataWindowResponse::success,
+            ReadMetadataWindowResponse::mut_success,
+            ReadMetadataWindowResponse::set_success,
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_oneof_message_has_get_mut_set_accessor::<_, MetadataReadFailure>(
+            "failure",
+            ReadMetadataWindowResponse::has_failure,
+            ReadMetadataWindowResponse::failure,
+            ReadMetadataWindowResponse::mut_failure,
+            ReadMetadataWindowResponse::set_failure,
+        ));
+        oneofs.push(read_metadata_window_response::Result::generated_oneof_descriptor_data());
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ReadMetadataWindowResponse>(
+            "ReadMetadataWindowResponse",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for ReadMetadataWindowResponse {
+    const NAME: &'static str = "ReadMetadataWindowResponse";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.result = ::std::option::Option::Some(read_metadata_window_response::Result::Success(is.read_message()?));
+                },
+                18 => {
+                    self.result = ::std::option::Option::Some(read_metadata_window_response::Result::Failure(is.read_message()?));
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if let ::std::option::Option::Some(ref v) = self.result {
+            match v {
+                &read_metadata_window_response::Result::Success(ref v) => {
+                    let len = v.compute_size();
+                    my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+                },
+                &read_metadata_window_response::Result::Failure(ref v) => {
+                    let len = v.compute_size();
+                    my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+                },
+            };
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if let ::std::option::Option::Some(ref v) = self.result {
+            match v {
+                &read_metadata_window_response::Result::Success(ref v) => {
+                    ::protobuf::rt::write_message_field_with_cached_size(1, v, os)?;
+                },
+                &read_metadata_window_response::Result::Failure(ref v) => {
+                    ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
+                },
+            };
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> ReadMetadataWindowResponse {
+        ReadMetadataWindowResponse::new()
+    }
+
+    fn clear(&mut self) {
+        self.result = ::std::option::Option::None;
+        self.result = ::std::option::Option::None;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static ReadMetadataWindowResponse {
+        static instance: ReadMetadataWindowResponse = ReadMetadataWindowResponse {
+            result: ::std::option::Option::None,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for ReadMetadataWindowResponse {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("ReadMetadataWindowResponse").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for ReadMetadataWindowResponse {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for ReadMetadataWindowResponse {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+/// Nested message and enums of message `ReadMetadataWindowResponse`
+pub mod read_metadata_window_response {
+
+    #[derive(Clone,PartialEq,Debug)]
+    // @@protoc_insertion_point(oneof:blobstream.v1.ReadMetadataWindowResponse.result)
+    pub enum Result {
+        // @@protoc_insertion_point(oneof_field:blobstream.v1.ReadMetadataWindowResponse.success)
+        Success(super::MetadataReadSuccess),
+        // @@protoc_insertion_point(oneof_field:blobstream.v1.ReadMetadataWindowResponse.failure)
+        Failure(super::MetadataReadFailure),
+    }
+
+    impl ::protobuf::Oneof for Result {
+    }
+
+    impl ::protobuf::OneofFull for Result {
+        fn descriptor() -> ::protobuf::reflect::OneofDescriptor {
+            static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::OneofDescriptor> = ::protobuf::rt::Lazy::new();
+            descriptor.get(|| <super::ReadMetadataWindowResponse as ::protobuf::MessageFull>::descriptor().oneof_by_name("result").unwrap()).clone()
+        }
+    }
+
+    impl Result {
+        pub(in super) fn generated_oneof_descriptor_data() -> ::protobuf::reflect::GeneratedOneofDescriptorData {
+            ::protobuf::reflect::GeneratedOneofDescriptorData::new::<Result>("result")
+        }
+    }
+}
+
 #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
 // @@protoc_insertion_point(enum:blobstream.v1.ProduceStatus)
 pub enum ProduceStatus {
@@ -928,28 +2417,192 @@ impl ProduceStatus {
     }
 }
 
+#[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
+// @@protoc_insertion_point(enum:blobstream.v1.MetadataReadConsistency)
+pub enum MetadataReadConsistency {
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadConsistency.METADATA_READ_CONSISTENCY_EVENTUAL)
+    METADATA_READ_CONSISTENCY_EVENTUAL = 0,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadConsistency.METADATA_READ_CONSISTENCY_STRONG)
+    METADATA_READ_CONSISTENCY_STRONG = 1,
+}
+
+impl ::protobuf::Enum for MetadataReadConsistency {
+    const NAME: &'static str = "MetadataReadConsistency";
+
+    fn value(&self) -> i32 {
+        *self as i32
+    }
+
+    fn from_i32(value: i32) -> ::std::option::Option<MetadataReadConsistency> {
+        match value {
+            0 => ::std::option::Option::Some(MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL),
+            1 => ::std::option::Option::Some(MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    fn from_str(str: &str) -> ::std::option::Option<MetadataReadConsistency> {
+        match str {
+            "METADATA_READ_CONSISTENCY_EVENTUAL" => ::std::option::Option::Some(MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL),
+            "METADATA_READ_CONSISTENCY_STRONG" => ::std::option::Option::Some(MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    const VALUES: &'static [MetadataReadConsistency] = &[
+        MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL,
+        MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG,
+    ];
+}
+
+impl ::protobuf::EnumFull for MetadataReadConsistency {
+    fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().enum_by_package_relative_name("MetadataReadConsistency").unwrap()).clone()
+    }
+
+    fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
+        let index = *self as usize;
+        Self::enum_descriptor().value_by_index(index)
+    }
+}
+
+impl ::std::default::Default for MetadataReadConsistency {
+    fn default() -> Self {
+        MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL
+    }
+}
+
+impl MetadataReadConsistency {
+    fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
+        ::protobuf::reflect::GeneratedEnumDescriptorData::new::<MetadataReadConsistency>("MetadataReadConsistency")
+    }
+}
+
+#[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
+// @@protoc_insertion_point(enum:blobstream.v1.MetadataReadFailureStatus)
+pub enum MetadataReadFailureStatus {
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadFailureStatus.METADATA_READ_FAILURE_STATUS_BAD_REQUEST)
+    METADATA_READ_FAILURE_STATUS_BAD_REQUEST = 0,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadFailureStatus.METADATA_READ_FAILURE_STATUS_OVERLOADED)
+    METADATA_READ_FAILURE_STATUS_OVERLOADED = 1,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadFailureStatus.METADATA_READ_FAILURE_STATUS_FAILED)
+    METADATA_READ_FAILURE_STATUS_FAILED = 2,
+}
+
+impl ::protobuf::Enum for MetadataReadFailureStatus {
+    const NAME: &'static str = "MetadataReadFailureStatus";
+
+    fn value(&self) -> i32 {
+        *self as i32
+    }
+
+    fn from_i32(value: i32) -> ::std::option::Option<MetadataReadFailureStatus> {
+        match value {
+            0 => ::std::option::Option::Some(MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_BAD_REQUEST),
+            1 => ::std::option::Option::Some(MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_OVERLOADED),
+            2 => ::std::option::Option::Some(MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_FAILED),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    fn from_str(str: &str) -> ::std::option::Option<MetadataReadFailureStatus> {
+        match str {
+            "METADATA_READ_FAILURE_STATUS_BAD_REQUEST" => ::std::option::Option::Some(MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_BAD_REQUEST),
+            "METADATA_READ_FAILURE_STATUS_OVERLOADED" => ::std::option::Option::Some(MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_OVERLOADED),
+            "METADATA_READ_FAILURE_STATUS_FAILED" => ::std::option::Option::Some(MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_FAILED),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    const VALUES: &'static [MetadataReadFailureStatus] = &[
+        MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_BAD_REQUEST,
+        MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_OVERLOADED,
+        MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_FAILED,
+    ];
+}
+
+impl ::protobuf::EnumFull for MetadataReadFailureStatus {
+    fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().enum_by_package_relative_name("MetadataReadFailureStatus").unwrap()).clone()
+    }
+
+    fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
+        let index = *self as usize;
+        Self::enum_descriptor().value_by_index(index)
+    }
+}
+
+impl ::std::default::Default for MetadataReadFailureStatus {
+    fn default() -> Self {
+        MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_BAD_REQUEST
+    }
+}
+
+impl MetadataReadFailureStatus {
+    fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
+        ::protobuf::reflect::GeneratedEnumDescriptorData::new::<MetadataReadFailureStatus>("MetadataReadFailureStatus")
+    }
+}
+
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1ablobstream/v1/broker.proto\x12\rblobstream.v1\"B\n\x06Record\x12\
-    \x18\n\x07payload\x18\x01\x20\x01(\x0cR\x07payload\x12\x1e\n\x0bevent_ts\
-    _ms\x18\x02\x20\x01(\x03R\teventTsMs\"v\n\x11StoredRecordBatch\x120\n\
-    \x14virtual_partition_id\x18\x01\x20\x01(\rR\x12virtualPartitionId\x12/\
-    \n\x07records\x18\x02\x20\x03(\x0b2\x15.blobstream.v1.RecordR\x07records\
-    \"\x8e\x01\n\x13ProduceBatchRequest\x12\x14\n\x05topic\x18\x01\x20\x01(\
-    \tR\x05topic\x120\n\x14virtual_partition_id\x18\x02\x20\x01(\rR\x12virtu\
-    alPartitionId\x12/\n\x07records\x18\x03\x20\x03(\x0b2\x15.blobstream.v1.\
-    RecordR\x07records\"q\n\x14ProduceBatchResponse\x124\n\x06status\x18\x01\
-    \x20\x01(\x0e2\x1c.blobstream.v1.ProduceStatusR\x06status\x12#\n\rerror_\
-    message\x18\x02\x20\x01(\tR\x0cerrorMessage\"U\n\x15ProduceBatchesReques\
-    t\x12<\n\x07batches\x18\x01\x20\x03(\x0b2\".blobstream.v1.ProduceBatchRe\
-    questR\x07batches\"W\n\x16ProduceBatchesResponse\x12=\n\x07results\x18\
-    \x01\x20\x03(\x0b2#.blobstream.v1.ProduceBatchResponseR\x07results*\xac\
-    \x01\n\rProduceStatus\x12\x15\n\x11PRODUCE_STATUS_OK\x10\0\x12#\n\x1fPRO\
-    DUCE_STATUS_NOT_LEASE_HOLDER\x10\x01\x12\x20\n\x1cPRODUCE_STATUS_UNKNOWN\
-    _TOPIC\x10\x02\x12\x1d\n\x19PRODUCE_STATUS_OVERLOADED\x10\x03\x12\x1e\n\
-    \x1aPRODUCE_STATUS_BAD_REQUEST\x10\x042\xc7\x01\n\rBrokerService\x12W\n\
-    \x0cProduceBatch\x12\".blobstream.v1.ProduceBatchRequest\x1a#.blobstream\
-    .v1.ProduceBatchResponse\x12]\n\x0eProduceBatches\x12$.blobstream.v1.Pro\
-    duceBatchesRequest\x1a%.blobstream.v1.ProduceBatchesResponseb\x06proto3\
+    \n\x1ablobstream/v1/broker.proto\x12\rblobstream.v1\x1a\x1cblobstream/v1\
+    /metadata.proto\"B\n\x06Record\x12\x18\n\x07payload\x18\x01\x20\x01(\x0c\
+    R\x07payload\x12\x1e\n\x0bevent_ts_ms\x18\x02\x20\x01(\x03R\teventTsMs\"\
+    v\n\x11StoredRecordBatch\x120\n\x14virtual_partition_id\x18\x01\x20\x01(\
+    \rR\x12virtualPartitionId\x12/\n\x07records\x18\x02\x20\x03(\x0b2\x15.bl\
+    obstream.v1.RecordR\x07records\"\x8e\x01\n\x13ProduceBatchRequest\x12\
+    \x14\n\x05topic\x18\x01\x20\x01(\tR\x05topic\x120\n\x14virtual_partition\
+    _id\x18\x02\x20\x01(\rR\x12virtualPartitionId\x12/\n\x07records\x18\x03\
+    \x20\x03(\x0b2\x15.blobstream.v1.RecordR\x07records\"q\n\x14ProduceBatch\
+    Response\x124\n\x06status\x18\x01\x20\x01(\x0e2\x1c.blobstream.v1.Produc\
+    eStatusR\x06status\x12#\n\rerror_message\x18\x02\x20\x01(\tR\x0cerrorMes\
+    sage\"U\n\x15ProduceBatchesRequest\x12<\n\x07batches\x18\x01\x20\x03(\
+    \x0b2\".blobstream.v1.ProduceBatchRequestR\x07batches\"W\n\x16ProduceBat\
+    chesResponse\x12=\n\x07results\x18\x01\x20\x03(\x0b2#.blobstream.v1.Prod\
+    uceBatchResponseR\x07results\"o\n\x16MetadataPartitionBound\x120\n\x14vi\
+    rtual_partition_id\x18\x01\x20\x01(\rR\x12virtualPartitionId\x12#\n\rmin\
+    _snowflake\x18\x02\x20\x01(\x04R\x0cminSnowflake\"h\n\x14TailMetadataCov\
+    erage\x12P\n\x10partition_bounds\x18\x01\x20\x03(\x0b2%.blobstream.v1.Me\
+    tadataPartitionBoundR\x0fpartitionBounds\"R\n\x1cFullRecoveryMetadataCov\
+    erage\x122\n\x15virtual_partition_ids\x18\x01\x20\x03(\rR\x13virtualPart\
+    itionIds\"\xff\x02\n\x19ReadMetadataWindowRequest\x12\x14\n\x05topic\x18\
+    \x01\x20\x01(\tR\x05topic\x129\n\x19window_start_unix_seconds\x18\x02\
+    \x20\x01(\x03R\x16windowStartUnixSeconds\x12H\n\x0bconsistency\x18\x03\
+    \x20\x01(\x0e2&.blobstream.v1.MetadataReadConsistencyR\x0bconsistency\
+    \x129\n\x04tail\x18\x05\x20\x01(\x0b2#.blobstream.v1.TailMetadataCoverag\
+    eH\0R\x04tail\x12R\n\rfull_recovery\x18\x06\x20\x01(\x0b2+.blobstream.v1\
+    .FullRecoveryMetadataCoverageH\0R\x0cfullRecovery\x12,\n\x12max_response\
+    _bytes\x18\x07\x20\x01(\x04R\x10maxResponseBytesB\n\n\x08coverage\"x\n\
+    \x15BrokerSegmentMetadata\x12!\n\x0csnowflake_id\x18\x01\x20\x01(\x04R\
+    \x0bsnowflakeId\x12<\n\x08metadata\x18\x02\x20\x01(\x0b2\x20.blobstream.\
+    v1.SegmentMetadataV1R\x08metadata\"\x8c\x02\n\x13MetadataReadSuccess\x12\
+    -\n\x13observed_at_unix_ms\x18\x01\x20\x01(\x03R\x10observedAtUnixMs\x12\
+    &\n\x0crefill_floor\x18\x02\x20\x01(\x04H\0R\x0brefillFloor\x88\x01\x01\
+    \x12\x1e\n\ngeneration\x18\x03\x20\x01(\x04R\ngeneration\x12+\n\x11retai\
+    ned_coverage\x18\x04\x20\x01(\x08R\x10retainedCoverage\x12@\n\x08segment\
+    s\x18\x05\x20\x03(\x0b2$.blobstream.v1.BrokerSegmentMetadataR\x08segment\
+    sB\x0f\n\r_refill_floor\"|\n\x13MetadataReadFailure\x12@\n\x06status\x18\
+    \x01\x20\x01(\x0e2(.blobstream.v1.MetadataReadFailureStatusR\x06status\
+    \x12#\n\rerror_message\x18\x02\x20\x01(\tR\x0cerrorMessage\"\xa6\x01\n\
+    \x1aReadMetadataWindowResponse\x12>\n\x07success\x18\x01\x20\x01(\x0b2\"\
+    .blobstream.v1.MetadataReadSuccessH\0R\x07success\x12>\n\x07failure\x18\
+    \x02\x20\x01(\x0b2\".blobstream.v1.MetadataReadFailureH\0R\x07failureB\
+    \x08\n\x06result*\xac\x01\n\rProduceStatus\x12\x15\n\x11PRODUCE_STATUS_O\
+    K\x10\0\x12#\n\x1fPRODUCE_STATUS_NOT_LEASE_HOLDER\x10\x01\x12\x20\n\x1cP\
+    RODUCE_STATUS_UNKNOWN_TOPIC\x10\x02\x12\x1d\n\x19PRODUCE_STATUS_OVERLOAD\
+    ED\x10\x03\x12\x1e\n\x1aPRODUCE_STATUS_BAD_REQUEST\x10\x04*g\n\x17Metada\
+    taReadConsistency\x12&\n\"METADATA_READ_CONSISTENCY_EVENTUAL\x10\0\x12$\
+    \n\x20METADATA_READ_CONSISTENCY_STRONG\x10\x01*\x9f\x01\n\x19MetadataRea\
+    dFailureStatus\x12,\n(METADATA_READ_FAILURE_STATUS_BAD_REQUEST\x10\0\x12\
+    +\n'METADATA_READ_FAILURE_STATUS_OVERLOADED\x10\x01\x12'\n#METADATA_READ\
+    _FAILURE_STATUS_FAILED\x10\x022\xb2\x02\n\rBrokerService\x12W\n\x0cProdu\
+    ceBatch\x12\".blobstream.v1.ProduceBatchRequest\x1a#.blobstream.v1.Produ\
+    ceBatchResponse\x12]\n\x0eProduceBatches\x12$.blobstream.v1.ProduceBatch\
+    esRequest\x1a%.blobstream.v1.ProduceBatchesResponse\x12i\n\x12ReadMetada\
+    taWindow\x12(.blobstream.v1.ReadMetadataWindowRequest\x1a).blobstream.v1\
+    .ReadMetadataWindowResponseb\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -966,16 +2619,27 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
     static file_descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::FileDescriptor> = ::protobuf::rt::Lazy::new();
     file_descriptor.get(|| {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
-            let mut deps = ::std::vec::Vec::with_capacity(0);
-            let mut messages = ::std::vec::Vec::with_capacity(6);
+            let mut deps = ::std::vec::Vec::with_capacity(1);
+            deps.push(super::metadata::file_descriptor().clone());
+            let mut messages = ::std::vec::Vec::with_capacity(14);
             messages.push(Record::generated_message_descriptor_data());
             messages.push(StoredRecordBatch::generated_message_descriptor_data());
             messages.push(ProduceBatchRequest::generated_message_descriptor_data());
             messages.push(ProduceBatchResponse::generated_message_descriptor_data());
             messages.push(ProduceBatchesRequest::generated_message_descriptor_data());
             messages.push(ProduceBatchesResponse::generated_message_descriptor_data());
-            let mut enums = ::std::vec::Vec::with_capacity(1);
+            messages.push(MetadataPartitionBound::generated_message_descriptor_data());
+            messages.push(TailMetadataCoverage::generated_message_descriptor_data());
+            messages.push(FullRecoveryMetadataCoverage::generated_message_descriptor_data());
+            messages.push(ReadMetadataWindowRequest::generated_message_descriptor_data());
+            messages.push(BrokerSegmentMetadata::generated_message_descriptor_data());
+            messages.push(MetadataReadSuccess::generated_message_descriptor_data());
+            messages.push(MetadataReadFailure::generated_message_descriptor_data());
+            messages.push(ReadMetadataWindowResponse::generated_message_descriptor_data());
+            let mut enums = ::std::vec::Vec::with_capacity(3);
             enums.push(ProduceStatus::generated_enum_descriptor_data());
+            enums.push(MetadataReadConsistency::generated_enum_descriptor_data());
+            enums.push(MetadataReadFailureStatus::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),
                 deps,

@@ -38,6 +38,7 @@ hostname.workspace                = true
 http.workspace                    = true
 humantime-serde.workspace         = true
 log.workspace                     = true
+moka.workspace                    = true
 parking_lot.workspace             = true
 prometheus.workspace              = true
 protobuf.workspace                = true
@@ -58,5 +59,6 @@ zstd.workspace                    = true
 cgroups-rs.workspace = true
 
 [dev-dependencies]
-blob-stream-test-utils.path = "../blob-stream-test-utils"
-mockall.workspace           = true
+bd-test-helpers-core.workspace = true
+blob-stream-test-utils.path    = "../blob-stream-test-utils"
+mockall.workspace              = true

@@ -34,6 +34,7 @@ mod producer_partition_leases_dynamo;
 mod producer_partition_leases_memory;
 
 pub use aws::{aws_retry_config, aws_timeout_config};
+pub use codec::{decode_segment_metadata_v1, encode_segment_metadata_v1};
 pub use consumer_group_leases_dynamo::DynamoConsumerGroupLeaseStore;
 pub use consumer_group_leases_memory::InMemoryConsumerGroupLeaseStore;
 pub use consumer_group_membership_dynamo::DynamoConsumerGroupMembershipStore;

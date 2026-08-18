@@ -20,8 +20,10 @@ This document describes the current implementation and its behavioral contracts.
   provide monotonic progress only within a virtual partition.
 - Consumers use cursors, not timestamp seeks. A new consumer group starts at its current aligned
   metadata window; a resumed group recovers from its committed metadata source through retention.
-- There is no broker read path, compaction, built-in authorization, or idempotent producer
-  protocol.
+- Brokers optionally serve bounded cached metadata-window reads; consumers still read segment
+  bytes directly from blob storage and fall back to DynamoDB whenever the broker path is disabled
+  or unavailable. There is no broker blob-byte read path, compaction, built-in authorization, or
+  idempotent producer protocol.
 - DynamoDB TTL is written by the service. S3 lifecycle expiration is configured by operators and
   must remain aligned with the chosen retention period.
 
@@ -82,13 +84,14 @@ reference immediately. In-flight requests retain their own reference and can fin
 the producer does not force-close an active connection.
 
 Broker discovery distinguishes a pending initial watch value from an initialized membership
-snapshot. A producer waits up to 10 seconds for an initialized snapshot before creating routes;
-otherwise construction fails. A broker starts its listener while discovery is pending so Kubernetes
-can mark the pod ready and include it in Endpoints, but it performs no lease acquisition, renewal,
-release, or assignment reconciliation until an initialized membership contains its own node ID. An
-initialized membership without the local node after that activation is a real ownership loss; an
-initialized empty membership owns no partitions and has no producer route. This prevents a pod from
-temporarily claiming every partition while Kubernetes publishes its initial Endpoint set.
+snapshot. A producer and a broker-collapsed consumer metadata client wait up to 10 seconds for an
+initialized snapshot before creating routes; otherwise construction fails. A broker starts its
+listener while discovery is pending so Kubernetes can mark the pod ready and include it in
+Endpoints, but it performs no lease acquisition, renewal, release, or assignment reconciliation
+until an initialized membership contains its own node ID. An initialized membership without the
+local node after that activation is a real ownership loss; an initialized empty membership owns no
+partitions and has no producer route. This prevents a pod from temporarily claiming every partition
+while Kubernetes publishes its initial Endpoint set.
 
 Each broker fences writes through a producer-partition lease. A lease key contains topic, the
 virtual partition ID. The virtual partition calculation already includes writer identity, so the
@@ -316,7 +319,30 @@ deployment model.
 
 ## Read Path
 
-Consumers read DynamoDB metadata and blob storage directly. The broker is not in the read path.
+Consumers read segment bytes directly from blob storage. Metadata reads use DynamoDB directly by
+default; an enabled consumer may route a bounded metadata-window request to its deterministically
+selected local broker. The broker uses a byte-bounded Moka cache for eventual metadata, collapses
+concurrent requests, and falls back to its authoritative DynamoDB store on a miss. Strong reads
+collapse only concurrent broker requests and are never retained after completion. A broker failure,
+invalid response, unavailable membership, or disabled capability causes the consumer to use its
+original direct DynamoDB scan.
+
+Tail and Full Recovery metadata use independent byte-weighted Moka caches with a five-minute idle
+expiry. A retained entry is invalidated when it is stale or cannot cover the request. The broker
+limits request partitions, cache-entry items, response items and bytes, waiters per key and
+globally, and concurrent refills. Its coalescing delay is bounded to at most half the cache RPC
+timeout, so an admission, size, refill, or timeout limit returns a typed overload instead of a
+partial response; the consumer then repeats the original direct scan. Full Recovery remains
+unpaged: each retained entry is one complete immutable snapshot, installed atomically after the
+authoritative query succeeds. In this model a Full Recovery baseline and final seal occur together
+when that snapshot is installed.
+
+For broker-routed recovery, the checkpoint-overlap window uses Tail coverage with its inclusive
+Sonyflake floor. Later unbounded recovery windows, along with Fresh windows, use Full Recovery
+coverage for the required partitions; a Full Recovery request that overlaps Fast also includes the
+Fast partitions, which retain their own frontier filtering after the response. The protocol has no
+pagination: a response that exceeds its byte budget fails as a whole and the consumer repeats its
+original direct scan, so no partial recovery response can advance a cursor.
 The reader has two different progress markers for each virtual partition:
 
 - The **cursor** is the greatest delivered-and-committed sequence end. It decides whether a batch

@@ -16,7 +16,7 @@ use crate::config::{
   consumer_prefetch_max_bytes,
   validate_runtime_config,
 };
-use crate::consumer::ConsumerReaderImpl;
+use crate::consumer::{BrokerMetadataQuery, ConsumerReaderImpl};
 use crate::coordination::ConsumerGroupCoordinatorImpl;
 use crate::diagnostics::ConsumerDiagnostics;
 use anyhow::{Result, anyhow, ensure};
@@ -55,7 +55,9 @@ pub struct ConsumerIteratorBuilder<'a> {
   maximum_metadata_publication_lag: Duration,
   metadata_window_size: Duration,
   maximum_clock_skew: Duration,
+  metadata_cache_max_age: Duration,
   feature_flags: Option<FeatureFlagsWatch>,
+  broker_metadata_query: Option<Arc<dyn BrokerMetadataQuery>>,
   time_provider: Arc<dyn TimeProvider>,
   lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
 }
@@ -89,7 +91,9 @@ impl<'a> ConsumerIteratorBuilder<'a> {
         .read
         .as_ref()
         .map_or(DEFAULT_MAX_CLOCK_SKEW, consumer_max_clock_skew),
+      metadata_cache_max_age: Duration::ZERO,
       feature_flags,
+      broker_metadata_query: None,
       time_provider: Arc::new(SystemTimeProvider),
       lifecycle_hooks: None,
     }
@@ -116,8 +120,21 @@ impl<'a> ConsumerIteratorBuilder<'a> {
   }
 
   #[must_use]
+  /// Supply the shared maximum age for retained eventual broker metadata.
+  pub fn metadata_cache_max_age(mut self, metadata_cache_max_age: Duration) -> Self {
+    self.metadata_cache_max_age = metadata_cache_max_age;
+    self
+  }
+
+  #[must_use]
   pub fn lifecycle_hooks(mut self, lifecycle_hooks: Arc<dyn ConsumerLifecycleHooks>) -> Self {
     self.lifecycle_hooks = Some(lifecycle_hooks);
+    self
+  }
+
+  #[must_use]
+  pub fn broker_metadata_query(mut self, query: Arc<dyn BrokerMetadataQuery>) -> Self {
+    self.broker_metadata_query = Some(query);
     self
   }
 }
@@ -169,7 +186,9 @@ impl ConsumerIteratorBuilder<'_> {
       maximum_metadata_publication_lag,
       metadata_window_size,
       maximum_clock_skew,
+      metadata_cache_max_age,
       feature_flags,
+      broker_metadata_query,
       time_provider,
       lifecycle_hooks,
     } = self;
@@ -215,7 +234,13 @@ impl ConsumerIteratorBuilder<'_> {
       feature_flags,
     )?
     .metadata_window_size(metadata_window_size)
-    .maximum_clock_skew(maximum_clock_skew);
+    .maximum_clock_skew(maximum_clock_skew)
+    .metadata_cache_max_age(metadata_cache_max_age);
+    let reader = if let Some(broker_metadata_query) = broker_metadata_query {
+      reader.broker_metadata_query(broker_metadata_query)
+    } else {
+      reader
+    };
     let coordinator = ConsumerGroupCoordinatorImpl::new(
       group_config.clone(),
       Arc::clone(&lease_store),

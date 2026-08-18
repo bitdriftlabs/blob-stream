@@ -11,12 +11,16 @@ use crate::{
 use bd_server_stats::stats::Collector;
 use blob_stream_proto::protos::blobstream::v1::config::{
   BlobStoreConfig,
+  BrokerDiscoveryConfig,
+  BrokerNode,
   ConsumerIteratorBootstrapConfig,
   InMemoryBlobStoreConfig,
   InMemoryMetadataStoreConfig,
   MetadataStoreConfig,
+  StaticBrokerDiscoveryConfig,
   TopicConfig,
   blob_store_config,
+  broker_discovery_config,
   metadata_store_config,
 };
 use blob_stream_types::ToProtoDuration;
@@ -49,6 +53,17 @@ fn topic() -> TopicConfig {
   topic
 }
 
+fn broker_discovery() -> BrokerDiscoveryConfig {
+  let mut node = BrokerNode::new();
+  node.node_id = "broker-a".into();
+  node.address = "127.0.0.1:1".into();
+  let mut static_discovery = StaticBrokerDiscoveryConfig::new();
+  static_discovery.nodes.push(node);
+  let mut discovery = BrokerDiscoveryConfig::new();
+  discovery.backend = Some(broker_discovery_config::Backend::Static(static_discovery));
+  discovery
+}
+
 fn in_memory_blob_store() -> BlobStoreConfig {
   let mut config = BlobStoreConfig::new();
   config.backend = Some(blob_store_config::Backend::InMemory(
@@ -71,6 +86,7 @@ fn proto_bootstrap_config(member_id: &str) -> ConsumerIteratorBootstrapConfig {
   config.topic = Some(topic()).into();
   config.blob_store = Some(in_memory_blob_store()).into();
   config.metadata_store = Some(in_memory_metadata_store()).into();
+  config.broker_discovery = Some(broker_discovery()).into();
   config
 }
 
@@ -93,6 +109,7 @@ async fn bootstrap_builds_iterator_for_in_memory_backends() {
     topic(),
     in_memory_blob_store(),
     in_memory_metadata_store(),
+    broker_discovery(),
   );
 
   let mut iterator = ConsumerConfigFactory::build_iterator(config, metrics_scope(), None)
@@ -108,6 +125,7 @@ async fn bootstrap_builds_iterator_without_static_members() {
     topic(),
     in_memory_blob_store(),
     in_memory_metadata_store(),
+    broker_discovery(),
   );
 
   let mut iterator = ConsumerConfigFactory::build_iterator(config, metrics_scope(), None)
@@ -152,6 +170,7 @@ async fn bootstrap_rejects_missing_retention_for_recovery() {
     topic,
     in_memory_blob_store(),
     in_memory_metadata_store(),
+    broker_discovery(),
   );
 
   assert!(

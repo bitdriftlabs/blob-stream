@@ -1,6 +1,7 @@
 use super::{
   Arc,
   BlobStore,
+  BrokerMetadataQuery,
   CommittedCursor,
   ConsumerReadConfig,
   ConsumerReaderImpl,
@@ -92,12 +93,14 @@ impl ConsumerReaderImpl {
       maximum_metadata_publication_lag,
       metadata_window_size: blob_stream_types::DEFAULT_METADATA_WINDOW_SIZE,
       maximum_clock_skew: consumer_max_clock_skew(&config),
+      metadata_cache_max_age: Duration::ZERO,
       fast_frontiers: HashMap::new(),
       recovery_scan_last_partition: None,
       recovery_metadata_cache: HashMap::new(),
       config,
       blob_store,
       metadata_store,
+      broker_metadata_query: None,
       feature_flags,
       metrics: ConsumerReaderMetrics::new(metrics_scope),
     })
@@ -118,6 +121,20 @@ impl ConsumerReaderImpl {
   }
 
   #[must_use]
+  /// Override the shared maximum age of retained eventual broker metadata.
+  pub(crate) fn metadata_cache_max_age(mut self, metadata_cache_max_age: Duration) -> Self {
+    self.metadata_cache_max_age = metadata_cache_max_age;
+    self
+  }
+
+  #[must_use]
+  /// Inject the broker transport used when broker metadata reads are enabled.
+  pub fn broker_metadata_query(mut self, query: Arc<dyn BrokerMetadataQuery>) -> Self {
+    self.broker_metadata_query = Some(query);
+    self
+  }
+
+  #[must_use]
   /// Return the bounded availability horizon for one resolved read pass.
   pub(in crate::consumer) fn availability_horizon(
     &self,
@@ -127,6 +144,14 @@ impl ConsumerReaderImpl {
       self.maximum_metadata_publication_lag,
       self.maximum_clock_skew,
       runtime_settings.metadata_visibility_delay,
+      if runtime_settings.broker_metadata_cache_enabled
+        && runtime_settings.metadata_read_consistency
+          == blob_stream_metadata_store::MetadataReadConsistency::Eventual
+      {
+        self.metadata_cache_max_age
+      } else {
+        Duration::ZERO
+      },
     )
   }
 

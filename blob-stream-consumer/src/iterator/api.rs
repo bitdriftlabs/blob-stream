@@ -129,6 +129,15 @@ pub trait ConsumerLifecycleHooks: Send + Sync {
   ) {
   }
 
+  /// Runs after an initial scan activates the Fast path without recovery state.
+  async fn initial_fast_path_active(
+    &self,
+    _member_id: &str,
+    _generation: u64,
+    _virtual_partition_id: VirtualPartitionId,
+  ) {
+  }
+
   /// Runs immediately before a scheduled heartbeat renews membership and partition leases.
   async fn before_scheduled_heartbeat(&self, _member_id: &str, _generation: u64) {}
 

@@ -39,17 +39,16 @@ pub struct EncodedSegmentMetadata {
   pub payload: Bytes,
 }
 
-pub fn encode(metadata: SegmentMetadata) -> Result<EncodedSegmentMetadata> {
-  let partition_key = metadata.partition_key();
-  let sort_key = metadata.snowflake_key();
+/// Convert canonical metadata into its durable protobuf payload.
+pub fn encode_segment_metadata_v1(metadata: &SegmentMetadata) -> Result<SegmentMetadataV1> {
   let compression = encode_compression(&metadata.compression);
   let partitions = metadata
     .segment_index
-    .into_iter()
-    .map(|(virtual_partition_id, batches)| SegmentPartitionIndex {
+    .iter()
+    .map(|(&virtual_partition_id, batches)| SegmentPartitionIndex {
       virtual_partition_id,
       batches: batches
-        .into_iter()
+        .iter()
         .map(|batch| SegmentBatchMetadata {
           seq_start: batch.seq_range.start,
           seq_end: batch.seq_range.end,
@@ -62,7 +61,8 @@ pub fn encode(metadata: SegmentMetadata) -> Result<EncodedSegmentMetadata> {
       ..Default::default()
     })
     .collect();
-  let metadata = SegmentMetadataV1 {
+
+  Ok(SegmentMetadataV1 {
     blob_key: metadata.blob_key.as_str().to_string().into(),
     created_ts_ms: unix_millis_from_offset_datetime(metadata.created_at)
       .map_err(|error| anyhow!("timestamp does not fit in Unix milliseconds: {error}"))?,
@@ -71,7 +71,13 @@ pub fn encode(metadata: SegmentMetadata) -> Result<EncodedSegmentMetadata> {
     compression: Some(compression).into(),
     partitions,
     ..Default::default()
-  };
+  })
+}
+
+pub fn encode(metadata: &SegmentMetadata) -> Result<EncodedSegmentMetadata> {
+  let partition_key = metadata.partition_key();
+  let sort_key = metadata.snowflake_key();
+  let metadata = encode_segment_metadata_v1(metadata)?;
 
   Ok(EncodedSegmentMetadata {
     partition_key,
@@ -86,6 +92,32 @@ pub fn encode(metadata: SegmentMetadata) -> Result<EncodedSegmentMetadata> {
 pub fn decode(partition_key: &str, sort_key: &str, payload: &Bytes) -> Result<SegmentMetadata> {
   let metadata = SegmentMetadataV1::parse_from_tokio_bytes(payload)
     .map_err(|error| anyhow!("decode segment metadata: {error}"))?;
+  let (topic, window_start) = partition_key
+    .rsplit_once('#')
+    .ok_or_else(|| anyhow!("invalid metadata partition key {partition_key}"))?;
+  let window_start_unix_seconds = window_start
+    .parse::<i64>()
+    .map_err(|error| anyhow!("invalid metadata window start {window_start}: {error}"))?;
+  let snowflake_id = sort_key
+    .parse::<u64>()
+    .map_err(|error| anyhow!("invalid metadata snowflake id {sort_key}: {error}"))?;
+
+  decode_segment_metadata_v1(
+    TopicWindowKey {
+      topic: topic.to_string(),
+      window_start_unix_seconds,
+    },
+    SnowflakeId(snowflake_id),
+    metadata,
+  )
+}
+
+/// Decode a canonical metadata protobuf supplied by an in-memory transport.
+pub fn decode_segment_metadata_v1(
+  window: TopicWindowKey,
+  snowflake_id: SnowflakeId,
+  metadata: SegmentMetadataV1,
+) -> Result<SegmentMetadata> {
   if metadata.blob_key.is_empty() {
     return Err(anyhow!("segment metadata is missing blob key"));
   }
@@ -143,22 +175,9 @@ pub fn decode(partition_key: &str, sort_key: &str, payload: &Bytes) -> Result<Se
     }
   }
 
-  let (topic, window_start) = partition_key
-    .rsplit_once('#')
-    .ok_or_else(|| anyhow!("invalid metadata partition key {partition_key}"))?;
-  let window_start_unix_seconds = window_start
-    .parse::<i64>()
-    .map_err(|error| anyhow!("invalid metadata window start {window_start}: {error}"))?;
-  let snowflake_id = sort_key
-    .parse::<u64>()
-    .map_err(|error| anyhow!("invalid metadata snowflake id {sort_key}: {error}"))?;
-
   Ok(SegmentMetadata {
-    window: TopicWindowKey {
-      topic: topic.to_string(),
-      window_start_unix_seconds,
-    },
-    snowflake_id: SnowflakeId(snowflake_id),
+    window,
+    snowflake_id,
     blob_key: BlobKey::from(metadata.blob_key.to_string()),
     compression,
     segment_index,

@@ -123,7 +123,7 @@ async fn skips_noncompliant_segment_rows() {
       sort_key: SnowflakeId(1).format_lex(),
       payload: vec![0xff].into(),
     });
-  let encoded = crate::codec::encode(valid.clone()).expect("encode valid metadata");
+  let encoded = crate::codec::encode(&valid).expect("encode valid metadata");
   let mut invalid_metadata =
     SegmentMetadataV1::parse_from_tokio_bytes(&encoded.payload).expect("parse valid metadata");
   invalid_metadata.partitions[0].batches[0].byte_end = 0;

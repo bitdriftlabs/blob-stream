@@ -179,7 +179,7 @@ impl MetadataStore for DynamoMetadataStore {
     }
 
     let ttl_epoch_seconds = self.metadata_ttl_epoch_seconds(&metadata);
-    let encoded = codec::encode(metadata).map_err(MetadataWriteError::from)?;
+    let encoded = codec::encode(&metadata).map_err(MetadataWriteError::from)?;
     let mut item = HashMap::from([
       (
         ATTR_PK.to_string(),

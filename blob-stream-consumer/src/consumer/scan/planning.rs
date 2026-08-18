@@ -97,6 +97,8 @@ impl ConsumerReaderImpl {
     topic: &str,
     window_start_unix_seconds: i64,
     min_snowflake: Option<SnowflakeId>,
+    fast_partition_bounds: BTreeMap<VirtualPartitionId, SnowflakeId>,
+    recovery_partition_bounds: BTreeMap<VirtualPartitionId, Option<SnowflakeId>>,
     recovery_scan: bool,
     eligibility: ScanEligibility,
   ) {
@@ -104,6 +106,12 @@ impl ConsumerReaderImpl {
       .entry(window_start_unix_seconds)
       .and_modify(|request| {
         request.min_snowflake = request.min_snowflake.min(min_snowflake);
+        request
+          .fast_partition_bounds
+          .extend(fast_partition_bounds.clone());
+        request
+          .recovery_partition_bounds
+          .extend(recovery_partition_bounds.clone());
         request.recovery_scan |= recovery_scan;
         for &partition_id in &eligibility.recovering_partitions {
           if !request
@@ -123,36 +131,28 @@ impl ConsumerReaderImpl {
           window_start_unix_seconds,
         },
         min_snowflake,
+        fast_partition_bounds,
+        recovery_partition_bounds,
         recovery_scan,
         eligibility,
       });
   }
 
-  /// Find the least inclusive lower bound required when one query serves several Fast partitions.
-  ///
-  /// Each partition needs the greater of its frontier and the shared time floor. The merged query
-  /// uses the least of those bounds so a sparse partition is not skipped by another partition
-  /// whose frontier is further ahead; execution reapplies the individual frontier afterward.
-  pub(in crate::consumer) fn fast_scan_min_snowflake(
+  /// Return each Fast partition's effective lower bound for one metadata window.
+  pub(in crate::consumer) fn fast_scan_partition_bounds(
     &self,
     assigned_partition_ids: &[VirtualPartitionId],
     window_start_unix_seconds: i64,
     safe_floor: SnowflakeId,
-  ) -> SnowflakeId {
-    let mut minimum = None;
-    for &partition_id in assigned_partition_ids {
-      let Some((_, partition_lower_bound)) =
-        self.fast_scan_partition_lower_bound(partition_id, window_start_unix_seconds, safe_floor)
-      else {
-        continue;
-      };
-      minimum = Some(
-        minimum.map_or(partition_lower_bound, |current: SnowflakeId| {
-          current.min(partition_lower_bound)
-        }),
-      );
-    }
-    minimum.unwrap_or(safe_floor)
+  ) -> BTreeMap<VirtualPartitionId, SnowflakeId> {
+    assigned_partition_ids
+      .iter()
+      .filter_map(|&partition_id| {
+        self
+          .fast_scan_partition_lower_bound(partition_id, window_start_unix_seconds, safe_floor)
+          .map(|(_, partition_lower_bound)| (partition_id, partition_lower_bound))
+      })
+      .collect()
   }
 
   /// Return the observed and effective lower bounds for one Fast partition/window pair.
@@ -346,6 +346,11 @@ impl ConsumerReaderImpl {
           self.config.topic.as_str(),
           *recovery_start_window,
           self.recovery_scan_min_snowflake(*partition_id, *recovery_start_window),
+          BTreeMap::new(),
+          BTreeMap::from([(
+            *partition_id,
+            self.recovery_scan_min_snowflake(*partition_id, *recovery_start_window),
+          )]),
           true,
           ScanEligibility {
             recovering_partitions: vec![*partition_id],
@@ -379,6 +384,11 @@ impl ConsumerReaderImpl {
           self.config.topic.as_str(),
           window_start,
           self.recovery_scan_min_snowflake(partition_id, window_start),
+          BTreeMap::new(),
+          BTreeMap::from([(
+            partition_id,
+            self.recovery_scan_min_snowflake(partition_id, window_start),
+          )]),
           true,
           ScanEligibility {
             recovering_partitions: vec![partition_id],
@@ -390,10 +400,10 @@ impl ConsumerReaderImpl {
       recovery_scan = true;
     }
 
-    for state in self
+    for (&partition_id, state) in self
       .virtual_partition_states
-      .values()
-      .filter(|state| state.is_assigned())
+      .iter()
+      .filter(|(_, state)| state.is_assigned())
     {
       if let VirtualPartitionState::Fresh {
         initial_window_start_unix_seconds,
@@ -405,6 +415,8 @@ impl ConsumerReaderImpl {
           self.config.topic.as_str(),
           *initial_window_start_unix_seconds,
           None,
+          BTreeMap::new(),
+          BTreeMap::from([(partition_id, None)]),
           true,
           ScanEligibility {
             recovering_partitions: Vec::new(),
@@ -422,15 +434,18 @@ impl ConsumerReaderImpl {
       .any(|state| state.is_assigned() && matches!(state, VirtualPartitionState::Fast { .. }))
     {
       for (window, safe_floor) in self.eligible_fast_scan_windows(now, runtime_settings)? {
+        let fast_partition_bounds = self.fast_scan_partition_bounds(
+          assigned_partition_ids,
+          window.window_start_unix_seconds,
+          safe_floor,
+        );
         Self::insert_scan_request(
           &mut scan_requests,
           self.config.topic.as_str(),
           window.window_start_unix_seconds,
-          Some(self.fast_scan_min_snowflake(
-            assigned_partition_ids,
-            window.window_start_unix_seconds,
-            safe_floor,
-          )),
+          fast_partition_bounds.values().copied().min(),
+          fast_partition_bounds,
+          BTreeMap::new(),
           false,
           ScanEligibility {
             recovering_partitions: Vec::new(),

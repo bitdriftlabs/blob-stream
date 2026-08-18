@@ -4,11 +4,15 @@ use blob_stream_consumer::{ConsumerGroupConfig, ConsumerReadConfig, ConsumerRunt
 use blob_stream_producer::{ProducerCompression, ProducerConfig, ProducerTopicConfig};
 use blob_stream_proto::protos::blobstream::v1::config::{
   BlobStoreConfig,
+  BrokerDiscoveryConfig,
+  BrokerNode,
   ConsumerIteratorBootstrapConfig,
   DynamoMetadataStoreConfig,
   MetadataStoreConfig,
   S3BlobStoreConfig,
+  StaticBrokerDiscoveryConfig,
   TopicConfig,
+  broker_discovery_config,
 };
 use blob_stream_types::ToProtoDuration;
 use time::Duration;
@@ -145,11 +149,20 @@ pub fn consumer_bootstrap_config_for(
   let mut metadata_store = MetadataStoreConfig::new();
   metadata_store.set_dynamo(dynamo);
 
+  let mut node = BrokerNode::new();
+  node.node_id = "disabled-feature-broker".into();
+  node.address = "127.0.0.1:1".into();
+  let mut static_discovery = StaticBrokerDiscoveryConfig::new();
+  static_discovery.nodes.push(node);
+  let mut broker_discovery = BrokerDiscoveryConfig::new();
+  broker_discovery.backend = Some(broker_discovery_config::Backend::Static(static_discovery));
+
   ConsumerIteratorBootstrapConfig {
     runtime: Some(runtime).into(),
     topic: Some(topic).into(),
     blob_store: Some(blob_store).into(),
     metadata_store: Some(metadata_store).into(),
+    broker_discovery: Some(broker_discovery).into(),
     ..Default::default()
   }
 }

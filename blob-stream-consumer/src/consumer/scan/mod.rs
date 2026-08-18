@@ -55,6 +55,9 @@ const MAX_RECOVERY_WINDOWS_PER_SCAN: usize = 32;
 pub(in crate::consumer) struct ScanRequest {
   pub(in crate::consumer) window: TopicWindowKey,
   pub(in crate::consumer) min_snowflake: Option<SnowflakeId>,
+  pub(in crate::consumer) fast_partition_bounds: BTreeMap<VirtualPartitionId, SnowflakeId>,
+  pub(in crate::consumer) recovery_partition_bounds:
+    BTreeMap<VirtualPartitionId, Option<SnowflakeId>>,
   pub(in crate::consumer) recovery_scan: bool,
   pub(in crate::consumer) eligibility: ScanEligibility,
 }

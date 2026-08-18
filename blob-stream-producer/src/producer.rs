@@ -29,7 +29,12 @@ use anyhow::{Result, anyhow, bail, ensure};
 use async_trait::async_trait;
 use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
-use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership};
+use blob_stream_broker_discovery::{
+  BrokerDiscovery,
+  BrokerMembership,
+  INITIAL_MEMBERSHIP_TIMEOUT,
+  wait_for_initialized_membership,
+};
 use blob_stream_proto::protos::blobstream::v1::broker::Record;
 use blob_stream_types::{
   MAX_PRODUCE_BATCHES_REQUEST_BYTES,
@@ -67,8 +72,6 @@ use tokio::time::{Instant, timeout};
 pub use transport::{BrokerTransport, GrpcBrokerTransport};
 
 // TODO(mattklein123): Consider adding disk buffering of segments.
-
-const INITIAL_MEMBERSHIP_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
 //
 // ProducerRecord
@@ -456,23 +459,6 @@ impl ProducerClientImpl {
         }
       }
     })
-  }
-}
-
-async fn wait_for_initialized_membership(
-  membership_rx: &mut watch::Receiver<BrokerMembership>,
-) -> Result<BrokerMembership> {
-  loop {
-    // Pending is not an authoritative empty membership, so routes must not be created from it.
-    let membership = membership_rx.borrow_and_update().clone();
-    if matches!(membership, BrokerMembership::Initialized(_)) {
-      return Ok(membership);
-    }
-
-    membership_rx
-      .changed()
-      .await
-      .map_err(|_| anyhow!("broker discovery closed before initial membership was available"))?;
   }
 }
 

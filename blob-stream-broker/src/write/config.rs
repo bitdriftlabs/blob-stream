@@ -216,6 +216,8 @@ impl TopicInfo {
 
 pub async fn build_write_engine(
   config: &RuntimeConfig,
+  metadata_store: Arc<dyn MetadataStore>,
+  dynamo_capacity_metrics: DynamoCapacityMetrics,
   shutdown_trigger_handle: ComponentShutdownTriggerHandle,
   metrics_scope: &Scope,
   feature_flags: Option<FeatureFlagsWatch>,
@@ -245,13 +247,6 @@ pub async fn build_write_engine(
     .metadata_store
     .as_ref()
     .context("runtime config missing metadata_store config")?;
-  let dynamo_capacity_metrics = DynamoCapacityMetrics::new(&metrics_scope.scope("dynamo"));
-  let metadata_store = build_metadata_store(
-    metadata_store_config,
-    &topics,
-    dynamo_capacity_metrics.clone(),
-  )
-  .await?;
 
   let lease_store =
     build_producer_partition_lease_store(metadata_store_config, dynamo_capacity_metrics).await?;
@@ -278,6 +273,20 @@ pub async fn build_write_engine(
   );
 
   Ok(Arc::new(engine))
+}
+
+/// Build the metadata store once so broker write and read paths share backend clients and state.
+pub async fn build_runtime_metadata_store(
+  config: &RuntimeConfig,
+  capacity_metrics: DynamoCapacityMetrics,
+) -> Result<Arc<dyn MetadataStore>> {
+  proto_validate::validate(config)?;
+  let metadata_store_config = config
+    .metadata_store
+    .as_ref()
+    .context("runtime config missing metadata_store config")?;
+  let topics = build_topics(&config.topics)?;
+  build_metadata_store(metadata_store_config, &topics, capacity_metrics).await
 }
 
 async fn build_producer_partition_lease_store(

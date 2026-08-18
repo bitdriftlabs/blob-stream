@@ -48,10 +48,9 @@ interested in helping with this.
 
 # Will you improve the system to make it more performant and cost effective for multiple concurrent consumer groups or very large groups?
 
-We have no plans at the current time. For compaction specifically, see the question above. For
-general improvements such as consuming through a broker API, attempting to consolidate S3 reads at
-the broker level, etc. this is technically possible but adds complexity. We may consider this in the
-future depending on need and interest. See
+For compaction specifically, see the question above. For general improvements such as consuming
+through a broker API, attempting to consolidate S3 reads at the broker level, etc. we are adding
+this functionality incrementally. See
 [COST_IMPROVEMENT_IDEAS.md](../plans/COST_IMPROVEMENT_IDEAS.md) for a discussion.
 
 # Are you going to implement the Kafka API?

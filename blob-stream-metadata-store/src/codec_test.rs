@@ -1,4 +1,10 @@
-use super::{EncodedSegmentMetadata, decode, encode};
+use super::{
+  EncodedSegmentMetadata,
+  decode,
+  decode_segment_metadata_v1,
+  encode,
+  encode_segment_metadata_v1,
+};
 use crate::SegmentMetadata;
 use blob_stream_blob_store::BlobKey;
 use blob_stream_proto::protos::blobstream::v1::metadata::SegmentMetadataV1;
@@ -66,13 +72,25 @@ fn estimated_dynamo_item_bytes(encoded: &EncodedSegmentMetadata) -> usize {
 fn round_trips_segment_metadata_with_each_compression_codec() {
   for compression in [Compression::none(), Compression::zstd(3)] {
     let metadata = build_segment(compression);
-    let encoded = encode(metadata.clone()).expect("encode metadata");
+    let encoded = encode(&metadata).expect("encode metadata");
 
     assert_eq!(
       decode(&encoded.partition_key, &encoded.sort_key, &encoded.payload).expect("decode metadata"),
       metadata
     );
   }
+}
+
+#[test]
+fn round_trips_segment_metadata_through_transport_proto() {
+  let metadata = build_segment(Compression::zstd(3));
+  let proto = encode_segment_metadata_v1(&metadata).expect("encode transport metadata");
+
+  assert_eq!(
+    decode_segment_metadata_v1(metadata.window.clone(), metadata.snowflake_id, proto)
+      .expect("decode transport metadata"),
+    metadata
+  );
 }
 
 #[test]
@@ -89,7 +107,8 @@ fn rejects_malformed_payload() {
 
 #[test]
 fn rejects_semantically_invalid_payloads() {
-  let encoded = encode(build_segment(Compression::none())).expect("encode metadata");
+  let metadata = build_segment(Compression::none());
+  let encoded = encode(&metadata).expect("encode metadata");
   for (description, mutate) in [
     (
       "missing blob key",
@@ -162,7 +181,7 @@ fn representative_segment_metadata_fits_one_dynamodb_read_chunk() {
     offset_datetime_from_unix_millis(1_700_000_000_000),
     offset_datetime_from_unix_millis(1_700_000_000_100),
   );
-  let encoded = encode(metadata).expect("encode representative metadata");
+  let encoded = encode(&metadata).expect("encode representative metadata");
   let item_bytes = estimated_dynamo_item_bytes(&encoded);
 
   assert_eq!(item_bytes, REPRESENTATIVE_DYNAMO_ITEM_BYTES);

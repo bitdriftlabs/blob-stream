@@ -78,11 +78,18 @@ broker:
 
 Feature flags affect local process behavior. `blob_stream_broker_fenced_metadata_writes` remains a
 broker control. Consumer reader flags
-`blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`, and
-`blob_stream_consumer_max_in_flight_batch_reads` are live. Consumer polling and group scheduling
-flags are sampled when a consumer is constructed. Producer batching, retry, timeout, concurrency,
-and compression flags are sampled when a producer is constructed. See [Operations](operations.md)
-for the complete inventory and rollout behavior.
+`blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`,
+`blob_stream_consumer_max_in_flight_batch_reads`,
+`blob_stream_consumer_broker_metadata_cache_enabled`, and
+`blob_stream_consumer_broker_metadata_cache_shadow` are live.
+`ConsumerIteratorBootstrapConfig.broker_discovery` is required; the broker metadata cache is
+always available and only consumer flags control whether it is used.
+Shadow mode always delivers the direct DynamoDB result and uses a validated broker response only
+for comparison. Broker-delivery mode returns the broker result but retains the original direct
+scan as fallback for transport, validation, overload, or stale-observation failures. Consumer
+polling and group scheduling flags are sampled when a consumer is constructed. Producer batching,
+retry, timeout, concurrency, and compression flags are sampled when a producer is constructed.
+See [Operations](operations.md) for the complete inventory and rollout behavior.
 
 ## S3
 
@@ -163,8 +170,8 @@ lifecycle still uses `GetItem` and `UpdateItem`.
 
 ## Kubernetes Discovery RBAC
 
-When broker or producer discovery uses `k8s_service`, the workload ServiceAccount needs `get`,
-`list`, and `watch` on core `Endpoints` in the broker namespace:
+When broker, producer, or consumer broker discovery uses `k8s_service`, the workload
+ServiceAccount needs `get`, `list`, and `watch` on core `Endpoints` in the broker namespace:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -178,6 +185,6 @@ rules:
     verbs: ["get", "list", "watch"]
 ```
 
-Bind this Role to broker pods using Kubernetes discovery and to producer applications using the same
-discovery backend. Consumers do not need this permission unless their application adds its own
-Kubernetes discovery behavior.
+Bind this Role to broker pods, producer applications, and consumer applications that use the
+`k8s_service` broker-discovery backend. A consumer using static broker discovery does not need this
+permission.

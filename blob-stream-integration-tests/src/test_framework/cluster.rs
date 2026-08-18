@@ -20,12 +20,15 @@ use super::transport::{
 };
 use crate::test_framework::{PARTITION_COUNT, SECOND_TOPIC, TOPIC, WINDOW_SIZE_SECONDS};
 use anyhow::{Result, anyhow};
+use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
 use bd_shutdown::{ComponentShutdownTrigger, ComponentShutdownTriggerHandle};
+use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore};
 use blob_stream_broker::grpc::make_broker_router;
 use blob_stream_broker::metrics::BrokerMetrics;
+use blob_stream_broker::read::metadata_cache::{MetadataCache, MetadataCacheConfig};
 use blob_stream_broker::write::{
   BrokerLeaseStatus,
   BrokerStateSnapshot,
@@ -35,6 +38,7 @@ use blob_stream_broker::write::{
   WriteEngineBuilder,
 };
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode};
+use blob_stream_consumer::consumer::GrpcBrokerMetadataQuery;
 use blob_stream_consumer::iterator::{ConsumerIteratorBuilder, ConsumerIteratorImpl};
 use blob_stream_consumer::{
   ConsumerRuntimeConfig,
@@ -59,9 +63,12 @@ use blob_stream_producer::{
   ProducerConfig,
   ProducerTopicConfig,
 };
+use blob_stream_proto::protos::blobstream::v1::config::{BrokerConfig, RuntimeConfig, TopicConfig};
+use blob_stream_types::ToProtoDuration;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use time::Duration as TimeDuration;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
@@ -73,9 +80,52 @@ use tokio::time::{Instant, sleep, timeout};
 struct BrokerHandle {
   node: BrokerNode,
   write_engine: Arc<dyn WriteEngine>,
+  metadata_cache: Arc<MetadataCache>,
   listener_shutdown_tx: Option<oneshot::Sender<()>>,
   broker_shutdown_trigger: Option<ComponentShutdownTrigger>,
   serve_task: JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TestMetadataCacheSettings {
+  coalescing_window: Option<TimeDuration>,
+  request_timeout: Option<TimeDuration>,
+  max_bytes: Option<u64>,
+  max_age: Option<TimeDuration>,
+}
+
+fn test_metadata_cache_config(
+  partition_count: u32,
+  topic_num_writers: u32,
+  settings: TestMetadataCacheSettings,
+) -> Result<MetadataCacheConfig> {
+  let mut runtime = RuntimeConfig::new();
+  runtime.broker = Some(BrokerConfig::new()).into();
+  let broker = runtime
+    .broker
+    .as_mut()
+    .ok_or_else(|| anyhow!("test runtime missing broker config"))?;
+  if let Some(coalescing_window) = settings.coalescing_window {
+    broker.metadata_cache_coalescing_window = coalescing_window.into_proto();
+  }
+  if let Some(request_timeout) = settings.request_timeout {
+    broker.metadata_cache_request_timeout = request_timeout.into_proto();
+  }
+  if let Some(max_bytes) = settings.max_bytes {
+    broker.metadata_cache_max_bytes = Some(max_bytes);
+  }
+  for topic_name in [TOPIC, SECOND_TOPIC] {
+    let mut topic = TopicConfig::new();
+    topic.name = topic_name.into();
+    topic.partition_count = partition_count;
+    topic.num_writers = topic_num_writers;
+    topic.metadata_window_size = TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto();
+    if let Some(max_age) = settings.max_age {
+      topic.metadata_cache_max_age = max_age.into_proto();
+    }
+    runtime.topics.push(topic);
+  }
+  MetadataCacheConfig::from_runtime_config(&runtime, None)
 }
 
 impl BrokerHandle {
@@ -120,6 +170,7 @@ pub struct ClusterHarness {
   lifecycle_hooks: TestLifecycleHooks,
   broker_time_provider: Arc<dyn TimeProvider>,
   consumer_time_provider: Arc<dyn TimeProvider>,
+  metadata_cache_settings: TestMetadataCacheSettings,
   store_fault_controller: Option<StoreFaultController>,
 }
 
@@ -226,6 +277,7 @@ impl InMemoryClusterHarnessBuilder {
       Arc::new(InMemoryTestTransport::new()),
       self.broker_time_provider,
       self.consumer_time_provider,
+      TestMetadataCacheSettings::default(),
     )
     .await
   }
@@ -248,6 +300,7 @@ pub struct ClusterHarnessBuilder<'a> {
   transport: Arc<dyn BrokerTransport>,
   broker_time_provider: Arc<dyn TimeProvider>,
   consumer_time_provider: Arc<dyn TimeProvider>,
+  metadata_cache_settings: TestMetadataCacheSettings,
 }
 
 impl ClusterHarnessBuilder<'_> {
@@ -304,6 +357,36 @@ impl ClusterHarnessBuilder<'_> {
     self
   }
 
+  /// Override broker metadata-cache timing limits for a deterministic deadline test.
+  #[must_use]
+  pub fn metadata_cache_timing(
+    mut self,
+    coalescing_window: TimeDuration,
+    request_timeout: TimeDuration,
+  ) -> Self {
+    self.metadata_cache_settings = TestMetadataCacheSettings {
+      coalescing_window: Some(coalescing_window),
+      request_timeout: Some(request_timeout),
+      max_bytes: None,
+      max_age: None,
+    };
+    self
+  }
+
+  /// Override the broker's Tail-cache byte budget for deterministic eviction tests.
+  #[must_use]
+  pub fn metadata_cache_max_bytes(mut self, max_bytes: u64) -> Self {
+    self.metadata_cache_settings.max_bytes = Some(max_bytes);
+    self
+  }
+
+  /// Override the shared topic cache-age contract for deterministic eventual-read tests.
+  #[must_use]
+  pub fn metadata_cache_max_age(mut self, max_age: TimeDuration) -> Self {
+    self.metadata_cache_settings.max_age = Some(max_age);
+    self
+  }
+
   pub async fn start(self) -> Result<ClusterHarness> {
     let blob_store = self
       .blob_store
@@ -332,6 +415,7 @@ impl ClusterHarnessBuilder<'_> {
       self.transport,
       self.broker_time_provider,
       self.consumer_time_provider,
+      self.metadata_cache_settings,
     )
     .await
   }
@@ -355,6 +439,7 @@ impl ClusterHarness {
       transport: Arc::new(GrpcTcpTransport),
       broker_time_provider: Arc::new(SystemTimeProvider),
       consumer_time_provider: Arc::new(SystemTimeProvider),
+      metadata_cache_settings: TestMetadataCacheSettings::default(),
     }
   }
 
@@ -388,6 +473,7 @@ impl ClusterHarness {
     transport: Arc<dyn BrokerTransport>,
     broker_time_provider: Arc<dyn TimeProvider>,
     consumer_time_provider: Arc<dyn TimeProvider>,
+    metadata_cache_settings: TestMetadataCacheSettings,
   ) -> Result<Self> {
     if partition_count == 0 {
       return Err(anyhow!("partition_count must be greater than zero"));
@@ -462,6 +548,7 @@ impl ClusterHarness {
       lifecycle_hooks,
       broker_time_provider,
       consumer_time_provider,
+      metadata_cache_settings,
       store_fault_controller,
     };
 
@@ -556,6 +643,70 @@ impl ClusterHarness {
     .await
   }
 
+  /// Build a consumer that exercises the production broker metadata-query transport.
+  pub async fn create_broker_metadata_cache_consumer(
+    &self,
+    runtime: &ConsumerRuntimeConfig,
+    shadow: bool,
+  ) -> Result<ConsumerIteratorImpl> {
+    self
+      .create_broker_metadata_cache_consumer_with_discovery(
+        runtime,
+        shadow,
+        Arc::new(self.producer_discovery()),
+      )
+      .await
+  }
+
+  /// Build a consumer with an explicit metadata-query discovery source for routing tests.
+  pub async fn create_broker_metadata_cache_consumer_with_discovery(
+    &self,
+    runtime: &ConsumerRuntimeConfig,
+    shadow: bool,
+    discovery: Arc<dyn BrokerDiscovery>,
+  ) -> Result<ConsumerIteratorImpl> {
+    let group = runtime
+      .group
+      .as_ref()
+      .ok_or_else(|| anyhow!("consumer runtime config requires a group config"))?;
+    let coordination_source = Arc::new(
+      MembershipCoordinationSource::new(
+        group.topic.to_string(),
+        group.group_id.to_string(),
+        group.member_id.to_string(),
+        (0 .. self.partition_count).collect(),
+        Arc::clone(&self.consumer_membership_store),
+      )
+      .time_provider(Arc::clone(&self.consumer_time_provider)),
+    );
+    let feature_flags = FakeLoader::new(Arc::new(
+      DefaultFeatureFlags::default()
+        .with_bool_flag("blob_stream_consumer_broker_metadata_cache_enabled", true)
+        .with_bool_flag("blob_stream_consumer_broker_metadata_cache_shadow", shadow),
+    ));
+    let feature_flags = feature_flags.snapshot_watch();
+    let broker_metadata_query = Arc::new(GrpcBrokerMetadataQuery::new(discovery).await?);
+
+    ConsumerIteratorBuilder::new(
+      runtime,
+      Arc::clone(&self.blob_store),
+      Arc::clone(&self.metadata_store),
+      Arc::clone(&self.consumer_lease_store),
+      Arc::clone(&self.consumer_membership_store),
+      coordination_source,
+      Collector::default().scope("blob_stream_consumer_it"),
+      time::Duration::days(1),
+      time::Duration::ZERO,
+      Some(feature_flags),
+    )
+    .broker_metadata_query(broker_metadata_query)
+    .metadata_cache_max_age(time::Duration::milliseconds(250))
+    .lifecycle_hooks(Arc::new(self.lifecycle_hooks.clone()))
+    .time_provider(Arc::clone(&self.consumer_time_provider))
+    .build()
+    .await
+  }
+
   pub fn consumer_lease_store(&self) -> Arc<dyn ConsumerGroupLeaseStore> {
     Arc::clone(&self.consumer_lease_store)
   }
@@ -636,6 +787,15 @@ impl ClusterHarness {
     snapshots
   }
 
+  pub async fn metadata_cache_active_waiters(&self) -> usize {
+    let mut active_waiters: usize = 0;
+    for broker in &self.brokers {
+      active_waiters =
+        active_waiters.saturating_add(broker.metadata_cache.snapshot().await.active_waiters);
+    }
+    active_waiters
+  }
+
   pub fn write_engine_by_id(&self, node_id: &str) -> Result<Arc<dyn WriteEngine>> {
     self
       .brokers
@@ -684,11 +844,23 @@ impl ClusterHarness {
       .register_write_engine(&node.node_id, Arc::clone(&write_engine))?;
 
     let metrics = BrokerMetrics::new();
+    let metadata_cache = Arc::new(MetadataCache::new(
+      Arc::clone(&self.metadata_store),
+      test_metadata_cache_config(
+        partition_count,
+        topic_num_writers,
+        self.metadata_cache_settings,
+      )?,
+    ));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     // TCP bindings run the real axum server; in-memory bindings only wait for shutdown.
     let serve_task = match endpoint.binding {
       BrokerEndpointBinding::Tcp(listener) => {
-        let router = make_broker_router(Arc::clone(&write_engine), &metrics);
+        let router = make_broker_router(
+          Arc::clone(&write_engine),
+          Arc::clone(&metadata_cache),
+          &metrics,
+        );
         tokio::spawn(async move {
           let result = axum::serve(listener, router)
             .with_graceful_shutdown(async move {
@@ -709,6 +881,7 @@ impl ClusterHarness {
     Ok(BrokerHandle {
       node,
       write_engine,
+      metadata_cache,
       listener_shutdown_tx: Some(shutdown_tx),
       broker_shutdown_trigger: Some(broker_shutdown_trigger),
       serve_task,

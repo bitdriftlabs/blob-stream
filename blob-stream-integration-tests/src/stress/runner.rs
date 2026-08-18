@@ -372,27 +372,30 @@ pub async fn run(config: StressConfig) -> Result<StressRunSummary> {
   };
 
   let remaining = remaining_until(deadline, &progress, started)?;
-  let result = timeout(remaining, async {
-    wait_for_broker_readiness(
-      &cluster,
-      config.partition_count,
-      config.startup_timeout,
-      config.progress_interval,
-      &progress,
-    )
-    .await?;
+  let result = timeout(
+    remaining,
+    Box::pin(async {
+      wait_for_broker_readiness(
+        &cluster,
+        config.partition_count,
+        config.startup_timeout,
+        config.progress_interval,
+        &progress,
+      )
+      .await?;
 
-    run_with_resources(
-      &config,
-      run_id,
-      expected_per_producer,
-      &mut validator,
-      &resources,
-      &cluster,
-      Arc::clone(&progress),
-    )
-    .await
-  })
+      Box::pin(run_with_resources(
+        &config,
+        run_id,
+        expected_per_producer,
+        &mut validator,
+        &resources,
+        &cluster,
+        Arc::clone(&progress),
+      ))
+      .await
+    }),
+  )
   .await;
 
   cluster.shutdown().await;

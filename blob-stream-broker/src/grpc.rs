@@ -3,6 +3,7 @@
 mod tests;
 
 use crate::metrics::BrokerMetrics;
+use crate::read::metadata_cache::{MAX_METADATA_READ_REQUEST_BYTES, MetadataCache};
 use crate::write::{ProduceOutcomeMetrics, WriteEngine, WriteError, WriteRequest};
 use axum::extract::Query;
 use axum::http::header::CONTENT_TYPE;
@@ -19,6 +20,8 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchesRequest,
   ProduceBatchesResponse,
   ProduceStatus,
+  ReadMetadataWindowRequest,
+  ReadMetadataWindowResponse,
 };
 use blob_stream_types::MAX_PRODUCE_BATCHES_REQUEST_BYTES;
 use futures::future::join_all;
@@ -99,6 +102,7 @@ impl BrokerGrpcMetrics {
 
 pub struct BrokerGrpc {
   write_engine: Arc<dyn WriteEngine>,
+  metadata_cache: Arc<MetadataCache>,
   produce_request_timeout: Duration,
   metrics: BrokerGrpcMetrics,
   produce_outcomes: ProduceOutcomeMetrics,
@@ -106,10 +110,15 @@ pub struct BrokerGrpc {
 
 impl BrokerGrpc {
   #[must_use]
-  pub fn new(write_engine: Arc<dyn WriteEngine>, metrics_scope: &Scope) -> Self {
+  pub fn new(
+    write_engine: Arc<dyn WriteEngine>,
+    metadata_cache: Arc<MetadataCache>,
+    metrics_scope: &Scope,
+  ) -> Self {
     let produce_request_timeout = write_engine.produce_request_timeout();
     Self {
       write_engine,
+      metadata_cache,
       produce_request_timeout,
       metrics: BrokerGrpcMetrics::new(metrics_scope),
       produce_outcomes: ProduceOutcomeMetrics::new(metrics_scope),
@@ -211,6 +220,18 @@ impl BrokerGrpc {
 }
 
 #[async_trait::async_trait]
+impl Handler<ReadMetadataWindowRequest, ReadMetadataWindowResponse> for BrokerGrpc {
+  async fn handle(
+    &self,
+    _headers: HeaderMap,
+    _extensions: Extensions,
+    request: ReadMetadataWindowRequest,
+  ) -> bd_grpc::error::Result<ReadMetadataWindowResponse> {
+    Ok(self.metadata_cache.read(request).await)
+  }
+}
+
+#[async_trait::async_trait]
 impl Handler<ProduceBatchRequest, ProduceBatchResponse> for BrokerGrpc {
   async fn handle(
     &self,
@@ -259,7 +280,11 @@ impl Handler<ProduceBatchesRequest, ProduceBatchesResponse> for BrokerGrpc {
   }
 }
 
-pub fn make_broker_router(write_engine: Arc<dyn WriteEngine>, metrics: &BrokerMetrics) -> Router {
+pub fn make_broker_router(
+  write_engine: Arc<dyn WriteEngine>,
+  metadata_cache: Arc<MetadataCache>,
+  metrics: &BrokerMetrics,
+) -> Router {
   let produce_batch_method = ServiceMethod::<ProduceBatchRequest, ProduceBatchResponse>::new(
     "BrokerService",
     "ProduceBatch",
@@ -268,10 +293,20 @@ pub fn make_broker_router(write_engine: Arc<dyn WriteEngine>, metrics: &BrokerMe
     "BrokerService",
     "ProduceBatches",
   );
+  let metadata_read_method =
+    ServiceMethod::<ReadMetadataWindowRequest, ReadMetadataWindowResponse>::new(
+      "BrokerService",
+      "ReadMetadataWindow",
+    );
   let grpc_metrics_scope = metrics.scope();
   let admin_metrics = metrics.clone();
   let admin_write_engine = write_engine.clone();
-  let grpc = Arc::new(BrokerGrpc::new(write_engine, &grpc_metrics_scope));
+  let admin_metadata_cache = metadata_cache.clone();
+  let grpc = Arc::new(BrokerGrpc::new(
+    write_engine,
+    metadata_cache,
+    &grpc_metrics_scope,
+  ));
   let produce_batch_router = UnaryRouterBuilder::new(&produce_batch_method, grpc.clone())
     .request_config(produce_request_config())
     .error_handler(|error| {
@@ -279,15 +314,26 @@ pub fn make_broker_router(write_engine: Arc<dyn WriteEngine>, metrics: &BrokerMe
     })
     .build()
     .expect("legacy broker gRPC router should build");
-  let produce_batches_router = UnaryRouterBuilder::new(&produce_batches_method, grpc)
+  let produce_batches_router = UnaryRouterBuilder::new(&produce_batches_method, grpc.clone())
     .request_config(produce_request_config())
     .error_handler(|error| {
       warn_every!(15.seconds(), "broker gRPC handler error: {error}");
     })
     .build()
     .expect("batched broker gRPC router should build");
+  let metadata_read_router = UnaryRouterBuilder::new(&metadata_read_method, grpc)
+    .request_config(metadata_read_request_config())
+    .error_handler(|error| {
+      warn_every!(
+        15.seconds(),
+        "broker metadata cache gRPC handler error: {error}"
+      );
+    })
+    .build()
+    .expect("metadata cache gRPC router should build");
   produce_batch_router
     .merge(produce_batches_router)
+    .merge(metadata_read_router)
     .route(
       "/metrics",
       get(move || {
@@ -307,6 +353,13 @@ pub fn make_broker_router(write_engine: Arc<dyn WriteEngine>, metrics: &BrokerMe
         async move { Json(write_engine.state_snapshot().await) }
       }),
     )
+    .route(
+      "/admin/metadata-cache",
+      get(move || {
+        let metadata_cache = admin_metadata_cache.clone();
+        async move { Json(metadata_cache.snapshot().await) }
+      }),
+    )
     .route("/admin/log", post(log))
 }
 
@@ -314,6 +367,15 @@ fn produce_request_config() -> UnaryRequestConfig {
   UnaryRequestConfig {
     max_request_bytes: MAX_PRODUCE_BATCHES_REQUEST_BYTES,
     max_decoded_request_bytes: MAX_PRODUCE_BATCHES_REQUEST_BYTES,
+    ..UnaryRequestConfig::default()
+  }
+  .with_validation_options(ValidationOptions::default())
+}
+
+fn metadata_read_request_config() -> UnaryRequestConfig {
+  UnaryRequestConfig {
+    max_request_bytes: MAX_METADATA_READ_REQUEST_BYTES,
+    max_decoded_request_bytes: MAX_METADATA_READ_REQUEST_BYTES,
     ..UnaryRequestConfig::default()
   }
   .with_validation_options(ValidationOptions::default())

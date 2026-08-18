@@ -31,7 +31,17 @@ use super::{
   try_join_all,
 };
 use crate::consumer::ConsumerReadOutcome;
+use crate::consumer::metadata_query::{decode_metadata_response, metadata_results_match};
 use bd_log_util::warn_every;
+use blob_stream_proto::protos::blobstream::v1::broker::{
+  FullRecoveryMetadataCoverage,
+  MetadataPartitionBound,
+  MetadataReadConsistency as BrokerReadConsistency,
+  ReadMetadataWindowRequest,
+  TailMetadataCoverage,
+  read_metadata_window_request,
+};
+use time::OffsetDateTime;
 use time::ext::NumericalDuration;
 
 //
@@ -72,7 +82,7 @@ impl ConsumerReaderImpl {
     runtime_settings: ConsumerReadRuntimeSettings,
     visibility_cutoff: time::OffsetDateTime,
     scan_states: &mut HashMap<VirtualPartitionId, ConsumerReaderPartitionScanState>,
-  ) -> Result<Vec<(ScanRequest, Arc<[SegmentMetadata]>)>> {
+  ) -> Result<Vec<(ScanRequest, Arc<[SegmentMetadata]>, time::OffsetDateTime)>> {
     let mut cached_window_results = Vec::new();
     let mut scan_futures = Vec::new();
     for (request_index, request) in scan_requests.iter().cloned().enumerate() {
@@ -93,7 +103,12 @@ impl ConsumerReaderImpl {
           offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
           segments.len()
         );
-        cached_window_results.push((request_index, request, Arc::clone(segments)));
+        cached_window_results.push((
+          request_index,
+          request,
+          Arc::clone(segments),
+          visibility_cutoff,
+        ));
         continue;
       }
       if let Some(cache_key) = cache_key {
@@ -104,34 +119,106 @@ impl ConsumerReaderImpl {
         }
       }
       let metadata_store = Arc::clone(&self.metadata_store);
+      let broker_metadata_query = self.broker_metadata_query.clone();
       let metrics = self.metrics.clone();
       let metadata_read_consistency = runtime_settings.metadata_read_consistency;
+      let broker_enabled = runtime_settings.broker_metadata_cache_enabled;
+      let broker_shadow = runtime_settings.broker_metadata_cache_shadow;
+      let metadata_cache_max_age = self.metadata_cache_max_age;
+      let broker_request = broker_enabled
+        .then(|| broker_request_for_scan(&request, metadata_read_consistency))
+        .flatten();
+      let shadow_request = broker_shadow.then(|| broker_request.clone()).flatten();
       scan_futures.push(async move {
         if !request.recovery_scan && request.eligibility.fast && request.min_snowflake.is_none() {
           metrics.metadata_fast_scan_without_lower_bound.inc();
         }
         let scan_started_at = Instant::now();
-        let segments = metadata_store
-          .scan_window_from_snowflake(
-            &request.window,
-            request.min_snowflake,
-            metadata_read_consistency,
+        let broker_attempted = broker_metadata_query.is_some() && broker_request.is_some();
+        let broker_result =
+          if let (Some(query), Some(broker_request)) = (broker_metadata_query, broker_request) {
+            metrics.record_broker_metadata_offload_request();
+            match query.read_metadata_window(broker_request.clone()).await {
+              Ok(response) => {
+                match decode_metadata_response(
+                  &broker_request,
+                  response,
+                  OffsetDateTime::now_utc(),
+                  metadata_cache_max_age,
+                ) {
+                  Ok(result) => Some(result),
+                  Err(error) => {
+                    trace!(
+                      "consumer broker metadata response rejected; falling back direct: {error}"
+                    );
+                    None
+                  },
+                }
+              },
+              Err(error) => {
+                trace!("consumer broker metadata query failed; falling back direct: {error}");
+                None
+              },
+            }
+          } else {
+            None
+          };
+        let (segments, result_visibility_cutoff) = if broker_shadow {
+          let direct_segments =
+            scan_direct_metadata(&metadata_store, &request, metadata_read_consistency).await?;
+          if let Some(broker_result) = broker_result {
+            match metadata_results_match(
+              &shadow_request.expect("shadow broker request exists"),
+              &broker_result.segments,
+              &direct_segments,
+            ) {
+              Ok(true) => metrics.record_broker_metadata_shadow_match(),
+              Ok(false) => {
+                metrics.record_broker_metadata_shadow_mismatch();
+                warn_every!(
+                  15.seconds(),
+                  "consumer broker metadata shadow mismatch: topic={}, window_start={}, \
+                   broker_segments={}, direct_segments={}",
+                  request.window.topic,
+                  offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
+                  broker_result.segments.len(),
+                  direct_segments.len()
+                );
+              },
+              Err(error) => {
+                metrics.record_broker_metadata_shadow_comparison_failure();
+                trace!("consumer broker metadata shadow comparison failed: {error}");
+              },
+            }
+          } else {
+            metrics.record_broker_metadata_shadow_comparison_failure();
+          }
+          (direct_segments, visibility_cutoff)
+        } else if let Some(result) = broker_result {
+          metrics.record_broker_metadata_offload_delivery();
+          (
+            result.segments,
+            result
+              .observed_at
+              .saturating_sub(runtime_settings.metadata_visibility_delay),
           )
-          .await
-          .with_context(|| {
-            format!(
-              "consumer metadata scan failed: topic={}, window_start={}, recovery={}, fast={}, \
-               fresh={}, min_snowflake={:?}",
-              request.window.topic,
-              offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
-              !request.eligibility.recovering_partitions.is_empty(),
-              request.eligibility.fast,
-              request.eligibility.fresh,
-              request.min_snowflake.map(SnowflakeId::as_u64)
-            )
-          })?;
+        } else {
+          if broker_attempted {
+            metrics.record_broker_metadata_offload_fallback();
+          }
+          (
+            scan_direct_metadata(&metadata_store, &request, metadata_read_consistency).await?,
+            visibility_cutoff,
+          )
+        };
         metrics.record_metadata_scan(scan_started_at, segments.len(), request.recovery_scan);
-        Ok::<_, Error>((request_index, request, segments, cache_key))
+        Ok::<_, Error>((
+          request_index,
+          request,
+          segments,
+          cache_key,
+          result_visibility_cutoff,
+        ))
       });
     }
 
@@ -145,12 +232,14 @@ impl ConsumerReaderImpl {
         return Err(error);
       },
     };
-    for (request_index, request, segments, cache_key) in queried_window_results {
+    for (request_index, request, segments, cache_key, result_visibility_cutoff) in
+      queried_window_results
+    {
       let segments = if let Some(cache_key) = cache_key {
         let partition_id = cache_key.0;
         let has_visibility_deferred_segment = segments.iter().any(|segment| {
           segment.segment_index.contains_key(&partition_id)
-            && segment.metadata_published_at > visibility_cutoff
+            && segment.metadata_published_at > result_visibility_cutoff
         });
         if has_visibility_deferred_segment {
           let mut segments = segments;
@@ -189,14 +278,14 @@ impl ConsumerReaderImpl {
         segments.sort_by_key(|metadata| metadata.snowflake_id);
         segments.into()
       };
-      cached_window_results.push((request_index, request, segments));
+      cached_window_results.push((request_index, request, segments, result_visibility_cutoff));
     }
     self.record_recovery_metadata_cache_state();
     cached_window_results.sort_by_key(|(request_index, ..)| *request_index);
     Ok(
       cached_window_results
         .into_iter()
-        .map(|(_, request, segments)| (request, segments))
+        .map(|(_, request, segments, visibility_cutoff)| (request, segments, visibility_cutoff))
         .collect(),
     )
   }
@@ -641,7 +730,9 @@ impl ConsumerReaderImpl {
       .collect::<HashSet<_>>();
     let mut segment_read_plans = Vec::new();
     let mut capacity_exhausted = false;
-    'windows: for (request_index, (request, segments)) in window_results.into_iter().enumerate() {
+    'windows: for (request_index, (request, segments, visibility_cutoff)) in
+      window_results.into_iter().enumerate()
+    {
       let window = request.window;
       trace!(
         "consumer scanned window: topic={}, window_start={}, segments={}",
@@ -975,4 +1066,106 @@ impl ConsumerReaderImpl {
       batches: output,
     })
   }
+}
+
+async fn scan_direct_metadata(
+  metadata_store: &Arc<dyn blob_stream_metadata_store::MetadataStore>,
+  request: &ScanRequest,
+  consistency: blob_stream_metadata_store::MetadataReadConsistency,
+) -> Result<Vec<SegmentMetadata>> {
+  metadata_store
+    .scan_window_from_snowflake(&request.window, request.min_snowflake, consistency)
+    .await
+    .with_context(|| {
+      format!(
+        "consumer metadata scan failed: topic={}, window_start={}, recovery={}, fast={}, \
+         fresh={}, min_snowflake={:?}",
+        request.window.topic,
+        offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
+        !request.eligibility.recovering_partitions.is_empty(),
+        request.eligibility.fast,
+        request.eligibility.fresh,
+        request.min_snowflake.map(SnowflakeId::as_u64)
+      )
+    })
+}
+
+fn broker_request_for_scan(
+  request: &ScanRequest,
+  consistency: blob_stream_metadata_store::MetadataReadConsistency,
+) -> Option<ReadMetadataWindowRequest> {
+  if request.fast_partition_bounds.is_empty() && request.recovery_partition_bounds.is_empty() {
+    return None;
+  }
+  let consistency = match consistency {
+    blob_stream_metadata_store::MetadataReadConsistency::Eventual => {
+      BrokerReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL
+    },
+    blob_stream_metadata_store::MetadataReadConsistency::Strong => {
+      BrokerReadConsistency::METADATA_READ_CONSISTENCY_STRONG
+    },
+  };
+  let coverage = if request.recovery_partition_bounds.is_empty() {
+    read_metadata_window_request::Coverage::Tail(TailMetadataCoverage {
+      partition_bounds: request
+        .fast_partition_bounds
+        .iter()
+        .map(
+          |(&virtual_partition_id, &min_snowflake)| MetadataPartitionBound {
+            virtual_partition_id,
+            min_snowflake: min_snowflake.as_u64(),
+            ..Default::default()
+          },
+        )
+        .collect(),
+      ..Default::default()
+    })
+  } else if request
+    .recovery_partition_bounds
+    .values()
+    .all(Option::is_some)
+  {
+    let mut partition_bounds = request.fast_partition_bounds.clone();
+    for (&partition_id, &min_snowflake) in &request.recovery_partition_bounds {
+      let min_snowflake = min_snowflake.expect("bounded recovery partition has a lower bound");
+      partition_bounds
+        .entry(partition_id)
+        .and_modify(|bound| *bound = (*bound).min(min_snowflake))
+        .or_insert(min_snowflake);
+    }
+    read_metadata_window_request::Coverage::Tail(TailMetadataCoverage {
+      partition_bounds: partition_bounds
+        .into_iter()
+        .map(
+          |(virtual_partition_id, min_snowflake)| MetadataPartitionBound {
+            virtual_partition_id,
+            min_snowflake: min_snowflake.as_u64(),
+            ..Default::default()
+          },
+        )
+        .collect(),
+      ..Default::default()
+    })
+  } else {
+    let mut partition_ids = request
+      .recovery_partition_bounds
+      .keys()
+      .copied()
+      .collect::<Vec<_>>();
+    partition_ids.extend(request.fast_partition_bounds.keys().copied());
+    partition_ids.sort_unstable();
+    partition_ids.dedup();
+    read_metadata_window_request::Coverage::FullRecovery(FullRecoveryMetadataCoverage {
+      virtual_partition_ids: partition_ids,
+      ..Default::default()
+    })
+  };
+  Some(ReadMetadataWindowRequest {
+    topic: request.window.topic.clone().into(),
+    window_start_unix_seconds: request.window.window_start_unix_seconds,
+    consistency: consistency.into(),
+    coverage: Some(coverage),
+    max_response_bytes: 16 * 1024 * 1024,
+    ..Default::default()
+  })
 }

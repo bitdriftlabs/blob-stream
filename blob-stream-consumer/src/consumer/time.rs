@@ -11,16 +11,18 @@ pub(in crate::consumer) struct AvailabilityHorizon(Duration);
 
 impl AvailabilityHorizon {
   #[must_use]
-  /// Combine publication, clock-skew, and visibility bounds into one audited duration.
+  /// Combine publication, clock-skew, visibility, and retained-cache-age bounds.
   pub(in crate::consumer) fn new(
     maximum_metadata_publication_lag: Duration,
     maximum_clock_skew: Duration,
     visibility_delay: Duration,
+    metadata_cache_max_age: Duration,
   ) -> Self {
     Self(
       maximum_metadata_publication_lag
         .saturating_add(maximum_clock_skew)
-        .saturating_add(visibility_delay),
+        .saturating_add(visibility_delay)
+        .saturating_add(metadata_cache_max_age),
     )
   }
 
