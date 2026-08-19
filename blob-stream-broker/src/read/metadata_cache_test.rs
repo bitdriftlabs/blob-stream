@@ -298,6 +298,53 @@ async fn coalesces_tail_requests_at_the_lowest_bound() {
 }
 
 #[tokio::test]
+async fn records_coalescing_metrics_for_strong_queries() {
+  let collector = Collector::default();
+  let metrics = Helper::new_with_collector(collector.clone());
+  let store = Arc::new(CountingMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: vec![segment()],
+  });
+  let cache = Arc::new(MetadataCache::new_with_metrics(
+    store.clone(),
+    cache_config(Duration::seconds(1), StdDuration::from_millis(20)),
+    &collector.scope("blob_stream_broker_test"),
+  ));
+
+  let (lower, higher) = tokio::join!(
+    cache.read(tail_request(
+      100,
+      MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG,
+    )),
+    cache.read(tail_request(
+      200,
+      MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG,
+    )),
+  );
+
+  assert!(matches!(
+    lower.result,
+    Some(read_metadata_window_response::Result::Success(_))
+  ));
+  assert!(matches!(
+    higher.result,
+    Some(read_metadata_window_response::Result::Success(_))
+  ));
+  assert_eq!(store.scans.load(Ordering::Relaxed), 1);
+  metrics.assert_counter_eq(
+    1,
+    "blob_stream_broker_test:metadata_cache:storage_queries_total",
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    2,
+    "blob_stream_broker_test:metadata_cache:coalescing_window_requests_total",
+    &labels!(),
+  );
+}
+
+#[tokio::test]
 async fn narrower_strong_request_after_refill_start_runs_a_follow_up_refill() {
   let store = Arc::new(GatedMetadataStore {
     scans: AtomicUsize::new(0),
@@ -700,7 +747,12 @@ async fn records_cache_hit_miss_refill_and_response_metrics() {
   );
   metrics.assert_counter_eq(
     1,
-    "blob_stream_broker_test:metadata_cache:misses_total",
+    "blob_stream_broker_test:metadata_cache:storage_queries_total",
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    1,
+    "blob_stream_broker_test:metadata_cache:coalescing_window_requests_total",
     &labels!(),
   );
   metrics.assert_counter_eq(

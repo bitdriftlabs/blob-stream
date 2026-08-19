@@ -57,7 +57,7 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 | `recovery_metadata_cache_hits`, `recovery_metadata_cache_misses`, `recovery_metadata_cache_inserts`, `recovery_metadata_cache_invalidations` | Counters | Recovery metadata-cache effectiveness and maintenance. |
 | `recovery_metadata_cache_entries`, `recovery_metadata_cache_retained_bytes` | Gauges | Current retained recovery cache entry count and bytes. |
 | `metadata_fast_scan_without_lower_bound` | Counter | Fast scans that could not use a derived metadata lower bound. |
-| `metadata_segments_deferred_by_visibility_delay` | Counter | Segment rows deferred by the resolved visibility maturity delay. Strong reads resolve that delay to zero, so only rows timestamped after the reader's current time are deferred. |
+| `metadata_segments_deferred_by_visibility_delay` | Counter | Segment rows deferred by the eventual-read visibility maturity delay. Strong reads accept every validated row and do not increment this counter. |
 | `metadata_batches_scanned`, `metadata_batches_skipped_by_cursor` | Counters | Batches decoded from metadata and batches skipped because the committed cursor had already passed them. |
 | `blob_range_requests`, `blob_range_bytes`, `blob_range_latency_seconds` | Counters, histogram | S3/object-store byte-range reads, bytes read, and range-read latency. |
 | `blob_batch_ranges`, `blob_batch_range_bytes` | Counters | Byte ranges planned for individual encoded batches and their total bytes. |
@@ -94,18 +94,24 @@ Broker metrics use `blob_stream_broker` with the component scopes below.
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `requests_total`, `misses_total`, `tail_hits_total`, `recovery_hits_total` | Counters | Metadata-cache requests, cache misses, and retained Tail or Full Recovery hits. |
+| `requests_total`, `tail_hits_total`, `recovery_hits_total` | Counters | Metadata-cache RPCs and retained Tail or Full Recovery hits. |
+| `storage_queries_total` | Counter | Authoritative metadata-store queries started after coalescing, for both eventual and strong reads. |
 | `tail_refills_total`, `recovery_baselines_total`, `recovery_seals_total` | Counters | Tail refills and complete Full Recovery snapshots installed. Full Recovery is unpaged, so its baseline and final seal are recorded together. |
 | `invalidations_total`, `evictions_total` | Counters | Retained entries removed because they no longer satisfy a request and entries evicted by cache policy. |
 | `failures_total`, `overloads_total` | Counters | Rejected or failed metadata-cache reads and the subset caused by admission, size, or timeout overload. |
 | `response_items_total`, `response_bytes_total` | Counters | Metadata segments and encoded metadata bytes returned in successful broker responses. |
-| `waiters_admitted_total` | Counter | Requests admitted to wait for an in-flight refill. |
-| `observation_age_seconds`, `coalescing_delay_seconds` | Histograms | Age of a retained hit and the configured delay before a refill begins. |
+| `coalescing_window_requests_total` | Counter | Requests still admitted when a coalescing window starts its authoritative query, including the request that created the query group. |
+| `observation_age_seconds` | Histogram | Age of a retained hit. |
 | `active_waiters`, `active_refills` | Gauges | Requests currently waiting on refill work and refills holding concurrency permits. |
 | `tail_entries`, `recovery_entries`, `tail_retained_bytes`, `recovery_retained_bytes` | Gauges | Current retained entry count and weighted bytes for each cache. |
 
 These metrics have no topic, metadata-window, partition, or consumer-group labels. Inspect
 aggregate capacity and current admission state through `/admin/metadata-cache`.
+
+`coalescing_window_requests_total / storage_queries_total` is the average request fan-in per
+authoritative query. Subtracting `storage_queries_total` from
+`coalescing_window_requests_total` gives the number of requests collapsed into an existing query
+group. Both calculations apply to eventual and strong reads; retained-cache hits are separate.
 
 ### gRPC: `blob_stream_broker:grpc`
 

@@ -289,7 +289,7 @@ pub struct MetadataCache {
 #[derive(Clone)]
 struct MetadataCacheMetrics {
   requests: prometheus::IntCounter,
-  misses: prometheus::IntCounter,
+  storage_queries: prometheus::IntCounter,
   tail_hits: prometheus::IntCounter,
   recovery_hits: prometheus::IntCounter,
   tail_refills: prometheus::IntCounter,
@@ -302,8 +302,7 @@ struct MetadataCacheMetrics {
   response_items: prometheus::IntCounter,
   response_bytes: prometheus::IntCounter,
   observation_age_seconds: prometheus::Histogram,
-  coalescing_delay_seconds: prometheus::Histogram,
-  waiters_admitted: prometheus::IntCounter,
+  coalescing_window_requests: prometheus::IntCounter,
   active_waiters: prometheus::IntGauge,
   active_refills: prometheus::IntGauge,
   tail_entries: prometheus::IntGauge,
@@ -317,7 +316,7 @@ impl MetadataCacheMetrics {
     let scope = scope.scope("metadata_cache");
     Self {
       requests: scope.counter("requests_total"),
-      misses: scope.counter("misses_total"),
+      storage_queries: scope.counter("storage_queries_total"),
       tail_hits: scope.counter("tail_hits_total"),
       recovery_hits: scope.counter("recovery_hits_total"),
       tail_refills: scope.counter("tail_refills_total"),
@@ -330,8 +329,7 @@ impl MetadataCacheMetrics {
       response_items: scope.counter("response_items_total"),
       response_bytes: scope.counter("response_bytes_total"),
       observation_age_seconds: scope.histogram("observation_age_seconds"),
-      coalescing_delay_seconds: scope.histogram("coalescing_delay_seconds"),
-      waiters_admitted: scope.counter("waiters_admitted_total"),
+      coalescing_window_requests: scope.counter("coalescing_window_requests_total"),
       active_waiters: scope.gauge("active_waiters"),
       active_refills: scope.gauge("active_refills"),
       tail_entries: scope.gauge("tail_entries"),
@@ -652,10 +650,7 @@ impl MetadataCache {
         self.metrics.invalidations.inc();
       }
 
-      self.metrics.misses.inc();
-
       let (pending, _waiter) = self.join_or_start_refill(&specification)?;
-      self.metrics.waiters_admitted.inc();
       let entry = pending.wait().await?;
       if entry.covers(&specification) {
         return Ok(LoadedCacheEntry {
@@ -727,13 +722,13 @@ impl MetadataCache {
     tokio::spawn(async move {
       // Delay the storage read so compatible requests can widen the shared Tail scan.
       tokio::time::sleep(cache.config.coalescing_window).await;
-      let request = worker.begin();
-      cache
-        .metrics
-        .coalescing_delay_seconds
-        .observe(cache.config.coalescing_window.as_secs_f64());
+      let (request, coalescing_window_requests) = worker.begin();
       let result = match cache.refill_permits.clone().try_acquire_owned() {
         Ok(permit) => {
+          cache
+            .metrics
+            .coalescing_window_requests
+            .inc_by(u64::try_from(coalescing_window_requests).unwrap_or(u64::MAX));
           cache.metrics.active_refills.inc();
           let result = cache.load_entry(request).await;
           drop(permit);
@@ -771,6 +766,7 @@ impl MetadataCache {
       specification.coverage,
       min_snowflake.map(SnowflakeId::as_u64),
     );
+    self.metrics.storage_queries.inc();
     let mut segments = self
       .metadata_store
       .scan_window_from_snowflake(
@@ -1135,8 +1131,9 @@ impl PendingRefill {
     })
   }
 
-  fn begin(&self) -> ReadSpecification {
-    self.state.lock().specification.clone()
+  fn begin(&self) -> (ReadSpecification, usize) {
+    let state = self.state.lock();
+    (state.specification.clone(), state.waiter_count)
   }
 
   fn complete(&self, result: Result<Arc<CacheEntry>>) {
@@ -1285,7 +1282,7 @@ fn response_error(
   warn_every!(
     5.seconds(),
     "broker metadata cache request failed: topic={}, window_start={}, status={status:?}, \
-     error={error}",
+     error={error:#}",
     request.topic,
     request.window_start_unix_seconds
   );

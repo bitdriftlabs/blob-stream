@@ -409,19 +409,20 @@ Visibility-deferred, Fresh, Fast, shared, and active-horizon responses are not c
 intentionally reader-local and is discarded on restart, revocation, seek, or replacement recovery
 hydration.
 
-The effective visibility delay applies in every mode. In the default eventual-read mode it is
-`metadata_visibility_delay_ms`; strong reads use zero delay and accept a row at its publication
-timestamp. When an eligible metadata row is newer than `now - effective_visibility_delay`, the
-reader defers it. Clock skew is accounted for by the Fast and checkpoint availability horizon, not
-added to this per-row maturity test. In Recovery, deferring a window blocks later recovery windows
-for that partition in the same pass, so the cursor cannot advance past a missing earlier sequence
-range. The recovery pointer remains at the deferred window for the next pass when that window is
-outside Fast's bounded scan horizon. A deferred window inside that horizon instead completes
-recovery and is handed to Fast: Fast retains the same visibility check, blocks later snowflakes in
-that partition/window during the pass, and retries from its inclusive time floor and frontier. This
-prevents recovery from tail-chasing a busy active window while preserving the historical recovery
-barrier that protects cursor order. A failed metadata or blob read, except a classified missing
-blob, restores the pass's cursor and frontier state so an undelivered batch is retried.
+The effective visibility delay applies only to eventual reads. In the default eventual-read mode it
+is `metadata_visibility_delay_ms`; when an eligible metadata row is newer than
+`now - effective_visibility_delay`, the reader defers it. Strong reads accept every validated row
+returned by storage. Clock skew is accounted for by the Fast and checkpoint availability horizon,
+not added to the eventual-read per-row maturity test. In Recovery, deferring a window blocks later
+recovery windows for that partition in the same pass, so the cursor cannot advance past a missing
+earlier sequence range. The recovery pointer remains at the deferred window for the next pass when
+that window is outside Fast's bounded scan horizon. A deferred window inside that horizon instead
+completes recovery and is handed to Fast: Fast retains the same visibility check, blocks later
+snowflakes in that partition/window during the pass, and retries from its inclusive time floor and
+frontier. This prevents recovery from tail-chasing a busy active window while preserving the
+historical recovery barrier that protects cursor order. A failed metadata or blob read, except a
+classified missing blob, restores the pass's cursor and frontier state so an undelivered batch is
+retried.
 
 A classified blob `NotFound` is a retention or storage durability violation: metadata is published
 only after its blob upload, and S3 retention must outlive the referencing metadata. The reader
