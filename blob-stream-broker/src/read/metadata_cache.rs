@@ -458,8 +458,10 @@ impl MetadataCache {
       .max_capacity(config.tail_max_bytes)
       .time_to_idle(CACHE_IDLE_TTL)
       .weigher(|_key: &CacheKey, entry: &Arc<CacheEntry>| entry.retained_bytes)
-      .eviction_listener(move |_key, entry, _cause| {
-        tail_evictions.inc();
+      .eviction_listener(move |_key, entry, cause| {
+        if cause.was_evicted() {
+          tail_evictions.inc();
+        }
         tail_eviction_metrics.record_eviction(entry.retained_bytes);
       })
       .build();
@@ -473,8 +475,10 @@ impl MetadataCache {
       .max_capacity(config.recovery_max_bytes)
       .time_to_idle(CACHE_IDLE_TTL)
       .weigher(|_key: &CacheKey, entry: &Arc<CacheEntry>| entry.retained_bytes)
-      .eviction_listener(move |_key, entry, _cause| {
-        recovery_evictions.inc();
+      .eviction_listener(move |_key, entry, cause| {
+        if cause.was_evicted() {
+          recovery_evictions.inc();
+        }
         recovery_eviction_metrics.record_eviction(entry.retained_bytes);
       })
       .build();

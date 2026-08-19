@@ -739,19 +739,25 @@ async fn records_cache_hit_miss_refill_and_response_metrics() {
       MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL,
     ))
     .await;
+  cache
+    .read(tail_request(
+      99,
+      MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL,
+    ))
+    .await;
 
   metrics.assert_counter_eq(
-    2,
+    3,
     "blob_stream_broker_test:metadata_cache:requests_total",
     &labels!(),
   );
   metrics.assert_counter_eq(
-    1,
+    2,
     "blob_stream_broker_test:metadata_cache:storage_queries_total",
     &labels!(),
   );
   metrics.assert_counter_eq(
-    1,
+    2,
     "blob_stream_broker_test:metadata_cache:coalescing_window_requests_total",
     &labels!(),
   );
@@ -761,12 +767,22 @@ async fn records_cache_hit_miss_refill_and_response_metrics() {
     &labels!(),
   );
   metrics.assert_counter_eq(
-    1,
+    2,
     "blob_stream_broker_test:metadata_cache:tail_refills_total",
     &labels!(),
   );
   metrics.assert_counter_eq(
-    2,
+    1,
+    "blob_stream_broker_test:metadata_cache:invalidations_total",
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    0,
+    "blob_stream_broker_test:metadata_cache:evictions_total",
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    3,
     "blob_stream_broker_test:metadata_cache:response_items_total",
     &labels!(),
   );
