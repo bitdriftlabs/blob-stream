@@ -807,7 +807,7 @@ async fn visibility_delay_defers_newly_published_metadata() {
 }
 
 #[tokio::test]
-async fn strong_metadata_reads_accept_metadata_at_its_publication_timestamp() {
+async fn strong_metadata_reads_accept_future_metadata_publication_timestamps() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let recording_metadata_store = Arc::new(RecordingMetadataStore::new());
   let metadata_store: Arc<dyn MetadataStore> = recording_metadata_store.clone();
@@ -853,15 +853,9 @@ async fn strong_metadata_reads_accept_metadata_at_its_publication_timestamp() {
     .await
     .unwrap();
 
-  assert!(outcome.batches.is_empty());
-  assert_eq!(
-    outcome.next_visibility_eligible_at,
-    Some(
-      OffsetDateTime::from_unix_timestamp(902)
-        .unwrap()
-        .saturating_add(time::Duration::milliseconds(500))
-    )
-  );
+  assert_eq!(outcome.batches.len(), 1);
+  assert_eq!(outcome.next_visibility_eligible_at, None);
+  assert_eq!(reader.cursor(7), Some(1));
   assert!(
     recording_metadata_store
       .consistencies
@@ -870,27 +864,7 @@ async fn strong_metadata_reads_accept_metadata_at_its_publication_timestamp() {
       .all(|consistency| *consistency == MetadataReadConsistency::Strong)
   );
   let scan_state = reader.partition_scan_states();
-  assert_eq!(scan_state[0].metadata_segments_deferred_by_visibility, 1);
-
-  let before_maturity = reader
-    .read_available_with_capacity_and_settings(
-      timestamp(902).saturating_add(TimeDuration::milliseconds(499)),
-      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
-      reader.runtime_settings(),
-    )
-    .await
-    .unwrap();
-  assert!(before_maturity.batches.is_empty());
-
-  let at_maturity = reader
-    .read_available_with_capacity_and_settings(
-      timestamp(902).saturating_add(TimeDuration::milliseconds(500)),
-      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
-      reader.runtime_settings(),
-    )
-    .await
-    .unwrap();
-  assert_eq!(at_maturity.batches.len(), 1);
+  assert_eq!(scan_state[0].metadata_segments_deferred_by_visibility, 0);
 }
 
 #[tokio::test]

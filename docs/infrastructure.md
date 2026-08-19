@@ -150,6 +150,10 @@ required by its encryption policy.
 
 - S3 bucket/prefix: `s3:PutObject`.
 - Segment-metadata table: `dynamodb:PutItem` for ordinary and fenced metadata publication.
+- Broker cached metadata reads require `dynamodb:Query` on the segment-metadata table. Every
+  retained-cache miss, invalidation, and strong metadata read requires DynamoDB-backed refill
+  data before the broker can respond. Compatible concurrent requests share one query; this
+  permission is required whenever the broker serves metadata reads.
 - Producer-lease table: `dynamodb:GetItem` and `dynamodb:UpdateItem` for lease observation,
   acquisition, heartbeat, sequence reservation, and release.
 - Fenced publication: `dynamodb:ConditionCheckItem` on the producer-lease table. The transaction

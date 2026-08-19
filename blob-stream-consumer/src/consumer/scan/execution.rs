@@ -33,6 +33,7 @@ use super::{
 use crate::consumer::ConsumerReadOutcome;
 use crate::consumer::metadata_query::{decode_metadata_response, metadata_results_match};
 use bd_log_util::warn_every;
+use blob_stream_metadata_store::MetadataReadConsistency;
 use blob_stream_proto::protos::blobstream::v1::broker::{
   FullRecoveryMetadataCoverage,
   MetadataPartitionBound,
@@ -187,7 +188,10 @@ impl ConsumerReaderImpl {
               },
               Err(error) => {
                 metrics.record_broker_metadata_shadow_comparison_failure();
-                trace!("consumer broker metadata shadow comparison failed: {error}");
+                warn_every!(
+                  15.seconds(),
+                  "consumer broker metadata shadow comparison failed: {error:#}"
+                );
               },
             }
           } else {
@@ -237,10 +241,12 @@ impl ConsumerReaderImpl {
     {
       let segments = if let Some(cache_key) = cache_key {
         let partition_id = cache_key.0;
-        let has_visibility_deferred_segment = segments.iter().any(|segment| {
-          segment.segment_index.contains_key(&partition_id)
-            && segment.metadata_published_at > result_visibility_cutoff
-        });
+        let has_visibility_deferred_segment = runtime_settings.metadata_read_consistency
+          == MetadataReadConsistency::Eventual
+          && segments.iter().any(|segment| {
+            segment.segment_index.contains_key(&partition_id)
+              && segment.metadata_published_at > result_visibility_cutoff
+          });
         if has_visibility_deferred_segment {
           let mut segments = segments;
           segments.sort_by_key(|metadata| metadata.snowflake_id);
@@ -842,7 +848,9 @@ impl ConsumerReaderImpl {
           }
 
           let published_at = segment.metadata_published_at;
-          if published_at > visibility_cutoff {
+          if runtime_settings.metadata_read_consistency == MetadataReadConsistency::Eventual
+            && published_at > visibility_cutoff
+          {
             self
               .metrics
               .metadata_segments_deferred_by_visibility_delay
@@ -1071,7 +1079,7 @@ impl ConsumerReaderImpl {
 async fn scan_direct_metadata(
   metadata_store: &Arc<dyn blob_stream_metadata_store::MetadataStore>,
   request: &ScanRequest,
-  consistency: blob_stream_metadata_store::MetadataReadConsistency,
+  consistency: MetadataReadConsistency,
 ) -> Result<Vec<SegmentMetadata>> {
   metadata_store
     .scan_window_from_snowflake(&request.window, request.min_snowflake, consistency)
@@ -1092,18 +1100,14 @@ async fn scan_direct_metadata(
 
 fn broker_request_for_scan(
   request: &ScanRequest,
-  consistency: blob_stream_metadata_store::MetadataReadConsistency,
+  consistency: MetadataReadConsistency,
 ) -> Option<ReadMetadataWindowRequest> {
   if request.fast_partition_bounds.is_empty() && request.recovery_partition_bounds.is_empty() {
     return None;
   }
   let consistency = match consistency {
-    blob_stream_metadata_store::MetadataReadConsistency::Eventual => {
-      BrokerReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL
-    },
-    blob_stream_metadata_store::MetadataReadConsistency::Strong => {
-      BrokerReadConsistency::METADATA_READ_CONSISTENCY_STRONG
-    },
+    MetadataReadConsistency::Eventual => BrokerReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL,
+    MetadataReadConsistency::Strong => BrokerReadConsistency::METADATA_READ_CONSISTENCY_STRONG,
   };
   let coverage = if request.recovery_partition_bounds.is_empty() {
     read_metadata_window_request::Coverage::Tail(TailMetadataCoverage {
