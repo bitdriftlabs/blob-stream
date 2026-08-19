@@ -12,6 +12,8 @@ service BrokerService {
   rpc ProduceBatches(ProduceBatchesRequest) returns (ProduceBatchesResponse);
   // Read bounded segment metadata for one topic window through the local broker cache.
   rpc ReadMetadataWindow(ReadMetadataWindowRequest) returns (ReadMetadataWindowResponse);
+  // Read requested ranges from one immutable blob through the local broker cache.
+  rpc ReadBlobRanges(ReadBlobRangesRequest) returns (ReadBlobRangesResponse);
 }
 
 // A single record in a producer batch.
@@ -164,5 +166,64 @@ message ReadMetadataWindowResponse {
   oneof result {
     MetadataReadSuccess success = 1;
     MetadataReadFailure failure = 2;
+  }
+}
+
+// Failure class for one broker blob-range read.
+enum BlobReadFailureStatus {
+  // The request does not satisfy the blob-cache contract and must not be retried unchanged.
+  BLOB_READ_FAILURE_STATUS_BAD_REQUEST = 0;
+  // The broker cannot admit or encode the request before its deadline; callers may retry.
+  BLOB_READ_FAILURE_STATUS_OVERLOADED = 1;
+  // The complete blob exceeds the broker's whole-object cache read limit.
+  BLOB_READ_FAILURE_STATUS_TOO_LARGE = 2;
+  // Blob storage or broker processing failed; callers may retry or fall back.
+  BLOB_READ_FAILURE_STATUS_STORAGE = 3;
+  // The immutable blob no longer exists in blob storage.
+  BLOB_READ_FAILURE_STATUS_NOT_FOUND = 4;
+}
+
+// One half-open byte range `[start, end)` within a blob.
+message BlobRangeRequest {
+  // Inclusive byte offset.
+  uint64 start = 1;
+  // Exclusive byte offset. `end` must be greater than `start`.
+  uint64 end = 2;
+}
+
+// One raw compressed-byte range returned from an immutable blob.
+message BlobRangeResult {
+  // Exactly the requested compressed bytes. Results preserve request order.
+  bytes payload = 1;
+}
+
+// Read requested ranges from one immutable blob through its selected local broker.
+message ReadBlobRangesRequest {
+  // Opaque immutable blob key. A request must not mix blob keys.
+  string blob_key = 1;
+  // Requested ranges in caller-defined order.
+  repeated BlobRangeRequest ranges = 2;
+}
+
+// Complete successful range mapping for one ReadBlobRangesRequest.
+message BlobReadSuccess {
+  // Exactly one result for every requested range, preserving request order.
+  repeated BlobRangeResult ranges = 1;
+}
+
+// Failed blob-range read result.
+message BlobReadFailure {
+  // Typed failure class for fallback and retry decisions.
+  BlobReadFailureStatus status = 1;
+  // Diagnostic detail. It is not stable for programmatic matching.
+  string error_message = 2;
+}
+
+// Broker blob-cache response for one bounded blob-key request.
+message ReadBlobRangesResponse {
+  // Exactly one result branch is present. A missing result is an invalid response.
+  oneof result {
+    BlobReadSuccess success = 1;
+    BlobReadFailure failure = 2;
   }
 }

@@ -200,6 +200,18 @@ pub fn metadata_window_owner(
     })
 }
 
+/// Select one stable local broker owner for an immutable blob key.
+#[must_use]
+pub fn blob_key_owner(blob_key: &str, membership: &BrokerMembership) -> Option<BrokerNode> {
+  canonical_nodes(membership)
+    .into_iter()
+    .max_by(|left, right| {
+      blob_key_score(blob_key, &left.node_id)
+        .cmp(&blob_key_score(blob_key, &right.node_id))
+        .then_with(|| right.node_id.cmp(&left.node_id))
+    })
+}
+
 fn canonical_nodes(membership: &BrokerMembership) -> Vec<BrokerNode> {
   let mut nodes = membership.nodes().unwrap_or_default().to_vec();
   nodes.sort_unstable_by(|left, right| {
@@ -224,6 +236,13 @@ fn metadata_window_score(topic: &str, window_start_unix_seconds: i64, node_id: &
   let mut hasher = DefaultHasher::new();
   topic.hash(&mut hasher);
   window_start_unix_seconds.hash(&mut hasher);
+  node_id.hash(&mut hasher);
+  hasher.finish()
+}
+
+fn blob_key_score(blob_key: &str, node_id: &str) -> u64 {
+  let mut hasher = DefaultHasher::new();
+  blob_key.hash(&mut hasher);
   node_id.hash(&mut hasher);
   hasher.finish()
 }

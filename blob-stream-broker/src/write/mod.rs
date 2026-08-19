@@ -10,7 +10,7 @@ mod engine;
 mod flush;
 mod hooks;
 mod lease;
-mod memory_pressure;
+pub mod memory_pressure;
 mod metrics;
 mod scheduler;
 mod state;
@@ -29,13 +29,8 @@ pub use api::{
   WriteRequest,
   WriteResponse,
 };
-pub use config::{TopicInfo, WriteConfig, build_runtime_metadata_store, build_write_engine};
-pub use engine::{
-  AdmissionController,
-  MemoryPressureAdmissionController,
-  WriteEngineBuilder,
-  WriteEngineImpl,
-};
+pub use config::{RuntimeWriteEngineBuilder, TopicInfo, WriteConfig, build_runtime_metadata_store};
+pub use engine::{AdmissionController, WriteEngineBuilder, WriteEngineImpl};
 pub use hooks::{BrokerLifecycleHooks, NoopBrokerLifecycleHooks};
 pub(crate) use metrics::ProduceOutcomeMetrics;
 pub(super) const DEFAULT_ZSTD_LEVEL: i32 = 3;

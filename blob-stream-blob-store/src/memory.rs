@@ -73,4 +73,26 @@ impl BlobStore for InMemoryBlobStore {
     })?;
     Ok(blob.slice(start .. end))
   }
+
+  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+    trace!(
+      "in-memory blob get: key={}, max_bytes={}",
+      key.as_str(),
+      max_bytes
+    );
+    let guard = self.blobs.read();
+    let blob = guard.get(key).ok_or_else(|| BlobStoreError::NotFound {
+      key: key.as_str().to_string(),
+    })?;
+    let actual_bytes = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    if actual_bytes > max_bytes {
+      return Err(BlobStoreError::TooLarge {
+        key: key.as_str().to_string(),
+        max_bytes,
+        actual_bytes,
+      });
+    }
+
+    Ok(blob.clone())
+  }
 }

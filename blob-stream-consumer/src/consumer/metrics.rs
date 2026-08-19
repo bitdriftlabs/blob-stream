@@ -42,6 +42,14 @@ pub(in crate::consumer) struct ConsumerReaderMetrics {
   blob_batch_ranges: IntCounter,
   blob_batch_range_bytes: IntCounter,
   blob_range_latency_seconds: Histogram,
+  broker_blob_range_attempts: IntCounter,
+  broker_blob_range_deliveries: IntCounter,
+  broker_blob_range_delivery_items: IntCounter,
+  broker_blob_range_delivery_bytes: IntCounter,
+  broker_blob_range_latency_seconds: Histogram,
+  broker_blob_range_not_found_groups: IntCounter,
+  broker_blob_range_not_found_items: IntCounter,
+  broker_blob_range_fallbacks: IntCounter,
   lost_records: IntCounter,
   batches_read: IntCounter,
   records_read: IntCounter,
@@ -93,6 +101,14 @@ impl ConsumerReaderMetrics {
       blob_batch_ranges: scope.counter("blob_batch_ranges"),
       blob_batch_range_bytes: scope.counter("blob_batch_range_bytes"),
       blob_range_latency_seconds: scope.histogram("blob_range_latency_seconds"),
+      broker_blob_range_attempts: scope.counter("broker_blob_range_attempts"),
+      broker_blob_range_deliveries: scope.counter("broker_blob_range_deliveries"),
+      broker_blob_range_delivery_items: scope.counter("broker_blob_range_delivery_items"),
+      broker_blob_range_delivery_bytes: scope.counter("broker_blob_range_delivery_bytes"),
+      broker_blob_range_latency_seconds: scope.histogram("broker_blob_range_latency_seconds"),
+      broker_blob_range_not_found_groups: scope.counter("broker_blob_range_not_found_groups"),
+      broker_blob_range_not_found_items: scope.counter("broker_blob_range_not_found_items"),
+      broker_blob_range_fallbacks: scope.counter("broker_blob_range_fallbacks"),
       lost_records: scope.counter("lost_records"),
       batches_read: scope.counter("batches_read"),
       records_read: scope.counter("records_read"),
@@ -200,6 +216,37 @@ impl ConsumerReaderMetrics {
       .blob_batch_ranges
       .inc_by(u64::try_from(range_count).unwrap_or(u64::MAX));
     self.blob_batch_range_bytes.inc_by(bytes);
+  }
+
+  pub(in crate::consumer) fn record_broker_blob_range_attempt(&self) {
+    self.broker_blob_range_attempts.inc();
+  }
+
+  pub(in crate::consumer) fn record_broker_blob_range_delivery(
+    &self,
+    started_at: Instant,
+    item_count: usize,
+    bytes: u64,
+  ) {
+    self.broker_blob_range_deliveries.inc();
+    self
+      .broker_blob_range_delivery_items
+      .inc_by(u64::try_from(item_count).unwrap_or(u64::MAX));
+    self.broker_blob_range_delivery_bytes.inc_by(bytes);
+    self
+      .broker_blob_range_latency_seconds
+      .observe(started_at.elapsed().as_secs_f64());
+  }
+
+  pub(in crate::consumer) fn record_broker_blob_range_not_found(&self, item_count: usize) {
+    self.broker_blob_range_not_found_groups.inc();
+    self
+      .broker_blob_range_not_found_items
+      .inc_by(u64::try_from(item_count).unwrap_or(u64::MAX));
+  }
+
+  pub(in crate::consumer) fn record_broker_blob_range_fallback(&self) {
+    self.broker_blob_range_fallbacks.inc();
   }
 
   pub(in crate::consumer) fn record_lost_records(&self, record_count: u64) {

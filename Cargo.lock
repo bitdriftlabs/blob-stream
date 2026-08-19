@@ -1336,6 +1336,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-types",
  "axum",
+ "bd-runtime-config",
  "bd-server-stats",
  "bd-shutdown",
  "bd-test-helpers-core",

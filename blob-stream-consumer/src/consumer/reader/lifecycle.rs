@@ -1,6 +1,7 @@
 use super::{
   Arc,
   BlobStore,
+  BrokerBlobRangeQuery,
   BrokerMetadataQuery,
   CommittedCursor,
   ConsumerReadConfig,
@@ -101,6 +102,7 @@ impl ConsumerReaderImpl {
       blob_store,
       metadata_store,
       broker_metadata_query: None,
+      broker_blob_range_query: None,
       feature_flags,
       metrics: ConsumerReaderMetrics::new(metrics_scope),
     })
@@ -131,6 +133,13 @@ impl ConsumerReaderImpl {
   /// Inject the broker transport used when broker metadata reads are enabled.
   pub fn broker_metadata_query(mut self, query: Arc<dyn BrokerMetadataQuery>) -> Self {
     self.broker_metadata_query = Some(query);
+    self
+  }
+
+  #[must_use]
+  /// Inject the broker transport used when broker blob-range reads are enabled.
+  pub fn broker_blob_range_query(mut self, query: Arc<dyn BrokerBlobRangeQuery>) -> Self {
+    self.broker_blob_range_query = Some(query);
     self
   }
 

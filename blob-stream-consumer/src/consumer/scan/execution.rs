@@ -30,20 +30,29 @@ use super::{
   trace,
   try_join_all,
 };
-use crate::consumer::ConsumerReadOutcome;
 use crate::consumer::metadata_query::{decode_metadata_response, metadata_results_match};
+use crate::consumer::{
+  BrokerBlobRangeQuery,
+  BrokerBlobRangeRead,
+  ConsumerReadOutcome,
+  decode_blob_range_response_for_ranges,
+};
 use bd_log_util::warn_every;
+use blob_stream_blob_store::BlobKey;
 use blob_stream_metadata_store::MetadataReadConsistency;
 use blob_stream_proto::protos::blobstream::v1::broker::{
+  BlobRangeRequest,
   FullRecoveryMetadataCoverage,
   MetadataPartitionBound,
   MetadataReadConsistency as BrokerReadConsistency,
+  ReadBlobRangesRequest,
   ReadMetadataWindowRequest,
   TailMetadataCoverage,
   read_metadata_window_request,
 };
 use time::OffsetDateTime;
 use time::ext::NumericalDuration;
+use tokio::sync::Semaphore;
 
 //
 // PartitionScanFinalization
@@ -303,19 +312,21 @@ impl ConsumerReaderImpl {
     segment_read_plans: Vec<SegmentReadPlan>,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<Vec<BatchReadResult>> {
-    // `buffered` preserves segment-plan order while allowing independent object-store requests
-    // and decoding work to overlap. Cursor changes occur only after every planned read succeeds.
-    let mut batch_read_results = stream::iter(
-      segment_read_plans
-        .into_iter()
-        .map(|plan| async { self.read_segment_plan(plan).await }),
-    )
-    .buffered(runtime_settings.max_in_flight_batch_reads)
-    .try_collect::<Vec<_>>()
-    .await?
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
+    let mut batch_read_results = if runtime_settings.broker_batch_cache_enabled {
+      if let Some(query) = self.broker_blob_range_query.as_deref() {
+        self
+          .execute_broker_blob_range_reads(segment_read_plans, query, runtime_settings)
+          .await?
+      } else {
+        self
+          .execute_direct_segment_reads(segment_read_plans, runtime_settings)
+          .await?
+      }
+    } else {
+      self
+        .execute_direct_segment_reads(segment_read_plans, runtime_settings)
+        .await?
+    };
     // Segment plans retain scan order, but concurrent metadata windows may not be ordered by a
     // partition's sequence range. Normalize before cursor advancement and delivery.
     batch_read_results.sort_by_key(|result| match result {
@@ -325,6 +336,158 @@ impl ConsumerReaderImpl {
       ),
     });
     Ok(batch_read_results)
+  }
+
+  /// Keep the disabled path identical to the existing bounded direct range-read fan-out.
+  async fn execute_direct_segment_reads(
+    &self,
+    segment_read_plans: Vec<SegmentReadPlan>,
+    runtime_settings: ConsumerReadRuntimeSettings,
+  ) -> Result<Vec<BatchReadResult>> {
+    // `buffered` preserves segment-plan order while allowing independent object-store requests
+    // and decoding work to overlap. Cursor changes occur only after every planned read succeeds.
+    Ok(
+      stream::iter(
+        segment_read_plans
+          .into_iter()
+          .map(|plan| async { self.read_segment_plan(plan).await }),
+      )
+      .buffered(runtime_settings.max_in_flight_batch_reads)
+      .try_collect::<Vec<_>>()
+      .await?
+      .into_iter()
+      .flatten()
+      .collect(),
+    )
+  }
+
+  /// Group immutable segment plans by blob key before attempting local broker cache delivery.
+  async fn execute_broker_blob_range_reads(
+    &self,
+    segment_read_plans: Vec<SegmentReadPlan>,
+    query: &dyn BrokerBlobRangeQuery,
+    runtime_settings: ConsumerReadRuntimeSettings,
+  ) -> Result<Vec<BatchReadResult>> {
+    let mut plans_by_blob_key = HashMap::<BlobKey, Vec<SegmentReadPlan>>::new();
+    for plan in segment_read_plans {
+      plans_by_blob_key
+        .entry(plan.metadata.blob_key.clone())
+        .or_default()
+        .push(plan);
+    }
+    let direct_read_concurrency = runtime_settings.max_in_flight_batch_reads;
+    let direct_read_permits = Arc::new(Semaphore::new(direct_read_concurrency));
+
+    stream::iter(plans_by_blob_key.into_values().map(|plans| {
+      let direct_read_permits = Arc::clone(&direct_read_permits);
+      async move {
+        self
+          .read_broker_blob_range_group(plans, query, direct_read_permits, direct_read_concurrency)
+          .await
+      }
+    }))
+    .buffered(runtime_settings.max_in_flight_batch_reads)
+    .try_collect::<Vec<_>>()
+    .await
+    .map(|groups| groups.into_iter().flatten().collect())
+  }
+
+  /// Use broker bytes only after positional validation; retry every other group outcome directly.
+  async fn read_broker_blob_range_group(
+    &self,
+    plans: Vec<SegmentReadPlan>,
+    query: &dyn BrokerBlobRangeQuery,
+    direct_read_permits: Arc<Semaphore>,
+    direct_read_concurrency: usize,
+  ) -> Result<Vec<BatchReadResult>> {
+    let blob_key = plans
+      .first()
+      .map(|plan| plan.metadata.blob_key.as_str())
+      .expect("blob range group is never empty");
+    let request = ReadBlobRangesRequest {
+      blob_key: blob_key.to_string().into(),
+      ranges: plans
+        .iter()
+        .map(|plan| BlobRangeRequest {
+          start: plan.byte_range.start,
+          end: plan.byte_range.end,
+          ..Default::default()
+        })
+        .collect(),
+      ..Default::default()
+    };
+    let started_at = Instant::now();
+    self.metrics.record_broker_blob_range_attempt();
+    let response = query.read_blob_ranges(request).await;
+    match response.and_then(|response| {
+      decode_blob_range_response_for_ranges(
+        plans
+          .iter()
+          .map(|plan| (plan.byte_range.start, plan.byte_range.end)),
+        response,
+      )
+    }) {
+      Ok(BrokerBlobRangeRead::Success(payloads)) => {
+        let delivered_bytes = payloads.iter().fold(0_u64, |total, payload| {
+          total.saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX))
+        });
+        self
+          .metrics
+          .record_broker_blob_range_delivery(started_at, payloads.len(), delivered_bytes);
+        plans
+          .into_iter()
+          .zip(payloads)
+          .map(|(plan, payload)| self.decode_segment_plan_payload(plan, &payload))
+          .collect::<Result<Vec<_>>>()
+          .map(|groups| groups.into_iter().flatten().collect())
+      },
+      Ok(BrokerBlobRangeRead::NotFound) => {
+        self.metrics.record_broker_blob_range_not_found(plans.len());
+        Ok(
+          plans
+            .into_iter()
+            .flat_map(Self::missing_segment_plan)
+            .collect(),
+        )
+      },
+      Err(error) => {
+        self.metrics.record_broker_blob_range_fallback();
+        trace!(
+          "consumer broker blob-range response rejected; falling back direct: \
+           blob_key={blob_key}, error={error}"
+        );
+        self
+          .read_direct_blob_range_group(plans, direct_read_permits, direct_read_concurrency)
+          .await
+      },
+    }
+  }
+
+  /// Retry one failed broker group with the same global direct-read concurrency bound.
+  async fn read_direct_blob_range_group(
+    &self,
+    plans: Vec<SegmentReadPlan>,
+    direct_read_permits: Arc<Semaphore>,
+    direct_read_concurrency: usize,
+  ) -> Result<Vec<BatchReadResult>> {
+    Ok(
+      stream::iter(plans.into_iter().map(|plan| {
+        let direct_read_permits = Arc::clone(&direct_read_permits);
+        async move {
+          let _permit = direct_read_permits
+            .acquire_owned()
+            .await
+            .expect("direct read permits remain owned while a fallback is active");
+          self.read_segment_plan(plan).await
+        }
+      }))
+      .buffered(direct_read_concurrency.max(1))
+      .try_collect::<Vec<_>>()
+      .await?
+      .into_iter()
+      .flatten()
+      .collect(),
+    )
   }
 
   /// Advance partition cursors for completed reads and return only newly decoded batches.

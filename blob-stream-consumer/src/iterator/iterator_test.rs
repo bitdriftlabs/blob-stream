@@ -468,6 +468,10 @@ impl BlobStore for BlockingBlobStore {
     }
     self.inner.get_range(key, range).await
   }
+
+  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+    self.inner.get(key, max_bytes).await
+  }
 }
 
 #[async_trait::async_trait]
@@ -481,6 +485,14 @@ impl BlobStore for FailingReadBlobStore {
     Err(BlobStoreError::Read {
       key: key.as_str().to_string(),
       source: anyhow::anyhow!("injected blob read failure for {key:?} at {range:?}"),
+    })
+  }
+
+  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+    self.failed_reads.fetch_add(1, Ordering::SeqCst);
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("injected blob full-read failure for {key:?} at {max_bytes}"),
     })
   }
 }

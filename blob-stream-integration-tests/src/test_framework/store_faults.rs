@@ -571,6 +571,10 @@ impl BlobStore for FaultInjectedBlobStore {
       .await;
     result
   }
+
+  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+    self.inner.get(key, max_bytes).await
+  }
 }
 
 //

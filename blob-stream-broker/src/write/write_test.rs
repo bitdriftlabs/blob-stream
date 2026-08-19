@@ -142,6 +142,13 @@ impl BlobStore for GatedBlobStore {
       source: anyhow::anyhow!("reads are not used by this test: {range:?}"),
     })
   }
+
+  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("full reads are not used by this test: {max_bytes}"),
+    })
+  }
 }
 
 #[async_trait]
@@ -164,6 +171,13 @@ impl BlobStore for BlockingBlobStore {
     Err(BlobStoreError::Read {
       key: key.as_str().to_string(),
       source: anyhow::anyhow!("reads are not used by this test: {range:?}"),
+    })
+  }
+
+  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("full reads are not used by this test: {max_bytes}"),
     })
   }
 }

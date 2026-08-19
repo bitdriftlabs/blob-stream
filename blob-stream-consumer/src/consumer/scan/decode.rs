@@ -46,15 +46,11 @@ impl ConsumerReaderImpl {
     {
       Ok(payload) => payload,
       Err(BlobStoreError::NotFound { .. }) => {
-        return Ok(
-          candidates
-            .into_iter()
-            .map(|candidate| BatchReadResult::Missing {
-              candidate,
-              blob_key: metadata.blob_key.clone(),
-            })
-            .collect(),
-        );
+        return Ok(Self::missing_segment_plan(SegmentReadPlan {
+          metadata,
+          candidates,
+          byte_range,
+        }));
       },
       Err(error) => return Err(error.into()),
     };
@@ -67,6 +63,28 @@ impl ConsumerReaderImpl {
     self
       .metrics
       .record_blob_batch_ranges(candidates.len(), selected_bytes);
+
+    self.decode_segment_plan_payload(
+      SegmentReadPlan {
+        metadata,
+        candidates,
+        byte_range,
+      },
+      &payload,
+    )
+  }
+
+  /// Decode a complete raw payload supplied for one segment read plan.
+  pub(in crate::consumer) fn decode_segment_plan_payload(
+    &self,
+    plan: SegmentReadPlan,
+    payload: &bytes::Bytes,
+  ) -> Result<Vec<BatchReadResult>> {
+    let SegmentReadPlan {
+      metadata,
+      candidates,
+      byte_range,
+    } = plan;
 
     let mut decoded_batches = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -99,6 +117,22 @@ impl ConsumerReaderImpl {
     }
 
     Ok(decoded_batches)
+  }
+
+  /// Produce missing results for every batch selected from an authoritative absent blob.
+  pub(in crate::consumer) fn missing_segment_plan(plan: SegmentReadPlan) -> Vec<BatchReadResult> {
+    let SegmentReadPlan {
+      metadata,
+      candidates,
+      ..
+    } = plan;
+    candidates
+      .into_iter()
+      .map(|candidate| BatchReadResult::Missing {
+        candidate,
+        blob_key: metadata.blob_key.clone(),
+      })
+      .collect()
   }
 
   /// Decompress, validate, and decode one batch payload supplied by a segment range read.

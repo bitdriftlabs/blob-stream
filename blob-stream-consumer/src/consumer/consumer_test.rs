@@ -2,6 +2,7 @@
 
 use super::state::{RecoveryState, VirtualPartitionState};
 use super::{
+  BrokerBlobRangeQuery,
   BrokerMetadataQuery,
   ConsumerBatch,
   ConsumerReader as BoundedConsumerReader,
@@ -39,11 +40,19 @@ use blob_stream_metadata_store::{
   encode_segment_metadata_v1,
 };
 use blob_stream_proto::protos::blobstream::v1::broker::{
+  BlobRangeRequest,
+  BlobRangeResult,
+  BlobReadFailure,
+  BlobReadFailureStatus,
+  BlobReadSuccess,
   BrokerSegmentMetadata,
   MetadataReadSuccess,
+  ReadBlobRangesRequest,
+  ReadBlobRangesResponse,
   ReadMetadataWindowRequest,
   ReadMetadataWindowResponse,
   StoredRecordBatch,
+  read_blob_ranges_response,
   read_metadata_window_request,
   read_metadata_window_response,
 };
@@ -67,7 +76,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use prometheus::labels;
 use protobuf::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -244,6 +253,111 @@ impl BrokerMetadataQuery for RecordingBrokerMetadataQuery {
 }
 
 //
+// FixedBrokerBlobRangeQuery
+//
+
+struct FixedBrokerBlobRangeQuery {
+  requests: Mutex<Vec<ReadBlobRangesRequest>>,
+  responses: Mutex<VecDeque<ReadBlobRangesResponse>>,
+}
+
+impl FixedBrokerBlobRangeQuery {
+  fn new(response: ReadBlobRangesResponse) -> Self {
+    Self::with_responses([response])
+  }
+
+  fn with_responses(responses: impl IntoIterator<Item = ReadBlobRangesResponse>) -> Self {
+    Self {
+      requests: Mutex::new(Vec::new()),
+      responses: Mutex::new(responses.into_iter().collect()),
+    }
+  }
+
+  fn requests(&self) -> Vec<ReadBlobRangesRequest> {
+    self.requests.lock().clone()
+  }
+}
+
+#[async_trait]
+impl BrokerBlobRangeQuery for FixedBrokerBlobRangeQuery {
+  async fn read_blob_ranges(
+    &self,
+    request: ReadBlobRangesRequest,
+  ) -> Result<ReadBlobRangesResponse> {
+    self.requests.lock().push(request);
+    self
+      .responses
+      .lock()
+      .pop_front()
+      .ok_or_else(|| anyhow!("test broker blob-range responses were exhausted"))
+  }
+}
+
+struct KeyedBrokerBlobRangeQuery {
+  requests: Mutex<Vec<ReadBlobRangesRequest>>,
+  responses: HashMap<String, ReadBlobRangesResponse>,
+}
+
+impl KeyedBrokerBlobRangeQuery {
+  fn new(responses: impl IntoIterator<Item = (String, ReadBlobRangesResponse)>) -> Self {
+    Self {
+      requests: Mutex::new(Vec::new()),
+      responses: responses.into_iter().collect(),
+    }
+  }
+
+  fn requests(&self) -> Vec<ReadBlobRangesRequest> {
+    self.requests.lock().clone()
+  }
+}
+
+#[async_trait]
+impl BrokerBlobRangeQuery for KeyedBrokerBlobRangeQuery {
+  async fn read_blob_ranges(
+    &self,
+    request: ReadBlobRangesRequest,
+  ) -> Result<ReadBlobRangesResponse> {
+    let response = self
+      .responses
+      .get(request.blob_key.as_str())
+      .cloned()
+      .ok_or_else(|| anyhow!("test broker blob-range response is missing"))?;
+    self.requests.lock().push(request);
+    Ok(response)
+  }
+}
+
+fn broker_blob_success(payloads: Vec<Bytes>) -> ReadBlobRangesResponse {
+  ReadBlobRangesResponse {
+    result: Some(read_blob_ranges_response::Result::Success(
+      BlobReadSuccess {
+        ranges: payloads
+          .into_iter()
+          .map(|payload| BlobRangeResult {
+            payload,
+            ..Default::default()
+          })
+          .collect(),
+        ..Default::default()
+      },
+    )),
+    ..Default::default()
+  }
+}
+
+fn broker_blob_failure(status: BlobReadFailureStatus) -> ReadBlobRangesResponse {
+  ReadBlobRangesResponse {
+    result: Some(read_blob_ranges_response::Result::Failure(
+      BlobReadFailure {
+        status: status.into(),
+        ..Default::default()
+      },
+    )),
+    ..Default::default()
+  }
+}
+
+//
 // FailSecondRangeBlobStore
 //
 
@@ -275,6 +389,10 @@ impl BlobStore for FailSecondRangeBlobStore {
       });
     }
     self.inner.get_range(key, range).await
+  }
+
+  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+    self.inner.get(key, max_bytes).await
   }
 }
 
@@ -314,6 +432,15 @@ impl BlobStore for MissingRangeBlobStore {
     }
     self.inner.get_range(key, range).await
   }
+
+  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+    if self.missing_key.lock().as_ref() == Some(key) {
+      return Err(BlobStoreError::NotFound {
+        key: key.as_str().to_string(),
+      });
+    }
+    self.inner.get(key, max_bytes).await
+  }
 }
 
 //
@@ -348,6 +475,10 @@ impl BlobStore for RecordingRangeBlobStore {
     self.ranges.lock().push(range.clone());
     self.inner.get_range(key, range).await
   }
+
+  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+    self.inner.get(key, max_bytes).await
+  }
 }
 
 //
@@ -375,6 +506,10 @@ impl BlobStore for TruncatingRangeBlobStore {
   async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
     let payload = self.inner.get_range(key, range).await?;
     Ok(payload.slice(.. payload.len().saturating_sub(1)))
+  }
+
+  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+    self.inner.get(key, max_bytes).await
   }
 }
 
@@ -440,6 +575,10 @@ impl BlobStore for BlockingRangeBlobStore {
     self.active_reads.fetch_sub(1, Ordering::SeqCst);
     result
   }
+
+  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+    self.inner.get(key, max_bytes).await
+  }
 }
 
 fn metrics_scope() -> bd_server_stats::stats::Scope {
@@ -479,6 +618,7 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
       metadata_visibility_delay: time::Duration::milliseconds(2_000),
       broker_metadata_cache_enabled: false,
       broker_metadata_cache_shadow: false,
+      broker_batch_cache_enabled: false,
     }
   );
 
@@ -486,7 +626,8 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
     DefaultFeatureFlags::default()
       .with_integer_flag("blob_stream_consumer_prefetch_max_bytes", 32)
       .with_integer_flag("blob_stream_consumer_max_in_flight_batch_reads", 4)
-      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
+      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true)
+      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
   ));
   assert_eq!(
     reader.runtime_settings(),
@@ -497,6 +638,7 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
       metadata_visibility_delay: time::Duration::ZERO,
       broker_metadata_cache_enabled: false,
       broker_metadata_cache_shadow: false,
+      broker_batch_cache_enabled: true,
     }
   );
 }
@@ -734,6 +876,64 @@ async fn write_multi_partition_segment(
     .unwrap();
 
   payload_len
+}
+
+async fn write_shared_blob_segments(
+  blob_store: &dyn BlobStore,
+  metadata_store: &dyn MetadataStore,
+  topic: &str,
+  window_start: i64,
+  batches: Vec<(u64, VirtualPartitionId, SeqRange, Vec<Record>)>,
+) -> (BlobKey, Vec<Bytes>) {
+  let blob_key = BlobKey::new(format!("{topic}/{window_start}/shared.bin"));
+  let mut blob = Vec::new();
+  let mut batch_payloads = Vec::with_capacity(batches.len());
+
+  for (snowflake_id, virtual_partition_id, seq_range, records) in batches {
+    let record_batch = RecordBatch::new(virtual_partition_id, records.clone());
+    let payload = Bytes::from(
+      StoredRecordBatch {
+        virtual_partition_id,
+        records,
+        ..Default::default()
+      }
+      .write_to_bytes()
+      .unwrap(),
+    );
+    let start = u64::try_from(blob.len()).unwrap();
+    blob.extend_from_slice(&payload);
+    let end = u64::try_from(blob.len()).unwrap();
+    metadata_store
+      .write_segment(
+        SegmentMetadata::new(
+          TopicWindowKey {
+            topic: topic.to_string(),
+            window_start_unix_seconds: window_start,
+          },
+          SnowflakeId(snowflake_id),
+          blob_key.clone(),
+          Compression::none(),
+          HashMap::from([(
+            virtual_partition_id,
+            vec![BatchMetadata {
+              seq_range,
+              byte_range: blob_stream_types::ByteRange { start, end },
+              payload_bytes: record_batch.summary().unwrap().payload_bytes,
+            }],
+          )]),
+          OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(window_start * 1_000),
+          OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(window_start * 1_000),
+        ),
+        None,
+        0,
+      )
+      .await
+      .unwrap();
+    batch_payloads.push(payload);
+  }
+
+  blob_store.put(&blob_key, Bytes::from(blob)).await.unwrap();
+  (blob_key, batch_payloads)
 }
 
 #[tokio::test]
@@ -2943,6 +3143,650 @@ async fn coalesces_owned_ranges_from_one_segment() {
       end: payload_len,
     }]
   );
+}
+
+#[tokio::test]
+async fn disabled_broker_blob_cache_uses_direct_ranges_without_a_broker_request() {
+  let blob_store = Arc::new(RecordingRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let (_, payloads) = write_shared_blob_segments(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    vec![(
+      1,
+      7,
+      SeqRange { start: 1, end: 1 },
+      vec![new_record(vec![7], 900_000)],
+    )],
+  )
+  .await;
+  let expected_range_end = u64::try_from(payloads[0].len()).unwrap();
+  let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_success(
+    payloads,
+  )));
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store.clone(),
+    metadata_store,
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )
+  .unwrap()
+  .broker_blob_range_query(query.clone());
+
+  let batches = reader.read_available(950).await.unwrap();
+
+  assert_eq!(batches.len(), 1);
+  assert!(query.requests().is_empty());
+  assert_eq!(
+    blob_store.ranges(),
+    vec![ByteRange {
+      start: 0,
+      end: expected_range_end,
+    }]
+  );
+}
+
+#[tokio::test]
+async fn broker_blob_cache_groups_same_key_plans_and_decodes_validated_ranges() {
+  let blob_store = Arc::new(RecordingRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let (blob_key, payloads) = write_shared_blob_segments(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    vec![
+      (
+        1,
+        7,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![7], 900_000)],
+      ),
+      (
+        2,
+        8,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![8], 900_001)],
+      ),
+    ],
+  )
+  .await;
+  let first_len = u64::try_from(payloads[0].len()).unwrap();
+  let second_len = u64::try_from(payloads[1].len()).unwrap();
+  let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_success(
+    payloads,
+  )));
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
+  ));
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    blob_store.clone(),
+    metadata_store,
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .broker_blob_range_query(query.clone());
+
+  let batches = reader.read_available(950).await.unwrap();
+
+  assert_eq!(
+    batches
+      .iter()
+      .map(|batch| batch.virtual_partition_id)
+      .collect::<Vec<_>>(),
+    vec![7, 8]
+  );
+  assert!(blob_store.ranges().is_empty());
+  assert_eq!(
+    query.requests(),
+    vec![ReadBlobRangesRequest {
+      blob_key: blob_key.as_str().to_string().into(),
+      ranges: vec![
+        BlobRangeRequest {
+          start: 0,
+          end: first_len,
+          ..Default::default()
+        },
+        BlobRangeRequest {
+          start: first_len,
+          end: first_len.saturating_add(second_len),
+          ..Default::default()
+        },
+      ],
+      ..Default::default()
+    }]
+  );
+}
+
+#[tokio::test]
+async fn broker_blob_cache_handles_many_ranges_from_one_blob_key() {
+  let blob_store = Arc::new(RecordingRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let batches = (1 ..= 16)
+    .map(|partition_id| {
+      (
+        u64::from(partition_id),
+        partition_id,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(
+          vec![u8::try_from(partition_id).unwrap()],
+          900_000,
+        )],
+      )
+    })
+    .collect();
+  let (blob_key, payloads) = write_shared_blob_segments(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    batches,
+  )
+  .await;
+  let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_success(
+    payloads,
+  )));
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
+  ));
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    (1 ..= 16).collect(),
+    HashMap::new(),
+    blob_store.clone(),
+    metadata_store,
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .broker_blob_range_query(query.clone());
+
+  let batches = reader.read_available(950).await.unwrap();
+
+  assert_eq!(batches.len(), 16);
+  assert!(blob_store.ranges().is_empty());
+  let requests = query.requests();
+  assert_eq!(requests.len(), 1);
+  assert_eq!(requests[0].blob_key.as_str(), blob_key.as_str());
+  assert_eq!(requests[0].ranges.len(), 16);
+}
+
+#[tokio::test]
+async fn malformed_broker_blob_response_retries_the_complete_group_directly() {
+  let blob_store = Arc::new(RecordingRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let (_, payloads) = write_shared_blob_segments(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    vec![
+      (
+        1,
+        7,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![7], 900_000)],
+      ),
+      (
+        2,
+        8,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![8], 900_001)],
+      ),
+    ],
+  )
+  .await;
+  let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_success(vec![
+    payloads[0].clone(),
+  ])));
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
+  ));
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    blob_store.clone(),
+    metadata_store,
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .broker_blob_range_query(query.clone());
+
+  let batches = reader.read_available(950).await.unwrap();
+
+  assert_eq!(batches.len(), 2);
+  assert_eq!(query.requests().len(), 1);
+  assert_eq!(blob_store.ranges().len(), 2);
+}
+
+#[tokio::test]
+async fn overloaded_broker_blob_response_retries_the_complete_group_directly() {
+  let blob_store = Arc::new(RecordingRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let _ = write_shared_blob_segments(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    vec![
+      (
+        1,
+        7,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![7], 900_000)],
+      ),
+      (
+        2,
+        8,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![8], 900_001)],
+      ),
+    ],
+  )
+  .await;
+  let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_failure(
+    BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED,
+  )));
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
+  ));
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    blob_store.clone(),
+    metadata_store,
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .broker_blob_range_query(query.clone());
+
+  let batches = reader.read_available(950).await.unwrap();
+
+  assert_eq!(batches.len(), 2);
+  assert_eq!(query.requests().len(), 1);
+  assert_eq!(blob_store.ranges().len(), 2);
+}
+
+#[tokio::test]
+async fn broker_blob_failure_preserves_direct_range_concurrency() {
+  let blob_store = Arc::new(BlockingRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let _ = write_shared_blob_segments(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    (1 ..= 4)
+      .map(|partition_id| {
+        (
+          u64::from(partition_id),
+          partition_id,
+          SeqRange { start: 1, end: 1 },
+          vec![new_record(
+            vec![u8::try_from(partition_id).unwrap()],
+            900_000,
+          )],
+        )
+      })
+      .collect(),
+  )
+  .await;
+  let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_failure(
+    BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED,
+  )));
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
+  ));
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      max_in_flight_batch_reads: Some(2),
+      ..Default::default()
+    },
+    vec![1, 2, 3, 4],
+    HashMap::new(),
+    blob_store.clone(),
+    metadata_store,
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .broker_blob_range_query(query.clone());
+
+  let read_task = tokio::spawn(async move { reader.read_available(950).await });
+  timeout(
+    Duration::from_secs(1),
+    blob_store.started_reads.acquire_many(2),
+  )
+  .await
+  .expect("expected two concurrent fallback range reads")
+  .expect("range-read start semaphore is open")
+  .forget();
+  assert_eq!(blob_store.maximum_active_reads.load(Ordering::SeqCst), 2);
+
+  blob_store.released_reads.add_permits(4);
+  assert_eq!(read_task.await.unwrap().unwrap().len(), 4);
+  assert_eq!(query.requests().len(), 1);
+  assert_eq!(blob_store.maximum_active_reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn distinct_blob_keys_use_distinct_broker_requests() {
+  let blob_store = Arc::new(RecordingRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    7,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![7], 900_000)],
+    Compression::none(),
+  )
+  .await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    2,
+    8,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![8], 900_001)],
+    Compression::none(),
+  )
+  .await;
+  let query = Arc::new(FixedBrokerBlobRangeQuery::with_responses(Vec::new()));
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
+  ));
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    blob_store.clone(),
+    metadata_store,
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .broker_blob_range_query(query.clone());
+
+  let batches = reader.read_available(950).await.unwrap();
+
+  let mut blob_keys = query
+    .requests()
+    .into_iter()
+    .map(|request| request.blob_key.to_string())
+    .collect::<Vec<_>>();
+  blob_keys.sort();
+  assert_eq!(batches.len(), 2);
+  assert_eq!(
+    blob_keys,
+    vec!["telemetry/900/1.bin", "telemetry/900/2.bin"]
+  );
+  assert_eq!(blob_store.ranges().len(), 2);
+}
+
+#[tokio::test]
+async fn broker_blob_cache_accepts_mixed_key_outcomes_without_direct_retry() {
+  let blob_store = Arc::new(RecordingRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let delivered_records = vec![new_record(vec![7], 900_000)];
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    7,
+    SeqRange { start: 1, end: 1 },
+    delivered_records.clone(),
+    Compression::none(),
+  )
+  .await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    2,
+    8,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![8], 900_001)],
+    Compression::none(),
+  )
+  .await;
+  let delivered_payload = Bytes::from(
+    StoredRecordBatch {
+      virtual_partition_id: 7,
+      records: delivered_records,
+      ..Default::default()
+    }
+    .write_to_bytes()
+    .unwrap(),
+  );
+  let query = Arc::new(KeyedBrokerBlobRangeQuery::new([
+    (
+      "telemetry/900/1.bin".to_string(),
+      broker_blob_success(vec![delivered_payload]),
+    ),
+    (
+      "telemetry/900/2.bin".to_string(),
+      broker_blob_failure(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_NOT_FOUND),
+    ),
+  ]));
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
+  ));
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    blob_store.clone(),
+    metadata_store,
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .broker_blob_range_query(query.clone());
+
+  let batches = reader.read_available(950).await.unwrap();
+
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].virtual_partition_id, 7);
+  assert_eq!(reader.cursor(7), Some(1));
+  assert_eq!(reader.cursor(8), Some(1));
+  assert_eq!(query.requests().len(), 2);
+  assert!(blob_store.ranges().is_empty());
+}
+
+#[tokio::test]
+async fn broker_blob_cache_flag_applies_on_the_next_read_pass() {
+  let blob_store = Arc::new(RecordingRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    7,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![1], 900_000)],
+    Compression::none(),
+  )
+  .await;
+  let broker_records = vec![new_record(vec![2], 900_001)];
+  let broker_payload = Bytes::from(
+    StoredRecordBatch {
+      virtual_partition_id: 7,
+      records: broker_records.clone(),
+      ..Default::default()
+    }
+    .write_to_bytes()
+    .unwrap(),
+  );
+  let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_success(vec![
+    broker_payload,
+  ])));
+  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store.clone(),
+    metadata_store.clone(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .broker_blob_range_query(query.clone());
+
+  assert_eq!(reader.read_available(950).await.unwrap().len(), 1);
+  assert!(query.requests().is_empty());
+  feature_flags.update(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
+  ));
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    2,
+    7,
+    SeqRange { start: 2, end: 2 },
+    broker_records,
+    Compression::none(),
+  )
+  .await;
+
+  let batches = reader.read_available(951).await.unwrap();
+
+  assert_eq!(batches.len(), 1);
+  assert_eq!(batches[0].records[0].payload.as_ref(), &[2]);
+  assert_eq!(query.requests().len(), 1);
+  assert_eq!(blob_store.ranges().len(), 1);
+}
+
+#[tokio::test]
+async fn authoritative_broker_blob_not_found_skips_direct_retry() {
+  let blob_store = Arc::new(RecordingRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let _ = write_shared_blob_segments(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    vec![(
+      1,
+      7,
+      SeqRange { start: 1, end: 1 },
+      vec![new_record(vec![7], 900_000)],
+    )],
+  )
+  .await;
+  let query = Arc::new(FixedBrokerBlobRangeQuery::new(ReadBlobRangesResponse {
+    result: Some(read_blob_ranges_response::Result::Failure(
+      BlobReadFailure {
+        status: BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_NOT_FOUND.into(),
+        ..Default::default()
+      },
+    )),
+    ..Default::default()
+  }));
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
+  ));
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store.clone(),
+    metadata_store,
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+  )
+  .unwrap()
+  .broker_blob_range_query(query.clone());
+
+  let batches = reader.read_available(950).await.unwrap();
+
+  assert!(batches.is_empty());
+  assert_eq!(reader.cursor(7), Some(1));
+  assert_eq!(query.requests().len(), 1);
+  assert!(blob_store.ranges().is_empty());
 }
 
 #[test]

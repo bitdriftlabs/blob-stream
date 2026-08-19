@@ -2340,6 +2340,950 @@ pub mod read_metadata_window_response {
     }
 }
 
+// @@protoc_insertion_point(message:blobstream.v1.BlobRangeRequest)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct BlobRangeRequest {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.BlobRangeRequest.start)
+    pub start: u64,
+    // @@protoc_insertion_point(field:blobstream.v1.BlobRangeRequest.end)
+    pub end: u64,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.BlobRangeRequest.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a BlobRangeRequest {
+    fn default() -> &'a BlobRangeRequest {
+        <BlobRangeRequest as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl BlobRangeRequest {
+    pub fn new() -> BlobRangeRequest {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "start",
+            |m: &BlobRangeRequest| { &m.start },
+            |m: &mut BlobRangeRequest| { &mut m.start },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "end",
+            |m: &BlobRangeRequest| { &m.end },
+            |m: &mut BlobRangeRequest| { &mut m.end },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<BlobRangeRequest>(
+            "BlobRangeRequest",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for BlobRangeRequest {
+    const NAME: &'static str = "BlobRangeRequest";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                8 => {
+                    self.start = is.read_uint64()?;
+                },
+                16 => {
+                    self.end = is.read_uint64()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if self.start != 0 {
+            my_size += ::protobuf::rt::uint64_size(1, self.start);
+        }
+        if self.end != 0 {
+            my_size += ::protobuf::rt::uint64_size(2, self.end);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if self.start != 0 {
+            os.write_uint64(1, self.start)?;
+        }
+        if self.end != 0 {
+            os.write_uint64(2, self.end)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> BlobRangeRequest {
+        BlobRangeRequest::new()
+    }
+
+    fn clear(&mut self) {
+        self.start = 0;
+        self.end = 0;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static BlobRangeRequest {
+        static instance: BlobRangeRequest = BlobRangeRequest {
+            start: 0,
+            end: 0,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for BlobRangeRequest {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("BlobRangeRequest").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for BlobRangeRequest {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for BlobRangeRequest {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.BlobRangeResult)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct BlobRangeResult {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.BlobRangeResult.payload)
+    pub payload: ::bytes::Bytes,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.BlobRangeResult.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a BlobRangeResult {
+    fn default() -> &'a BlobRangeResult {
+        <BlobRangeResult as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl BlobRangeResult {
+    pub fn new() -> BlobRangeResult {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(1);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "payload",
+            |m: &BlobRangeResult| { &m.payload },
+            |m: &mut BlobRangeResult| { &mut m.payload },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<BlobRangeResult>(
+            "BlobRangeResult",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for BlobRangeResult {
+    const NAME: &'static str = "BlobRangeResult";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.payload = is.read_tokio_bytes()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if !self.payload.is_empty() {
+            my_size += ::protobuf::rt::bytes_size(1, &self.payload);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if !self.payload.is_empty() {
+            os.write_bytes(1, &self.payload)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> BlobRangeResult {
+        BlobRangeResult::new()
+    }
+
+    fn clear(&mut self) {
+        self.payload.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static BlobRangeResult {
+        static instance: BlobRangeResult = BlobRangeResult {
+            payload: ::bytes::Bytes::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for BlobRangeResult {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("BlobRangeResult").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for BlobRangeResult {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for BlobRangeResult {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.ReadBlobRangesRequest)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct ReadBlobRangesRequest {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.ReadBlobRangesRequest.blob_key)
+    pub blob_key: ::protobuf::Chars,
+    // @@protoc_insertion_point(field:blobstream.v1.ReadBlobRangesRequest.ranges)
+    pub ranges: ::std::vec::Vec<BlobRangeRequest>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.ReadBlobRangesRequest.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a ReadBlobRangesRequest {
+    fn default() -> &'a ReadBlobRangesRequest {
+        <ReadBlobRangesRequest as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl ReadBlobRangesRequest {
+    pub fn new() -> ReadBlobRangesRequest {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "blob_key",
+            |m: &ReadBlobRangesRequest| { &m.blob_key },
+            |m: &mut ReadBlobRangesRequest| { &mut m.blob_key },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
+            "ranges",
+            |m: &ReadBlobRangesRequest| { &m.ranges },
+            |m: &mut ReadBlobRangesRequest| { &mut m.ranges },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ReadBlobRangesRequest>(
+            "ReadBlobRangesRequest",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for ReadBlobRangesRequest {
+    const NAME: &'static str = "ReadBlobRangesRequest";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.blob_key = is.read_tokio_chars()?;
+                },
+                18 => {
+                    self.ranges.push(is.read_message()?);
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if !self.blob_key.is_empty() {
+            my_size += ::protobuf::rt::string_size(1, &self.blob_key);
+        }
+        for value in &self.ranges {
+            let len = value.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        };
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if !self.blob_key.is_empty() {
+            os.write_string(1, &self.blob_key)?;
+        }
+        for v in &self.ranges {
+            ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
+        };
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> ReadBlobRangesRequest {
+        ReadBlobRangesRequest::new()
+    }
+
+    fn clear(&mut self) {
+        self.blob_key.clear();
+        self.ranges.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static ReadBlobRangesRequest {
+        static instance: ReadBlobRangesRequest = ReadBlobRangesRequest {
+            blob_key: ::protobuf::Chars::new(),
+            ranges: ::std::vec::Vec::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for ReadBlobRangesRequest {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("ReadBlobRangesRequest").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for ReadBlobRangesRequest {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for ReadBlobRangesRequest {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.BlobReadSuccess)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct BlobReadSuccess {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.BlobReadSuccess.ranges)
+    pub ranges: ::std::vec::Vec<BlobRangeResult>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.BlobReadSuccess.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a BlobReadSuccess {
+    fn default() -> &'a BlobReadSuccess {
+        <BlobReadSuccess as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl BlobReadSuccess {
+    pub fn new() -> BlobReadSuccess {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(1);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
+            "ranges",
+            |m: &BlobReadSuccess| { &m.ranges },
+            |m: &mut BlobReadSuccess| { &mut m.ranges },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<BlobReadSuccess>(
+            "BlobReadSuccess",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for BlobReadSuccess {
+    const NAME: &'static str = "BlobReadSuccess";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.ranges.push(is.read_message()?);
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        for value in &self.ranges {
+            let len = value.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        };
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        for v in &self.ranges {
+            ::protobuf::rt::write_message_field_with_cached_size(1, v, os)?;
+        };
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> BlobReadSuccess {
+        BlobReadSuccess::new()
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static BlobReadSuccess {
+        static instance: BlobReadSuccess = BlobReadSuccess {
+            ranges: ::std::vec::Vec::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for BlobReadSuccess {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("BlobReadSuccess").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for BlobReadSuccess {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for BlobReadSuccess {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.BlobReadFailure)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct BlobReadFailure {
+    // message fields
+    // @@protoc_insertion_point(field:blobstream.v1.BlobReadFailure.status)
+    pub status: ::protobuf::EnumOrUnknown<BlobReadFailureStatus>,
+    // @@protoc_insertion_point(field:blobstream.v1.BlobReadFailure.error_message)
+    pub error_message: ::protobuf::Chars,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.BlobReadFailure.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a BlobReadFailure {
+    fn default() -> &'a BlobReadFailure {
+        <BlobReadFailure as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl BlobReadFailure {
+    pub fn new() -> BlobReadFailure {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "status",
+            |m: &BlobReadFailure| { &m.status },
+            |m: &mut BlobReadFailure| { &mut m.status },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "error_message",
+            |m: &BlobReadFailure| { &m.error_message },
+            |m: &mut BlobReadFailure| { &mut m.error_message },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<BlobReadFailure>(
+            "BlobReadFailure",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for BlobReadFailure {
+    const NAME: &'static str = "BlobReadFailure";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                8 => {
+                    self.status = is.read_enum_or_unknown()?;
+                },
+                18 => {
+                    self.error_message = is.read_tokio_chars()?;
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if self.status != ::protobuf::EnumOrUnknown::new(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_BAD_REQUEST) {
+            my_size += ::protobuf::rt::int32_size(1, self.status.value());
+        }
+        if !self.error_message.is_empty() {
+            my_size += ::protobuf::rt::string_size(2, &self.error_message);
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if self.status != ::protobuf::EnumOrUnknown::new(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_BAD_REQUEST) {
+            os.write_enum(1, ::protobuf::EnumOrUnknown::value(&self.status))?;
+        }
+        if !self.error_message.is_empty() {
+            os.write_string(2, &self.error_message)?;
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> BlobReadFailure {
+        BlobReadFailure::new()
+    }
+
+    fn clear(&mut self) {
+        self.status = ::protobuf::EnumOrUnknown::new(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_BAD_REQUEST);
+        self.error_message.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static BlobReadFailure {
+        static instance: BlobReadFailure = BlobReadFailure {
+            status: ::protobuf::EnumOrUnknown::from_i32(0),
+            error_message: ::protobuf::Chars::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for BlobReadFailure {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("BlobReadFailure").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for BlobReadFailure {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for BlobReadFailure {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+// @@protoc_insertion_point(message:blobstream.v1.ReadBlobRangesResponse)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct ReadBlobRangesResponse {
+    // message oneof groups
+    pub result: ::std::option::Option<read_blob_ranges_response::Result>,
+    // special fields
+    // @@protoc_insertion_point(special_field:blobstream.v1.ReadBlobRangesResponse.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a ReadBlobRangesResponse {
+    fn default() -> &'a ReadBlobRangesResponse {
+        <ReadBlobRangesResponse as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl ReadBlobRangesResponse {
+    pub fn new() -> ReadBlobRangesResponse {
+        ::std::default::Default::default()
+    }
+
+    // .blobstream.v1.BlobReadSuccess success = 1;
+
+    pub fn success(&self) -> &BlobReadSuccess {
+        match self.result {
+            ::std::option::Option::Some(read_blob_ranges_response::Result::Success(ref v)) => v,
+            _ => <BlobReadSuccess as ::protobuf::Message>::default_instance(),
+        }
+    }
+
+    pub fn clear_success(&mut self) {
+        self.result = ::std::option::Option::None;
+    }
+
+    pub fn has_success(&self) -> bool {
+        match self.result {
+            ::std::option::Option::Some(read_blob_ranges_response::Result::Success(..)) => true,
+            _ => false,
+        }
+    }
+
+    // Param is passed by value, moved
+    pub fn set_success(&mut self, v: BlobReadSuccess) {
+        self.result = ::std::option::Option::Some(read_blob_ranges_response::Result::Success(v))
+    }
+
+    // Mutable pointer to the field.
+    pub fn mut_success(&mut self) -> &mut BlobReadSuccess {
+        if let ::std::option::Option::Some(read_blob_ranges_response::Result::Success(_)) = self.result {
+        } else {
+            self.result = ::std::option::Option::Some(read_blob_ranges_response::Result::Success(BlobReadSuccess::new()));
+        }
+        match self.result {
+            ::std::option::Option::Some(read_blob_ranges_response::Result::Success(ref mut v)) => v,
+            _ => panic!(),
+        }
+    }
+
+    // Take field
+    pub fn take_success(&mut self) -> BlobReadSuccess {
+        if self.has_success() {
+            match self.result.take() {
+                ::std::option::Option::Some(read_blob_ranges_response::Result::Success(v)) => v,
+                _ => panic!(),
+            }
+        } else {
+            BlobReadSuccess::new()
+        }
+    }
+
+    // .blobstream.v1.BlobReadFailure failure = 2;
+
+    pub fn failure(&self) -> &BlobReadFailure {
+        match self.result {
+            ::std::option::Option::Some(read_blob_ranges_response::Result::Failure(ref v)) => v,
+            _ => <BlobReadFailure as ::protobuf::Message>::default_instance(),
+        }
+    }
+
+    pub fn clear_failure(&mut self) {
+        self.result = ::std::option::Option::None;
+    }
+
+    pub fn has_failure(&self) -> bool {
+        match self.result {
+            ::std::option::Option::Some(read_blob_ranges_response::Result::Failure(..)) => true,
+            _ => false,
+        }
+    }
+
+    // Param is passed by value, moved
+    pub fn set_failure(&mut self, v: BlobReadFailure) {
+        self.result = ::std::option::Option::Some(read_blob_ranges_response::Result::Failure(v))
+    }
+
+    // Mutable pointer to the field.
+    pub fn mut_failure(&mut self) -> &mut BlobReadFailure {
+        if let ::std::option::Option::Some(read_blob_ranges_response::Result::Failure(_)) = self.result {
+        } else {
+            self.result = ::std::option::Option::Some(read_blob_ranges_response::Result::Failure(BlobReadFailure::new()));
+        }
+        match self.result {
+            ::std::option::Option::Some(read_blob_ranges_response::Result::Failure(ref mut v)) => v,
+            _ => panic!(),
+        }
+    }
+
+    // Take field
+    pub fn take_failure(&mut self) -> BlobReadFailure {
+        if self.has_failure() {
+            match self.result.take() {
+                ::std::option::Option::Some(read_blob_ranges_response::Result::Failure(v)) => v,
+                _ => panic!(),
+            }
+        } else {
+            BlobReadFailure::new()
+        }
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut oneofs = ::std::vec::Vec::with_capacity(1);
+        fields.push(::protobuf::reflect::rt::v2::make_oneof_message_has_get_mut_set_accessor::<_, BlobReadSuccess>(
+            "success",
+            ReadBlobRangesResponse::has_success,
+            ReadBlobRangesResponse::success,
+            ReadBlobRangesResponse::mut_success,
+            ReadBlobRangesResponse::set_success,
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_oneof_message_has_get_mut_set_accessor::<_, BlobReadFailure>(
+            "failure",
+            ReadBlobRangesResponse::has_failure,
+            ReadBlobRangesResponse::failure,
+            ReadBlobRangesResponse::mut_failure,
+            ReadBlobRangesResponse::set_failure,
+        ));
+        oneofs.push(read_blob_ranges_response::Result::generated_oneof_descriptor_data());
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ReadBlobRangesResponse>(
+            "ReadBlobRangesResponse",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for ReadBlobRangesResponse {
+    const NAME: &'static str = "ReadBlobRangesResponse";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                10 => {
+                    self.result = ::std::option::Option::Some(read_blob_ranges_response::Result::Success(is.read_message()?));
+                },
+                18 => {
+                    self.result = ::std::option::Option::Some(read_blob_ranges_response::Result::Failure(is.read_message()?));
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        if let ::std::option::Option::Some(ref v) = self.result {
+            match v {
+                &read_blob_ranges_response::Result::Success(ref v) => {
+                    let len = v.compute_size();
+                    my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+                },
+                &read_blob_ranges_response::Result::Failure(ref v) => {
+                    let len = v.compute_size();
+                    my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+                },
+            };
+        }
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        if let ::std::option::Option::Some(ref v) = self.result {
+            match v {
+                &read_blob_ranges_response::Result::Success(ref v) => {
+                    ::protobuf::rt::write_message_field_with_cached_size(1, v, os)?;
+                },
+                &read_blob_ranges_response::Result::Failure(ref v) => {
+                    ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
+                },
+            };
+        }
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> ReadBlobRangesResponse {
+        ReadBlobRangesResponse::new()
+    }
+
+    fn clear(&mut self) {
+        self.result = ::std::option::Option::None;
+        self.result = ::std::option::Option::None;
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static ReadBlobRangesResponse {
+        static instance: ReadBlobRangesResponse = ReadBlobRangesResponse {
+            result: ::std::option::Option::None,
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for ReadBlobRangesResponse {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("ReadBlobRangesResponse").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for ReadBlobRangesResponse {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for ReadBlobRangesResponse {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
+/// Nested message and enums of message `ReadBlobRangesResponse`
+pub mod read_blob_ranges_response {
+
+    #[derive(Clone,PartialEq,Debug)]
+    // @@protoc_insertion_point(oneof:blobstream.v1.ReadBlobRangesResponse.result)
+    pub enum Result {
+        // @@protoc_insertion_point(oneof_field:blobstream.v1.ReadBlobRangesResponse.success)
+        Success(super::BlobReadSuccess),
+        // @@protoc_insertion_point(oneof_field:blobstream.v1.ReadBlobRangesResponse.failure)
+        Failure(super::BlobReadFailure),
+    }
+
+    impl ::protobuf::Oneof for Result {
+    }
+
+    impl ::protobuf::OneofFull for Result {
+        fn descriptor() -> ::protobuf::reflect::OneofDescriptor {
+            static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::OneofDescriptor> = ::protobuf::rt::Lazy::new();
+            descriptor.get(|| <super::ReadBlobRangesResponse as ::protobuf::MessageFull>::descriptor().oneof_by_name("result").unwrap()).clone()
+        }
+    }
+
+    impl Result {
+        pub(in super) fn generated_oneof_descriptor_data() -> ::protobuf::reflect::GeneratedOneofDescriptorData {
+            ::protobuf::reflect::GeneratedOneofDescriptorData::new::<Result>("result")
+        }
+    }
+}
+
 #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
 // @@protoc_insertion_point(enum:blobstream.v1.ProduceStatus)
 pub enum ProduceStatus {
@@ -2546,6 +3490,83 @@ impl MetadataReadFailureStatus {
     }
 }
 
+#[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
+// @@protoc_insertion_point(enum:blobstream.v1.BlobReadFailureStatus)
+pub enum BlobReadFailureStatus {
+    // @@protoc_insertion_point(enum_value:blobstream.v1.BlobReadFailureStatus.BLOB_READ_FAILURE_STATUS_BAD_REQUEST)
+    BLOB_READ_FAILURE_STATUS_BAD_REQUEST = 0,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.BlobReadFailureStatus.BLOB_READ_FAILURE_STATUS_OVERLOADED)
+    BLOB_READ_FAILURE_STATUS_OVERLOADED = 1,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.BlobReadFailureStatus.BLOB_READ_FAILURE_STATUS_TOO_LARGE)
+    BLOB_READ_FAILURE_STATUS_TOO_LARGE = 2,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.BlobReadFailureStatus.BLOB_READ_FAILURE_STATUS_STORAGE)
+    BLOB_READ_FAILURE_STATUS_STORAGE = 3,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.BlobReadFailureStatus.BLOB_READ_FAILURE_STATUS_NOT_FOUND)
+    BLOB_READ_FAILURE_STATUS_NOT_FOUND = 4,
+}
+
+impl ::protobuf::Enum for BlobReadFailureStatus {
+    const NAME: &'static str = "BlobReadFailureStatus";
+
+    fn value(&self) -> i32 {
+        *self as i32
+    }
+
+    fn from_i32(value: i32) -> ::std::option::Option<BlobReadFailureStatus> {
+        match value {
+            0 => ::std::option::Option::Some(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_BAD_REQUEST),
+            1 => ::std::option::Option::Some(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED),
+            2 => ::std::option::Option::Some(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_TOO_LARGE),
+            3 => ::std::option::Option::Some(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_STORAGE),
+            4 => ::std::option::Option::Some(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_NOT_FOUND),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    fn from_str(str: &str) -> ::std::option::Option<BlobReadFailureStatus> {
+        match str {
+            "BLOB_READ_FAILURE_STATUS_BAD_REQUEST" => ::std::option::Option::Some(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_BAD_REQUEST),
+            "BLOB_READ_FAILURE_STATUS_OVERLOADED" => ::std::option::Option::Some(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED),
+            "BLOB_READ_FAILURE_STATUS_TOO_LARGE" => ::std::option::Option::Some(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_TOO_LARGE),
+            "BLOB_READ_FAILURE_STATUS_STORAGE" => ::std::option::Option::Some(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_STORAGE),
+            "BLOB_READ_FAILURE_STATUS_NOT_FOUND" => ::std::option::Option::Some(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_NOT_FOUND),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    const VALUES: &'static [BlobReadFailureStatus] = &[
+        BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_BAD_REQUEST,
+        BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED,
+        BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_TOO_LARGE,
+        BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_STORAGE,
+        BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_NOT_FOUND,
+    ];
+}
+
+impl ::protobuf::EnumFull for BlobReadFailureStatus {
+    fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().enum_by_package_relative_name("BlobReadFailureStatus").unwrap()).clone()
+    }
+
+    fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
+        let index = *self as usize;
+        Self::enum_descriptor().value_by_index(index)
+    }
+}
+
+impl ::std::default::Default for BlobReadFailureStatus {
+    fn default() -> Self {
+        BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_BAD_REQUEST
+    }
+}
+
+impl BlobReadFailureStatus {
+    fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
+        ::protobuf::reflect::GeneratedEnumDescriptorData::new::<BlobReadFailureStatus>("BlobReadFailureStatus")
+    }
+}
+
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x1ablobstream/v1/broker.proto\x12\rblobstream.v1\x1a\x1cblobstream/v1\
     /metadata.proto\"B\n\x06Record\x12\x18\n\x07payload\x18\x01\x20\x01(\x0c\
@@ -2589,20 +3610,38 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x1aReadMetadataWindowResponse\x12>\n\x07success\x18\x01\x20\x01(\x0b2\"\
     .blobstream.v1.MetadataReadSuccessH\0R\x07success\x12>\n\x07failure\x18\
     \x02\x20\x01(\x0b2\".blobstream.v1.MetadataReadFailureH\0R\x07failureB\
-    \x08\n\x06result*\xac\x01\n\rProduceStatus\x12\x15\n\x11PRODUCE_STATUS_O\
-    K\x10\0\x12#\n\x1fPRODUCE_STATUS_NOT_LEASE_HOLDER\x10\x01\x12\x20\n\x1cP\
-    RODUCE_STATUS_UNKNOWN_TOPIC\x10\x02\x12\x1d\n\x19PRODUCE_STATUS_OVERLOAD\
-    ED\x10\x03\x12\x1e\n\x1aPRODUCE_STATUS_BAD_REQUEST\x10\x04*g\n\x17Metada\
-    taReadConsistency\x12&\n\"METADATA_READ_CONSISTENCY_EVENTUAL\x10\0\x12$\
-    \n\x20METADATA_READ_CONSISTENCY_STRONG\x10\x01*\x9f\x01\n\x19MetadataRea\
-    dFailureStatus\x12,\n(METADATA_READ_FAILURE_STATUS_BAD_REQUEST\x10\0\x12\
-    +\n'METADATA_READ_FAILURE_STATUS_OVERLOADED\x10\x01\x12'\n#METADATA_READ\
-    _FAILURE_STATUS_FAILED\x10\x022\xb2\x02\n\rBrokerService\x12W\n\x0cProdu\
-    ceBatch\x12\".blobstream.v1.ProduceBatchRequest\x1a#.blobstream.v1.Produ\
-    ceBatchResponse\x12]\n\x0eProduceBatches\x12$.blobstream.v1.ProduceBatch\
-    esRequest\x1a%.blobstream.v1.ProduceBatchesResponse\x12i\n\x12ReadMetada\
-    taWindow\x12(.blobstream.v1.ReadMetadataWindowRequest\x1a).blobstream.v1\
-    .ReadMetadataWindowResponseb\x06proto3\
+    \x08\n\x06result\":\n\x10BlobRangeRequest\x12\x14\n\x05start\x18\x01\x20\
+    \x01(\x04R\x05start\x12\x10\n\x03end\x18\x02\x20\x01(\x04R\x03end\"+\n\
+    \x0fBlobRangeResult\x12\x18\n\x07payload\x18\x01\x20\x01(\x0cR\x07payloa\
+    d\"k\n\x15ReadBlobRangesRequest\x12\x19\n\x08blob_key\x18\x01\x20\x01(\t\
+    R\x07blobKey\x127\n\x06ranges\x18\x02\x20\x03(\x0b2\x1f.blobstream.v1.Bl\
+    obRangeRequestR\x06ranges\"I\n\x0fBlobReadSuccess\x126\n\x06ranges\x18\
+    \x01\x20\x03(\x0b2\x1e.blobstream.v1.BlobRangeResultR\x06ranges\"t\n\x0f\
+    BlobReadFailure\x12<\n\x06status\x18\x01\x20\x01(\x0e2$.blobstream.v1.Bl\
+    obReadFailureStatusR\x06status\x12#\n\rerror_message\x18\x02\x20\x01(\tR\
+    \x0cerrorMessage\"\x9a\x01\n\x16ReadBlobRangesResponse\x12:\n\x07success\
+    \x18\x01\x20\x01(\x0b2\x1e.blobstream.v1.BlobReadSuccessH\0R\x07success\
+    \x12:\n\x07failure\x18\x02\x20\x01(\x0b2\x1e.blobstream.v1.BlobReadFailu\
+    reH\0R\x07failureB\x08\n\x06result*\xac\x01\n\rProduceStatus\x12\x15\n\
+    \x11PRODUCE_STATUS_OK\x10\0\x12#\n\x1fPRODUCE_STATUS_NOT_LEASE_HOLDER\
+    \x10\x01\x12\x20\n\x1cPRODUCE_STATUS_UNKNOWN_TOPIC\x10\x02\x12\x1d\n\x19\
+    PRODUCE_STATUS_OVERLOADED\x10\x03\x12\x1e\n\x1aPRODUCE_STATUS_BAD_REQUES\
+    T\x10\x04*g\n\x17MetadataReadConsistency\x12&\n\"METADATA_READ_CONSISTEN\
+    CY_EVENTUAL\x10\0\x12$\n\x20METADATA_READ_CONSISTENCY_STRONG\x10\x01*\
+    \x9f\x01\n\x19MetadataReadFailureStatus\x12,\n(METADATA_READ_FAILURE_STA\
+    TUS_BAD_REQUEST\x10\0\x12+\n'METADATA_READ_FAILURE_STATUS_OVERLOADED\x10\
+    \x01\x12'\n#METADATA_READ_FAILURE_STATUS_FAILED\x10\x02*\xe0\x01\n\x15Bl\
+    obReadFailureStatus\x12(\n$BLOB_READ_FAILURE_STATUS_BAD_REQUEST\x10\0\
+    \x12'\n#BLOB_READ_FAILURE_STATUS_OVERLOADED\x10\x01\x12&\n\"BLOB_READ_FA\
+    ILURE_STATUS_TOO_LARGE\x10\x02\x12$\n\x20BLOB_READ_FAILURE_STATUS_STORAG\
+    E\x10\x03\x12&\n\"BLOB_READ_FAILURE_STATUS_NOT_FOUND\x10\x042\x91\x03\n\
+    \rBrokerService\x12W\n\x0cProduceBatch\x12\".blobstream.v1.ProduceBatchR\
+    equest\x1a#.blobstream.v1.ProduceBatchResponse\x12]\n\x0eProduceBatches\
+    \x12$.blobstream.v1.ProduceBatchesRequest\x1a%.blobstream.v1.ProduceBatc\
+    hesResponse\x12i\n\x12ReadMetadataWindow\x12(.blobstream.v1.ReadMetadata\
+    WindowRequest\x1a).blobstream.v1.ReadMetadataWindowResponse\x12]\n\x0eRe\
+    adBlobRanges\x12$.blobstream.v1.ReadBlobRangesRequest\x1a%.blobstream.v1\
+    .ReadBlobRangesResponseb\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -2621,7 +3660,7 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
             let mut deps = ::std::vec::Vec::with_capacity(1);
             deps.push(super::metadata::file_descriptor().clone());
-            let mut messages = ::std::vec::Vec::with_capacity(14);
+            let mut messages = ::std::vec::Vec::with_capacity(20);
             messages.push(Record::generated_message_descriptor_data());
             messages.push(StoredRecordBatch::generated_message_descriptor_data());
             messages.push(ProduceBatchRequest::generated_message_descriptor_data());
@@ -2636,10 +3675,17 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             messages.push(MetadataReadSuccess::generated_message_descriptor_data());
             messages.push(MetadataReadFailure::generated_message_descriptor_data());
             messages.push(ReadMetadataWindowResponse::generated_message_descriptor_data());
-            let mut enums = ::std::vec::Vec::with_capacity(3);
+            messages.push(BlobRangeRequest::generated_message_descriptor_data());
+            messages.push(BlobRangeResult::generated_message_descriptor_data());
+            messages.push(ReadBlobRangesRequest::generated_message_descriptor_data());
+            messages.push(BlobReadSuccess::generated_message_descriptor_data());
+            messages.push(BlobReadFailure::generated_message_descriptor_data());
+            messages.push(ReadBlobRangesResponse::generated_message_descriptor_data());
+            let mut enums = ::std::vec::Vec::with_capacity(4);
             enums.push(ProduceStatus::generated_enum_descriptor_data());
             enums.push(MetadataReadConsistency::generated_enum_descriptor_data());
             enums.push(MetadataReadFailureStatus::generated_enum_descriptor_data());
+            enums.push(BlobReadFailureStatus::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),
                 deps,

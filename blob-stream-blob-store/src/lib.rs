@@ -90,6 +90,13 @@ pub enum BlobStoreError {
   #[error("invalid byte range for blob {key}: {message}")]
   /// The requested byte range cannot be read from the blob.
   InvalidRange { key: String, message: String },
+  #[error("blob {key} is {actual_bytes} bytes, exceeding the {max_bytes}-byte limit")]
+  /// The complete blob exceeds the caller's bounded read limit.
+  TooLarge {
+    key: String,
+    max_bytes: u64,
+    actual_bytes: u64,
+  },
   #[error("read blob {key}: {source}")]
   /// A storage or body-stream error not otherwise classified.
   Read {
@@ -115,4 +122,7 @@ pub trait BlobStore: Send + Sync {
 
   /// Read an exact byte range from a blob.
   async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes>;
+
+  /// Read the complete blob when its size does not exceed `max_bytes`.
+  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes>;
 }

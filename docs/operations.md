@@ -27,12 +27,14 @@ metadata. The broker returns a retryable failure. There is no unfenced fallback 
 Feature flags are local process controls. `TopicConfig.metadata_window_size` defines the durable
 metadata-key layout used by broker publication and consumer scans. Broker metadata caching is
 always served and `ConsumerIteratorBootstrapConfig.broker_discovery` is required; consumer flags
-alone select direct, shadow, or broker-delivery reads.
+alone select direct, shadow, or broker-delivery reads. Raw broker blob delivery is independently
+disabled by default and always retains direct blob storage as retryable fallback.
 
 | Scope | Flags | Adoption | Operational effect |
 | --- | --- | --- | --- |
-| Consumer reader | `blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads`, `blob_stream_consumer_broker_metadata_cache_enabled`, `blob_stream_consumer_broker_metadata_cache_shadow` | Live | Enables broker-collapsed metadata reads or shadow validation. Delivery remains direct in shadow mode and falls back directly on broker failure. |
+| Consumer reader | `blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads`, `blob_stream_consumer_broker_metadata_cache_enabled`, `blob_stream_consumer_broker_metadata_cache_shadow`, `blob_stream_consumer_broker_batch_cache_enabled` | Live | Enables broker-collapsed metadata reads, shadow validation, or raw immutable blob-range delivery. The blob flag defaults to `false`; non-`NOT_FOUND` broker blob failures retry the full affected group directly. |
 | Broker metadata-cache startup | `blob_stream_broker_metadata_recovery_cache_max_bytes`, `blob_stream_broker_metadata_cache_max_waiters_per_key`, `blob_stream_broker_metadata_cache_max_waiters`, `blob_stream_broker_metadata_cache_max_refills`, `blob_stream_broker_metadata_cache_max_request_partitions`, `blob_stream_broker_metadata_cache_max_response_items`, `blob_stream_broker_metadata_cache_max_response_bytes`, `blob_stream_broker_metadata_cache_max_entry_items` | Restart the broker | Overrides the internal cache defaults when a feature-flag loader is configured. Values must be positive; the per-key waiter limit cannot exceed the global waiter limit, and the response-byte limit is capped at the gRPC request maximum. |
+| Broker blob-cache startup | `blob_stream_broker_blob_cache_idle_ttl_ms` | Restart the broker | Sets positive idle retention for complete immutable blobs; absent means 10 seconds. Cgroup-aware memory admission can flush entries or disable cache admission without disabling direct consumer reads. |
 | Consumer startup | `blob_stream_consumer_idle_poll_delay_ms`, `blob_stream_consumer_max_idle_poll_delay_ms`, `blob_stream_consumer_lease_duration_ms`, `blob_stream_consumer_heartbeat_interval_ms`, `blob_stream_consumer_rebalance_interval_ms` | Rebuild or restart the iterator | Changes local polling and consumer-group scheduling. Persistent lease state stores absolute expiry timestamps, so members may use different local durations. |
 | Producer startup | `blob_stream_producer_max_batch_records`, `blob_stream_producer_max_batch_bytes`, `blob_stream_producer_flush_max_delay_ms`, `blob_stream_producer_retry_base_delay_ms`, `blob_stream_producer_retry_max_delay_ms`, `blob_stream_producer_connect_timeout_ms`, `blob_stream_producer_request_timeout_ms`, `blob_stream_producer_max_request_concurrency`, `blob_stream_producer_compression` | Recreate or restart the producer | Changes local batching, retry, request, concurrency, and compression behavior. |
 
@@ -49,6 +51,7 @@ The broker listener serves gRPC plus these HTTP endpoints:
 | `GET /metrics` | Prometheus text format (`text/plain; version=0.0.4`) |
 | `GET /admin/state` | JSON snapshot of broker configuration, discovery, ownership, and local buffers |
 | `GET /admin/metadata-cache` | Aggregate bounded metadata-cache capacity, age, refill, waiter, and failure state |
+| `GET /admin/blob-cache` | Aggregate raw blob-cache retention, active fetch, memory headroom, and failure state; never exposes object keys or bytes |
 | `POST /admin/log?rust_log=<filter>` | Replaces the active Rust log filter without restarting the broker |
 
 Protect the admin listener according to the deployment's network policy. `/admin/log` accepts a log
@@ -92,10 +95,11 @@ metrics to the `bd-server-stats` scope supplied by their embedding application. 
 [Metrics reference](metrics.md) for names, scopes, types, and meanings.
 
 For broker alerts, focus on gRPC timeouts and status failures, metadata-cache overloads and
-evictions, write admission rejections and flush failures, metadata-publication deadline exhaustion,
-sequence-reservation failures, and memory admission state. Pair ownership or write-admission
-failures with `/admin/state`, and cache pressure with `/admin/metadata-cache`, before changing
-capacity or routing.
+evictions, blob-cache overloads/failures/pressure flushes, write admission rejections and flush
+failures, metadata-publication deadline exhaustion, sequence-reservation failures, and memory
+admission state. Pair ownership or write-admission failures with `/admin/state`, metadata-cache
+pressure with `/admin/metadata-cache`, and raw blob-cache pressure with `/admin/blob-cache`, before
+changing capacity or routing.
 
 ## Diagnostic Runbooks
 
@@ -134,3 +138,14 @@ capacity or routing.
    the consumer's `max_clock_skew`, and the effective visibility delay.
 3. Use [Cost analysis](cost-analysis.md) with observed page and range-read rates before changing
    strong-read or transactional-publication modes.
+
+### Broker Blob Delivery Falls Back
+
+1. Compare consumer `broker_blob_range_attempts`, `broker_blob_range_deliveries`, and
+   `broker_blob_range_fallbacks` with direct `blob_range_requests` and `blob_range_bytes`.
+2. Inspect broker `blob_cache` overloads, storage failures, pressure flushes, retained bytes, and
+   whole-object fetch volume. Check `/admin/blob-cache` for headroom and active fetches.
+3. Verify broker discovery returns only healthy local brokers and that the broker has
+   `s3:GetObject` on the configured prefix.
+4. Disable `blob_stream_consumer_broker_batch_cache_enabled` to return immediately to the
+   established direct-range path while investigating.

@@ -24,8 +24,6 @@ use crate::write::memory_pressure::MemoryPressureController;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use bd_log_util::warn_every;
-use bd_server_stats::stats::Scope;
-use bd_shutdown::ComponentShutdownTriggerHandle;
 use blob_stream_broker_discovery::{balanced_assignment, writer_virtual_partitions};
 use blob_stream_metadata_store::ProducerPartitionLeaseKey;
 use blob_stream_types::RecordBatch;
@@ -413,29 +411,8 @@ pub trait AdmissionController: Send + Sync {
   fn is_overloaded(&self) -> bool;
 }
 
-//
-// MemoryPressureAdmissionController
-//
-
-#[derive(Clone, Debug)]
-pub struct MemoryPressureAdmissionController {
-  memory_pressure: MemoryPressureController,
-}
-
-impl MemoryPressureAdmissionController {
-  #[must_use]
-  pub fn new(
-    shutdown_trigger_handle: &ComponentShutdownTriggerHandle,
-    metrics_scope: &Scope,
-  ) -> Self {
-    Self {
-      memory_pressure: MemoryPressureController::new(shutdown_trigger_handle, metrics_scope),
-    }
-  }
-}
-
-impl AdmissionController for MemoryPressureAdmissionController {
+impl AdmissionController for MemoryPressureController {
   fn is_overloaded(&self) -> bool {
-    self.memory_pressure.is_overloaded()
+    self.is_overloaded()
   }
 }

@@ -1,5 +1,7 @@
-use super::{BrokerGrpc, BrokerGrpcMetrics, produce_request_config};
+use super::{BrokerGrpc, BrokerGrpcMetrics, blob_read_request_config, produce_request_config};
+use crate::read::blob_cache::{BlobCache, BlobCacheConfig, MAX_BLOB_READ_REQUEST_BYTES};
 use crate::read::metadata_cache::{MetadataCache, MetadataCacheConfig};
+use crate::write::memory_pressure::{MemoryPressureController, MemoryPressureSample};
 use crate::write::{AdmissionController, TopicInfo, WriteConfig, WriteEngineBuilder};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -7,12 +9,16 @@ use bd_grpc::Handler;
 use bd_server_stats::stats::Collector;
 use bd_server_stats::test::util::stats::Helper;
 use bd_shutdown::ComponentShutdownTrigger;
-use blob_stream_blob_store::InMemoryBlobStore;
+use blob_stream_blob_store::{BlobStore, InMemoryBlobStore};
 use blob_stream_metadata_store::{InMemoryMetadataStore, InMemoryProducerPartitionLeaseStore};
 use blob_stream_proto::protos::blobstream::v1::broker::{
+  BlobRangeRequest,
+  BlobReadFailureStatus,
   ProduceBatchRequest,
   ProduceBatchesRequest,
   ProduceStatus,
+  ReadBlobRangesRequest,
+  read_blob_ranges_response,
 };
 use blob_stream_proto::protos::blobstream::v1::config::{BrokerConfig, RuntimeConfig, TopicConfig};
 use blob_stream_test_utils::ManualTimeProvider;
@@ -147,6 +153,145 @@ fn limits_produce_request_bytes() {
     produce_request_config().max_decoded_request_bytes,
     MAX_PRODUCE_BATCHES_REQUEST_BYTES
   );
+}
+
+#[test]
+fn limits_blob_read_request_bytes() {
+  assert_eq!(
+    blob_read_request_config().max_request_bytes,
+    MAX_BLOB_READ_REQUEST_BYTES
+  );
+  assert_eq!(
+    blob_read_request_config().max_decoded_request_bytes,
+    MAX_BLOB_READ_REQUEST_BYTES
+  );
+}
+
+#[tokio::test]
+async fn serves_blob_ranges_from_the_grpc_handler() -> Result<()> {
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let scope = Collector::default().scope("blob_stream_broker_test");
+  let store = Arc::new(InMemoryBlobStore::new());
+  store
+    .put(
+      &blob_stream_blob_store::BlobKey::from("topic/blob"),
+      bytes::Bytes::from_static(b"abcdefgh"),
+    )
+    .await?;
+  let cache = Arc::new(BlobCache::new(
+    store,
+    BlobCacheConfig::from_broker_config(&BrokerConfig::new(), 64, None)?,
+    MemoryPressureController::new_for_test_with_sample(
+      MemoryPressureSample {
+        allocated_bytes: 0,
+        limit_bytes: 1_000,
+      },
+      &scope,
+    ),
+    &scope,
+  ));
+  let grpc = BrokerGrpc::new_with_blob_cache(
+    Arc::new(PartialResponseWriteEngine),
+    metadata_cache(),
+    cache,
+    &scope,
+  );
+
+  let response = <BrokerGrpc as Handler<ReadBlobRangesRequest, _>>::handle(
+    &grpc,
+    HeaderMap::new(),
+    Extensions::new(),
+    ReadBlobRangesRequest {
+      blob_key: "topic/blob".into(),
+      ranges: vec![BlobRangeRequest {
+        start: 2,
+        end: 5,
+        ..Default::default()
+      }],
+      ..Default::default()
+    },
+  )
+  .await?;
+
+  let Some(read_blob_ranges_response::Result::Success(success)) = response.result else {
+    panic!("expected blob range success");
+  };
+  assert_eq!(success.ranges[0].payload, bytes::Bytes::from_static(b"cde"));
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn grpc_blob_handler_preserves_typed_cache_failures() -> Result<()> {
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let scope = Collector::default().scope("blob_stream_broker_test");
+  let cache = Arc::new(BlobCache::new(
+    Arc::new(InMemoryBlobStore::new()),
+    BlobCacheConfig::from_broker_config(&BrokerConfig::new(), 64, None)?,
+    MemoryPressureController::new_for_test_with_sample(
+      MemoryPressureSample {
+        allocated_bytes: 0,
+        limit_bytes: 1_000,
+      },
+      &scope,
+    ),
+    &scope,
+  ));
+  let grpc = BrokerGrpc::new_with_blob_cache(
+    Arc::new(PartialResponseWriteEngine),
+    metadata_cache(),
+    cache,
+    &scope,
+  );
+
+  let invalid = <BrokerGrpc as Handler<ReadBlobRangesRequest, _>>::handle(
+    &grpc,
+    HeaderMap::new(),
+    Extensions::new(),
+    ReadBlobRangesRequest {
+      blob_key: "topic/blob".into(),
+      ranges: vec![BlobRangeRequest {
+        start: 2,
+        end: 2,
+        ..Default::default()
+      }],
+      ..Default::default()
+    },
+  )
+  .await?;
+  let missing = <BrokerGrpc as Handler<ReadBlobRangesRequest, _>>::handle(
+    &grpc,
+    HeaderMap::new(),
+    Extensions::new(),
+    ReadBlobRangesRequest {
+      blob_key: "topic/missing".into(),
+      ranges: vec![BlobRangeRequest {
+        start: 0,
+        end: 1,
+        ..Default::default()
+      }],
+      ..Default::default()
+    },
+  )
+  .await?;
+
+  let Some(read_blob_ranges_response::Result::Failure(invalid)) = invalid.result else {
+    panic!("expected invalid range failure");
+  };
+  assert_eq!(
+    invalid.status,
+    BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_BAD_REQUEST.into()
+  );
+  let Some(read_blob_ranges_response::Result::Failure(missing)) = missing.result else {
+    panic!("expected missing blob failure");
+  };
+  assert_eq!(
+    missing.status,
+    BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_NOT_FOUND.into()
+  );
+  assert_eq!(missing.error_message.as_str(), "blob not found");
+  shutdown_trigger.shutdown().await;
+  Ok(())
 }
 
 #[test]
