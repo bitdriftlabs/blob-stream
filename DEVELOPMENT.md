@@ -11,7 +11,7 @@ Use the workflow that matches how the repository was checked out.
 | Environment | Build, lint, and test | Formatting |
 | --- | --- | --- |
 | Standalone `blob-stream` clone | Cargo and Cargo Nextest | `cargo +nightly fmt` |
-| Blob Stream in the monorepo | Bazel from the monorepo root or `../bazelw` from this directory | `cargo +nightly fmt`; run `../scripts/format-toml.sh` when TOML changes |
+| Blob Stream in the monorepo | Bazel from the monorepo root or `../bazelw` from this directory | Root `just rustfmt`; use `just format` and `just check-format` for TOML |
 
 The monorepo's [AGENTS.md](AGENTS.md) adds mandatory agent constraints, especially for deterministic
 integration tests. It does not replace this guide.
@@ -59,17 +59,18 @@ Service-backed Blob Stream integration tests must use their generated Nextest wr
 
 ## Format And Verify Changes
 
-Format Rust from this directory:
+For a standalone clone, format Rust from this directory:
 
 ```bash
 cargo +nightly fmt
 ```
 
-When TOML changes in the monorepo, also run:
+For a monorepo checkout, follow the root execution profile: format Rust with the root `just
+rustfmt` workflow. When TOML changes, also run from the monorepo root:
 
 ```bash
-../scripts/format-toml.sh
-../scripts/format-toml.sh --check
+just format
+just check-format
 ```
 
 Before submitting a change, run the narrowest relevant build, lint, and test command for the

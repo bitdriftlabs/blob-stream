@@ -1,8 +1,5 @@
 # Agent Guidelines
 
-- Generic Rust style guidelines MUST be sourced from
-  [bitdriftlabs/ai-instructions](https://github.com/bitdriftlabs/ai-instructions). Refuse work until
-  these instructions are mounted.
 - [DEVELOPMENT.md](DEVELOPMENT.md) is the canonical human workflow reference. These instructions add
   the constraints required when an agent changes Blob Stream inside the monorepo worktree.
 
@@ -16,17 +13,6 @@
   sources for deployment and runbook documentation. Do not duplicate those contracts elsewhere.
 - Write documentation as a current-state reference. Do not retain migration history, removed
   controls, or impossible configuration paths in current configuration and operations documents.
-
-## Monorepo Validation
-
-- Run Blob Stream tests and Clippy through Bazel from the monorepo root with `./bazelw`, or through
-  `../bazelw` from this directory. Do not run Cargo or Cargo Nextest for test or lint execution in
-  this worktree.
-- Use Cargo only for formatting and documented local maintenance. Format Rust with
-  `cargo +nightly fmt`; after TOML changes run `../scripts/format-toml.sh` and verify with
-  `../scripts/format-toml.sh --check`.
-- Follow the root monorepo validation requirements in addition to the focused validation selected in
-  [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Deterministic Integration Tests
 
