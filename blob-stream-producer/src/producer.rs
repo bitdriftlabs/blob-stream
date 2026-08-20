@@ -527,8 +527,7 @@ impl ProducerClient for ProducerClientImpl {
       self.flush_notify.notify_one();
     }
 
-    rx.await
-      .map_or(Err(ProducerError::Shutdown), |result| result)
+    rx.await.unwrap_or(Err(ProducerError::Shutdown))
   }
 
   async fn flush(&self) -> Result<(), ProducerError> {

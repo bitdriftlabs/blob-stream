@@ -139,7 +139,7 @@ pub fn logical_partition_for_key(record_key: &[u8], partition_count: u32) -> u32
   let mut hasher = DefaultHasher::new();
   record_key.hash(&mut hasher);
   let logical_partition = hasher.finish() % u64::from(partition_count);
-  u32::try_from(logical_partition).map_or(0, |partition_id| partition_id)
+  u32::try_from(logical_partition).unwrap_or(0)
 }
 
 #[must_use]

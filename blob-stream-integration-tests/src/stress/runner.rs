@@ -764,8 +764,7 @@ async fn run_producer(
       producer_index,
       sequence,
     };
-    let partition_index =
-      usize::try_from(sequence % u64::from(partition_count)).map_or(0, |index| index);
+    let partition_index = usize::try_from(sequence % u64::from(partition_count)).unwrap_or(0);
     let key = partition_keys[partition_index].clone();
     let producer_client = Arc::clone(&producer);
     submissions.push(async move {
