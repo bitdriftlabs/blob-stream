@@ -7,6 +7,7 @@ use super::{
   BrokerNode,
   BrokerPartition,
   balanced_assignment,
+  blob_key_owner,
   metadata_window_owner,
   wait_for_initialized_membership,
   writer_virtual_partitions,
@@ -167,6 +168,48 @@ fn metadata_window_owner_is_stable_for_reordered_and_empty_membership() {
     metadata_window_owner(
       "telemetry",
       1_700_000_000,
+      &BrokerMembership::new(Vec::new()),
+    ),
+    None
+  );
+}
+
+#[test]
+fn blob_key_owner_uses_canonical_initialized_membership() {
+  let node_a = BrokerNode {
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
+  };
+  let node_b = BrokerNode {
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
+  };
+  let node_c = BrokerNode {
+    node_id: "node-c".into(),
+    address: "10.0.0.3:8080".into(),
+  };
+  let ordered = BrokerMembership::new(vec![node_a.clone(), node_b.clone(), node_c.clone()]);
+  let reordered_with_duplicate = BrokerMembership::new(vec![
+    node_c,
+    BrokerNode {
+      node_id: "node-b".into(),
+      address: "10.0.0.99:8080".into(),
+    },
+    node_a,
+    node_b,
+  ]);
+
+  assert_eq!(
+    blob_key_owner("telemetry/segments/blob-1", &ordered),
+    blob_key_owner("telemetry/segments/blob-1", &reordered_with_duplicate)
+  );
+  assert_eq!(
+    blob_key_owner("telemetry/segments/blob-1", &BrokerMembership::Pending),
+    None
+  );
+  assert_eq!(
+    blob_key_owner(
+      "telemetry/segments/blob-1",
       &BrokerMembership::new(Vec::new()),
     ),
     None

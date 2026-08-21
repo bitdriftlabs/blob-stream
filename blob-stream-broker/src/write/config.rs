@@ -1,4 +1,4 @@
-use crate::write::{DEFAULT_ZSTD_LEVEL, WriteEngine, WriteEngineBuilder};
+use crate::write::{AdmissionController, DEFAULT_ZSTD_LEVEL, WriteEngine, WriteEngineBuilder};
 use anyhow::{Context, Result, anyhow, ensure};
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
@@ -7,7 +7,7 @@ use bd_pgv::proto_validate;
 use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
 use bd_server_stats::stats::Scope;
 use bd_shutdown::ComponentShutdownTriggerHandle;
-use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
+use blob_stream_blob_store::BlobStore;
 use blob_stream_broker_discovery::k8s::K8sServiceBrokerDiscovery;
 use blob_stream_broker_discovery::r#static::StaticBrokerDiscovery;
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode};
@@ -22,7 +22,6 @@ use blob_stream_metadata_store::{
   aws_timeout_config,
 };
 use blob_stream_proto::protos::blobstream::v1::config::{
-  BlobStoreConfig,
   BrokerConfig,
   DynamoMetadataStoreConfig,
   MetadataStoreConfig,
@@ -211,68 +210,121 @@ impl TopicInfo {
 }
 
 //
-// build_write_engine
+// RuntimeWriteEngineBuilder
 //
 
-pub async fn build_write_engine(
-  config: &RuntimeConfig,
+/// Builds a write engine from broker runtime configuration and startup-owned dependencies.
+pub struct RuntimeWriteEngineBuilder<'a> {
+  config: &'a RuntimeConfig,
   metadata_store: Arc<dyn MetadataStore>,
   dynamo_capacity_metrics: DynamoCapacityMetrics,
+  blob_store: Option<Arc<dyn BlobStore>>,
+  blob_prefix: Option<String>,
   shutdown_trigger_handle: ComponentShutdownTriggerHandle,
-  metrics_scope: &Scope,
+  metrics_scope: &'a Scope,
   feature_flags: Option<FeatureFlagsWatch>,
-) -> Result<Arc<dyn WriteEngine>> {
-  trace!("building broker write engine from runtime config");
-  proto_validate::validate(config)?;
+  admission: Option<Arc<dyn AdmissionController>>,
+}
 
-  let broker = config
-    .broker
-    .as_ref()
-    .context("runtime config missing broker config")?;
-  let mut write_config = WriteConfig::from_broker_config(broker)?;
-  let holder_id = resolve_node_id(broker)?;
-  let membership_rx = build_membership_watch(broker, &holder_id).await?;
+impl<'a> RuntimeWriteEngineBuilder<'a> {
+  #[must_use]
+  pub fn new(
+    config: &'a RuntimeConfig,
+    metadata_store: Arc<dyn MetadataStore>,
+    dynamo_capacity_metrics: DynamoCapacityMetrics,
+    shutdown_trigger_handle: ComponentShutdownTriggerHandle,
+    metrics_scope: &'a Scope,
+    feature_flags: Option<FeatureFlagsWatch>,
+  ) -> Self {
+    Self {
+      config,
+      metadata_store,
+      dynamo_capacity_metrics,
+      blob_store: None,
+      blob_prefix: None,
+      shutdown_trigger_handle,
+      metrics_scope,
+      feature_flags,
+      admission: None,
+    }
+  }
 
-  let topics = build_topics(&config.topics)?;
-  validate_writer_id(write_config.writer_id, &topics)?;
+  #[must_use]
+  pub fn blob_store(mut self, blob_store: Arc<dyn BlobStore>, blob_prefix: Option<String>) -> Self {
+    self.blob_store = Some(blob_store);
+    self.blob_prefix = blob_prefix;
+    self
+  }
 
-  let blob_store_config = config
-    .blob_store
-    .as_ref()
-    .context("runtime config missing blob_store config")?;
-  let (blob_store, prefix) = build_blob_store(blob_store_config).await?;
-  write_config.blob_prefix = prefix;
+  #[must_use]
+  pub fn admission(mut self, admission: Arc<dyn AdmissionController>) -> Self {
+    self.admission = Some(admission);
+    self
+  }
 
-  let metadata_store_config = config
-    .metadata_store
-    .as_ref()
-    .context("runtime config missing metadata_store config")?;
+  pub async fn build(self) -> Result<Arc<dyn WriteEngine>> {
+    let Self {
+      config,
+      metadata_store,
+      dynamo_capacity_metrics,
+      blob_store,
+      blob_prefix,
+      shutdown_trigger_handle,
+      metrics_scope,
+      feature_flags,
+      admission,
+    } = self;
+    trace!("building broker write engine from runtime config");
+    proto_validate::validate(config)?;
+    let blob_store = blob_store.ok_or_else(|| anyhow!("broker blob store is required"))?;
 
-  let lease_store =
-    build_producer_partition_lease_store(metadata_store_config, dynamo_capacity_metrics).await?;
-  let topics_count = topics.len();
-  let holder_id_for_log = holder_id.clone();
-  let writer_id = write_config.writer_id;
-  let engine = WriteEngineBuilder::new(
-    write_config,
-    topics,
-    blob_store,
-    metadata_store,
-    lease_store,
-    holder_id,
-    shutdown_trigger_handle,
-    metrics_scope,
-  )
-  .membership_rx(membership_rx)
-  .feature_flags(feature_flags)
-  .build()?;
+    let broker = config
+      .broker
+      .as_ref()
+      .context("runtime config missing broker config")?;
+    let mut write_config = WriteConfig::from_broker_config(broker)?;
+    let holder_id = resolve_node_id(broker)?;
+    let membership_rx = build_membership_watch(broker, &holder_id).await?;
 
-  debug!(
-    "broker write engine built: holder_id={holder_id_for_log}, topics={topics_count}, \
-     writer_id={writer_id}"
-  );
+    let topics = build_topics(&config.topics)?;
+    validate_writer_id(write_config.writer_id, &topics)?;
 
-  Ok(Arc::new(engine))
+    write_config.blob_prefix = blob_prefix;
+
+    let metadata_store_config = config
+      .metadata_store
+      .as_ref()
+      .context("runtime config missing metadata_store config")?;
+
+    let lease_store =
+      build_producer_partition_lease_store(metadata_store_config, dynamo_capacity_metrics).await?;
+    let topics_count = topics.len();
+    let holder_id_for_log = holder_id.clone();
+    let writer_id = write_config.writer_id;
+    let mut builder = WriteEngineBuilder::new(
+      write_config,
+      topics,
+      blob_store,
+      metadata_store,
+      lease_store,
+      holder_id,
+      shutdown_trigger_handle,
+      metrics_scope,
+    )
+    .membership_rx(membership_rx)
+    .feature_flags(feature_flags);
+    if let Some(admission) = admission {
+      builder = builder.admission(admission);
+    }
+    let engine = builder.build()?;
+
+    debug!(
+      "broker write engine built: holder_id={holder_id_for_log}, topics={topics_count}, \
+       writer_id={writer_id}"
+    );
+
+    Ok(Arc::new(engine))
+  }
 }
 
 /// Build the metadata store once so broker write and read paths share backend clients and state.
@@ -427,53 +479,6 @@ fn hostname_identity() -> Result<String> {
   let hostname = hostname.to_string_lossy().to_string();
   ensure!(!hostname.trim().is_empty(), "hostname is empty");
   Ok(hostname)
-}
-
-async fn build_blob_store(
-  config: &BlobStoreConfig,
-) -> Result<(Arc<dyn BlobStore>, Option<String>)> {
-  if config.has_in_memory() {
-    debug!("using in-memory blob store backend");
-    let store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
-    return Ok((store, None));
-  }
-
-  if config.has_s3() {
-    debug!("using s3 blob store backend");
-    let s3 = config.s3();
-    let bucket = s3.bucket.to_string();
-    let region = s3.region.to_string();
-
-    let region_provider = RegionProviderChain::first_try(Some(Region::new(region)));
-    let mut loader = aws_config::defaults(BehaviorVersion::latest())
-      .region(region_provider)
-      .retry_config(aws_retry_config())
-      .timeout_config(aws_timeout_config());
-    if !s3.endpoint.is_empty() {
-      loader = loader.endpoint_url(s3.endpoint.to_string());
-    }
-
-    let shared = loader.load().await;
-    let client = if s3.endpoint.is_empty() {
-      aws_sdk_s3::Client::new(&shared)
-    } else {
-      // Local S3-compatible endpoints (e.g. LocalStack) require path-style requests.
-      let config = aws_sdk_s3::config::Builder::from(&shared)
-        .force_path_style(true)
-        .build();
-      aws_sdk_s3::Client::from_conf(config)
-    };
-    let store: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(client, bucket));
-    let prefix = if s3.prefix.is_empty() {
-      None
-    } else {
-      Some(s3.prefix.to_string())
-    };
-
-    return Ok((store, prefix));
-  }
-
-  Err(anyhow!("blob_store backend not configured"))
 }
 
 async fn build_metadata_store(

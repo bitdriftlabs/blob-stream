@@ -61,6 +61,9 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 | `metadata_batches_scanned`, `metadata_batches_skipped_by_cursor` | Counters | Batches decoded from metadata and batches skipped because the committed cursor had already passed them. |
 | `blob_range_requests`, `blob_range_bytes`, `blob_range_latency_seconds` | Counters, histogram | S3/object-store byte-range reads, bytes read, and range-read latency. |
 | `blob_batch_ranges`, `blob_batch_range_bytes` | Counters | Byte ranges planned for individual encoded batches and their total bytes. |
+| `broker_blob_range_attempts`, `broker_blob_range_deliveries`, `broker_blob_range_delivery_items`, `broker_blob_range_delivery_bytes`, `broker_blob_range_latency_seconds` | Counters, counter, counters, counter, histogram | Broker raw-blob group attempts, validated broker deliveries, delivered ranges and bytes, and broker delivery latency. Direct range metrics remain unchanged and increment only when a direct object-store range read occurs. |
+| `broker_blob_range_not_found_groups`, `broker_blob_range_not_found_items` | Counters | Authoritative immutable-object absences accepted without a direct retry. |
+| `broker_blob_range_fallbacks` | Counter | Broker range groups retried through the original direct object-store reads after any non-authoritative transport, protocol, timeout, admission, or storage failure. |
 | `batches_read`, `records_read`, `record_payload_bytes` | Counters | Decoded batches, records, and uncompressed record payload bytes accepted by the reader. |
 | `lost_records` | Counter | Records dropped because a requested historical position cannot be recovered from retained data. |
 
@@ -112,6 +115,27 @@ aggregate capacity and current admission state through `/admin/metadata-cache`.
 authoritative query. Subtracting `storage_queries_total` from
 `coalescing_window_requests_total` gives the number of requests collapsed into an existing query
 group. Both calculations apply to eventual and strong reads; retained-cache hits are separate.
+
+### Blob Cache: `blob_stream_broker:blob_cache`
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `requests_total`, `response_items_total`, `response_bytes_total`, `request_latency_seconds` | Counters, counters, counter, histogram | Raw blob-range requests, successful requested-range items and bytes, and complete broker cache request latency. |
+| `hits_total`, `fetches_total`, `fetch_bytes_total` | Counters | Retained complete-blob hits, bounded whole-object storage reads, and bytes fetched into the cache. |
+| `evictions_total`, `pressure_flushes_total` | Counters | Idle/underlying-cache removals and cache invalidations caused by a memory-overload transition. |
+| `not_found_total`, `overloads_total`, `failures_total` | Counters | Authoritative absent objects, retryable overload outcomes, and all failed cache requests. |
+| `entries`, `retained_bytes`, `active_fetches` | Gauges | Current retained complete-object count and bytes, and in-flight whole-object reads. |
+
+These metrics have no object-key, topic, partition, or consumer labels. Use `/admin/blob-cache`
+for the matching aggregate cache headroom and reservation state. A useful aggregate collapse signal
+is:
+
+$$
+collapse\ rate = 1 - \frac{fetches\_total}{response\_items\_total}
+$$
+
+Interpret it together with direct consumer range reads and bytes: a higher collapse rate is useful
+only when whole-object overfetch and broker resource use remain acceptable.
 
 ### gRPC: `blob_stream_broker:grpc`
 

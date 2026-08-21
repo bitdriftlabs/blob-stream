@@ -24,4 +24,5 @@ pub mod config;
 pub mod grpc;
 pub mod metrics;
 pub mod read;
+pub mod storage;
 pub mod write;

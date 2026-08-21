@@ -20,9 +20,15 @@ This document describes the current implementation and its behavioral contracts.
   provide monotonic progress only within a virtual partition.
 - Consumers use cursors, not timestamp seeks. A new consumer group starts at its current aligned
   metadata window; a resumed group recovers from its committed metadata source through retention.
-- Brokers optionally serve bounded cached metadata-window reads; consumers still read segment
-  bytes directly from blob storage and fall back to DynamoDB whenever the broker path is disabled
-  or unavailable. There is no broker blob-byte read path, compaction, built-in authorization, or
+- Brokers optionally serve bounded cached metadata-window reads and a bounded raw blob-range RPC.
+  The blob-range service inspects an object's advertised content length and admits its complete
+  immutable body only when the Linux cgroup-aware memory monitor has enough headroom, before
+  streaming that body from storage. It then returns exact requested byte slices. Consumers select
+  the broker blob-range path with a live feature flag, grouping the current pass's segment ranges
+  by immutable blob key. A complete validated broker response supplies raw bytes to the existing
+  consumer decoder; any unavailable, malformed, or retryable response reissues the whole group
+  through direct blob storage. An authoritative broker `NOT_FOUND` follows the existing
+  missing-batch path without a direct retry. There is no compaction, built-in authorization, or
   idempotent producer protocol.
 - DynamoDB TTL is written by the service. S3 lifecycle expiration is configured by operators and
   must remain aligned with the chosen retention period.
@@ -319,13 +325,23 @@ deployment model.
 
 ## Read Path
 
-Consumers read segment bytes directly from blob storage. Metadata reads use DynamoDB directly by
-default; an enabled consumer may route a bounded metadata-window request to its deterministically
-selected local broker. The broker uses a byte-bounded Moka cache for eventual metadata, collapses
-concurrent requests, and falls back to its authoritative DynamoDB store on a miss. Strong reads
-collapse only concurrent broker requests and are never retained after completion. A broker failure,
-invalid response, unavailable membership, or disabled capability causes the consumer to use its
-original direct DynamoDB scan.
+Consumers range-read segment bytes directly from blob storage by default. Metadata reads use
+DynamoDB directly by default; an enabled consumer may route a bounded metadata-window request to
+its deterministically selected local broker. The broker uses a byte-bounded Moka cache for eventual
+metadata, collapses concurrent requests, and falls back to its authoritative DynamoDB store on a
+miss. Strong reads collapse only concurrent broker requests and are never retained after
+completion. A broker failure, invalid response, unavailable membership, or disabled capability
+causes the consumer to use its original direct DynamoDB scan.
+
+The independently enabled raw blob path groups currently planned batch ranges by immutable blob
+key and sends each group to its deterministic local broker. The broker caches a bounded complete
+compressed object, shares one in-flight whole-object read for concurrent same-key requests, then
+returns only the requested ranges. Consumers retain decompression, validation, ordering, cursor
+progression, and direct blob-storage authority. `NOT_FOUND` is authoritative for an immutable
+object and preserves the existing missing-batch behavior; every other broker, protocol, admission,
+or timeout failure retries every range in the group directly from blob storage. The broker cache is
+best-effort: idle expiry or memory pressure removes retained objects without changing delivery
+semantics.
 
 Tail and Full Recovery metadata use independent byte-weighted Moka caches with a five-minute idle
 expiry. A retained entry is invalidated when it is stale or cannot cover the request. The broker

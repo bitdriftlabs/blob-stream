@@ -81,9 +81,14 @@ broker control. Consumer reader flags
 `blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`,
 `blob_stream_consumer_max_in_flight_batch_reads`,
 `blob_stream_consumer_broker_metadata_cache_enabled`, and
-`blob_stream_consumer_broker_metadata_cache_shadow` are live.
+`blob_stream_consumer_broker_metadata_cache_shadow` are live. The raw blob path is selected by the
+live `blob_stream_consumer_broker_batch_cache_enabled` flag and defaults to disabled.
 `ConsumerIteratorBootstrapConfig.broker_discovery` is required; the broker metadata cache is
-always available and only consumer flags control whether it is used.
+always available and only consumer flags control whether it is used. Blob-cache idle retention is
+configured when a broker starts through
+`blob_stream_broker_blob_cache_idle_ttl_ms`; it defaults to 10 seconds and must be positive.
+The broker admits each complete object from its reported content length and current cgroup headroom
+before reading its body.
 Shadow mode always delivers the direct DynamoDB result and uses a validated broker response only
 for comparison. Broker-delivery mode returns the broker result but retains the original direct
 scan as fallback for transport, validation, overload, or stale-observation failures. Consumer
@@ -93,9 +98,10 @@ See [Operations](operations.md) for the complete inventory and rollout behavior.
 
 ## S3
 
-Production brokers write segment objects and consumers range-read them. Configure an S3 bucket in
-the same region as the deployment, grant brokers write access and consumers read access, and choose
-an optional prefix for isolation. Segment keys use:
+Production brokers write segment objects and consumers range-read them. Brokers also need read
+access when serving the optional raw blob cache. Configure an S3 bucket in the same region as the
+deployment, grant brokers read/write access and consumers read access, and choose an optional prefix
+for isolation. Segment keys use:
 
 ```text
 <prefix>/<topic>/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>
@@ -148,7 +154,8 @@ required by its encryption policy.
 
 ### Broker
 
-- S3 bucket/prefix: `s3:PutObject`.
+- S3 bucket/prefix: `s3:PutObject` and `s3:GetObject`. `GetObject` is required only when the
+  broker serves raw blob-range cache requests, but grant it before enabling the consumer flag.
 - Segment-metadata table: `dynamodb:PutItem` for ordinary and fenced metadata publication.
 - Broker cached metadata reads require `dynamodb:Query` on the segment-metadata table. Every
   retained-cache miss, invalidation, and strong metadata read requires DynamoDB-backed refill

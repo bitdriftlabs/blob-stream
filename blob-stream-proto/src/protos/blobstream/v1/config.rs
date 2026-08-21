@@ -59,6 +59,8 @@ pub struct BrokerConfig {
     pub metadata_cache_coalescing_window: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.metadata_cache_request_timeout)
     pub metadata_cache_request_timeout: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.BrokerConfig.blob_cache_request_timeout)
+    pub blob_cache_request_timeout: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.BrokerConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -76,7 +78,7 @@ impl BrokerConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(15);
+        let mut fields = ::std::vec::Vec::with_capacity(16);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "flush_max_bytes",
@@ -153,6 +155,11 @@ impl BrokerConfig {
             |m: &BrokerConfig| { &m.metadata_cache_request_timeout },
             |m: &mut BrokerConfig| { &mut m.metadata_cache_request_timeout },
         ));
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "blob_cache_request_timeout",
+            |m: &BrokerConfig| { &m.blob_cache_request_timeout },
+            |m: &mut BrokerConfig| { &mut m.blob_cache_request_timeout },
+        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<BrokerConfig>(
             "BrokerConfig",
             fields,
@@ -215,6 +222,9 @@ impl ::protobuf::Message for BrokerConfig {
                 },
                 130 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.metadata_cache_request_timeout)?;
+                },
+                138 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.blob_cache_request_timeout)?;
                 },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
@@ -281,6 +291,10 @@ impl ::protobuf::Message for BrokerConfig {
             let len = v.compute_size();
             my_size += 2 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
+        if let Some(v) = self.blob_cache_request_timeout.as_ref() {
+            let len = v.compute_size();
+            my_size += 2 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -332,6 +346,9 @@ impl ::protobuf::Message for BrokerConfig {
         if let Some(v) = self.metadata_cache_request_timeout.as_ref() {
             ::protobuf::rt::write_message_field_with_cached_size(16, v, os)?;
         }
+        if let Some(v) = self.blob_cache_request_timeout.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(17, v, os)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -364,6 +381,7 @@ impl ::protobuf::Message for BrokerConfig {
         self.metadata_cache_max_bytes = ::std::option::Option::None;
         self.metadata_cache_coalescing_window.clear();
         self.metadata_cache_request_timeout.clear();
+        self.blob_cache_request_timeout.clear();
         self.special_fields.clear();
     }
 
@@ -384,6 +402,7 @@ impl ::protobuf::Message for BrokerConfig {
             metadata_cache_max_bytes: ::std::option::Option::None,
             metadata_cache_coalescing_window: ::protobuf::MessageField::none(),
             metadata_cache_request_timeout: ::protobuf::MessageField::none(),
+            blob_cache_request_timeout: ::protobuf::MessageField::none(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -4630,7 +4649,7 @@ impl ProducerCompression {
 
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n\x1ablobstream/v1/config.proto\x12\rblobstream.v1\x1a\x1egoogle/protob\
-    uf/duration.proto\x1a\x17validate/validate.proto\"\xb9\t\n\x0cBrokerConf\
+    uf/duration.proto\x1a\x17validate/validate.proto\"\x9b\n\n\x0cBrokerConf\
     ig\x12&\n\x0fflush_max_bytes\x18\x01\x20\x01(\rR\rflushMaxBytes\x12K\n\
     \x0fflush_max_delay\x18\x02\x20\x01(\x0b2\x19.google.protobuf.DurationR\
     \rflushMaxDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12$\n\tbind_addr\x18\x03\
@@ -4655,16 +4674,18 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     tionR\x1dmetadataCacheCoalescingWindowB\x08\xfaB\x05\xaa\x01\x022\0\x12h\
     \n\x1emetadata_cache_request_timeout\x18\x10\x20\x01(\x0b2\x19.google.pr\
     otobuf.DurationR\x1bmetadataCacheRequestTimeoutB\x08\xfaB\x05\xaa\x01\
-    \x02*\0B\x16\n\x14_segment_compressionB\x0c\n\n_writer_idB\x1c\n\x1a_seq\
-    uence_reservation_sizeB\x1b\n\x19_metadata_cache_max_bytes\"R\n\x18Broke\
-    rFeatureFlagsConfig\x12\x19\n\x03dir\x18\x01\x20\x01(\tR\x03dirB\x07\xfa\
-    B\x04r\x02\x10\x01\x12\x1b\n\x04file\x18\x02\x20\x01(\tR\x04fileB\x07\
-    \xfaB\x04r\x02\x10\x01\"\x96\x01\n\x18BrokerNodeIdentityConfig\x12&\n\ts\
-    tatic_id\x18\x01\x20\x01(\tH\0R\x08staticIdB\x07\xfaB\x04r\x02\x10\x01\
-    \x12C\n\x08hostname\x18\x02\x20\x01(\x0b2%.blobstream.v1.BrokerHostnameI\
-    dentityH\0R\x08hostnameB\r\n\x06source\x12\x03\xf8B\x01\"\x18\n\x16Broke\
-    rHostnameIdentity\"\xc0\x01\n\x15BrokerDiscoveryConfig\x12D\n\x06static\
-    \x18\x01\x20\x01(\x0b2*.blobstream.v1.StaticBrokerDiscoveryConfigH\0R\
+    \x02*\0\x12`\n\x1ablob_cache_request_timeout\x18\x11\x20\x01(\x0b2\x19.g\
+    oogle.protobuf.DurationR\x17blobCacheRequestTimeoutB\x08\xfaB\x05\xaa\
+    \x01\x02*\0B\x16\n\x14_segment_compressionB\x0c\n\n_writer_idB\x1c\n\x1a\
+    _sequence_reservation_sizeB\x1b\n\x19_metadata_cache_max_bytes\"R\n\x18B\
+    rokerFeatureFlagsConfig\x12\x19\n\x03dir\x18\x01\x20\x01(\tR\x03dirB\x07\
+    \xfaB\x04r\x02\x10\x01\x12\x1b\n\x04file\x18\x02\x20\x01(\tR\x04fileB\
+    \x07\xfaB\x04r\x02\x10\x01\"\x96\x01\n\x18BrokerNodeIdentityConfig\x12&\
+    \n\tstatic_id\x18\x01\x20\x01(\tH\0R\x08staticIdB\x07\xfaB\x04r\x02\x10\
+    \x01\x12C\n\x08hostname\x18\x02\x20\x01(\x0b2%.blobstream.v1.BrokerHostn\
+    ameIdentityH\0R\x08hostnameB\r\n\x06source\x12\x03\xf8B\x01\"\x18\n\x16B\
+    rokerHostnameIdentity\"\xc0\x01\n\x15BrokerDiscoveryConfig\x12D\n\x06sta\
+    tic\x18\x01\x20\x01(\x0b2*.blobstream.v1.StaticBrokerDiscoveryConfigH\0R\
     \x06static\x12Q\n\x0bk8s_service\x18\x02\x20\x01(\x0b2..blobstream.v1.K8\
     sServiceBrokerDiscoveryConfigH\0R\nk8sServiceB\x0e\n\x07backend\x12\x03\
     \xf8B\x01\"X\n\x1bStaticBrokerDiscoveryConfig\x129\n\x05nodes\x18\x01\

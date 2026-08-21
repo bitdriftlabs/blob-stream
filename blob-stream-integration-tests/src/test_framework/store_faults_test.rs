@@ -1,4 +1,5 @@
 use super::{
+  FaultInjectedBlobStore,
   FaultInjectedConsumerGroupLeaseStore,
   FaultInjectedConsumerGroupMembershipStore,
   FaultInjectedProducerPartitionLeaseStore,
@@ -8,6 +9,7 @@ use super::{
   StoreFaultOperation,
   StoreFaultRule,
 };
+use blob_stream_blob_store::{BlobKey, BlobStore, BlobStoreError, InMemoryBlobStore};
 use blob_stream_metadata_store::{
   ConsumerGroupLeaseKey,
   ConsumerGroupLeaseStore,
@@ -22,6 +24,39 @@ use blob_stream_metadata_store::{
 use blob_stream_types::offset_datetime_from_unix_millis;
 use std::sync::Arc;
 use time::Duration;
+
+#[tokio::test]
+async fn blob_cache_admission_read_honors_not_found_faults() {
+  let controller = StoreFaultController::default();
+  let store = FaultInjectedBlobStore::new(Arc::new(InMemoryBlobStore::new()), controller.clone());
+  let key = BlobKey::from("telemetry/blob");
+  store
+    .put(&key, bytes::Bytes::from_static(b"payload"))
+    .await
+    .expect("seed blob");
+  controller
+    .enable_fault(StoreFaultRule {
+      domain: StoreFaultDomain::Blob,
+      operation: StoreFaultOperation::BlobGetWithCacheAdmission,
+      key_pattern: Some(key.as_str().to_string()),
+      action: StoreFaultAction::NotFound,
+      remaining_hits: Some(1),
+    })
+    .await;
+
+  let error = store
+    .get_with_cache_admission(&key, &|_| true)
+    .await
+    .expect_err("cache admission read should honor the injected not-found fault");
+  assert!(matches!(error, BlobStoreError::NotFound { .. }));
+  assert!(controller.events().await.iter().any(|event| {
+    event.operation == StoreFaultOperation::BlobGetWithCacheAdmission
+      && event
+        .action
+        .as_ref()
+        .is_some_and(|action| matches!(action, StoreFaultAction::NotFound))
+  }));
+}
 
 #[tokio::test]
 async fn coalesced_reservation_honors_sequence_reservation_faults() {

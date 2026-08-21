@@ -15,7 +15,7 @@ use crate::config::{
   consumer_read_runtime_settings,
   validate_read_config,
 };
-use crate::consumer::metadata_query::BrokerMetadataQuery;
+use crate::consumer::{BrokerBlobRangeQuery, BrokerMetadataQuery};
 use anyhow::{Result, ensure};
 use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
@@ -100,6 +100,7 @@ pub struct ConsumerReaderImpl {
   pub(in crate::consumer) blob_store: Arc<dyn BlobStore>,
   pub(in crate::consumer) metadata_store: Arc<dyn MetadataStore>,
   pub(in crate::consumer) broker_metadata_query: Option<Arc<dyn BrokerMetadataQuery>>,
+  pub(in crate::consumer) broker_blob_range_query: Option<Arc<dyn BrokerBlobRangeQuery>>,
   pub(in crate::consumer) virtual_partition_states:
     HashMap<VirtualPartitionId, VirtualPartitionState>,
   pub(in crate::consumer) retention: Duration,

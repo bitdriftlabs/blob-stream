@@ -28,7 +28,13 @@ use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore};
 use blob_stream_broker::grpc::make_broker_router;
 use blob_stream_broker::metrics::BrokerMetrics;
+use blob_stream_broker::read::blob_cache::{BlobCache, BlobCacheConfig};
 use blob_stream_broker::read::metadata_cache::{MetadataCache, MetadataCacheConfig};
+use blob_stream_broker::write::memory_pressure::{
+  MemoryPressureController,
+  MemoryPressureSample,
+  MemoryPressureSampler,
+};
 use blob_stream_broker::write::{
   BrokerLeaseStatus,
   BrokerStateSnapshot,
@@ -38,7 +44,7 @@ use blob_stream_broker::write::{
   WriteEngineBuilder,
 };
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode};
-use blob_stream_consumer::consumer::GrpcBrokerMetadataQuery;
+use blob_stream_consumer::consumer::{GrpcBrokerBlobRangeQuery, GrpcBrokerMetadataQuery};
 use blob_stream_consumer::iterator::{ConsumerIteratorBuilder, ConsumerIteratorImpl};
 use blob_stream_consumer::{
   ConsumerRuntimeConfig,
@@ -84,6 +90,17 @@ struct BrokerHandle {
   listener_shutdown_tx: Option<oneshot::Sender<()>>,
   broker_shutdown_trigger: Option<ComponentShutdownTrigger>,
   serve_task: JoinHandle<()>,
+}
+
+struct StaticMemoryPressureSampler;
+
+impl MemoryPressureSampler for StaticMemoryPressureSampler {
+  fn sample(&self) -> Result<MemoryPressureSample> {
+    Ok(MemoryPressureSample {
+      allocated_bytes: 0,
+      limit_bytes: 1_u64 << 30,
+    })
+  }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -707,6 +724,51 @@ impl ClusterHarness {
     .await
   }
 
+  /// Build a consumer that exercises the production broker blob-range transport.
+  pub async fn create_broker_blob_cache_consumer_with_discovery(
+    &self,
+    runtime: &ConsumerRuntimeConfig,
+    discovery: Arc<dyn BrokerDiscovery>,
+  ) -> Result<ConsumerIteratorImpl> {
+    let group = runtime
+      .group
+      .as_ref()
+      .ok_or_else(|| anyhow!("consumer runtime config requires a group config"))?;
+    let coordination_source = Arc::new(
+      MembershipCoordinationSource::new(
+        group.topic.to_string(),
+        group.group_id.to_string(),
+        group.member_id.to_string(),
+        (0 .. self.partition_count).collect(),
+        Arc::clone(&self.consumer_membership_store),
+      )
+      .time_provider(Arc::clone(&self.consumer_time_provider)),
+    );
+    let feature_flags = FakeLoader::new(Arc::new(
+      DefaultFeatureFlags::default()
+        .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
+    ));
+    let broker_blob_range_query = Arc::new(GrpcBrokerBlobRangeQuery::new(discovery).await?);
+
+    ConsumerIteratorBuilder::new(
+      runtime,
+      Arc::clone(&self.blob_store),
+      Arc::clone(&self.metadata_store),
+      Arc::clone(&self.consumer_lease_store),
+      Arc::clone(&self.consumer_membership_store),
+      coordination_source,
+      Collector::default().scope("blob_stream_consumer_it"),
+      time::Duration::days(1),
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+      Some(feature_flags.snapshot_watch()),
+    )
+    .broker_blob_range_query(broker_blob_range_query)
+    .lifecycle_hooks(Arc::new(self.lifecycle_hooks.clone()))
+    .time_provider(Arc::clone(&self.consumer_time_provider))
+    .build()
+    .await
+  }
+
   pub fn consumer_lease_store(&self) -> Arc<dyn ConsumerGroupLeaseStore> {
     Arc::clone(&self.consumer_lease_store)
   }
@@ -844,6 +906,15 @@ impl ClusterHarness {
       .register_write_engine(&node.node_id, Arc::clone(&write_engine))?;
 
     let metrics = BrokerMetrics::new();
+    let blob_cache = Arc::new(BlobCache::new(
+      Arc::clone(&self.blob_store),
+      BlobCacheConfig::from_broker_config(&BrokerConfig::new(), None)?,
+      MemoryPressureController::with_sampler(
+        Arc::new(StaticMemoryPressureSampler),
+        &metrics.scope(),
+      ),
+      &metrics.scope(),
+    ));
     let metadata_cache = Arc::new(MetadataCache::new(
       Arc::clone(&self.metadata_store),
       test_metadata_cache_config(
@@ -859,6 +930,7 @@ impl ClusterHarness {
         let router = make_broker_router(
           Arc::clone(&write_engine),
           Arc::clone(&metadata_cache),
+          blob_cache,
           &metrics,
         );
         tokio::spawn(async move {

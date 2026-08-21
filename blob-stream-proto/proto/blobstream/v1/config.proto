@@ -68,6 +68,10 @@ message BrokerConfig {
   // Deadline for one metadata-cache RPC, including coalescing, DynamoDB, and encoding. Default
   // when unset: 5 seconds.
   google.protobuf.Duration metadata_cache_request_timeout = 16 [(validate.rules).duration.gt = {}];
+
+  // Deadline for one blob-cache RPC, including blob storage, slicing, and encoding. Default when
+  // unset: 30 seconds.
+  google.protobuf.Duration blob_cache_request_timeout = 17 [(validate.rules).duration.gt = {}];
 }
 
 // Filesystem paths used to reload broker feature flags.

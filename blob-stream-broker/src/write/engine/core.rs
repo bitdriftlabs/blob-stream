@@ -9,7 +9,7 @@ use super::super::{
   TopicInfo,
   WriteConfig,
 };
-use super::MemoryPressureAdmissionController;
+use super::MemoryPressureController;
 use anyhow::Result;
 use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
@@ -188,10 +188,7 @@ impl<'a> WriteEngineBuilder<'a> {
       lifecycle_hooks.clone(),
     );
     let admission = admission.unwrap_or_else(|| {
-      Arc::new(MemoryPressureAdmissionController::new(
-        &shutdown_trigger_handle,
-        &metrics_scope.scope("write"),
-      ))
+      MemoryPressureController::new(&shutdown_trigger_handle, &metrics_scope.scope("write"))
     });
     let engine = WriteEngineImpl {
       config,

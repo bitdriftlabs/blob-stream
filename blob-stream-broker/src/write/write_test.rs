@@ -21,6 +21,7 @@ use bd_server_stats::test::util::stats::Helper;
 use bd_shutdown::ComponentShutdownTrigger;
 use bd_time::TimeProvider;
 use blob_stream_blob_store::{
+  BlobCacheAdmission,
   BlobKey,
   BlobStore,
   BlobStoreError,
@@ -142,6 +143,18 @@ impl BlobStore for GatedBlobStore {
       source: anyhow::anyhow!("reads are not used by this test: {range:?}"),
     })
   }
+
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    let _ = admission;
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("cache admission reads are not used by this test"),
+    })
+  }
 }
 
 #[async_trait]
@@ -164,6 +177,18 @@ impl BlobStore for BlockingBlobStore {
     Err(BlobStoreError::Read {
       key: key.as_str().to_string(),
       source: anyhow::anyhow!("reads are not used by this test: {range:?}"),
+    })
+  }
+
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    let _ = admission;
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("cache admission reads are not used by this test"),
     })
   }
 }

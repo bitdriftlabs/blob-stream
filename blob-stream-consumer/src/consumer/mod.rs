@@ -3,6 +3,8 @@
 mod tests;
 
 mod api;
+mod blob_query;
+mod broker_client;
 mod diagnostics;
 mod metadata_query;
 mod metrics;
@@ -13,6 +15,14 @@ mod time;
 
 pub(crate) use api::ConsumerReadOutcome;
 pub use api::{ConsumerBatch, ConsumerReader, ReadCapacity};
+pub(crate) use blob_query::decode_blob_range_response_for_ranges;
+pub use blob_query::{
+  BrokerBlobRangeQuery,
+  BrokerBlobRangeRead,
+  GrpcBrokerBlobRangeQuery,
+  decode_blob_range_response,
+};
+pub(crate) use broker_client::BrokerClientPool;
 pub(crate) use diagnostics::{
   ConsumerReaderFastFrontierState,
   ConsumerReaderFastScanBoundState,

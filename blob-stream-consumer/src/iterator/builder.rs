@@ -16,7 +16,7 @@ use crate::config::{
   consumer_prefetch_max_bytes,
   validate_runtime_config,
 };
-use crate::consumer::{BrokerMetadataQuery, ConsumerReaderImpl};
+use crate::consumer::{BrokerBlobRangeQuery, BrokerMetadataQuery, ConsumerReaderImpl};
 use crate::coordination::ConsumerGroupCoordinatorImpl;
 use crate::diagnostics::ConsumerDiagnostics;
 use anyhow::{Result, anyhow, ensure};
@@ -58,6 +58,7 @@ pub struct ConsumerIteratorBuilder<'a> {
   metadata_cache_max_age: Duration,
   feature_flags: Option<FeatureFlagsWatch>,
   broker_metadata_query: Option<Arc<dyn BrokerMetadataQuery>>,
+  broker_blob_range_query: Option<Arc<dyn BrokerBlobRangeQuery>>,
   time_provider: Arc<dyn TimeProvider>,
   lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
 }
@@ -94,6 +95,7 @@ impl<'a> ConsumerIteratorBuilder<'a> {
       metadata_cache_max_age: Duration::ZERO,
       feature_flags,
       broker_metadata_query: None,
+      broker_blob_range_query: None,
       time_provider: Arc::new(SystemTimeProvider),
       lifecycle_hooks: None,
     }
@@ -135,6 +137,12 @@ impl<'a> ConsumerIteratorBuilder<'a> {
   #[must_use]
   pub fn broker_metadata_query(mut self, query: Arc<dyn BrokerMetadataQuery>) -> Self {
     self.broker_metadata_query = Some(query);
+    self
+  }
+
+  #[must_use]
+  pub fn broker_blob_range_query(mut self, query: Arc<dyn BrokerBlobRangeQuery>) -> Self {
+    self.broker_blob_range_query = Some(query);
     self
   }
 }
@@ -189,6 +197,7 @@ impl ConsumerIteratorBuilder<'_> {
       metadata_cache_max_age,
       feature_flags,
       broker_metadata_query,
+      broker_blob_range_query,
       time_provider,
       lifecycle_hooks,
     } = self;
@@ -238,6 +247,11 @@ impl ConsumerIteratorBuilder<'_> {
     .metadata_cache_max_age(metadata_cache_max_age);
     let reader = if let Some(broker_metadata_query) = broker_metadata_query {
       reader.broker_metadata_query(broker_metadata_query)
+    } else {
+      reader
+    };
+    let reader = if let Some(broker_blob_range_query) = broker_blob_range_query {
+      reader.broker_blob_range_query(broker_blob_range_query)
     } else {
       reader
     };

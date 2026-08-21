@@ -5,8 +5,11 @@ use bd_shutdown::{ComponentShutdownTrigger, real_graceful_shutdown};
 use blob_stream_broker::config::load_runtime_config;
 use blob_stream_broker::grpc::make_broker_router;
 use blob_stream_broker::metrics::BrokerMetrics;
+use blob_stream_broker::read::blob_cache::{BlobCache, BlobCacheConfig};
 use blob_stream_broker::read::metadata_cache::{MetadataCache, MetadataCacheConfig};
-use blob_stream_broker::write::{build_runtime_metadata_store, build_write_engine};
+use blob_stream_broker::storage::build_runtime_blob_store;
+use blob_stream_broker::write::memory_pressure::MemoryPressureController;
+use blob_stream_broker::write::{RuntimeWriteEngineBuilder, build_runtime_metadata_store};
 use blob_stream_metadata_store::DynamoCapacityMetrics;
 use clap::Parser;
 use log::info;
@@ -68,6 +71,7 @@ async fn async_main() -> Result<()> {
   let dynamo_capacity_metrics = DynamoCapacityMetrics::new(&metrics_scope.scope("dynamo"));
   let metadata_store =
     build_runtime_metadata_store(&config, dynamo_capacity_metrics.clone()).await?;
+  let broker_blob_store = build_runtime_blob_store(&config).await?;
   let metadata_cache_config =
     MetadataCacheConfig::from_runtime_config(&config, feature_flags_watch.as_ref())?;
   let metadata_cache = Arc::new(MetadataCache::new_with_metrics(
@@ -75,7 +79,15 @@ async fn async_main() -> Result<()> {
     metadata_cache_config,
     &metrics_scope,
   ));
-  let write_engine = build_write_engine(
+  let memory_pressure =
+    MemoryPressureController::new(&broker_shutdown_trigger.make_handle(), &metrics_scope);
+  let blob_cache = Arc::new(BlobCache::new(
+    Arc::clone(&broker_blob_store.blob_store),
+    BlobCacheConfig::from_broker_config(broker_config, feature_flags_watch.as_ref())?,
+    Arc::clone(&memory_pressure),
+    &metrics_scope,
+  ));
+  let write_engine = RuntimeWriteEngineBuilder::new(
     &config,
     metadata_store,
     dynamo_capacity_metrics,
@@ -83,6 +95,9 @@ async fn async_main() -> Result<()> {
     &metrics_scope,
     feature_flags_watch,
   )
+  .blob_store(broker_blob_store.blob_store, broker_blob_store.prefix)
+  .admission(memory_pressure)
+  .build()
   .await?;
   let listener = tokio::net::TcpListener::bind(addr).await?;
   info!("broker listening: bind_addr={addr}, metrics_path=/metrics, log_path=/admin/log");
@@ -92,7 +107,7 @@ async fn async_main() -> Result<()> {
   let server = tokio::spawn(async move {
     axum::serve(
       listener,
-      make_broker_router(write_engine, metadata_cache, &metrics),
+      make_broker_router(write_engine, metadata_cache, blob_cache, &metrics),
     )
     .with_graceful_shutdown(async move { listener_shutdown.cancelled().await })
     .await

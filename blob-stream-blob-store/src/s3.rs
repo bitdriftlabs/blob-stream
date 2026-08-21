@@ -1,4 +1,4 @@
-use crate::{BlobKey, BlobStore, BlobStoreError, BlobStoreResult, ByteRange};
+use crate::{BlobCacheAdmission, BlobKey, BlobStore, BlobStoreError, BlobStoreResult, ByteRange};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_sdk_s3::error::SdkError;
@@ -6,6 +6,11 @@ use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use log::{debug, trace};
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+#[cfg(test)]
+#[path = "./s3_test.rs"]
+mod tests;
 
 //
 // S3BlobStore
@@ -25,6 +30,28 @@ impl S3BlobStore {
       client,
     }
   }
+}
+
+async fn read_content_length_body(
+  body: impl AsyncRead + Unpin,
+  content_length: u64,
+) -> std::io::Result<Vec<u8>> {
+  let mut body = body.take(content_length);
+  let capacity = usize::try_from(content_length).map_err(|_| {
+    std::io::Error::other("S3 content length does not fit in this process's address space")
+  })?;
+  let mut bytes = Vec::new();
+  bytes
+    .try_reserve_exact(capacity)
+    .map_err(|error| std::io::Error::other(format!("could not reserve S3 body buffer: {error}")))?;
+  body.read_to_end(&mut bytes).await?;
+  if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != content_length {
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::UnexpectedEof,
+      "S3 body did not match its advertised content length",
+    ));
+  }
+  Ok(bytes)
 }
 
 #[async_trait]
@@ -111,5 +138,55 @@ impl BlobStore for S3BlobStore {
     );
 
     Ok(bytes)
+  }
+
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    let response = match self
+      .client
+      .get_object()
+      .bucket(&self.bucket)
+      .key(key.as_str())
+      .send()
+      .await
+    {
+      Ok(response) => response,
+      Err(SdkError::ServiceError(error)) if matches!(error.err(), GetObjectError::NoSuchKey(_)) => {
+        return Err(BlobStoreError::NotFound {
+          key: key.as_str().to_string(),
+        });
+      },
+      Err(source) => {
+        return Err(BlobStoreError::Read {
+          key: key.as_str().to_string(),
+          source: source.into(),
+        });
+      },
+    };
+    let content_length = response
+      .content_length
+      .ok_or_else(|| BlobStoreError::Read {
+        key: key.as_str().to_string(),
+        source: anyhow::anyhow!("S3 response has no content length"),
+      })?;
+    let content_length = u64::try_from(content_length).map_err(|_| BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("S3 response content length is negative"),
+    })?;
+    if !admission(content_length) {
+      return Err(BlobStoreError::AdmissionRejected {
+        key: key.as_str().to_string(),
+      });
+    }
+    let bytes = read_content_length_body(response.body.into_async_read(), content_length)
+      .await
+      .map_err(|source| BlobStoreError::Read {
+        key: key.as_str().to_string(),
+        source: source.into(),
+      })?;
+    Ok(Bytes::from(bytes))
   }
 }

@@ -3,6 +3,7 @@
 mod tests;
 
 use crate::metrics::BrokerMetrics;
+use crate::read::blob_cache::{BlobCache, MAX_BLOB_READ_REQUEST_BYTES};
 use crate::read::metadata_cache::{MAX_METADATA_READ_REQUEST_BYTES, MetadataCache};
 use crate::write::{ProduceOutcomeMetrics, WriteEngine, WriteError, WriteRequest};
 use axum::extract::Query;
@@ -20,6 +21,8 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchesRequest,
   ProduceBatchesResponse,
   ProduceStatus,
+  ReadBlobRangesRequest,
+  ReadBlobRangesResponse,
   ReadMetadataWindowRequest,
   ReadMetadataWindowResponse,
 };
@@ -103,6 +106,7 @@ impl BrokerGrpcMetrics {
 pub struct BrokerGrpc {
   write_engine: Arc<dyn WriteEngine>,
   metadata_cache: Arc<MetadataCache>,
+  blob_cache: Option<Arc<BlobCache>>,
   produce_request_timeout: Duration,
   metrics: BrokerGrpcMetrics,
   produce_outcomes: ProduceOutcomeMetrics,
@@ -119,10 +123,23 @@ impl BrokerGrpc {
     Self {
       write_engine,
       metadata_cache,
+      blob_cache: None,
       produce_request_timeout,
       metrics: BrokerGrpcMetrics::new(metrics_scope),
       produce_outcomes: ProduceOutcomeMetrics::new(metrics_scope),
     }
+  }
+
+  #[must_use]
+  pub fn new_with_blob_cache(
+    write_engine: Arc<dyn WriteEngine>,
+    metadata_cache: Arc<MetadataCache>,
+    blob_cache: Arc<BlobCache>,
+    metrics_scope: &Scope,
+  ) -> Self {
+    let mut grpc = Self::new(write_engine, metadata_cache, metrics_scope);
+    grpc.blob_cache = Some(blob_cache);
+    grpc
   }
 
   async fn handle_batch(&self, request: ProduceBatchRequest) -> ProduceBatchResponse {
@@ -232,6 +249,25 @@ impl Handler<ReadMetadataWindowRequest, ReadMetadataWindowResponse> for BrokerGr
 }
 
 #[async_trait::async_trait]
+impl Handler<ReadBlobRangesRequest, ReadBlobRangesResponse> for BrokerGrpc {
+  async fn handle(
+    &self,
+    _headers: HeaderMap,
+    _extensions: Extensions,
+    request: ReadBlobRangesRequest,
+  ) -> bd_grpc::error::Result<ReadBlobRangesResponse> {
+    Ok(
+      self
+        .blob_cache
+        .as_ref()
+        .expect("blob range handler requires a configured blob cache")
+        .read(request)
+        .await,
+    )
+  }
+}
+
+#[async_trait::async_trait]
 impl Handler<ProduceBatchRequest, ProduceBatchResponse> for BrokerGrpc {
   async fn handle(
     &self,
@@ -283,6 +319,7 @@ impl Handler<ProduceBatchesRequest, ProduceBatchesResponse> for BrokerGrpc {
 pub fn make_broker_router(
   write_engine: Arc<dyn WriteEngine>,
   metadata_cache: Arc<MetadataCache>,
+  blob_cache: Arc<BlobCache>,
   metrics: &BrokerMetrics,
 ) -> Router {
   let produce_batch_method = ServiceMethod::<ProduceBatchRequest, ProduceBatchResponse>::new(
@@ -298,13 +335,19 @@ pub fn make_broker_router(
       "BrokerService",
       "ReadMetadataWindow",
     );
+  let blob_read_method = ServiceMethod::<ReadBlobRangesRequest, ReadBlobRangesResponse>::new(
+    "BrokerService",
+    "ReadBlobRanges",
+  );
   let grpc_metrics_scope = metrics.scope();
   let admin_metrics = metrics.clone();
   let admin_write_engine = write_engine.clone();
   let admin_metadata_cache = metadata_cache.clone();
-  let grpc = Arc::new(BrokerGrpc::new(
+  let admin_blob_cache = blob_cache.clone();
+  let grpc = Arc::new(BrokerGrpc::new_with_blob_cache(
     write_engine,
     metadata_cache,
+    blob_cache,
     &grpc_metrics_scope,
   ));
   let produce_batch_router = UnaryRouterBuilder::new(&produce_batch_method, grpc.clone())
@@ -321,7 +364,7 @@ pub fn make_broker_router(
     })
     .build()
     .expect("batched broker gRPC router should build");
-  let metadata_read_router = UnaryRouterBuilder::new(&metadata_read_method, grpc)
+  let metadata_read_router = UnaryRouterBuilder::new(&metadata_read_method, grpc.clone())
     .request_config(metadata_read_request_config())
     .error_handler(|error| {
       warn_every!(
@@ -331,9 +374,20 @@ pub fn make_broker_router(
     })
     .build()
     .expect("metadata cache gRPC router should build");
+  let blob_read_router = UnaryRouterBuilder::new(&blob_read_method, grpc)
+    .request_config(blob_read_request_config())
+    .error_handler(|error| {
+      warn_every!(
+        15.seconds(),
+        "broker blob cache gRPC handler error: {error}"
+      );
+    })
+    .build()
+    .expect("blob cache gRPC router should build");
   produce_batch_router
     .merge(produce_batches_router)
     .merge(metadata_read_router)
+    .merge(blob_read_router)
     .route(
       "/metrics",
       get(move || {
@@ -360,6 +414,13 @@ pub fn make_broker_router(
         async move { Json(metadata_cache.snapshot().await) }
       }),
     )
+    .route(
+      "/admin/blob-cache",
+      get(move || {
+        let blob_cache = admin_blob_cache.clone();
+        async move { Json(blob_cache.snapshot().await) }
+      }),
+    )
     .route("/admin/log", post(log))
 }
 
@@ -376,6 +437,15 @@ fn metadata_read_request_config() -> UnaryRequestConfig {
   UnaryRequestConfig {
     max_request_bytes: MAX_METADATA_READ_REQUEST_BYTES,
     max_decoded_request_bytes: MAX_METADATA_READ_REQUEST_BYTES,
+    ..UnaryRequestConfig::default()
+  }
+  .with_validation_options(ValidationOptions::default())
+}
+
+fn blob_read_request_config() -> UnaryRequestConfig {
+  UnaryRequestConfig {
+    max_request_bytes: MAX_BLOB_READ_REQUEST_BYTES,
+    max_decoded_request_bytes: MAX_BLOB_READ_REQUEST_BYTES,
     ..UnaryRequestConfig::default()
   }
   .with_validation_options(ValidationOptions::default())

@@ -1,5 +1,6 @@
 use super::{
   BatchMetadata,
+  BatchReadCandidate,
   BatchReadResult,
   CommittedSourceCheckpoint,
   CompressionCodec,
@@ -13,7 +14,7 @@ use super::{
   trace,
 };
 use anyhow::{anyhow, ensure};
-use blob_stream_blob_store::BlobStoreError;
+use blob_stream_blob_store::{BlobStoreError, ByteRange};
 use protobuf::Message;
 use std::io::Cursor;
 use std::time::Instant;
@@ -46,15 +47,11 @@ impl ConsumerReaderImpl {
     {
       Ok(payload) => payload,
       Err(BlobStoreError::NotFound { .. }) => {
-        return Ok(
-          candidates
-            .into_iter()
-            .map(|candidate| BatchReadResult::Missing {
-              candidate,
-              blob_key: metadata.blob_key.clone(),
-            })
-            .collect(),
-        );
+        return Ok(Self::missing_segment_plan(SegmentReadPlan {
+          metadata,
+          candidates,
+          byte_range,
+        }));
       },
       Err(error) => return Err(error.into()),
     };
@@ -68,6 +65,50 @@ impl ConsumerReaderImpl {
       .metrics
       .record_blob_batch_ranges(candidates.len(), selected_bytes);
 
+    self.decode_segment_plan_payload(
+      SegmentReadPlan {
+        metadata,
+        candidates,
+        byte_range,
+      },
+      &payload,
+    )
+  }
+
+  /// Decode a complete raw payload supplied for one segment read plan.
+  pub(in crate::consumer) fn decode_segment_plan_payload(
+    &self,
+    plan: SegmentReadPlan,
+    payload: &bytes::Bytes,
+  ) -> Result<Vec<BatchReadResult>> {
+    let SegmentReadPlan {
+      metadata,
+      candidates,
+      byte_range,
+    } = plan;
+
+    let decoded_batches =
+      self.decode_segment_payload(&metadata, &candidates, &byte_range, payload)?;
+    Ok(
+      candidates
+        .into_iter()
+        .zip(decoded_batches)
+        .map(|(candidate, batch)| {
+          self.record_decoded_batch(&batch);
+          BatchReadResult::Decoded { candidate, batch }
+        })
+        .collect(),
+    )
+  }
+
+  /// Decode a payload for a plan without consuming it, so callers can retry the plan on failure.
+  pub(in crate::consumer) fn decode_segment_payload(
+    &self,
+    metadata: &SegmentMetadata,
+    candidates: &[BatchReadCandidate],
+    byte_range: &ByteRange,
+    payload: &bytes::Bytes,
+  ) -> Result<Vec<ConsumerBatch>> {
     let mut decoded_batches = Vec::with_capacity(candidates.len());
     for candidate in candidates {
       let batch_range = &candidate.batch_metadata.byte_range;
@@ -90,15 +131,31 @@ impl ConsumerReaderImpl {
       );
       let batch_payload = payload.slice(start .. end);
       let batch = self.decode_batch(
-        &metadata,
+        metadata,
         &candidate.batch_metadata,
         candidate.virtual_partition_id,
         batch_payload,
       )?;
-      decoded_batches.push(BatchReadResult::Decoded { candidate, batch });
+      decoded_batches.push(batch);
     }
 
     Ok(decoded_batches)
+  }
+
+  /// Produce missing results for every batch selected from an authoritative absent blob.
+  pub(in crate::consumer) fn missing_segment_plan(plan: SegmentReadPlan) -> Vec<BatchReadResult> {
+    let SegmentReadPlan {
+      metadata,
+      candidates,
+      ..
+    } = plan;
+    candidates
+      .into_iter()
+      .map(|candidate| BatchReadResult::Missing {
+        candidate,
+        blob_key: metadata.blob_key.clone(),
+      })
+      .collect()
   }
 
   /// Decompress, validate, and decode one batch payload supplied by a segment range read.
@@ -137,13 +194,6 @@ impl ConsumerReaderImpl {
       virtual_partition_id
     );
 
-    let payload_bytes = record_batch.records.iter().fold(0_usize, |total, record| {
-      total.saturating_add(record.payload.len())
-    });
-    self
-      .metrics
-      .record_batch(record_batch.records.len(), payload_bytes);
-
     Ok(ConsumerBatch {
       virtual_partition_id,
       seq_range: batch_metadata.seq_range.clone(),
@@ -153,5 +203,14 @@ impl ConsumerReaderImpl {
       },
       records: record_batch.records,
     })
+  }
+
+  pub(in crate::consumer) fn record_decoded_batch(&self, batch: &ConsumerBatch) {
+    let payload_bytes = batch.records.iter().fold(0_usize, |total, record| {
+      total.saturating_add(record.payload.len())
+    });
+    self
+      .metrics
+      .record_batch(batch.records.len(), payload_bytes);
   }
 }
