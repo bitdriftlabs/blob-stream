@@ -3219,6 +3219,10 @@ async fn disabled_broker_blob_cache_uses_direct_ranges_without_a_broker_request(
 
 #[tokio::test]
 async fn broker_blob_cache_groups_same_key_plans_and_decodes_validated_ranges() {
+  let metrics = Helper::new();
+  let metrics_scope = metrics
+    .collector()
+    .scope("blob_stream_consumer_broker_blob_delivery_test");
   let blob_store = Arc::new(RecordingRangeBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let (blob_key, payloads) = write_shared_blob_segments(
@@ -3260,7 +3264,7 @@ async fn broker_blob_cache_groups_same_key_plans_and_decodes_validated_ranges() 
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
-    &metrics_scope(),
+    &metrics_scope,
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
@@ -3296,6 +3300,37 @@ async fn broker_blob_cache_groups_same_key_plans_and_decodes_validated_ranges() 
       ],
       ..Default::default()
     }]
+  );
+  let metric = "blob_stream_consumer_broker_blob_delivery_test:reader";
+  metrics.assert_counter_eq(
+    1,
+    &format!("{metric}:broker_blob_range_attempts"),
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    1,
+    &format!("{metric}:broker_blob_range_deliveries"),
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    2,
+    &format!("{metric}:broker_blob_range_delivery_items"),
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    first_len.saturating_add(second_len),
+    &format!("{metric}:broker_blob_range_delivery_bytes"),
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    0,
+    &format!("{metric}:broker_blob_range_fallbacks"),
+    &labels!(),
+  );
+  metrics.assert_histogram_count(
+    1,
+    &format!("{metric}:broker_blob_range_latency_seconds"),
+    &labels!(),
   );
 }
 
@@ -3360,6 +3395,10 @@ async fn broker_blob_cache_handles_many_ranges_from_one_blob_key() {
 
 #[tokio::test]
 async fn corrupt_broker_blob_payload_retries_the_complete_group_directly() {
+  let metrics = Helper::new();
+  let metrics_scope = metrics
+    .collector()
+    .scope("blob_stream_consumer_broker_blob_fallback_test");
   let blob_store = Arc::new(RecordingRangeBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let (_, payloads) = write_shared_blob_segments(
@@ -3400,7 +3439,7 @@ async fn corrupt_broker_blob_payload_retries_the_complete_group_directly() {
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
-    &metrics_scope(),
+    &metrics_scope,
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
@@ -3413,6 +3452,22 @@ async fn corrupt_broker_blob_payload_retries_the_complete_group_directly() {
   assert_eq!(batches.len(), 2);
   assert_eq!(query.requests().len(), 1);
   assert_eq!(blob_store.ranges().len(), 2);
+  let metric = "blob_stream_consumer_broker_blob_fallback_test:reader";
+  metrics.assert_counter_eq(
+    1,
+    &format!("{metric}:broker_blob_range_attempts"),
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    0,
+    &format!("{metric}:broker_blob_range_deliveries"),
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    1,
+    &format!("{metric}:broker_blob_range_fallbacks"),
+    &labels!(),
+  );
 }
 
 #[tokio::test]
@@ -3758,6 +3813,10 @@ async fn broker_blob_cache_flag_applies_on_the_next_read_pass() {
 
 #[tokio::test]
 async fn authoritative_broker_blob_not_found_skips_direct_retry() {
+  let metrics = Helper::new();
+  let metrics_scope = metrics
+    .collector()
+    .scope("blob_stream_consumer_broker_blob_not_found_test");
   let blob_store = Arc::new(RecordingRangeBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let _ = write_shared_blob_segments(
@@ -3795,7 +3854,7 @@ async fn authoritative_broker_blob_not_found_skips_direct_retry() {
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
-    &metrics_scope(),
+    &metrics_scope,
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
@@ -3809,6 +3868,27 @@ async fn authoritative_broker_blob_not_found_skips_direct_retry() {
   assert_eq!(reader.cursor(7), Some(1));
   assert_eq!(query.requests().len(), 1);
   assert!(blob_store.ranges().is_empty());
+  let metric = "blob_stream_consumer_broker_blob_not_found_test:reader";
+  metrics.assert_counter_eq(
+    1,
+    &format!("{metric}:broker_blob_range_attempts"),
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    1,
+    &format!("{metric}:broker_blob_range_not_found_groups"),
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    1,
+    &format!("{metric}:broker_blob_range_not_found_items"),
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    0,
+    &format!("{metric}:broker_blob_range_fallbacks"),
+    &labels!(),
+  );
 }
 
 #[test]

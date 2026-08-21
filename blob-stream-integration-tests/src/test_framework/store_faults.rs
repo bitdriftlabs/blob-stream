@@ -66,6 +66,7 @@ pub enum StoreFaultDomain {
 pub enum StoreFaultOperation {
   BlobPut,
   BlobGetRange,
+  BlobGetWithCacheAdmission,
   MetadataWriteSegment,
   MetadataScanWindow,
   ProducerAcquireLease,
@@ -439,6 +440,7 @@ fn describe_store_operation(operation: StoreFaultOperation) -> &'static str {
   match operation {
     StoreFaultOperation::BlobPut => "blob_put",
     StoreFaultOperation::BlobGetRange => "blob_get_range",
+    StoreFaultOperation::BlobGetWithCacheAdmission => "blob_get_with_cache_admission",
     StoreFaultOperation::MetadataWriteSegment => "metadata_write_segment",
     StoreFaultOperation::MetadataScanWindow => "metadata_scan_window",
     StoreFaultOperation::ProducerAcquireLease => "producer_acquire_lease",
@@ -584,7 +586,55 @@ impl BlobStore for FaultInjectedBlobStore {
     key: &BlobKey,
     admission: &BlobCacheAdmission,
   ) -> BlobStoreResult<Bytes> {
-    self.inner.get_with_cache_admission(key, admission).await
+    let effects = self
+      .controller
+      .effects_for_call(
+        StoreFaultDomain::Blob,
+        StoreFaultOperation::BlobGetWithCacheAdmission,
+        key.as_str(),
+      )
+      .await;
+
+    if let Some(delay) = effects.delay {
+      sleep(delay).await;
+    }
+    if effects.not_found {
+      return Err(BlobStoreError::NotFound {
+        key: key.as_str().to_string(),
+      });
+    }
+    if let Some(timeout) = effects.timeout {
+      sleep(timeout).await;
+      return Err(BlobStoreError::Read {
+        key: key.as_str().to_string(),
+        source: anyhow!(
+          "blob cache admission read timed out for key {}",
+          key.as_str()
+        ),
+      });
+    }
+    if let Some(message) = effects.fail_message {
+      return Err(BlobStoreError::Read {
+        key: key.as_str().to_string(),
+        source: anyhow!(
+          "blob cache admission read fault for key {}: {}",
+          key.as_str(),
+          message
+        ),
+      });
+    }
+
+    let result = self.inner.get_with_cache_admission(key, admission).await;
+    self
+      .controller
+      .record_operation_outcome(
+        StoreFaultOperation::BlobGetWithCacheAdmission,
+        key.as_str().to_string(),
+        if result.is_ok() { "ok" } else { "error" },
+        result.as_ref().err().map(std::string::ToString::to_string),
+      )
+      .await;
+    result
   }
 }
 

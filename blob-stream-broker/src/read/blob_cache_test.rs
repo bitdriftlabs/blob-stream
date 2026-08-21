@@ -6,6 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
+use bd_server_stats::test::util::stats::Helper;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_blob_store::{
   BlobCacheAdmission,
@@ -21,6 +22,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 };
 use blob_stream_test_utils::ManualTimeProvider;
 use parking_lot::Mutex;
+use prometheus::labels;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use time::OffsetDateTime;
@@ -170,6 +172,24 @@ fn cache_with_idle_ttl(
     BlobCacheConfig {
       request_timeout: Duration::from_secs(1),
       idle_ttl,
+      max_fetches: DEFAULT_MAX_FETCHES,
+    },
+    pressure,
+    &Collector::default().scope("blob_cache_test"),
+  ))
+}
+
+fn cache_with_max_fetches(
+  store: Arc<dyn BlobStore>,
+  pressure: Arc<MemoryPressureController>,
+  max_fetches: usize,
+) -> Arc<BlobCache> {
+  Arc::new(BlobCache::new(
+    store,
+    BlobCacheConfig {
+      request_timeout: Duration::from_secs(1),
+      idle_ttl: Duration::from_secs(30),
+      max_fetches,
     },
     pressure,
     &Collector::default().scope("blob_cache_test"),
@@ -187,6 +207,7 @@ fn cache_with_idle_ttl_and_clock(
     BlobCacheConfig {
       request_timeout: Duration::from_secs(1),
       idle_ttl,
+      max_fetches: DEFAULT_MAX_FETCHES,
     },
     pressure,
     time_provider,
@@ -254,8 +275,12 @@ impl BlobStore for FailingBlobStore {
 }
 
 fn request(ranges: &[(u64, u64)]) -> ReadBlobRangesRequest {
+  request_for_blob("topic/blob", ranges)
+}
+
+fn request_for_blob(blob_key: &str, ranges: &[(u64, u64)]) -> ReadBlobRangesRequest {
   ReadBlobRangesRequest {
-    blob_key: "topic/blob".into(),
+    blob_key: blob_key.to_string().into(),
     ranges: ranges
       .iter()
       .map(|&(start, end)| BlobRangeRequest {
@@ -600,6 +625,89 @@ async fn shares_one_full_blob_fetch_for_concurrent_requests() {
 }
 
 #[tokio::test]
+async fn saturated_fetch_capacity_rejects_a_distinct_blob_key() {
+  let store = Arc::new(GatedBlobStore::new());
+  for key in ["topic/one", "topic/two"] {
+    store
+      .put(&BlobKey::from(key), Bytes::from_static(b"abcdefgh"))
+      .await
+      .unwrap();
+  }
+  let cache = cache_with_max_fetches(
+    Arc::clone(&store) as Arc<dyn BlobStore>,
+    pressure(0, 1_000),
+    1,
+  );
+
+  let first_cache = Arc::clone(&cache);
+  let first = tokio::spawn(async move {
+    first_cache
+      .read(request_for_blob("topic/one", &[(0, 1)]))
+      .await
+  });
+  store.entered.notified().await;
+
+  let response = cache.read(request_for_blob("topic/two", &[(0, 1)])).await;
+  let Some(read_blob_ranges_response::Result::Failure(failure)) = response.result else {
+    panic!("expected overloaded failure");
+  };
+  assert_eq!(
+    failure.status,
+    BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED.into()
+  );
+  assert_eq!(store.get_calls.load(Ordering::Relaxed), 1);
+
+  store.release.notify_waiters();
+  assert!(matches!(
+    first.await.unwrap().result,
+    Some(read_blob_ranges_response::Result::Success(_))
+  ));
+}
+
+#[tokio::test]
+async fn records_cache_fetch_and_response_metrics() {
+  let collector = Collector::default();
+  let metrics = Helper::new_with_collector(collector.clone());
+  let store = Arc::new(CountingBlobStore::new());
+  store
+    .put(
+      &BlobKey::from("topic/blob"),
+      Bytes::from_static(b"abcdefgh"),
+    )
+    .await
+    .unwrap();
+  let cache = Arc::new(BlobCache::new(
+    Arc::clone(&store) as Arc<dyn BlobStore>,
+    BlobCacheConfig {
+      request_timeout: Duration::from_secs(1),
+      idle_ttl: Duration::from_secs(30),
+      max_fetches: DEFAULT_MAX_FETCHES,
+    },
+    pressure(0, 1_000),
+    &collector.scope("blob_cache_metrics_test"),
+  ));
+
+  for blob_key in ["topic/blob", "topic/blob", "topic/missing"] {
+    cache.read(request_for_blob(blob_key, &[(0, 1)])).await;
+  }
+  let _snapshot = cache.snapshot().await;
+
+  let metric = "blob_cache_metrics_test:blob_cache";
+  metrics.assert_counter_eq(3, &format!("{metric}:requests_total"), &labels!());
+  metrics.assert_counter_eq(2, &format!("{metric}:fetches_total"), &labels!());
+  metrics.assert_counter_eq(8, &format!("{metric}:fetch_bytes_total"), &labels!());
+  metrics.assert_counter_eq(1, &format!("{metric}:hits_total"), &labels!());
+  metrics.assert_counter_eq(2, &format!("{metric}:response_items_total"), &labels!());
+  metrics.assert_counter_eq(2, &format!("{metric}:response_bytes_total"), &labels!());
+  metrics.assert_counter_eq(1, &format!("{metric}:not_found_total"), &labels!());
+  metrics.assert_counter_eq(1, &format!("{metric}:failures_total"), &labels!());
+  metrics.assert_gauge_eq(1, &format!("{metric}:entries"), &labels!());
+  metrics.assert_gauge_eq(8, &format!("{metric}:retained_bytes"), &labels!());
+  metrics.assert_gauge_eq(0, &format!("{metric}:active_fetches"), &labels!());
+  metrics.assert_histogram_count(3, &format!("{metric}:request_latency_seconds"), &labels!());
+}
+
+#[tokio::test]
 async fn concurrent_failed_fetches_share_one_request_and_release_admission() {
   let store = Arc::new(GatedFailingBlobStore::new());
   let pressure = pressure(0, 1_000);
@@ -653,6 +761,7 @@ async fn timed_out_request_keeps_fetch_cleanup_running() {
     BlobCacheConfig {
       request_timeout: Duration::from_millis(1),
       idle_ttl: Duration::from_secs(30),
+      max_fetches: DEFAULT_MAX_FETCHES,
     },
     Arc::clone(&pressure),
     &Collector::default().scope("blob_cache_test"),

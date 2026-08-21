@@ -37,7 +37,13 @@ async fn read_content_length_body(
   content_length: u64,
 ) -> std::io::Result<Vec<u8>> {
   let mut body = body.take(content_length);
+  let capacity = usize::try_from(content_length).map_err(|_| {
+    std::io::Error::other("S3 content length does not fit in this process's address space")
+  })?;
   let mut bytes = Vec::new();
+  bytes
+    .try_reserve_exact(capacity)
+    .map_err(|error| std::io::Error::other(format!("could not reserve S3 body buffer: {error}")))?;
   body.read_to_end(&mut bytes).await?;
   if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != content_length {
     return Err(std::io::Error::new(

@@ -20,3 +20,10 @@ async fn content_length_read_rejects_a_short_body() {
 
   assert!(read_content_length_body(reader, 4).await.is_err());
 }
+
+#[tokio::test]
+async fn content_length_read_reports_an_unallocatable_buffer() {
+  let (_writer, reader) = duplex(16);
+
+  assert!(read_content_length_body(reader, u64::MAX).await.is_err());
+}

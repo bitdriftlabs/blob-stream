@@ -6,6 +6,10 @@ use blob_stream_integration_tests::test_framework::{
   self as framework,
   ClusterHarness,
   IntegrationResources,
+  StoreFaultAction,
+  StoreFaultDomain,
+  StoreFaultOperation,
+  StoreFaultRule,
   consume_next_record,
   consumer_runtime_config,
   produce_message,
@@ -96,6 +100,40 @@ async fn broker_batch_cache_uses_real_transport_then_falls_back_after_owner_loss
     0,
     "successful broker blob-range delivery must not direct-read ranges"
   );
+
+  blob_store.reset_reads();
+  resources
+    .store_fault_controller()
+    .enable_fault(StoreFaultRule {
+      domain: StoreFaultDomain::Blob,
+      operation: StoreFaultOperation::BlobGetWithCacheAdmission,
+      key_pattern: None,
+      action: StoreFaultAction::Fail {
+        message: "injected cache admission read failure".to_string(),
+      },
+      remaining_hits: Some(1),
+    })
+    .await;
+  produce_message(
+    &producer,
+    b"broker-cache-fault".to_vec(),
+    "fallback-after-fault",
+  )
+  .await?;
+  assert_eq!(
+    consume_next_record(&mut consumer).await?,
+    "fallback-after-fault"
+  );
+  assert!(
+    blob_store.range_reads.load(Ordering::Relaxed) > 0,
+    "a cache admission fault must fall back to direct range reads"
+  );
+  assert!(resources.store_fault_controller().events().await.iter().any(|event| {
+    event.operation == StoreFaultOperation::BlobGetWithCacheAdmission
+      && event.action.as_ref().is_some_and(|action| {
+        matches!(action, StoreFaultAction::Fail { message } if message == "injected cache admission read failure")
+      })
+  }));
 
   blob_store.reset_reads();
   discovery.update_nodes(Vec::new());
