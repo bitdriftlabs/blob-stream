@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
 use bd_server_stats::test::util::stats::Helper;
+use bd_shutdown::ComponentShutdownTrigger;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_blob_store::BlobKey;
 use blob_stream_metadata_store::{MetadataWriteResult, SegmentMetadata};
@@ -301,16 +302,18 @@ async fn coalesces_tail_requests_at_the_lowest_bound() {
 async fn records_coalescing_metrics_for_strong_queries() {
   let collector = Collector::default();
   let metrics = Helper::new_with_collector(collector.clone());
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let store = Arc::new(CountingMetadataStore {
     scans: AtomicUsize::new(0),
     observed_bounds: Mutex::new(Vec::new()),
     segments: vec![segment()],
   });
-  let cache = Arc::new(MetadataCache::new_with_metrics(
+  let cache = MetadataCache::new_with_metrics(
     store.clone(),
     cache_config(Duration::seconds(1), StdDuration::from_millis(20)),
+    &shutdown_trigger.make_handle(),
     &collector.scope("blob_stream_broker_test"),
-  ));
+  );
 
   let (lower, higher) = tokio::join!(
     cache.read(tail_request(
@@ -342,6 +345,7 @@ async fn records_coalescing_metrics_for_strong_queries() {
     "blob_stream_broker_test:metadata_cache:coalescing_window_requests_total",
     &labels!(),
   );
+  shutdown_trigger.shutdown().await;
 }
 
 #[tokio::test]
@@ -624,6 +628,51 @@ async fn retains_full_recovery_in_its_separate_budget() {
 }
 
 #[tokio::test]
+async fn recovery_cache_maintenance_evicts_invalidated_entries() {
+  let collector = Collector::default();
+  let metrics = Helper::new_with_collector(collector.clone());
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let cache = MetadataCache::new_with_metrics(
+    Arc::new(CountingMetadataStore {
+      scans: AtomicUsize::new(0),
+      observed_bounds: Mutex::new(Vec::new()),
+      segments: vec![segment()],
+    }),
+    cache_config(Duration::seconds(1), StdDuration::ZERO),
+    &shutdown_trigger.make_handle(),
+    &collector.scope("blob_stream_broker_test"),
+  );
+  let request = full_recovery_request();
+  let key = cache.validate_request(&request).unwrap().key;
+
+  let response = cache.read(request).await;
+  assert!(matches!(
+    response.result,
+    Some(read_metadata_window_response::Result::Success(_))
+  ));
+  metrics.assert_gauge_eq(
+    1,
+    "blob_stream_broker_test:metadata_cache:recovery_entries",
+    &labels!(),
+  );
+
+  cache.eventual_recovery_entries.invalidate(&key).await;
+  cache.run_maintenance().await;
+
+  metrics.assert_gauge_eq(
+    0,
+    "blob_stream_broker_test:metadata_cache:recovery_entries",
+    &labels!(),
+  );
+  metrics.assert_gauge_eq(
+    0,
+    "blob_stream_broker_test:metadata_cache:recovery_retained_bytes",
+    &labels!(),
+  );
+  shutdown_trigger.shutdown().await;
+}
+
+#[tokio::test]
 async fn rejects_response_item_limit_without_partial_success() {
   let mut second_segment = segment();
   second_segment.snowflake_id = SnowflakeId(101);
@@ -716,16 +765,18 @@ async fn sanitizes_internal_storage_failures() {
 async fn records_cache_hit_miss_refill_and_response_metrics() {
   let collector = Collector::default();
   let metrics = Helper::new_with_collector(collector.clone());
+  let shutdown_trigger = ComponentShutdownTrigger::default();
   let store = Arc::new(CountingMetadataStore {
     scans: AtomicUsize::new(0),
     observed_bounds: Mutex::new(Vec::new()),
     segments: vec![segment()],
   });
-  let cache = Arc::new(MetadataCache::new_with_metrics(
+  let cache = MetadataCache::new_with_metrics(
     store,
     cache_config(Duration::seconds(1), StdDuration::ZERO),
+    &shutdown_trigger.make_handle(),
     &collector.scope("blob_stream_broker_test"),
-  ));
+  );
 
   cache
     .read(tail_request(
@@ -802,6 +853,7 @@ async fn records_cache_hit_miss_refill_and_response_metrics() {
     "blob_stream_broker_test:metadata_cache:tail_entries",
     &labels!(),
   );
+  shutdown_trigger.shutdown().await;
 }
 
 #[tokio::test]
