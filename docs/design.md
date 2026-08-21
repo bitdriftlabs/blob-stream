@@ -21,10 +21,11 @@ This document describes the current implementation and its behavioral contracts.
 - Consumers use cursors, not timestamp seeks. A new consumer group starts at its current aligned
   metadata window; a resumed group recovers from its committed metadata source through retention.
 - Brokers optionally serve bounded cached metadata-window reads and a bounded raw blob-range RPC.
-  The blob-range service caches complete immutable objects only when its Linux cgroup-aware memory
-  admission monitor permits it, then returns exact requested byte slices. Consumers select the
-  broker blob-range path with a live feature flag, grouping the current pass's segment ranges by
-  immutable blob key. A complete validated broker response supplies raw bytes to the existing
+  The blob-range service inspects an object's advertised content length and admits its complete
+  immutable body only when the Linux cgroup-aware memory monitor has enough headroom, before
+  streaming that body from storage. It then returns exact requested byte slices. Consumers select
+  the broker blob-range path with a live feature flag, grouping the current pass's segment ranges
+  by immutable blob key. A complete validated broker response supplies raw bytes to the existing
   consumer decoder; any unavailable, malformed, or retryable response reissues the whole group
   through direct blob storage. An authoritative broker `NOT_FOUND` follows the existing
   missing-batch path without a direct retry. There is no compaction, built-in authorization, or

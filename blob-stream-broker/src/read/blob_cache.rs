@@ -28,7 +28,7 @@ use protobuf::Message;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use time::OffsetDateTime;
 
@@ -47,19 +47,13 @@ type SharedFetch = Shared<BoxFuture<'static, std::result::Result<Bytes, BlobCach
 pub struct BlobCacheConfig {
   request_timeout: Duration,
   idle_ttl: Duration,
-  max_blob_bytes: u64,
 }
 
 impl BlobCacheConfig {
   pub fn from_broker_config(
     broker: &BrokerConfig,
-    max_blob_bytes: u64,
     feature_flags: Option<&FeatureFlagsWatch>,
   ) -> Result<Self> {
-    ensure!(
-      max_blob_bytes > 0,
-      "broker flush_max_bytes must be positive"
-    );
     let request_timeout = broker
       .blob_cache_request_timeout
       .as_ref()
@@ -91,7 +85,6 @@ impl BlobCacheConfig {
       idle_ttl: Duration::try_from(idle_ttl).map_err(|_| {
         anyhow!("feature flag {BLOB_CACHE_IDLE_TTL_FEATURE_FLAG} exceeds supported range")
       })?,
-      max_blob_bytes,
     })
   }
 }
@@ -127,10 +120,9 @@ pub struct BlobCache {
   // Production uses Moka's native idle expiry. Tests opt into a logical clock for deterministic
   // expiration without adding a hash table or mutex acquisition to production cache hits.
   logical_idle_expiry: Option<LogicalIdleExpiry>,
-  in_flight: Mutex<HashMap<String, SharedFetch>>,
+  in_flight: Mutex<HashMap<String, Arc<SharedFetch>>>,
   cache_generation: Arc<AtomicU64>,
   failures: AtomicU64,
-  was_overloaded: AtomicBool,
   metrics: BlobCacheMetrics,
 }
 
@@ -186,7 +178,6 @@ impl BlobCacheMetrics {
 enum BlobCacheError {
   BadRequest(String),
   Overloaded,
-  TooLarge,
   NotFound,
   Storage,
 }
@@ -201,7 +192,7 @@ impl BlobCache {
   ) -> Self {
     let metrics = BlobCacheMetrics::new(metrics_scope);
     let evictions = metrics.evictions.clone();
-    Self {
+    let cache = Self {
       blob_store,
       config,
       pressure,
@@ -218,9 +209,10 @@ impl BlobCache {
       in_flight: Mutex::new(HashMap::new()),
       cache_generation: Arc::new(AtomicU64::new(0)),
       failures: AtomicU64::new(0),
-      was_overloaded: AtomicBool::new(false),
       metrics,
-    }
+    };
+    cache.register_pressure_flush();
+    cache
   }
 
   #[cfg(test)]
@@ -235,7 +227,7 @@ impl BlobCache {
     let evictions = metrics.evictions.clone();
     let last_access = Arc::new(Mutex::new(HashMap::new()));
     let eviction_last_access = Arc::clone(&last_access);
-    Self {
+    let cache = Self {
       blob_store,
       config,
       pressure,
@@ -255,9 +247,10 @@ impl BlobCache {
       in_flight: Mutex::new(HashMap::new()),
       cache_generation: Arc::new(AtomicU64::new(0)),
       failures: AtomicU64::new(0),
-      was_overloaded: AtomicBool::new(false),
       metrics,
-    }
+    };
+    cache.register_pressure_flush();
+    cache
   }
 
   #[must_use]
@@ -361,18 +354,12 @@ impl BlobCache {
   }
 
   async fn read_ranges(
-    &self,
+    self: &Arc<Self>,
     request: &ReadBlobRangesRequest,
   ) -> std::result::Result<Vec<Bytes>, BlobCacheError> {
     if self.pressure.is_overloaded() {
-      if !self.was_overloaded.swap(true, Ordering::Relaxed) {
-        self.cache_generation.fetch_add(1, Ordering::Relaxed);
-        self.entries.invalidate_all();
-        self.metrics.pressure_flushes.inc();
-      }
       return Err(BlobCacheError::Overloaded);
     }
-    self.was_overloaded.store(false, Ordering::Relaxed);
     let key = request.blob_key.to_string();
     self.expire_idle_entry(&key).await;
     let blob = match self.entries.get(&key).await {
@@ -403,59 +390,111 @@ impl BlobCache {
       .collect()
   }
 
-  async fn fetch_blob(&self, key: String) -> std::result::Result<Bytes, BlobCacheError> {
-    let fetch = {
+  async fn fetch_blob(self: &Arc<Self>, key: String) -> std::result::Result<Bytes, BlobCacheError> {
+    let (fetch, started) = {
       let mut in_flight = self.in_flight.lock();
-      in_flight.get(&key).cloned().unwrap_or_else(|| {
-        let cache = self.entries.clone();
-        let blob_store = Arc::clone(&self.blob_store);
-        let pressure = self.pressure.clone();
-        let metrics = self.metrics.clone();
-        let cache_generation = Arc::clone(&self.cache_generation);
-        let fetch_generation = cache_generation.load(Ordering::Relaxed);
-        let logical_idle_expiry = self.logical_idle_expiry.clone();
-        let max_blob_bytes = self.config.max_blob_bytes;
-        let fetch_key = key.clone();
-        let fetch = async move {
-          let _reservation = pressure
-            .try_reserve_cache_bytes(max_blob_bytes)
-            .ok_or(BlobCacheError::Overloaded)?;
-          metrics.fetches.inc();
-          let blob = blob_store
-            .get(&BlobKey::from(fetch_key.clone()), max_blob_bytes)
-            .await
-            .map_err(|error| blob_store_error(&error))?;
-          metrics
-            .fetch_bytes
-            .inc_by(u64::try_from(blob.len()).unwrap_or(u64::MAX));
-          // A pressure flush invalidates this generation. Do not reinsert an object fetched
-          // before that transition, even if pressure recovers before the read completes.
-          if cache_generation.load(Ordering::Relaxed) == fetch_generation
-            && !pressure.is_overloaded()
-          {
-            cache.insert(fetch_key.clone(), blob.clone()).await;
-            if let Some(logical_idle_expiry) = logical_idle_expiry {
-              logical_idle_expiry
-                .last_access
-                .lock()
-                .insert(fetch_key, logical_idle_expiry.time_provider.now());
+      let existing = in_flight.get(&key).cloned();
+      existing.map_or_else(
+        || {
+          let cache = self.entries.clone();
+          let blob_store = Arc::clone(&self.blob_store);
+          let pressure = self.pressure.clone();
+          let metrics = self.metrics.clone();
+          let cache_generation = Arc::clone(&self.cache_generation);
+          let fetch_generation = cache_generation.load(Ordering::Relaxed);
+          let logical_idle_expiry = self.logical_idle_expiry.clone();
+          let fetch_key = key.clone();
+          let fetch = Arc::new(
+            async move {
+              metrics.fetches.inc();
+              let reservation = Arc::new(Mutex::new(None));
+              let admission = {
+                let pressure = Arc::clone(&pressure);
+                let reservation = Arc::clone(&reservation);
+                move |content_length| {
+                  let Some(reservation_guard) = pressure.try_reserve_cache_bytes(content_length)
+                  else {
+                    return false;
+                  };
+                  *reservation.lock() = Some(reservation_guard);
+                  true
+                }
+              };
+              let blob = blob_store
+                .get_with_cache_admission(&BlobKey::from(fetch_key.clone()), &admission)
+                .await
+                .map_err(|error| blob_store_error(&error))?;
+              metrics
+                .fetch_bytes
+                .inc_by(u64::try_from(blob.len()).unwrap_or(u64::MAX));
+              // A pressure flush invalidates this generation. Do not reinsert an object fetched
+              // before that transition, even if pressure recovers before the read completes.
+              if cache_generation.load(Ordering::Relaxed) == fetch_generation
+                && !pressure.is_overloaded()
+              {
+                cache.insert(fetch_key.clone(), blob.clone()).await;
+                if let Some(logical_idle_expiry) = logical_idle_expiry {
+                  logical_idle_expiry
+                    .last_access
+                    .lock()
+                    .insert(fetch_key, logical_idle_expiry.time_provider.now());
+                }
+              }
+              Ok(blob)
             }
-          }
-          Ok(blob)
-        }
-        .boxed()
-        .shared();
-        in_flight.insert(key.clone(), fetch.clone());
-        fetch
-      })
+            .boxed()
+            .shared(),
+          );
+          in_flight.insert(key.clone(), Arc::clone(&fetch));
+          (fetch, true)
+        },
+        |fetch| (fetch, false),
+      )
     };
+    if started {
+      let cache = Arc::clone(self);
+      let fetch_key = key.clone();
+      let worker = Arc::clone(&fetch);
+      // The worker owns the shared future so a timed-out RPC cannot strand an admission
+      // reservation or in-flight entry when no later caller polls the fetch.
+      tokio::spawn(async move {
+        let _ = worker.as_ref().clone().await;
+        cache.remove_in_flight_fetch(&fetch_key, &worker);
+      });
+    }
     self
       .metrics
       .active_fetches
       .set(i64::try_from(self.in_flight.lock().len()).unwrap_or(i64::MAX));
-    let result = fetch.await;
-    self.in_flight.lock().remove(&key);
+    let result = fetch.as_ref().clone().await;
+    self.remove_in_flight_fetch(&key, &fetch);
     result
+  }
+
+  fn remove_in_flight_fetch(&self, key: &str, completed: &Arc<SharedFetch>) {
+    let mut in_flight = self.in_flight.lock();
+    if in_flight
+      .get(key)
+      .is_some_and(|fetch| Arc::ptr_eq(fetch, completed))
+    {
+      in_flight.remove(key);
+    }
+  }
+
+  fn register_pressure_flush(&self) {
+    let entries = self.entries.clone();
+    let cache_generation = Arc::clone(&self.cache_generation);
+    let metrics = self.metrics.clone();
+    let logical_idle_expiry = self.logical_idle_expiry.clone();
+    let overload_handler: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+      cache_generation.fetch_add(1, Ordering::Relaxed);
+      entries.invalidate_all();
+      if let Some(logical_idle_expiry) = logical_idle_expiry.as_ref() {
+        logical_idle_expiry.last_access.lock().clear();
+      }
+      metrics.pressure_flushes.inc();
+    });
+    self.pressure.register_overload_handler(&overload_handler);
   }
 
   fn response_error(&self, error: BlobCacheError) -> ReadBlobRangesResponse {
@@ -471,10 +510,6 @@ impl BlobCache {
           "blob cache overloaded".to_string(),
         )
       },
-      BlobCacheError::TooLarge => (
-        BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_TOO_LARGE,
-        "blob exceeds cache size limit".to_string(),
-      ),
       BlobCacheError::NotFound => {
         self.metrics.not_found.inc();
         (
@@ -567,7 +602,7 @@ impl BlobCache {
 fn blob_store_error(error: &BlobStoreError) -> BlobCacheError {
   match error {
     BlobStoreError::NotFound { .. } => BlobCacheError::NotFound,
-    BlobStoreError::TooLarge { .. } => BlobCacheError::TooLarge,
+    BlobStoreError::AdmissionRejected { .. } => BlobCacheError::Overloaded,
     BlobStoreError::InvalidRange { .. } | BlobStoreError::Read { .. } => BlobCacheError::Storage,
   }
 }

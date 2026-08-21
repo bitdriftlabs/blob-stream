@@ -1,5 +1,5 @@
 use super::*;
-use blob_stream_blob_store::BlobKey;
+use blob_stream_blob_store::{BlobKey, ByteRange};
 use blob_stream_proto::protos::blobstream::v1::config::{
   BlobStoreConfig,
   InMemoryBlobStoreConfig,
@@ -24,7 +24,11 @@ async fn builds_an_in_memory_store_for_writer_reads() {
     .unwrap();
 
   assert_eq!(
-    store.blob_store.get(&key, 7).await.unwrap(),
+    store
+      .blob_store
+      .get_range(&key, ByteRange { start: 0, end: 7 })
+      .await
+      .unwrap(),
     Bytes::from_static(b"payload")
   );
   assert_eq!(store.prefix, None);

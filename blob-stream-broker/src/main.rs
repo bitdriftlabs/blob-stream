@@ -9,11 +9,7 @@ use blob_stream_broker::read::blob_cache::{BlobCache, BlobCacheConfig};
 use blob_stream_broker::read::metadata_cache::{MetadataCache, MetadataCacheConfig};
 use blob_stream_broker::storage::build_runtime_blob_store;
 use blob_stream_broker::write::memory_pressure::MemoryPressureController;
-use blob_stream_broker::write::{
-  RuntimeWriteEngineBuilder,
-  WriteConfig,
-  build_runtime_metadata_store,
-};
+use blob_stream_broker::write::{RuntimeWriteEngineBuilder, build_runtime_metadata_store};
 use blob_stream_metadata_store::DynamoCapacityMetrics;
 use clap::Parser;
 use log::info;
@@ -83,16 +79,11 @@ async fn async_main() -> Result<()> {
     metadata_cache_config,
     &metrics_scope,
   ));
-  let write_config = WriteConfig::from_broker_config(broker_config)?;
   let memory_pressure =
     MemoryPressureController::new(&broker_shutdown_trigger.make_handle(), &metrics_scope);
   let blob_cache = Arc::new(BlobCache::new(
     Arc::clone(&broker_blob_store.blob_store),
-    BlobCacheConfig::from_broker_config(
-      broker_config,
-      write_config.flush_max_bytes,
-      feature_flags_watch.as_ref(),
-    )?,
+    BlobCacheConfig::from_broker_config(broker_config, feature_flags_watch.as_ref())?,
     Arc::clone(&memory_pressure),
     &metrics_scope,
   ));

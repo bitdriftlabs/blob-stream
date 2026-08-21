@@ -1,7 +1,14 @@
 use crate::test_framework::event_log::TestEventLog;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use blob_stream_blob_store::{BlobKey, BlobStore, BlobStoreError, BlobStoreResult, ByteRange};
+use blob_stream_blob_store::{
+  BlobCacheAdmission,
+  BlobKey,
+  BlobStore,
+  BlobStoreError,
+  BlobStoreResult,
+  ByteRange,
+};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupAssignmentPlan,
@@ -572,8 +579,12 @@ impl BlobStore for FaultInjectedBlobStore {
     result
   }
 
-  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
-    self.inner.get(key, max_bytes).await
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    self.inner.get_with_cache_admission(key, admission).await
   }
 }
 

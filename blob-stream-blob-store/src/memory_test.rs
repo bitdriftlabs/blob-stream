@@ -47,39 +47,3 @@ async fn missing_key_returns_not_found() {
     BlobStoreError::NotFound { key } if key == "topic/1/missing"
   ));
 }
-
-#[tokio::test]
-async fn bounded_full_read_returns_the_complete_blob() {
-  let store = InMemoryBlobStore::new();
-  let key = BlobKey::from("topic/1/full");
-  let payload = Bytes::from_static(b"abcdef");
-  store.put(&key, payload.clone()).await.expect("put blob");
-
-  let fetched = store.get(&key, 6).await.expect("read full blob");
-
-  assert_eq!(fetched, payload);
-}
-
-#[tokio::test]
-async fn bounded_full_read_rejects_an_oversized_blob() {
-  let store = InMemoryBlobStore::new();
-  let key = BlobKey::from("topic/1/oversized");
-  store
-    .put(&key, Bytes::from_static(b"abcdef"))
-    .await
-    .expect("put blob");
-
-  let error = store
-    .get(&key, 5)
-    .await
-    .expect_err("oversized blob should be rejected");
-
-  assert!(matches!(
-    error,
-    BlobStoreError::TooLarge {
-      key,
-      max_bytes: 5,
-      actual_bytes: 6,
-    } if key == "topic/1/oversized"
-  ));
-}

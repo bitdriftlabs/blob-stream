@@ -402,10 +402,10 @@ impl ConsumerReaderImpl {
   ) -> Result<Vec<BatchReadResult>> {
     let blob_key = plans
       .first()
-      .map(|plan| plan.metadata.blob_key.as_str())
+      .map(|plan| plan.metadata.blob_key.as_str().to_string())
       .expect("blob range group is never empty");
     let request = ReadBlobRangesRequest {
-      blob_key: blob_key.to_string().into(),
+      blob_key: blob_key.clone().into(),
       ranges: plans
         .iter()
         .map(|plan| BlobRangeRequest {
@@ -431,15 +431,42 @@ impl ConsumerReaderImpl {
         let delivered_bytes = payloads.iter().fold(0_u64, |total, payload| {
           total.saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX))
         });
-        self
-          .metrics
-          .record_broker_blob_range_delivery(started_at, payloads.len(), delivered_bytes);
-        plans
-          .into_iter()
-          .zip(payloads)
-          .map(|(plan, payload)| self.decode_segment_plan_payload(plan, &payload))
-          .collect::<Result<Vec<_>>>()
-          .map(|groups| groups.into_iter().flatten().collect())
+        let decoded = plans
+          .iter()
+          .zip(&payloads)
+          .map(|(plan, payload)| {
+            self.decode_segment_payload(&plan.metadata, &plan.candidates, &plan.byte_range, payload)
+          })
+          .collect::<Result<Vec<_>>>();
+        match decoded {
+          Ok(groups) => {
+            let decoded = plans
+              .into_iter()
+              .zip(groups)
+              .flat_map(|(plan, batches)| plan.candidates.into_iter().zip(batches))
+              .map(|(candidate, batch)| {
+                self.record_decoded_batch(&batch);
+                BatchReadResult::Decoded { candidate, batch }
+              })
+              .collect();
+            self.metrics.record_broker_blob_range_delivery(
+              started_at,
+              payloads.len(),
+              delivered_bytes,
+            );
+            Ok(decoded)
+          },
+          Err(error) => {
+            self.metrics.record_broker_blob_range_fallback();
+            trace!(
+              "consumer broker blob-range payload rejected; falling back direct: \
+               blob_key={blob_key}, error={error}"
+            );
+            self
+              .read_direct_blob_range_group(plans, direct_read_permits, direct_read_concurrency)
+              .await
+          },
+        }
       },
       Ok(BrokerBlobRangeRead::NotFound) => {
         self.metrics.record_broker_blob_range_not_found(plans.len());

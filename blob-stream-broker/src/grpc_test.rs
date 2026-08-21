@@ -180,7 +180,7 @@ async fn serves_blob_ranges_from_the_grpc_handler() -> Result<()> {
     .await?;
   let cache = Arc::new(BlobCache::new(
     store,
-    BlobCacheConfig::from_broker_config(&BrokerConfig::new(), 64, None)?,
+    BlobCacheConfig::from_broker_config(&BrokerConfig::new(), None)?,
     MemoryPressureController::new_for_test_with_sample(
       MemoryPressureSample {
         allocated_bytes: 0,
@@ -227,7 +227,7 @@ async fn grpc_blob_handler_preserves_typed_cache_failures() -> Result<()> {
   let scope = Collector::default().scope("blob_stream_broker_test");
   let cache = Arc::new(BlobCache::new(
     Arc::new(InMemoryBlobStore::new()),
-    BlobCacheConfig::from_broker_config(&BrokerConfig::new(), 64, None)?,
+    BlobCacheConfig::from_broker_config(&BrokerConfig::new(), None)?,
     MemoryPressureController::new_for_test_with_sample(
       MemoryPressureSample {
         allocated_bytes: 0,

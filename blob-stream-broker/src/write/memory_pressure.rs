@@ -20,6 +20,7 @@ use cgroups_rs::fs::hierarchies;
 #[cfg(target_os = "linux")]
 use cgroups_rs::fs::memory::MemController;
 use log::{debug, info};
+use parking_lot::Mutex;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -129,6 +130,7 @@ pub struct MemoryPressureController {
   allocated_bytes: AtomicU64,
   cgroup_limit_bytes: AtomicU64,
   cache_reservations: AtomicU64,
+  overload_handlers: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
   metrics: MemoryPressureMetrics,
 }
 
@@ -183,6 +185,7 @@ impl MemoryPressureController {
       allocated_bytes: AtomicU64::new(0),
       cgroup_limit_bytes: AtomicU64::new(0),
       cache_reservations: AtomicU64::new(0),
+      overload_handlers: Mutex::new(Vec::new()),
       metrics: MemoryPressureMetrics::new(metrics_scope),
     })
   }
@@ -194,6 +197,7 @@ impl MemoryPressureController {
       allocated_bytes: AtomicU64::new(0),
       cgroup_limit_bytes: AtomicU64::new(0),
       cache_reservations: AtomicU64::new(0),
+      overload_handlers: Mutex::new(Vec::new()),
       metrics: MemoryPressureMetrics::new(metrics_scope),
     })
   }
@@ -271,6 +275,19 @@ impl MemoryPressureController {
     )
   }
 
+  /// Register maintenance to run each time memory pressure enters overload.
+  pub fn register_overload_handler(&self, handler: &Arc<dyn Fn() + Send + Sync>) {
+    let run_now = {
+      let mut overload_handlers = self.overload_handlers.lock();
+      let run_now = self.is_overloaded();
+      overload_handlers.push(Arc::clone(handler));
+      run_now
+    };
+    if run_now {
+      handler();
+    }
+  }
+
   fn overload_threshold_bytes(&self) -> u64 {
     let limit = self.cgroup_limit_bytes.load(Ordering::Relaxed);
     u64::try_from(
@@ -331,6 +348,12 @@ impl MemoryPressureController {
     if previously_overloaded != overloaded {
       self.metrics.transitions_total.inc();
       info!("broker memory-pressure overload transition {previously_overloaded} -> {overloaded}");
+    }
+    if overloaded && !previously_overloaded {
+      let overload_handlers = self.overload_handlers.lock().clone();
+      for handler in overload_handlers {
+        handler();
+      }
     }
   }
 }

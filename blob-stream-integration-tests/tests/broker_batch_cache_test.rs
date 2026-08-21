@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use blob_stream_blob_store::{BlobKey, BlobStore, BlobStoreResult, ByteRange};
+use blob_stream_blob_store::{BlobCacheAdmission, BlobKey, BlobStore, BlobStoreResult, ByteRange};
 use blob_stream_consumer::iterator::ConsumerIterator;
 use blob_stream_integration_tests::test_framework::{
   self as framework,
@@ -48,9 +48,13 @@ impl BlobStore for CountingBlobStore {
     self.inner.get_range(key, range).await
   }
 
-  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
     self.full_reads.fetch_add(1, Ordering::Relaxed);
-    self.inner.get(key, max_bytes).await
+    self.inner.get_with_cache_admission(key, admission).await
   }
 }
 

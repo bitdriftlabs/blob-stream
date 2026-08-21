@@ -1233,6 +1233,7 @@ dependencies = [
  "blob-stream-broker-discovery",
  "blob-stream-metadata-store",
  "blob-stream-proto",
+ "blob-stream-runtime-config",
  "blob-stream-test-utils",
  "blob-stream-types",
  "bytes",

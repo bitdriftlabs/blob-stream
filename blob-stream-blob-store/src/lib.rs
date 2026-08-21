@@ -90,13 +90,9 @@ pub enum BlobStoreError {
   #[error("invalid byte range for blob {key}: {message}")]
   /// The requested byte range cannot be read from the blob.
   InvalidRange { key: String, message: String },
-  #[error("blob {key} is {actual_bytes} bytes, exceeding the {max_bytes}-byte limit")]
-  /// The complete blob exceeds the caller's bounded read limit.
-  TooLarge {
-    key: String,
-    max_bytes: u64,
-    actual_bytes: u64,
-  },
+  #[error("blob cache admission rejected: {key}")]
+  /// The caller rejected the content length before the complete object was read.
+  AdmissionRejected { key: String },
   #[error("read blob {key}: {source}")]
   /// A storage or body-stream error not otherwise classified.
   Read {
@@ -108,6 +104,9 @@ pub enum BlobStoreError {
 
 /// Result returned by blob range reads.
 pub type BlobStoreResult<T> = std::result::Result<T, BlobStoreError>;
+
+/// Decides whether a complete object of the reported byte length may be retained.
+pub type BlobCacheAdmission = dyn Fn(u64) -> bool + Send + Sync;
 
 //
 // BlobStore
@@ -123,6 +122,10 @@ pub trait BlobStore: Send + Sync {
   /// Read an exact byte range from a blob.
   async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes>;
 
-  /// Read the complete blob when its size does not exceed `max_bytes`.
-  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes>;
+  /// Read a complete blob after admitting its content length for cache retention.
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes>;
 }

@@ -7,7 +7,13 @@ use async_trait::async_trait;
 use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
-use blob_stream_blob_store::{BlobStoreError, BlobStoreResult, ByteRange, InMemoryBlobStore};
+use blob_stream_blob_store::{
+  BlobCacheAdmission,
+  BlobStoreError,
+  BlobStoreResult,
+  ByteRange,
+  InMemoryBlobStore,
+};
 use blob_stream_proto::protos::blobstream::v1::broker::{
   BlobRangeRequest,
   BlobReadFailureStatus,
@@ -48,11 +54,16 @@ impl BlobStore for GatedBlobStore {
     self.store.get_range(key, range).await
   }
 
-  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    let blob = self.store.get_with_cache_admission(key, admission).await?;
     self.get_calls.fetch_add(1, Ordering::Relaxed);
     self.entered.notify_waiters();
     self.release.notified().await;
-    self.store.get(key, max_bytes).await
+    Ok(blob)
   }
 }
 
@@ -89,7 +100,12 @@ impl BlobStore for GatedFailingBlobStore {
     unreachable!("blob cache uses full-object reads")
   }
 
-  async fn get(&self, key: &BlobKey, _max_bytes: u64) -> BlobStoreResult<Bytes> {
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    let _ = admission;
     self.get_calls.fetch_add(1, Ordering::Relaxed);
     self.entered.notify_waiters();
     while !self.released.load(Ordering::Relaxed) {
@@ -154,7 +170,6 @@ fn cache_with_idle_ttl(
     BlobCacheConfig {
       request_timeout: Duration::from_secs(1),
       idle_ttl,
-      max_blob_bytes: 64,
     },
     pressure,
     &Collector::default().scope("blob_cache_test"),
@@ -172,7 +187,6 @@ fn cache_with_idle_ttl_and_clock(
     BlobCacheConfig {
       request_timeout: Duration::from_secs(1),
       idle_ttl,
-      max_blob_bytes: 64,
     },
     pressure,
     time_provider,
@@ -204,9 +218,13 @@ impl BlobStore for CountingBlobStore {
     self.store.get_range(key, range).await
   }
 
-  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
     self.get_calls.fetch_add(1, Ordering::Relaxed);
-    self.store.get(key, max_bytes).await
+    self.store.get_with_cache_admission(key, admission).await
   }
 }
 
@@ -222,7 +240,12 @@ impl BlobStore for FailingBlobStore {
     unreachable!("blob cache uses full-object reads")
   }
 
-  async fn get(&self, key: &BlobKey, _max_bytes: u64) -> BlobStoreResult<Bytes> {
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    let _ = admission;
     Err(BlobStoreError::Read {
       key: key.as_str().to_string(),
       source: anyhow::anyhow!("private bucket credentials failed"),
@@ -253,14 +276,14 @@ fn config_reads_idle_ttl_from_feature_flags() {
   let feature_flags = feature_flags.snapshot_watch();
 
   let config =
-    BlobCacheConfig::from_broker_config(&BrokerConfig::new(), 64, Some(&feature_flags)).unwrap();
+    BlobCacheConfig::from_broker_config(&BrokerConfig::new(), Some(&feature_flags)).unwrap();
 
   assert_eq!(config.idle_ttl, Duration::from_millis(1_234));
 }
 
 #[test]
 fn config_defaults_idle_ttl_to_ten_seconds() {
-  let config = BlobCacheConfig::from_broker_config(&BrokerConfig::new(), 64, None).unwrap();
+  let config = BlobCacheConfig::from_broker_config(&BrokerConfig::new(), None).unwrap();
 
   assert_eq!(config.idle_ttl, Duration::from_secs(10));
 }
@@ -272,9 +295,7 @@ fn config_rejects_nonpositive_idle_ttl_feature_flags() {
   ));
   let feature_flags = feature_flags.snapshot_watch();
 
-  assert!(
-    BlobCacheConfig::from_broker_config(&BrokerConfig::new(), 64, Some(&feature_flags)).is_err()
-  );
+  assert!(BlobCacheConfig::from_broker_config(&BrokerConfig::new(), Some(&feature_flags)).is_err());
 }
 
 #[tokio::test]
@@ -434,7 +455,12 @@ async fn request_over_the_wire_response_limit_does_not_read_or_cache() {
 
 #[tokio::test]
 async fn insufficient_pressure_headroom_rejects_cache_admission() {
-  let cache = cache(Arc::new(InMemoryBlobStore::new()), pressure(790, 1_000));
+  let store = Arc::new(InMemoryBlobStore::new());
+  store
+    .put(&BlobKey::from("topic/blob"), Bytes::from(vec![0; 64]))
+    .await
+    .unwrap();
+  let cache = cache(store, pressure(790, 1_000));
 
   let response = cache.read(request(&[(0, 1)])).await;
 
@@ -480,6 +506,7 @@ async fn overload_flushes_retained_entries_before_rejecting_new_reads() {
     limit_bytes: 1_000,
   }));
   assert!(pressure.try_reserve_cache_bytes(0).is_none());
+  assert_eq!(cache.snapshot().await.entry_count, 0);
 
   let response = cache.read(request(&[(0, 1)])).await;
 
@@ -610,14 +637,54 @@ async fn concurrent_failed_fetches_share_one_request_and_release_admission() {
   assert_eq!(store.get_calls.load(Ordering::Relaxed), 2);
 }
 
+#[tokio::test(start_paused = true)]
+async fn timed_out_request_keeps_fetch_cleanup_running() {
+  let store = Arc::new(GatedBlobStore::new());
+  store
+    .put(
+      &BlobKey::from("topic/blob"),
+      Bytes::from_static(b"abcdefgh"),
+    )
+    .await
+    .unwrap();
+  let pressure = pressure(0, 1_000);
+  let cache = Arc::new(BlobCache::new(
+    Arc::clone(&store) as Arc<dyn BlobStore>,
+    BlobCacheConfig {
+      request_timeout: Duration::from_millis(1),
+      idle_ttl: Duration::from_secs(30),
+    },
+    Arc::clone(&pressure),
+    &Collector::default().scope("blob_cache_test"),
+  ));
+
+  let cache_for_request = Arc::clone(&cache);
+  let request = tokio::spawn(async move { cache_for_request.read(request(&[(0, 1)])).await });
+  store.entered.notified().await;
+  tokio::time::advance(Duration::from_millis(1)).await;
+  assert!(matches!(
+    request.await.unwrap().result,
+    Some(read_blob_ranges_response::Result::Failure(_))
+  ));
+  assert_eq!(cache.snapshot().await.active_fetches, 1);
+  assert_eq!(pressure.cache_reservations(), 8);
+
+  store.release.notify_waiters();
+  for _ in 0 .. 3 {
+    tokio::task::yield_now().await;
+  }
+  assert_eq!(cache.snapshot().await.active_fetches, 0);
+  assert_eq!(pressure.cache_reservations(), 0);
+}
+
 #[tokio::test]
-async fn oversized_blob_is_not_cached() {
+async fn content_length_admission_rejects_a_blob_that_exceeds_headroom() {
   let store = Arc::new(InMemoryBlobStore::new());
   store
     .put(&BlobKey::from("topic/blob"), Bytes::from(vec![0; 65]))
     .await
     .unwrap();
-  let cache = cache(store, pressure(0, 1_000));
+  let cache = cache(store, pressure(750, 1_000));
 
   let response = cache.read(request(&[(0, 1)])).await;
 
@@ -626,7 +693,7 @@ async fn oversized_blob_is_not_cached() {
   };
   assert_eq!(
     failure.status,
-    BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_TOO_LARGE.into()
+    BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED.into()
   );
   assert_eq!(cache.snapshot().await.entry_count, 0);
 }

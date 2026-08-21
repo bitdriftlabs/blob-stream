@@ -34,6 +34,7 @@ use crate::diagnostics::{
 use bd_server_stats::stats::Collector;
 use bd_time::SystemTimeProvider;
 use blob_stream_blob_store::{
+  BlobCacheAdmission,
   BlobKey,
   BlobStore,
   BlobStoreError,
@@ -469,8 +470,12 @@ impl BlobStore for BlockingBlobStore {
     self.inner.get_range(key, range).await
   }
 
-  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
-    self.inner.get(key, max_bytes).await
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    self.inner.get_with_cache_admission(key, admission).await
   }
 }
 
@@ -488,11 +493,16 @@ impl BlobStore for FailingReadBlobStore {
     })
   }
 
-  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    let _ = admission;
     self.failed_reads.fetch_add(1, Ordering::SeqCst);
     Err(BlobStoreError::Read {
       key: key.as_str().to_string(),
-      source: anyhow::anyhow!("injected blob full-read failure for {key:?} at {max_bytes}"),
+      source: anyhow::anyhow!("injected blob cache-admission read failure for {key:?}"),
     })
   }
 }

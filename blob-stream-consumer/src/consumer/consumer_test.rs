@@ -24,6 +24,7 @@ use bd_server_stats::stats::Collector;
 use bd_server_stats::test::util::stats::Helper;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_blob_store::{
+  BlobCacheAdmission,
   BlobKey,
   BlobStore,
   BlobStoreError,
@@ -391,8 +392,12 @@ impl BlobStore for FailSecondRangeBlobStore {
     self.inner.get_range(key, range).await
   }
 
-  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
-    self.inner.get(key, max_bytes).await
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    self.inner.get_with_cache_admission(key, admission).await
   }
 }
 
@@ -433,13 +438,17 @@ impl BlobStore for MissingRangeBlobStore {
     self.inner.get_range(key, range).await
   }
 
-  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
     if self.missing_key.lock().as_ref() == Some(key) {
       return Err(BlobStoreError::NotFound {
         key: key.as_str().to_string(),
       });
     }
-    self.inner.get(key, max_bytes).await
+    self.inner.get_with_cache_admission(key, admission).await
   }
 }
 
@@ -476,8 +485,12 @@ impl BlobStore for RecordingRangeBlobStore {
     self.inner.get_range(key, range).await
   }
 
-  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
-    self.inner.get(key, max_bytes).await
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    self.inner.get_with_cache_admission(key, admission).await
   }
 }
 
@@ -508,8 +521,12 @@ impl BlobStore for TruncatingRangeBlobStore {
     Ok(payload.slice(.. payload.len().saturating_sub(1)))
   }
 
-  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
-    self.inner.get(key, max_bytes).await
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    self.inner.get_with_cache_admission(key, admission).await
   }
 }
 
@@ -576,8 +593,12 @@ impl BlobStore for BlockingRangeBlobStore {
     result
   }
 
-  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
-    self.inner.get(key, max_bytes).await
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    self.inner.get_with_cache_admission(key, admission).await
   }
 }
 
@@ -3338,7 +3359,7 @@ async fn broker_blob_cache_handles_many_ranges_from_one_blob_key() {
 }
 
 #[tokio::test]
-async fn malformed_broker_blob_response_retries_the_complete_group_directly() {
+async fn corrupt_broker_blob_payload_retries_the_complete_group_directly() {
   let blob_store = Arc::new(RecordingRangeBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let (_, payloads) = write_shared_blob_segments(
@@ -3363,7 +3384,8 @@ async fn malformed_broker_blob_response_retries_the_complete_group_directly() {
   )
   .await;
   let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_success(vec![
-    payloads[0].clone(),
+    Bytes::from(vec![0; payloads[0].len()]),
+    payloads[1].clone(),
   ])));
   let feature_flags = FakeLoader::new(Arc::new(
     DefaultFeatureFlags::default()

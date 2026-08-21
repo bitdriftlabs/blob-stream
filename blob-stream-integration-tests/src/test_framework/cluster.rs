@@ -908,7 +908,7 @@ impl ClusterHarness {
     let metrics = BrokerMetrics::new();
     let blob_cache = Arc::new(BlobCache::new(
       Arc::clone(&self.blob_store),
-      BlobCacheConfig::from_broker_config(&BrokerConfig::new(), 1024, None)?,
+      BlobCacheConfig::from_broker_config(&BrokerConfig::new(), None)?,
       MemoryPressureController::with_sampler(
         Arc::new(StaticMemoryPressureSampler),
         &metrics.scope(),

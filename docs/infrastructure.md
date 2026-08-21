@@ -87,6 +87,8 @@ live `blob_stream_consumer_broker_batch_cache_enabled` flag and defaults to disa
 always available and only consumer flags control whether it is used. Blob-cache idle retention is
 configured when a broker starts through
 `blob_stream_broker_blob_cache_idle_ttl_ms`; it defaults to 10 seconds and must be positive.
+The broker admits each complete object from its reported content length and current cgroup headroom
+before reading its body.
 Shadow mode always delivers the direct DynamoDB result and uses a validated broker response only
 for comparison. Broker-delivery mode returns the broker result but retains the original direct
 scan as fallback for transport, validation, overload, or stale-observation failures. Consumer

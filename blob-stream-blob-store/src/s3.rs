@@ -1,4 +1,4 @@
-use crate::{BlobKey, BlobStore, BlobStoreError, BlobStoreResult, ByteRange};
+use crate::{BlobCacheAdmission, BlobKey, BlobStore, BlobStoreError, BlobStoreResult, ByteRange};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_sdk_s3::error::SdkError;
@@ -32,17 +32,19 @@ impl S3BlobStore {
   }
 }
 
-fn bounded_full_read_limit(max_bytes: u64) -> u64 {
-  max_bytes.saturating_add(1)
-}
-
-async fn read_bounded_body(
+async fn read_content_length_body(
   body: impl AsyncRead + Unpin,
-  max_bytes: u64,
+  content_length: u64,
 ) -> std::io::Result<Vec<u8>> {
-  let mut body = body.take(bounded_full_read_limit(max_bytes));
+  let mut body = body.take(content_length);
   let mut bytes = Vec::new();
   body.read_to_end(&mut bytes).await?;
+  if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != content_length {
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::UnexpectedEof,
+      "S3 body did not match its advertised content length",
+    ));
+  }
   Ok(bytes)
 }
 
@@ -132,21 +134,16 @@ impl BlobStore for S3BlobStore {
     Ok(bytes)
   }
 
-  async fn get(&self, key: &BlobKey, max_bytes: u64) -> BlobStoreResult<Bytes> {
-    trace!(
-      "s3 get start: bucket={}, key={}, max_bytes={}",
-      self.bucket,
-      key.as_str(),
-      max_bytes
-    );
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
     let response = match self
       .client
       .get_object()
       .bucket(&self.bucket)
       .key(key.as_str())
-      // Fetch one extra byte so an endpoint that omits Content-Length still cannot make this
-      // bounded cache read retain more than its configured maximum.
-      .range(format!("bytes=0-{max_bytes}"))
       .send()
       .await
     {
@@ -163,39 +160,27 @@ impl BlobStore for S3BlobStore {
         });
       },
     };
-
-    if let Some(content_length) = response.content_length {
-      let actual_bytes = u64::try_from(content_length).unwrap_or(u64::MAX);
-      if actual_bytes > max_bytes {
-        return Err(BlobStoreError::TooLarge {
-          key: key.as_str().to_string(),
-          max_bytes,
-          actual_bytes,
-        });
-      }
+    let content_length = response
+      .content_length
+      .ok_or_else(|| BlobStoreError::Read {
+        key: key.as_str().to_string(),
+        source: anyhow::anyhow!("S3 response has no content length"),
+      })?;
+    let content_length = u64::try_from(content_length).map_err(|_| BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("S3 response content length is negative"),
+    })?;
+    if !admission(content_length) {
+      return Err(BlobStoreError::AdmissionRejected {
+        key: key.as_str().to_string(),
+      });
     }
-
-    let bytes = read_bounded_body(response.body.into_async_read(), max_bytes)
+    let bytes = read_content_length_body(response.body.into_async_read(), content_length)
       .await
       .map_err(|source| BlobStoreError::Read {
         key: key.as_str().to_string(),
         source: source.into(),
       })?;
-    let actual_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    if actual_bytes > max_bytes {
-      return Err(BlobStoreError::TooLarge {
-        key: key.as_str().to_string(),
-        max_bytes,
-        actual_bytes,
-      });
-    }
-
-    debug!(
-      "s3 get complete: bucket={}, key={}, bytes={}",
-      self.bucket,
-      key.as_str(),
-      bytes.len()
-    );
     Ok(Bytes::from(bytes))
   }
 }
