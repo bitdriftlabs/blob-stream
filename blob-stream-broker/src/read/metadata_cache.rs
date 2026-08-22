@@ -5,6 +5,7 @@ mod tests;
 use anyhow::{Result, anyhow, ensure};
 use bd_log_util::warn_every;
 use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
+use bd_shutdown::ComponentShutdownTriggerHandle;
 use blob_stream_metadata_store::{
   MetadataReadConsistency as StoreConsistency,
   MetadataStore,
@@ -58,6 +59,7 @@ const DEFAULT_MAX_RESPONSE_ITEMS: usize = 10_000;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_MAX_ENTRY_ITEMS: usize = 100_000;
 const CACHE_IDLE_TTL: StdDuration = StdDuration::from_mins(5);
+const CACHE_MAINTENANCE_INTERVAL: StdDuration = StdDuration::from_mins(1);
 pub const MAX_METADATA_READ_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const RECOVERY_CACHE_MAX_BYTES_FEATURE_FLAG: &str =
   "blob_stream_broker_metadata_recovery_cache_max_bytes";
@@ -433,7 +435,7 @@ impl MetadataCache {
   #[must_use]
   pub fn new(metadata_store: Arc<dyn MetadataStore>, config: MetadataCacheConfig) -> Self {
     let collector = bd_server_stats::stats::Collector::default();
-    Self::new_with_metrics(
+    Self::new_inner(
       metadata_store,
       config,
       &collector.scope("blob_stream_broker"),
@@ -442,6 +444,17 @@ impl MetadataCache {
 
   #[must_use]
   pub fn new_with_metrics(
+    metadata_store: Arc<dyn MetadataStore>,
+    config: MetadataCacheConfig,
+    shutdown_trigger_handle: &ComponentShutdownTriggerHandle,
+    metrics_scope: &bd_server_stats::stats::Scope,
+  ) -> Arc<Self> {
+    let cache = Arc::new(Self::new_inner(metadata_store, config, metrics_scope));
+    cache.spawn_maintenance(shutdown_trigger_handle);
+    cache
+  }
+
+  fn new_inner(
     metadata_store: Arc<dyn MetadataStore>,
     config: MetadataCacheConfig,
     metrics_scope: &bd_server_stats::stats::Scope,
@@ -503,11 +516,26 @@ impl MetadataCache {
     self.config.request_timeout
   }
 
+  /// Runs cache eviction work independently of read traffic.
+  fn spawn_maintenance(self: &Arc<Self>, shutdown_trigger_handle: &ComponentShutdownTriggerHandle) {
+    let cache = Arc::clone(self);
+    let mut shutdown = shutdown_trigger_handle.clone().make_shutdown();
+    tokio::spawn(async move {
+      loop {
+        tokio::select! {
+          () = shutdown.cancelled() => {
+            debug!("broker metadata cache maintenance shutdown");
+            return;
+          },
+          () = tokio::time::sleep(CACHE_MAINTENANCE_INTERVAL) => cache.run_maintenance().await,
+        }
+      }
+    });
+  }
+
   #[must_use]
   pub async fn snapshot(&self) -> MetadataCacheSnapshot {
-    // Moka applies eviction asynchronously, so flush its maintenance work before reporting usage.
-    self.eventual_tail_entries.run_pending_tasks().await;
-    self.eventual_recovery_entries.run_pending_tasks().await;
+    self.run_maintenance().await;
     let snapshot = MetadataCacheSnapshot {
       tail_entry_count: self.eventual_tail_entries.entry_count(),
       tail_retained_bytes: self.eventual_tail_entries.weighted_size(),
@@ -524,6 +552,21 @@ impl MetadataCache {
     };
     self.record_cache_state(&snapshot);
     snapshot
+  }
+
+  async fn run_maintenance(&self) {
+    // Moka applies expiration and capacity eviction asynchronously. A quiet cache therefore
+    // needs a maintenance driver so its retained-entry metrics converge without an admin read.
+    self.eventual_tail_entries.run_pending_tasks().await;
+    self.eventual_recovery_entries.run_pending_tasks().await;
+    self.tail_retained_metrics.record_exact(
+      self.eventual_tail_entries.entry_count(),
+      self.eventual_tail_entries.weighted_size(),
+    );
+    self.recovery_retained_metrics.record_exact(
+      self.eventual_recovery_entries.entry_count(),
+      self.eventual_recovery_entries.weighted_size(),
+    );
   }
 
   pub async fn read(

@@ -74,11 +74,12 @@ async fn async_main() -> Result<()> {
   let broker_blob_store = build_runtime_blob_store(&config).await?;
   let metadata_cache_config =
     MetadataCacheConfig::from_runtime_config(&config, feature_flags_watch.as_ref())?;
-  let metadata_cache = Arc::new(MetadataCache::new_with_metrics(
+  let metadata_cache = MetadataCache::new_with_metrics(
     Arc::clone(&metadata_store),
     metadata_cache_config,
+    &broker_shutdown_trigger.make_handle(),
     &metrics_scope,
-  ));
+  );
   let memory_pressure =
     MemoryPressureController::new(&broker_shutdown_trigger.make_handle(), &metrics_scope);
   let blob_cache = Arc::new(BlobCache::new(
