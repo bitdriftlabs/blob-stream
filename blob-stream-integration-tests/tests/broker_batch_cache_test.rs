@@ -85,7 +85,7 @@ async fn broker_batch_cache_uses_real_transport_then_falls_back_after_owner_loss
     .expect("test runtime has group configuration")
     .group_id = "broker-batch-cache-group".into();
   let mut consumer = cluster
-    .create_broker_blob_cache_consumer_with_discovery(&runtime, Arc::new(discovery.clone()))
+    .create_consumer_with_discovery(&runtime, Arc::new(discovery.clone()))
     .await?;
   consumer.start()?;
 

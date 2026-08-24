@@ -42,7 +42,7 @@ use tokio::sync::Notify;
 // ConsumerIteratorBuilder
 //
 
-/// Configures a consumer iterator and optional test-only runtime dependencies.
+/// Configures a consumer iterator and runtime dependencies.
 pub struct ConsumerIteratorBuilder<'a> {
   runtime: &'a ConsumerRuntimeConfig,
   blob_store: Arc<dyn BlobStore>,
@@ -57,8 +57,8 @@ pub struct ConsumerIteratorBuilder<'a> {
   maximum_clock_skew: Duration,
   metadata_cache_max_age: Duration,
   feature_flags: Option<FeatureFlagsWatch>,
-  broker_metadata_query: Option<Arc<dyn BrokerMetadataQuery>>,
-  broker_blob_range_query: Option<Arc<dyn BrokerBlobRangeQuery>>,
+  broker_metadata_query: Arc<dyn BrokerMetadataQuery>,
+  broker_blob_range_query: Arc<dyn BrokerBlobRangeQuery>,
   time_provider: Arc<dyn TimeProvider>,
   lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
 }
@@ -72,6 +72,8 @@ impl<'a> ConsumerIteratorBuilder<'a> {
     lease_store: Arc<dyn ConsumerGroupLeaseStore>,
     membership_store: Arc<dyn ConsumerGroupMembershipStore>,
     coordination_source: Arc<dyn ConsumerCoordinationSource>,
+    broker_metadata_query: Arc<dyn BrokerMetadataQuery>,
+    broker_blob_range_query: Arc<dyn BrokerBlobRangeQuery>,
     metrics_scope: Scope,
     retention: Duration,
     maximum_metadata_publication_lag: Duration,
@@ -94,8 +96,8 @@ impl<'a> ConsumerIteratorBuilder<'a> {
         .map_or(DEFAULT_MAX_CLOCK_SKEW, consumer_max_clock_skew),
       metadata_cache_max_age: Duration::ZERO,
       feature_flags,
-      broker_metadata_query: None,
-      broker_blob_range_query: None,
+      broker_metadata_query,
+      broker_blob_range_query,
       time_provider: Arc::new(SystemTimeProvider),
       lifecycle_hooks: None,
     }
@@ -133,18 +135,6 @@ impl<'a> ConsumerIteratorBuilder<'a> {
     self.lifecycle_hooks = Some(lifecycle_hooks);
     self
   }
-
-  #[must_use]
-  pub fn broker_metadata_query(mut self, query: Arc<dyn BrokerMetadataQuery>) -> Self {
-    self.broker_metadata_query = Some(query);
-    self
-  }
-
-  #[must_use]
-  pub fn broker_blob_range_query(mut self, query: Arc<dyn BrokerBlobRangeQuery>) -> Self {
-    self.broker_blob_range_query = Some(query);
-    self
-  }
 }
 
 impl ConsumerIteratorImpl {
@@ -157,6 +147,8 @@ impl ConsumerIteratorImpl {
     lease_store: Arc<dyn ConsumerGroupLeaseStore>,
     membership_store: Arc<dyn ConsumerGroupMembershipStore>,
     coordination_source: Arc<dyn ConsumerCoordinationSource>,
+    broker_metadata_query: Arc<dyn BrokerMetadataQuery>,
+    broker_blob_range_query: Arc<dyn BrokerBlobRangeQuery>,
     metrics_scope: Scope,
     retention: Duration,
     maximum_metadata_publication_lag: Duration,
@@ -169,6 +161,8 @@ impl ConsumerIteratorImpl {
       lease_store,
       membership_store,
       coordination_source,
+      broker_metadata_query,
+      broker_blob_range_query,
       metrics_scope,
       retention,
       maximum_metadata_publication_lag,
@@ -237,6 +231,8 @@ impl ConsumerIteratorBuilder<'_> {
       HashMap::new(),
       blob_store,
       metadata_store,
+      broker_metadata_query,
+      broker_blob_range_query,
       &metrics_scope.scope("consumer"),
       retention,
       maximum_metadata_publication_lag,
@@ -245,16 +241,6 @@ impl ConsumerIteratorBuilder<'_> {
     .metadata_window_size(metadata_window_size)
     .maximum_clock_skew(maximum_clock_skew)
     .metadata_cache_max_age(metadata_cache_max_age);
-    let reader = if let Some(broker_metadata_query) = broker_metadata_query {
-      reader.broker_metadata_query(broker_metadata_query)
-    } else {
-      reader
-    };
-    let reader = if let Some(broker_blob_range_query) = broker_blob_range_query {
-      reader.broker_blob_range_query(broker_blob_range_query)
-    } else {
-      reader
-    };
     let coordinator = ConsumerGroupCoordinatorImpl::new(
       group_config.clone(),
       Arc::clone(&lease_store),

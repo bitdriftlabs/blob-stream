@@ -18,8 +18,8 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   read_metadata_window_response,
 };
 use blob_stream_proto::protos::blobstream::v1::config::BrokerDiscoveryConfig;
-use blob_stream_types::{BatchMetadata, SnowflakeId, TopicWindowKey};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use blob_stream_types::{SnowflakeId, TopicWindowKey};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -35,19 +35,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) struct BrokerMetadataResult {
   pub(super) segments: Vec<SegmentMetadata>,
   pub(super) observed_at: OffsetDateTime,
-}
-
-//
-// CanonicalSegmentMetadata
-//
-
-/// Immutable metadata fields selected by one Tail request for shadow comparison.
-#[derive(Debug, Eq, PartialEq)]
-struct CanonicalSegmentMetadata {
-  blob_key: String,
-  compression: blob_stream_types::Compression,
-  metadata_published_at: OffsetDateTime,
-  partition_index: BTreeMap<u32, Vec<BatchMetadata>>,
 }
 
 #[async_trait]
@@ -263,112 +250,4 @@ pub(super) fn decode_metadata_response(
     segments,
     observed_at,
   })
-}
-
-/// Compare broker and direct metadata after applying the request's partition coverage.
-///
-/// A match requires the canonical projections to be comparable: every segment in the smaller
-/// projection must appear with identical immutable metadata in the larger projection. This accepts
-/// either source returning an overall superset when it observes a later eventual-consistency state,
-/// but rejects gaps or conflicting metadata because neither side then covers the other.
-pub(super) fn metadata_results_match(
-  request: &ReadMetadataWindowRequest,
-  broker_segments: &[SegmentMetadata],
-  direct_segments: &[SegmentMetadata],
-) -> Result<bool> {
-  let broker = canonicalize_metadata(request, broker_segments)?;
-  let direct = canonicalize_metadata(request, direct_segments)?;
-  Ok(canonical_projection_covers(&broker, &direct) || canonical_projection_covers(&direct, &broker))
-}
-
-/// Produce the request-visible metadata used by the shadow comparison.
-///
-/// The projection discards unrequested partitions, Tail rows below a partition's lower bound, and
-/// segments left empty by that filtering. It preserves the immutable fields needed to distinguish
-/// identical visibility from conflicting metadata for the same snowflake.
-fn canonicalize_metadata(
-  request: &ReadMetadataWindowRequest,
-  segments: &[SegmentMetadata],
-) -> Result<BTreeMap<SnowflakeId, CanonicalSegmentMetadata>> {
-  let (requested_partitions, partition_bounds) = match request.coverage.as_ref() {
-    Some(read_metadata_window_request::Coverage::Tail(coverage)) => {
-      let partition_bounds = coverage
-        .partition_bounds
-        .iter()
-        .map(|bound| (bound.virtual_partition_id, SnowflakeId(bound.min_snowflake)))
-        .collect::<HashMap<_, _>>();
-      ensure!(
-        !partition_bounds.is_empty(),
-        "shadow comparison request has no Tail partition bounds"
-      );
-      (
-        partition_bounds.keys().copied().collect(),
-        Some(partition_bounds),
-      )
-    },
-    Some(read_metadata_window_request::Coverage::FullRecovery(coverage)) => {
-      let requested_partitions = coverage
-        .virtual_partition_ids
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-      ensure!(
-        !requested_partitions.is_empty()
-          && requested_partitions.len() == coverage.virtual_partition_ids.len(),
-        "shadow comparison Full Recovery request has no partitions or duplicate partitions"
-      );
-      (requested_partitions, None)
-    },
-    None => return Err(anyhow!("shadow comparison request has no coverage")),
-  };
-
-  // Compare only the portion each request can observe; cache population may legitimately include
-  // other partitions from the same segment.
-  let mut canonical = BTreeMap::new();
-  for segment in segments {
-    let partition_index = segment
-      .segment_index
-      .iter()
-      .filter_map(|(&partition_id, batches)| {
-        requested_partitions
-          .contains(&partition_id)
-          .then_some(partition_id)
-          .filter(|partition_id| {
-            partition_bounds.as_ref().is_none_or(|bounds| {
-              bounds
-                .get(partition_id)
-                .is_some_and(|bound| segment.snowflake_id >= *bound)
-            })
-          })
-          .map(|partition_id| (partition_id, batches.clone()))
-      })
-      .collect::<BTreeMap<_, _>>();
-    if partition_index.is_empty() {
-      continue;
-    }
-    let candidate = CanonicalSegmentMetadata {
-      blob_key: segment.blob_key.as_str().to_string(),
-      compression: segment.compression.clone(),
-      metadata_published_at: segment.metadata_published_at,
-      partition_index,
-    };
-    if let Some(previous) = canonical.insert(segment.snowflake_id, candidate) {
-      ensure!(
-        canonical.get(&segment.snowflake_id) == Some(&previous),
-        "shadow comparison metadata has duplicate snowflake {} with unequal metadata",
-        segment.snowflake_id.as_u64()
-      );
-    }
-  }
-  Ok(canonical)
-}
-
-/// Return whether every segment in `required` occurs identically in `candidate`.
-fn canonical_projection_covers(
-  required: &BTreeMap<SnowflakeId, CanonicalSegmentMetadata>,
-  candidate: &BTreeMap<SnowflakeId, CanonicalSegmentMetadata>,
-) -> bool {
-  required
-    .iter()
-    .all(|(snowflake_id, metadata)| candidate.get(snowflake_id) == Some(metadata))
 }

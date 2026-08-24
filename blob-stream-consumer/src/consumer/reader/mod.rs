@@ -99,8 +99,8 @@ pub struct ConsumerReaderImpl {
   pub(in crate::consumer) config: ConsumerReadConfig,
   pub(in crate::consumer) blob_store: Arc<dyn BlobStore>,
   pub(in crate::consumer) metadata_store: Arc<dyn MetadataStore>,
-  pub(in crate::consumer) broker_metadata_query: Option<Arc<dyn BrokerMetadataQuery>>,
-  pub(in crate::consumer) broker_blob_range_query: Option<Arc<dyn BrokerBlobRangeQuery>>,
+  pub(in crate::consumer) broker_metadata_query: Arc<dyn BrokerMetadataQuery>,
+  pub(in crate::consumer) broker_blob_range_query: Arc<dyn BrokerBlobRangeQuery>,
   pub(in crate::consumer) virtual_partition_states:
     HashMap<VirtualPartitionId, VirtualPartitionState>,
   pub(in crate::consumer) retention: Duration,

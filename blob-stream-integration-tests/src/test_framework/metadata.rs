@@ -1,12 +1,15 @@
 use super::{ClusterHarness, IntegrationResources, ManualTimeProvider, TOPIC};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
-use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use bd_time::{OffsetDateTimeExt, TimeProvider};
 use blob_stream_blob_store::{BlobKey, BlobStore};
-use blob_stream_consumer::consumer::{ConsumerReaderImpl, GrpcBrokerMetadataQuery};
+use blob_stream_consumer::consumer::{
+  BrokerBlobRangeQuery,
+  BrokerMetadataQuery,
+  ConsumerReaderImpl,
+  GrpcBrokerMetadataQuery,
+};
 use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, NextResult};
 use blob_stream_consumer::{ConsumerReadConfig, DEFAULT_MAX_METADATA_PUBLICATION_LAG};
 use blob_stream_metadata_store::{
@@ -20,6 +23,12 @@ use blob_stream_metadata_store::{
   SegmentMetadata,
 };
 use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerRecord};
+use blob_stream_proto::protos::blobstream::v1::broker::{
+  ReadBlobRangesRequest,
+  ReadBlobRangesResponse,
+  ReadMetadataWindowRequest,
+  ReadMetadataWindowResponse,
+};
 use blob_stream_types::{
   BatchMetadata,
   Compression,
@@ -706,10 +715,6 @@ pub async fn broker_metadata_cache_reader(
   strongly_consistent: bool,
   metadata_visibility_delay: TimeDuration,
 ) -> Result<ConsumerReaderImpl> {
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_broker_metadata_cache_enabled", true),
-  ));
   let discovery = Arc::new(cluster.producer_discovery());
   let broker_metadata_query = Arc::new(GrpcBrokerMetadataQuery::new(discovery).await?);
   ConsumerReaderImpl::new(
@@ -723,12 +728,45 @@ pub async fn broker_metadata_cache_reader(
     HashMap::new(),
     resources.blob_store(),
     metadata_store,
+    broker_metadata_query,
+    rejecting_broker_blob_range_query(),
     &Collector::default().scope("blob_stream_broker_metadata_cache_frontier_it"),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-    Some(feature_flags.snapshot_watch()),
+    None,
   )
-  .map(|reader| reader.broker_metadata_query(broker_metadata_query))
+}
+
+pub fn rejecting_broker_metadata_query() -> Arc<dyn BrokerMetadataQuery> {
+  Arc::new(RejectingBrokerMetadataQuery)
+}
+
+pub fn rejecting_broker_blob_range_query() -> Arc<dyn BrokerBlobRangeQuery> {
+  Arc::new(RejectingBrokerBlobRangeQuery)
+}
+
+struct RejectingBrokerMetadataQuery;
+
+#[async_trait]
+impl BrokerMetadataQuery for RejectingBrokerMetadataQuery {
+  async fn read_metadata_window(
+    &self,
+    _request: ReadMetadataWindowRequest,
+  ) -> Result<ReadMetadataWindowResponse> {
+    Err(anyhow!("test broker metadata query is unavailable"))
+  }
+}
+
+struct RejectingBrokerBlobRangeQuery;
+
+#[async_trait]
+impl BrokerBlobRangeQuery for RejectingBrokerBlobRangeQuery {
+  async fn read_blob_ranges(
+    &self,
+    _request: ReadBlobRangesRequest,
+  ) -> Result<ReadBlobRangesResponse> {
+    Err(anyhow!("test broker blob-range query is unavailable"))
+  }
 }
 
 pub async fn consume_one_record(mut consumer: ConsumerIteratorImpl) -> Result<String> {

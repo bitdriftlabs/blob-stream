@@ -20,10 +20,8 @@ use super::transport::{
 };
 use crate::test_framework::{PARTITION_COUNT, SECOND_TOPIC, TOPIC, WINDOW_SIZE_SECONDS};
 use anyhow::{Result, anyhow};
-use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
 use bd_shutdown::{ComponentShutdownTrigger, ComponentShutdownTriggerHandle};
-use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore};
 use blob_stream_broker::grpc::make_broker_router;
@@ -628,6 +626,17 @@ impl ClusterHarness {
     &self,
     runtime: &ConsumerRuntimeConfig,
   ) -> Result<ConsumerIteratorImpl> {
+    self
+      .create_consumer_with_discovery(runtime, Arc::new(self.producer_discovery()))
+      .await
+  }
+
+  /// Build a consumer with an explicit broker discovery source for routing tests.
+  pub async fn create_consumer_with_discovery(
+    &self,
+    runtime: &ConsumerRuntimeConfig,
+    discovery: Arc<dyn BrokerDiscovery>,
+  ) -> Result<ConsumerIteratorImpl> {
     let group = runtime
       .group
       .as_ref()
@@ -642,6 +651,9 @@ impl ClusterHarness {
       )
       .time_provider(Arc::clone(&self.consumer_time_provider)),
     );
+    let broker_metadata_query =
+      Arc::new(GrpcBrokerMetadataQuery::new(Arc::clone(&discovery)).await?);
+    let broker_blob_range_query = Arc::new(GrpcBrokerBlobRangeQuery::new(discovery).await?);
     ConsumerIteratorBuilder::new(
       runtime,
       Arc::clone(&self.blob_store),
@@ -649,6 +661,8 @@ impl ClusterHarness {
       Arc::clone(&self.consumer_lease_store),
       Arc::clone(&self.consumer_membership_store),
       coordination_source,
+      broker_metadata_query,
+      broker_blob_range_query,
       Collector::default().scope("blob_stream_consumer_it"),
       time::Duration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -664,12 +678,10 @@ impl ClusterHarness {
   pub async fn create_broker_metadata_cache_consumer(
     &self,
     runtime: &ConsumerRuntimeConfig,
-    shadow: bool,
   ) -> Result<ConsumerIteratorImpl> {
     self
       .create_broker_metadata_cache_consumer_with_discovery(
         runtime,
-        shadow,
         Arc::new(self.producer_discovery()),
       )
       .await
@@ -679,7 +691,6 @@ impl ClusterHarness {
   pub async fn create_broker_metadata_cache_consumer_with_discovery(
     &self,
     runtime: &ConsumerRuntimeConfig,
-    shadow: bool,
     discovery: Arc<dyn BrokerDiscovery>,
   ) -> Result<ConsumerIteratorImpl> {
     let group = runtime
@@ -696,58 +707,8 @@ impl ClusterHarness {
       )
       .time_provider(Arc::clone(&self.consumer_time_provider)),
     );
-    let feature_flags = FakeLoader::new(Arc::new(
-      DefaultFeatureFlags::default()
-        .with_bool_flag("blob_stream_consumer_broker_metadata_cache_enabled", true)
-        .with_bool_flag("blob_stream_consumer_broker_metadata_cache_shadow", shadow),
-    ));
-    let feature_flags = feature_flags.snapshot_watch();
-    let broker_metadata_query = Arc::new(GrpcBrokerMetadataQuery::new(discovery).await?);
-
-    ConsumerIteratorBuilder::new(
-      runtime,
-      Arc::clone(&self.blob_store),
-      Arc::clone(&self.metadata_store),
-      Arc::clone(&self.consumer_lease_store),
-      Arc::clone(&self.consumer_membership_store),
-      coordination_source,
-      Collector::default().scope("blob_stream_consumer_it"),
-      time::Duration::days(1),
-      time::Duration::ZERO,
-      Some(feature_flags),
-    )
-    .broker_metadata_query(broker_metadata_query)
-    .metadata_cache_max_age(time::Duration::milliseconds(250))
-    .lifecycle_hooks(Arc::new(self.lifecycle_hooks.clone()))
-    .time_provider(Arc::clone(&self.consumer_time_provider))
-    .build()
-    .await
-  }
-
-  /// Build a consumer that exercises the production broker blob-range transport.
-  pub async fn create_broker_blob_cache_consumer_with_discovery(
-    &self,
-    runtime: &ConsumerRuntimeConfig,
-    discovery: Arc<dyn BrokerDiscovery>,
-  ) -> Result<ConsumerIteratorImpl> {
-    let group = runtime
-      .group
-      .as_ref()
-      .ok_or_else(|| anyhow!("consumer runtime config requires a group config"))?;
-    let coordination_source = Arc::new(
-      MembershipCoordinationSource::new(
-        group.topic.to_string(),
-        group.group_id.to_string(),
-        group.member_id.to_string(),
-        (0 .. self.partition_count).collect(),
-        Arc::clone(&self.consumer_membership_store),
-      )
-      .time_provider(Arc::clone(&self.consumer_time_provider)),
-    );
-    let feature_flags = FakeLoader::new(Arc::new(
-      DefaultFeatureFlags::default()
-        .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
-    ));
+    let broker_metadata_query =
+      Arc::new(GrpcBrokerMetadataQuery::new(Arc::clone(&discovery)).await?);
     let broker_blob_range_query = Arc::new(GrpcBrokerBlobRangeQuery::new(discovery).await?);
 
     ConsumerIteratorBuilder::new(
@@ -757,12 +718,14 @@ impl ClusterHarness {
       Arc::clone(&self.consumer_lease_store),
       Arc::clone(&self.consumer_membership_store),
       coordination_source,
+      broker_metadata_query,
+      broker_blob_range_query,
       Collector::default().scope("blob_stream_consumer_it"),
       time::Duration::days(1),
-      DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-      Some(feature_flags.snapshot_watch()),
+      time::Duration::ZERO,
+      None,
     )
-    .broker_blob_range_query(broker_blob_range_query)
+    .metadata_cache_max_age(time::Duration::milliseconds(250))
     .lifecycle_hooks(Arc::new(self.lifecycle_hooks.clone()))
     .time_provider(Arc::clone(&self.consumer_time_provider))
     .build()

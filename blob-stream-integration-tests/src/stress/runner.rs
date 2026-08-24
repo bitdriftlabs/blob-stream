@@ -10,7 +10,14 @@ use crate::test_framework::{
 use anyhow::{Result, anyhow};
 use bd_server_stats::stats::Collector;
 use blob_stream_broker::write::BrokerLeaseStatus;
-use blob_stream_consumer::consumer::{ConsumerReader, ConsumerReaderImpl, ReadCapacity};
+use blob_stream_broker_discovery::BrokerDiscovery;
+use blob_stream_consumer::consumer::{
+  ConsumerReader,
+  ConsumerReaderImpl,
+  GrpcBrokerBlobRangeQuery,
+  GrpcBrokerMetadataQuery,
+  ReadCapacity,
+};
 use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, NextResult};
 use blob_stream_consumer::{
   ConsumerConfigFactory,
@@ -705,6 +712,7 @@ async fn run_with_resources(
   progress.enter_stage(StressStage::Verifying, Instant::now());
   let direct_verification_error = verify_all_records(
     validator,
+    cluster,
     resources,
     config.partition_count,
     config.verification_timeout,
@@ -1062,12 +1070,16 @@ pub fn stress_keys_for_partitions(partition_count: u32) -> Result<Vec<Vec<u8>>> 
 
 async fn verify_all_records(
   validator: &mut StressValidator,
+  cluster: &ClusterHarness,
   resources: &IntegrationResources,
   partition_count: u32,
   verification_timeout: Duration,
   progress_interval: Duration,
   progress: &StressProgress,
 ) -> Result<()> {
+  let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
+  let broker_metadata_query = Arc::new(GrpcBrokerMetadataQuery::new(Arc::clone(&discovery)).await?);
+  let broker_blob_range_query = Arc::new(GrpcBrokerBlobRangeQuery::new(discovery).await?);
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
@@ -1077,6 +1089,8 @@ async fn verify_all_records(
     HashMap::new(),
     resources.s3_blob_store(),
     resources.metadata_store(),
+    broker_metadata_query,
+    broker_blob_range_query,
     &Collector::default().scope("blob_stream_stress_verifier"),
     time::Duration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,

@@ -20,6 +20,7 @@ use crate::config::{
   DEFAULT_MAX_METADATA_PUBLICATION_LAG,
   consumer_max_clock_skew,
 };
+use crate::consumer::{BrokerBlobRangeQuery, BrokerMetadataQuery};
 use crate::diagnostics::{
   ConsumerAssignmentPlanSnapshot,
   ConsumerAssignmentPolicy,
@@ -63,7 +64,13 @@ use blob_stream_metadata_store::{
   MetadataWriteResult,
   SegmentMetadata,
 };
-use blob_stream_proto::protos::blobstream::v1::broker::StoredRecordBatch;
+use blob_stream_proto::protos::blobstream::v1::broker::{
+  ReadBlobRangesRequest,
+  ReadBlobRangesResponse,
+  ReadMetadataWindowRequest,
+  ReadMetadataWindowResponse,
+  StoredRecordBatch,
+};
 use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::{
   BatchMetadata,
@@ -95,6 +102,40 @@ use time::macros::datetime;
 use time::{Duration as TimeDuration, OffsetDateTime, UtcOffset};
 use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep, timeout};
+
+struct RejectingBrokerMetadataQuery;
+
+#[async_trait::async_trait]
+impl BrokerMetadataQuery for RejectingBrokerMetadataQuery {
+  async fn read_metadata_window(
+    &self,
+    _request: ReadMetadataWindowRequest,
+  ) -> anyhow::Result<ReadMetadataWindowResponse> {
+    Err(anyhow::anyhow!("test broker metadata query is unavailable"))
+  }
+}
+
+struct RejectingBrokerBlobRangeQuery;
+
+#[async_trait::async_trait]
+impl BrokerBlobRangeQuery for RejectingBrokerBlobRangeQuery {
+  async fn read_blob_ranges(
+    &self,
+    _request: ReadBlobRangesRequest,
+  ) -> anyhow::Result<ReadBlobRangesResponse> {
+    Err(anyhow::anyhow!(
+      "test broker blob-range query is unavailable"
+    ))
+  }
+}
+
+fn rejecting_broker_metadata_query() -> Arc<dyn BrokerMetadataQuery> {
+  Arc::new(RejectingBrokerMetadataQuery)
+}
+
+fn rejecting_broker_blob_range_query() -> Arc<dyn BrokerBlobRangeQuery> {
+  Arc::new(RejectingBrokerBlobRangeQuery)
+}
 
 struct MutableCoordinationSource {
   snapshot: Arc<Mutex<CoordinationSnapshot>>,
@@ -870,6 +911,8 @@ async fn build_iterator_with_clock_skew(
     Arc::new(InMemoryConsumerGroupLeaseStore::new()),
     Arc::new(InMemoryConsumerGroupMembershipStore::new()),
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -915,6 +958,8 @@ async fn idle_prefetch_worker_processes_hydration_command_without_clock_advance(
     lease_store,
     membership_store,
     coordination_source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1018,6 +1063,8 @@ async fn visibility_deferred_empty_scan_waits_until_metadata_is_eligible() {
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1102,6 +1149,8 @@ async fn iterator_builder_applies_configured_clock_skew_to_reader_scan_horizon()
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     TimeDuration::ZERO,
@@ -1261,6 +1310,8 @@ async fn failed_membership_heartbeats_fence_at_lease_deadline() {
     lease_store,
     membership_store.clone(),
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1325,6 +1376,8 @@ async fn partial_heartbeat_failure_revokes_fenced_partition() {
     lease_store.clone(),
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1420,6 +1473,8 @@ async fn lifecycle_hook_gates_commit_until_released() {
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1470,6 +1525,8 @@ async fn diagnostics_report_assignment_and_start_state() {
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1541,6 +1598,8 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1647,6 +1706,8 @@ async fn state_response_reports_lease_lookup_failure_without_blocking_local_diag
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1734,6 +1795,8 @@ async fn assignment_callback_replays_active_partitions() {
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1802,6 +1865,8 @@ async fn next_returns_revocation_until_completed() {
     lease_store,
     membership_store,
     source.clone(),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1878,6 +1943,8 @@ async fn next_does_not_lose_notification_between_state_check_and_wait() {
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1957,6 +2024,8 @@ async fn commit_during_revocation_persists_revoked_partition_cursor() {
     lease_store,
     membership_store,
     source.clone(),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2080,6 +2149,8 @@ async fn next_delivers_records_and_commit_renews() {
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     collector.scope("blob_stream_consumer_test"),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2152,6 +2223,8 @@ async fn scheduled_heartbeats_do_not_depend_on_next_polling() {
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2231,6 +2304,8 @@ async fn seek_waits_for_prefetch_scan_without_stalling_heartbeats() {
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2305,6 +2380,8 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2413,6 +2490,8 @@ async fn seek_interrupts_prefetch_read_retries_without_clock_advance() {
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2461,6 +2540,8 @@ fn shutdown_span_reports_success_after_all_work_completes() {
       lease_store,
       membership_store,
       source,
+      rejecting_broker_metadata_query(),
+      rejecting_broker_blob_range_query(),
       metrics_scope(),
       TimeDuration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2528,6 +2609,8 @@ fn shutdown_span_reports_best_effort_cleanup_failure() {
       lease_store,
       membership_store,
       source,
+      rejecting_broker_metadata_query(),
+      rejecting_broker_blob_range_query(),
       metrics_scope(),
       TimeDuration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2592,6 +2675,8 @@ fn revocation_handoff_span_reports_success_after_reassignment() {
       lease_store,
       membership_store,
       source.clone(),
+      rejecting_broker_metadata_query(),
+      rejecting_broker_blob_range_query(),
       metrics_scope(),
       TimeDuration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2715,6 +2800,8 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2850,6 +2937,8 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
     lease_store,
     membership_store,
     source.clone(),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2942,6 +3031,8 @@ async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
     lease_store,
     membership_store.clone(),
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -3011,6 +3102,8 @@ async fn cancelled_next_does_not_restart_rebalance() {
     lease_store,
     membership_store,
     source.clone(),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -3081,6 +3174,8 @@ async fn cancelled_next_preserves_prefetched_record() {
     lease_store,
     membership_store,
     source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,

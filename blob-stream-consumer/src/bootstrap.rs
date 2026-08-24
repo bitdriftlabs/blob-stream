@@ -290,6 +290,14 @@ impl ConsumerIteratorImpl {
       )
       .time_provider(Arc::clone(&time_provider)),
     );
+    let broker_client_pool =
+      Arc::new(BrokerClientPool::from_config(&config.broker_discovery).await?);
+    let broker_metadata_query = Arc::new(GrpcBrokerMetadataQuery::from_client_pool(Arc::clone(
+      &broker_client_pool,
+    )));
+    let broker_blob_range_query = Arc::new(GrpcBrokerBlobRangeQuery::from_client_pool(
+      broker_client_pool,
+    ));
 
     let builder = ConsumerIteratorBuilder::new(
       &config.runtime,
@@ -298,6 +306,8 @@ impl ConsumerIteratorImpl {
       lease_store,
       membership_store,
       coordination,
+      broker_metadata_query,
+      broker_blob_range_query,
       metrics_scope,
       retention,
       topic_max_metadata_publication_lag(&config.topic),
@@ -313,15 +323,6 @@ impl ConsumerIteratorImpl {
         .ok_or_else(|| anyhow!("consumer read config is required"))?,
     ))
     .time_provider(time_provider);
-    let broker_client_pool =
-      Arc::new(BrokerClientPool::from_config(&config.broker_discovery).await?);
-    let builder = builder
-      .broker_metadata_query(Arc::new(GrpcBrokerMetadataQuery::from_client_pool(
-        Arc::clone(&broker_client_pool),
-      )))
-      .broker_blob_range_query(Arc::new(GrpcBrokerBlobRangeQuery::from_client_pool(
-        broker_client_pool,
-      )));
     let builder = if let Some(lifecycle_hooks) = lifecycle_hooks {
       builder.lifecycle_hooks(lifecycle_hooks)
     } else {

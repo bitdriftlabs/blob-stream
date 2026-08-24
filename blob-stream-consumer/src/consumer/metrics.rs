@@ -24,9 +24,6 @@ pub(in crate::consumer) struct ConsumerReaderMetrics {
   broker_metadata_offload_requests: IntCounter,
   broker_metadata_offload_deliveries: IntCounter,
   broker_metadata_offload_fallbacks: IntCounter,
-  broker_metadata_shadow_matches: IntCounter,
-  broker_metadata_shadow_mismatches: IntCounter,
-  broker_metadata_shadow_comparison_failures: IntCounter,
   recovery_metadata_cache_hits: IntCounter,
   recovery_metadata_cache_misses: IntCounter,
   recovery_metadata_cache_inserts: IntCounter,
@@ -76,10 +73,6 @@ impl ConsumerReaderMetrics {
       broker_metadata_offload_requests: scope.counter("broker_metadata_offload_requests"),
       broker_metadata_offload_deliveries: scope.counter("broker_metadata_offload_deliveries"),
       broker_metadata_offload_fallbacks: scope.counter("broker_metadata_offload_fallbacks"),
-      broker_metadata_shadow_matches: scope.counter("broker_metadata_shadow_matches"),
-      broker_metadata_shadow_mismatches: scope.counter("broker_metadata_shadow_mismatches"),
-      broker_metadata_shadow_comparison_failures: scope
-        .counter("broker_metadata_shadow_comparison_failures"),
       recovery_metadata_cache_hits: scope.counter("recovery_metadata_cache_hits"),
       recovery_metadata_cache_misses: scope.counter("recovery_metadata_cache_misses"),
       recovery_metadata_cache_inserts: scope.counter("recovery_metadata_cache_inserts"),
@@ -148,31 +141,19 @@ impl ConsumerReaderMetrics {
     self.recovery_metadata_cache_hits.inc();
   }
 
-  /// Record an RPC sent to the broker metadata cache, including requests made by shadow mode.
+  /// Record an RPC sent to the broker metadata cache.
   pub(in crate::consumer) fn record_broker_metadata_offload_request(&self) {
     self.broker_metadata_offload_requests.inc();
   }
 
-  /// Record a non-shadow scan that selected validated broker metadata for delivery.
+  /// Record a scan that selected validated broker metadata for delivery.
   pub(in crate::consumer) fn record_broker_metadata_offload_delivery(&self) {
     self.broker_metadata_offload_deliveries.inc();
   }
 
-  /// Record a non-shadow scan that retried the original direct query after an attempted offload.
+  /// Record a scan that retried the original direct query after an attempted broker read.
   pub(in crate::consumer) fn record_broker_metadata_offload_fallback(&self) {
     self.broker_metadata_offload_fallbacks.inc();
-  }
-
-  pub(in crate::consumer) fn record_broker_metadata_shadow_match(&self) {
-    self.broker_metadata_shadow_matches.inc();
-  }
-
-  pub(in crate::consumer) fn record_broker_metadata_shadow_mismatch(&self) {
-    self.broker_metadata_shadow_mismatches.inc();
-  }
-
-  pub(in crate::consumer) fn record_broker_metadata_shadow_comparison_failure(&self) {
-    self.broker_metadata_shadow_comparison_failures.inc();
   }
 
   pub(in crate::consumer) fn record_recovery_metadata_cache_miss(&self) {

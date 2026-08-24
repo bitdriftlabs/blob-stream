@@ -36,13 +36,12 @@ substitute for deterministic synchronization.
 
 ## Already Hardened
 
-- [x] Production broker-metadata routing, collapse, fallback, and shadow boundaries use real TCP
-  discovery and lifecycle/store gates.
+- [x] Production broker-metadata routing, collapse, and fallback use real TCP discovery and
+  lifecycle/store gates.
   - Covered: independent consumer groups collapse compatible eventual and strong Fast Tail reads
-    into one broker metadata scan; an unavailable metadata owner takes the direct-read path; and
-    shadow mode issues broker reads while retaining direct metadata as the delivery authority for
-    every initial-recovery window. A broker Tail request that exceeds its configured deadline also
-    takes the original direct-read path while the held broker scan remains in flight. A replacement
+    into one broker metadata scan; an unavailable metadata owner takes the direct-read path. A
+    broker Tail request that exceeds its configured deadline also takes the original direct-read
+    path while the held broker scan remains in flight. A replacement
     member recovers through the broker transport after a graceful restart and only delivers work
     published after its predecessor's committed source checkpoint; retained recovery across two
     historical windows likewise queries through the broker cache and skips that checkpoint.
