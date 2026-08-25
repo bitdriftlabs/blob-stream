@@ -2,7 +2,7 @@ use crate::coordination::HeartbeatReport;
 use crate::diagnostics::ConsumerDiagnostics;
 use anyhow::Result;
 use async_trait::async_trait;
-use blob_stream_types::{Record, VirtualPartitionId};
+use blob_stream_types::{CommittedSourceCheckpoint, Record, VirtualPartitionId};
 use std::sync::Arc;
 use tokio::sync::{Notify, oneshot};
 
@@ -81,8 +81,25 @@ pub struct ConsumerRecord {
   pub virtual_partition_id: VirtualPartitionId,
   /// Inclusive sequence offset for this record.
   pub offset: u64,
+  /// Metadata source that produced this record.
+  pub source_checkpoint: CommittedSourceCheckpoint,
   /// Decoded record payload and metadata.
   pub record: Record,
+}
+
+//
+// ConsumerSeekTarget
+//
+
+/// Caller-provided source location from which an explicit seek recovers retained history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerSeekTarget {
+  /// Sequence offset to resume after discarding buffered records.
+  pub offset: u64,
+  /// Metadata window containing the recovery origin.
+  pub window_start_unix_seconds: i64,
+  /// Optional source segment identifier used to derive the first recovery-window lower bound.
+  pub snowflake_id: Option<u64>,
 }
 
 /// Result of polling the iterator.
@@ -195,9 +212,13 @@ pub trait ConsumerIterator: Send + Sync {
   async fn shutdown(self: Box<Self>) -> Result<()>;
   /// Reposition a partition cursor after discarding buffered records read under the prior cursor.
   ///
-  /// TODO: Accept a source checkpoint so historical seeks can target the exact source window.
-  /// TODO: Slice a batch at the requested offset rather than redelivering its earlier records.
-  async fn seek(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()>;
+  /// The next delivered record has an offset greater than `target.offset`, even when the target
+  /// lies within a decoded batch.
+  async fn seek(
+    &mut self,
+    virtual_partition_id: VirtualPartitionId,
+    target: ConsumerSeekTarget,
+  ) -> Result<()>;
   /// Register a callback for active partition assignments.
   ///
   /// The callback replays the current assignment when nonempty, then receives only newly active

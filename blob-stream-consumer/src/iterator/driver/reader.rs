@@ -3,6 +3,7 @@ use super::{
   ConsumerCommittedCursorSnapshot,
   ConsumerDriver,
   ConsumerReaderCommand,
+  ConsumerSeekTarget,
   HashMap,
   Ordering,
   PrefetchWorker,
@@ -105,7 +106,7 @@ impl ConsumerDriver {
   pub(in crate::iterator) fn seek_reader(
     &mut self,
     virtual_partition_id: VirtualPartitionId,
-    offset: u64,
+    target: ConsumerSeekTarget,
     now: time::OffsetDateTime,
     seek_trace: SeekTrace,
     response: oneshot::Sender<Result<()>>,
@@ -113,7 +114,7 @@ impl ConsumerDriver {
     if let Some(reader) = &mut self.reader {
       // Before the iterator starts, the driver owns the reader directly. There is no prefetch
       // worker to enter recovery, so the seek trace finishes at this synchronous application.
-      reader.seek(virtual_partition_id, offset, now);
+      reader.seek(virtual_partition_id, &target, now);
       record_reader_diagnostics(reader, &self.shared_state);
       seek_trace.finish("reader_inline");
       let _ = response.send(Ok(()));
@@ -127,7 +128,7 @@ impl ConsumerDriver {
     };
     let command = ConsumerReaderCommand::Seek {
       virtual_partition_id,
-      offset,
+      target,
       now,
       seek_trace,
       response,

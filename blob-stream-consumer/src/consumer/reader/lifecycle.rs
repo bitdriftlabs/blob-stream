@@ -8,7 +8,6 @@ use super::{
   ConsumerReaderImpl,
   ConsumerReaderMetrics,
   FeatureFlagsWatch,
-  HISTORICAL_SEEK_RECOVERY,
   HashMap,
   HashSet,
   MetadataStore,
@@ -27,6 +26,7 @@ use super::{
 };
 use crate::config::{ConsumerReadRuntimeSettings, consumer_max_clock_skew};
 use crate::consumer::AvailabilityHorizon;
+use crate::iterator::ConsumerSeekTarget;
 use blob_stream_types::offset_datetime_from_unix_millis;
 use time::{Duration, OffsetDateTime};
 
@@ -244,23 +244,46 @@ impl ConsumerReaderImpl {
     self.record_recovery_metadata_cache_state();
   }
 
-  /// Reposition a partition cursor and recover recent windows before returning to the fast path.
+  /// Reposition a partition cursor and recover from the caller-provided metadata source.
   pub fn seek(
     &mut self,
     virtual_partition_id: VirtualPartitionId,
-    seq_end: u64,
+    target: &ConsumerSeekTarget,
     now: OffsetDateTime,
   ) {
-    self.set_cursor(virtual_partition_id, seq_end);
     let cutover_window_start = self.window_start(now);
-    let recovery_start_window = self
-      .window_start(now.saturating_sub(HISTORICAL_SEEK_RECOVERY))
+    let target_window_start = self.window_start(offset_datetime_from_unix_seconds(
+      target.window_start_unix_seconds,
+    ));
+    // Metadata keys exist only at aligned boundaries. A future target must not put Recovery past
+    // this pass's cutover, so scan the current window and then transition to Fast instead.
+    let recovery_start_window = target_window_start
+      .min(cutover_window_start)
       .max(self.retention_floor_window_start(cutover_window_start));
+    let starts_at_target_window = recovery_start_window == target_window_start;
+    self.set_cursor(virtual_partition_id, target.offset);
+    let runtime_settings =
+      consumer_read_runtime_settings(&self.config, self.feature_flags.as_ref());
+    let first_window_min_snowflake = starts_at_target_window
+      .then(|| {
+        target
+          .snowflake_id
+          .and_then(|snowflake_id| SnowflakeId(snowflake_id).timestamp())
+          .map(|timestamp| {
+            SnowflakeId::minimum_for_timestamp(
+              timestamp
+                .saturating_sub(self.availability_horizon(runtime_settings).duration())
+                .max(recovery_start_window),
+            )
+          })
+      })
+      .flatten();
     let recovery_state = RecoveryState {
       next_window_start_unix_seconds: recovery_start_window.unix_timestamp(),
       cutover_window_start_unix_seconds: cutover_window_start.unix_timestamp(),
-      first_window_start_unix_seconds: None,
-      first_window_min_snowflake: None,
+      first_window_start_unix_seconds: starts_at_target_window
+        .then_some(recovery_start_window.unix_timestamp()),
+      first_window_min_snowflake,
     };
     if let Some(state) = self.virtual_partition_states.get_mut(&virtual_partition_id) {
       state.start_recovery(recovery_state);
@@ -268,16 +291,22 @@ impl ConsumerReaderImpl {
       self.virtual_partition_states.insert(
         virtual_partition_id,
         VirtualPartitionState::PendingRecovering {
-          cursor: seq_end,
+          cursor: target.offset,
           recovery_state,
           last_scan: None,
         },
       );
     }
     info!(
-      "consumer historical seek recovery started: topic={}, partition={}, offset={}, \
-       recovery_start_window={}, cutover_window={}",
-      self.config.topic, virtual_partition_id, seq_end, recovery_start_window, cutover_window_start
+      "consumer seek recovery started: topic={}, partition={}, offset={}, requested_window={}, \
+       recovery_start_window={}, cutover_window={}, has_snowflake_bound={}",
+      self.config.topic,
+      virtual_partition_id,
+      target.offset,
+      target.window_start_unix_seconds,
+      recovery_start_window,
+      cutover_window_start,
+      first_window_min_snowflake.is_some(),
     );
   }
 

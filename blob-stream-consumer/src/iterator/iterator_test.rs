@@ -10,6 +10,7 @@ use super::{
   ConsumerIteratorBuilder,
   ConsumerIteratorImpl,
   ConsumerLifecycleHooks,
+  ConsumerSeekTarget,
   CoordinationSnapshot,
   NextResult,
 };
@@ -2328,7 +2329,14 @@ async fn seek_waits_for_prefetch_scan_without_stalling_heartbeats() {
   let heartbeat_calls_before = concrete_membership_store
     .heartbeat_calls
     .load(Ordering::SeqCst);
-  let mut seek = Box::pin(iterator.seek(3, 0));
+  let mut seek = Box::pin(iterator.seek(
+    3,
+    ConsumerSeekTarget {
+      offset: 0,
+      window_start_unix_seconds: now_window,
+      snowflake_id: None,
+    },
+  ));
   assert!(
     timeout(Duration::from_millis(50), seek.as_mut())
       .await
@@ -2512,10 +2520,20 @@ async fn seek_interrupts_prefetch_read_retries_without_clock_advance() {
   .expect("prefetch worker did not retry the injected read failure");
   time_provider.wait_until_sleeping(2).await;
 
-  timeout(Duration::from_secs(1), iterator.seek(3, 0))
-    .await
-    .expect("seek did not interrupt the prefetch retry backoff")
-    .unwrap();
+  timeout(
+    Duration::from_secs(1),
+    iterator.seek(
+      3,
+      ConsumerSeekTarget {
+        offset: 0,
+        window_start_unix_seconds: 300,
+        snowflake_id: None,
+      },
+    ),
+  )
+  .await
+  .expect("seek did not interrupt the prefetch retry backoff")
+  .unwrap();
   Box::new(iterator).shutdown().await.unwrap();
 }
 
@@ -2747,7 +2765,7 @@ fn revocation_handoff_span_reports_success_after_reassignment() {
 }
 
 #[tokio::test]
-async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
+async fn seek_discards_prefetched_records_slices_the_resume_batch_and_rewinds_fast_frontier() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
@@ -2841,10 +2859,20 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
     in_flight_snapshot.prefetch_buffered_record_count
   );
 
-  timeout(Duration::from_secs(2), iterator.seek(7, 0))
-    .await
-    .unwrap()
-    .unwrap();
+  timeout(
+    Duration::from_secs(2),
+    iterator.seek(
+      7,
+      ConsumerSeekTarget {
+        offset: 1,
+        window_start_unix_seconds: now_window,
+        snowflake_id: None,
+      },
+    ),
+  )
+  .await
+  .unwrap()
+  .unwrap();
   assert_eq!(iterator.metrics.seeks.get(), 1);
   let rewound = timeout(Duration::from_secs(2), iterator.next())
     .await
@@ -2855,8 +2883,8 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
     NextResult::Revoked(_) => panic!("expected rewound record"),
   };
   assert_eq!(rewound_record.virtual_partition_id, 7);
-  assert_eq!(rewound_record.offset, 1);
-  for expected_offset in 2 ..= 6 {
+  assert_eq!(rewound_record.offset, 2);
+  for expected_offset in 3 ..= 6 {
     let next = timeout(Duration::from_secs(2), iterator.next())
       .await
       .unwrap()
@@ -2879,6 +2907,142 @@ async fn seek_discards_prefetched_records_and_rewinds_fast_frontier() {
       .mode,
     ConsumerPartitionReadMode::Fast
   );
+
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn seek_end_to_end_replays_current_and_earlier_windows_with_source_checkpoints() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let now_window = (SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap()
+    .as_secs()
+    .try_into()
+    .unwrap_or(i64::MAX)
+    / 300)
+    * 300;
+  let previous_window = now_window - 300;
+  let previous_snowflake = SnowflakeId::minimum_for_timestamp(
+    OffsetDateTime::from_unix_timestamp(previous_window + 1).unwrap(),
+  );
+  let current_snowflake = SnowflakeId::minimum_for_timestamp(
+    OffsetDateTime::from_unix_timestamp(now_window + 1).unwrap(),
+  );
+
+  for (window_start, snowflake_id, seq_range) in [
+    (
+      previous_window,
+      previous_snowflake.as_u64(),
+      SeqRange { start: 1, end: 3 },
+    ),
+    (
+      now_window,
+      current_snowflake.as_u64(),
+      SeqRange { start: 4, end: 6 },
+    ),
+  ] {
+    let records = (seq_range.start ..= seq_range.end)
+      .map(|offset| new_record(vec![u8::try_from(offset).unwrap(); 6], window_start * 1_000))
+      .collect();
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      window_start,
+      snowflake_id,
+      7,
+      seq_range,
+      records,
+    )
+    .await;
+  }
+
+  // Each encoded batch carries 18 payload bytes, so a 16-byte prefetch limit exercises the
+  // single-oversized-batch admission path before seek trims the delivered suffix.
+  let runtime = runtime_config_with_prefetch_max_bytes(Some(16));
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![7],
+    }));
+  let mut iterator = ConsumerIteratorImpl::from_config(
+    &runtime,
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )
+  .await
+  .unwrap();
+  iterator.start().unwrap();
+  wait_for_prefetch_buffer_len(&iterator, 1).await;
+
+  timeout(
+    Duration::from_secs(2),
+    iterator.seek(
+      7,
+      ConsumerSeekTarget {
+        offset: 4,
+        window_start_unix_seconds: now_window,
+        snowflake_id: Some(current_snowflake.as_u64()),
+      },
+    ),
+  )
+  .await
+  .unwrap()
+  .unwrap();
+  let mut current_window_replay = Vec::new();
+  for _ in 0 .. 2 {
+    let NextResult::Record(record) = timeout(Duration::from_secs(2), iterator.next())
+      .await
+      .unwrap()
+      .unwrap()
+    else {
+      panic!("expected replayed current-window record");
+    };
+    current_window_replay.push(record.offset);
+  }
+  assert_eq!(current_window_replay, vec![5, 6]);
+
+  timeout(
+    Duration::from_secs(2),
+    iterator.seek(
+      7,
+      ConsumerSeekTarget {
+        offset: 0,
+        window_start_unix_seconds: previous_window,
+        snowflake_id: Some(previous_snowflake.as_u64()),
+      },
+    ),
+  )
+  .await
+  .unwrap()
+  .unwrap();
+  let mut earlier_window_replay = Vec::new();
+  for _ in 0 .. 6 {
+    let NextResult::Record(record) = timeout(Duration::from_secs(2), iterator.next())
+      .await
+      .unwrap()
+      .unwrap()
+    else {
+      panic!("expected replayed record after earlier-window seek");
+    };
+    earlier_window_replay.push(record.offset);
+  }
+  assert_eq!(earlier_window_replay, vec![1, 2, 3, 4, 5, 6]);
 
   Box::new(iterator).shutdown().await.unwrap();
 }

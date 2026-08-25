@@ -16,7 +16,7 @@ use super::delivery::{
   update_worker_prefetch_metrics,
 };
 use super::shared::ConsumerIteratorMetrics;
-use super::{ConsumerLifecycleHooks, ConsumerSharedState};
+use super::{ConsumerLifecycleHooks, ConsumerSeekTarget, ConsumerSharedState};
 use crate::consumer::{
   ConsumerBatch,
   ConsumerReadOutcome,
@@ -110,7 +110,7 @@ pub(super) enum ConsumerReaderCommand {
   },
   Seek {
     virtual_partition_id: VirtualPartitionId,
-    offset: u64,
+    target: ConsumerSeekTarget,
     now: OffsetDateTime,
     seek_trace: SeekTrace,
     response: oneshot::Sender<Result<()>>,
@@ -938,7 +938,7 @@ fn process_reader_commands(
       },
       ConsumerReaderCommand::Seek {
         virtual_partition_id,
-        offset,
+        target,
         now,
         seek_trace,
         response,
@@ -952,7 +952,7 @@ fn process_reader_commands(
           seek_trace.finish("superseded");
         }
         pending_seek_traces.insert(virtual_partition_id, seek_trace);
-        reader.seek(virtual_partition_id, offset, now);
+        reader.seek(virtual_partition_id, &target, now);
         // A seek invalidates all unread reader output for that partition, including batches that
         // have not crossed the shared byte-budget boundary yet.
         pending.retain(|batch| {

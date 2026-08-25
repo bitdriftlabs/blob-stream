@@ -1,5 +1,6 @@
 use super::{
   ConsumerDriver,
+  ConsumerSeekTarget,
   HashSet,
   HeartbeatReport,
   HeartbeatTrigger,
@@ -264,7 +265,7 @@ impl ConsumerDriver {
   pub(in crate::iterator) fn seek(
     &mut self,
     virtual_partition_id: VirtualPartitionId,
-    offset: u64,
+    target: ConsumerSeekTarget,
     response: oneshot::Sender<Result<()>>,
   ) {
     if !self.active_assignment.contains(&virtual_partition_id) {
@@ -287,7 +288,9 @@ impl ConsumerDriver {
       consumer.member_id = %snapshot.member_id,
       consumer.generation = snapshot.accepted_assignment_plan_version,
       messaging.partition = virtual_partition_id,
-      seek.requested_offset = offset,
+      seek.requested_offset = target.offset,
+      seek.recovery_window = target.window_start_unix_seconds,
+      seek.has_snowflake_bound = target.snowflake_id.is_some(),
       seek.start_cursor = ?partition.and_then(|partition| partition.cursor),
       seek.committed_cursor = ?partition.and_then(|partition| partition.last_committed_offset),
       seek.outcome = field::Empty,
@@ -315,16 +318,17 @@ impl ConsumerDriver {
     }
     self.prefetch_space_notify.notify_waiters();
     self.refresh_diagnostics();
+    let requested_offset = target.offset;
     self.seek_reader(
       virtual_partition_id,
-      offset,
+      target,
       self.time_provider.now(),
       seek_trace,
       response,
     );
     trace!(
       "consumer seek: topic={}, partition={}, offset={}",
-      self.group_config.topic, virtual_partition_id, offset
+      self.group_config.topic, virtual_partition_id, requested_offset
     );
   }
 }

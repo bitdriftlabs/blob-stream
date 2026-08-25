@@ -1,7 +1,13 @@
 use super::delivery::{update_total_prefetch_bytes, update_worker_prefetch_metrics};
 use super::driver::{ConsumerDriver, ConsumerDriverCommand};
 use super::shared::{ConsumerIteratorMetrics, PendingCommit};
-use super::{AssignmentCallback, ConsumerIterator, ConsumerSharedState, NextResult};
+use super::{
+  AssignmentCallback,
+  ConsumerIterator,
+  ConsumerSeekTarget,
+  ConsumerSharedState,
+  NextResult,
+};
 use crate::coordination::HeartbeatReport;
 use crate::diagnostics::ConsumerDiagnostics;
 use anyhow::{Result, anyhow, ensure};
@@ -228,7 +234,11 @@ impl ConsumerIterator for ConsumerIteratorImpl {
     shutdown_result
   }
 
-  async fn seek(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()> {
+  async fn seek(
+    &mut self,
+    virtual_partition_id: VirtualPartitionId,
+    target: ConsumerSeekTarget,
+  ) -> Result<()> {
     ensure!(
       self.started,
       "consumer iterator must be started before seek"
@@ -240,7 +250,7 @@ impl ConsumerIterator for ConsumerIteratorImpl {
       .ok_or_else(|| anyhow!("consumer iterator command queue is unavailable"))?
       .send(ConsumerDriverCommand::Seek {
         virtual_partition_id,
-        offset,
+        target,
         response: response_tx,
       })
       .map_err(|_| anyhow!("consumer driver stopped before seek could be queued"))?;

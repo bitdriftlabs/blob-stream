@@ -480,7 +480,10 @@ impl ConsumerReaderImpl {
       }
 
       match result {
-        BatchReadResult::Decoded { candidate, batch } => {
+        BatchReadResult::Decoded {
+          candidate,
+          mut batch,
+        } => {
           // Cursor always moves forward. max() keeps monotonicity if metadata ordering is odd.
           let next_cursor = batch.seq_range.end.max(current_cursor.unwrap_or(0));
           if let Some(state) = self
@@ -488,6 +491,9 @@ impl ConsumerReaderImpl {
             .get_mut(&candidate.virtual_partition_id)
           {
             state.advance_cursor(next_cursor);
+          }
+          if let Some(cursor) = current_cursor {
+            batch.discard_through(cursor);
           }
           trace!(
             "consumer accepted batch: topic={}, partition={}, seq_start={}, seq_end={}, \

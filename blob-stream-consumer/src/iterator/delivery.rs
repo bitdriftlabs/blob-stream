@@ -116,6 +116,7 @@ impl DeliveryState {
           return Some(NextResult::Record(ConsumerRecord {
             virtual_partition_id: current_batch.virtual_partition_id,
             offset,
+            source_checkpoint: current_batch.source_checkpoint.clone(),
             record,
           }));
         }

@@ -402,9 +402,16 @@ bound.
 
 This deliberately adopts Fast's bounded-availability tradeoff for replacement startup. A metadata
 row older than the overlap that becomes visible only after the reader leaves the first source window
-is not automatically rediscovered. Legacy checkpoints, retention-clamped checkpoints, malformed
-checkpoint IDs, and explicit seeks retain the conservative full-window behavior. Neither path uses
-the source checkpoint as a correctness ordering certificate.
+is not automatically rediscovered. Legacy checkpoints, retention-clamped checkpoints, and malformed
+checkpoint IDs retain the conservative full-window behavior. Neither path uses the source checkpoint
+as a correctness ordering certificate.
+
+Explicit seek requires a caller-provided source location: the requested sequence offset, metadata
+window, and an optional source segment identifier. The consumer discards buffered records, starts
+recovery at that window, and uses the supplied segment identifier to derive the first-window overlap
+bound. It rejects no source location because an offset alone cannot identify a bounded metadata
+recovery origin. Each delivered record has an offset strictly greater than the requested offset,
+including when the target falls within a batch.
 
 Recovery cost is proportional to the gap from the durable source checkpoint to the captured
 cutover, not to current partition activity. A sparse partition with an old committed cursor still
