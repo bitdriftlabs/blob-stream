@@ -169,10 +169,10 @@ impl ConsumerDriver {
             },
             ConsumerDriverCommand::Seek {
               virtual_partition_id,
-              offset,
+              target,
               response,
             } => {
-              self.seek(virtual_partition_id, offset, response);
+              self.seek(virtual_partition_id, target, response);
             },
             ConsumerDriverCommand::Shutdown { response } => {
               let _ = response.send(self.shutdown().await);

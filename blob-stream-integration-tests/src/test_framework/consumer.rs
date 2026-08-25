@@ -5,6 +5,7 @@ use blob_stream_consumer::HeartbeatReport;
 use blob_stream_consumer::iterator::{
   ConsumerIterator,
   ConsumerIteratorImpl,
+  ConsumerSeekTarget,
   NextResult,
   RevokedPartitions,
 };
@@ -166,7 +167,11 @@ impl ConsumerIterator for StopAwareRevocationTestConsumer {
     Ok(())
   }
 
-  async fn seek(&mut self, _virtual_partition_id: VirtualPartitionId, _offset: u64) -> Result<()> {
+  async fn seek(
+    &mut self,
+    _virtual_partition_id: VirtualPartitionId,
+    _target: ConsumerSeekTarget,
+  ) -> Result<()> {
     Ok(())
   }
 }

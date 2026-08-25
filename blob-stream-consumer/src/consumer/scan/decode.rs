@@ -193,6 +193,14 @@ impl ConsumerReaderImpl {
       record_batch.virtual_partition_id,
       virtual_partition_id
     );
+    ensure!(
+      u64::try_from(record_batch.records.len()).unwrap_or(u64::MAX)
+        == batch_metadata.seq_range.len(),
+      "decoded record count {} does not match sequence range {}..={}",
+      record_batch.records.len(),
+      batch_metadata.seq_range.start,
+      batch_metadata.seq_range.end
+    );
 
     Ok(ConsumerBatch {
       virtual_partition_id,

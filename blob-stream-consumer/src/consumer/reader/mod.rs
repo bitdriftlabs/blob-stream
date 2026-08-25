@@ -32,8 +32,6 @@ mod diagnostics;
 mod lifecycle;
 mod runtime;
 
-const HISTORICAL_SEEK_RECOVERY: Duration = Duration::minutes(10);
-
 /// Identity of one immutable recovery metadata response retained by this reader instance.
 pub(in crate::consumer) type RecoveryMetadataCacheKey = (VirtualPartitionId, i64, Option<u64>);
 

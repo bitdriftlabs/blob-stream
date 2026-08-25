@@ -11,6 +11,7 @@ use super::{
   AssignmentCallback,
   ConsumerCoordinationSource,
   ConsumerLifecycleHooks,
+  ConsumerSeekTarget,
   ConsumerSharedState,
   CoordinationSnapshot,
 };
@@ -160,7 +161,7 @@ pub(in crate::iterator) enum ConsumerDriverCommand {
   },
   Seek {
     virtual_partition_id: VirtualPartitionId,
-    offset: u64,
+    target: ConsumerSeekTarget,
     response: oneshot::Sender<Result<()>>,
   },
   Shutdown {

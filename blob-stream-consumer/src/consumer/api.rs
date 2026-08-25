@@ -21,6 +21,23 @@ pub struct ConsumerBatch {
   pub records: Vec<Record>,
 }
 
+impl ConsumerBatch {
+  /// Drop records already covered by a cursor while preserving the remaining sequence offsets.
+  pub(in crate::consumer) fn discard_through(&mut self, cursor: u64) {
+    if cursor < self.seq_range.start {
+      return;
+    }
+    let discarded_records = usize::try_from(
+      cursor
+        .saturating_sub(self.seq_range.start)
+        .saturating_add(1),
+    )
+    .unwrap_or(usize::MAX);
+    self.records.drain(.. discarded_records);
+    self.seq_range.start = cursor.saturating_add(1);
+  }
+}
+
 //
 // ConsumerReadOutcome
 //

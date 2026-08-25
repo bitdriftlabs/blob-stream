@@ -17,6 +17,7 @@ use crate::config::{
   DEFAULT_MAX_CLOCK_SKEW,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG,
 };
+use crate::iterator::ConsumerSeekTarget;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use bd_runtime_config::loader::Loader;
@@ -99,6 +100,21 @@ impl ConsumerReaderImpl {
       ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
     )
     .await
+  }
+}
+
+fn batch_for_slicing_test(seq_range: SeqRange) -> ConsumerBatch {
+  let records = (seq_range.start ..= seq_range.end)
+    .map(|offset| new_record(vec![u8::try_from(offset).unwrap()], 0))
+    .collect();
+  ConsumerBatch {
+    virtual_partition_id: 7,
+    seq_range,
+    source_checkpoint: CommittedSourceCheckpoint {
+      window_start_unix_seconds: 900,
+      snowflake_id: 1,
+    },
+    records,
   }
 }
 
@@ -821,6 +837,138 @@ async fn write_segment_with_publication_time(
     .write_segment(metadata, None, 0)
     .await
     .unwrap();
+}
+
+#[test]
+fn discard_through_preserves_only_the_unseen_suffix() {
+  let mut before_range = batch_for_slicing_test(SeqRange { start: 2, end: 4 });
+  before_range.discard_through(1);
+  assert_eq!(before_range.seq_range, SeqRange { start: 2, end: 4 });
+  assert_eq!(before_range.records.len(), 3);
+
+  let mut inside_range = batch_for_slicing_test(SeqRange { start: 1, end: 3 });
+  inside_range.discard_through(2);
+  assert_eq!(inside_range.seq_range, SeqRange { start: 3, end: 3 });
+  assert_eq!(inside_range.records[0].payload, vec![3]);
+}
+
+#[tokio::test]
+async fn seek_slices_a_multi_record_batch_and_suppresses_a_fully_consumed_batch() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    7,
+    SeqRange { start: 1, end: 3 },
+    vec![
+      new_record(vec![1], 900_000),
+      new_record(vec![2], 900_001),
+      new_record(vec![3], 900_002),
+    ],
+    Compression::none(),
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    Arc::clone(&blob_store),
+    Arc::clone(&metadata_store),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )
+  .unwrap();
+
+  reader.seek(
+    7,
+    &ConsumerSeekTarget {
+      offset: 1,
+      window_start_unix_seconds: 900,
+      snowflake_id: None,
+    },
+    timestamp(900),
+  );
+  let sliced = reader.read_available(900).await.unwrap();
+  assert_eq!(sliced.len(), 1);
+  assert_eq!(sliced[0].seq_range, SeqRange { start: 2, end: 3 });
+  assert_eq!(
+    sliced[0]
+      .records
+      .iter()
+      .map(|record| record.payload.clone())
+      .collect::<Vec<_>>(),
+    vec![vec![2], vec![3]]
+  );
+  assert_eq!(reader.cursor(7), Some(3));
+
+  reader.seek(
+    7,
+    &ConsumerSeekTarget {
+      offset: 3,
+      window_start_unix_seconds: 900,
+      snowflake_id: None,
+    },
+    timestamp(900),
+  );
+  assert!(reader.read_available(900).await.unwrap().is_empty());
+  assert_eq!(reader.cursor(7), Some(3));
+}
+
+#[tokio::test]
+async fn reader_rejects_decoded_batch_with_mismatched_record_count() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    7,
+    SeqRange { start: 1, end: 2 },
+    vec![new_record(vec![1], 900_000)],
+    Compression::none(),
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )
+  .unwrap();
+
+  let error = reader.read_available(900).await.unwrap_err();
+  assert!(
+    error
+      .to_string()
+      .contains("decoded record count 1 does not match sequence range 1..=2")
+  );
 }
 
 async fn write_multi_partition_segment(
@@ -4603,7 +4751,7 @@ async fn seek_resets_partition_fast_frontier() {
 }
 
 #[tokio::test]
-async fn historical_seek_recovers_recent_windows_then_returns_to_fast_path() {
+async fn source_directed_seek_normalizes_target_window_and_handles_future_window() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let recording_metadata_store = Arc::new(RecordingMetadataStore::new());
   let metadata_store: Arc<dyn MetadataStore> = recording_metadata_store.clone();
@@ -4657,13 +4805,23 @@ async fn historical_seek_recovers_recent_windows_then_returns_to_fast_path() {
   ));
   recording_metadata_store.scans.lock().clear();
 
-  reader.seek(7, 0, timestamp(1_200));
+  reader.seek(
+    7,
+    &ConsumerSeekTarget {
+      offset: 0,
+      window_start_unix_seconds: 601,
+      snowflake_id: None,
+    },
+    timestamp(1_200),
+  );
   assert!(matches!(
     reader.virtual_partition_states.get(&7),
     Some(VirtualPartitionState::Recovering {
       recovery_state: RecoveryState {
         next_window_start_unix_seconds: 600,
         cutover_window_start_unix_seconds: 1_200,
+        first_window_start_unix_seconds: Some(600),
+        first_window_min_snowflake: None,
         ..
       },
       ..
@@ -4682,10 +4840,129 @@ async fn historical_seek_recovers_recent_windows_then_returns_to_fast_path() {
     reader.virtual_partition_states.get(&7),
     Some(VirtualPartitionState::Fast { .. })
   ));
+  {
+    let scans = recording_metadata_store.scans.lock();
+    assert!(scans.contains(&(600, None)));
+    assert!(scans.contains(&(900, None)));
+    assert!(scans.contains(&(1_200, None)));
+  }
+  recording_metadata_store.scans.lock().clear();
+
+  reader.seek(
+    7,
+    &ConsumerSeekTarget {
+      offset: 2,
+      window_start_unix_seconds: 1_501,
+      snowflake_id: None,
+    },
+    timestamp(1_200),
+  );
+  assert!(matches!(
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::Recovering {
+      recovery_state: RecoveryState {
+        next_window_start_unix_seconds: 1_200,
+        cutover_window_start_unix_seconds: 1_200,
+        first_window_start_unix_seconds: None,
+        first_window_min_snowflake: None,
+        ..
+      },
+      ..
+    })
+  ));
+
+  assert!(reader.read_available(1_200).await.unwrap().is_empty());
+  assert!(matches!(
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::Fast { .. })
+  ));
   let scans = recording_metadata_store.scans.lock();
-  assert!(scans.contains(&(600, None)));
-  assert!(scans.contains(&(900, None)));
   assert!(scans.contains(&(1_200, None)));
+  assert!(!scans.contains(&(1_500, None)));
+}
+
+#[tokio::test]
+async fn source_directed_seek_uses_the_checkpoint_snowflake_lower_bound() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
+  let window_start = 1_700_000_100;
+  let checkpoint_timestamp = timestamp(window_start + 120);
+  let checkpoint_snowflake = SnowflakeId::minimum_for_timestamp(checkpoint_timestamp);
+  let expected_floor = SnowflakeId::minimum_for_timestamp(
+    timestamp(window_start + 104).saturating_add(TimeDuration::milliseconds(990)),
+  );
+
+  for (snowflake_id, sequence) in [
+    (
+      SnowflakeId::minimum_for_timestamp(timestamp(window_start + 60)).as_u64(),
+      1,
+    ),
+    (checkpoint_snowflake.as_u64(), 10),
+    (
+      SnowflakeId::minimum_for_timestamp(timestamp(window_start + 121)).as_u64(),
+      11,
+    ),
+  ] {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store_dyn.as_ref(),
+      "telemetry",
+      window_start,
+      snowflake_id,
+      7,
+      SeqRange {
+        start: sequence,
+        end: sequence,
+      },
+      vec![new_record(
+        vec![u8::try_from(sequence).unwrap()],
+        window_start * 1_000,
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+
+  let mut reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store,
+    metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )
+  .unwrap();
+
+  reader.seek(
+    7,
+    &ConsumerSeekTarget {
+      offset: 10,
+      window_start_unix_seconds: window_start,
+      snowflake_id: Some(checkpoint_snowflake.as_u64()),
+    },
+    checkpoint_timestamp,
+  );
+  let recovered = reader.read_available(window_start + 120).await.unwrap();
+
+  assert_eq!(recovered.len(), 1);
+  assert_eq!(recovered[0].seq_range, SeqRange { start: 11, end: 11 });
+  assert!(
+    metadata_store
+      .scans
+      .lock()
+      .contains(&(window_start, Some(expected_floor)))
+  );
 }
 
 #[tokio::test]

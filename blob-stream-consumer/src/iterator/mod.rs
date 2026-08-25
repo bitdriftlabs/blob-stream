@@ -16,6 +16,7 @@ pub use api::{
   ConsumerIterator,
   ConsumerLifecycleHooks,
   ConsumerRecord,
+  ConsumerSeekTarget,
   CoordinationSnapshot,
   NextResult,
   NoopConsumerLifecycleHooks,
