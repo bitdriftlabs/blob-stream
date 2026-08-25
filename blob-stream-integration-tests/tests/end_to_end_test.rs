@@ -3104,28 +3104,46 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
     expected_ids.insert(id);
   }
 
+  // C0 and C1 must receive acknowledgements for their revocations before C2 can apply the
+  // scale-out assignment. Hold C2 at that applied boundary while this test drains those events.
+  let mut scale_out_consumer_2_assignment_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerRebalanceApplied,
+      "consumer-2",
+      None,
+      None,
+    )
+    .await?;
   let consumer_2 = Box::new(cluster.create_consumer(&runtime_2).await?);
   let consumer_2_task = tokio::spawn(run_consumer_task(consumer_2, stop_rx_2, event_tx.clone()));
 
   timeout(Duration::from_secs(10), async {
+    let scale_out_assignment_wait = scale_out_consumer_2_assignment_gate.wait_until_reached();
+    tokio::pin!(scale_out_assignment_wait);
     loop {
-      let scale_out_leases = consumer_lease_store
-        .list_group_leases(TOPIC, "integration-group")
-        .await?;
-      if scale_out_leases
-        .iter()
-        .any(|lease| lease.owner_id == "consumer-2")
-      {
-        return Ok::<_, anyhow::Error>(());
+      tokio::select! {
+        result = &mut scale_out_assignment_wait => return result,
+        event = event_rx.recv() => {
+          let event = event.ok_or_else(|| {
+            anyhow!("all consumer tasks stopped before consumer-2 applied its scale-out assignment")
+          })?;
+          handle_consumer_event_with_trace(event, &mut delivery_traces, &mut revocation_count);
+        },
       }
-      let event = event_rx.recv().await.ok_or_else(|| {
-        anyhow!("all consumer tasks stopped before consumer-2 acquired a partition")
-      })?;
-      handle_consumer_event_with_trace(event, &mut delivery_traces, &mut revocation_count);
     }
   })
   .await
-  .map_err(|_| anyhow!("joining consumer did not own a partition after scale-out"))??;
+  .map_err(|_| anyhow!("consumer-2 did not apply its scale-out assignment"))??;
+  scale_out_consumer_2_assignment_gate.release()?;
+  let scale_out_leases = consumer_lease_store
+    .list_group_leases(TOPIC, "integration-group")
+    .await?;
+  assert!(
+    scale_out_leases
+      .iter()
+      .any(|lease| lease.owner_id == "consumer-2"),
+    "consumer-2 applied its scale-out assignment without owning a partition: {scale_out_leases:?}"
+  );
 
   for message_id in 24 .. 48 {
     let id = format!("rebalance-{message_id}");
