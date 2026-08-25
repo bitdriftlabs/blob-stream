@@ -36,12 +36,6 @@ const PREFETCH_MAX_BYTES_FEATURE_FLAG: &str = "blob_stream_consumer_prefetch_max
 const MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG: &str =
   "blob_stream_consumer_max_in_flight_batch_reads";
 const STRONG_METADATA_READS_FEATURE_FLAG: &str = "blob_stream_consumer_strong_metadata_reads";
-const BROKER_METADATA_CACHE_ENABLED_FEATURE_FLAG: &str =
-  "blob_stream_consumer_broker_metadata_cache_enabled";
-const BROKER_METADATA_CACHE_SHADOW_FEATURE_FLAG: &str =
-  "blob_stream_consumer_broker_metadata_cache_shadow";
-const BROKER_BATCH_CACHE_ENABLED_FEATURE_FLAG: &str =
-  "blob_stream_consumer_broker_batch_cache_enabled";
 const IDLE_POLL_DELAY_FEATURE_FLAG: &str = "blob_stream_consumer_idle_poll_delay_ms";
 const MAX_IDLE_POLL_DELAY_FEATURE_FLAG: &str = "blob_stream_consumer_max_idle_poll_delay_ms";
 const LEASE_DURATION_FEATURE_FLAG: &str = "blob_stream_consumer_lease_duration_ms";
@@ -58,9 +52,6 @@ pub struct ConsumerReadRuntimeSettings {
   pub(crate) max_in_flight_batch_reads: usize,
   pub(crate) metadata_read_consistency: MetadataReadConsistency,
   pub(crate) metadata_visibility_delay: Duration,
-  pub(crate) broker_metadata_cache_enabled: bool,
-  pub(crate) broker_metadata_cache_shadow: bool,
-  pub(crate) broker_batch_cache_enabled: bool,
 }
 
 /// Apply startup-only feature flags that affect this consumer process's local scheduling.
@@ -242,22 +233,12 @@ pub fn consumer_read_runtime_settings(
     consumer_metadata_visibility_delay(config),
     strong_metadata_reads,
   );
-  let broker_metadata_cache_enabled = feature_flags
-    .is_some_and(|flags| flags.get_bool(BROKER_METADATA_CACHE_ENABLED_FEATURE_FLAG, false));
-  let broker_metadata_cache_shadow = broker_metadata_cache_enabled
-    && feature_flags
-      .is_some_and(|flags| flags.get_bool(BROKER_METADATA_CACHE_SHADOW_FEATURE_FLAG, false));
-  let broker_batch_cache_enabled = feature_flags
-    .is_some_and(|flags| flags.get_bool(BROKER_BATCH_CACHE_ENABLED_FEATURE_FLAG, false));
 
   ConsumerReadRuntimeSettings {
     prefetch_max_bytes,
     max_in_flight_batch_reads,
     metadata_read_consistency,
     metadata_visibility_delay,
-    broker_metadata_cache_enabled,
-    broker_metadata_cache_shadow,
-    broker_batch_cache_enabled,
   }
 }
 

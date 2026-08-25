@@ -284,26 +284,7 @@ fn runtime_feature_flags_override_configured_reader_settings() {
       max_in_flight_batch_reads: 4,
       metadata_read_consistency: MetadataReadConsistency::Eventual,
       metadata_visibility_delay: Duration::milliseconds(2_000),
-      broker_metadata_cache_enabled: false,
-      broker_metadata_cache_shadow: false,
-      broker_batch_cache_enabled: false,
     }
-  );
-}
-
-#[test]
-fn broker_batch_cache_feature_flag_defaults_disabled_and_can_enable() {
-  let read = read_config();
-  assert!(!consumer_read_runtime_settings(&read, None).broker_batch_cache_enabled);
-
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
-  ));
-
-  assert!(
-    consumer_read_runtime_settings(&read, Some(&feature_flags.snapshot_watch()))
-      .broker_batch_cache_enabled
   );
 }
 

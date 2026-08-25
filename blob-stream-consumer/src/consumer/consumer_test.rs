@@ -186,11 +186,7 @@ struct FixedBrokerMetadataQuery {
   responses: HashMap<i64, ReadMetadataWindowResponse>,
 }
 
-//
-// ShadowBrokerResponse
-//
-
-enum ShadowBrokerResponse {
+enum BrokerMetadataResponse {
   Valid,
   TransportFailure,
   Malformed,
@@ -253,6 +249,12 @@ impl BrokerMetadataQuery for RecordingBrokerMetadataQuery {
   }
 }
 
+fn rejecting_broker_metadata_query() -> Arc<dyn BrokerMetadataQuery> {
+  Arc::new(RecordingBrokerMetadataQuery {
+    requests: Mutex::new(Vec::new()),
+  })
+}
+
 //
 // FixedBrokerBlobRangeQuery
 //
@@ -292,6 +294,10 @@ impl BrokerBlobRangeQuery for FixedBrokerBlobRangeQuery {
       .pop_front()
       .ok_or_else(|| anyhow!("test broker blob-range responses were exhausted"))
   }
+}
+
+fn rejecting_broker_blob_range_query() -> Arc<dyn BrokerBlobRangeQuery> {
+  Arc::new(FixedBrokerBlobRangeQuery::with_responses(Vec::new()))
 }
 
 struct KeyedBrokerBlobRangeQuery {
@@ -624,6 +630,8 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
     HashMap::new(),
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -637,9 +645,6 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
       max_in_flight_batch_reads: 2,
       metadata_read_consistency: MetadataReadConsistency::Eventual,
       metadata_visibility_delay: time::Duration::milliseconds(2_000),
-      broker_metadata_cache_enabled: false,
-      broker_metadata_cache_shadow: false,
-      broker_batch_cache_enabled: false,
     }
   );
 
@@ -647,8 +652,7 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
     DefaultFeatureFlags::default()
       .with_integer_flag("blob_stream_consumer_prefetch_max_bytes", 32)
       .with_integer_flag("blob_stream_consumer_max_in_flight_batch_reads", 4)
-      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true)
-      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
+      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
   ));
   assert_eq!(
     reader.runtime_settings(),
@@ -657,19 +661,12 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
       max_in_flight_batch_reads: 4,
       metadata_read_consistency: MetadataReadConsistency::Strong,
       metadata_visibility_delay: time::Duration::ZERO,
-      broker_metadata_cache_enabled: false,
-      broker_metadata_cache_shadow: false,
-      broker_batch_cache_enabled: true,
     }
   );
 }
 
 #[test]
 fn eventual_broker_reads_include_cache_age_in_availability_horizon() {
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_broker_metadata_cache_enabled", true),
-  ));
   let reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
@@ -679,10 +676,12 @@ fn eventual_broker_reads_include_cache_age_in_availability_horizon() {
     HashMap::new(),
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-    Some(feature_flags.snapshot_watch()),
+    None,
   )
   .unwrap()
   .metadata_cache_max_age(TimeDuration::milliseconds(250));
@@ -709,6 +708,8 @@ fn reader_rejects_negative_publication_lag() {
     HashMap::new(),
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     -TimeDuration::nanoseconds(1),
@@ -986,6 +987,8 @@ async fn visibility_delay_defers_newly_published_metadata() {
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1058,6 +1061,8 @@ async fn strong_metadata_reads_accept_future_metadata_publication_timestamps() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1119,6 +1124,8 @@ async fn runtime_strong_metadata_reads_apply_on_the_next_scan() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1177,6 +1184,8 @@ fn strong_metadata_reads_use_clock_skew_without_a_visibility_delay() {
     HashMap::new(),
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1237,6 +1246,8 @@ async fn derived_horizon_retries_visibility_deferred_metadata_across_window_boun
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     TimeDuration::seconds(30),
@@ -1290,6 +1301,8 @@ async fn retention_recovery_scans_from_checkpoint_before_fast_path() {
     HashMap::new(),
     Arc::clone(&blob_store),
     metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1383,6 +1396,8 @@ async fn recovery_scans_single_checkpoint_window_with_overlap_bound() {
     HashMap::new(),
     Arc::clone(&blob_store),
     metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1439,6 +1454,8 @@ fn recovery_only_bounds_its_checkpoint_window() {
     HashMap::new(),
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1496,8 +1513,7 @@ async fn broker_recovery_uses_tail_for_checkpoint_and_full_recovery_afterward() 
   });
   let feature_flags = FakeLoader::new(Arc::new(
     DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true)
-      .with_bool_flag("blob_stream_consumer_broker_metadata_cache_enabled", true),
+      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
   ));
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
@@ -1508,13 +1524,14 @@ async fn broker_recovery_uses_tail_for_checkpoint_and_full_recovery_afterward() 
     HashMap::new(),
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
+    broker_query.clone(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
   )
-  .unwrap()
-  .broker_metadata_query(broker_query.clone());
+  .unwrap();
   reader.hydrate_cursor_with_source(
     7,
     &CommittedCursor {
@@ -1636,8 +1653,7 @@ async fn broker_recovery_delivery_preserves_batches_and_cursor() {
   });
   let feature_flags = FakeLoader::new(Arc::new(
     DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true)
-      .with_bool_flag("blob_stream_consumer_broker_metadata_cache_enabled", true),
+      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
   ));
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
@@ -1648,13 +1664,14 @@ async fn broker_recovery_delivery_preserves_batches_and_cursor() {
     HashMap::new(),
     blob_store,
     metadata_store_dyn,
+    broker_query,
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
   )
-  .unwrap()
-  .broker_metadata_query(broker_query);
+  .unwrap();
   reader.hydrate_cursor_with_source(
     7,
     &CommittedCursor {
@@ -1697,6 +1714,8 @@ async fn assignment_activates_hydrated_state_and_removes_revoked_state() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1753,6 +1772,8 @@ async fn retention_recovery_clamps_legacy_cursor_to_retention_floor() {
     HashMap::new(),
     blob_store,
     metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1818,6 +1839,8 @@ async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -1904,6 +1927,8 @@ async fn recovery_waits_for_visibility_deferred_window_before_advancing() {
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2013,6 +2038,8 @@ async fn recovery_does_not_advance_cursor_past_visibility_deferred_window() {
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2087,6 +2114,8 @@ async fn recovery_hands_active_window_visibility_deferral_to_fast() {
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2155,6 +2184,8 @@ async fn advances_cursor_and_dedupes_on_rescan() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2207,6 +2238,8 @@ async fn failed_scan_restores_cursor_before_retrying_undelivered_batches() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2266,6 +2299,8 @@ async fn missing_blob_range_is_counted_and_skipped() {
     HashMap::new(),
     blob_store_dyn,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &collector.scope("blob_stream_consumer_test"),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2298,6 +2333,8 @@ async fn metadata_scan_error_preserves_aws_source_chain() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2349,6 +2386,8 @@ async fn byte_capacity_defers_later_batches_until_the_next_scan() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2418,6 +2457,8 @@ async fn recovery_capacity_resumes_at_the_first_deferred_window() {
     HashMap::new(),
     blob_store,
     metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2514,6 +2555,8 @@ async fn recovery_capacity_deferral_keeps_unprocessed_cutover_partitions_recover
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2608,6 +2651,8 @@ async fn fresh_capacity_deferral_retries_the_initial_window_before_fast_path() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2689,6 +2734,8 @@ async fn mature_recovery_metadata_is_scanned_once_across_capacity_cycles() {
     HashMap::new(),
     blob_store,
     metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2803,6 +2850,8 @@ async fn mature_recovery_metadata_caches_after_visibility_deferral() {
     HashMap::new(),
     blob_store,
     metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2915,6 +2964,8 @@ async fn mature_recovery_metadata_survives_blob_read_failure() {
     HashMap::new(),
     blob_store_dyn,
     metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -2997,6 +3048,8 @@ fn recovery_metadata_cache_is_invalidated_by_lifecycle_resets() {
     HashMap::new(),
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -3049,6 +3102,8 @@ fn recovery_planning_rotates_between_partitions() {
     HashMap::new(),
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -3132,6 +3187,8 @@ async fn coalesces_owned_ranges_from_one_segment() {
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -3167,7 +3224,7 @@ async fn coalesces_owned_ranges_from_one_segment() {
 }
 
 #[tokio::test]
-async fn disabled_broker_blob_cache_uses_direct_ranges_without_a_broker_request() {
+async fn broker_blob_cache_reads_ranges_without_object_store_access() {
   let blob_store = Arc::new(RecordingRangeBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let (_, payloads) = write_shared_blob_segments(
@@ -3183,7 +3240,6 @@ async fn disabled_broker_blob_cache_uses_direct_ranges_without_a_broker_request(
     )],
   )
   .await;
-  let expected_range_end = u64::try_from(payloads[0].len()).unwrap();
   let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_success(
     payloads,
   )));
@@ -3196,25 +3252,19 @@ async fn disabled_broker_blob_cache_uses_direct_ranges_without_a_broker_request(
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
+    rejecting_broker_metadata_query(),
+    query.clone(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )
-  .unwrap()
-  .broker_blob_range_query(query.clone());
-
+  .unwrap();
   let batches = reader.read_available(950).await.unwrap();
 
   assert_eq!(batches.len(), 1);
-  assert!(query.requests().is_empty());
-  assert_eq!(
-    blob_store.ranges(),
-    vec![ByteRange {
-      start: 0,
-      end: expected_range_end,
-    }]
-  );
+  assert_eq!(query.requests().len(), 1);
+  assert!(blob_store.ranges().is_empty());
 }
 
 #[tokio::test]
@@ -3251,10 +3301,7 @@ async fn broker_blob_cache_groups_same_key_plans_and_decodes_validated_ranges() 
   let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_success(
     payloads,
   )));
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
-  ));
+  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
@@ -3264,14 +3311,14 @@ async fn broker_blob_cache_groups_same_key_plans_and_decodes_validated_ranges() 
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
+    rejecting_broker_metadata_query(),
+    query.clone(),
     &metrics_scope,
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
   )
-  .unwrap()
-  .broker_blob_range_query(query.clone());
-
+  .unwrap();
   let batches = reader.read_available(950).await.unwrap();
 
   assert_eq!(
@@ -3362,10 +3409,7 @@ async fn broker_blob_cache_handles_many_ranges_from_one_blob_key() {
   let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_success(
     payloads,
   )));
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
-  ));
+  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
@@ -3375,14 +3419,14 @@ async fn broker_blob_cache_handles_many_ranges_from_one_blob_key() {
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
+    rejecting_broker_metadata_query(),
+    query.clone(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
   )
-  .unwrap()
-  .broker_blob_range_query(query.clone());
-
+  .unwrap();
   let batches = reader.read_available(950).await.unwrap();
 
   assert_eq!(batches.len(), 16);
@@ -3426,10 +3470,7 @@ async fn corrupt_broker_blob_payload_retries_the_complete_group_directly() {
     Bytes::from(vec![0; payloads[0].len()]),
     payloads[1].clone(),
   ])));
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
-  ));
+  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
@@ -3439,14 +3480,14 @@ async fn corrupt_broker_blob_payload_retries_the_complete_group_directly() {
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
+    rejecting_broker_metadata_query(),
+    query.clone(),
     &metrics_scope,
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
   )
-  .unwrap()
-  .broker_blob_range_query(query.clone());
-
+  .unwrap();
   let batches = reader.read_available(950).await.unwrap();
 
   assert_eq!(batches.len(), 2);
@@ -3498,10 +3539,7 @@ async fn overloaded_broker_blob_response_retries_the_complete_group_directly() {
   let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_failure(
     BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED,
   )));
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
-  ));
+  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
@@ -3511,14 +3549,14 @@ async fn overloaded_broker_blob_response_retries_the_complete_group_directly() {
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
+    rejecting_broker_metadata_query(),
+    query.clone(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
   )
-  .unwrap()
-  .broker_blob_range_query(query.clone());
-
+  .unwrap();
   let batches = reader.read_available(950).await.unwrap();
 
   assert_eq!(batches.len(), 2);
@@ -3553,10 +3591,7 @@ async fn broker_blob_failure_preserves_direct_range_concurrency() {
   let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_failure(
     BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED,
   )));
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
-  ));
+  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
@@ -3567,14 +3602,14 @@ async fn broker_blob_failure_preserves_direct_range_concurrency() {
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
+    rejecting_broker_metadata_query(),
+    query.clone(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
   )
-  .unwrap()
-  .broker_blob_range_query(query.clone());
-
+  .unwrap();
   let read_task = tokio::spawn(async move { reader.read_available(950).await });
   timeout(
     Duration::from_secs(1),
@@ -3621,10 +3656,7 @@ async fn distinct_blob_keys_use_distinct_broker_requests() {
   )
   .await;
   let query = Arc::new(FixedBrokerBlobRangeQuery::with_responses(Vec::new()));
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
-  ));
+  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
@@ -3634,14 +3666,14 @@ async fn distinct_blob_keys_use_distinct_broker_requests() {
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
+    rejecting_broker_metadata_query(),
+    query.clone(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
   )
-  .unwrap()
-  .broker_blob_range_query(query.clone());
-
+  .unwrap();
   let batches = reader.read_available(950).await.unwrap();
 
   let mut blob_keys = query
@@ -3706,10 +3738,7 @@ async fn broker_blob_cache_accepts_mixed_key_outcomes_without_direct_retry() {
       broker_blob_failure(BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_NOT_FOUND),
     ),
   ]));
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
-  ));
+  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
@@ -3719,14 +3748,14 @@ async fn broker_blob_cache_accepts_mixed_key_outcomes_without_direct_retry() {
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
+    rejecting_broker_metadata_query(),
+    query.clone(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
   )
-  .unwrap()
-  .broker_blob_range_query(query.clone());
-
+  .unwrap();
   let batches = reader.read_available(950).await.unwrap();
 
   assert_eq!(batches.len(), 1);
@@ -3735,80 +3764,6 @@ async fn broker_blob_cache_accepts_mixed_key_outcomes_without_direct_retry() {
   assert_eq!(reader.cursor(8), Some(1));
   assert_eq!(query.requests().len(), 2);
   assert!(blob_store.ranges().is_empty());
-}
-
-#[tokio::test]
-async fn broker_blob_cache_flag_applies_on_the_next_read_pass() {
-  let blob_store = Arc::new(RecordingRangeBlobStore::new());
-  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
-  write_segment(
-    blob_store.as_ref(),
-    metadata_store.as_ref(),
-    "telemetry",
-    900,
-    1,
-    7,
-    SeqRange { start: 1, end: 1 },
-    vec![new_record(vec![1], 900_000)],
-    Compression::none(),
-  )
-  .await;
-  let broker_records = vec![new_record(vec![2], 900_001)];
-  let broker_payload = Bytes::from(
-    StoredRecordBatch {
-      virtual_partition_id: 7,
-      records: broker_records.clone(),
-      ..Default::default()
-    }
-    .write_to_bytes()
-    .unwrap(),
-  );
-  let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_success(vec![
-    broker_payload,
-  ])));
-  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
-  let mut reader = ConsumerReaderImpl::new(
-    ConsumerReadConfig {
-      topic: "telemetry".to_string().into(),
-      ..Default::default()
-    },
-    vec![7],
-    HashMap::new(),
-    blob_store.clone(),
-    metadata_store.clone(),
-    &metrics_scope(),
-    TimeDuration::days(1),
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-    Some(feature_flags.snapshot_watch()),
-  )
-  .unwrap()
-  .broker_blob_range_query(query.clone());
-
-  assert_eq!(reader.read_available(950).await.unwrap().len(), 1);
-  assert!(query.requests().is_empty());
-  feature_flags.update(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
-  ));
-  write_segment(
-    blob_store.as_ref(),
-    metadata_store.as_ref(),
-    "telemetry",
-    900,
-    2,
-    7,
-    SeqRange { start: 2, end: 2 },
-    broker_records,
-    Compression::none(),
-  )
-  .await;
-
-  let batches = reader.read_available(951).await.unwrap();
-
-  assert_eq!(batches.len(), 1);
-  assert_eq!(batches[0].records[0].payload.as_ref(), &[2]);
-  assert_eq!(query.requests().len(), 1);
-  assert_eq!(blob_store.ranges().len(), 1);
 }
 
 #[tokio::test]
@@ -3841,10 +3796,7 @@ async fn authoritative_broker_blob_not_found_skips_direct_retry() {
     )),
     ..Default::default()
   }));
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_broker_batch_cache_enabled", true),
-  ));
+  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
@@ -3854,14 +3806,14 @@ async fn authoritative_broker_blob_not_found_skips_direct_retry() {
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
+    rejecting_broker_metadata_query(),
+    query.clone(),
     &metrics_scope,
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
   )
-  .unwrap()
-  .broker_blob_range_query(query.clone());
-
+  .unwrap();
   let batches = reader.read_available(950).await.unwrap();
 
   assert!(batches.is_empty());
@@ -3902,6 +3854,8 @@ fn recovery_planning_batches_active_cutover_partitions() {
     HashMap::new(),
     Arc::new(InMemoryBlobStore::new()),
     Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -3975,6 +3929,8 @@ async fn capacity_limited_segment_read_excludes_deferred_batches() {
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -4052,6 +4008,8 @@ async fn failed_slice_in_segment_read_does_not_advance_cursor() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -4099,6 +4057,8 @@ async fn bounded_parallel_reads_respect_configured_limit() {
     HashMap::new(),
     blob_store.clone(),
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -4151,6 +4111,8 @@ async fn catches_late_metadata_with_derived_candidate_horizon() {
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     TimeDuration::seconds(600),
@@ -4208,6 +4170,8 @@ async fn decodes_zstd_compressed_batches() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -4251,6 +4215,8 @@ async fn fast_scan_uses_per_partition_inclusive_frontier() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -4310,6 +4276,8 @@ async fn fast_scan_uses_lowest_partition_frontier_for_cross_partition_ordering()
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -4354,8 +4322,7 @@ async fn broker_tail_request_keeps_each_fast_partition_frontier() {
   });
   let feature_flags = FakeLoader::new(Arc::new(
     DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true)
-      .with_bool_flag("blob_stream_consumer_broker_metadata_cache_enabled", true),
+      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
   ));
 
   write_segment(
@@ -4392,13 +4359,14 @@ async fn broker_tail_request_keeps_each_fast_partition_frontier() {
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    broker_query.clone(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
   )
-  .unwrap()
-  .broker_metadata_query(broker_query.clone());
+  .unwrap();
 
   assert_eq!(reader.read_available(901).await.unwrap().len(), 2);
   broker_query.requests.lock().clear();
@@ -4442,15 +4410,13 @@ async fn broker_tail_request_keeps_each_fast_partition_frontier() {
   );
 }
 
-async fn shadow_read(
-  mutate_broker_segment: impl FnOnce(&mut SegmentMetadata),
-  broker_response: ShadowBrokerResponse,
-  shadow: bool,
+async fn broker_offload_read(
+  broker_response: BrokerMetadataResponse,
 ) -> (Vec<ConsumerBatch>, Option<u64>, Helper) {
   let metrics = Helper::new();
   let metrics_scope = metrics
     .collector()
-    .scope("blob_stream_consumer_shadow_test");
+    .scope("blob_stream_consumer_broker_metadata_offload_test");
   let blob_store = Arc::new(InMemoryBlobStore::new());
   let metadata_store = Arc::new(InMemoryMetadataStore::new());
   let snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(901));
@@ -4474,11 +4440,9 @@ async fn shadow_read(
     .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Strong)
     .await
     .unwrap();
-  let mut broker_segments = direct_segments.clone();
-  mutate_broker_segment(&mut broker_segments[0]);
   let mut empty_response = broker_metadata_response(&[], timestamp(901));
-  let mut segments_response = broker_metadata_response(&broker_segments, timestamp(901));
-  if matches!(broker_response, ShadowBrokerResponse::Malformed) {
+  let mut segments_response = broker_metadata_response(&direct_segments, timestamp(901));
+  if matches!(broker_response, BrokerMetadataResponse::Malformed) {
     for response in [&mut empty_response, &mut segments_response] {
       if let Some(read_metadata_window_response::Result::Success(success)) =
         response.result.as_mut()
@@ -4489,20 +4453,16 @@ async fn shadow_read(
   }
   let broker_query = Arc::new(FixedBrokerMetadataQuery {
     responses: match broker_response {
-      ShadowBrokerResponse::Valid | ShadowBrokerResponse::Malformed => {
+      BrokerMetadataResponse::Valid | BrokerMetadataResponse::Malformed => {
         HashMap::from([(600, empty_response), (900, segments_response)])
       },
-      ShadowBrokerResponse::TransportFailure => HashMap::new(),
+      BrokerMetadataResponse::TransportFailure => HashMap::new(),
     },
   });
-  let mut feature_flags = DefaultFeatureFlags::default()
-    .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true)
-    .with_bool_flag("blob_stream_consumer_broker_metadata_cache_enabled", true);
-  if shadow {
-    feature_flags =
-      feature_flags.with_bool_flag("blob_stream_consumer_broker_metadata_cache_shadow", true);
-  }
-  let feature_flags = FakeLoader::new(Arc::new(feature_flags));
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
+  ));
   let mut reader = ConsumerReaderImpl::new(
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
@@ -4512,143 +4472,70 @@ async fn shadow_read(
     HashMap::new(),
     blob_store,
     metadata_store,
+    broker_query,
+    rejecting_broker_blob_range_query(),
     &metrics_scope,
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
   )
-  .unwrap()
-  .broker_metadata_query(broker_query);
-
+  .unwrap();
   let batches = reader.read_available(901).await.unwrap();
   (batches, reader.cursor(7), metrics)
 }
 
 #[tokio::test]
-async fn shadow_match_delivers_direct_metadata_and_records_match() {
-  let (batches, cursor, metrics) = shadow_read(|_| {}, ShadowBrokerResponse::Valid, true).await;
-
-  assert_eq!(batches.len(), 1);
-  assert_eq!(batches[0].records[0].payload, vec![7]);
-  assert_eq!(cursor, Some(1));
-  metrics.assert_counter_eq(
-    2,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_shadow_matches",
-    &labels!(),
-  );
-  metrics.assert_counter_eq(
-    0,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_shadow_mismatches",
-    &labels!(),
-  );
-}
-
-#[tokio::test]
-async fn shadow_mismatch_keeps_direct_delivery_and_records_mismatch() {
-  let (batches, cursor, metrics) = shadow_read(
-    |segment| {
-      segment.blob_key = BlobKey::from("telemetry/different");
-    },
-    ShadowBrokerResponse::Valid,
-    true,
-  )
-  .await;
-
-  assert_eq!(batches.len(), 1);
-  assert_eq!(batches[0].records[0].payload, vec![7]);
-  assert_eq!(cursor, Some(1));
-  metrics.assert_counter_eq(
-    1,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_shadow_matches",
-    &labels!(),
-  );
-  metrics.assert_counter_eq(
-    1,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_shadow_mismatches",
-    &labels!(),
-  );
-}
-
-#[tokio::test]
-async fn shadow_transport_failure_keeps_direct_delivery_and_records_comparison_failure() {
-  let (batches, cursor, metrics) =
-    shadow_read(|_| {}, ShadowBrokerResponse::TransportFailure, true).await;
-
-  assert_eq!(batches.len(), 1);
-  assert_eq!(batches[0].records[0].payload, vec![7]);
-  assert_eq!(cursor, Some(1));
-  metrics.assert_counter_eq(
-    2,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_shadow_comparison_failures",
-    &labels!(),
-  );
-}
-
-#[tokio::test]
-async fn shadow_malformed_response_keeps_direct_delivery_and_records_comparison_failure() {
-  let (batches, cursor, metrics) = shadow_read(|_| {}, ShadowBrokerResponse::Malformed, true).await;
-
-  assert_eq!(batches.len(), 1);
-  assert_eq!(batches[0].records[0].payload, vec![7]);
-  assert_eq!(cursor, Some(1));
-  metrics.assert_counter_eq(
-    2,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_shadow_comparison_failures",
-    &labels!(),
-  );
-}
-
-#[tokio::test]
 async fn broker_offload_metrics_distinguish_delivery_from_direct_fallback() {
-  let (_, _, delivered_metrics) = shadow_read(|_| {}, ShadowBrokerResponse::Valid, false).await;
+  let metric = "blob_stream_consumer_broker_metadata_offload_test:reader";
+  let (_, _, delivered_metrics) = broker_offload_read(BrokerMetadataResponse::Valid).await;
   delivered_metrics.assert_counter_eq(
     2,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_requests",
+    &format!("{metric}:broker_metadata_offload_requests"),
     &labels!(),
   );
   delivered_metrics.assert_counter_eq(
     2,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_deliveries",
+    &format!("{metric}:broker_metadata_offload_deliveries"),
     &labels!(),
   );
   delivered_metrics.assert_counter_eq(
     0,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_fallbacks",
+    &format!("{metric}:broker_metadata_offload_fallbacks"),
     &labels!(),
   );
 
   let (_, _, fallback_metrics) =
-    shadow_read(|_| {}, ShadowBrokerResponse::TransportFailure, false).await;
+    broker_offload_read(BrokerMetadataResponse::TransportFailure).await;
   fallback_metrics.assert_counter_eq(
     2,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_requests",
+    &format!("{metric}:broker_metadata_offload_requests"),
     &labels!(),
   );
   fallback_metrics.assert_counter_eq(
     0,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_deliveries",
+    &format!("{metric}:broker_metadata_offload_deliveries"),
     &labels!(),
   );
   fallback_metrics.assert_counter_eq(
     2,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_fallbacks",
+    &format!("{metric}:broker_metadata_offload_fallbacks"),
     &labels!(),
   );
 
-  let (_, _, rejected_metrics) = shadow_read(|_| {}, ShadowBrokerResponse::Malformed, false).await;
+  let (_, _, rejected_metrics) = broker_offload_read(BrokerMetadataResponse::Malformed).await;
   rejected_metrics.assert_counter_eq(
     2,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_requests",
+    &format!("{metric}:broker_metadata_offload_requests"),
     &labels!(),
   );
   rejected_metrics.assert_counter_eq(
     0,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_deliveries",
+    &format!("{metric}:broker_metadata_offload_deliveries"),
     &labels!(),
   );
   rejected_metrics.assert_counter_eq(
     2,
-    "blob_stream_consumer_shadow_test:reader:broker_metadata_offload_fallbacks",
+    &format!("{metric}:broker_metadata_offload_fallbacks"),
     &labels!(),
   );
 }
@@ -4690,6 +4577,8 @@ async fn seek_resets_partition_fast_frontier() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -4750,6 +4639,8 @@ async fn historical_seek_recovers_recent_windows_then_returns_to_fast_path() {
     HashMap::new(),
     blob_store,
     metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -4838,6 +4729,8 @@ async fn fast_scan_uses_per_window_frontiers_across_candidate_window_boundary() 
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -4909,6 +4802,8 @@ async fn fast_scan_omits_windows_before_the_safe_publication_floor() {
     HashMap::new(),
     blob_store,
     metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -4968,6 +4863,8 @@ async fn fast_scan_prunes_frontiers_for_windows_before_the_safe_publication_floo
     HashMap::new(),
     Arc::clone(&blob_store),
     Arc::clone(&metadata_store),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -5160,6 +5057,8 @@ async fn fast_scan_bounds_sparse_partitions_with_the_safe_publication_floor() {
     HashMap::new(),
     blob_store,
     metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,

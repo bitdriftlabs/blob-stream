@@ -77,23 +77,17 @@ broker:
 ```
 
 Feature flags affect local process behavior. `blob_stream_broker_fenced_metadata_writes` remains a
-broker control. Consumer reader flags
-`blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`,
-`blob_stream_consumer_max_in_flight_batch_reads`,
-`blob_stream_consumer_broker_metadata_cache_enabled`, and
-`blob_stream_consumer_broker_metadata_cache_shadow` are live. The raw blob path is selected by the
-live `blob_stream_consumer_broker_batch_cache_enabled` flag and defaults to disabled.
-`ConsumerIteratorBootstrapConfig.broker_discovery` is required; the broker metadata cache is
-always available and only consumer flags control whether it is used. Blob-cache idle retention is
+broker control. Consumer reader flags `blob_stream_consumer_strong_metadata_reads`,
+`blob_stream_consumer_prefetch_max_bytes`, and `blob_stream_consumer_max_in_flight_batch_reads`
+are live. `ConsumerIteratorBootstrapConfig.broker_discovery` is required. Consumers use the broker
+metadata and blob caches for every read, retrying direct storage only after a broker transport,
+validation, overload, or stale-observation failure. Blob-cache idle retention is
 configured when a broker starts through
 `blob_stream_broker_blob_cache_idle_ttl_ms`; it defaults to 10 seconds and must be positive.
 The broker admits each complete object from its reported content length and current cgroup headroom
-before reading its body.
-Shadow mode always delivers the direct DynamoDB result and uses a validated broker response only
-for comparison. Broker-delivery mode returns the broker result but retains the original direct
-scan as fallback for transport, validation, overload, or stale-observation failures. Consumer
-polling and group scheduling flags are sampled when a consumer is constructed. Producer batching,
-retry, timeout, concurrency, and compression flags are sampled when a producer is constructed.
+before reading its body. Consumer polling and group scheduling flags are sampled when a consumer
+is constructed. Producer batching, retry, timeout, concurrency, and compression flags are sampled
+when a producer is constructed.
 See [Operations](operations.md) for the complete inventory and rollout behavior.
 
 ## S3

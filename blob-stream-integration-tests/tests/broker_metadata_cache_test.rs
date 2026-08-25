@@ -63,14 +63,14 @@ async fn broker_metadata_cache_delivers_real_broker_multi_group_initial_recovery
   .await?;
   let consumer_a = Box::new(
     cluster
-      .create_broker_metadata_cache_consumer(&runtime_a, false)
+      .create_broker_metadata_cache_consumer(&runtime_a)
       .await?,
   );
   let task_a = tokio::spawn(consume_one_record(*consumer_a));
   metadata_store.wait_for_first_scan().await;
   let consumer_b = Box::new(
     cluster
-      .create_broker_metadata_cache_consumer(&runtime_b, false)
+      .create_broker_metadata_cache_consumer(&runtime_b)
       .await?,
   );
   let task_b = tokio::spawn(consume_one_record(*consumer_b));
@@ -382,10 +382,10 @@ async fn assert_broker_metadata_cache_collapses_multi_group_fast_tail(
     )
     .await?;
   let mut consumer_a = cluster
-    .create_broker_metadata_cache_consumer(&runtime_a, false)
+    .create_broker_metadata_cache_consumer(&runtime_a)
     .await?;
   let mut consumer_b = cluster
-    .create_broker_metadata_cache_consumer(&runtime_b, false)
+    .create_broker_metadata_cache_consumer(&runtime_b)
     .await?;
   consumer_a.start()?;
   consumer_b.start()?;
@@ -444,61 +444,6 @@ async fn broker_metadata_cache_collapses_real_broker_concurrent_strong_fast_tail
 }
 
 #[tokio::test]
-async fn broker_metadata_cache_shadow_oracle_uses_direct_authority() -> Result<()> {
-  let resources = IntegrationResources::create().await?;
-  let metadata_store = Arc::new(GatedMetadataStore::new(resources.metadata_store()));
-  let mut cluster = ClusterHarness::builder(&resources, 1)
-    .partition_count(1)
-    .metadata_store(metadata_store.clone())
-    .start()
-    .await?;
-  let producer = cluster
-    .create_producer(
-      producer_config(),
-      vec![producer_topic_named_with_partition_count(TOPIC, 1, 1)],
-    )
-    .await?;
-  let mut runtime = consumer_runtime_config("cache-shadow-member");
-  runtime
-    .group
-    .as_mut()
-    .ok_or_else(|| anyhow!("shadow consumer group config missing"))?
-    .group_id = "cache-shadow-group".into();
-  runtime
-    .read
-    .as_mut()
-    .ok_or_else(|| anyhow!("shadow consumer read config missing"))?
-    .metadata_visibility_delay = TimeDuration::ZERO.into_proto();
-
-  let mut consumer = cluster
-    .create_broker_metadata_cache_consumer(&runtime, true)
-    .await?;
-  consumer.start()?;
-  timeout(Duration::from_secs(5), metadata_store.wait_for_first_scan())
-    .await
-    .map_err(|_| anyhow!("shadow consumer did not begin its broker metadata scan"))?;
-  assert_eq!(
-    cluster.metadata_cache_active_waiters().await,
-    1,
-    "shadow mode must issue a broker metadata query before its direct oracle scan"
-  );
-  produce_message(&producer, b"cache-shadow".to_vec(), "cache-shadow").await?;
-  metadata_store.release();
-
-  assert_eq!(consume_next_record(&mut consumer).await?, "cache-shadow");
-  assert_eq!(
-    metadata_store.scan_count(),
-    4,
-    "shadow mode must compare broker and direct-authoritative results for both initial windows"
-  );
-
-  Box::new(consumer).shutdown().await?;
-  cluster.shutdown().await;
-  resources.cleanup().await;
-  Ok(())
-}
-
-#[tokio::test]
 async fn broker_metadata_cache_unavailable_owner_falls_back_to_direct_metadata() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let metadata_store = Arc::new(GatedMetadataStore::new(resources.metadata_store()));
@@ -529,7 +474,6 @@ async fn broker_metadata_cache_unavailable_owner_falls_back_to_direct_metadata()
   let mut consumer = cluster
     .create_broker_metadata_cache_consumer_with_discovery(
       &runtime,
-      false,
       Arc::new(metadata_discovery.clone()),
     )
     .await?;
@@ -603,7 +547,6 @@ async fn broker_metadata_cache_owner_churn_falls_back_to_direct_metadata() -> Re
   let mut consumer = cluster
     .create_broker_metadata_cache_consumer_with_discovery(
       &runtime,
-      false,
       Arc::new(metadata_discovery.clone()),
     )
     .await?;
@@ -684,7 +627,7 @@ async fn broker_metadata_cache_deadline_falls_back_to_direct_metadata() -> Resul
     )
     .await?;
   let mut consumer = cluster
-    .create_broker_metadata_cache_consumer(&runtime, false)
+    .create_broker_metadata_cache_consumer(&runtime)
     .await?;
   consumer.start()?;
   timeout(Duration::from_secs(5), initial_fast.wait_until_reached())
@@ -754,7 +697,7 @@ async fn broker_metadata_cache_pressure_reloads_evicted_tail_entry() -> Result<(
     )
     .await?;
   let mut consumer = cluster
-    .create_broker_metadata_cache_consumer(&runtime, false)
+    .create_broker_metadata_cache_consumer(&runtime)
     .await?;
   consumer.start()?;
   timeout(Duration::from_secs(5), initial_fast.wait_until_reached())
@@ -852,7 +795,7 @@ async fn broker_metadata_cache_delivers_active_recovery_after_restart() -> Resul
   )
   .await?;
   let mut first_consumer = cluster
-    .create_broker_metadata_cache_consumer(&runtime_a, false)
+    .create_broker_metadata_cache_consumer(&runtime_a)
     .await?;
   first_consumer.start()?;
   let checkpoint = loop {
@@ -876,7 +819,7 @@ async fn broker_metadata_cache_delivers_active_recovery_after_restart() -> Resul
   )
   .await?;
   let mut replacement_consumer = cluster
-    .create_broker_metadata_cache_consumer(&runtime_b, false)
+    .create_broker_metadata_cache_consumer(&runtime_b)
     .await?;
   replacement_consumer.start()?;
   assert_eq!(
@@ -938,7 +881,7 @@ async fn broker_metadata_cache_recovers_retained_historical_windows() -> Result<
   )
   .await?;
   let mut first_consumer = cluster
-    .create_broker_metadata_cache_consumer(&runtime_a, false)
+    .create_broker_metadata_cache_consumer(&runtime_a)
     .await?;
   first_consumer.start()?;
   consumer_time.advance(TimeDuration::milliseconds(200));
@@ -980,7 +923,7 @@ async fn broker_metadata_cache_recovers_retained_historical_windows() -> Result<
 
   metadata_store.arm_next_scan();
   let mut replacement_consumer = cluster
-    .create_broker_metadata_cache_consumer(&runtime_b, false)
+    .create_broker_metadata_cache_consumer(&runtime_b)
     .await?;
   replacement_consumer.start()?;
   consumer_time.advance(TimeDuration::milliseconds(200));

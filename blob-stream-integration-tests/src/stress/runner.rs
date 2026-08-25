@@ -6,6 +6,8 @@ use crate::test_framework::{
   TOPIC,
   consumer_bootstrap_config_for,
   producer_topic_named_with_partition_count,
+  rejecting_broker_blob_range_query,
+  rejecting_broker_metadata_query,
 };
 use anyhow::{Result, anyhow};
 use bd_server_stats::stats::Collector;
@@ -1077,6 +1079,8 @@ async fn verify_all_records(
     HashMap::new(),
     resources.s3_blob_store(),
     resources.metadata_store(),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
     &Collector::default().scope("blob_stream_stress_verifier"),
     time::Duration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,

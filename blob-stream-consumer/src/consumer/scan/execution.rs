@@ -30,7 +30,7 @@ use super::{
   trace,
   try_join_all,
 };
-use crate::consumer::metadata_query::{decode_metadata_response, metadata_results_match};
+use crate::consumer::metadata_query::decode_metadata_response;
 use crate::consumer::{
   BrokerBlobRangeQuery,
   BrokerBlobRangeRead,
@@ -129,85 +129,48 @@ impl ConsumerReaderImpl {
         }
       }
       let metadata_store = Arc::clone(&self.metadata_store);
-      let broker_metadata_query = self.broker_metadata_query.clone();
+      let broker_metadata_query = Arc::clone(&self.broker_metadata_query);
       let metrics = self.metrics.clone();
       let metadata_read_consistency = runtime_settings.metadata_read_consistency;
-      let broker_enabled = runtime_settings.broker_metadata_cache_enabled;
-      let broker_shadow = runtime_settings.broker_metadata_cache_shadow;
       let metadata_cache_max_age = self.metadata_cache_max_age;
-      let broker_request = broker_enabled
-        .then(|| broker_request_for_scan(&request, metadata_read_consistency))
-        .flatten();
-      let shadow_request = broker_shadow.then(|| broker_request.clone()).flatten();
+      let broker_request = broker_request_for_scan(&request, metadata_read_consistency);
       scan_futures.push(async move {
         if !request.recovery_scan && request.eligibility.fast && request.min_snowflake.is_none() {
           metrics.metadata_fast_scan_without_lower_bound.inc();
         }
         let scan_started_at = Instant::now();
-        let broker_attempted = broker_metadata_query.is_some() && broker_request.is_some();
-        let broker_result =
-          if let (Some(query), Some(broker_request)) = (broker_metadata_query, broker_request) {
-            metrics.record_broker_metadata_offload_request();
-            match query.read_metadata_window(broker_request.clone()).await {
-              Ok(response) => {
-                match decode_metadata_response(
-                  &broker_request,
-                  response,
-                  OffsetDateTime::now_utc(),
-                  metadata_cache_max_age,
-                ) {
-                  Ok(result) => Some(result),
-                  Err(error) => {
-                    trace!(
-                      "consumer broker metadata response rejected; falling back direct: {error}"
-                    );
-                    None
-                  },
-                }
-              },
-              Err(error) => {
-                trace!("consumer broker metadata query failed; falling back direct: {error}");
-                None
-              },
-            }
-          } else {
-            None
-          };
-        let (segments, result_visibility_cutoff) = if broker_shadow {
-          let direct_segments =
-            scan_direct_metadata(&metadata_store, &request, metadata_read_consistency).await?;
-          if let Some(broker_result) = broker_result {
-            match metadata_results_match(
-              &shadow_request.expect("shadow broker request exists"),
-              &broker_result.segments,
-              &direct_segments,
-            ) {
-              Ok(true) => metrics.record_broker_metadata_shadow_match(),
-              Ok(false) => {
-                metrics.record_broker_metadata_shadow_mismatch();
-                warn_every!(
-                  15.seconds(),
-                  "consumer broker metadata shadow mismatch: topic={}, window_start={}, \
-                   broker_segments={}, direct_segments={}",
-                  request.window.topic,
-                  offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
-                  broker_result.segments.len(),
-                  direct_segments.len()
-                );
-              },
-              Err(error) => {
-                metrics.record_broker_metadata_shadow_comparison_failure();
-                warn_every!(
-                  15.seconds(),
-                  "consumer broker metadata shadow comparison failed: {error:#}"
-                );
-              },
-            }
-          } else {
-            metrics.record_broker_metadata_shadow_comparison_failure();
+        let broker_attempted = broker_request.is_some();
+        let broker_result = if let Some(broker_request) = broker_request {
+          metrics.record_broker_metadata_offload_request();
+          match broker_metadata_query
+            .read_metadata_window(broker_request.clone())
+            .await
+          {
+            Ok(response) => {
+              match decode_metadata_response(
+                &broker_request,
+                response,
+                OffsetDateTime::now_utc(),
+                metadata_cache_max_age,
+              ) {
+                Ok(result) => Some(result),
+                Err(error) => {
+                  trace!(
+                    "consumer broker metadata response rejected; falling back direct: {error}"
+                  );
+                  None
+                },
+              }
+            },
+            Err(error) => {
+              trace!("consumer broker metadata query failed; falling back direct: {error}");
+              None
+            },
           }
-          (direct_segments, visibility_cutoff)
-        } else if let Some(result) = broker_result {
+        } else {
+          None
+        };
+        let (segments, result_visibility_cutoff) = if let Some(result) = broker_result {
           metrics.record_broker_metadata_offload_delivery();
           (
             result.segments,
@@ -312,21 +275,13 @@ impl ConsumerReaderImpl {
     segment_read_plans: Vec<SegmentReadPlan>,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<Vec<BatchReadResult>> {
-    let mut batch_read_results = if runtime_settings.broker_batch_cache_enabled {
-      if let Some(query) = self.broker_blob_range_query.as_deref() {
-        self
-          .execute_broker_blob_range_reads(segment_read_plans, query, runtime_settings)
-          .await?
-      } else {
-        self
-          .execute_direct_segment_reads(segment_read_plans, runtime_settings)
-          .await?
-      }
-    } else {
-      self
-        .execute_direct_segment_reads(segment_read_plans, runtime_settings)
-        .await?
-    };
+    let mut batch_read_results = self
+      .execute_broker_blob_range_reads(
+        segment_read_plans,
+        self.broker_blob_range_query.as_ref(),
+        runtime_settings,
+      )
+      .await?;
     // Segment plans retain scan order, but concurrent metadata windows may not be ordered by a
     // partition's sequence range. Normalize before cursor advancement and delivery.
     batch_read_results.sort_by_key(|result| match result {
@@ -336,29 +291,6 @@ impl ConsumerReaderImpl {
       ),
     });
     Ok(batch_read_results)
-  }
-
-  /// Keep the disabled path identical to the existing bounded direct range-read fan-out.
-  async fn execute_direct_segment_reads(
-    &self,
-    segment_read_plans: Vec<SegmentReadPlan>,
-    runtime_settings: ConsumerReadRuntimeSettings,
-  ) -> Result<Vec<BatchReadResult>> {
-    // `buffered` preserves segment-plan order while allowing independent object-store requests
-    // and decoding work to overlap. Cursor changes occur only after every planned read succeeds.
-    Ok(
-      stream::iter(
-        segment_read_plans
-          .into_iter()
-          .map(|plan| async { self.read_segment_plan(plan).await }),
-      )
-      .buffered(runtime_settings.max_in_flight_batch_reads)
-      .try_collect::<Vec<_>>()
-      .await?
-      .into_iter()
-      .flatten()
-      .collect(),
-    )
   }
 
   /// Group immutable segment plans by blob key before attempting local broker cache delivery.

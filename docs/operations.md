@@ -25,14 +25,13 @@ metadata. The broker returns a retryable failure. There is no unfenced fallback 
 ## Runtime Feature Flags
 
 Feature flags are local process controls. `TopicConfig.metadata_window_size` defines the durable
-metadata-key layout used by broker publication and consumer scans. Broker metadata caching is
-always served and `ConsumerIteratorBootstrapConfig.broker_discovery` is required; consumer flags
-alone select direct, shadow, or broker-delivery reads. Raw broker blob delivery is independently
-disabled by default and always retains direct blob storage as retryable fallback.
+metadata-key layout used by broker publication and consumer scans.
+`ConsumerIteratorBootstrapConfig.broker_discovery` is required. Consumers read metadata and raw
+blob ranges from broker caches, retrying direct storage only after a retryable broker failure.
 
 | Scope | Flags | Adoption | Operational effect |
 | --- | --- | --- | --- |
-| Consumer reader | `blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads`, `blob_stream_consumer_broker_metadata_cache_enabled`, `blob_stream_consumer_broker_metadata_cache_shadow`, `blob_stream_consumer_broker_batch_cache_enabled` | Live | Enables broker-collapsed metadata reads, shadow validation, or raw immutable blob-range delivery. The blob flag defaults to `false`; non-`NOT_FOUND` broker blob failures retry the full affected group directly. |
+| Consumer reader | `blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads` | Live | Configures metadata consistency, prefetch capacity, and range-read concurrency. Non-`NOT_FOUND` broker blob failures retry the full affected group directly. |
 | Broker metadata-cache startup | `blob_stream_broker_metadata_recovery_cache_max_bytes`, `blob_stream_broker_metadata_cache_max_waiters_per_key`, `blob_stream_broker_metadata_cache_max_waiters`, `blob_stream_broker_metadata_cache_max_refills`, `blob_stream_broker_metadata_cache_max_request_partitions`, `blob_stream_broker_metadata_cache_max_response_items`, `blob_stream_broker_metadata_cache_max_response_bytes`, `blob_stream_broker_metadata_cache_max_entry_items` | Restart the broker | Overrides the internal cache defaults when a feature-flag loader is configured. Values must be positive; the per-key waiter limit cannot exceed the global waiter limit, and the response-byte limit is capped at the gRPC request maximum. |
 | Broker blob-cache startup | `blob_stream_broker_blob_cache_idle_ttl_ms` | Restart the broker | Sets positive idle retention for complete immutable blobs; absent means 10 seconds. The broker admits each object from its reported content length and current cgroup headroom before reading its body. Cgroup-aware memory admission can flush entries or disable cache admission without disabling direct consumer reads. |
 | Consumer startup | `blob_stream_consumer_idle_poll_delay_ms`, `blob_stream_consumer_max_idle_poll_delay_ms`, `blob_stream_consumer_lease_duration_ms`, `blob_stream_consumer_heartbeat_interval_ms`, `blob_stream_consumer_rebalance_interval_ms` | Rebuild or restart the iterator | Changes local polling and consumer-group scheduling. Persistent lease state stores absolute expiry timestamps, so members may use different local durations. |
@@ -147,5 +146,3 @@ changing capacity or routing.
    whole-object fetch volume. Check `/admin/blob-cache` for headroom and active fetches.
 3. Verify broker discovery returns only healthy local brokers and that the broker has
    `s3:GetObject` on the configured prefix.
-4. Disable `blob_stream_consumer_broker_batch_cache_enabled` to return immediately to the
-   established direct-range path while investigating.

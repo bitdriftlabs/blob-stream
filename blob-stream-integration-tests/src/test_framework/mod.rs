@@ -79,6 +79,8 @@ pub use metadata::{
   consume_next_record,
   consume_one_record,
   produce_message_at_manual_time,
+  rejecting_broker_blob_range_query,
+  rejecting_broker_metadata_query,
   write_recovery_segment,
   write_recovery_segment_for_partitions,
 };
