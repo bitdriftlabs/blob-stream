@@ -109,6 +109,12 @@ struct TestMetadataCacheSettings {
   max_age: Option<TimeDuration>,
 }
 
+impl TestMetadataCacheSettings {
+  fn effective_max_age(self) -> TimeDuration {
+    self.max_age.unwrap_or(TimeDuration::milliseconds(250))
+  }
+}
+
 fn test_metadata_cache_config(
   partition_count: u32,
   topic_num_writers: u32,
@@ -135,9 +141,7 @@ fn test_metadata_cache_config(
     topic.partition_count = partition_count;
     topic.num_writers = topic_num_writers;
     topic.metadata_window_size = TimeDuration::seconds(WINDOW_SIZE_SECONDS).into_proto();
-    if let Some(max_age) = settings.max_age {
-      topic.metadata_cache_max_age = max_age.into_proto();
-    }
+    topic.metadata_cache_max_age = settings.effective_max_age().into_proto();
     runtime.topics.push(topic);
   }
   MetadataCacheConfig::from_runtime_config(&runtime, None)
@@ -668,6 +672,7 @@ impl ClusterHarness {
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
     )
+    .metadata_cache_max_age(self.metadata_cache_settings.effective_max_age())
     .lifecycle_hooks(Arc::new(self.lifecycle_hooks.clone()))
     .time_provider(Arc::clone(&self.consumer_time_provider))
     .build()
