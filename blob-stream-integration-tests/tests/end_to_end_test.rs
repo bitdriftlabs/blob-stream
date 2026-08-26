@@ -4153,7 +4153,7 @@ async fn multi_topic_isolation() -> Result<()> {
 }
 
 #[tokio::test]
-async fn shared_cross_topic_blob_is_readable_through_broker() -> Result<()> {
+async fn shared_cross_topic_blob_pulls_forward_a_fresh_topic() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let broker_time = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
     1_700_000_000_000,
@@ -4190,6 +4190,30 @@ async fn shared_cross_topic_blob_is_readable_through_broker() -> Result<()> {
       ))
       .await
   });
+  timeout(Duration::from_secs(5), async {
+    loop {
+      let first_buffered = cluster
+        .broker_state_snapshots()
+        .await
+        .into_iter()
+        .flat_map(|snapshot| snapshot.topics)
+        .any(|topic| {
+          topic.name.as_str() == TOPIC
+            && topic
+              .local_partitions
+              .iter()
+              .any(|partition| partition.buffered_batch_count > 0)
+        });
+      if first_buffered {
+        return Ok::<_, anyhow::Error>(());
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("first topic write did not enter the broker buffer"))??;
+  broker_time.advance(TimeDuration::milliseconds(900));
+
   let second_producer = Arc::clone(&producer);
   let second = tokio::spawn(async move {
     second_producer
@@ -4225,7 +4249,7 @@ async fn shared_cross_topic_blob_is_readable_through_broker() -> Result<()> {
   })
   .await
   .map_err(|_| anyhow!("both topic writes did not enter the broker buffer"))??;
-  broker_time.advance(TimeDuration::seconds(1));
+  broker_time.advance(TimeDuration::milliseconds(100));
   first.await??;
   second.await??;
 

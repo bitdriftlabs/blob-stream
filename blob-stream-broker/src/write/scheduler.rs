@@ -224,11 +224,39 @@ pub(super) fn collect_flush_plans(
   if max_plans == 0 {
     return Vec::new();
   }
+
+  // Planning atomically removes batches from the buffers and marks them in flight. Hold the write
+  // state lock for the entire selection so a batch belongs to exactly one plan, even if another
+  // scheduler pass starts while this pass is constructing its output.
   let fenced_metadata_writes = config.fenced_metadata_writes(feature_flags);
   let shared_cross_topic_blobs = WriteConfig::shared_cross_topic_blobs(feature_flags);
   let mut state = state.lock();
+
+  // Most scheduler passes are timer ticks or sub-threshold write notifications. Avoid cloning and
+  // sorting all partition keys unless at least one partition has work to flush. The same scan finds
+  // a time-due trigger for cross-topic promotion without allocating a temporary key collection.
+  let mut has_flushable_partition = false;
+  let mut shared_time_flush = false;
+  'topics: for topic_state in state.topics.values() {
+    for partition_state in topic_state.partitions.values() {
+      let trigger = flush_trigger(partition_state, now, config);
+      has_flushable_partition |= trigger.is_some();
+      shared_time_flush |=
+        shared_cross_topic_blobs && matches!(trigger, Some(FlushTrigger::MaxDelay));
+      if has_flushable_partition && (!shared_cross_topic_blobs || shared_time_flush) {
+        break 'topics;
+      }
+    }
+  }
+  if !has_flushable_partition {
+    return Vec::new();
+  }
+
   let mut partition_keys = state.partition_keys();
   partition_keys.sort_unstable();
+
+  // Keep the global ordering stable for fair round-robin iteration below, but also index all of a
+  // topic's partitions. A time-triggered flush takes the full topic group in one operation.
   let mut partition_ids_by_topic = HashMap::new();
   for (topic, virtual_partition_id) in &partition_keys {
     partition_ids_by_topic
@@ -236,6 +264,8 @@ pub(super) fn collect_flush_plans(
       .or_insert_with(Vec::new)
       .push(*virtual_partition_id);
   }
+  // Resume just after the topic that most recently consumed a durable plan. This rotates priority
+  // between topics while still allowing every partition to be examined exactly once per pass.
   let start = state.last_flush_topic.as_ref().map_or(0, |last_topic| {
     partition_keys
       .iter()
@@ -243,8 +273,17 @@ pub(super) fn collect_flush_plans(
       .unwrap_or(0)
   });
   let partition_state_count = partition_keys.len();
+
+  // These parallel maps describe logical topic plans before they are assembled into physical
+  // objects. A topic can have multiple entries when fenced metadata writes force its partitions
+  // into DynamoDB-transaction-sized chunks.
   let mut plans_by_topic: HashMap<Chars, Vec<Vec<FlushPartition>>> = HashMap::new();
   let mut plan_triggers_by_topic: HashMap<Chars, Vec<FlushTrigger>> = HashMap::new();
+
+  // A shared object can contain the nth chunk from each topic. Track each topic's chunk count so
+  // all first chunks share one plan, all second chunks share another, and so on.
+  // `durable_plan_count` counts those physical shared objects rather than every logical per-topic
+  // chunk.
   let mut shared_time_chunks_by_topic = HashMap::new();
   let mut durable_plan_count: usize = 0;
   let mut shared_time_plan_count: usize = 0;
@@ -259,10 +298,24 @@ pub(super) fn collect_flush_plans(
     topics
       .get(topic.as_str())
       .expect("write state is created only for configured topics");
-    let flush_trigger = state
+
+    // Once any local partition has reached its latency limit, the feature flag permits buffered
+    // peers to join that same shared flush. They receive a MaxDelay trigger deliberately: later
+    // assembly groups only time-triggered topic plans into the shared object.
+    let trigger = state
       .partition_state(topic.as_str(), *virtual_partition_id)
-      .and_then(|partition_state| flush_trigger(partition_state, now, config));
-    let Some(flush_trigger) = flush_trigger else {
+      .and_then(|partition_state| {
+        if shared_time_flush
+          && !partition_state.flush_in_flight
+          && !partition_state.draining
+          && !partition_state.buffer.batches.is_empty()
+        {
+          Some(FlushTrigger::MaxDelay)
+        } else {
+          flush_trigger(partition_state, now, config)
+        }
+      });
+    let Some(trigger) = trigger else {
       continue;
     };
     let existing_partition_count = plans_by_topic
@@ -272,13 +325,17 @@ pub(super) fn collect_flush_plans(
     let existing_trigger = plan_triggers_by_topic
       .get(topic)
       .and_then(|triggers| triggers.last());
-    let requires_new_plan = existing_trigger.is_none_or(|trigger| *trigger != flush_trigger)
+
+    // Different triggers cannot share a topic plan. Fenced metadata writes add a second boundary:
+    // each durable metadata transaction can check at most MAX_FENCED_METADATA_PARTITIONS leases.
+    let requires_new_plan = existing_trigger.is_none_or(|existing| *existing != trigger)
       || (fenced_metadata_writes && existing_partition_count == MAX_FENCED_METADATA_PARTITIONS);
-    let shared_time_plan = shared_cross_topic_blobs
-      && matches!(flush_trigger, FlushTrigger::MaxDelay)
-      && requires_new_plan;
+    let shared_time_plan =
+      shared_cross_topic_blobs && matches!(trigger, FlushTrigger::MaxDelay) && requires_new_plan;
     let additional_durable_plans = if shared_time_plan {
       let topic_chunks = shared_time_chunks_by_topic.get(topic).copied().unwrap_or(0);
+      // Joining an existing nth shared chunk is free. Starting a new nth chunk requires another
+      // physical object, so it consumes one of the scheduler's available durable-plan slots.
       usize::from(topic_chunks == shared_time_plan_count)
     } else {
       usize::from(requires_new_plan)
@@ -296,9 +353,13 @@ pub(super) fn collect_flush_plans(
     } else {
       usize::MAX
     };
-    let partitions = match flush_trigger {
-      // A topic's first time-due partition establishes its flush cadence. Pulling its available
-      // peers forward produces one larger segment rather than retaining their startup skew.
+
+    // Time-triggered work consumes every eligible partition for its topic so it establishes a
+    // shared cadence. Byte and drain triggers intentionally take only their selected partition:
+    // they must not pull unrelated fresh work forward.
+    let partitions = match trigger {
+      // A normal time-due flush establishes a cadence for its topic. When the shared pass promoted
+      // peer topics above, each of their topic groups follows the same path to form one object.
       FlushTrigger::MaxDelay => take_flush_partitions(
         &mut state,
         topic,
@@ -315,7 +376,7 @@ pub(super) fn collect_flush_plans(
         &mut state,
         topic,
         iter::once(*virtual_partition_id),
-        flush_trigger,
+        trigger,
         max_partitions,
         fenced_metadata_writes,
       ),
@@ -329,7 +390,7 @@ pub(super) fn collect_flush_plans(
       plan_triggers_by_topic
         .entry(topic.clone())
         .or_default()
-        .push(flush_trigger);
+        .push(trigger);
       if shared_time_plan {
         *shared_time_chunks_by_topic
           .entry(topic.clone())
@@ -342,6 +403,9 @@ pub(super) fn collect_flush_plans(
         );
       }
       durable_plan_count = durable_plan_count.saturating_add(additional_durable_plans);
+
+      // Only advance fairness after a plan actually claims capacity. Skipped partitions leave the
+      // cursor unchanged, so exhaustion of max_plans does not make them look as though they ran.
       last_planned_topic = Some(topic.clone());
     }
     plans
@@ -354,6 +418,9 @@ pub(super) fn collect_flush_plans(
     state.last_flush_topic = Some(last_planned_topic);
   }
 
+  // Convert the mutable planning representation into immutable topic sections. Sort explicitly:
+  // HashMap iteration is nondeterministic, whereas deterministic topic order stabilizes object
+  // construction, tests, and the mapping from fenced chunks to shared objects.
   let mut topic_plans = plans_by_topic
     .into_iter()
     .flat_map(|(topic, plans)| {
@@ -374,6 +441,7 @@ pub(super) fn collect_flush_plans(
   topic_plans.sort_by(|left, right| left.topic.as_str().cmp(right.topic.as_str()));
   let max_segment_bytes = config.max_segment_bytes(feature_flags);
   if !shared_cross_topic_blobs {
+    // The default mode preserves one storage object per topic section.
     return topic_plans
       .into_iter()
       .map(|topic| FlushPlan {
@@ -384,11 +452,10 @@ pub(super) fn collect_flush_plans(
       .collect();
   }
 
-  // Time-due work has already reached its latency bound, so sharing it amortizes object uploads
-  // without making fresh buffers follow an unrelated hot partition's cadence. Size-triggered and
-  // drain work stays local: pulling peer buffers forward can create smaller topic segments, couple
-  // them to the shared object's tightest metadata-publication deadline, and occupy a flush slot
-  // longer while its bounded objects persist sequentially.
+  // A time-due local partition has reached its latency bound, so its shared pass may amortize
+  // object uploads across buffered peer topics. Independently size-triggered and drain work stays
+  // local: pulling peer buffers forward would create smaller segments, couple their metadata
+  // deadlines, and hold a flush slot while bounded objects persist sequentially.
   // TODO: Evaluate a bounded eligible-work policy that can share across trigger types. Benchmark
   // S3 PUTs, DynamoDB metadata writes, producer latency, and flush-slot occupancy, while retaining
   // per-topic metadata deadlines and the fenced-partition transaction limit.
@@ -407,6 +474,7 @@ pub(super) fn collect_flush_plans(
   for topic in time_triggered {
     // Fenced topic plans are split at DynamoDB's transaction limit. Keep those chunks in
     // distinct shared plans so object construction cannot merge their fence sets back together.
+    // The first compatible shared plan is the same numbered chunk from previously sorted topics.
     if let Some(plan) = shared_plans.iter_mut().find(|plan: &&mut FlushPlan| {
       plan
         .topics

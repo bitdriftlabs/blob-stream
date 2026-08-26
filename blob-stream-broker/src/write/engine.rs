@@ -80,7 +80,7 @@ impl WriteEngine for WriteEngineImpl {
     let mut records = Some(request.records);
     let mut summary = Some(summary);
 
-    let (completion_rx, seq_range) = loop {
+    let (completion_rx, seq_range, should_notify_flush) = loop {
       let now = self.time_provider.now();
       let buffered = {
         let mut state = self.state.lock();
@@ -115,6 +115,7 @@ impl WriteEngine for WriteEngineImpl {
             seq_range.end,
             partition_state.seq_allocator.remaining_capacity(),
           );
+          let was_byte_due = partition_state.buffer.buffered_bytes >= self.config.flush_max_bytes;
           partition_state.buffer.push(
             BufferedBatch {
               records: records.take().expect("records are buffered only once"),
@@ -125,7 +126,11 @@ impl WriteEngine for WriteEngineImpl {
             },
             now,
           );
-          Some((completion_rx, seq_range))
+          let flush_became_byte_due =
+            !was_byte_due && partition_state.buffer.buffered_bytes >= self.config.flush_max_bytes;
+          let should_notify_flush =
+            flush_became_byte_due || partition_state.buffer.is_time_due(now, &self.config);
+          Some((completion_rx, seq_range, should_notify_flush))
         }
       };
       if let Some(buffered) = buffered {
@@ -208,7 +213,12 @@ impl WriteEngine for WriteEngineImpl {
       }
     };
 
-    self.flush_notifier.notify_one();
+    // Timer ticks handle sub-threshold delay-bound buffers. Notify when this batch crosses the
+    // byte threshold or encounters an already-time-due buffer, avoiding a complete planner pass
+    // for ordinary sub-threshold batches while preserving the latency bound.
+    if should_notify_flush {
+      self.flush_notifier.notify_one();
+    }
 
     match completion_rx.await {
       Ok(Ok(())) => {},
