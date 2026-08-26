@@ -2774,7 +2774,7 @@ async fn time_flush_retains_all_topics_when_shared_object_reaches_segment_cap() 
       })
       .await
   });
-  tokio::task::yield_now().await;
+  wait_for_buffered_partitions(&engine, &["first", "second"]).await;
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
   first.await??;

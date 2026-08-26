@@ -406,3 +406,125 @@ fn shared_time_flushes_order_topics_by_name() {
     ["alpha", "zebra"]
   );
 }
+
+#[test]
+fn shared_time_flushes_group_all_topics_before_applying_plan_limit() {
+  let state = Arc::new(Mutex::new(WriteState::default()));
+  let topic_info = |name: String| TopicInfo {
+    name: name.into(),
+    partition_count: 1,
+    num_writers: 1,
+    retention: Duration::days(7),
+    max_metadata_publication_lag: Duration::seconds(15),
+    metadata_window_size: Duration::minutes(5),
+  };
+  let topics = (0 .. 5)
+    .map(|topic_index| {
+      let topic = format!("topic-{topic_index}");
+      {
+        let mut state = state.lock();
+        state.partition_state_mut(&topic, 0).buffer.push(
+          BufferedBatch {
+            records: vec![new_record(vec![1], 0)],
+            summary: BatchSummary {
+              record_count: 1,
+              payload_bytes: 1,
+            },
+            seq_range: SeqRange { start: 0, end: 0 },
+            acceptance_fence: None,
+            completion: None,
+          },
+          offset_datetime_from_unix_millis(0),
+        );
+      }
+      (topic.clone().into(), topic_info(topic))
+    })
+    .collect();
+  let flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default().with_bool_flag(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, true),
+  ));
+
+  let plans = collect_flush_plans(
+    &state,
+    offset_datetime_from_unix_millis(1_000),
+    &WriteConfig::with_defaults(),
+    Some(&flags.snapshot_watch()),
+    &topics,
+    4,
+  );
+
+  assert_eq!(plans.len(), 1);
+  assert!(plans[0].shared_blob);
+  assert_eq!(plans[0].topics.len(), 5);
+}
+
+#[test]
+fn shared_time_flush_excludes_draining_peer_partitions() {
+  let state = Arc::new(Mutex::new(WriteState::default()));
+  {
+    let mut state = state.lock();
+    for (topic, virtual_partition_id) in [("telemetry", 0), ("telemetry", 1), ("logs", 0)] {
+      state
+        .partition_state_mut(topic, virtual_partition_id)
+        .buffer
+        .push(
+          BufferedBatch {
+            records: vec![new_record(vec![1], 0)],
+            summary: BatchSummary {
+              record_count: 1,
+              payload_bytes: 1,
+            },
+            seq_range: SeqRange { start: 0, end: 0 },
+            acceptance_fence: None,
+            completion: None,
+          },
+          offset_datetime_from_unix_millis(0),
+        );
+    }
+    state.partition_state_mut("telemetry", 1).draining = true;
+  }
+  let flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default().with_bool_flag(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, true),
+  ));
+  let topic_info = |name: &'static str| TopicInfo {
+    name: name.into(),
+    partition_count: 1,
+    num_writers: 1,
+    retention: Duration::days(7),
+    max_metadata_publication_lag: Duration::seconds(15),
+    metadata_window_size: Duration::minutes(5),
+  };
+  let topics = HashMap::from([
+    ("telemetry".into(), topic_info("telemetry")),
+    ("logs".into(), topic_info("logs")),
+  ]);
+
+  let plans = collect_flush_plans(
+    &state,
+    offset_datetime_from_unix_millis(1_000),
+    &WriteConfig::with_defaults(),
+    Some(&flags.snapshot_watch()),
+    &topics,
+    2,
+  );
+
+  assert_eq!(plans.len(), 2);
+  let shared_plan = plans.iter().find(|plan| plan.shared_blob).unwrap();
+  assert_eq!(shared_plan.topics.len(), 2);
+  assert_eq!(
+    shared_plan
+      .topics
+      .iter()
+      .find(|topic| topic.topic.as_str() == "telemetry")
+      .unwrap()
+      .partitions[0]
+      .virtual_partition_id,
+    0
+  );
+  let drain_plan = plans.iter().find(|plan| !plan.shared_blob).unwrap();
+  assert_eq!(drain_plan.topics[0].partitions[0].virtual_partition_id, 1);
+  assert!(matches!(
+    drain_plan.topics[0].partitions[0].trigger,
+    FlushTrigger::LeaseDrain
+  ));
+}

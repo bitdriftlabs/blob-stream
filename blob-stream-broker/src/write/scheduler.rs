@@ -196,7 +196,9 @@ fn take_flush_partitions(
     .filter_map(|virtual_partition_id| {
       let partition_state =
         state.partition_state_mut_if_present(topic.as_str(), virtual_partition_id)?;
-      if partition_state.flush_in_flight {
+      if partition_state.flush_in_flight
+        || (matches!(trigger, FlushTrigger::MaxDelay) && partition_state.draining)
+      {
         None
       } else {
         take_flush_partition(
@@ -223,6 +225,7 @@ pub(super) fn collect_flush_plans(
     return Vec::new();
   }
   let fenced_metadata_writes = config.fenced_metadata_writes(feature_flags);
+  let shared_cross_topic_blobs = WriteConfig::shared_cross_topic_blobs(feature_flags);
   let mut state = state.lock();
   let mut partition_keys = state.partition_keys();
   partition_keys.sort_unstable();
@@ -241,7 +244,10 @@ pub(super) fn collect_flush_plans(
   });
   let partition_state_count = partition_keys.len();
   let mut plans_by_topic: HashMap<Chars, Vec<Vec<FlushPartition>>> = HashMap::new();
-  let mut planned_count = 0;
+  let mut plan_triggers_by_topic: HashMap<Chars, Vec<FlushTrigger>> = HashMap::new();
+  let mut shared_time_chunks_by_topic = HashMap::new();
+  let mut durable_plan_count: usize = 0;
+  let mut shared_time_plan_count: usize = 0;
   let mut last_planned_topic = None;
 
   for (topic, virtual_partition_id) in partition_keys
@@ -253,21 +259,33 @@ pub(super) fn collect_flush_plans(
     topics
       .get(topic.as_str())
       .expect("write state is created only for configured topics");
-    let existing_partition_count = plans_by_topic
-      .get(topic)
-      .and_then(|plans| plans.last())
-      .map_or(0, Vec::len);
-    let requires_new_plan = !plans_by_topic.contains_key(topic)
-      || (fenced_metadata_writes && existing_partition_count == MAX_FENCED_METADATA_PARTITIONS);
-    if requires_new_plan && planned_count == max_plans {
-      continue;
-    }
     let flush_trigger = state
       .partition_state(topic.as_str(), *virtual_partition_id)
       .and_then(|partition_state| flush_trigger(partition_state, now, config));
     let Some(flush_trigger) = flush_trigger else {
       continue;
     };
+    let existing_partition_count = plans_by_topic
+      .get(topic)
+      .and_then(|plans| plans.last())
+      .map_or(0, Vec::len);
+    let existing_trigger = plan_triggers_by_topic
+      .get(topic)
+      .and_then(|triggers| triggers.last());
+    let requires_new_plan = existing_trigger.is_none_or(|trigger| *trigger != flush_trigger)
+      || (fenced_metadata_writes && existing_partition_count == MAX_FENCED_METADATA_PARTITIONS);
+    let shared_time_plan = shared_cross_topic_blobs
+      && matches!(flush_trigger, FlushTrigger::MaxDelay)
+      && requires_new_plan;
+    let additional_durable_plans = if shared_time_plan {
+      let topic_chunks = shared_time_chunks_by_topic.get(topic).copied().unwrap_or(0);
+      usize::from(topic_chunks == shared_time_plan_count)
+    } else {
+      usize::from(requires_new_plan)
+    };
+    if durable_plan_count.saturating_add(additional_durable_plans) > max_plans {
+      continue;
+    }
 
     let max_partitions = if fenced_metadata_writes {
       if requires_new_plan {
@@ -308,7 +326,22 @@ pub(super) fn collect_flush_plans(
     let plans = plans_by_topic.entry(topic.clone()).or_default();
     if requires_new_plan {
       plans.push(Vec::new());
-      planned_count += 1;
+      plan_triggers_by_topic
+        .entry(topic.clone())
+        .or_default()
+        .push(flush_trigger);
+      if shared_time_plan {
+        *shared_time_chunks_by_topic
+          .entry(topic.clone())
+          .or_default() += 1;
+        shared_time_plan_count = shared_time_plan_count.max(
+          shared_time_chunks_by_topic
+            .get(topic)
+            .copied()
+            .expect("shared time chunk count was inserted"),
+        );
+      }
+      durable_plan_count = durable_plan_count.saturating_add(additional_durable_plans);
       last_planned_topic = Some(topic.clone());
     }
     plans
@@ -340,7 +373,7 @@ pub(super) fn collect_flush_plans(
     .collect::<Vec<_>>();
   topic_plans.sort_by(|left, right| left.topic.as_str().cmp(right.topic.as_str()));
   let max_segment_bytes = config.max_segment_bytes(feature_flags);
-  if !WriteConfig::shared_cross_topic_blobs(feature_flags) {
+  if !shared_cross_topic_blobs {
     return topic_plans
       .into_iter()
       .map(|topic| FlushPlan {

@@ -682,7 +682,9 @@ async fn fenced_metadata_write_fails_when_lease_is_invalidated_before_dynamo_tra
 #[tokio::test]
 async fn broker_coalesces_same_partition_requests_into_one_consumer_batch() -> Result<()> {
   let resources = IntegrationResources::create().await?;
-  let broker_time = Arc::new(framework::ManualTimeProvider::new(OffsetDateTime::now_utc()));
+  let broker_time = Arc::new(framework::ManualTimeProvider::new(
+    offset_datetime_from_unix_millis(1_700_000_000_000),
+  ));
   let mut cluster = ClusterHarness::builder(&resources, 1)
     .broker_flush_max_delay(Duration::from_mins(1))
     .broker_time_provider(broker_time.clone())

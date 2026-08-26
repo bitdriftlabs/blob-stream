@@ -141,7 +141,7 @@ pub(super) struct FlushPartition {
   pub(super) trigger: FlushTrigger,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FlushTrigger {
   MaxBytes,
   MaxDelay,
