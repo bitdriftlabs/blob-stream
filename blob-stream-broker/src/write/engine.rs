@@ -14,6 +14,7 @@ use super::api::{
   WriteRequest,
   WriteResponse,
 };
+use crate::write::WriteConfig;
 use crate::write::allocation::{
   AllocationTransitionDecision,
   LeaseExpirationUpdate,
@@ -394,6 +395,11 @@ impl WriteEngine for WriteEngineImpl {
       holder_id: self.holder_id.clone(),
       writer_id: self.config.writer_id,
       flush_max_bytes: self.config.flush_max_bytes,
+      max_segment_bytes: self.config.max_segment_bytes,
+      effective_max_segment_bytes: self.config.max_segment_bytes(self.feature_flags.as_ref()),
+      shared_cross_topic_blobs_enabled: WriteConfig::shared_cross_topic_blobs(
+        self.feature_flags.as_ref(),
+      ),
       flush_max_delay: StdDuration::try_from(self.config.flush_max_delay)
         .unwrap_or(StdDuration::MAX),
       membership: membership_snapshot,

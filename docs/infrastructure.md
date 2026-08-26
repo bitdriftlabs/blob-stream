@@ -52,18 +52,18 @@ Every broker, producer, and consumer using a topic must use the same `name`, `pa
 must be in range for every configured topic, and its broker discovery must contain only brokers in
 that domain.
 
-Important broker defaults are 64 MiB `flush_max_bytes`, 1 second `flush_max_delay`, 10,000
-`sequence_reservation_size`, a 30-second producer-partition `lease_duration`, a 10-second
-`heartbeat_interval`, zstd segment compression, and disabled `fenced_metadata_writes`. The
-heartbeat interval must be shorter than the lease duration. Increasing both reduces DynamoDB lease
-renewal writes but delays recovery after an ungraceful broker loss; graceful membership changes
-release moved leases explicitly. Topics default `max_metadata_publication_lag` to 15 seconds when
-unset. Consumers default `max_clock_skew` to 10 ms when unset. Configure the skew bound to the
-proven, monitored pairwise broker-to-consumer clock offset for the deployment; it is a consumer
-read setting.
-The topic `metadata_window_size` defines the durable metadata-key layout that brokers publish and
-consumers scan. Producer and consumer defaults, including batching, retry, polling, and prefetch
-values, are documented in the protobuf schema.
+Important broker defaults are 64 MiB `flush_max_bytes`, 64 MiB `max_segment_bytes`, 1 second
+`flush_max_delay`, 10,000 `sequence_reservation_size`, a 30-second producer-partition
+`lease_duration`, a 10-second `heartbeat_interval`, zstd segment compression, and disabled
+`fenced_metadata_writes`. The heartbeat interval must be shorter than the lease duration. Increasing
+both reduces DynamoDB lease renewal writes but delays recovery after an ungraceful broker loss;
+graceful membership changes release moved leases explicitly. Topics default
+`max_metadata_publication_lag` to 15 seconds when unset. Consumers default `max_clock_skew` to 10 ms
+when unset. Configure the skew bound to the proven, monitored pairwise broker-to-consumer clock
+offset for the deployment; it is a consumer read setting. The topic `metadata_window_size` defines
+the durable metadata-key layout that brokers publish and consumers scan. Producer and consumer
+defaults, including batching, retry, polling, and prefetch values, are documented in the protobuf
+schema.
 
 ### Feature-Flag Mounts
 
@@ -76,19 +76,21 @@ broker:
     file: "/etc/blob-stream/feature_flags/feature_flags.yaml"
 ```
 
-Feature flags affect local process behavior. `blob_stream_broker_fenced_metadata_writes` remains a
-broker control. Consumer reader flags `blob_stream_consumer_strong_metadata_reads`,
-`blob_stream_consumer_prefetch_max_bytes`, and `blob_stream_consumer_max_in_flight_batch_reads`
-are live. `ConsumerIteratorBootstrapConfig.broker_discovery` is required. Consumers use the broker
+Feature flags affect local process behavior. Broker controls include
+`blob_stream_broker_fenced_metadata_writes`, the default-off
+`blob_stream_broker_shared_cross_topic_blobs`, and `blob_stream_broker_max_segment_bytes`, whose
+positive integer value overrides the configured `max_segment_bytes` for newly selected flushes.
+Consumer reader flags `blob_stream_consumer_strong_metadata_reads`,
+`blob_stream_consumer_prefetch_max_bytes`, and `blob_stream_consumer_max_in_flight_batch_reads` are
+live. `ConsumerIteratorBootstrapConfig.broker_discovery` is required. Consumers use the broker
 metadata and blob caches for every read, retrying direct storage only after a broker transport,
-validation, overload, or stale-observation failure. Blob-cache idle retention is
-configured when a broker starts through
-`blob_stream_broker_blob_cache_idle_ttl_ms`; it defaults to 10 seconds and must be positive.
-The broker admits each complete object from its reported content length and current cgroup headroom
-before reading its body. Consumer polling and group scheduling flags are sampled when a consumer
-is constructed. Producer batching, retry, timeout, concurrency, and compression flags are sampled
-when a producer is constructed.
-See [Operations](operations.md) for the complete inventory and rollout behavior.
+validation, overload, or stale-observation failure. Blob-cache idle retention is configured when a
+broker starts through `blob_stream_broker_blob_cache_idle_ttl_ms`; it defaults to 10 seconds and
+must be positive. The broker admits each complete object from its reported content length and
+current cgroup headroom before reading its body. Consumer polling and group scheduling flags are
+sampled when a consumer is constructed. Producer batching, retry, timeout, concurrency, and
+compression flags are sampled when a producer is constructed. See [Operations](operations.md) for
+the complete inventory and rollout behavior.
 
 ## S3
 
@@ -100,6 +102,11 @@ for isolation. Segment keys use:
 ```text
 <prefix>/<topic>/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>
 ```
+
+With `blob_stream_broker_shared_cross_topic_blobs`, time-triggered objects can instead use
+`<prefix>/shared/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>`. Configure the lifecycle
+rule for the `shared/` prefix to retain objects for at least the maximum retention of every topic
+eligible to share, plus the metadata TTL buffer.
 
 Configure the S3 lifecycle so objects remain available for at least the topic retention period plus
 the metadata TTL buffer. DynamoDB TTL deletion is asynchronous; expiring S3 objects first can leave

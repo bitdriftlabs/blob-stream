@@ -1,8 +1,16 @@
-use super::buffer::{BufferedBatch, FlushPartition, FlushPlan};
+use super::buffer::{
+  BufferedBatch,
+  FlushCompletionError,
+  FlushPartition,
+  FlushPartitionResult,
+  FlushPlan,
+  TopicFlushPlan,
+};
 use super::metrics::WriteMetrics;
 use super::{BrokerLifecycleHooks, DEFAULT_ZSTD_LEVEL, WriteConfig, WriteError};
 use anyhow::{Context, Result};
-use bd_time::OffsetDateTimeExt;
+use bd_log_util::warn_every;
+use bd_time::{OffsetDateTimeExt, TimeProvider};
 use blob_stream_blob_store::{BlobKey, BlobStore};
 use blob_stream_metadata_store::{
   MetadataStore,
@@ -23,6 +31,7 @@ use blob_stream_types::{
   Window,
 };
 use bytes::{Bytes, BytesMut};
+use futures::{StreamExt, TryStreamExt};
 use log::{debug, trace};
 use protobuf::Message;
 use sonyflake::Sonyflake;
@@ -30,8 +39,11 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Instant;
-use time::OffsetDateTime;
+use time::ext::NumericalDuration;
+use time::{Duration, OffsetDateTime};
 use tokio::time::timeout;
+
+const MAX_CONCURRENT_METADATA_WRITES: usize = 8;
 
 #[cfg(test)]
 #[path = "./flush_test.rs"]
@@ -45,7 +57,6 @@ pub(super) struct SnowflakeGenerator {
   generator: Sonyflake,
 }
 
-use bd_time::TimeProvider;
 impl SnowflakeGenerator {
   pub(super) fn new() -> Result<Self> {
     let generator = Sonyflake::builder()
@@ -62,12 +73,20 @@ impl SnowflakeGenerator {
     Ok(Self { generator })
   }
 
-  fn next(&self, now: OffsetDateTime) -> Result<SnowflakeId> {
-    let value = self
-      .generator
-      .next_id(now)
-      .context("generate sonyflake id")?;
-    Ok(SnowflakeId(value))
+  async fn next(&self, time_provider: &dyn TimeProvider) -> Result<(SnowflakeId, OffsetDateTime)> {
+    loop {
+      let now = time_provider.now();
+      match self.generator.next_id(now) {
+        Ok(value) => return Ok((SnowflakeId(value), now)),
+        // A bounded flush can contain more than Sonyflake's 512 IDs per 10 ms bucket. Wait for
+        // the next real bucket rather than synthesizing a future ID timestamp, which could move
+        // consumer-visible ordering ahead of the clock.
+        Err(sonyflake::Error::OverSequenceLimit) => {
+          time_provider.sleep(Duration::milliseconds(10)).await;
+        },
+        Err(error) => return Err(error).context("generate sonyflake id"),
+      }
+    }
   }
 }
 
@@ -82,8 +101,170 @@ struct SegmentEnvelope {
   blob_key: BlobKey,
   compression: blob_stream_types::Compression,
   segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
-  record_count: u64,
   created_at: OffsetDateTime,
+}
+
+struct PersistedTopic {
+  envelope: SegmentEnvelope,
+  fences: Option<Vec<ProducerPartitionFence>>,
+  max_metadata_publication_lag: time::Duration,
+}
+
+struct PersistedObject {
+  payload: Bytes,
+  topics: Vec<PersistedTopic>,
+  shared_blob: bool,
+  oversized_singleton: bool,
+}
+
+impl PersistedObject {
+  fn failure_results(
+    topics: &[PersistedTopic],
+    error: FlushCompletionError,
+  ) -> Vec<FlushPartitionResult> {
+    topics
+      .iter()
+      .flat_map(|topic| {
+        topic
+          .envelope
+          .segment_index
+          .keys()
+          .map(|virtual_partition_id| FlushPartitionResult {
+            topic: topic.envelope.window.topic.clone().into(),
+            virtual_partition_id: *virtual_partition_id,
+            error: Some(error),
+          })
+      })
+      .collect()
+  }
+}
+
+struct EncodedPartition {
+  topic: protobuf::Chars,
+  virtual_partition_id: VirtualPartitionId,
+  payload: Bytes,
+  metadata: BatchMetadata,
+  fence: Option<ProducerPartitionFence>,
+  max_metadata_publication_lag: time::Duration,
+  metadata_window_size: time::Duration,
+}
+
+struct ObjectTopicBuilder {
+  topic: protobuf::Chars,
+  max_metadata_publication_lag: time::Duration,
+  metadata_window_size: time::Duration,
+  segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
+  fences: Option<Vec<ProducerPartitionFence>>,
+}
+
+struct ObjectBuilder {
+  payload: BytesMut,
+  topics: Vec<ObjectTopicBuilder>,
+}
+
+impl ObjectBuilder {
+  fn new() -> Self {
+    Self {
+      payload: BytesMut::new(),
+      topics: Vec::new(),
+    }
+  }
+
+  fn is_empty(&self) -> bool {
+    self.payload.is_empty()
+  }
+
+  fn would_exceed(&self, encoded: &EncodedPartition, max_segment_bytes: u64) -> bool {
+    u64::try_from(self.payload.len())
+      .unwrap_or(u64::MAX)
+      .saturating_add(u64::try_from(encoded.payload.len()).unwrap_or(u64::MAX))
+      > max_segment_bytes
+  }
+
+  fn push(&mut self, encoded: EncodedPartition) {
+    let start = u64::try_from(self.payload.len()).unwrap_or(u64::MAX);
+    self.payload.extend_from_slice(&encoded.payload);
+    let end = u64::try_from(self.payload.len()).unwrap_or(u64::MAX);
+    let metadata = BatchMetadata {
+      byte_range: blob_stream_types::ByteRange { start, end },
+      ..encoded.metadata
+    };
+    let topic = if let Some(topic) = self
+      .topics
+      .iter_mut()
+      .find(|topic| topic.topic == encoded.topic)
+    {
+      topic
+    } else {
+      self.topics.push(ObjectTopicBuilder {
+        topic: encoded.topic.clone(),
+        max_metadata_publication_lag: encoded.max_metadata_publication_lag,
+        metadata_window_size: encoded.metadata_window_size,
+        segment_index: HashMap::new(),
+        fences: encoded.fence.as_ref().map(|_| Vec::new()),
+      });
+      self
+        .topics
+        .last_mut()
+        .expect("new topic section is present")
+    };
+    topic
+      .segment_index
+      .insert(encoded.virtual_partition_id, vec![metadata]);
+    if let Some(fence) = encoded.fence {
+      topic
+        .fences
+        .as_mut()
+        .expect("fenced partition has a fenced topic section")
+        .push(fence);
+    }
+  }
+
+  async fn finish(
+    self,
+    context: &FlushContext,
+    shared_blob: bool,
+    max_segment_bytes: u64,
+  ) -> Result<PersistedObject> {
+    let Self { payload, topics } = self;
+    let (snowflake_id, now) = context
+      .snowflake
+      .next(context.time_provider.as_ref())
+      .await?;
+    let topic = topics.first().expect("nonempty object has a topic section");
+    let window = Window::for_timestamp(now, topic.metadata_window_size);
+    let blob_key = if shared_blob || topics.len() > 1 {
+      context.make_shared_blob_key(&window, snowflake_id)
+    } else {
+      context.make_blob_key(topic.topic.as_str(), &window, snowflake_id)
+    };
+    let compression = context.config.compression.clone();
+    let topics = topics
+      .into_iter()
+      .map(|topic| {
+        let window = Window::for_timestamp(now, topic.metadata_window_size);
+        PersistedTopic {
+          envelope: SegmentEnvelope {
+            window: window.key(topic.topic.as_str()),
+            snowflake_id,
+            blob_key: blob_key.clone(),
+            compression: compression.clone(),
+            segment_index: topic.segment_index,
+            created_at: now,
+          },
+          fences: topic.fences,
+          max_metadata_publication_lag: topic.max_metadata_publication_lag,
+        }
+      })
+      .collect();
+    let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    Ok(PersistedObject {
+      payload: payload.freeze(),
+      topics,
+      shared_blob,
+      oversized_singleton: payload_len > max_segment_bytes,
+    })
+  }
 }
 
 impl SegmentEnvelope {
@@ -136,7 +317,7 @@ impl FlushContext {
     }
   }
 
-  fn make_blob_key(&self, topic: &str, window: &Window, snowflake_id: SnowflakeId) -> BlobKey {
+  fn make_blob_key(&self, namespace: &str, window: &Window, snowflake_id: SnowflakeId) -> BlobKey {
     let extension = match self.config.compression.codec {
       CompressionCodec::None => "bin",
       CompressionCodec::Zstd => "zst",
@@ -151,7 +332,7 @@ impl FlushContext {
       }
     }
 
-    key.push_str(topic);
+    key.push_str(namespace);
     key.push('/');
     key.push_str(&window.start.unix_timestamp().to_string());
     key.push('/');
@@ -160,6 +341,10 @@ impl FlushContext {
     key.push_str(extension);
 
     BlobKey::new(key)
+  }
+
+  fn make_shared_blob_key(&self, window: &Window, snowflake_id: SnowflakeId) -> BlobKey {
+    self.make_blob_key("shared", window, snowflake_id)
   }
 
   fn encode_batch(virtual_partition_id: VirtualPartitionId, records: Vec<Record>) -> Result<Bytes> {
@@ -237,189 +422,276 @@ impl FlushContext {
     Ok((virtual_partition_id, records, summary, seq_range))
   }
 
-  fn build_segment(
+  fn encode_partition(
     &self,
-    topic: &str,
-    partitions: Vec<FlushPartition>,
-    metadata_window_size: time::Duration,
-    now: OffsetDateTime,
-  ) -> Result<(Bytes, SegmentEnvelope)> {
-    trace!("building flush segment: topic={topic}");
-    let window = Window::for_timestamp(now, metadata_window_size);
-    let snowflake_id = self.snowflake.next(now)?;
-    let blob_key = self.make_blob_key(topic, &window, snowflake_id);
-    let compression = self.config.compression.clone();
-
-    let mut payload = BytesMut::new();
-    let mut segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>> = HashMap::new();
-    let mut record_count = 0_u64;
-    for partition in partitions {
-      trace!(
-        "encoding partition batches: topic={}, virtual_partition_id={}, batches={}",
-        topic,
-        partition.virtual_partition_id,
-        partition.batches.len()
-      );
-      let (virtual_partition_id, records, summary, seq_range) =
-        Self::merge_partition_batches(partition)?;
-      let encoded = Self::encode_batch(virtual_partition_id, records)?;
-      let compressed = self.compress_batch(encoded)?;
-      let start = payload.len() as u64;
-      payload.extend_from_slice(&compressed);
-      let end = payload.len() as u64;
-
-      record_count = record_count.saturating_add(u64::from(summary.record_count));
-      let metadata = BatchMetadata {
-        seq_range,
-        byte_range: blob_stream_types::ByteRange { start, end },
-        payload_bytes: summary.payload_bytes,
-      };
-
-      segment_index.insert(virtual_partition_id, vec![metadata]);
-    }
-
-    let envelope = SegmentEnvelope {
-      window: window.key(topic),
-      snowflake_id,
-      blob_key,
-      compression,
-      segment_index,
-      record_count,
-      created_at: now,
-    };
-
-    debug!(
-      "built segment envelope: topic={}, partitions={}, records={}, bytes={}",
-      topic,
-      envelope.segment_index.len(),
-      envelope.record_count,
-      payload.len()
+    topic_plan: &TopicFlushPlan,
+    partition: FlushPartition,
+  ) -> Result<EncodedPartition> {
+    trace!(
+      "encoding partition batches: topic={}, virtual_partition_id={}, batches={}",
+      topic_plan.topic,
+      partition.virtual_partition_id,
+      partition.batches.len()
     );
+    let virtual_partition_id = partition.virtual_partition_id;
+    let fence = if topic_plan.fenced_metadata_writes {
+      let fence = partition.lease_fence.as_deref().cloned().ok_or_else(|| {
+        anyhow::anyhow!("fenced metadata publication requires a durable producer lease fence")
+      })?;
+      Some(ProducerPartitionFence {
+        key: ProducerPartitionLeaseKey {
+          topic: topic_plan.topic.clone(),
+          virtual_partition_id,
+        },
+        fence,
+      })
+    } else {
+      None
+    };
+    let (virtual_partition_id, records, summary, seq_range) =
+      Self::merge_partition_batches(partition)?;
+    let payload = self.compress_batch(Self::encode_batch(virtual_partition_id, records)?)?;
+    Ok(EncodedPartition {
+      topic: topic_plan.topic.clone(),
+      virtual_partition_id,
+      payload,
+      metadata: BatchMetadata {
+        seq_range,
+        byte_range: blob_stream_types::ByteRange { start: 0, end: 0 },
+        payload_bytes: summary.payload_bytes,
+      },
+      fence,
+      max_metadata_publication_lag: topic_plan.max_metadata_publication_lag,
+      metadata_window_size: topic_plan.metadata_window_size,
+    })
+  }
 
-    Ok((payload.freeze(), envelope))
+  async fn build_objects(&self, plan: &mut FlushPlan) -> Result<Vec<PersistedObject>> {
+    let topic_plans = std::mem::take(&mut plan.topics);
+    let mut current = ObjectBuilder::new();
+    let mut objects = Vec::new();
+    for mut topic_plan in topic_plans {
+      for partition in std::mem::take(&mut topic_plan.partitions) {
+        let encoded = self.encode_partition(&topic_plan, partition)?;
+        if !current.is_empty() && current.would_exceed(&encoded, plan.max_segment_bytes) {
+          objects.push(
+            current
+              .finish(self, plan.shared_blob, plan.max_segment_bytes)
+              .await?,
+          );
+          current = ObjectBuilder::new();
+        }
+        current.push(encoded);
+      }
+    }
+    if !current.is_empty() {
+      objects.push(
+        current
+          .finish(self, plan.shared_blob, plan.max_segment_bytes)
+          .await?,
+      );
+    }
+    Ok(objects)
+  }
+
+  async fn persist_topic_metadata(
+    &self,
+    topic: PersistedTopic,
+    publication_started_at: Instant,
+    metrics: &WriteMetrics,
+  ) -> Result<Vec<FlushPartitionResult>, WriteError> {
+    let virtual_partition_ids = topic
+      .envelope
+      .segment_index
+      .keys()
+      .copied()
+      .collect::<Vec<_>>();
+    if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+      lifecycle_hooks
+        .blob_persisted(topic.envelope.window.topic.as_str(), &virtual_partition_ids)
+        .await;
+    }
+    let topic_name = topic.envelope.window.topic.clone();
+    let metadata_publication_budget =
+      std::time::Duration::try_from(topic.max_metadata_publication_lag).map_err(|_| {
+        WriteError::Internal(anyhow::anyhow!(
+          "metadata publication deadline must not be negative"
+        ))
+      })?;
+    let metadata_remaining_budget =
+      metadata_publication_budget.checked_sub(publication_started_at.elapsed());
+    let metadata_published_at = self.time_provider.now();
+    let metadata = topic.envelope.into_metadata(metadata_published_at);
+    let error = match metadata_remaining_budget {
+      None => {
+        metrics.record_metadata_publication_deadline_exhausted_before_persistence();
+        Some(FlushCompletionError::Internal)
+      },
+      Some(remaining_budget) => match timeout(
+        remaining_budget,
+        self.metadata_store.write_segment(
+          metadata,
+          topic.fences.as_deref(),
+          metadata_published_at.unix_timestamp_ms(),
+        ),
+      )
+      .await
+      {
+        Ok(Ok(())) => None,
+        Ok(Err(MetadataWriteError::ProducerLeaseFenceLost)) => {
+          Some(FlushCompletionError::LeaseFenceLost)
+        },
+        Ok(Err(_)) => Some(FlushCompletionError::Internal),
+        Err(_) => {
+          metrics.record_metadata_publication_deadline_exhausted_while_persisting();
+          Some(FlushCompletionError::Internal)
+        },
+      },
+    };
+    if error.is_none()
+      && let Some(lifecycle_hooks) = &self.lifecycle_hooks
+    {
+      lifecycle_hooks
+        .metadata_persisted(topic_name.as_str(), &virtual_partition_ids)
+        .await;
+    }
+    Ok(
+      virtual_partition_ids
+        .into_iter()
+        .map(|virtual_partition_id| FlushPartitionResult {
+          topic: topic_name.clone().into(),
+          virtual_partition_id,
+          error,
+        })
+        .collect(),
+    )
   }
 
   pub(super) async fn flush_plan(
     &self,
     plan: &mut FlushPlan,
-    now: OffsetDateTime,
     metrics: &WriteMetrics,
-  ) -> Result<(), WriteError> {
+  ) -> Result<Vec<FlushPartitionResult>, WriteError> {
     let publication_started_at = Instant::now();
-    let partitions = std::mem::take(&mut plan.partitions);
-    let virtual_partition_ids = partitions
-      .iter()
-      .map(|partition| partition.virtual_partition_id)
-      .collect::<Vec<_>>();
-    let fences = if plan.fenced_metadata_writes {
-      Some(
-        partitions
-          .iter()
-          .map(|partition| {
-            let fence = partition.lease_fence.as_deref().cloned().ok_or_else(|| {
-              anyhow::anyhow!("fenced metadata publication requires a durable producer lease fence")
-            })?;
-            Ok(ProducerPartitionFence {
-              key: ProducerPartitionLeaseKey {
-                topic: plan.topic.clone(),
-                virtual_partition_id: partition.virtual_partition_id,
-              },
-              fence,
-            })
-          })
-          .collect::<Result<Vec<_>, anyhow::Error>>()?,
-      )
-    } else {
-      None
-    };
-    let (payload, envelope) = self.build_segment(
-      plan.topic.as_str(),
-      partitions,
-      plan.metadata_window_size,
-      now,
-    )?;
-    let payload_bytes = payload.len();
-    let record_count = envelope.record_count;
-    let partition_count = envelope.segment_index.len();
-
-    let publication_budget = std::time::Duration::try_from(plan.max_metadata_publication_lag)
-      .map_err(|_| {
+    let mut objects = self.build_objects(plan).await?.into_iter();
+    let mut results = Vec::new();
+    while let Some(object) = objects.next() {
+      let publication_budget = object
+        .topics
+        .iter()
+        .map(|topic| topic.max_metadata_publication_lag)
+        .min()
+        .expect("persisted object has at least one topic");
+      let publication_budget = std::time::Duration::try_from(publication_budget).map_err(|_| {
         WriteError::Internal(anyhow::anyhow!(
           "metadata publication deadline must not be negative"
         ))
       })?;
-    let remaining_budget = publication_budget
-      .checked_sub(publication_started_at.elapsed())
-      .ok_or_else(|| {
-        metrics.record_metadata_publication_latency(publication_started_at);
+      let Some(remaining_budget) = publication_budget.checked_sub(publication_started_at.elapsed())
+      else {
         metrics.record_metadata_publication_deadline_exhausted_before_persistence();
-        anyhow::anyhow!(
-          "metadata publication exceeded {} ms before segment persistence",
-          plan.max_metadata_publication_lag.whole_milliseconds()
-        )
-      })?;
-    let persistence_result = timeout(remaining_budget, async {
-      if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
-        lifecycle_hooks
-          .before_flush_persist(plan.topic.as_str(), &virtual_partition_ids)
-          .await;
+        results.extend(PersistedObject::failure_results(
+          &object.topics,
+          FlushCompletionError::Internal,
+        ));
+        for object in objects {
+          results.extend(PersistedObject::failure_results(
+            &object.topics,
+            FlushCompletionError::Internal,
+          ));
+        }
+        break;
+      };
+      for topic in &object.topics {
+        if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+          lifecycle_hooks
+            .before_flush_persist(
+              topic.envelope.window.topic.as_str(),
+              &topic
+                .envelope
+                .segment_index
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            )
+            .await;
+        }
       }
-      self
-        .blob_store
-        .put(&envelope.blob_key, payload)
-        .await
-        .map_err(|error| MetadataWriteError::Other(error.context("write segment blob")))?;
-      metrics.record_uploaded_object(payload_bytes);
-      if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
-        lifecycle_hooks
-          .blob_persisted(plan.topic.as_str(), &virtual_partition_ids)
-          .await;
+      let payload_bytes = object.payload.len();
+      let blob_key = object
+        .topics
+        .first()
+        .expect("persisted object has at least one topic")
+        .envelope
+        .blob_key
+        .clone();
+      let blob_result = timeout(
+        remaining_budget,
+        self.blob_store.put(&blob_key, object.payload),
+      )
+      .await;
+      if blob_result.is_err() || blob_result.as_ref().is_ok_and(Result::is_err) {
+        if blob_result.is_err() {
+          metrics.record_metadata_publication_deadline_exhausted_while_persisting();
+        }
+        results.extend(PersistedObject::failure_results(
+          &object.topics,
+          FlushCompletionError::Internal,
+        ));
+        continue;
       }
-      let metadata_published_at = self.time_provider.now();
-      let metadata = envelope.into_metadata(metadata_published_at);
-      self
-        .metadata_store
-        .write_segment(
-          metadata,
-          fences.as_deref(),
-          metadata_published_at.unix_timestamp_ms(),
-        )
-        .await?;
-      if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
-        lifecycle_hooks
-          .metadata_persisted(plan.topic.as_str(), &virtual_partition_ids)
-          .await;
-      }
-      Ok::<(), MetadataWriteError>(())
-    })
-    .await;
-    metrics.record_metadata_publication_latency(publication_started_at);
-    match persistence_result {
-      Ok(Ok(())) => {},
-      Ok(Err(MetadataWriteError::ProducerLeaseFenceLost)) => {
-        return Err(WriteError::LeaseFenceLost);
-      },
-      Ok(Err(error)) => {
-        return Err(anyhow::Error::new(error).context("persist segment").into());
-      },
-      Err(_elapsed) => {
-        metrics.record_metadata_publication_deadline_exhausted_while_persisting();
-        return Err(
-          anyhow::anyhow!(
-            "metadata publication exceeded {} ms while persisting segment",
-            plan.max_metadata_publication_lag.whole_milliseconds()
-          )
-          .into(),
+      metrics.record_uploaded_object(payload_bytes, object.oversized_singleton);
+      if object.oversized_singleton {
+        let topic = object
+          .topics
+          .first()
+          .expect("oversized object has one topic section");
+        let virtual_partition_id = topic
+          .envelope
+          .segment_index
+          .keys()
+          .next()
+          .expect("oversized object has one partition");
+        warn_every!(
+          15.seconds(),
+          "broker persisted oversized single-partition object: topic={}, \
+           virtual_partition_id={virtual_partition_id}, payload_bytes={payload_bytes}, \
+           max_segment_bytes={}",
+          topic.envelope.window.topic,
+          plan.max_segment_bytes
         );
-      },
+      }
+      debug!(
+        "persisted segment object: blob_key={}, payload_bytes={payload_bytes}, topics={}, \
+         shared={}, oversized_singleton={}",
+        blob_key.as_str(),
+        object.topics.len(),
+        object.shared_blob,
+        object.oversized_singleton
+      );
+      // Metadata rows determine acknowledgement independently, even when their data shares a
+      // single uploaded object. Bound the fan-out so a wide shared flush cannot overwhelm storage.
+      let topic_results = futures::stream::iter(
+        object
+          .topics
+          .into_iter()
+          .map(|topic| self.persist_topic_metadata(topic, publication_started_at, metrics)),
+      )
+      .buffer_unordered(MAX_CONCURRENT_METADATA_WRITES)
+      .try_collect::<Vec<_>>()
+      .await?;
+      results.extend(topic_results.into_iter().flatten());
     }
-
-    debug!(
-      "flush persisted segment: topic={}, partitions={partition_count}, records={record_count}, \
-       bytes={payload_bytes}",
-      plan.topic
-    );
-    Ok(())
+    results.sort_by(|left, right| {
+      left
+        .topic
+        .as_str()
+        .cmp(right.topic.as_str())
+        .then_with(|| left.virtual_partition_id.cmp(&right.virtual_partition_id))
+    });
+    metrics.record_metadata_publication_latency(publication_started_at);
+    debug!("flush completed {} partition results", results.len());
+    Ok(results)
   }
 
   #[must_use]

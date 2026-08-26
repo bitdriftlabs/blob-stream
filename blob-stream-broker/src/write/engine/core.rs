@@ -257,11 +257,10 @@ impl WriteEngineImpl {
             let flush_context = flush_context.clone();
             let metrics = metrics.clone();
             let state = Arc::clone(&state);
-            let now = time_provider.now();
             flushes.push(async move {
               let _active_flush =
                 bd_server_stats::stats::StackAutoGauge::new(&metrics.active_flush_plans);
-              flush_plan_and_notify(&flush_context, plan, now, &metrics, &state).await;
+              flush_plan_and_notify(&flush_context, plan, &metrics, &state).await;
             });
           }
           continue;

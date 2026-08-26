@@ -4,7 +4,11 @@ use bd_time::{OffsetDateTimeExt, TimeProvider};
 use blob_stream_blob_store::BlobKey;
 use blob_stream_broker::write::{BrokerLeaseStatus, WriteRequest};
 use blob_stream_broker_discovery::BrokerDiscovery;
-use blob_stream_consumer::consumer::ConsumerReaderImpl;
+use blob_stream_consumer::consumer::{
+  ConsumerReaderImpl,
+  GrpcBrokerBlobRangeQuery,
+  GrpcBrokerMetadataQuery,
+};
 use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, NextResult};
 use blob_stream_consumer::{
   ConsumerBootstrapConfig,
@@ -44,6 +48,7 @@ use blob_stream_producer::{
   ProducerRecord,
   ProducerTopicConfig,
 };
+use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::{
   BatchMetadata,
   CommittedCursor,
@@ -75,7 +80,12 @@ use framework::{
   LifecycleEvent,
   PARTITION_COUNT,
   SECOND_TOPIC,
+  StoreFaultAction,
+  StoreFaultDomain,
+  StoreFaultOperation,
+  StoreFaultRule,
   TOPIC,
+  TestEventMatcher,
   WINDOW_SIZE_SECONDS,
   append_reader_delivery_traces,
   consumer_bootstrap_config,
@@ -672,7 +682,9 @@ async fn fenced_metadata_write_fails_when_lease_is_invalidated_before_dynamo_tra
 #[tokio::test]
 async fn broker_coalesces_same_partition_requests_into_one_consumer_batch() -> Result<()> {
   let resources = IntegrationResources::create().await?;
-  let broker_time = Arc::new(framework::ManualTimeProvider::new(OffsetDateTime::now_utc()));
+  let broker_time = Arc::new(framework::ManualTimeProvider::new(
+    offset_datetime_from_unix_millis(1_700_000_000_000),
+  ));
   let mut cluster = ClusterHarness::builder(&resources, 1)
     .broker_flush_max_delay(Duration::from_mins(1))
     .broker_time_provider(broker_time.clone())
@@ -4135,6 +4147,360 @@ async fn multi_topic_isolation() -> Result<()> {
   );
 
   // Step 4: Clean up all resources.
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn shared_cross_topic_blob_is_readable_through_broker() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let broker_time = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .shared_cross_topic_blobs()
+    .partition_count(1)
+    .broker_flush_max_delay(Duration::from_secs(1))
+    .broker_time_provider(broker_time.clone())
+    .start()
+    .await?;
+  let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
+  let producer = Arc::new(
+    new_producer(
+      producer_config(),
+      vec![
+        producer_topic_named_with_partition_count(TOPIC, 1, 1),
+        producer_topic_named_with_partition_count(SECOND_TOPIC, 1, 1),
+      ],
+      Arc::clone(&discovery),
+      metrics_scope("blob_stream_producer_it"),
+    )
+    .await?,
+  );
+
+  let first_producer = Arc::clone(&producer);
+  let first = tokio::spawn(async move {
+    first_producer
+      .produce(ProducerRecord::new(
+        TOPIC.into(),
+        b"shared-first-key".to_vec(),
+        b"shared-first".to_vec().into(),
+        1_700_000_000_000,
+      ))
+      .await
+  });
+  let second_producer = Arc::clone(&producer);
+  let second = tokio::spawn(async move {
+    second_producer
+      .produce(ProducerRecord::new(
+        SECOND_TOPIC.into(),
+        b"shared-second-key".to_vec(),
+        b"shared-second".to_vec().into(),
+        1_700_000_000_000,
+      ))
+      .await
+  });
+
+  timeout(Duration::from_secs(5), async {
+    loop {
+      let buffered_topics = cluster
+        .broker_state_snapshots()
+        .await
+        .into_iter()
+        .flat_map(|snapshot| snapshot.topics)
+        .filter(|topic| {
+          topic
+            .local_partitions
+            .iter()
+            .any(|partition| partition.buffered_batch_count > 0)
+        })
+        .map(|topic| topic.name.to_string())
+        .collect::<HashSet<_>>();
+      if buffered_topics.contains(TOPIC) && buffered_topics.contains(SECOND_TOPIC) {
+        return Ok::<_, anyhow::Error>(());
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("both topic writes did not enter the broker buffer"))??;
+  broker_time.advance(TimeDuration::seconds(1));
+  first.await??;
+  second.await??;
+
+  let window = Window::for_timestamp(
+    broker_time.now(),
+    TimeDuration::seconds(WINDOW_SIZE_SECONDS),
+  );
+  let first_segments = resources
+    .metadata_store()
+    .scan_window_from_snowflake(&window.key(TOPIC), None, MetadataReadConsistency::Strong)
+    .await?;
+  let second_segments = resources
+    .metadata_store()
+    .scan_window_from_snowflake(
+      &window.key(SECOND_TOPIC),
+      None,
+      MetadataReadConsistency::Strong,
+    )
+    .await?;
+  assert_eq!(first_segments.len(), 1);
+  assert_eq!(second_segments.len(), 1);
+  assert_eq!(first_segments[0].blob_key, second_segments[0].blob_key);
+  assert!(first_segments[0].blob_key.as_str().starts_with("shared/"));
+
+  let mut first_reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: TOPIC.into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![0],
+    HashMap::new(),
+    resources.blob_store(),
+    resources.metadata_store(),
+    Arc::new(GrpcBrokerMetadataQuery::new(Arc::new(cluster.producer_discovery())).await?),
+    Arc::new(GrpcBrokerBlobRangeQuery::new(Arc::new(cluster.producer_discovery())).await?),
+    &metrics_scope("blob_stream_consumer_it"),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )?;
+  let mut second_reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: SECOND_TOPIC.into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![0],
+    HashMap::new(),
+    resources.blob_store(),
+    resources.metadata_store(),
+    Arc::new(GrpcBrokerMetadataQuery::new(Arc::new(cluster.producer_discovery())).await?),
+    Arc::new(GrpcBrokerBlobRangeQuery::new(Arc::new(cluster.producer_discovery())).await?),
+    &metrics_scope("blob_stream_consumer_it"),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )?;
+  let reader_now = broker_time.now().unix_timestamp().saturating_add(3);
+  let first_payloads = first_reader
+    .read_available(reader_now)
+    .await?
+    .into_iter()
+    .flat_map(|batch| batch.records)
+    .map(|record| record.payload.to_vec())
+    .collect::<Vec<_>>();
+  let second_payloads = second_reader
+    .read_available(reader_now)
+    .await?
+    .into_iter()
+    .flat_map(|batch| batch.records)
+    .map(|record| record.payload.to_vec())
+    .collect::<Vec<_>>();
+  assert_eq!(first_payloads, [b"shared-first"]);
+  assert_eq!(second_payloads, [b"shared-second"]);
+
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
+// High-level: verifies shared-object metadata rows publish independently when one topic retries.
+#[tokio::test]
+async fn shared_object_metadata_failure_is_isolated_and_retries() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let broker_time = Arc::new(framework::ManualTimeProvider::new(OffsetDateTime::now_utc()));
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .shared_cross_topic_blobs()
+    .partition_count(1)
+    .broker_flush_max_delay(Duration::from_secs(1))
+    .broker_time_provider(broker_time.clone())
+    .start()
+    .await?;
+  resources
+    .store_fault_controller()
+    .enable_fault(StoreFaultRule {
+      domain: StoreFaultDomain::Metadata,
+      operation: StoreFaultOperation::MetadataWriteSegment,
+      key_pattern: Some(SECOND_TOPIC.to_string()),
+      action: StoreFaultAction::Fail {
+        message: "secondary topic metadata write failure".to_string(),
+      },
+      remaining_hits: Some(1),
+    })
+    .await;
+
+  let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
+  let producer = Arc::new(
+    new_producer(
+      producer_config(),
+      vec![
+        producer_topic_named_with_partition_count(TOPIC, 1, 1),
+        producer_topic_named_with_partition_count(SECOND_TOPIC, 1, 1),
+      ],
+      discovery,
+      metrics_scope("blob_stream_producer_it"),
+    )
+    .await?,
+  );
+  let first_producer = Arc::clone(&producer);
+  let first = tokio::spawn(async move {
+    first_producer
+      .produce(ProducerRecord::new(
+        TOPIC.into(),
+        b"partial-first-key".to_vec(),
+        b"partial-first".to_vec().into(),
+        1_700_000_000_000,
+      ))
+      .await
+  });
+  let second_producer = Arc::clone(&producer);
+  let second = tokio::spawn(async move {
+    second_producer
+      .produce(ProducerRecord::new(
+        SECOND_TOPIC.into(),
+        b"partial-second-key".to_vec(),
+        b"partial-second".to_vec().into(),
+        1_700_000_000_000,
+      ))
+      .await
+  });
+
+  timeout(Duration::from_secs(5), async {
+    loop {
+      let buffered_topics = cluster
+        .broker_state_snapshots()
+        .await
+        .into_iter()
+        .flat_map(|snapshot| snapshot.topics)
+        .filter(|topic| {
+          topic
+            .local_partitions
+            .iter()
+            .any(|partition| partition.buffered_batch_count > 0)
+        })
+        .map(|topic| topic.name.to_string())
+        .collect::<HashSet<_>>();
+      if buffered_topics.contains(TOPIC) && buffered_topics.contains(SECOND_TOPIC) {
+        return Ok::<_, anyhow::Error>(());
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("both topic writes did not enter the broker buffer"))??;
+  broker_time.advance(TimeDuration::seconds(1));
+
+  cluster
+    .wait_for_event(
+      &TestEventMatcher {
+        category: Some("store".to_string()),
+        operation: Some("metadata_write_segment".to_string()),
+        key_contains: Some(SECOND_TOPIC.to_string()),
+        status: Some("fault_applied".to_string()),
+      },
+      Duration::from_secs(5),
+    )
+    .await?;
+  first.await??;
+
+  let window = Window::for_timestamp(
+    broker_time.now(),
+    TimeDuration::seconds(WINDOW_SIZE_SECONDS),
+  );
+  let first_segments = resources
+    .metadata_store()
+    .scan_window_from_snowflake(&window.key(TOPIC), None, MetadataReadConsistency::Strong)
+    .await?;
+  let second_segments = resources
+    .metadata_store()
+    .scan_window_from_snowflake(
+      &window.key(SECOND_TOPIC),
+      None,
+      MetadataReadConsistency::Strong,
+    )
+    .await?;
+  assert_eq!(first_segments.len(), 1);
+  assert!(first_segments[0].blob_key.as_str().starts_with("shared/"));
+  assert!(
+    second_segments.is_empty(),
+    "the failed topic must not publish metadata before its retry"
+  );
+
+  timeout(Duration::from_secs(5), async {
+    loop {
+      let secondary_buffered = cluster
+        .broker_state_snapshots()
+        .await
+        .into_iter()
+        .flat_map(|snapshot| snapshot.topics)
+        .any(|topic| {
+          topic.name.as_str() == SECOND_TOPIC
+            && topic
+              .local_partitions
+              .iter()
+              .any(|partition| partition.buffered_batch_count > 0)
+        });
+      if secondary_buffered {
+        return Ok::<_, anyhow::Error>(());
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("secondary topic retry did not re-enter the broker buffer"))??;
+  broker_time.advance(TimeDuration::seconds(1));
+  let second_ack = second.await??;
+  assert!(
+    second_ack.attempts > 1,
+    "secondary metadata failure must cause a producer retry"
+  );
+
+  let first_segments = resources
+    .metadata_store()
+    .scan_window_from_snowflake(&window.key(TOPIC), None, MetadataReadConsistency::Strong)
+    .await?;
+  let second_segments = resources
+    .metadata_store()
+    .scan_window_from_snowflake(
+      &window.key(SECOND_TOPIC),
+      None,
+      MetadataReadConsistency::Strong,
+    )
+    .await?;
+  assert_eq!(first_segments.len(), 1);
+  assert_eq!(second_segments.len(), 1);
+  assert_ne!(first_segments[0].blob_key, second_segments[0].blob_key);
+
+  let mut second_reader = ConsumerReaderImpl::new(
+    ConsumerReadConfig {
+      topic: SECOND_TOPIC.into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![0],
+    HashMap::new(),
+    resources.blob_store(),
+    resources.metadata_store(),
+    framework::rejecting_broker_metadata_query(),
+    framework::rejecting_broker_blob_range_query(),
+    &metrics_scope("blob_stream_consumer_it"),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )?;
+  let reader_now = broker_time.now().unix_timestamp().saturating_add(3);
+  let second_payloads = second_reader
+    .read_available(reader_now)
+    .await?
+    .into_iter()
+    .flat_map(|batch| batch.records)
+    .map(|record| record.payload.to_vec())
+    .collect::<Vec<_>>();
+  assert_eq!(second_payloads, [b"partial-second"]);
+
   cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())

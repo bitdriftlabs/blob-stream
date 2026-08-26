@@ -162,7 +162,8 @@ only when whole-object overfetch and broker resource use remain acceptable.
 | `flush_failures_total`, `flush_latency_seconds` | Counter, histogram | Failed flushes and complete flush latency. |
 | `metadata_publication_latency_seconds` | Histogram | Time spent persisting segment metadata after blob upload. |
 | `metadata_publication_deadline_exhausted_before_persistence_total`, `metadata_publication_deadline_exhausted_while_persisting_total` | Counters | Publication deadlines exhausted before metadata persistence begins or while it is in progress. Both fail the flush. |
-| `flush_uploaded_object_bytes_total`, `flush_uploaded_object_bytes` | Counter, histogram | Total bytes uploaded in flush objects and per-object upload size. |
+| `flush_uploaded_objects_total`, `flush_oversized_single_partition_objects_total` | Counters | Uploaded immutable objects and objects containing one partition that exceeded `max_segment_bytes` and could not be split. |
+| `flush_uploaded_object_bytes_total`, `flush_uploaded_object_bytes` | Counter, histogram | Total bytes uploaded and per-object upload size. |
 | `lease_drain_starts_total`, `lease_drain_completions_total` | Counters | Graceful producer-lease drain starts and completed releases. |
 
 ### Memory Admission: `blob_stream_broker:memory_pressure`

@@ -15,6 +15,13 @@ pub(super) enum FlushCompletionError {
   Internal,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct FlushPartitionResult {
+  pub(super) topic: Chars,
+  pub(super) virtual_partition_id: VirtualPartitionId,
+  pub(super) error: Option<FlushCompletionError>,
+}
+
 //
 // BufferState
 //
@@ -89,16 +96,37 @@ pub(super) struct BufferedBatch {
 }
 
 //
-// FlushPlan
+// TopicFlushPlan
 //
 
 #[derive(Debug)]
-pub(super) struct FlushPlan {
+pub(super) struct TopicFlushPlan {
   pub(super) topic: Chars,
   pub(super) partitions: Vec<FlushPartition>,
   pub(super) max_metadata_publication_lag: Duration,
   pub(super) metadata_window_size: Duration,
   pub(super) fenced_metadata_writes: bool,
+}
+
+impl TopicFlushPlan {
+  pub(super) fn is_time_triggered(&self) -> bool {
+    self
+      .partitions
+      .iter()
+      .all(|partition| matches!(partition.trigger, FlushTrigger::MaxDelay))
+  }
+}
+
+//
+// FlushPlan
+//
+
+/// One or more topic sections selected for one or more bounded immutable objects.
+#[derive(Debug)]
+pub(super) struct FlushPlan {
+  pub(super) topics: Vec<TopicFlushPlan>,
+  pub(super) max_segment_bytes: u64,
+  pub(super) shared_blob: bool,
 }
 
 //
@@ -113,7 +141,7 @@ pub(super) struct FlushPartition {
   pub(super) trigger: FlushTrigger,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FlushTrigger {
   MaxBytes,
   MaxDelay,
