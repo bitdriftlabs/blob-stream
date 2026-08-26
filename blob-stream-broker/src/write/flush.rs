@@ -10,7 +10,7 @@ use super::metrics::WriteMetrics;
 use super::{BrokerLifecycleHooks, DEFAULT_ZSTD_LEVEL, WriteConfig, WriteError};
 use anyhow::{Context, Result};
 use bd_log_util::warn_every;
-use bd_time::OffsetDateTimeExt;
+use bd_time::{OffsetDateTimeExt, TimeProvider};
 use blob_stream_blob_store::{BlobKey, BlobStore};
 use blob_stream_metadata_store::{
   MetadataStore,
@@ -39,8 +39,8 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Instant;
-use time::OffsetDateTime;
 use time::ext::NumericalDuration;
+use time::{Duration, OffsetDateTime};
 use tokio::time::timeout;
 
 const MAX_CONCURRENT_METADATA_WRITES: usize = 8;
@@ -57,7 +57,6 @@ pub(super) struct SnowflakeGenerator {
   generator: Sonyflake,
 }
 
-use bd_time::TimeProvider;
 impl SnowflakeGenerator {
   pub(super) fn new() -> Result<Self> {
     let generator = Sonyflake::builder()
@@ -74,12 +73,20 @@ impl SnowflakeGenerator {
     Ok(Self { generator })
   }
 
-  fn next(&self, now: OffsetDateTime) -> Result<SnowflakeId> {
-    let value = self
-      .generator
-      .next_id(now)
-      .context("generate sonyflake id")?;
-    Ok(SnowflakeId(value))
+  async fn next(&self, time_provider: &dyn TimeProvider) -> Result<(SnowflakeId, OffsetDateTime)> {
+    loop {
+      let now = time_provider.now();
+      match self.generator.next_id(now) {
+        Ok(value) => return Ok((SnowflakeId(value), now)),
+        // A bounded flush can contain more than Sonyflake's 512 IDs per 10 ms bucket. Wait for
+        // the next real bucket rather than synthesizing a future ID timestamp, which could move
+        // consumer-visible ordering ahead of the clock.
+        Err(sonyflake::Error::OverSequenceLimit) => {
+          time_provider.sleep(Duration::milliseconds(10)).await;
+        },
+        Err(error) => return Err(error).context("generate sonyflake id"),
+      }
+    }
   }
 }
 
@@ -213,15 +220,17 @@ impl ObjectBuilder {
     }
   }
 
-  fn finish(
+  async fn finish(
     self,
     context: &FlushContext,
-    now: OffsetDateTime,
     shared_blob: bool,
     max_segment_bytes: u64,
   ) -> Result<PersistedObject> {
     let Self { payload, topics } = self;
-    let snowflake_id = context.snowflake.next(now)?;
+    let (snowflake_id, now) = context
+      .snowflake
+      .next(context.time_provider.as_ref())
+      .await?;
     let topic = topics.first().expect("nonempty object has a topic section");
     let window = Window::for_timestamp(now, topic.metadata_window_size);
     let blob_key = if shared_blob || topics.len() > 1 {
@@ -457,11 +466,7 @@ impl FlushContext {
     })
   }
 
-  fn build_objects(
-    &self,
-    plan: &mut FlushPlan,
-    now: OffsetDateTime,
-  ) -> Result<Vec<PersistedObject>> {
+  async fn build_objects(&self, plan: &mut FlushPlan) -> Result<Vec<PersistedObject>> {
     let topic_plans = std::mem::take(&mut plan.topics);
     let mut current = ObjectBuilder::new();
     let mut objects = Vec::new();
@@ -469,14 +474,22 @@ impl FlushContext {
       for partition in std::mem::take(&mut topic_plan.partitions) {
         let encoded = self.encode_partition(&topic_plan, partition)?;
         if !current.is_empty() && current.would_exceed(&encoded, plan.max_segment_bytes) {
-          objects.push(current.finish(self, now, plan.shared_blob, plan.max_segment_bytes)?);
+          objects.push(
+            current
+              .finish(self, plan.shared_blob, plan.max_segment_bytes)
+              .await?,
+          );
           current = ObjectBuilder::new();
         }
         current.push(encoded);
       }
     }
     if !current.is_empty() {
-      objects.push(current.finish(self, now, plan.shared_blob, plan.max_segment_bytes)?);
+      objects.push(
+        current
+          .finish(self, plan.shared_blob, plan.max_segment_bytes)
+          .await?,
+      );
     }
     Ok(objects)
   }
@@ -557,11 +570,10 @@ impl FlushContext {
   pub(super) async fn flush_plan(
     &self,
     plan: &mut FlushPlan,
-    now: OffsetDateTime,
     metrics: &WriteMetrics,
   ) -> Result<Vec<FlushPartitionResult>, WriteError> {
-    let mut objects = self.build_objects(plan, now)?.into_iter();
     let publication_started_at = Instant::now();
+    let mut objects = self.build_objects(plan).await?.into_iter();
     let mut results = Vec::new();
     while let Some(object) = objects.next() {
       let publication_budget = object
@@ -678,7 +690,7 @@ impl FlushContext {
         .then_with(|| left.virtual_partition_id.cmp(&right.virtual_partition_id))
     });
     metrics.record_metadata_publication_latency(publication_started_at);
-    debug!("flush persisted {} bounded segment objects", results.len());
+    debug!("flush completed {} partition results", results.len());
     Ok(results)
   }
 

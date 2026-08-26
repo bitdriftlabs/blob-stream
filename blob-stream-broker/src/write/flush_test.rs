@@ -156,24 +156,28 @@ fn topic_flush_plan(
 ) -> TopicFlushPlan {
   TopicFlushPlan {
     topic,
-    partitions: vec![FlushPartition {
-      virtual_partition_id,
-      lease_fence: None,
-      batches: vec![BufferedBatch {
-        records: vec![new_record(payload.to_vec(), 10)],
-        summary: BatchSummary {
-          record_count: 1,
-          payload_bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
-        },
-        seq_range: SeqRange { start: 0, end: 0 },
-        acceptance_fence: None,
-        completion: None,
-      }],
-      trigger: FlushTrigger::MaxDelay,
-    }],
+    partitions: vec![flush_partition(virtual_partition_id, payload)],
     max_metadata_publication_lag: time::Duration::seconds(1),
     metadata_window_size: time::Duration::minutes(5),
     fenced_metadata_writes: false,
+  }
+}
+
+fn flush_partition(virtual_partition_id: u32, payload: &[u8]) -> FlushPartition {
+  FlushPartition {
+    virtual_partition_id,
+    lease_fence: None,
+    batches: vec![BufferedBatch {
+      records: vec![new_record(payload.to_vec(), 10)],
+      summary: BatchSummary {
+        record_count: 1,
+        payload_bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+      },
+      seq_range: SeqRange { start: 0, end: 0 },
+      acceptance_fence: None,
+      completion: None,
+    }],
+    trigger: FlushTrigger::MaxDelay,
   }
 }
 
@@ -187,21 +191,71 @@ async fn receive_metadata_write(receiver: &mut mpsc::UnboundedReceiver<String>) 
   panic!("expected metadata write did not begin");
 }
 
-#[test]
-fn default_machine_id_generator_initializes() -> Result<()> {
+#[tokio::test]
+async fn default_machine_id_generator_initializes() -> Result<()> {
   let generator = SnowflakeGenerator::new()?;
+  let time_provider = ManualTimeProvider::new(OffsetDateTime::now_utc());
 
-  assert!(generator.next(OffsetDateTime::now_utc())?.as_u64() > 0);
+  assert!(generator.next(&time_provider).await?.0.as_u64() > 0);
   Ok(())
 }
 
-#[test]
-fn explicit_machine_ids_produce_distinct_ids() -> Result<()> {
+#[tokio::test]
+async fn explicit_machine_ids_produce_distinct_ids() -> Result<()> {
   let first = SnowflakeGenerator::with_machine_id(1)?;
   let second = SnowflakeGenerator::with_machine_id(2)?;
-  let now = OffsetDateTime::now_utc();
+  let time_provider = ManualTimeProvider::new(OffsetDateTime::now_utc());
 
-  assert_ne!(first.next(now)?.as_u64(), second.next(now)?.as_u64());
+  assert_ne!(
+    first.next(&time_provider).await?.0.as_u64(),
+    second.next(&time_provider).await?.0.as_u64()
+  );
+  Ok(())
+}
+
+#[tokio::test]
+async fn object_build_resnaps_time_after_sonyflake_sequence_overflow() -> Result<()> {
+  let now = OffsetDateTime::from_unix_timestamp(1_700_000_099)?
+    .saturating_add(time::Duration::milliseconds(995));
+  let time_provider = Arc::new(ManualTimeProvider::new(now));
+  let context = FlushContext::new(
+    WriteConfig::with_defaults(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    SnowflakeGenerator::with_machine_id(1)?,
+    time_provider.clone(),
+    None,
+  );
+  let mut topic = topic_flush_plan("telemetry".into(), 0, b"payload");
+  topic.partitions = (0 .. 513)
+    .map(|virtual_partition_id| flush_partition(virtual_partition_id, b"payload"))
+    .collect();
+  let plan = FlushPlan {
+    topics: vec![topic],
+    max_segment_bytes: 1,
+    shared_blob: false,
+  };
+
+  let objects = tokio::spawn(async move {
+    let mut plan = plan;
+    context.build_objects(&mut plan).await
+  });
+  time_provider.wait_until_sleeping(1).await;
+  time_provider.advance(time::Duration::milliseconds(10));
+  let objects = objects.await??;
+  let last_topic = &objects.last().expect("513 bounded objects").topics[0];
+  let refreshed_at = now.saturating_add(time::Duration::milliseconds(10));
+
+  assert_eq!(objects.len(), 513);
+  assert_eq!(
+    last_topic.envelope.snowflake_id.timestamp(),
+    SnowflakeId::minimum_for_timestamp(refreshed_at).timestamp()
+  );
+  assert_eq!(last_topic.envelope.created_at, refreshed_at);
+  assert_eq!(
+    last_topic.envelope.window,
+    Window::for_timestamp(refreshed_at, time::Duration::minutes(5)).key("telemetry")
+  );
   Ok(())
 }
 
@@ -361,7 +415,7 @@ async fn lost_fence_does_not_fall_back_to_ordinary_metadata_write() -> Result<()
   };
 
   let results = context
-    .flush_plan(&mut plan, now, &WriteMetrics::new(&scope))
+    .flush_plan(&mut plan, &WriteMetrics::new(&scope))
     .await?;
   assert_eq!(results.len(), 1);
   assert_eq!(
@@ -411,9 +465,7 @@ async fn shared_object_metadata_writes_start_concurrently() -> Result<()> {
   let flush_metrics = metrics.clone();
   let flush = tokio::spawn(async move {
     let mut plan = plan;
-    flush_context
-      .flush_plan(&mut plan, now, &flush_metrics)
-      .await
+    flush_context.flush_plan(&mut plan, &flush_metrics).await
   });
 
   let first_topic = receive_metadata_write(&mut started_rx).await;
@@ -448,7 +500,7 @@ async fn shared_blob_upload_failure_prevents_every_metadata_publication() -> Res
   let collector = Collector::default();
   let metrics = WriteMetrics::new(&collector.scope("flush_test"));
 
-  let results = context.flush_plan(&mut plan, now, &metrics).await?;
+  let results = context.flush_plan(&mut plan, &metrics).await?;
 
   assert_eq!(results.len(), 2);
   assert!(results.iter().all(|result| result.error.is_some()));
@@ -486,7 +538,7 @@ async fn capped_flush_keeps_published_object_results_when_later_object_expires()
   let collector = Collector::default();
   let metrics = WriteMetrics::new(&collector.scope("flush_test"));
 
-  let results = context.flush_plan(&mut plan, now, &metrics).await?;
+  let results = context.flush_plan(&mut plan, &metrics).await?;
 
   assert_eq!(results.len(), 2);
   assert!(
@@ -532,7 +584,7 @@ async fn shared_object_uses_each_topics_metadata_window() -> Result<()> {
   let collector = Collector::default();
   let metrics = WriteMetrics::new(&collector.scope("flush_test"));
 
-  context.flush_plan(&mut plan, now, &metrics).await?;
+  context.flush_plan(&mut plan, &metrics).await?;
 
   let first_window = Window::for_timestamp(now, time::Duration::minutes(5)).key("first");
   let second_window = Window::for_timestamp(now, time::Duration::minutes(10)).key("second");
@@ -578,7 +630,6 @@ async fn oversized_single_partition_object_is_counted() -> Result<()> {
   context
     .flush_plan(
       &mut plan,
-      now,
       &WriteMetrics::new(&collector.scope("flush_test")),
     )
     .await?;

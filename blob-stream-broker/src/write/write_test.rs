@@ -835,6 +835,24 @@ async fn wait_for_partition_draining_start(engine: &WriteEngineImpl) {
   panic!("partition did not begin draining");
 }
 
+async fn wait_for_buffered_partitions(engine: &WriteEngineImpl, topics: &[&str]) {
+  for _ in 0 .. 100 {
+    let buffered = {
+      let state = engine.state.lock();
+      topics.iter().all(|topic| {
+        state
+          .partition_state(topic, 0)
+          .is_some_and(|partition| !partition.buffer.batches.is_empty())
+      })
+    };
+    if buffered {
+      return;
+    }
+    tokio::task::yield_now().await;
+  }
+  panic!("partitions did not buffer accepted batches");
+}
+
 #[tokio::test]
 async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   let now_ms = 1_700_000_000_000;
@@ -2583,7 +2601,7 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
       .await
   });
 
-  tokio::task::yield_now().await;
+  wait_for_buffered_partitions(&engine, &["first", "second"]).await;
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
 
@@ -2659,7 +2677,7 @@ async fn time_flush_shares_one_object_across_topics_when_enabled() -> Result<()>
       })
       .await
   });
-  tokio::task::yield_now().await;
+  wait_for_buffered_partitions(&engine, &["first", "second"]).await;
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
   first.await??;
@@ -2824,7 +2842,7 @@ async fn time_flush_caps_serialized_object_size() -> Result<()> {
       })
       .await
   });
-  tokio::task::yield_now().await;
+  wait_for_buffered_partitions(&engine, &["telemetry"]).await;
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
   first.await??;

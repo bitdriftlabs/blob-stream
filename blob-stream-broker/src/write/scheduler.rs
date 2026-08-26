@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::iter;
 use std::sync::Arc;
 use std::time::Instant;
-use time::OffsetDateTime;
 
 #[cfg(test)]
 #[path = "./scheduler_test.rs"]
@@ -28,7 +27,6 @@ mod tests;
 pub(super) async fn flush_plan_and_notify(
   flush_context: &FlushContext,
   mut plan: FlushPlan,
-  now: OffsetDateTime,
   metrics: &WriteMetrics,
   state: &Arc<Mutex<WriteState>>,
 ) {
@@ -62,7 +60,7 @@ pub(super) async fn flush_plan_and_notify(
   }
 
   let flush_started = Instant::now();
-  let result = flush_context.flush_plan(&mut plan, now, metrics).await;
+  let result = flush_context.flush_plan(&mut plan, metrics).await;
   if result.as_ref().is_err()
     || result
       .as_ref()
