@@ -43,6 +43,8 @@ pub(super) struct WriteMetrics {
   pub(super) metadata_publication_deadline_exhausted_before_persistence_total:
     prometheus::IntCounter,
   pub(super) metadata_publication_deadline_exhausted_while_persisting_total: prometheus::IntCounter,
+  pub(super) flush_uploaded_objects_total: prometheus::IntCounter,
+  pub(super) flush_oversized_single_partition_objects_total: prometheus::IntCounter,
   pub(super) flush_uploaded_object_bytes_total: prometheus::IntCounter,
   pub(super) flush_uploaded_object_bytes: prometheus::Histogram,
   pub(super) lease_drain_starts_total: prometheus::IntCounter,
@@ -73,6 +75,9 @@ impl WriteMetrics {
         .counter("metadata_publication_deadline_exhausted_before_persistence_total"),
       metadata_publication_deadline_exhausted_while_persisting_total: scope
         .counter("metadata_publication_deadline_exhausted_while_persisting_total"),
+      flush_uploaded_objects_total: scope.counter("flush_uploaded_objects_total"),
+      flush_oversized_single_partition_objects_total: scope
+        .counter("flush_oversized_single_partition_objects_total"),
       flush_uploaded_object_bytes_total: scope.counter("flush_uploaded_object_bytes_total"),
       flush_uploaded_object_bytes: scope.histogram_with_buckets(
         "flush_uploaded_object_bytes",
@@ -86,23 +91,25 @@ impl WriteMetrics {
   pub(super) fn record_flush_plan_summary(&self, plans: &[FlushPlan]) {
     self.flush_plans_total.inc_by(plans.len() as u64);
     for plan in plans {
-      self
-        .flush_partitions_total
-        .inc_by(plan.partitions.len() as u64);
-      for partition in &plan.partitions {
+      for topic_plan in &plan.topics {
         self
-          .flush_batches_total
-          .inc_by(partition.batches.len() as u64);
-        match partition.trigger {
-          FlushTrigger::MaxBytes => self
-            .flush_batches_max_bytes_total
-            .inc_by(partition.batches.len() as u64),
-          FlushTrigger::MaxDelay => self
-            .flush_batches_max_delay_total
-            .inc_by(partition.batches.len() as u64),
-          FlushTrigger::LeaseDrain => self
-            .flush_batches_lease_drain_total
-            .inc_by(partition.batches.len() as u64),
+          .flush_partitions_total
+          .inc_by(topic_plan.partitions.len() as u64);
+        for partition in &topic_plan.partitions {
+          self
+            .flush_batches_total
+            .inc_by(partition.batches.len() as u64);
+          match partition.trigger {
+            FlushTrigger::MaxBytes => self
+              .flush_batches_max_bytes_total
+              .inc_by(partition.batches.len() as u64),
+            FlushTrigger::MaxDelay => self
+              .flush_batches_max_delay_total
+              .inc_by(partition.batches.len() as u64),
+            FlushTrigger::LeaseDrain => self
+              .flush_batches_lease_drain_total
+              .inc_by(partition.batches.len() as u64),
+          }
         }
       }
     }
@@ -177,7 +184,11 @@ impl ProduceOutcomeMetrics {
 
 impl WriteMetrics {
   #[allow(clippy::cast_precision_loss)] // Prometheus histograms require f64 observations.
-  pub(super) fn record_uploaded_object(&self, payload_bytes: usize) {
+  pub(super) fn record_uploaded_object(&self, payload_bytes: usize, oversized_singleton: bool) {
+    self.flush_uploaded_objects_total.inc();
+    if oversized_singleton {
+      self.flush_oversized_single_partition_objects_total.inc();
+    }
     self
       .flush_uploaded_object_bytes_total
       .inc_by(payload_bytes as u64);

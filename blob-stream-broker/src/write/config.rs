@@ -3,6 +3,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
 use aws_types::region::Region;
+use bd_log_util::warn_every;
 use bd_pgv::proto_validate;
 use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
 use bd_server_stats::stats::Scope;
@@ -43,9 +44,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use time::Duration;
+use time::ext::NumericalDuration;
 use tokio::sync::watch;
 
 const DEFAULT_FLUSH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_FLUSH_MAX_DELAY: Duration = Duration::seconds(1);
 const DEFAULT_LEASE_DURATION: Duration = Duration::seconds(30);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::seconds(10);
@@ -54,6 +57,9 @@ const DEFAULT_SEGMENT_TTL_BUFFER: Duration = Duration::hours(1);
 const DEFAULT_LEASE_TTL_BUFFER: Duration = Duration::hours(1);
 const PRODUCE_REQUEST_TIMEOUT_FLUSH_DELAY_MULTIPLIER: i32 = 10;
 pub const FENCED_METADATA_WRITES_FEATURE_FLAG: &str = "blob_stream_broker_fenced_metadata_writes";
+pub const MAX_SEGMENT_BYTES_FEATURE_FLAG: &str = "blob_stream_broker_max_segment_bytes";
+pub const SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG: &str =
+  "blob_stream_broker_shared_cross_topic_blobs";
 
 #[cfg(test)]
 #[path = "./config_test.rs"]
@@ -72,6 +78,7 @@ enum DynamoTablePurpose {
 #[derive(Clone, Debug)]
 pub struct WriteConfig {
   pub flush_max_bytes: u64,
+  pub max_segment_bytes: u64,
   pub flush_max_delay: Duration,
   pub lease_duration: Duration,
   pub heartbeat_interval: Duration,
@@ -87,6 +94,7 @@ impl WriteConfig {
   pub fn with_defaults() -> Self {
     Self {
       flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
+      max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
       flush_max_delay: DEFAULT_FLUSH_MAX_DELAY,
       lease_duration: DEFAULT_LEASE_DURATION,
       heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
@@ -107,6 +115,9 @@ impl WriteConfig {
 
     if broker.flush_max_bytes > 0 {
       config.flush_max_bytes = u64::from(broker.flush_max_bytes);
+    }
+    if let Some(max_segment_bytes) = broker.max_segment_bytes {
+      config.max_segment_bytes = max_segment_bytes;
     }
 
     if let Some(flush_max_delay) = broker.flush_max_delay.as_ref() {
@@ -163,6 +174,30 @@ impl WriteConfig {
         FENCED_METADATA_WRITES_FEATURE_FLAG,
         self.fenced_metadata_writes,
       )
+    })
+  }
+
+  #[must_use]
+  pub(crate) fn max_segment_bytes(&self, feature_flags: Option<&FeatureFlagsWatch>) -> u64 {
+    let value = feature_flags.map_or(self.max_segment_bytes, |feature_flags| {
+      feature_flags.get_integer(MAX_SEGMENT_BYTES_FEATURE_FLAG, self.max_segment_bytes)
+    });
+    if value > 0 {
+      return value;
+    }
+
+    warn_every!(
+      15.seconds(),
+      "broker max segment bytes override must be greater than zero; using configured value {}",
+      self.max_segment_bytes
+    );
+    self.max_segment_bytes
+  }
+
+  #[must_use]
+  pub(crate) fn shared_cross_topic_blobs(feature_flags: Option<&FeatureFlagsWatch>) -> bool {
+    feature_flags.is_some_and(|feature_flags| {
+      feature_flags.get_bool(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, false)
     })
   }
 }

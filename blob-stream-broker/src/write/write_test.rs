@@ -16,9 +16,11 @@ use super::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::{Collector, Scope};
 use bd_server_stats::test::util::stats::Helper;
 use bd_shutdown::ComponentShutdownTrigger;
+use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use bd_time::TimeProvider;
 use blob_stream_blob_store::{
   BlobCacheAdmission,
@@ -867,6 +869,9 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   );
   assert_eq!(snapshot.holder_id, "test-node");
   assert_eq!(snapshot.writer_id, 0);
+  assert_eq!(snapshot.max_segment_bytes, 64 * 1024 * 1024);
+  assert_eq!(snapshot.effective_max_segment_bytes, 64 * 1024 * 1024);
+  assert!(!snapshot.shared_cross_topic_blobs_enabled);
   assert_eq!(snapshot.membership.len(), 1);
   assert_eq!(snapshot.membership[0].node_id.as_str(), "test-node");
   assert_eq!(snapshot.membership[0].address.as_str(), "test-node");
@@ -910,6 +915,9 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   assert_eq!(state_dump["generated_at"], "2023-11-14T22:13:20Z");
   assert!(state_dump.get("generated_at_ts_ms").is_none());
   assert_eq!(state_dump["flush_max_delay"], "1m");
+  assert_eq!(state_dump["max_segment_bytes"], 64 * 1024 * 1024);
+  assert_eq!(state_dump["effective_max_segment_bytes"], 64 * 1024 * 1024);
+  assert_eq!(state_dump["shared_cross_topic_blobs_enabled"], false);
   assert_eq!(state_dump["topics"][0]["name"], "telemetry");
   assert_eq!(state_dump["ownership"][0]["topic"], "telemetry");
   assert_eq!(
@@ -923,6 +931,50 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
 
   pending_write.abort();
   let _ignored = pending_write.await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn state_snapshot_reports_effective_segment_runtime_policy() -> Result<()> {
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.max_segment_bytes = 128 * 1024 * 1024;
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag("blob_stream_broker_max_segment_bytes", 32 * 1024 * 1024)
+      .with_bool_flag("blob_stream_broker_shared_cross_topic_blobs", true),
+  ));
+  let engine = WriteEngineBuilder::new(
+    config,
+    HashMap::from([(
+      "telemetry".into(),
+      TopicInfo {
+        name: "telemetry".into(),
+        partition_count: 1,
+        num_writers: 1,
+        retention: TimeDuration::days(7),
+        max_metadata_publication_lag: TimeDuration::seconds(30),
+        metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
+      },
+    )]),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+    "test-node".to_string(),
+    shutdown_trigger.make_handle(),
+    &metrics_scope(),
+  )
+  .time_provider(time_provider)
+  .feature_flags(Some(feature_flags.snapshot_watch()))
+  .build()?;
+
+  let snapshot = engine.state_snapshot().await;
+  assert_eq!(snapshot.max_segment_bytes, 128 * 1024 * 1024);
+  assert_eq!(snapshot.effective_max_segment_bytes, 32 * 1024 * 1024);
+  assert!(snapshot.shared_cross_topic_blobs_enabled);
   Ok(())
 }
 
@@ -2537,6 +2589,262 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
 
   first.await??;
   assert!(second.await?.is_err());
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn time_flush_shares_one_object_across_topics_when_enabled() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1_024;
+  config.flush_max_delay = TimeDuration::milliseconds(10);
+  let topics = ["first", "second"]
+    .into_iter()
+    .map(|topic| {
+      (
+        topic.into(),
+        TopicInfo {
+          name: topic.into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::seconds(30),
+          metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
+        },
+      )
+    })
+    .collect();
+  let metadata_store = Arc::new(InMemoryMetadataStore::new());
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_broker_shared_cross_topic_blobs", true),
+  ));
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config.clone(),
+      topics,
+      Arc::new(InMemoryBlobStore::new()),
+      metadata_store.clone(),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider.clone())
+    .feature_flags(Some(feature_flags.snapshot_watch()))
+    .build()?,
+  );
+
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "first".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  let second_engine = Arc::clone(&engine);
+  let second = tokio::spawn(async move {
+    second_engine
+      .produce_batch(WriteRequest {
+        topic: "second".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![2], 20)],
+      })
+      .await
+  });
+  tokio::task::yield_now().await;
+  time_provider.advance(config.flush_max_delay);
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
+  first.await??;
+  second.await??;
+
+  let window = Window::for_timestamp(time_provider.now(), DEFAULT_TEST_METADATA_WINDOW_SIZE);
+  let first_segments = metadata_store
+    .scan_window_from_snowflake(
+      &window.key("first"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
+    .await?;
+  let second_segments = metadata_store
+    .scan_window_from_snowflake(
+      &window.key("second"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
+    .await?;
+  assert_eq!(first_segments.len(), 1);
+  assert_eq!(second_segments.len(), 1);
+  assert_eq!(first_segments[0].blob_key, second_segments[0].blob_key);
+  assert!(first_segments[0].blob_key.as_str().starts_with("shared/"));
+  assert!(first_segments[0].segment_index.contains_key(&0));
+  assert!(second_segments[0].segment_index.contains_key(&0));
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn time_flush_retains_all_topics_when_shared_object_reaches_segment_cap() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1_024;
+  config.flush_max_delay = TimeDuration::milliseconds(10);
+  config.max_segment_bytes = 1;
+  let topics = ["first", "second"]
+    .into_iter()
+    .map(|topic| {
+      (
+        topic.into(),
+        TopicInfo {
+          name: topic.into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::seconds(30),
+          metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
+        },
+      )
+    })
+    .collect();
+  let metadata_store = Arc::new(InMemoryMetadataStore::new());
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_broker_shared_cross_topic_blobs", true),
+  ));
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config.clone(),
+      topics,
+      Arc::new(InMemoryBlobStore::new()),
+      metadata_store.clone(),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider.clone())
+    .feature_flags(Some(feature_flags.snapshot_watch()))
+    .build()?,
+  );
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "first".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  let second_engine = Arc::clone(&engine);
+  let second = tokio::spawn(async move {
+    second_engine
+      .produce_batch(WriteRequest {
+        topic: "second".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![2], 20)],
+      })
+      .await
+  });
+  tokio::task::yield_now().await;
+  time_provider.advance(config.flush_max_delay);
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
+  first.await??;
+  second.await??;
+
+  let window = Window::for_timestamp(time_provider.now(), DEFAULT_TEST_METADATA_WINDOW_SIZE);
+  let first_segments = metadata_store
+    .scan_window_from_snowflake(
+      &window.key("first"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
+    .await?;
+  let second_segments = metadata_store
+    .scan_window_from_snowflake(
+      &window.key("second"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
+    .await?;
+  assert_eq!(first_segments.len(), 1);
+  assert_eq!(second_segments.len(), 1);
+  assert_ne!(first_segments[0].blob_key, second_segments[0].blob_key);
+  assert!(first_segments[0].blob_key.as_str().starts_with("shared/"));
+  assert!(second_segments[0].blob_key.as_str().starts_with("shared/"));
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn time_flush_caps_serialized_object_size() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1_024;
+  config.max_segment_bytes = 1;
+  config.flush_max_delay = TimeDuration::milliseconds(10);
+  let metadata_window_size = TimeDuration::seconds(60);
+  let (engine, metadata_store) = make_two_partition_engine_with_metadata_window_size(
+    time_provider.clone(),
+    config.clone(),
+    metadata_window_size,
+    shutdown_trigger.make_handle(),
+  )?;
+
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  let second_engine = Arc::clone(&engine);
+  let second = tokio::spawn(async move {
+    second_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id: 1,
+        records: vec![new_record(vec![2], 20)],
+      })
+      .await
+  });
+  tokio::task::yield_now().await;
+  time_provider.advance(config.flush_max_delay);
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
+  first.await??;
+  second.await??;
+
+  let window = Window::for_timestamp(time_provider.now(), metadata_window_size);
+  let segments = metadata_store
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
+    .await?;
+  assert_eq!(segments.len(), 2);
+  assert!(
+    segments
+      .iter()
+      .all(|segment| segment.segment_index.len() == 1)
+  );
+  assert_ne!(segments[0].blob_key, segments[1].blob_key);
   Ok(())
 }
 

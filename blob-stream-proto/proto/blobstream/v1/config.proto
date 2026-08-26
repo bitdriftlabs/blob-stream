@@ -58,6 +58,10 @@ message BrokerConfig {
   // This must be shorter than lease_duration.
   google.protobuf.Duration heartbeat_interval = 12 [(validate.rules).duration.gt = {}];
 
+  // Maximum serialized and compressed bytes in one persisted segment object. Default when unset:
+  // 67,108,864 bytes (64 MiB). This bounds each object after time-triggered flush aggregation.
+  optional uint64 max_segment_bytes = 13 [(validate.rules).uint64.gt = 0];
+
   // Maximum retained broker metadata-cache bytes. Default when unset: 64 MiB.
   optional uint64 metadata_cache_max_bytes = 14 [(validate.rules).uint64.gt = 0];
 

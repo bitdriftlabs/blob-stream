@@ -20,8 +20,10 @@ use super::transport::{
 };
 use crate::test_framework::{PARTITION_COUNT, SECOND_TOPIC, TOPIC, WINDOW_SIZE_SECONDS};
 use anyhow::{Result, anyhow};
+use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
 use bd_shutdown::{ComponentShutdownTrigger, ComponentShutdownTriggerHandle};
+use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore};
 use blob_stream_broker::grpc::make_broker_router;
@@ -185,6 +187,7 @@ pub struct ClusterHarness {
   topic_num_writers: u32,
   broker_flush_max_delay: Duration,
   fenced_metadata_writes: bool,
+  shared_cross_topic_blobs: bool,
   transport: Arc<dyn BrokerTransport>,
   lifecycle_hooks: TestLifecycleHooks,
   broker_time_provider: Arc<dyn TimeProvider>,
@@ -292,6 +295,7 @@ impl InMemoryClusterHarnessBuilder {
       self.topic_num_writers,
       self.broker_flush_max_delay,
       false,
+      false,
       self.start_with_all_nodes,
       Arc::new(InMemoryTestTransport::new()),
       self.broker_time_provider,
@@ -315,6 +319,7 @@ pub struct ClusterHarnessBuilder<'a> {
   topic_num_writers: u32,
   broker_flush_max_delay: Duration,
   fenced_metadata_writes: bool,
+  shared_cross_topic_blobs: bool,
   start_with_all_nodes: bool,
   transport: Arc<dyn BrokerTransport>,
   broker_time_provider: Arc<dyn TimeProvider>,
@@ -351,6 +356,12 @@ impl ClusterHarnessBuilder<'_> {
   #[must_use]
   pub fn fenced_metadata_writes(mut self) -> Self {
     self.fenced_metadata_writes = true;
+    self
+  }
+
+  #[must_use]
+  pub fn shared_cross_topic_blobs(mut self) -> Self {
+    self.shared_cross_topic_blobs = true;
     self
   }
 
@@ -430,6 +441,7 @@ impl ClusterHarnessBuilder<'_> {
       self.topic_num_writers,
       self.broker_flush_max_delay,
       self.fenced_metadata_writes,
+      self.shared_cross_topic_blobs,
       self.start_with_all_nodes,
       self.transport,
       self.broker_time_provider,
@@ -454,6 +466,7 @@ impl ClusterHarness {
       topic_num_writers: 1,
       broker_flush_max_delay: Duration::from_millis(10),
       fenced_metadata_writes: false,
+      shared_cross_topic_blobs: false,
       start_with_all_nodes: false,
       transport: Arc::new(GrpcTcpTransport),
       broker_time_provider: Arc::new(SystemTimeProvider),
@@ -488,6 +501,7 @@ impl ClusterHarness {
     topic_num_writers: u32,
     broker_flush_max_delay: Duration,
     fenced_metadata_writes: bool,
+    shared_cross_topic_blobs: bool,
     start_with_all_nodes: bool,
     transport: Arc<dyn BrokerTransport>,
     broker_time_provider: Arc<dyn TimeProvider>,
@@ -563,6 +577,7 @@ impl ClusterHarness {
       topic_num_writers,
       broker_flush_max_delay,
       fenced_metadata_writes,
+      shared_cross_topic_blobs,
       transport,
       lifecycle_hooks,
       broker_time_provider,
@@ -864,6 +879,7 @@ impl ClusterHarness {
       topic_num_writers,
       self.broker_flush_max_delay,
       self.fenced_metadata_writes,
+      self.shared_cross_topic_blobs,
       broker_shutdown_trigger.make_handle(),
       Arc::new(self.lifecycle_hooks.clone()),
       Arc::clone(&self.broker_time_provider),
@@ -988,6 +1004,7 @@ fn build_write_engine(
   topic_num_writers: u32,
   broker_flush_max_delay: Duration,
   fenced_metadata_writes: bool,
+  shared_cross_topic_blobs: bool,
   shutdown_trigger_handle: ComponentShutdownTriggerHandle,
   lifecycle_hooks: Arc<dyn blob_stream_broker::write::BrokerLifecycleHooks>,
   time_provider: Arc<dyn TimeProvider>,
@@ -1014,6 +1031,13 @@ fn build_write_engine(
   config.flush_max_bytes = 1024;
   config.reservation_size = 64;
   config.fenced_metadata_writes = fenced_metadata_writes;
+  let feature_flags = shared_cross_topic_blobs.then(|| {
+    FakeLoader::new(Arc::new(
+      DefaultFeatureFlags::default()
+        .with_bool_flag("blob_stream_broker_shared_cross_topic_blobs", true),
+    ))
+    .snapshot_watch()
+  });
   let metrics_scope = Collector::default().scope("blob_stream_broker_it");
   let engine = WriteEngineBuilder::new(
     config,
@@ -1029,6 +1053,7 @@ fn build_write_engine(
   .membership_rx(membership_rx)
   .time_provider(time_provider)
   .lifecycle_hooks(lifecycle_hooks)
+  .feature_flags(feature_flags)
   .build()?;
 
   Ok(Arc::new(engine))

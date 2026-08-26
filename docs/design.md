@@ -224,17 +224,24 @@ invariant.
    the broker includes every available buffered virtual partition for that topic in the same plan.
    This can flush younger peer buffers slightly before their individual delay to produce larger
    blobs and fewer metadata rows. Byte-threshold and lease-drain flushes remain partition-local.
+   `max_segment_bytes` separately caps each serialized compressed object; it defaults to 64 MiB
+   and can be changed live with `blob_stream_broker_max_segment_bytes`. A compressed partition
+   batch that cannot be split is emitted alone when it exceeds that cap.
    A partition with a durable plan in progress continues buffering its next epoch until that prior
    plan completes. A single bounded flush scheduler wakes for eligible writes, timer ticks, and
   durable-plan completions; a completion immediately promotes an eligible successor epoch. It
   runs at most four durable flush plans concurrently; `write:active_flush_plans` reports its
   current occupancy.
 6. A flush coalesces each virtual partition's accepted batches into one `StoredRecordBatch`,
-  compresses each serialized partition batch independently, concatenates the stored bytes into a
-  segment blob, uploads the blob, and then writes the segment metadata row. With fenced metadata
-  writes enabled, that final write is a transaction conditioned on the snapshot lease fence for
-  every partition in the plan. Plans may run concurrently for different virtual partitions, but
-  each virtual partition persists plans in sequence order.
+  compresses each serialized partition batch independently, and concatenates the stored bytes into
+  bounded segment objects. `blob_stream_broker_shared_cross_topic_blobs` defaults off; when
+  enabled, one time-triggered object can contain contiguous sections for several topics. The broker
+  uploads each object once, then writes one ordinary topic-local metadata row for every section.
+  A successful row acknowledges only its own topic's partitions; a failed row remains retryable
+  and can produce an at-least-once duplicate. With fenced metadata writes enabled, each row is a
+  transaction conditioned on the snapshot lease fences for that row's topic. Plans may run
+  concurrently for different virtual partitions, but each virtual partition persists plans in
+  sequence order.
 7. Only after both blob upload and metadata write succeed does the broker complete the waiting
    write and return `OK`. A producer acknowledgement therefore represents durable segment
    metadata, not merely in-memory buffering.
@@ -264,11 +271,21 @@ an ambiguous failure can produce a duplicate batch, which is part of the at-leas
 ### Segment Blobs
 
 Segments are stored through the blob-store abstraction, backed by S3 in production and an
-in-memory implementation in tests. A key has this form:
+in-memory implementation in tests. Legacy topic-scoped keys have this form:
 
 ```
 <optional-prefix>/<topic>/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>
 ```
+
+When `blob_stream_broker_shared_cross_topic_blobs` is enabled, time-triggered objects can use:
+
+```
+<optional-prefix>/shared/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>
+```
+
+Shared objects can contain sections for topics with different retention periods. Configure the S3
+lifecycle rule for the `shared/` prefix to retain objects for at least the maximum retention of all
+topics eligible to share in the deployment, plus the metadata TTL buffer.
 
 The extension records whether stored batches use zstd or no compression. A segment is not
 compressed as one monolithic payload. It is a concatenation of individually serialized and
@@ -294,10 +311,12 @@ The consumer requires every metadata row to use this durable layout. During the 
 cutover, missing, malformed, or legacy rows are skipped with a rate-limited warning rather than
 being decoded through a compatibility path.
 
-Metadata is written only after the blob upload succeeds. Segment metadata TTL is derived from the
-topic retention setting plus the configured DynamoDB TTL buffer. S3 lifecycle expiration is not
-managed by the service; operators must configure it so blobs remain available at least as long as
-the metadata that references them.
+Metadata is written only after the blob upload succeeds. Rows can reference either key form during a
+flag rollout; the broker-mediated range reader routes by the complete immutable key rather than
+inferring its topic from the key shape. Segment metadata TTL is derived from the topic retention
+setting plus the configured DynamoDB TTL buffer. S3 lifecycle expiration is not managed by the
+service; operators must configure it so blobs remain available at least as long as the metadata that
+references them.
 
 ### Lease and Membership Domains
 

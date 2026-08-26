@@ -1,4 +1,14 @@
-use super::{DynamoTablePurpose, TopicInfo, WriteConfig, dynamo_table_name, validate_writer_id};
+use super::{
+  DynamoTablePurpose,
+  MAX_SEGMENT_BYTES_FEATURE_FLAG,
+  SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG,
+  TopicInfo,
+  WriteConfig,
+  dynamo_table_name,
+  validate_writer_id,
+};
+use bd_runtime_config::loader::Loader;
+use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_proto::protos::blobstream::v1::config::{
   BrokerConfig,
   DynamoMetadataStoreConfig,
@@ -7,6 +17,7 @@ use blob_stream_proto::protos::blobstream::v1::config::{
 };
 use blob_stream_types::{CompressionCodec, DEFAULT_MAX_METADATA_PUBLICATION_LAG, ToProtoDuration};
 use std::collections::HashMap;
+use std::sync::Arc;
 use time::Duration;
 
 fn dynamo_config() -> DynamoMetadataStoreConfig {
@@ -56,7 +67,65 @@ fn defaults_segment_compression_to_zstd() {
   assert_eq!(config.lease_duration, Duration::seconds(30));
   assert_eq!(config.heartbeat_interval, Duration::seconds(10));
   assert_eq!(config.reservation_size, 10_000);
+  assert_eq!(config.max_segment_bytes, 64 * 1024 * 1024);
   assert!(!config.fenced_metadata_writes);
+}
+
+#[test]
+fn respects_explicit_max_segment_bytes() {
+  let mut broker_config = BrokerConfig::new();
+  broker_config.writer_id = Some(0);
+  broker_config.max_segment_bytes = Some(8 * 1024 * 1024);
+
+  let config = WriteConfig::from_broker_config(&broker_config).unwrap();
+
+  assert_eq!(config.max_segment_bytes, 8 * 1024 * 1024);
+}
+
+#[test]
+fn max_segment_bytes_runtime_override_defaults_to_configured_value() {
+  let mut config = WriteConfig::with_defaults();
+  config.max_segment_bytes = 8 * 1024 * 1024;
+  let defaults = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
+  let override_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag(MAX_SEGMENT_BYTES_FEATURE_FLAG, 4 * 1024 * 1024),
+  ));
+
+  assert_eq!(
+    config.max_segment_bytes(Some(&defaults.snapshot_watch())),
+    config.max_segment_bytes
+  );
+  assert_eq!(
+    config.max_segment_bytes(Some(&override_flags.snapshot_watch())),
+    4 * 1024 * 1024
+  );
+}
+
+#[test]
+fn max_segment_bytes_runtime_zero_uses_configured_value() {
+  let mut config = WriteConfig::with_defaults();
+  config.max_segment_bytes = 8 * 1024 * 1024;
+  let override_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(MAX_SEGMENT_BYTES_FEATURE_FLAG, 0),
+  ));
+
+  assert_eq!(
+    config.max_segment_bytes(Some(&override_flags.snapshot_watch())),
+    config.max_segment_bytes
+  );
+}
+
+#[test]
+fn shared_cross_topic_blobs_defaults_off_and_uses_runtime_override() {
+  let enabled = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default().with_bool_flag(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, true),
+  ));
+
+  assert!(!WriteConfig::shared_cross_topic_blobs(None));
+  assert!(WriteConfig::shared_cross_topic_blobs(Some(
+    &enabled.snapshot_watch(),
+  )));
 }
 
 #[test]
