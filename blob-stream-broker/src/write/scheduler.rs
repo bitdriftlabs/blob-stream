@@ -213,18 +213,13 @@ fn take_flush_partitions(
     .collect()
 }
 
-pub(super) fn collect_flush_plans(
+pub(super) fn collect_next_flush_plan(
   state: &Arc<Mutex<WriteState>>,
   now: time::OffsetDateTime,
   config: &WriteConfig,
   feature_flags: Option<&FeatureFlagsWatch>,
   topics: &HashMap<Chars, TopicInfo>,
-  max_plans: usize,
-) -> Vec<FlushPlan> {
-  if max_plans == 0 {
-    return Vec::new();
-  }
-
+) -> Option<FlushPlan> {
   // Planning atomically removes batches from the buffers and marks them in flight. Hold the write
   // state lock for the entire selection so a batch belongs to exactly one plan, even if another
   // scheduler pass starts while this pass is constructing its output.
@@ -249,7 +244,7 @@ pub(super) fn collect_flush_plans(
     }
   }
   if !has_flushable_partition {
-    return Vec::new();
+    return None;
   }
 
   let mut partition_keys = state.partition_keys();
@@ -274,19 +269,10 @@ pub(super) fn collect_flush_plans(
   });
   let partition_state_count = partition_keys.len();
 
-  // These parallel maps describe logical topic plans before they are assembled into physical
-  // objects. A topic can have multiple entries when fenced metadata writes force its partitions
-  // into DynamoDB-transaction-sized chunks.
-  let mut plans_by_topic: HashMap<Chars, Vec<Vec<FlushPartition>>> = HashMap::new();
-  let mut plan_triggers_by_topic: HashMap<Chars, Vec<FlushTrigger>> = HashMap::new();
-
-  // A shared object can contain the nth chunk from each topic. Track each topic's chunk count so
-  // all first chunks share one plan, all second chunks share another, and so on.
-  // `durable_plan_count` counts those physical shared objects rather than every logical per-topic
-  // chunk.
-  let mut shared_time_chunks_by_topic = HashMap::new();
-  let mut durable_plan_count: usize = 0;
-  let mut shared_time_plan_count: usize = 0;
+  // The scheduler acquires one permit before calling this function, so this pass builds exactly
+  // one durable plan. A shared time plan may include a single compatible section per topic.
+  let mut topic_plans = HashMap::<Chars, TopicFlushPlan>::new();
+  let mut selected_shared_blob = None;
   let mut last_planned_topic = None;
 
   for (topic, virtual_partition_id) in partition_keys
@@ -318,34 +304,36 @@ pub(super) fn collect_flush_plans(
     let Some(trigger) = trigger else {
       continue;
     };
-    let existing_partition_count = plans_by_topic
-      .get(topic)
-      .and_then(|plans| plans.last())
-      .map_or(0, Vec::len);
-    let existing_trigger = plan_triggers_by_topic
-      .get(topic)
-      .and_then(|triggers| triggers.last());
+    let existing_topic_plan = topic_plans.get(topic);
+    let existing_partition_count = existing_topic_plan.map_or(0, |plan| plan.partitions.len());
+    let existing_trigger = existing_topic_plan
+      .and_then(|plan| plan.partitions.first())
+      .map(|partition| &partition.trigger);
 
-    // Different triggers cannot share a topic plan. Fenced metadata writes add a second boundary:
-    // each durable metadata transaction can check at most MAX_FENCED_METADATA_PARTITIONS leases.
-    let requires_new_plan = existing_trigger.is_none_or(|existing| *existing != trigger)
-      || (fenced_metadata_writes && existing_partition_count == MAX_FENCED_METADATA_PARTITIONS);
-    let shared_time_plan =
-      shared_cross_topic_blobs && matches!(trigger, FlushTrigger::MaxDelay) && requires_new_plan;
-    let additional_durable_plans = if shared_time_plan {
-      let topic_chunks = shared_time_chunks_by_topic.get(topic).copied().unwrap_or(0);
-      // Joining an existing nth shared chunk is free. Starting a new nth chunk requires another
-      // physical object, so it consumes one of the scheduler's available durable-plan slots.
-      usize::from(topic_chunks == shared_time_plan_count)
-    } else {
-      usize::from(requires_new_plan)
-    };
-    if durable_plan_count.saturating_add(additional_durable_plans) > max_plans {
+    // Different triggers cannot share a topic section. Fenced metadata writes add a second
+    // boundary: each durable metadata transaction can check at most 99 leases.
+    let requires_new_topic_plan = existing_trigger.is_none_or(|existing_trigger| {
+      *existing_trigger != trigger
+        || (fenced_metadata_writes && existing_partition_count == MAX_FENCED_METADATA_PARTITIONS)
+    });
+    let shared_time_plan = shared_cross_topic_blobs
+      && matches!(trigger, FlushTrigger::MaxDelay)
+      && requires_new_topic_plan;
+    let joins_selected_plan = selected_shared_blob.is_none_or(|selected_shared_blob| {
+      if selected_shared_blob {
+        // A shared plan may add another topic, or more partitions for a topic already in its
+        // current chunk. A second chunk for that topic requires a later scheduler pass.
+        shared_time_plan && (!requires_new_topic_plan || existing_topic_plan.is_none())
+      } else {
+        !requires_new_topic_plan
+      }
+    });
+    if !joins_selected_plan {
       continue;
     }
 
     let max_partitions = if fenced_metadata_writes {
-      if requires_new_plan {
+      if requires_new_topic_plan {
         MAX_FENCED_METADATA_PARTITIONS
       } else {
         MAX_FENCED_METADATA_PARTITIONS.saturating_sub(existing_partition_count)
@@ -384,114 +372,46 @@ pub(super) fn collect_flush_plans(
     if partitions.is_empty() {
       continue;
     }
-    let plans = plans_by_topic.entry(topic.clone()).or_default();
-    if requires_new_plan {
-      plans.push(Vec::new());
-      plan_triggers_by_topic
-        .entry(topic.clone())
-        .or_default()
-        .push(trigger);
-      if shared_time_plan {
-        *shared_time_chunks_by_topic
-          .entry(topic.clone())
-          .or_default() += 1;
-        shared_time_plan_count = shared_time_plan_count.max(
-          shared_time_chunks_by_topic
-            .get(topic)
-            .copied()
-            .expect("shared time chunk count was inserted"),
-        );
-      }
-      durable_plan_count = durable_plan_count.saturating_add(additional_durable_plans);
+    if requires_new_topic_plan {
+      let topic_info = topics
+        .get(topic.as_str())
+        .expect("flush plans are created only for configured topics");
+      topic_plans.insert(
+        topic.clone(),
+        TopicFlushPlan {
+          max_metadata_publication_lag: topic_info.max_metadata_publication_lag,
+          metadata_window_size: topic_info.metadata_window_size,
+          topic: topic.clone(),
+          partitions,
+          fenced_metadata_writes,
+        },
+      );
+      selected_shared_blob.get_or_insert(shared_time_plan);
 
-      // Only advance fairness after a plan actually claims capacity. Skipped partitions leave the
-      // cursor unchanged, so exhaustion of max_plans does not make them look as though they ran.
+      // Only advance fairness after this pass has claimed work. Skipped partitions leave the
+      // cursor unchanged, so a later selection can resume from the same eligible work.
       last_planned_topic = Some(topic.clone());
+    } else {
+      topic_plans
+        .get_mut(topic)
+        .expect("existing topic section remains available")
+        .partitions
+        .extend(partitions);
     }
-    plans
-      .last_mut()
-      .expect("new or existing flush plan is available")
-      .extend(partitions);
   }
 
   if let Some(last_planned_topic) = last_planned_topic {
     state.last_flush_topic = Some(last_planned_topic);
   }
 
-  // Convert the mutable planning representation into immutable topic sections. Sort explicitly:
-  // HashMap iteration is nondeterministic, whereas deterministic topic order stabilizes object
-  // construction, tests, and the mapping from fenced chunks to shared objects.
-  let mut topic_plans = plans_by_topic
-    .into_iter()
-    .flat_map(|(topic, plans)| {
-      let topic_info = topics
-        .get(topic.as_str())
-        .expect("flush plans are created only for configured topics");
-      let max_metadata_publication_lag = topic_info.max_metadata_publication_lag;
-      let metadata_window_size = topic_info.metadata_window_size;
-      plans.into_iter().map(move |partitions| TopicFlushPlan {
-        max_metadata_publication_lag,
-        metadata_window_size,
-        topic: topic.clone(),
-        partitions,
-        fenced_metadata_writes,
-      })
-    })
-    .collect::<Vec<_>>();
-  topic_plans.sort_by(|left, right| left.topic.as_str().cmp(right.topic.as_str()));
-  let max_segment_bytes = config.max_segment_bytes(feature_flags);
-  if !shared_cross_topic_blobs {
-    // The default mode preserves one storage object per topic section.
-    return topic_plans
-      .into_iter()
-      .map(|topic| FlushPlan {
-        topics: vec![topic],
-        max_segment_bytes,
-        shared_blob: false,
-      })
-      .collect();
-  }
-
-  // A time-due local partition has reached its latency bound, so its shared pass may amortize
-  // object uploads across buffered peer topics. Independently size-triggered and drain work stays
-  // local: pulling peer buffers forward would create smaller segments, couple their metadata
-  // deadlines, and hold a flush slot while bounded objects persist sequentially.
-  // TODO: Evaluate a bounded eligible-work policy that can share across trigger types. Benchmark
-  // S3 PUTs, DynamoDB metadata writes, producer latency, and flush-slot occupancy, while retaining
-  // per-topic metadata deadlines and the fenced-partition transaction limit.
-  let (time_triggered, local) = topic_plans
-    .into_iter()
-    .partition::<Vec<_>, _>(TopicFlushPlan::is_time_triggered);
-  let mut plans = local
-    .into_iter()
-    .map(|topic| FlushPlan {
-      topics: vec![topic],
-      max_segment_bytes,
-      shared_blob: false,
-    })
-    .collect::<Vec<_>>();
-  let mut shared_plans = Vec::new();
-  for topic in time_triggered {
-    // Fenced topic plans are split at DynamoDB's transaction limit. Keep those chunks in
-    // distinct shared plans so object construction cannot merge their fence sets back together.
-    // The first compatible shared plan is the same numbered chunk from previously sorted topics.
-    if let Some(plan) = shared_plans.iter_mut().find(|plan: &&mut FlushPlan| {
-      plan
-        .topics
-        .iter()
-        .all(|existing| existing.topic != topic.topic)
-    }) {
-      plan.topics.push(topic);
-    } else {
-      shared_plans.push(FlushPlan {
-        topics: vec![topic],
-        max_segment_bytes,
-        shared_blob: true,
-      });
-    }
-  }
-  plans.extend(shared_plans);
-  plans
+  let shared_blob = selected_shared_blob?;
+  let mut topics = topic_plans.into_values().collect::<Vec<_>>();
+  topics.sort_by(|left, right| left.topic.as_str().cmp(right.topic.as_str()));
+  Some(FlushPlan {
+    topics,
+    max_segment_bytes: config.max_segment_bytes(feature_flags),
+    shared_blob,
+  })
 }
 
 pub(super) fn begin_shutdown_drain(state: &Arc<Mutex<WriteState>>) {

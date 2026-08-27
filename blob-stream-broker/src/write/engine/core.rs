@@ -1,6 +1,10 @@
 use super::super::flush::FlushContext;
 use super::super::metrics::WriteMetrics;
-use super::super::scheduler::{begin_shutdown_drain, collect_flush_plans, flush_plan_and_notify};
+use super::super::scheduler::{
+  begin_shutdown_drain,
+  collect_next_flush_plan,
+  flush_plan_and_notify,
+};
 use super::super::state::WriteState;
 use super::super::{
   AdmissionController,
@@ -18,14 +22,13 @@ use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::BlobStore;
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{MetadataStore, ProducerPartitionLeaseStore};
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
 use parking_lot::Mutex;
 use protobuf::Chars;
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::Duration as TimeDuration;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, Semaphore, watch};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 //
@@ -229,10 +232,11 @@ impl WriteEngineImpl {
     let feature_flags = self.feature_flags.clone();
     let flush_notifier = Arc::clone(&self.flush_notifier);
     let mut shutdown = self.shutdown_trigger_handle.make_shutdown();
+    let flush_plan_permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT_FLUSH_PLANS));
 
     tokio::spawn(async move {
       let mut flush_tick = Box::pin(time_provider.sleep(flush_delay));
-      let mut flushes = FuturesUnordered::new();
+      let mut flushes = JoinSet::new();
       let mut shutdown_requested = false;
       loop {
         if shutdown_requested && flushes.is_empty() {
@@ -240,29 +244,34 @@ impl WriteEngineImpl {
           return;
         }
 
-        let available_slots = MAX_IN_FLIGHT_FLUSH_PLANS.saturating_sub(flushes.len());
-        let now = time_provider.now();
-        let plans = collect_flush_plans(
-          &state,
-          now,
-          flush_context.config(),
-          feature_flags.as_ref(),
-          &topics,
-          available_slots,
-        );
+        // Reserve a slot before moving buffered batches out of WriteState. The spawned task owns
+        // the permit while it merges, encodes, compresses, and persists its flush plan.
+        let mut scheduled_flush = false;
+        while let Ok(permit) = Arc::clone(&flush_plan_permits).try_acquire_owned() {
+          let Some(plan) = collect_next_flush_plan(
+            &state,
+            time_provider.now(),
+            flush_context.config(),
+            feature_flags.as_ref(),
+            &topics,
+          ) else {
+            drop(permit);
+            break;
+          };
 
-        if !plans.is_empty() {
-          metrics.record_flush_plan_summary(&plans);
-          for plan in plans {
-            let flush_context = flush_context.clone();
-            let metrics = metrics.clone();
-            let state = Arc::clone(&state);
-            flushes.push(async move {
-              let _active_flush =
-                bd_server_stats::stats::StackAutoGauge::new(&metrics.active_flush_plans);
-              flush_plan_and_notify(&flush_context, plan, &metrics, &state).await;
-            });
-          }
+          metrics.record_flush_plan_summary(std::slice::from_ref(&plan));
+          let flush_context = flush_context.clone();
+          let metrics = metrics.clone();
+          let state = Arc::clone(&state);
+          flushes.spawn(async move {
+            let _permit = permit;
+            let _active_flush =
+              bd_server_stats::stats::StackAutoGauge::new(&metrics.active_flush_plans);
+            flush_plan_and_notify(&flush_context, plan, &metrics, &state).await;
+          });
+          scheduled_flush = true;
+        }
+        if scheduled_flush {
           continue;
         }
 
@@ -277,7 +286,11 @@ impl WriteEngineImpl {
             flush_tick = Box::pin(time_provider.sleep(flush_delay));
           },
           () = flush_notifier.notified() => {},
-          Some(()) = flushes.next(), if !flushes.is_empty() => {},
+          Some(result) = flushes.join_next(), if !flushes.is_empty() => {
+            if let Err(error) = result {
+              log::error!("broker flush task failed: {error}");
+            }
+          },
         }
       }
     });

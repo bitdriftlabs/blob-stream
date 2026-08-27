@@ -42,13 +42,11 @@ let acknowledgement = producer
     event_timestamp_ms,
   ))
   .await?;
-producer.flush().await?;
 ```
 
 `produce` batches records by topic and virtual partition, then resolves when the broker acknowledges
 that batch. Retrying an ambiguous request can deliver a record more than once, so downstream
-processing must remain idempotent. Call `flush` before a controlled shutdown to wait for buffered
-records; the producer client itself owns a background flush task.
+processing must remain idempotent. The producer client owns a background batch-flush task.
 
 `ProducerRuntimeConfig` contains:
 

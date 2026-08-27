@@ -5,6 +5,7 @@ mod tests;
 mod diagnostics;
 mod dispatch;
 mod metrics;
+mod protocol;
 mod retry;
 mod routing;
 mod state;
@@ -32,6 +33,7 @@ use bd_server_stats::stats::Scope;
 use blob_stream_broker_discovery::{
   BrokerDiscovery,
   BrokerMembership,
+  BrokerPartition,
   INITIAL_MEMBERSHIP_TIMEOUT,
   wait_for_initialized_membership,
 };
@@ -52,22 +54,20 @@ pub use diagnostics::{
   ProducerStateSnapshot,
   ProducerTopicSnapshot,
 };
-use dispatch::{dispatch_group_and_notify, notify_unassigned_batches, remember_first_error};
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
+use dispatch::{dispatch_group_and_notify, notify_unassigned_batches};
 use log::{debug, trace};
 use metrics::ProducerMetrics;
 use parking_lot::Mutex;
 use protobuf::Chars;
 pub use retry::ProducerRetryClock;
-use routing::{ProducerRoutes, group_batches_by_broker, record_fits_grouped_request};
+use routing::{ProducerRoutes, record_wire_sizes};
 use state::{BufferedRecord, ProducerState};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, timeout};
 pub use transport::{BrokerTransport, GrpcBrokerTransport};
 
@@ -146,8 +146,6 @@ pub enum ProducerError {
 pub trait ProducerClient: Send + Sync {
   /// Enqueue a record and wait for broker acknowledgement.
   async fn produce(&self, record: ProducerRecord) -> Result<ProducerAck, ProducerError>;
-  /// Flush any buffered records for all topics/partitions.
-  async fn flush(&self) -> Result<(), ProducerError>;
   /// Returns a handle for observing this producer's local runtime state.
   fn diagnostics(&self) -> Option<ProducerDiagnostics> {
     None
@@ -208,16 +206,16 @@ impl ProducerClientBuilder {
 /// Default producer implementation with discovery, batching, and retry handling.
 pub struct ProducerClientImpl {
   config: ProducerConfig,
+  writer_id: u32,
+  max_batch_records: usize,
+  max_batch_bytes: usize,
   topics: HashMap<Chars, ProducerTopicConfig>,
   membership_rx: watch::Receiver<BrokerMembership>,
-  transport: Arc<dyn BrokerTransport>,
   metrics: Arc<ProducerMetrics>,
   retry_diagnostics: ProducerRetryDiagnostics,
-  retry_clock: Arc<dyn ProducerRetryClock>,
   routes: ProducerRoutes,
   state: Arc<Mutex<ProducerState>>,
   flush_notify: Arc<Notify>,
-  dispatch_permits: Arc<Semaphore>,
   flush_task: JoinHandle<()>,
 }
 
@@ -281,6 +279,8 @@ impl ProducerClientImpl {
 
     validate_producer_config(&config)?;
     let writer_id = producer_writer_id(&config);
+    let max_batch_records = producer_max_batch_records(&config) as usize;
+    let max_batch_bytes = producer_max_batch_bytes(&config) as usize;
 
     let mut topic_map = HashMap::new();
     for topic in topics {
@@ -350,16 +350,16 @@ impl ProducerClientImpl {
 
     Ok(Self {
       config,
+      writer_id,
+      max_batch_records,
+      max_batch_bytes,
       topics: topic_map,
       membership_rx,
-      transport,
       metrics,
       retry_diagnostics,
-      retry_clock,
       routes,
       state,
       flush_notify,
-      dispatch_permits,
       flush_task,
     })
   }
@@ -386,10 +386,9 @@ impl ProducerClientImpl {
         .expect("producer config validation requires a positive flush max delay");
       let flush_sleep = tokio::time::sleep(flush_delay);
       tokio::pin!(flush_sleep);
-      // Keep dispatches owned by the flush task so producer shutdown cancels queued permit waits,
-      // RPCs, and retries. Their completions still need polling to advance semaphore waiters, but
-      // must not define a new batching boundary.
-      let mut dispatches = FuturesUnordered::new();
+      // Keep dispatches owned by the flush task so producer shutdown cancels RPCs and retries.
+      // A task owns its admission permit until terminal waiter notification, bounding spawned work.
+      let mut dispatches = JoinSet::new();
       let mut membership_closed = false;
 
       loop {
@@ -407,55 +406,78 @@ impl ProducerClientImpl {
           },
           () = &mut flush_sleep => Some(false),
           () = flush_notify.notified() => Some(true),
-          Some(_) = dispatches.next(), if !dispatches.is_empty() => {
-            // Polling this completion lets another dispatch acquire a released permit. Its
-            // waiters have already been notified, and it must not flush partial new batches.
+          Some(result) = dispatches.join_next(), if !dispatches.is_empty() => {
+            if let Err(error) = result {
+              log::error!("producer dispatch task failed: {error}");
+            }
+            // A completed task may have released a permit for batches retained in shared state,
+            // but must not flush an unrelated later partial batch.
             None
           },
         };
 
-        let Some(flush_triggered_by_size) = flush_triggered_by_size else {
-          continue;
-        };
-
-        // Each trigger-driven drain starts a new maximum-delay window for subsequent partial
-        // batches.
-        flush_sleep.as_mut().reset(Instant::now() + flush_delay);
-
-        // Only this task owns batches after they leave shared state. A caller dropping its
-        // `produce` future cannot cancel dispatch, and all batches present at this wake can pack
-        // into the same broker-scoped RPC.
-        let batches = {
-          let mut guard = state.lock();
-          guard.drain_all_batches()
-        };
-
-        if !batches.is_empty() {
-          if flush_triggered_by_size {
-            metrics.flushes_max_size.inc();
-          } else {
-            metrics.flushes_max_delay.inc();
+        if let Some(flush_triggered_by_size) = flush_triggered_by_size {
+          let assignment = routes.assignment_snapshot();
+          let sealed = state
+            .lock()
+            .seal_ready_generation(|topic, virtual_partition_id| {
+              assignment
+                .get(&BrokerPartition {
+                  topic: topic.clone(),
+                  virtual_partition_id,
+                })
+                .map(|broker| broker.address.clone())
+            });
+          if sealed.batch_count > 0 {
+            if flush_triggered_by_size {
+              metrics.flushes_max_size.inc();
+            } else {
+              metrics.flushes_max_delay.inc();
+            }
+            trace!(
+              "producer flush loop sealed {} batch(es)",
+              sealed.batch_count
+            );
           }
-          trace!("producer flush loop drained {} batch(es)", batches.len());
+          // Unassigned batches have notified their record waiters. This background task has no
+          // caller to receive the terminal error.
+          let _ = notify_unassigned_batches(&metrics, sealed.unassigned);
+
+          // Each trigger-driven drain starts a new maximum-delay window for subsequent partial
+          // batches.
+          flush_sleep.as_mut().reset(Instant::now() + flush_delay);
         }
 
-        let grouped = group_batches_by_broker(&routes, batches);
-        // Unassigned batches have notified their record waiters. This background task has no
-        // caller to receive the terminal error.
-        let _ = notify_unassigned_batches(&metrics, grouped.unassigned);
-        for group in grouped.groups {
-          dispatches.push(dispatch_group_and_notify(
-            &config,
-            &topics,
-            &routes,
-            &dispatch_membership_rx,
-            &transport,
-            &metrics,
-            &retry_diagnostics,
-            &retry_clock,
-            &dispatch_permits,
-            group,
-          ));
+        // Acquire a task slot before removing the next ready group. The ready broker FIFO keeps
+        // unsent work in ProducerState, so no batch must be reconstructed after admission fails.
+        while let Ok(permit) = Arc::clone(&dispatch_permits).try_acquire_owned() {
+          let Some(group) = state.lock().take_next_ready_group() else {
+            drop(permit);
+            break;
+          };
+          let config = config.clone();
+          let topics = topics.clone();
+          let routes = routes.clone();
+          let membership_rx = dispatch_membership_rx.clone();
+          let transport = Arc::clone(&transport);
+          let metrics = Arc::clone(&metrics);
+          let retry_diagnostics = retry_diagnostics.clone();
+          let retry_clock = Arc::clone(&retry_clock);
+          dispatches.spawn(async move {
+            dispatch_group_and_notify(
+              &config,
+              &topics,
+              &routes,
+              &membership_rx,
+              &transport,
+              &metrics,
+              &retry_diagnostics,
+              &retry_clock,
+              permit,
+              group,
+            )
+            .await
+          });
         }
       }
     })
@@ -483,17 +505,15 @@ impl ProducerClient for ProducerClientImpl {
       .get(topic.as_str())
       .ok_or_else(|| ProducerError::UnknownTopic(topic.clone()))?;
 
-    let virtual_partition_id = compute_virtual_partition_id(
-      &record_key,
-      topic_config.partition_count,
-      producer_writer_id(&self.config),
-    );
+    let virtual_partition_id =
+      compute_virtual_partition_id(&record_key, topic_config.partition_count, self.writer_id);
     let proto_record = Record {
       payload,
       event_ts_ms,
       ..Default::default()
     };
-    if !record_fits_grouped_request(&topic, virtual_partition_id, &proto_record) {
+    let record_wire_sizes = record_wire_sizes(&topic, virtual_partition_id, &proto_record);
+    if !record_wire_sizes.fits_grouped_request() {
       return Err(ProducerError::Rejected(format!(
         "record exceeds the {MAX_PRODUCE_BATCHES_REQUEST_BYTES} byte request limit"
       )));
@@ -514,9 +534,11 @@ impl ProducerClient for ProducerClientImpl {
           virtual_partition_id,
           proto_record,
           waiter: tx,
+          encoded_record_size: record_wire_sizes.encoded_record_size,
+          request_base_size: record_wire_sizes.request_base_size,
         },
-        producer_max_batch_records(&self.config) as usize,
-        producer_max_batch_bytes(&self.config) as usize,
+        self.max_batch_records,
+        self.max_batch_bytes,
       )
     };
 
@@ -528,40 +550,6 @@ impl ProducerClient for ProducerClientImpl {
     }
 
     rx.await.unwrap_or(Err(ProducerError::Shutdown))
-  }
-
-  async fn flush(&self) -> Result<(), ProducerError> {
-    let batches = {
-      let mut guard = self.state.lock();
-      guard.drain_all_batches()
-    };
-
-    let mut dispatches = FuturesUnordered::new();
-    let grouped = group_batches_by_broker(&self.routes, batches);
-    let mut first_error = None;
-    remember_first_error(
-      &mut first_error,
-      notify_unassigned_batches(&self.metrics, grouped.unassigned),
-    );
-    for group in grouped.groups {
-      dispatches.push(dispatch_group_and_notify(
-        &self.config,
-        &self.topics,
-        &self.routes,
-        &self.membership_rx,
-        &self.transport,
-        &self.metrics,
-        &self.retry_diagnostics,
-        &self.retry_clock,
-        &self.dispatch_permits,
-        group,
-      ));
-    }
-
-    while let Some(result) = dispatches.next().await {
-      remember_first_error(&mut first_error, result);
-    }
-    first_error.map_or(Ok(()), Err)
   }
 
   fn diagnostics(&self) -> Option<ProducerDiagnostics> {

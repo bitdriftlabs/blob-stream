@@ -73,7 +73,6 @@
 //!     "acked partition={}, attempts={}",
 //!     ack.virtual_partition_id, ack.attempts
 //!   );
-//!   producer.flush().await?;
 //!   Ok(())
 //! }
 //! ```

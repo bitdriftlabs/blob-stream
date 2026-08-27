@@ -1,4 +1,5 @@
 use super::metrics::ProducerMetrics;
+use super::protocol::broker_error_message;
 use super::retry::{ProducerRetryClock, acknowledge_batch, send_batch_with_retry};
 use super::routing::{BrokerBatchGroup, ProducerRoutes, produce_batch_request};
 use super::state::BufferedBatch;
@@ -13,14 +14,12 @@ use anyhow::anyhow;
 use bd_log_util::warn_every;
 use blob_stream_broker_discovery::BrokerMembership;
 use blob_stream_proto::protos::blobstream::v1::broker::{ProduceBatchesRequest, ProduceStatus};
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
 use protobuf::Chars;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use time::ext::NumericalDuration;
-use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 
 pub(super) async fn dispatch_group_and_notify(
   config: &ProducerConfig,
@@ -31,7 +30,7 @@ pub(super) async fn dispatch_group_and_notify(
   metrics: &Arc<ProducerMetrics>,
   retry_diagnostics: &ProducerRetryDiagnostics,
   retry_clock: &Arc<dyn ProducerRetryClock>,
-  dispatch_permits: &Arc<Semaphore>,
+  dispatch_permit: OwnedSemaphorePermit,
   group: BrokerBatchGroup,
 ) -> Result<(), ProducerError> {
   send_grouped_batches_and_notify(
@@ -43,7 +42,7 @@ pub(super) async fn dispatch_group_and_notify(
     metrics,
     retry_diagnostics,
     retry_clock.as_ref(),
-    dispatch_permits,
+    dispatch_permit,
     group,
   )
   .await
@@ -83,9 +82,12 @@ async fn send_grouped_batches_and_notify(
   metrics: &ProducerMetrics,
   retry_diagnostics: &ProducerRetryDiagnostics,
   retry_clock: &dyn ProducerRetryClock,
-  dispatch_permits: &Arc<Semaphore>,
+  dispatch_permit: OwnedSemaphorePermit,
   group: BrokerBatchGroup,
 ) -> Result<(), ProducerError> {
+  // TODO: Split task admission from an RPC-only permit if backoff should release task capacity.
+  // Today this permit intentionally bounds all preparation, requests, and retries for the task.
+  let _dispatch_permit = dispatch_permit;
   let retry_started_at = retry_clock.now();
 
   // The grouped RPC amortizes transport overhead, but each response remains an independent
@@ -101,13 +103,6 @@ async fn send_grouped_batches_and_notify(
         .expect("producer config validation requires a positive retry deadline"),
     );
   let response = {
-    let Ok(_permit) = dispatch_permits.clone().acquire_owned().await else {
-      let result = Err(ProducerError::Shutdown);
-      for batch in group.batches {
-        notify_waiters(batch.waiters, &result);
-      }
-      return Err(ProducerError::Shutdown);
-    };
     let _active_request = bd_server_stats::stats::StackAutoGauge::new(&metrics.active_requests);
     tokio::time::timeout(
       request_timeout,
@@ -147,10 +142,10 @@ async fn send_grouped_batches_and_notify(
   };
 
   let mut first_error = None;
-  let mut retries = FuturesUnordered::new();
+  let mut retryable_batches = Vec::new();
 
-  // Do not route successful responses through retry handling. The remaining futures are driven
-  // together so one batch's backoff or broker handoff cannot delay another batch in this group.
+  // Handle terminal statuses before beginning any retry backoff. A retryable batch must not delay
+  // an acknowledgement or rejection already returned for a later batch in the same grouped RPC.
   for (batch, initial_response) in group.batches.into_iter().zip(results) {
     match initial_response
       .as_ref()
@@ -173,44 +168,35 @@ async fn send_grouped_batches_and_notify(
       },
       Some(ProduceStatus::PRODUCE_STATUS_BAD_REQUEST) => {
         let response = initial_response.expect("bad request response must be present");
-        let error = if response.error_message.is_empty() {
-          format!(
-            "broker status: {:?}",
-            response.status.enum_value_or_default()
-          )
-        } else {
-          response.error_message.to_string()
-        };
-        let result = Err(ProducerError::Rejected(error));
+        let result = Err(ProducerError::Rejected(broker_error_message(&response)));
         notify_waiters(batch.waiters, &result);
         remember_first_error(&mut first_error, result);
       },
       _ => {
-        retries.push(async {
-          let result = send_batch_with_retry(
-            config,
-            topics,
-            routes,
-            membership_rx,
-            transport,
-            &batch,
-            dispatch_permits,
-            metrics,
-            retry_diagnostics,
-            initial_response,
-            1,
-            retry_clock,
-            retry_started_at,
-          )
-          .await;
-          notify_waiters(batch.waiters, &result);
-          result
-        });
+        retryable_batches.push((batch, initial_response));
       },
     }
   }
 
-  while let Some(result) = retries.next().await {
+  // A group holds one task-admission permit, so retry sequentially to keep that permit as the
+  // concurrency bound for all RPC attempts rather than fan out requests from one admitted task.
+  for (batch, initial_response) in retryable_batches {
+    let result = send_batch_with_retry(
+      config,
+      topics,
+      routes,
+      membership_rx,
+      transport,
+      &batch,
+      metrics,
+      retry_diagnostics,
+      initial_response,
+      1,
+      retry_clock,
+      retry_started_at,
+    )
+    .await;
+    notify_waiters(batch.waiters, &result);
     remember_first_error(&mut first_error, result);
   }
   first_error.map_or(Ok(()), Err)

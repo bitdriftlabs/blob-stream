@@ -1,4 +1,5 @@
 use super::metrics::ProducerMetrics;
+use super::protocol::broker_error_message;
 use super::routing::{ProducerRoutes, produce_batch_request};
 use super::state::BufferedBatch;
 use super::{
@@ -29,11 +30,10 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 use log::{debug, trace};
 use protobuf::Chars;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 use time::Duration as TimeDuration;
 use time::ext::NumericalDuration;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 const NOT_LEASE_HOLDER_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
@@ -47,7 +47,6 @@ pub(super) async fn send_batch_with_retry(
   membership_rx: &watch::Receiver<BrokerMembership>,
   transport: &dyn BrokerTransport,
   batch: &BufferedBatch,
-  dispatch_permits: &Arc<Semaphore>,
   metrics: &ProducerMetrics,
   retry_diagnostics: &ProducerRetryDiagnostics,
   initial_response: Option<ProduceBatchResponse>,
@@ -156,7 +155,6 @@ pub(super) async fn send_batch_with_retry(
         transport,
         &broker_address,
         batch,
-        dispatch_permits,
         metrics,
         remaining,
       )
@@ -179,20 +177,11 @@ pub(super) async fn send_batch_with_retry(
             return Err(ProducerError::UnknownTopic(batch.topic.clone()));
           },
           ProduceStatus::PRODUCE_STATUS_BAD_REQUEST => {
-            let error = if response.error_message.is_empty() {
-              format!("broker status: {status:?}")
-            } else {
-              response.error_message.to_string()
-            };
-            return Err(ProducerError::Rejected(error));
+            return Err(ProducerError::Rejected(broker_error_message(&response)));
           },
           ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER
           | ProduceStatus::PRODUCE_STATUS_OVERLOADED => {
-            let error = if response.error_message.is_empty() {
-              format!("broker status: {status:?}")
-            } else {
-              response.error_message.to_string()
-            };
+            let error = broker_error_message(&response);
             let reason = match status {
               ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER => ProducerRetryReason::NotLeaseHolder,
               ProduceStatus::PRODUCE_STATUS_OVERLOADED => ProducerRetryReason::Overloaded,
@@ -289,7 +278,6 @@ async fn send_single_batch_request(
   transport: &dyn BrokerTransport,
   broker_address: &Chars,
   batch: &BufferedBatch,
-  dispatch_permits: &Arc<Semaphore>,
   metrics: &ProducerMetrics,
   remaining: Duration,
 ) -> Result<ProduceBatchResponse, ProducerError> {
@@ -299,9 +287,6 @@ async fn send_single_batch_request(
   let request = ProduceBatchesRequest {
     batches: vec![produce_batch_request(batch)],
     ..Default::default()
-  };
-  let Ok(_permit) = dispatch_permits.clone().acquire_owned().await else {
-    return Err(ProducerError::Shutdown);
   };
   let _active_request = bd_server_stats::stats::StackAutoGauge::new(&metrics.active_requests);
   let mut response = tokio::time::timeout(

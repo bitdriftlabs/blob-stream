@@ -276,21 +276,17 @@ impl ProducerDiagnostics {
 
     let state = self.state.lock();
     let mut partition_buffers = state
-      .buffers
-      .iter()
-      .flat_map(|(topic, partitions)| {
-        partitions
-          .iter()
-          .map(
-            move |(virtual_partition_id, buffer)| ProducerPartitionBufferSnapshot {
-              topic: topic.clone(),
-              virtual_partition_id: *virtual_partition_id,
-              buffered_record_count: buffer.records.len(),
-              pending_ack_count: buffer.waiters.len(),
-              buffered_bytes: buffer.buffered_bytes,
-            },
-          )
-      })
+      .buffered_partition_stats()
+      .into_iter()
+      .map(
+        |((topic, virtual_partition_id), stats)| ProducerPartitionBufferSnapshot {
+          topic,
+          virtual_partition_id,
+          buffered_record_count: stats.record_count,
+          pending_ack_count: stats.pending_ack_count,
+          buffered_bytes: stats.payload_bytes,
+        },
+      )
       .collect::<Vec<_>>();
     partition_buffers.sort_by(|left, right| {
       (&left.topic, left.virtual_partition_id).cmp(&(&right.topic, right.virtual_partition_id))

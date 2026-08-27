@@ -4642,7 +4642,6 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
     let ack = task.await??;
     assert!(ack.attempts >= 1);
   }
-  batching_producer.flush().await?;
 
   // Step 4: Drain and assert exact payload recovery plus at least one multi-record batch.
   let expected_total = expected_payload_counts.values().sum::<usize>();
