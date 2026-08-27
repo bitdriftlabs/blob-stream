@@ -142,9 +142,10 @@ async fn send_grouped_batches_and_notify(
   };
 
   let mut first_error = None;
+  let mut retryable_batches = Vec::new();
 
-  // A group holds one task-admission permit, so retry sequentially to keep that permit as the
-  // concurrency bound for all RPC attempts rather than fan out requests from one admitted task.
+  // Handle terminal statuses before beginning any retry backoff. A retryable batch must not delay
+  // an acknowledgement or rejection already returned for a later batch in the same grouped RPC.
   for (batch, initial_response) in group.batches.into_iter().zip(results) {
     match initial_response
       .as_ref()
@@ -172,25 +173,31 @@ async fn send_grouped_batches_and_notify(
         remember_first_error(&mut first_error, result);
       },
       _ => {
-        let result = send_batch_with_retry(
-          config,
-          topics,
-          routes,
-          membership_rx,
-          transport,
-          &batch,
-          metrics,
-          retry_diagnostics,
-          initial_response,
-          1,
-          retry_clock,
-          retry_started_at,
-        )
-        .await;
-        notify_waiters(batch.waiters, &result);
-        remember_first_error(&mut first_error, result);
+        retryable_batches.push((batch, initial_response));
       },
     }
+  }
+
+  // A group holds one task-admission permit, so retry sequentially to keep that permit as the
+  // concurrency bound for all RPC attempts rather than fan out requests from one admitted task.
+  for (batch, initial_response) in retryable_batches {
+    let result = send_batch_with_retry(
+      config,
+      topics,
+      routes,
+      membership_rx,
+      transport,
+      &batch,
+      metrics,
+      retry_diagnostics,
+      initial_response,
+      1,
+      retry_clock,
+      retry_started_at,
+    )
+    .await;
+    notify_waiters(batch.waiters, &result);
+    remember_first_error(&mut first_error, result);
   }
   first_error.map_or(Ok(()), Err)
 }

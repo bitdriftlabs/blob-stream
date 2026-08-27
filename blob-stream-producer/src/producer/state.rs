@@ -33,8 +33,6 @@ pub(super) struct BufferedRecord {
 
 // One partition's records prepared for one broker RPC. Records and waiters remain aligned so a
 // dispatch result can be reported to every caller after the RPC completes.
-// A sealed partition batch awaiting extraction into one or more bounded broker RPCs. A record
-// cursor and waiter deque avoid shifting a potentially large remaining suffix after each group.
 pub(super) struct BufferedBatch {
   pub(super) topic: Chars,
   pub(super) virtual_partition_id: VirtualPartitionId,
