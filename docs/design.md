@@ -201,16 +201,17 @@ invariant.
 ## Write Path
 
 1. A producer buffers records independently for each `(topic, virtual_partition_id)`.
-2. A producer drains all currently buffered partition batches on the fixed `flush_max_delay_ms`
-   cadence or when a batch reaches its record-count or payload-byte threshold. It groups drained
-   batches that share a selected broker into byte-bounded `ProduceBatches` RPCs, intentionally
-   bringing younger batches forward to improve packing. Membership updates refresh the cached
-   route map but do not force an early drain; completed dispatches only advance queued work under
-   the request-concurrency limit. The producer dispatches RPCs concurrently up to its configured
-   request limit and does not preserve producer submission order, including within one virtual
-  partition. The broker starts all logical batches in a grouped request concurrently and returns
-  their results in request order. It assigns sequence ranges in the order that it accepts
-  requests and preserves that durable order.
+2. A producer seals all currently buffered partition batches on the fixed `flush_max_delay_ms`
+   cadence or when a batch reaches its record-count or payload-byte threshold. New records enter a
+   subsequent generation. For each available concurrency permit, the producer removes one
+   byte-bounded broker group from sealed state and spawns its dispatch task; unadmitted work remains
+   sealed until a permit returns. Membership updates refresh the cached route map but do not force
+   an early seal. The producer holds each permit through request preparation, the initial RPC, and
+   any retry backoff or retry RPCs. Retries for logical batches in one admitted group are sequential,
+   so the limit also bounds all producer RPC attempts. It does not preserve producer submission
+   order, including within one virtual partition. The broker starts all logical batches in a grouped
+   request concurrently and returns their results in request order. It assigns sequence ranges in
+   the order that it accepts requests and preserves that durable order.
 3. `ProduceBatches` returns one ordered result per submitted partition batch. The producer
    resolves successful entries independently and retries only entries that were rejected or whose
    request outcome is ambiguous. It retains the legacy `ProduceBatch` RPC only for a staged

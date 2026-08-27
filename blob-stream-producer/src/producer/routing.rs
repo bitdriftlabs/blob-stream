@@ -1,3 +1,4 @@
+use super::protocol::encoded_grouped_message_size;
 use super::state::BufferedBatch;
 use crate::config::{ProducerConfig, ProducerTopicConfig, producer_writer_id};
 use blob_stream_broker_discovery::{
@@ -23,16 +24,19 @@ pub(super) struct BrokerBatchGroup {
   pub(super) batches: Vec<BufferedBatch>,
 }
 
-//
-// GroupedBatches
-//
+type BrokerAssignment = BTreeMap<BrokerPartition, BrokerNode>;
 
-pub(super) struct GroupedBatches {
-  pub(super) groups: Vec<BrokerBatchGroup>,
-  pub(super) unassigned: Vec<BufferedBatch>,
+pub(super) struct RecordWireSizes {
+  pub(super) request_base_size: usize,
+  pub(super) encoded_record_size: usize,
+  grouped_batch_size: usize,
 }
 
-type BrokerAssignment = BTreeMap<BrokerPartition, BrokerNode>;
+impl RecordWireSizes {
+  pub(super) fn fits_grouped_request(&self) -> bool {
+    self.grouped_batch_size <= MAX_PRODUCE_BATCHES_REQUEST_BYTES
+  }
+}
 
 //
 // ProducerRoutes
@@ -90,6 +94,10 @@ impl ProducerRoutes {
   pub(super) fn owner(&self, partition: &BrokerPartition) -> Option<BrokerNode> {
     self.routes.read().assignment.get(partition).cloned()
   }
+
+  pub(super) fn assignment_snapshot(&self) -> Arc<BrokerAssignment> {
+    Arc::clone(&self.routes.read().assignment)
+  }
 }
 
 pub(super) fn broker_assignment(
@@ -110,112 +118,6 @@ pub(super) fn broker_assignment(
   )
 }
 
-pub(super) fn group_batches_by_broker(
-  routes: &ProducerRoutes,
-  batches: Vec<BufferedBatch>,
-) -> GroupedBatches {
-  // Snapshot one assignment for the full drain. A batch without an owner is deliberately returned
-  // rather than retained here; the caller notifies its waiters with NoBrokersAvailable.
-  let assignment = Arc::clone(&routes.routes.read().assignment);
-  let mut batches_by_broker = BTreeMap::<Chars, Vec<BufferedBatch>>::new();
-  let mut unassigned = Vec::new();
-  for batch in batches {
-    let Some(broker) = assignment.get(&BrokerPartition {
-      topic: batch.topic.clone(),
-      virtual_partition_id: batch.virtual_partition_id,
-    }) else {
-      unassigned.push(batch);
-      continue;
-    };
-    batches_by_broker
-      .entry(broker.address.clone())
-      .or_default()
-      .push(batch);
-  }
-
-  // Then pack each broker's logical batches into wire-size-bounded ProduceBatches RPCs. The map
-  // provides a stable broker order, while each broker retains the order of its drained batches.
-  let mut groups = Vec::new();
-  for (broker_address, batches) in batches_by_broker {
-    let mut group = Vec::new();
-    let mut group_size: usize = 0;
-
-    // A producer batch can be larger than the grouped-RPC limit when its own configured limits
-    // are larger. Split it only between records before deciding which broker request contains it.
-    for batch in batches
-      .into_iter()
-      .flat_map(split_batch_for_grouped_request)
-    {
-      let batch_size = encoded_grouped_batch_size(&batch);
-
-      // The current batch starts a new request when adding it would exceed the limit. A single
-      // batch is known to fit because split_batch_for_grouped_request enforces the same bound.
-      if !group.is_empty()
-        && group_size.saturating_add(batch_size) > MAX_PRODUCE_BATCHES_REQUEST_BYTES
-      {
-        groups.push(BrokerBatchGroup {
-          broker_address: broker_address.clone(),
-          batches: group,
-        });
-        group = Vec::new();
-        group_size = 0;
-      }
-      group_size = group_size.saturating_add(batch_size);
-      group.push(batch);
-    }
-    if !group.is_empty() {
-      groups.push(BrokerBatchGroup {
-        broker_address,
-        batches: group,
-      });
-    }
-  }
-
-  GroupedBatches { groups, unassigned }
-}
-
-pub(super) fn split_batch_for_grouped_request(batch: BufferedBatch) -> Vec<BufferedBatch> {
-  assert_eq!(batch.records.len(), batch.waiters.len());
-
-  // ProduceBatches embeds each ProduceBatchRequest as a length-delimited repeated field. Track
-  // both the inner batch size and its outer field wrapper so every returned chunk fits the RPC.
-  let base_size = encoded_produce_batch_size(&batch.topic, batch.virtual_partition_id, &[]);
-  let mut batches = Vec::new();
-  let mut records = Vec::new();
-  let mut waiters = Vec::new();
-  let mut request_size = base_size;
-  for (record, waiter) in batch.records.into_iter().zip(batch.waiters) {
-    let record_size = encoded_record_field_size(&record);
-    let next_size = request_size.saturating_add(record_size);
-
-    // Preserve record/waiter pairs when a full logical batch must span multiple broker RPCs.
-    // Oversized individual records are rejected before buffering by record_fits_grouped_request.
-    if !records.is_empty()
-      && encoded_grouped_message_size(next_size) > MAX_PRODUCE_BATCHES_REQUEST_BYTES
-    {
-      batches.push(BufferedBatch {
-        topic: batch.topic.clone(),
-        virtual_partition_id: batch.virtual_partition_id,
-        records: std::mem::take(&mut records),
-        waiters: std::mem::take(&mut waiters),
-      });
-      request_size = base_size;
-    }
-    request_size = request_size.saturating_add(record_size);
-    records.push(record);
-    waiters.push(waiter);
-  }
-  if !records.is_empty() {
-    batches.push(BufferedBatch {
-      topic: batch.topic,
-      virtual_partition_id: batch.virtual_partition_id,
-      records,
-      waiters,
-    });
-  }
-  batches
-}
-
 pub(super) fn produce_batch_request(batch: &BufferedBatch) -> ProduceBatchRequest {
   // Dispatch keeps the BufferedBatch for waiter notification, so build an independent protobuf
   // request rather than consuming its records.
@@ -227,26 +129,22 @@ pub(super) fn produce_batch_request(batch: &BufferedBatch) -> ProduceBatchReques
   }
 }
 
-pub(super) fn record_fits_grouped_request(
+pub(super) fn record_wire_sizes(
   topic: &Chars,
   virtual_partition_id: VirtualPartitionId,
   record: &Record,
-) -> bool {
-  // Reject records that could never be sent, even alone. This lets splitting assume its first
-  // record fits instead of creating an invalid one-record request.
-  encoded_grouped_message_size(encoded_produce_batch_size(
-    topic,
-    virtual_partition_id,
-    std::slice::from_ref(record),
-  )) <= MAX_PRODUCE_BATCHES_REQUEST_BYTES
-}
-
-fn encoded_grouped_batch_size(batch: &BufferedBatch) -> usize {
-  // A logical batch is a repeated message inside ProduceBatches, so include the outer tag and
-  // length prefix rather than comparing only the nested ProduceBatchRequest size.
-  let batch_size =
-    encoded_produce_batch_size(&batch.topic, batch.virtual_partition_id, &batch.records);
-  encoded_grouped_message_size(batch_size)
+) -> RecordWireSizes {
+  // Save the immutable wire-size components when a record is accepted. Ready-group extraction
+  // then checks only stored lengths rather than traversing protobuf records on the coordinator.
+  let request_base_size = encoded_produce_batch_size(topic, virtual_partition_id, &[]);
+  let encoded_record_size = encoded_record_field_size(record);
+  RecordWireSizes {
+    request_base_size,
+    encoded_record_size,
+    grouped_batch_size: encoded_grouped_message_size(
+      request_base_size.saturating_add(encoded_record_size),
+    ),
+  }
 }
 
 fn encoded_produce_batch_size(
@@ -273,21 +171,4 @@ fn encoded_record_field_size(record: &Record) -> usize {
   let record_size =
     usize::try_from(record.compute_size()).expect("encoded protobuf record size must fit in usize");
   encoded_grouped_message_size(record_size)
-}
-
-fn encoded_grouped_message_size(message_size: usize) -> usize {
-  // Every nested protobuf message carries one field tag byte and a varint-encoded payload length.
-  1usize
-    .saturating_add(encoded_varint_size(message_size as u64))
-    .saturating_add(message_size)
-}
-
-fn encoded_varint_size(mut value: u64) -> usize {
-  // Protobuf encodes lengths in seven-bit groups, with the high bit marking continuation bytes.
-  let mut size: usize = 1;
-  while value >= 128 {
-    size = size.saturating_add(1);
-    value >>= 7;
-  }
-  size
 }

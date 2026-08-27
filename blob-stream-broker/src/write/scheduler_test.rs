@@ -1,5 +1,5 @@
-use super::collect_flush_plans;
-use crate::write::buffer::{BufferedBatch, FlushCompletionError, FlushTrigger};
+use super::collect_next_flush_plan;
+use crate::write::buffer::{BufferedBatch, FlushCompletionError, FlushPlan, FlushTrigger};
 use crate::write::config::{MAX_SEGMENT_BYTES_FEATURE_FLAG, SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG};
 use crate::write::state::WriteState;
 use crate::write::{TopicInfo, WriteConfig};
@@ -34,6 +34,20 @@ fn topics() -> HashMap<protobuf::Chars, TopicInfo> {
   )])
 }
 
+fn collect_all_flush_plans(
+  state: &Arc<Mutex<WriteState>>,
+  now: time::OffsetDateTime,
+  config: &WriteConfig,
+  feature_flags: Option<&bd_runtime_config::feature_flags::FeatureFlagsWatch>,
+  topics: &HashMap<protobuf::Chars, TopicInfo>,
+) -> Vec<FlushPlan> {
+  let mut plans = Vec::new();
+  while let Some(plan) = collect_next_flush_plan(state, now, config, feature_flags, topics) {
+    plans.push(plan);
+  }
+  plans
+}
+
 #[test]
 fn fenced_flushes_split_at_ninety_nine_flushable_partitions() {
   let state = Arc::new(Mutex::new(WriteState::default()));
@@ -63,13 +77,12 @@ fn fenced_flushes_split_at_ninety_nine_flushable_partitions() {
 
   let mut config = WriteConfig::with_defaults();
   config.fenced_metadata_writes = true;
-  let plans = collect_flush_plans(
+  let plans = collect_all_flush_plans(
     &state,
     offset_datetime_from_unix_millis(1_000),
     &config,
     None,
     &topics(),
-    4,
   );
 
   assert_eq!(plans.len(), 2);
@@ -116,7 +129,7 @@ fn shared_fenced_flushes_keep_topic_chunks_within_transaction_limit() {
   let flags = FakeLoader::new(Arc::new(
     DefaultFeatureFlags::default().with_bool_flag(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, true),
   ));
-  let plans = collect_flush_plans(
+  let plans = collect_all_flush_plans(
     &state,
     offset_datetime_from_unix_millis(1_000),
     &config,
@@ -145,7 +158,6 @@ fn shared_fenced_flushes_keep_topic_chunks_within_transaction_limit() {
         },
       ),
     ]),
-    4,
   );
 
   assert_eq!(plans.len(), 2);
@@ -208,13 +220,12 @@ fn live_feature_flag_updates_apply_to_new_flush_plans() {
       .with_integer_flag(MAX_SEGMENT_BYTES_FEATURE_FLAG, 1),
   ));
 
-  let plans = collect_flush_plans(
+  let plans = collect_all_flush_plans(
     &state,
     offset_datetime_from_unix_millis(1_000),
     &WriteConfig::with_defaults(),
     Some(&feature_flags),
     &topics,
-    2,
   );
 
   assert_eq!(plans.len(), 1);
@@ -252,13 +263,12 @@ fn fenced_flush_uses_the_batches_acceptance_fence() {
 
   let mut config = WriteConfig::with_defaults();
   config.fenced_metadata_writes = true;
-  let plans = collect_flush_plans(
+  let plans = collect_all_flush_plans(
     &state,
     offset_datetime_from_unix_millis(1_000),
     &config,
     None,
     &topics(),
-    1,
   );
 
   assert_eq!(plans.len(), 1);
@@ -294,13 +304,12 @@ fn fenced_flush_drops_batches_without_an_acceptance_fence() {
   let mut config = WriteConfig::with_defaults();
   config.fenced_metadata_writes = true;
   assert!(
-    collect_flush_plans(
+    collect_all_flush_plans(
       &state,
       offset_datetime_from_unix_millis(1_000),
       &config,
       None,
       &topics(),
-      1,
     )
     .is_empty()
   );
@@ -365,13 +374,12 @@ fn shared_time_flush_pulls_forward_buffered_topics() {
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 2;
 
-  let plans = collect_flush_plans(
+  let plans = collect_all_flush_plans(
     &state,
     offset_datetime_from_unix_millis(1_000),
     &config,
     Some(&flags.snapshot_watch()),
     &topics,
-    2,
   );
 
   assert_eq!(plans.len(), 1);
@@ -427,13 +435,12 @@ fn no_op_planning_keeps_multiple_topic_partitions_buffered() {
   config.flush_max_bytes = 2;
 
   assert!(
-    collect_flush_plans(
+    collect_all_flush_plans(
       &state,
       offset_datetime_from_unix_millis(1_000),
       &config,
       None,
       &topics,
-      2,
     )
     .is_empty()
   );
@@ -487,13 +494,12 @@ fn shared_flag_keeps_independently_byte_triggered_work_local() {
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
 
-  let plans = collect_flush_plans(
+  let plans = collect_all_flush_plans(
     &state,
     offset_datetime_from_unix_millis(1_000),
     &config,
     Some(&flags.snapshot_watch()),
     &topics,
-    2,
   );
 
   assert_eq!(plans.len(), 2);
@@ -543,13 +549,12 @@ fn shared_time_flushes_order_topics_by_name() {
   ));
   let feature_flags = flags.snapshot_watch();
 
-  let plans = collect_flush_plans(
+  let plans = collect_all_flush_plans(
     &state,
     offset_datetime_from_unix_millis(1_000),
     &WriteConfig::with_defaults(),
     Some(&feature_flags),
     &topics,
-    2,
   );
 
   assert_eq!(plans.len(), 1);
@@ -565,7 +570,7 @@ fn shared_time_flushes_order_topics_by_name() {
 }
 
 #[test]
-fn shared_time_flushes_group_all_topics_before_applying_plan_limit() {
+fn shared_time_flushes_group_all_topics_in_one_plan() {
   let state = Arc::new(Mutex::new(WriteState::default()));
   let topic_info = |name: String| TopicInfo {
     name: name.into(),
@@ -601,13 +606,12 @@ fn shared_time_flushes_group_all_topics_before_applying_plan_limit() {
     DefaultFeatureFlags::default().with_bool_flag(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, true),
   ));
 
-  let plans = collect_flush_plans(
+  let plans = collect_all_flush_plans(
     &state,
     offset_datetime_from_unix_millis(1_000),
     &WriteConfig::with_defaults(),
     Some(&flags.snapshot_watch()),
     &topics,
-    4,
   );
 
   assert_eq!(plans.len(), 1);
@@ -656,13 +660,12 @@ fn shared_time_flush_excludes_draining_peer_partitions() {
     ("logs".into(), topic_info("logs")),
   ]);
 
-  let plans = collect_flush_plans(
+  let plans = collect_all_flush_plans(
     &state,
     offset_datetime_from_unix_millis(1_000),
     &WriteConfig::with_defaults(),
     Some(&flags.snapshot_watch()),
     &topics,
-    2,
   );
 
   assert_eq!(plans.len(), 2);

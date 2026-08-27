@@ -816,19 +816,11 @@ async fn run_producer(
     }
   }
 
-  match producer.flush().await {
-    Ok(()) => ProducerReport {
-      acknowledged_records,
-      retry_attempts,
-      retry_summary: producer_retry_summary(&producer),
-      error: None,
-    },
-    Err(error) => ProducerReport {
-      acknowledged_records,
-      retry_attempts,
-      retry_summary: producer_retry_summary(&producer),
-      error: Some(error.to_string()),
-    },
+  ProducerReport {
+    acknowledged_records,
+    retry_attempts,
+    retry_summary: producer_retry_summary(&producer),
+    error: None,
   }
 }
 

@@ -108,15 +108,6 @@ pub(super) struct TopicFlushPlan {
   pub(super) fenced_metadata_writes: bool,
 }
 
-impl TopicFlushPlan {
-  pub(super) fn is_time_triggered(&self) -> bool {
-    self
-      .partitions
-      .iter()
-      .all(|partition| matches!(partition.trigger, FlushTrigger::MaxDelay))
-  }
-}
-
 //
 // FlushPlan
 //
