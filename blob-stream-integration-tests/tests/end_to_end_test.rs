@@ -4212,6 +4212,7 @@ async fn shared_cross_topic_blob_pulls_forward_a_fresh_topic() -> Result<()> {
   })
   .await
   .map_err(|_| anyhow!("first topic write did not enter the broker buffer"))??;
+  broker_time.wait_until_sleeping(1).await;
   broker_time.advance(TimeDuration::milliseconds(900));
 
   let second_producer = Arc::clone(&producer);
