@@ -72,8 +72,9 @@ where that additional overlap is material.
 ## Calibration
 
 Use direct observed rates whenever available. The fallback segment and range-read estimates are for
-early sizing only: time-due broker flushes coalesce partitions by topic, and several consumer
-instances can select ranges from the same segment.
+early sizing only: time-due broker flushes coalesce partitions by topic, and, when cross-topic blobs
+are enabled, by locally buffered topic; several consumer instances can select ranges from the same
+segment.
 
 | Input | Meaning | Preferred source |
 | --- | --- | --- |

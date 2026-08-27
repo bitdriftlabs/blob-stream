@@ -35,7 +35,6 @@ pub(super) struct WriteMetrics {
   pub(super) flush_batches_max_delay_total: prometheus::IntCounter,
   pub(super) flush_batches_lease_drain_total: prometheus::IntCounter,
   pub(super) flush_partitions_total: prometheus::IntCounter,
-  pub(super) flush_plans_total: prometheus::IntCounter,
   pub(super) active_flush_plans: prometheus::IntGauge,
   pub(super) flush_failures_total: prometheus::IntCounter,
   pub(super) flush_latency_seconds: prometheus::Histogram,
@@ -66,7 +65,6 @@ impl WriteMetrics {
       flush_batches_max_delay_total: scope.counter("flush_batches_max_delay_total"),
       flush_batches_lease_drain_total: scope.counter("flush_batches_lease_drain_total"),
       flush_partitions_total: scope.counter("flush_partitions_total"),
-      flush_plans_total: scope.counter("flush_plans_total"),
       active_flush_plans: scope.gauge("active_flush_plans"),
       flush_failures_total: scope.counter("flush_failures_total"),
       flush_latency_seconds: scope.histogram("flush_latency_seconds"),
@@ -89,7 +87,6 @@ impl WriteMetrics {
   }
 
   pub(super) fn record_flush_plan_summary(&self, plans: &[FlushPlan]) {
-    self.flush_plans_total.inc_by(plans.len() as u64);
     for plan in plans {
       for topic_plan in &plan.topics {
         self
