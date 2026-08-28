@@ -35,14 +35,15 @@ blob ranges from broker caches, retrying direct storage only after a retryable b
 | Consumer reader | `blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads` | Live | Configures metadata consistency, prefetch capacity, and range-read concurrency. Non-`NOT_FOUND` broker blob failures retry the full affected group directly. |
 | Broker metadata-cache startup | `blob_stream_broker_metadata_recovery_cache_max_bytes`, `blob_stream_broker_metadata_cache_max_waiters_per_key`, `blob_stream_broker_metadata_cache_max_waiters`, `blob_stream_broker_metadata_cache_max_refills`, `blob_stream_broker_metadata_cache_max_request_partitions`, `blob_stream_broker_metadata_cache_max_response_items`, `blob_stream_broker_metadata_cache_max_response_bytes`, `blob_stream_broker_metadata_cache_max_entry_items` | Restart the broker | Overrides the internal cache defaults when a feature-flag loader is configured. Values must be positive; the per-key waiter limit cannot exceed the global waiter limit, and the response-byte limit is capped at the gRPC request maximum. |
 | Broker blob-cache startup | `blob_stream_broker_blob_cache_idle_ttl_ms` | Restart the broker | Sets positive idle retention for complete immutable blobs; absent means 10 seconds. The broker admits each object from its reported content length and current cgroup headroom before reading its body. Cgroup-aware memory admission can flush entries or disable cache admission without disabling direct consumer reads. |
-| Broker write path | `blob_stream_broker_flush_max_bytes`, `blob_stream_broker_flush_max_delay_ms`, `blob_stream_broker_max_segment_bytes` | Live | A time-due local partition always pulls every available buffered non-draining local topic section into bounded shared objects. Positive flush overrides apply at the next scheduler timer cycle; positive segment-cap overrides apply to future flush plans. Independently byte-triggered and lease-drain work remain local. |
+| Broker write path | `blob_stream_broker_flush_max_bytes`, `blob_stream_broker_flush_max_delay_ms`, `blob_stream_broker_max_segment_bytes` | Live | A time-due local partition always pulls every available buffered non-draining local topic section into bounded shared objects. Positive byte overrides and positive delay overrides no greater than `flush_max_delay` apply at the next scheduler timer cycle; invalid values retain static configuration. Positive segment-cap overrides apply to future flush plans. Independently byte-triggered and lease-drain work remain local. |
 | Consumer startup | `blob_stream_consumer_idle_poll_delay_ms`, `blob_stream_consumer_max_idle_poll_delay_ms`, `blob_stream_consumer_lease_duration_ms`, `blob_stream_consumer_heartbeat_interval_ms`, `blob_stream_consumer_rebalance_interval_ms` | Rebuild or restart the iterator | Changes local polling and consumer-group scheduling. Persistent lease state stores absolute expiry timestamps, so members may use different local durations. |
 | Producer startup | `blob_stream_producer_max_batch_records`, `blob_stream_producer_max_batch_bytes`, `blob_stream_producer_flush_max_delay_ms`, `blob_stream_producer_retry_base_delay_ms`, `blob_stream_producer_retry_max_delay_ms`, `blob_stream_producer_connect_timeout_ms`, `blob_stream_producer_request_timeout_ms`, `blob_stream_producer_max_request_concurrency`, `blob_stream_producer_compression` | Recreate or restart the producer | Changes local batching, retry, request, concurrency, and compression behavior. |
 
 Validate feature-flag rollouts against the configured fallback values. Missing or nonpositive broker
-write-path overrides retain the configured value. Invalid producer duration or integer overrides fail
-producer construction; invalid consumer startup duration overrides fail iterator construction. A
-running consumer continues with its already-applied startup settings.
+write-path overrides, and broker delay overrides above `flush_max_delay`, retain the configured
+value. Invalid producer duration or integer overrides fail producer construction; invalid consumer
+startup duration overrides fail iterator construction. A running consumer continues with its
+already-applied startup settings.
 
 ## HTTP Endpoints
 
@@ -61,9 +62,9 @@ filter such as `blob_stream=debug,bd=debug`; use trace only for targeted investi
 
 ## Reading Broker State
 
-`/admin/state` includes the snapshot timestamp, local holder ID and writer ID, active flush limits,
-configured and effective segment-byte caps, the effective shared-object setting, and discovered
-membership. Its ownership list covers writer-scoped partitions and reports the planned
+`/admin/state` includes the snapshot timestamp, local holder ID and writer ID, configured and
+effective flush limits, configured and effective segment-byte caps, and discovered membership. Its
+ownership list covers writer-scoped partitions and reports the planned
 broker, whether the assignment is local, the observed producer lease, and one of these statuses:
 
 - `local_active`: this broker holds the active lease.

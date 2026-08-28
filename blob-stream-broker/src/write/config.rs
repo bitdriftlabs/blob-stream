@@ -215,18 +215,17 @@ impl WriteConfig {
     let max_delay = i64::try_from(delay_milliseconds)
       .ok()
       .filter(|milliseconds| *milliseconds > 0)
-      .map_or_else(
-        || {
-          warn_every!(
-            15.seconds(),
-            "broker flush max delay override must be a positive millisecond value; using \
-             configured value {}",
-            self.flush_max_delay
-          );
+      .map(Duration::milliseconds)
+      .filter(|delay| *delay <= self.flush_max_delay)
+      .unwrap_or_else(|| {
+        warn_every!(
+          15.seconds(),
+          "broker flush max delay override must be positive and no greater than configured delay \
+           {}; using configured value",
           self.flush_max_delay
-        },
-        Duration::milliseconds,
-      );
+        );
+        self.flush_max_delay
+      });
 
     EffectiveFlushConfig {
       max_bytes,

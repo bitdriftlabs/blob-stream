@@ -142,18 +142,24 @@ fn flush_runtime_overrides_default_to_configured_values() {
 }
 
 #[test]
-fn zero_flush_runtime_overrides_use_configured_values() {
+fn invalid_flush_runtime_overrides_use_configured_values() {
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 8 * 1024 * 1024;
   config.flush_max_delay = Duration::milliseconds(250);
-  let overrides = FakeLoader::new(Arc::new(
+  let zero_overrides = FakeLoader::new(Arc::new(
     DefaultFeatureFlags::default()
       .with_integer_flag(FLUSH_MAX_BYTES_FEATURE_FLAG, 0)
       .with_integer_flag(FLUSH_MAX_DELAY_FEATURE_FLAG, 0),
   ));
+  let over_limit_delay = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(FLUSH_MAX_DELAY_FEATURE_FLAG, 500),
+  ));
 
-  let flush_config = config.effective_flush_config(Some(&overrides.snapshot_watch()));
+  let flush_config = config.effective_flush_config(Some(&zero_overrides.snapshot_watch()));
   assert_eq!(flush_config.max_bytes, config.flush_max_bytes);
+  assert_eq!(flush_config.max_delay, config.flush_max_delay);
+
+  let flush_config = config.effective_flush_config(Some(&over_limit_delay.snapshot_watch()));
   assert_eq!(flush_config.max_delay, config.flush_max_delay);
 }
 
