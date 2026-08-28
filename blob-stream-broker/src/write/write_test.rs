@@ -1816,10 +1816,6 @@ async fn flush_trigger_and_uploaded_object_metrics_are_recorded() -> Result<()> 
     metrics.contains("blob_stream_broker_test:write:flush_uploaded_object_bytes_total"),
     "{metrics}"
   );
-  assert!(
-    metrics.contains("blob_stream_broker_test:write:metadata_publication_latency_seconds_count 2"),
-    "{metrics}"
-  );
   Ok(())
 }
 
@@ -1884,10 +1880,6 @@ async fn metadata_publication_timeout_records_deadline_metric() -> Result<()> {
       "blob_stream_broker_test:write:\
        metadata_publication_deadline_exhausted_while_persisting_total 1"
     ),
-    "{metrics}"
-  );
-  assert!(
-    metrics.contains("blob_stream_broker_test:write:metadata_publication_latency_seconds_count 1"),
     "{metrics}"
   );
   Ok(())

@@ -14,39 +14,13 @@ use anyhow::anyhow;
 use bd_log_util::warn_every;
 use blob_stream_broker_discovery::BrokerMembership;
 use blob_stream_proto::protos::blobstream::v1::broker::{ProduceBatchesRequest, ProduceStatus};
+use futures::stream::{FuturesUnordered, StreamExt};
 use protobuf::Chars;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use time::ext::NumericalDuration;
-use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
-
-pub(super) async fn dispatch_group_and_notify(
-  config: &ProducerConfig,
-  topics: &HashMap<Chars, ProducerTopicConfig>,
-  routes: &ProducerRoutes,
-  membership_rx: &watch::Receiver<BrokerMembership>,
-  transport: &Arc<dyn BrokerTransport>,
-  metrics: &Arc<ProducerMetrics>,
-  retry_diagnostics: &ProducerRetryDiagnostics,
-  retry_clock: &Arc<dyn ProducerRetryClock>,
-  dispatch_permit: OwnedSemaphorePermit,
-  group: BrokerBatchGroup,
-) -> Result<(), ProducerError> {
-  send_grouped_batches_and_notify(
-    config,
-    topics,
-    routes,
-    membership_rx,
-    transport.as_ref(),
-    metrics,
-    retry_diagnostics,
-    retry_clock.as_ref(),
-    dispatch_permit,
-    group,
-  )
-  .await
-}
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 pub(super) fn notify_unassigned_batches(
   metrics: &ProducerMetrics,
@@ -73,7 +47,7 @@ fn notify_waiters(
   }
 }
 
-async fn send_grouped_batches_and_notify(
+pub(super) async fn send_grouped_batches_and_notify(
   config: &ProducerConfig,
   topics: &HashMap<Chars, ProducerTopicConfig>,
   routes: &ProducerRoutes,
@@ -82,12 +56,13 @@ async fn send_grouped_batches_and_notify(
   metrics: &ProducerMetrics,
   retry_diagnostics: &ProducerRetryDiagnostics,
   retry_clock: &dyn ProducerRetryClock,
-  dispatch_permit: OwnedSemaphorePermit,
+  dispatch_task_permit: OwnedSemaphorePermit,
+  initial_request_permit: OwnedSemaphorePermit,
+  request_permits: Arc<Semaphore>,
   group: BrokerBatchGroup,
 ) -> Result<(), ProducerError> {
-  // TODO: Split task admission from an RPC-only permit if backoff should release task capacity.
-  // Today this permit intentionally bounds all preparation, requests, and retries for the task.
-  let _dispatch_permit = dispatch_permit;
+  // The task permit bounds retained group work while request permits bound active transport calls.
+  let _dispatch_task_permit = dispatch_task_permit;
   let retry_started_at = retry_clock.now();
 
   // The grouped RPC amortizes transport overhead, but each response remains an independent
@@ -103,6 +78,7 @@ async fn send_grouped_batches_and_notify(
         .expect("producer config validation requires a positive retry deadline"),
     );
   let response = {
+    let _initial_request_permit = initial_request_permit;
     let _active_request = bd_server_stats::stats::StackAutoGauge::new(&metrics.active_requests);
     tokio::time::timeout(
       request_timeout,
@@ -178,24 +154,32 @@ async fn send_grouped_batches_and_notify(
     }
   }
 
-  // A group holds one task-admission permit, so retry sequentially to keep that permit as the
-  // concurrency bound for all RPC attempts rather than fan out requests from one admitted task.
+  // Retry futures remain owned by this bounded dispatch task. Each future acquires request
+  // capacity independently, so one retryable batch cannot block sibling retry admission.
+  let mut retries = FuturesUnordered::new();
   for (batch, initial_response) in retryable_batches {
-    let result = send_batch_with_retry(
-      config,
-      topics,
-      routes,
-      membership_rx,
-      transport,
-      &batch,
-      metrics,
-      retry_diagnostics,
-      initial_response,
-      1,
-      retry_clock,
-      retry_started_at,
-    )
-    .await;
+    let request_permits = Arc::clone(&request_permits);
+    retries.push(async move {
+      let result = send_batch_with_retry(
+        config,
+        topics,
+        routes,
+        membership_rx,
+        transport,
+        &batch,
+        metrics,
+        retry_diagnostics,
+        &request_permits,
+        initial_response,
+        1,
+        retry_clock,
+        retry_started_at,
+      )
+      .await;
+      (batch, result)
+    });
+  }
+  while let Some((batch, result)) = retries.next().await {
     notify_waiters(batch.waiters, &result);
     remember_first_error(&mut first_error, result);
   }

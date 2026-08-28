@@ -54,7 +54,7 @@ pub use diagnostics::{
   ProducerStateSnapshot,
   ProducerTopicSnapshot,
 };
-use dispatch::{dispatch_group_and_notify, notify_unassigned_batches};
+use dispatch::{notify_unassigned_batches, send_grouped_batches_and_notify};
 use log::{debug, trace};
 use metrics::ProducerMetrics;
 use parking_lot::Mutex;
@@ -321,7 +321,8 @@ impl ProducerClientImpl {
       max_request_concurrency > 0,
       "producer max request concurrency must be positive"
     );
-    let dispatch_permits = Arc::new(Semaphore::new(max_request_concurrency));
+    let dispatch_task_permits = Arc::new(Semaphore::new(max_request_concurrency));
+    let request_permits = Arc::new(Semaphore::new(max_request_concurrency));
     let flush_notify = Arc::new(Notify::new());
 
     log::info!(
@@ -344,7 +345,8 @@ impl ProducerClientImpl {
       retry_diagnostics.clone(),
       Arc::clone(&retry_clock),
       routes.clone(),
-      Arc::clone(&dispatch_permits),
+      Arc::clone(&dispatch_task_permits),
+      Arc::clone(&request_permits),
       Arc::clone(&flush_notify),
     );
 
@@ -374,7 +376,8 @@ impl ProducerClientImpl {
     retry_diagnostics: ProducerRetryDiagnostics,
     retry_clock: Arc<dyn ProducerRetryClock>,
     routes: ProducerRoutes,
-    dispatch_permits: Arc<Semaphore>,
+    dispatch_task_permits: Arc<Semaphore>,
+    request_permits: Arc<Semaphore>,
     flush_notify: Arc<Notify>,
   ) -> JoinHandle<()> {
     // Every flush trigger drains and packs all buffered partitions, maximizing each broker-scoped
@@ -387,7 +390,7 @@ impl ProducerClientImpl {
       let flush_sleep = tokio::time::sleep(flush_delay);
       tokio::pin!(flush_sleep);
       // Keep dispatches owned by the flush task so producer shutdown cancels RPCs and retries.
-      // A task owns its admission permit until terminal waiter notification, bounding spawned work.
+      // The task permit bounds dispatch lifetimes; request permits bound active transport calls.
       let mut dispatches = JoinSet::new();
       let mut membership_closed = false;
 
@@ -450,9 +453,15 @@ impl ProducerClientImpl {
 
         // Acquire a task slot before removing the next ready group. The ready broker FIFO keeps
         // unsent work in ProducerState, so no batch must be reconstructed after admission fails.
-        while let Ok(permit) = Arc::clone(&dispatch_permits).try_acquire_owned() {
+        while let Ok(dispatch_task_permit) = Arc::clone(&dispatch_task_permits).try_acquire_owned()
+        {
+          let Ok(initial_request_permit) = Arc::clone(&request_permits).try_acquire_owned() else {
+            drop(dispatch_task_permit);
+            break;
+          };
           let Some(group) = state.lock().take_next_ready_group() else {
-            drop(permit);
+            drop(initial_request_permit);
+            drop(dispatch_task_permit);
             break;
           };
           let config = config.clone();
@@ -463,17 +472,20 @@ impl ProducerClientImpl {
           let metrics = Arc::clone(&metrics);
           let retry_diagnostics = retry_diagnostics.clone();
           let retry_clock = Arc::clone(&retry_clock);
+          let request_permits = Arc::clone(&request_permits);
           dispatches.spawn(async move {
-            dispatch_group_and_notify(
+            send_grouped_batches_and_notify(
               &config,
               &topics,
               &routes,
               &membership_rx,
-              &transport,
+              transport.as_ref(),
               &metrics,
               &retry_diagnostics,
-              &retry_clock,
-              permit,
+              retry_clock.as_ref(),
+              dispatch_task_permit,
+              initial_request_permit,
+              request_permits,
               group,
             )
             .await

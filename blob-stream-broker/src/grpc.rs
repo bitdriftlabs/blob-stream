@@ -51,7 +51,6 @@ struct BrokerGrpcMetrics {
   request_timeouts_total: prometheus::IntCounter,
   active_batches: prometheus::IntGauge,
   request_latency_seconds: prometheus::Histogram,
-  grouped_request_batches: prometheus::Histogram,
   grouped_request_latency_seconds: prometheus::Histogram,
 }
 
@@ -70,7 +69,6 @@ impl BrokerGrpcMetrics {
       request_timeouts_total: scope.counter("request_timeouts_total"),
       active_batches: scope.gauge("active_batches"),
       request_latency_seconds: scope.histogram("request_latency_seconds"),
-      grouped_request_batches: scope.histogram("grouped_request_batches"),
       grouped_request_latency_seconds: scope.histogram("grouped_request_latency_seconds"),
     }
   }
@@ -290,8 +288,6 @@ impl Handler<ProduceBatchesRequest, ProduceBatchesResponse> for BrokerGrpc {
   ) -> bd_grpc::error::Result<ProduceBatchesResponse> {
     self.metrics.rpc_requests_total.inc();
     let started = Instant::now();
-    let batch_count = u32::try_from(request.batches.len())
-      .expect("decoded grouped request batch count fits in u32");
     // The decoded request is byte-bounded. Start every logical batch together while join_all
     // retains the request order required by the producer response.
     let results = join_all(
@@ -301,10 +297,6 @@ impl Handler<ProduceBatchesRequest, ProduceBatchesResponse> for BrokerGrpc {
         .map(|batch| self.handle_batch(batch)),
     )
     .await;
-    self
-      .metrics
-      .grouped_request_batches
-      .observe(f64::from(batch_count));
     self
       .metrics
       .grouped_request_latency_seconds

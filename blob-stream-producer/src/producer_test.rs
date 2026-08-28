@@ -941,6 +941,7 @@ async fn bad_request_status_is_terminal_in_retry_path() {
   let membership = watch::channel(membership()).1;
   let topics = HashMap::from([("telemetry".into(), topic_config())]);
   let routes = ProducerRoutes::new(&config, &topics, &membership.borrow());
+  let request_permits = Arc::new(Semaphore::new(1));
   let batch = BufferedBatch {
     topic: "telemetry".into(),
     virtual_partition_id: 16,
@@ -957,6 +958,7 @@ async fn bad_request_status_is_terminal_in_retry_path() {
     &batch,
     &super::ProducerMetrics::new(&metrics_scope()),
     &super::ProducerRetryDiagnostics::default(),
+    &request_permits,
     Some(ProduceBatchResponse {
       status: ProduceStatus::PRODUCE_STATUS_BAD_REQUEST.into(),
       error_message: "record batch is empty".into(),
@@ -1015,6 +1017,7 @@ async fn not_lease_holder_waits_longer_when_membership_is_unchanged() {
   let membership = watch::channel(membership()).1;
   let topics = HashMap::from([("telemetry".into(), topic_config())]);
   let routes = ProducerRoutes::new(&config, &topics, &membership.borrow());
+  let request_permits = Arc::new(Semaphore::new(1));
   let batch = BufferedBatch {
     topic: "telemetry".into(),
     virtual_partition_id: 16,
@@ -1031,6 +1034,7 @@ async fn not_lease_holder_waits_longer_when_membership_is_unchanged() {
     &batch,
     &super::ProducerMetrics::new(&metrics_scope()),
     &super::ProducerRetryDiagnostics::default(),
+    &request_permits,
     None,
     0,
     &clock,
@@ -1820,7 +1824,7 @@ async fn background_flush_dispatches_distinct_partition_batches_concurrently() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn background_flush_retries_grouped_batches_sequentially_within_one_admitted_task() {
+async fn background_flush_retries_grouped_batches_in_parallel_within_one_admitted_task() {
   let mut config = default_config();
   config.max_batch_records = Some(2);
   config.flush_max_delay = TimeDuration::milliseconds(10).into_proto();
@@ -1852,16 +1856,13 @@ async fn background_flush_retries_grouped_batches_sequentially_within_one_admitt
     .recv()
     .await
     .expect("first retry should enter transport");
-  assert!(retry_entered_rx.try_recv().is_err());
-
-  release.add_permits(1);
-  let second_retry = retry_entered_rx
-    .recv()
+  let second_retry = timeout(Duration::from_millis(10), retry_entered_rx.recv())
     .await
-    .expect("second retry should enter after the first retry completes");
+    .expect("second retry should enter before either retry completes")
+    .expect("second retry sender remains open");
   assert_ne!(first_retry, second_retry);
 
-  release.add_permits(1);
+  release.add_permits(2);
   for pending_produce in pending_produces {
     pending_produce.await.unwrap().unwrap();
   }
@@ -2292,6 +2293,12 @@ struct MembershipUpdateRetryClock {
   update: parking_lot::Mutex<Option<(watch::Sender<BrokerMembership>, BrokerMembership)>>,
 }
 
+struct GatedRetryClock {
+  now: Instant,
+  sleep_started_tx: mpsc::UnboundedSender<Duration>,
+  release: Arc<Semaphore>,
+}
+
 impl MembershipUpdateRetryClock {
   fn new(membership_tx: watch::Sender<BrokerMembership>, membership: BrokerMembership) -> Self {
     Self {
@@ -2313,6 +2320,26 @@ impl ProducerRetryClock for MembershipUpdateRetryClock {
         .send(membership)
         .expect("membership receiver remains open");
     }
+  }
+}
+
+#[async_trait]
+impl ProducerRetryClock for GatedRetryClock {
+  fn now(&self) -> Instant {
+    self.now
+  }
+
+  async fn sleep(&self, duration: Duration) {
+    self
+      .sleep_started_tx
+      .send(duration)
+      .expect("retry sleep receiver remains open");
+    self
+      .release
+      .acquire()
+      .await
+      .expect("retry sleep gate remains open")
+      .forget();
   }
 }
 
@@ -2374,6 +2401,7 @@ async fn retry_deadline_clips_the_retry_delay() {
   let membership = watch::channel(membership()).1;
   let topics = HashMap::from([("telemetry".into(), topic_config())]);
   let routes = ProducerRoutes::new(&config, &topics, &membership.borrow());
+  let request_permits = Arc::new(Semaphore::new(1));
   let batch = BufferedBatch {
     topic: "telemetry".into(),
     virtual_partition_id: 16,
@@ -2390,6 +2418,7 @@ async fn retry_deadline_clips_the_retry_delay() {
     &batch,
     &super::ProducerMetrics::new(&metrics_scope()),
     &super::ProducerRetryDiagnostics::default(),
+    &request_permits,
     None,
     0,
     &clock,
@@ -2400,4 +2429,103 @@ async fn retry_deadline_clips_the_retry_delay() {
   assert!(matches!(result, Err(ProducerError::RetriesExhausted(_))));
   assert_eq!(transport.sent.lock().await.len(), 1);
   assert_eq!(*clock.sleeps.lock(), vec![Duration::from_millis(10)]);
+}
+
+#[tokio::test]
+async fn retry_deadline_bounds_request_permit_wait() {
+  let mut config = default_config();
+  config.retry_deadline = TimeDuration::milliseconds(10).into_proto();
+
+  let transport = FakeBrokerTransport::default();
+  let clock = FixedRetryClock::new(Instant::now());
+  let membership = watch::channel(membership()).1;
+  let topics = HashMap::from([("telemetry".into(), topic_config())]);
+  let routes = ProducerRoutes::new(&config, &topics, &membership.borrow());
+  let request_permits = Arc::new(Semaphore::new(1));
+  let _held_request_permit = Arc::clone(&request_permits)
+    .acquire_owned()
+    .await
+    .expect("request permit is available");
+  let batch = BufferedBatch {
+    topic: "telemetry".into(),
+    virtual_partition_id: 16,
+    records: Vec::new(),
+    waiters: Vec::new(),
+  };
+
+  let result = send_batch_with_retry(
+    &config,
+    &topics,
+    &routes,
+    &membership,
+    &transport,
+    &batch,
+    &super::ProducerMetrics::new(&metrics_scope()),
+    &super::ProducerRetryDiagnostics::default(),
+    &request_permits,
+    None,
+    0,
+    &clock,
+    clock.now(),
+  )
+  .await;
+
+  assert!(matches!(result, Err(ProducerError::RetriesExhausted(_))));
+  assert!(transport.sent.lock().await.is_empty());
+  assert_eq!(*clock.sleeps.lock(), vec![Duration::from_millis(10)]);
+}
+
+#[tokio::test]
+async fn retry_releases_request_permit_before_backoff() {
+  let config = default_config();
+  let transport = FakeBrokerTransport::default();
+  transport
+    .enqueue_response(Err(anyhow!("network down")))
+    .await;
+  let (sleep_started_tx, mut sleep_started_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let clock = GatedRetryClock {
+    now: Instant::now(),
+    sleep_started_tx,
+    release: Arc::clone(&release),
+  };
+  let membership = watch::channel(membership()).1;
+  let topics = HashMap::from([("telemetry".into(), topic_config())]);
+  let routes = ProducerRoutes::new(&config, &topics, &membership.borrow());
+  let request_permits = Arc::new(Semaphore::new(1));
+  let batch = BufferedBatch {
+    topic: "telemetry".into(),
+    virtual_partition_id: 16,
+    records: Vec::new(),
+    waiters: Vec::new(),
+  };
+  let metrics = super::ProducerMetrics::new(&metrics_scope());
+  let retry_diagnostics = super::ProducerRetryDiagnostics::default();
+
+  let retry = send_batch_with_retry(
+    &config,
+    &topics,
+    &routes,
+    &membership,
+    &transport,
+    &batch,
+    &metrics,
+    &retry_diagnostics,
+    &request_permits,
+    None,
+    0,
+    &clock,
+    clock.now(),
+  );
+  tokio::pin!(retry);
+  tokio::select! {
+    result = &mut retry => panic!("retry ended before backoff: {result:?}"),
+    Some(_) = sleep_started_rx.recv() => {},
+  }
+
+  assert_eq!(request_permits.available_permits(), 1);
+  assert_eq!(transport.sent.lock().await.len(), 1);
+  release.add_permits(1);
+  assert!(retry.await.is_ok());
+  assert_eq!(transport.sent.lock().await.len(), 2);
 }

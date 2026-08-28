@@ -1,4 +1,5 @@
 load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("//tools/lint:linters.bzl", "rust_binary")
 load("//tools/rust:tests.bzl", "rust_library_with_test")
 
@@ -35,4 +36,19 @@ rust_binary(
     crate_root = "src/bin/blob_stream_stress.rs",
     edition = "2024",
     deps = all_crate_deps(normal = True) + [":blob-stream-integration-tests"],
+)
+
+sh_binary(
+    name = "blob-stream-stress-itest",
+    srcs = ["blob_stream_stress_itest.sh"],
+    args = [
+        "$(location :blob-stream-stress)",
+        "$(location //tools/itest:pool-service)",
+        "$(location //tools/itest:wait-for-service)",
+    ],
+    data = [
+        ":blob-stream-stress",
+        "//tools/itest:pool-service",
+        "//tools/itest:wait-for-service",
+    ],
 )

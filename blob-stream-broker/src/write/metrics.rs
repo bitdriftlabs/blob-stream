@@ -2,7 +2,6 @@ use super::buffer::{FlushPlan, FlushTrigger};
 use super::{WriteError, WriteResponse};
 use bd_server_stats::stats::Scope;
 use blob_stream_types::SeqRange;
-use std::time::Instant;
 
 const UPLOADED_OBJECT_SIZE_BUCKETS_BYTES: &[f64] = &[
   64.0 * 1024.0,
@@ -38,7 +37,6 @@ pub(super) struct WriteMetrics {
   pub(super) active_flush_plans: prometheus::IntGauge,
   pub(super) flush_failures_total: prometheus::IntCounter,
   pub(super) flush_latency_seconds: prometheus::Histogram,
-  pub(super) metadata_publication_latency_seconds: prometheus::Histogram,
   pub(super) metadata_publication_deadline_exhausted_before_persistence_total:
     prometheus::IntCounter,
   pub(super) metadata_publication_deadline_exhausted_while_persisting_total: prometheus::IntCounter,
@@ -68,7 +66,6 @@ impl WriteMetrics {
       active_flush_plans: scope.gauge("active_flush_plans"),
       flush_failures_total: scope.counter("flush_failures_total"),
       flush_latency_seconds: scope.histogram("flush_latency_seconds"),
-      metadata_publication_latency_seconds: scope.histogram("metadata_publication_latency_seconds"),
       metadata_publication_deadline_exhausted_before_persistence_total: scope
         .counter("metadata_publication_deadline_exhausted_before_persistence_total"),
       metadata_publication_deadline_exhausted_while_persisting_total: scope
@@ -192,12 +189,6 @@ impl WriteMetrics {
     self
       .flush_uploaded_object_bytes
       .observe(payload_bytes as f64);
-  }
-
-  pub(super) fn record_metadata_publication_latency(&self, started_at: Instant) {
-    self
-      .metadata_publication_latency_seconds
-      .observe(started_at.elapsed().as_secs_f64());
   }
 
   pub(super) fn record_metadata_publication_deadline_exhausted_before_persistence(&self) {

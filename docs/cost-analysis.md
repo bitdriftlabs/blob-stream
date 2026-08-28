@@ -79,7 +79,7 @@ segment.
 | Input | Meaning | Preferred source |
 | --- | --- | --- |
 | `s_seg_per_hour` | Segment metadata publications and S3 object writes per hour | `write:flush_uploaded_objects_total` delta |
-| `s_range_read_per_hour` | S3 range requests per hour | `reader:blob_range_requests` delta |
+| `s_range_read_per_hour` | S3 range requests per hour | `reader:fallback_blob_range_requests` delta |
 | `recovery_window_queries_per_hour` | Fresh/Recovering metadata window queries before pagination | `reader:metadata_recovery_scan_requests` delta |
 | `consumer_partition_claims_per_hour` | Lease claims caused by actual assignment changes | `consumer:lease_claims_*` deltas |
 | `consumer_cursor_commits_per_hour` | Explicit cursor-only commits outside scheduled heartbeats | `consumer:cursor_commit_partitions` delta |
@@ -93,7 +93,7 @@ Collect a steady interval and a peak/recovery interval using the same time range
 DynamoDB capacity, and regional prices. Compare the model with:
 
 - `reader:metadata_fast_scan_requests` and `reader:metadata_recovery_scan_requests`
-- `reader:blob_range_requests` and `reader:blob_range_bytes`
+- `reader:fallback_blob_range_requests` and `reader:fallback_blob_range_bytes`
 - `write:flush_uploaded_objects_total` and `write:flush_uploaded_object_bytes_total`
 - `dynamo:read_request_units_total` and `dynamo:write_request_units_total`
 - CloudWatch/billing data for S3 request counts, storage, and transfer

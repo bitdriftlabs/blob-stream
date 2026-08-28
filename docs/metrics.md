@@ -58,11 +58,9 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 | `metadata_fast_scan_without_lower_bound` | Counter | Fast scans that could not use a derived metadata lower bound. |
 | `metadata_segments_deferred_by_visibility_delay` | Counter | Segment rows deferred by the eventual-read visibility maturity delay. Strong reads accept every validated row and do not increment this counter. |
 | `metadata_batches_scanned`, `metadata_batches_skipped_by_cursor` | Counters | Batches decoded from metadata and batches skipped because the committed cursor had already passed them. |
-| `blob_range_requests`, `blob_range_bytes`, `blob_range_latency_seconds` | Counters, histogram | S3/object-store byte-range reads, bytes read, and range-read latency. |
-| `blob_batch_ranges`, `blob_batch_range_bytes` | Counters | Byte ranges planned for individual encoded batches and their total bytes. |
-| `broker_blob_range_attempts`, `broker_blob_range_deliveries`, `broker_blob_range_delivery_items`, `broker_blob_range_delivery_bytes`, `broker_blob_range_latency_seconds` | Counters, counter, counters, counter, histogram | Broker raw-blob group attempts, validated broker deliveries, delivered ranges and bytes, and broker delivery latency. Direct range metrics remain unchanged and increment only when a direct object-store range read occurs. |
-| `broker_blob_range_not_found_groups`, `broker_blob_range_not_found_items` | Counters | Authoritative immutable-object absences accepted without a direct retry. |
-| `broker_blob_range_fallbacks` | Counter | Broker range groups retried through the original direct object-store reads after any non-authoritative transport, protocol, timeout, admission, or storage failure. |
+| `broker_blob_range_requests`, `broker_blob_range_successes`, `broker_blob_range_bytes`, `broker_blob_range_latency_seconds` | Counters, counter, counter, histogram | Broker raw-blob group requests, validated successes, delivered bytes, and successful broker delivery latency. |
+| `broker_blob_range_fallbacks`, `broker_blob_range_not_found_groups` | Counters | Broker groups retried through direct object-store reads after an unusable response, and authoritative immutable-object absences accepted without a direct retry. Together with successes, these are the terminal outcomes of broker requests. |
+| `fallback_blob_range_requests`, `fallback_blob_range_bytes`, `fallback_blob_range_latency_seconds` | Counters, counter, histogram | Direct object-store range reads, bytes, and latency after a broker group falls back. One fallback group can produce multiple direct range reads. |
 | `batches_read`, `records_read`, `record_payload_bytes` | Counters | Decoded batches, records, and uncompressed record payload bytes accepted by the reader. |
 | `lost_records` | Counter | Records dropped because a requested historical position cannot be recovered from retained data. |
 
@@ -160,7 +158,6 @@ only when whole-object overfetch and broker resource use remain acceptable.
 | `flush_partitions_total`, `flush_batches_total` | Counters | Partition plans and producer batches included in flushes. |
 | `flush_batches_max_bytes_total`, `flush_batches_max_delay_total`, `flush_batches_lease_drain_total` | Counters | Flushed batches classified by size, delay, or lease-drain trigger. |
 | `flush_failures_total`, `flush_latency_seconds` | Counter, histogram | Failed flushes and complete flush latency. |
-| `metadata_publication_latency_seconds` | Histogram | Time spent persisting segment metadata after blob upload. |
 | `metadata_publication_deadline_exhausted_before_persistence_total`, `metadata_publication_deadline_exhausted_while_persisting_total` | Counters | Publication deadlines exhausted before metadata persistence begins or while it is in progress. Both fail the flush. |
 | `flush_uploaded_objects_total`, `flush_oversized_single_partition_objects_total` | Counters | Uploaded immutable objects and objects containing one partition that exceeded `max_segment_bytes` and could not be split. |
 | `flush_uploaded_object_bytes_total`, `flush_uploaded_object_bytes` | Counter, histogram | Total bytes uploaded and per-object upload size. |

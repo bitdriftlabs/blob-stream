@@ -30,10 +30,11 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 use log::{debug, trace};
 use protobuf::Chars;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use time::Duration as TimeDuration;
 use time::ext::NumericalDuration;
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::Instant;
 
 const NOT_LEASE_HOLDER_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
@@ -49,6 +50,7 @@ pub(super) async fn send_batch_with_retry(
   batch: &BufferedBatch,
   metrics: &ProducerMetrics,
   retry_diagnostics: &ProducerRetryDiagnostics,
+  request_permits: &Arc<Semaphore>,
   initial_response: Option<ProduceBatchResponse>,
   completed_attempts: u32,
   retry_clock: &dyn ProducerRetryClock,
@@ -71,17 +73,12 @@ pub(super) async fn send_batch_with_retry(
   loop {
     let remaining = retry_deadline.saturating_duration_since(retry_clock.now());
     if remaining.is_zero() {
-      metrics.failures.inc();
-      metrics.send_latency_seconds.observe(
-        retry_clock
-          .now()
-          .duration_since(retry_started_at)
-          .as_secs_f64(),
-      );
-      return Err(ProducerError::RetriesExhausted(format!(
-        "retry deadline of {} ms elapsed",
-        producer_retry_deadline(config).whole_milliseconds()
-      )));
+      return Err(retry_deadline_exhausted(
+        config,
+        metrics,
+        retry_clock,
+        retry_started_at,
+      ));
     }
 
     let (broker_node_id, broker_address) = routes
@@ -150,15 +147,26 @@ pub(super) async fn send_batch_with_retry(
         "send attempt: topic={}, virtual_partition_id={}, attempt={}, broker={}",
         batch.topic, batch.virtual_partition_id, completed_attempts, broker_address
       );
-      send_single_batch_request(
+      let request_permit = acquire_request_permit(
+        request_permits,
+        config,
+        metrics,
+        retry_clock,
+        retry_deadline,
+        retry_started_at,
+      )
+      .await?;
+      let response = send_single_batch_request(
         config,
         transport,
         &broker_address,
         batch,
         metrics,
-        remaining,
+        retry_deadline.saturating_duration_since(retry_clock.now()),
       )
-      .await
+      .await;
+      drop(request_permit);
+      response
     };
     let (current_error, retry_reason) = match response {
       Ok(response) => {
@@ -248,6 +256,56 @@ pub(super) async fn send_batch_with_retry(
       retry_clock.sleep(delay).await;
     }
   }
+}
+
+async fn acquire_request_permit(
+  request_permits: &Arc<Semaphore>,
+  config: &ProducerConfig,
+  metrics: &ProducerMetrics,
+  retry_clock: &dyn ProducerRetryClock,
+  retry_deadline: Instant,
+  retry_started_at: Instant,
+) -> Result<OwnedSemaphorePermit, ProducerError> {
+  let remaining = retry_deadline.saturating_duration_since(retry_clock.now());
+  if remaining.is_zero() {
+    return Err(retry_deadline_exhausted(
+      config,
+      metrics,
+      retry_clock,
+      retry_started_at,
+    ));
+  }
+  tokio::select! {
+    biased;
+    permit = Arc::clone(request_permits).acquire_owned() => {
+      permit.map_err(|_| ProducerError::Shutdown)
+    },
+    () = retry_clock.sleep(remaining) => Err(retry_deadline_exhausted(
+      config,
+      metrics,
+      retry_clock,
+      retry_started_at,
+    )),
+  }
+}
+
+fn retry_deadline_exhausted(
+  config: &ProducerConfig,
+  metrics: &ProducerMetrics,
+  retry_clock: &dyn ProducerRetryClock,
+  retry_started_at: Instant,
+) -> ProducerError {
+  metrics.failures.inc();
+  metrics.send_latency_seconds.observe(
+    retry_clock
+      .now()
+      .duration_since(retry_started_at)
+      .as_secs_f64(),
+  );
+  ProducerError::RetriesExhausted(format!(
+    "retry deadline of {} ms elapsed",
+    producer_retry_deadline(config).whole_milliseconds()
+  ))
 }
 
 /// Account for a successful logical batch and build the acknowledgement for all of its records.

@@ -144,8 +144,10 @@ changing capacity or routing.
 
 ### Broker Blob Delivery Falls Back
 
-1. Compare consumer `broker_blob_range_attempts`, `broker_blob_range_deliveries`, and
-   `broker_blob_range_fallbacks` with direct `blob_range_requests` and `blob_range_bytes`.
+1. Compare `broker_blob_range_requests` with the sum of `broker_blob_range_successes`,
+   `broker_blob_range_fallbacks`, and `broker_blob_range_not_found_groups`. Compare
+   `broker_blob_range_bytes` with direct `fallback_blob_range_bytes`; one fallback group can
+   result in multiple `fallback_blob_range_requests`.
 2. Inspect broker `blob_cache` overloads, storage failures, pressure flushes, retained bytes, and
    whole-object fetch volume. Check `/admin/blob-cache` for headroom and active fetches.
 3. Verify broker discovery returns only healthy local brokers and that the broker has

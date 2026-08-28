@@ -57,13 +57,7 @@ impl ConsumerReaderImpl {
     };
     self
       .metrics
-      .record_blob_range(blob_read_started_at, payload.len());
-    let selected_bytes = candidates.iter().fold(0_u64, |total, candidate| {
-      total.saturating_add(candidate.batch_metadata.byte_range.len())
-    });
-    self
-      .metrics
-      .record_blob_batch_ranges(candidates.len(), selected_bytes);
+      .record_fallback_blob_range(blob_read_started_at, payload.len());
 
     self.decode_segment_plan_payload(
       SegmentReadPlan {
