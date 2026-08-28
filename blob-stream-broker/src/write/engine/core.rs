@@ -232,6 +232,7 @@ impl WriteEngineImpl {
     let time_provider = Arc::clone(&self.time_provider);
     let metrics = self.metrics.clone();
     let feature_flags = self.feature_flags.clone();
+    let mut feature_flag_changes = feature_flags.clone();
     let effective_flush_config = Arc::clone(&self.effective_flush_config);
     let flush_notifier = Arc::clone(&self.flush_notifier);
     let mut shutdown = self.shutdown_trigger_handle.make_shutdown();
@@ -243,6 +244,7 @@ impl WriteEngineImpl {
         Box::pin(time_provider.sleep(flush_config.max_delay.max(TimeDuration::milliseconds(1))));
       let mut flushes = JoinSet::new();
       let mut shutdown_requested = false;
+      let mut flush_config_needs_reload = false;
       loop {
         if shutdown_requested && flushes.is_empty() {
           log::info!("broker flush loop shutdown complete");
@@ -289,13 +291,30 @@ impl WriteEngineImpl {
             log::info!("broker flush loop draining buffered writes for shutdown");
           },
           () = &mut flush_tick => {
-            flush_config = flush_context
-              .config()
-              .effective_flush_config(feature_flags.as_ref());
-            *effective_flush_config.write() = flush_config;
+            if flush_config_needs_reload {
+              flush_config = flush_context
+                .config()
+                .effective_flush_config(feature_flags.as_ref());
+              *effective_flush_config.write() = flush_config;
+              flush_config_needs_reload = false;
+            }
             flush_tick = Box::pin(time_provider.sleep(
               flush_config.max_delay.max(TimeDuration::milliseconds(1)),
             ));
+          },
+          feature_flag_change = async {
+            let Some(feature_flags) = feature_flag_changes.as_mut() else {
+              std::future::pending().await
+            };
+            feature_flags.changed().await
+          }, if feature_flag_changes.is_some() => {
+            match feature_flag_change {
+              Ok(()) => flush_config_needs_reload = true,
+              Err(error) => {
+                feature_flag_changes = None;
+                log::debug!("broker feature flag watch closed: {error}");
+              },
+            }
           },
           () = flush_notifier.notified() => {},
           Some(result) = flushes.join_next(), if !flushes.is_empty() => {

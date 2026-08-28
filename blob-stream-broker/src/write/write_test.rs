@@ -957,7 +957,7 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn state_snapshot_reports_effective_runtime_policy() -> Result<()> {
   let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
     1_700_000_000_000,
@@ -993,7 +993,7 @@ async fn state_snapshot_reports_effective_runtime_policy() -> Result<()> {
     shutdown_trigger.make_handle(),
     &metrics_scope(),
   )
-  .time_provider(time_provider)
+  .time_provider(time_provider.clone())
   .feature_flags(Some(feature_flags.snapshot_watch()))
   .build()?;
 
@@ -1007,6 +1007,32 @@ async fn state_snapshot_reports_effective_runtime_policy() -> Result<()> {
   );
   assert_eq!(snapshot.max_segment_bytes, 128 * 1024 * 1024);
   assert_eq!(snapshot.effective_max_segment_bytes, 32 * 1024 * 1024);
+
+  feature_flags.update(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag("blob_stream_broker_flush_max_bytes", 16 * 1024 * 1024)
+      .with_integer_flag("blob_stream_broker_flush_max_delay_ms", 250)
+      .with_integer_flag("blob_stream_broker_max_segment_bytes", 16 * 1024 * 1024),
+  ));
+  tokio::task::yield_now().await;
+
+  let snapshot = engine.state_snapshot().await;
+  assert_eq!(snapshot.effective_flush_max_bytes, 32 * 1024 * 1024);
+  assert_eq!(
+    snapshot.effective_flush_max_delay,
+    StdDuration::from_millis(500)
+  );
+
+  time_provider.advance(TimeDuration::milliseconds(500));
+  tokio::time::advance(StdDuration::from_millis(500)).await;
+  tokio::task::yield_now().await;
+
+  let snapshot = engine.state_snapshot().await;
+  assert_eq!(snapshot.effective_flush_max_bytes, 16 * 1024 * 1024);
+  assert_eq!(
+    snapshot.effective_flush_max_delay,
+    StdDuration::from_millis(250)
+  );
   Ok(())
 }
 
