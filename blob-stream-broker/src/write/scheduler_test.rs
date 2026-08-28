@@ -1,6 +1,10 @@
 use super::collect_next_flush_plan;
 use crate::write::buffer::{BufferedBatch, FlushCompletionError, FlushPlan, FlushTrigger};
-use crate::write::config::{MAX_SEGMENT_BYTES_FEATURE_FLAG, SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG};
+use crate::write::config::{
+  FLUSH_MAX_BYTES_FEATURE_FLAG,
+  FLUSH_MAX_DELAY_FEATURE_FLAG,
+  MAX_SEGMENT_BYTES_FEATURE_FLAG,
+};
 use crate::write::state::WriteState;
 use crate::write::{TopicInfo, WriteConfig};
 use bd_runtime_config::loader::Loader;
@@ -41,8 +45,11 @@ fn collect_all_flush_plans(
   feature_flags: Option<&bd_runtime_config::feature_flags::FeatureFlagsWatch>,
   topics: &HashMap<protobuf::Chars, TopicInfo>,
 ) -> Vec<FlushPlan> {
+  let flush_config = config.effective_flush_config(feature_flags);
   let mut plans = Vec::new();
-  while let Some(plan) = collect_next_flush_plan(state, now, config, feature_flags, topics) {
+  while let Some(plan) =
+    collect_next_flush_plan(state, now, config, &flush_config, feature_flags, topics)
+  {
     plans.push(plan);
   }
   plans
@@ -126,14 +133,11 @@ fn shared_fenced_flushes_keep_topic_chunks_within_transaction_limit() {
 
   let mut config = WriteConfig::with_defaults();
   config.fenced_metadata_writes = true;
-  let flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default().with_bool_flag(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, true),
-  ));
   let plans = collect_all_flush_plans(
     &state,
     offset_datetime_from_unix_millis(1_000),
     &config,
-    Some(&flags.snapshot_watch()),
+    None,
     &HashMap::from([
       (
         "telemetry".into(),
@@ -216,13 +220,14 @@ fn live_feature_flag_updates_apply_to_new_flush_plans() {
   let feature_flags = flags.snapshot_watch();
   flags.update(Arc::new(
     DefaultFeatureFlags::default()
-      .with_bool_flag(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, true)
+      .with_integer_flag(FLUSH_MAX_BYTES_FEATURE_FLAG, 2)
+      .with_integer_flag(FLUSH_MAX_DELAY_FEATURE_FLAG, 500)
       .with_integer_flag(MAX_SEGMENT_BYTES_FEATURE_FLAG, 1),
   ));
 
   let plans = collect_all_flush_plans(
     &state,
-    offset_datetime_from_unix_millis(1_000),
+    offset_datetime_from_unix_millis(600),
     &WriteConfig::with_defaults(),
     Some(&feature_flags),
     &topics,
@@ -368,9 +373,6 @@ fn shared_time_flush_pulls_forward_buffered_topics() {
     ("time-due".into(), topic_info("time-due")),
     ("fresh".into(), topic_info("fresh")),
   ]);
-  let flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default().with_bool_flag(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, true),
-  ));
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 2;
 
@@ -378,7 +380,7 @@ fn shared_time_flush_pulls_forward_buffered_topics() {
     &state,
     offset_datetime_from_unix_millis(1_000),
     &config,
-    Some(&flags.snapshot_watch()),
+    None,
     &topics,
   );
 
@@ -456,7 +458,7 @@ fn no_op_planning_keeps_multiple_topic_partitions_buffered() {
 }
 
 #[test]
-fn shared_flag_keeps_independently_byte_triggered_work_local() {
+fn shared_time_flush_keeps_independently_byte_triggered_work_local() {
   let state = Arc::new(Mutex::new(WriteState::default()));
   {
     let mut state = state.lock();
@@ -488,9 +490,6 @@ fn shared_flag_keeps_independently_byte_triggered_work_local() {
     ("first".into(), topic_info("first")),
     ("second".into(), topic_info("second")),
   ]);
-  let flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default().with_bool_flag(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, true),
-  ));
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
 
@@ -498,7 +497,7 @@ fn shared_flag_keeps_independently_byte_triggered_work_local() {
     &state,
     offset_datetime_from_unix_millis(1_000),
     &config,
-    Some(&flags.snapshot_watch()),
+    None,
     &topics,
   );
 
@@ -544,16 +543,11 @@ fn shared_time_flushes_order_topics_by_name() {
     ("zebra".into(), topic_info("zebra")),
     ("alpha".into(), topic_info("alpha")),
   ]);
-  let flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default().with_bool_flag(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, true),
-  ));
-  let feature_flags = flags.snapshot_watch();
-
   let plans = collect_all_flush_plans(
     &state,
     offset_datetime_from_unix_millis(1_000),
     &WriteConfig::with_defaults(),
-    Some(&feature_flags),
+    None,
     &topics,
   );
 
@@ -602,15 +596,11 @@ fn shared_time_flushes_group_all_topics_in_one_plan() {
       (topic.clone().into(), topic_info(topic))
     })
     .collect();
-  let flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default().with_bool_flag(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, true),
-  ));
-
   let plans = collect_all_flush_plans(
     &state,
     offset_datetime_from_unix_millis(1_000),
     &WriteConfig::with_defaults(),
-    Some(&flags.snapshot_watch()),
+    None,
     &topics,
   );
 
@@ -644,9 +634,6 @@ fn shared_time_flush_excludes_draining_peer_partitions() {
     }
     state.partition_state_mut("telemetry", 1).draining = true;
   }
-  let flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default().with_bool_flag(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, true),
-  ));
   let topic_info = |name: &'static str| TopicInfo {
     name: name.into(),
     partition_count: 1,
@@ -664,7 +651,7 @@ fn shared_time_flush_excludes_draining_peer_partitions() {
     &state,
     offset_datetime_from_unix_millis(1_000),
     &WriteConfig::with_defaults(),
-    Some(&flags.snapshot_watch()),
+    None,
     &topics,
   );
 

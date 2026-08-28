@@ -14,7 +14,6 @@ use super::api::{
   WriteRequest,
   WriteResponse,
 };
-use crate::write::WriteConfig;
 use crate::write::allocation::{
   AllocationTransitionDecision,
   LeaseExpirationUpdate,
@@ -115,7 +114,8 @@ impl WriteEngine for WriteEngineImpl {
             seq_range.end,
             partition_state.seq_allocator.remaining_capacity(),
           );
-          let was_byte_due = partition_state.buffer.buffered_bytes >= self.config.flush_max_bytes;
+          let flush_config = *self.effective_flush_config.read();
+          let was_byte_due = partition_state.buffer.buffered_bytes >= flush_config.max_bytes;
           partition_state.buffer.push(
             BufferedBatch {
               records: records.take().expect("records are buffered only once"),
@@ -127,9 +127,9 @@ impl WriteEngine for WriteEngineImpl {
             now,
           );
           let flush_became_byte_due =
-            !was_byte_due && partition_state.buffer.buffered_bytes >= self.config.flush_max_bytes;
+            !was_byte_due && partition_state.buffer.buffered_bytes >= flush_config.max_bytes;
           let should_notify_flush =
-            flush_became_byte_due || partition_state.buffer.is_time_due(now, &self.config);
+            flush_became_byte_due || partition_state.buffer.is_time_due(now, &flush_config);
           Some((completion_rx, seq_range, should_notify_flush))
         }
       };
@@ -400,17 +400,18 @@ impl WriteEngine for WriteEngineImpl {
       (&left.topic, left.virtual_partition_id).cmp(&(&right.topic, right.virtual_partition_id))
     });
 
+    let effective_flush_config = *self.effective_flush_config.read();
     BrokerStateSnapshot {
       generated_at,
       holder_id: self.holder_id.clone(),
       writer_id: self.config.writer_id,
       flush_max_bytes: self.config.flush_max_bytes,
+      effective_flush_max_bytes: effective_flush_config.max_bytes,
       max_segment_bytes: self.config.max_segment_bytes,
       effective_max_segment_bytes: self.config.max_segment_bytes(self.feature_flags.as_ref()),
-      shared_cross_topic_blobs_enabled: WriteConfig::shared_cross_topic_blobs(
-        self.feature_flags.as_ref(),
-      ),
       flush_max_delay: StdDuration::try_from(self.config.flush_max_delay)
+        .unwrap_or(StdDuration::MAX),
+      effective_flush_max_delay: StdDuration::try_from(effective_flush_config.max_delay)
         .unwrap_or(StdDuration::MAX),
       membership: membership_snapshot,
       ownership,

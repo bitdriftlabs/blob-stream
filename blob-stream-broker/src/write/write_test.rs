@@ -889,7 +889,11 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   assert_eq!(snapshot.writer_id, 0);
   assert_eq!(snapshot.max_segment_bytes, 64 * 1024 * 1024);
   assert_eq!(snapshot.effective_max_segment_bytes, 64 * 1024 * 1024);
-  assert!(!snapshot.shared_cross_topic_blobs_enabled);
+  assert_eq!(snapshot.effective_flush_max_bytes, 1024);
+  assert_eq!(
+    snapshot.effective_flush_max_delay,
+    StdDuration::from_secs(60)
+  );
   assert_eq!(snapshot.membership.len(), 1);
   assert_eq!(snapshot.membership[0].node_id.as_str(), "test-node");
   assert_eq!(snapshot.membership[0].address.as_str(), "test-node");
@@ -933,9 +937,10 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
   assert_eq!(state_dump["generated_at"], "2023-11-14T22:13:20Z");
   assert!(state_dump.get("generated_at_ts_ms").is_none());
   assert_eq!(state_dump["flush_max_delay"], "1m");
+  assert_eq!(state_dump["effective_flush_max_bytes"], 1024);
+  assert_eq!(state_dump["effective_flush_max_delay"], "1m");
   assert_eq!(state_dump["max_segment_bytes"], 64 * 1024 * 1024);
   assert_eq!(state_dump["effective_max_segment_bytes"], 64 * 1024 * 1024);
-  assert_eq!(state_dump["shared_cross_topic_blobs_enabled"], false);
   assert_eq!(state_dump["topics"][0]["name"], "telemetry");
   assert_eq!(state_dump["ownership"][0]["topic"], "telemetry");
   assert_eq!(
@@ -953,17 +958,20 @@ async fn state_snapshot_reports_local_buffer_and_lease_state() -> Result<()> {
 }
 
 #[tokio::test]
-async fn state_snapshot_reports_effective_segment_runtime_policy() -> Result<()> {
+async fn state_snapshot_reports_effective_runtime_policy() -> Result<()> {
   let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
     1_700_000_000_000,
   )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 128 * 1024 * 1024;
+  config.flush_max_delay = TimeDuration::seconds(10);
   config.max_segment_bytes = 128 * 1024 * 1024;
   let feature_flags = FakeLoader::new(Arc::new(
     DefaultFeatureFlags::default()
-      .with_integer_flag("blob_stream_broker_max_segment_bytes", 32 * 1024 * 1024)
-      .with_bool_flag("blob_stream_broker_shared_cross_topic_blobs", true),
+      .with_integer_flag("blob_stream_broker_flush_max_bytes", 32 * 1024 * 1024)
+      .with_integer_flag("blob_stream_broker_flush_max_delay_ms", 500)
+      .with_integer_flag("blob_stream_broker_max_segment_bytes", 32 * 1024 * 1024),
   ));
   let engine = WriteEngineBuilder::new(
     config,
@@ -990,9 +998,15 @@ async fn state_snapshot_reports_effective_segment_runtime_policy() -> Result<()>
   .build()?;
 
   let snapshot = engine.state_snapshot().await;
+  assert_eq!(snapshot.flush_max_bytes, 128 * 1024 * 1024);
+  assert_eq!(snapshot.effective_flush_max_bytes, 32 * 1024 * 1024);
+  assert_eq!(snapshot.flush_max_delay, StdDuration::from_secs(10));
+  assert_eq!(
+    snapshot.effective_flush_max_delay,
+    StdDuration::from_millis(500)
+  );
   assert_eq!(snapshot.max_segment_bytes, 128 * 1024 * 1024);
   assert_eq!(snapshot.effective_max_segment_bytes, 32 * 1024 * 1024);
-  assert!(snapshot.shared_cross_topic_blobs_enabled);
   Ok(())
 }
 
@@ -1945,7 +1959,11 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
   tokio::task::yield_now().await;
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
-  assert!(receive_blob_write(&mut entered_rx).await.contains("first/"));
+  assert!(
+    receive_blob_write(&mut entered_rx)
+      .await
+      .starts_with("shared/")
+  );
 
   let second_engine = Arc::clone(&engine);
   let second = tokio::spawn(async move {
@@ -1964,7 +1982,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
   assert!(
     receive_blob_write(&mut entered_rx)
       .await
-      .contains("second/")
+      .starts_with("shared/")
   );
   assert!(!first.is_finished());
   assert!(second.is_finished());
@@ -2332,7 +2350,7 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
 }
 
 #[tokio::test(start_paused = true)]
-async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Result<()> {
+async fn time_flush_groups_ready_topics_into_one_durable_plan() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
     now_ms,
@@ -2402,9 +2420,8 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
 
-  let first_blob_key = receive_blob_write(&mut entered_rx).await;
-  let second_blob_key = receive_blob_write(&mut entered_rx).await;
-  assert_ne!(first_blob_key, second_blob_key);
+  let blob_key = receive_blob_write(&mut entered_rx).await;
+  assert!(blob_key.starts_with("shared/"));
 
   release_first.add_permits(1);
   first.await??;
@@ -2413,7 +2430,7 @@ async fn flush_scheduler_dispatches_independent_ready_plans_concurrently() -> Re
 }
 
 #[tokio::test(start_paused = true)]
-async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()> {
+async fn time_flush_groups_topics_into_one_durable_plan() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
     now_ms,
@@ -2493,29 +2510,14 @@ async fn flush_scheduler_rotates_topics_when_capacity_is_limited() -> Result<()>
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
 
-  let mut first_topics = Vec::new();
-  for _ in 0 .. 4 {
-    first_topics.push(receive_blob_write(&mut entered_rx).await);
-  }
-  first_topics.sort();
-  assert!(
-    first_topics
-      .iter()
-      .zip(0 .. 4)
-      .all(|(key, expected_topic)| key.contains(&format!("topic-{expected_topic}/")))
-  );
+  let blob_key = receive_blob_write(&mut entered_rx).await;
+  assert!(blob_key.starts_with("shared/"));
   metrics.assert_gauge_eq(
-    4,
+    1,
     "blob_stream_broker_test:write:active_flush_plans",
     &labels!(),
   );
   release.add_permits(1);
-  assert!(
-    receive_blob_write(&mut entered_rx)
-      .await
-      .contains("topic-4/")
-  );
-  release.add_permits(4);
 
   for write in writes {
     write.await??;
@@ -2603,7 +2605,7 @@ async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
 }
 
 #[tokio::test(start_paused = true)]
-async fn time_flush_shares_one_object_across_topics_when_enabled() -> Result<()> {
+async fn time_flush_shares_one_object_across_topics() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
     now_ms,
@@ -2629,10 +2631,6 @@ async fn time_flush_shares_one_object_across_topics_when_enabled() -> Result<()>
     })
     .collect();
   let metadata_store = Arc::new(InMemoryMetadataStore::new());
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_broker_shared_cross_topic_blobs", true),
-  ));
   let engine = Arc::new(
     WriteEngineBuilder::new(
       config.clone(),
@@ -2645,7 +2643,6 @@ async fn time_flush_shares_one_object_across_topics_when_enabled() -> Result<()>
       &metrics_scope(),
     )
     .time_provider(time_provider.clone())
-    .feature_flags(Some(feature_flags.snapshot_watch()))
     .build()?,
   );
 
@@ -2727,10 +2724,6 @@ async fn time_flush_retains_all_topics_when_shared_object_reaches_segment_cap() 
     })
     .collect();
   let metadata_store = Arc::new(InMemoryMetadataStore::new());
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_broker_shared_cross_topic_blobs", true),
-  ));
   let engine = Arc::new(
     WriteEngineBuilder::new(
       config.clone(),
@@ -2743,7 +2736,6 @@ async fn time_flush_retains_all_topics_when_shared_object_reaches_segment_cap() 
       &metrics_scope(),
     )
     .time_provider(time_provider.clone())
-    .feature_flags(Some(feature_flags.snapshot_watch()))
     .build()?,
   );
   let first_engine = Arc::clone(&engine);

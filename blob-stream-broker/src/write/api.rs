@@ -45,11 +45,13 @@ pub struct BrokerStateSnapshot {
   pub holder_id: String,
   pub writer_id: u32,
   pub flush_max_bytes: u64,
+  pub effective_flush_max_bytes: u64,
   pub max_segment_bytes: u64,
   pub effective_max_segment_bytes: u64,
-  pub shared_cross_topic_blobs_enabled: bool,
   #[serde(with = "humantime_serde")]
   pub flush_max_delay: Duration,
+  #[serde(with = "humantime_serde")]
+  pub effective_flush_max_delay: Duration,
   pub membership: Vec<BrokerNodeSnapshot>,
   pub ownership: Vec<BrokerPartitionOwnershipSnapshot>,
   pub topics: Vec<BrokerTopicStateSnapshot>,

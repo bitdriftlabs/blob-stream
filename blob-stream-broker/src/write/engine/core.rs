@@ -1,3 +1,4 @@
+use super::super::config::EffectiveFlushConfig;
 use super::super::flush::FlushContext;
 use super::super::metrics::WriteMetrics;
 use super::super::scheduler::{
@@ -22,7 +23,7 @@ use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::BlobStore;
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{MetadataStore, ProducerPartitionLeaseStore};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use protobuf::Chars;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,6 +47,7 @@ pub struct WriteEngineImpl {
   pub(in crate::write) time_provider: Arc<dyn TimeProvider>,
   pub(in crate::write) metrics: WriteMetrics,
   pub(in crate::write) state: Arc<Mutex<WriteState>>,
+  pub(in crate::write) effective_flush_config: Arc<RwLock<EffectiveFlushConfig>>,
   pub(in crate::write) flush_notifier: Arc<Notify>,
   pub(in crate::write) shutdown_trigger_handle: ComponentShutdownTriggerHandle,
   pub(in crate::write) lifecycle_hooks: Option<Arc<dyn BrokerLifecycleHooks>>,
@@ -190,6 +192,9 @@ impl<'a> WriteEngineBuilder<'a> {
       Arc::clone(&time_provider),
       lifecycle_hooks.clone(),
     );
+    let effective_flush_config = Arc::new(RwLock::new(
+      config.effective_flush_config(feature_flags.as_ref()),
+    ));
     let admission = admission.unwrap_or_else(|| {
       MemoryPressureController::new(&shutdown_trigger_handle, &metrics_scope.scope("write"))
     });
@@ -204,6 +209,7 @@ impl<'a> WriteEngineBuilder<'a> {
       time_provider,
       metrics: WriteMetrics::new(metrics_scope),
       state,
+      effective_flush_config,
       flush_notifier: Arc::new(Notify::new()),
       shutdown_trigger_handle,
       lifecycle_hooks,
@@ -220,22 +226,21 @@ impl<'a> WriteEngineBuilder<'a> {
 
 impl WriteEngineImpl {
   fn spawn_flush_loop(&self) {
-    let flush_delay = self
-      .config
-      .flush_max_delay
-      .max(TimeDuration::milliseconds(1));
     let flush_context = self.flush_context.clone();
     let state = Arc::clone(&self.state);
     let topics = self.topics.clone();
     let time_provider = Arc::clone(&self.time_provider);
     let metrics = self.metrics.clone();
     let feature_flags = self.feature_flags.clone();
+    let effective_flush_config = Arc::clone(&self.effective_flush_config);
     let flush_notifier = Arc::clone(&self.flush_notifier);
     let mut shutdown = self.shutdown_trigger_handle.make_shutdown();
     let flush_plan_permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT_FLUSH_PLANS));
 
     tokio::spawn(async move {
-      let mut flush_tick = Box::pin(time_provider.sleep(flush_delay));
+      let mut flush_config = *effective_flush_config.read();
+      let mut flush_tick =
+        Box::pin(time_provider.sleep(flush_config.max_delay.max(TimeDuration::milliseconds(1))));
       let mut flushes = JoinSet::new();
       let mut shutdown_requested = false;
       loop {
@@ -252,6 +257,7 @@ impl WriteEngineImpl {
             &state,
             time_provider.now(),
             flush_context.config(),
+            &flush_config,
             feature_flags.as_ref(),
             &topics,
           ) else {
@@ -283,7 +289,13 @@ impl WriteEngineImpl {
             log::info!("broker flush loop draining buffered writes for shutdown");
           },
           () = &mut flush_tick => {
-            flush_tick = Box::pin(time_provider.sleep(flush_delay));
+            flush_config = flush_context
+              .config()
+              .effective_flush_config(feature_flags.as_ref());
+            *effective_flush_config.write() = flush_config;
+            flush_tick = Box::pin(time_provider.sleep(
+              flush_config.max_delay.max(TimeDuration::milliseconds(1)),
+            ));
           },
           () = flush_notifier.notified() => {},
           Some(result) = flushes.join_next(), if !flushes.is_empty() => {

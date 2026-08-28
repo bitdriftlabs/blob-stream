@@ -224,30 +224,30 @@ invariant.
 5. The broker samples jemalloc allocation against its Linux cgroup memory limit and rejects new
    batches with `OVERLOADED` when utilization exceeds its admission threshold. It flushes a
    virtual-partition buffer when its raw payload bytes reach `flush_max_bytes` or its oldest batch
-   reaches `flush_max_delay_ms`. A time-due partition establishes a flush cadence for the local
-   broker: with `blob_stream_broker_shared_cross_topic_blobs` enabled, the broker includes every
-   available buffered, non-draining virtual partition across its local topics in the same plan.
-   Otherwise it includes every available buffered virtual partition for that topic. This can flush
-   younger peer buffers before their individual delay to produce larger blobs and fewer S3 PUTs.
-   Byte-threshold flushes remain local unless a time-due shared flush pulls them forward, and
-   lease-drain flushes remain partition-local. `max_segment_bytes` separately caps each serialized
-   compressed object; it defaults to 64 MiB and can be changed live with
-   `blob_stream_broker_max_segment_bytes`. A compressed partition batch that cannot be split is
-   emitted alone when it exceeds that cap. A partition with a durable plan in progress continues
+   reaches `flush_max_delay_ms`. `blob_stream_broker_flush_max_bytes` and
+   `blob_stream_broker_flush_max_delay_ms` are positive live integer overrides. The scheduler
+   snapshots them when it starts its next timer cycle; an existing cycle and already selected plans
+   retain their prior values. A time-due partition establishes a flush cadence for the local broker
+   and includes every available buffered, non-draining virtual partition across its local topics in
+   the same plan. This can flush younger peer buffers before their individual delay to produce
+   larger blobs and fewer S3 PUTs. Byte-threshold flushes remain local unless a time-due shared
+   flush pulls them forward, and lease-drain flushes remain partition-local. `max_segment_bytes`
+   separately caps each serialized compressed object; it defaults to 64 MiB and can be changed live
+   with `blob_stream_broker_max_segment_bytes`. A compressed partition batch that cannot be split
+   is emitted alone when it exceeds that cap. A partition with a durable plan in progress continues
    buffering its next epoch until that prior plan completes. A single bounded flush scheduler wakes
    for eligible writes, timer ticks, and durable-plan completions; a completion immediately promotes
    an eligible successor epoch. It runs at most four durable flush plans concurrently;
   `write:active_flush_plans` reports its current occupancy.
 6. A flush coalesces each virtual partition's accepted batches into one `StoredRecordBatch`,
   compresses each serialized partition batch independently, and concatenates the stored bytes into
-  bounded segment objects. `blob_stream_broker_shared_cross_topic_blobs` defaults off; when
-  enabled, one time-triggered object can contain contiguous sections for several topics. The broker
-  uploads each object once, then writes one ordinary topic-local metadata row for every section.
-  A successful row acknowledges only its own topic's partitions; a failed row remains retryable
-  and can produce an at-least-once duplicate. With fenced metadata writes enabled, each row is a
-  transaction conditioned on the snapshot lease fences for that row's topic. Plans may run
-  concurrently for different virtual partitions, but each virtual partition persists plans in
-  sequence order.
+  bounded segment objects. One time-triggered object can contain contiguous sections for several
+  topics. The broker uploads each object once, then writes one ordinary topic-local metadata row
+  for every section. A successful row acknowledges only its own topic's partitions; a failed row
+  remains retryable and can produce an at-least-once duplicate. With fenced metadata writes
+  enabled, each row is a transaction conditioned on the snapshot lease fences for that row's topic.
+  Plans may run concurrently for different virtual partitions, but each virtual partition persists
+  plans in sequence order.
 7. Only after both blob upload and metadata write succeed does the broker complete the waiting
    write and return `OK`. A producer acknowledgement therefore represents durable segment
    metadata, not merely in-memory buffering.
@@ -277,13 +277,9 @@ an ambiguous failure can produce a duplicate batch, which is part of the at-leas
 ### Segment Blobs
 
 Segments are stored through the blob-store abstraction, backed by S3 in production and an
-in-memory implementation in tests. Legacy topic-scoped keys have this form:
+in-memory implementation in tests.
 
-```
-<optional-prefix>/<topic>/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>
-```
-
-When `blob_stream_broker_shared_cross_topic_blobs` is enabled, time-triggered objects can use:
+Time-triggered objects use a shared key:
 
 ```
 <optional-prefix>/shared/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>
