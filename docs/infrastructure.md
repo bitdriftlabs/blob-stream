@@ -77,10 +77,11 @@ broker:
 ```
 
 Feature flags affect local process behavior. Broker controls include
-`blob_stream_broker_fenced_metadata_writes`, the default-off
-`blob_stream_broker_shared_cross_topic_blobs`, and `blob_stream_broker_max_segment_bytes`, whose
-positive integer value overrides the configured `max_segment_bytes` for newly selected flushes.
-Consumer reader flags `blob_stream_consumer_strong_metadata_reads`,
+`blob_stream_broker_fenced_metadata_writes`, `blob_stream_broker_max_segment_bytes`,
+`blob_stream_broker_flush_max_bytes`, and `blob_stream_broker_flush_max_delay_ms`. The segment and
+flush threshold overrides accept positive integers; invalid values retain the configured fallback.
+The flush settings are sampled for the next timer cycle, while the segment cap applies to newly
+selected flushes. Consumer reader flags `blob_stream_consumer_strong_metadata_reads`,
 `blob_stream_consumer_prefetch_max_bytes`, and `blob_stream_consumer_max_in_flight_batch_reads` are
 live. `ConsumerIteratorBootstrapConfig.broker_discovery` is required. Consumers use the broker
 metadata and blob caches for every read, retrying direct storage only after a broker transport,
@@ -103,10 +104,9 @@ for isolation. Segment keys use:
 <prefix>/<topic>/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>
 ```
 
-With `blob_stream_broker_shared_cross_topic_blobs`, time-triggered objects can instead use
-`<prefix>/shared/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>`. Configure the lifecycle
-rule for the `shared/` prefix to retain objects for at least the maximum retention of every topic
-eligible to share, plus the metadata TTL buffer.
+Time-triggered objects use `<prefix>/shared/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>`.
+Configure the lifecycle rule for the `shared/` prefix to retain objects for at least the maximum
+retention of every topic eligible to share, plus the metadata TTL buffer.
 
 Configure the S3 lifecycle so objects remain available for at least the topic retention period plus
 the metadata TTL buffer. DynamoDB TTL deletion is asynchronous; expiring S3 objects first can leave

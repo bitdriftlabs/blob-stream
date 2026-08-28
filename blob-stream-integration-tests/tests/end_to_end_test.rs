@@ -4160,7 +4160,6 @@ async fn shared_cross_topic_blob_pulls_forward_a_fresh_topic() -> Result<()> {
     1_700_000_000_000,
   )));
   let mut cluster = ClusterHarness::builder(&resources, 1)
-    .shared_cross_topic_blobs()
     .partition_count(1)
     .broker_flush_max_delay(Duration::from_secs(1))
     .broker_time_provider(broker_time.clone())
@@ -4339,7 +4338,6 @@ async fn shared_object_metadata_failure_is_isolated_and_retries() -> Result<()> 
   let resources = IntegrationResources::create().await?;
   let broker_time = Arc::new(framework::ManualTimeProvider::new(OffsetDateTime::now_utc()));
   let mut cluster = ClusterHarness::builder(&resources, 1)
-    .shared_cross_topic_blobs()
     .partition_count(1)
     .broker_flush_max_delay(Duration::from_secs(1))
     .broker_time_provider(broker_time.clone())

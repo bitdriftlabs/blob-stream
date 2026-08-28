@@ -6,6 +6,7 @@ use super::buffer::{
   FlushTrigger,
   TopicFlushPlan,
 };
+use super::config::EffectiveFlushConfig;
 use super::flush::FlushContext;
 use super::metrics::WriteMetrics;
 use super::state::{PartitionState, WriteState};
@@ -167,7 +168,7 @@ fn take_flush_partition(
 fn flush_trigger(
   partition_state: &PartitionState,
   now: time::OffsetDateTime,
-  config: &WriteConfig,
+  flush_config: &EffectiveFlushConfig,
 ) -> Option<FlushTrigger> {
   if partition_state.flush_in_flight {
     return None;
@@ -177,9 +178,9 @@ fn flush_trigger(
   } else {
     partition_state
       .buffer
-      .is_time_due(now, config)
+      .is_time_due(now, flush_config)
       .then_some(FlushTrigger::MaxDelay)
-      .or_else(|| partition_state.buffer.flush_trigger(now, config))
+      .or_else(|| partition_state.buffer.flush_trigger(now, flush_config))
   }
 }
 
@@ -217,6 +218,7 @@ pub(super) fn collect_next_flush_plan(
   state: &Arc<Mutex<WriteState>>,
   now: time::OffsetDateTime,
   config: &WriteConfig,
+  flush_config: &EffectiveFlushConfig,
   feature_flags: Option<&FeatureFlagsWatch>,
   topics: &HashMap<Chars, TopicInfo>,
 ) -> Option<FlushPlan> {
@@ -224,7 +226,6 @@ pub(super) fn collect_next_flush_plan(
   // state lock for the entire selection so a batch belongs to exactly one plan, even if another
   // scheduler pass starts while this pass is constructing its output.
   let fenced_metadata_writes = config.fenced_metadata_writes(feature_flags);
-  let shared_cross_topic_blobs = WriteConfig::shared_cross_topic_blobs(feature_flags);
   let mut state = state.lock();
 
   // Most scheduler passes are timer ticks or sub-threshold write notifications. Avoid cloning and
@@ -234,11 +235,10 @@ pub(super) fn collect_next_flush_plan(
   let mut shared_time_flush = false;
   'topics: for topic_state in state.topics.values() {
     for partition_state in topic_state.partitions.values() {
-      let trigger = flush_trigger(partition_state, now, config);
+      let trigger = flush_trigger(partition_state, now, flush_config);
       has_flushable_partition |= trigger.is_some();
-      shared_time_flush |=
-        shared_cross_topic_blobs && matches!(trigger, Some(FlushTrigger::MaxDelay));
-      if has_flushable_partition && (!shared_cross_topic_blobs || shared_time_flush) {
+      shared_time_flush |= matches!(trigger, Some(FlushTrigger::MaxDelay));
+      if has_flushable_partition && shared_time_flush {
         break 'topics;
       }
     }
@@ -285,9 +285,9 @@ pub(super) fn collect_next_flush_plan(
       .get(topic.as_str())
       .expect("write state is created only for configured topics");
 
-    // Once any local partition has reached its latency limit, the feature flag permits buffered
-    // peers to join that same shared flush. They receive a MaxDelay trigger deliberately: later
-    // assembly groups only time-triggered topic plans into the shared object.
+    // Once any local partition has reached its latency limit, buffered peers join that same shared
+    // flush. They receive a MaxDelay trigger deliberately: later assembly groups only
+    // time-triggered topic plans into the shared object.
     let trigger = state
       .partition_state(topic.as_str(), *virtual_partition_id)
       .and_then(|partition_state| {
@@ -298,7 +298,7 @@ pub(super) fn collect_next_flush_plan(
         {
           Some(FlushTrigger::MaxDelay)
         } else {
-          flush_trigger(partition_state, now, config)
+          flush_trigger(partition_state, now, flush_config)
         }
       });
     let Some(trigger) = trigger else {
@@ -316,9 +316,7 @@ pub(super) fn collect_next_flush_plan(
       *existing_trigger != trigger
         || (fenced_metadata_writes && existing_partition_count == MAX_FENCED_METADATA_PARTITIONS)
     });
-    let shared_time_plan = shared_cross_topic_blobs
-      && matches!(trigger, FlushTrigger::MaxDelay)
-      && requires_new_topic_plan;
+    let shared_time_plan = matches!(trigger, FlushTrigger::MaxDelay) && requires_new_topic_plan;
     let joins_selected_plan = selected_shared_blob.is_none_or(|selected_shared_blob| {
       if selected_shared_blob {
         // A shared plan may add another topic, or more partitions for a topic already in its

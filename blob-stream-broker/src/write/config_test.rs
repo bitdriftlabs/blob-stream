@@ -1,7 +1,8 @@
 use super::{
   DynamoTablePurpose,
+  FLUSH_MAX_BYTES_FEATURE_FLAG,
+  FLUSH_MAX_DELAY_FEATURE_FLAG,
   MAX_SEGMENT_BYTES_FEATURE_FLAG,
-  SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG,
   TopicInfo,
   WriteConfig,
   dynamo_table_name,
@@ -117,15 +118,49 @@ fn max_segment_bytes_runtime_zero_uses_configured_value() {
 }
 
 #[test]
-fn shared_cross_topic_blobs_defaults_off_and_uses_runtime_override() {
-  let enabled = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default().with_bool_flag(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, true),
+fn flush_runtime_overrides_default_to_configured_values() {
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 8 * 1024 * 1024;
+  config.flush_max_delay = Duration::milliseconds(250);
+  let defaults = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
+  let overrides = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag(FLUSH_MAX_BYTES_FEATURE_FLAG, 4 * 1024 * 1024)
+      .with_integer_flag(FLUSH_MAX_DELAY_FEATURE_FLAG, 100),
   ));
 
-  assert!(!WriteConfig::shared_cross_topic_blobs(None));
-  assert!(WriteConfig::shared_cross_topic_blobs(Some(
-    &enabled.snapshot_watch(),
-  )));
+  let default_flush_config = config.effective_flush_config(Some(&defaults.snapshot_watch()));
+  assert_eq!(default_flush_config.max_bytes, config.flush_max_bytes);
+  assert_eq!(default_flush_config.max_delay, config.flush_max_delay);
+
+  let overridden_flush_config = config.effective_flush_config(Some(&overrides.snapshot_watch()));
+  assert_eq!(overridden_flush_config.max_bytes, 4 * 1024 * 1024);
+  assert_eq!(
+    overridden_flush_config.max_delay,
+    Duration::milliseconds(100)
+  );
+}
+
+#[test]
+fn invalid_flush_runtime_overrides_use_configured_values() {
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 8 * 1024 * 1024;
+  config.flush_max_delay = Duration::milliseconds(250);
+  let zero_overrides = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag(FLUSH_MAX_BYTES_FEATURE_FLAG, 0)
+      .with_integer_flag(FLUSH_MAX_DELAY_FEATURE_FLAG, 0),
+  ));
+  let over_limit_delay = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(FLUSH_MAX_DELAY_FEATURE_FLAG, 500),
+  ));
+
+  let flush_config = config.effective_flush_config(Some(&zero_overrides.snapshot_watch()));
+  assert_eq!(flush_config.max_bytes, config.flush_max_bytes);
+  assert_eq!(flush_config.max_delay, config.flush_max_delay);
+
+  let flush_config = config.effective_flush_config(Some(&over_limit_delay.snapshot_watch()));
+  assert_eq!(flush_config.max_delay, config.flush_max_delay);
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use super::WriteConfig;
+use super::config::EffectiveFlushConfig;
 use anyhow::Result;
 use blob_stream_metadata_store::ProducerLeaseFence;
 use blob_stream_types::{BatchSummary, Record, SeqRange, VirtualPartitionId};
@@ -47,23 +47,23 @@ impl BufferState {
   pub(super) fn flush_trigger(
     &self,
     now: OffsetDateTime,
-    config: &WriteConfig,
+    config: &EffectiveFlushConfig,
   ) -> Option<FlushTrigger> {
     if self.batches.is_empty() {
       return None;
     }
-    if self.buffered_bytes >= config.flush_max_bytes {
+    if self.buffered_bytes >= config.max_bytes {
       return Some(FlushTrigger::MaxBytes);
     }
 
     let first_buffered_at = self.first_buffered_at?;
-    (now - first_buffered_at >= config.flush_max_delay).then_some(FlushTrigger::MaxDelay)
+    (now - first_buffered_at >= config.max_delay).then_some(FlushTrigger::MaxDelay)
   }
 
-  pub(super) fn is_time_due(&self, now: OffsetDateTime, config: &WriteConfig) -> bool {
+  pub(super) fn is_time_due(&self, now: OffsetDateTime, config: &EffectiveFlushConfig) -> bool {
     self
       .first_buffered_at
-      .is_some_and(|first_buffered_at| now - first_buffered_at >= config.flush_max_delay)
+      .is_some_and(|first_buffered_at| now - first_buffered_at >= config.max_delay)
   }
 
   pub(super) fn reset(&mut self) {

@@ -57,9 +57,9 @@ const DEFAULT_SEGMENT_TTL_BUFFER: Duration = Duration::hours(1);
 const DEFAULT_LEASE_TTL_BUFFER: Duration = Duration::hours(1);
 const PRODUCE_REQUEST_TIMEOUT_FLUSH_DELAY_MULTIPLIER: i32 = 10;
 pub const FENCED_METADATA_WRITES_FEATURE_FLAG: &str = "blob_stream_broker_fenced_metadata_writes";
+pub const FLUSH_MAX_BYTES_FEATURE_FLAG: &str = "blob_stream_broker_flush_max_bytes";
+pub const FLUSH_MAX_DELAY_FEATURE_FLAG: &str = "blob_stream_broker_flush_max_delay_ms";
 pub const MAX_SEGMENT_BYTES_FEATURE_FLAG: &str = "blob_stream_broker_max_segment_bytes";
-pub const SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG: &str =
-  "blob_stream_broker_shared_cross_topic_blobs";
 
 #[cfg(test)]
 #[path = "./config_test.rs"]
@@ -87,6 +87,17 @@ pub struct WriteConfig {
   pub compression: blob_stream_types::Compression,
   pub blob_prefix: Option<String>,
   pub fenced_metadata_writes: bool,
+}
+
+//
+// EffectiveFlushConfig
+//
+
+/// Flush thresholds captured at the start of one scheduler cycle.
+#[derive(Clone, Copy, Debug)]
+pub struct EffectiveFlushConfig {
+  pub(crate) max_bytes: u64,
+  pub(crate) max_delay: Duration,
 }
 
 impl WriteConfig {
@@ -178,6 +189,51 @@ impl WriteConfig {
   }
 
   #[must_use]
+  pub(crate) fn effective_flush_config(
+    &self,
+    feature_flags: Option<&FeatureFlagsWatch>,
+  ) -> EffectiveFlushConfig {
+    let max_bytes = feature_flags.map_or(self.flush_max_bytes, |feature_flags| {
+      feature_flags.get_integer(FLUSH_MAX_BYTES_FEATURE_FLAG, self.flush_max_bytes)
+    });
+    let max_bytes = if max_bytes > 0 {
+      max_bytes
+    } else {
+      warn_every!(
+        15.seconds(),
+        "broker flush max bytes override must be greater than zero; using configured value {}",
+        self.flush_max_bytes
+      );
+      self.flush_max_bytes
+    };
+
+    let configured_delay_milliseconds =
+      u64::try_from(self.flush_max_delay.whole_milliseconds()).unwrap_or_default();
+    let delay_milliseconds = feature_flags.map_or(configured_delay_milliseconds, |feature_flags| {
+      feature_flags.get_integer(FLUSH_MAX_DELAY_FEATURE_FLAG, configured_delay_milliseconds)
+    });
+    let max_delay = i64::try_from(delay_milliseconds)
+      .ok()
+      .filter(|milliseconds| *milliseconds > 0)
+      .map(Duration::milliseconds)
+      .filter(|delay| *delay <= self.flush_max_delay)
+      .unwrap_or_else(|| {
+        warn_every!(
+          15.seconds(),
+          "broker flush max delay override must be positive and no greater than configured delay \
+           {}; using configured value",
+          self.flush_max_delay
+        );
+        self.flush_max_delay
+      });
+
+    EffectiveFlushConfig {
+      max_bytes,
+      max_delay,
+    }
+  }
+
+  #[must_use]
   pub(crate) fn max_segment_bytes(&self, feature_flags: Option<&FeatureFlagsWatch>) -> u64 {
     let value = feature_flags.map_or(self.max_segment_bytes, |feature_flags| {
       feature_flags.get_integer(MAX_SEGMENT_BYTES_FEATURE_FLAG, self.max_segment_bytes)
@@ -192,13 +248,6 @@ impl WriteConfig {
       self.max_segment_bytes
     );
     self.max_segment_bytes
-  }
-
-  #[must_use]
-  pub(crate) fn shared_cross_topic_blobs(feature_flags: Option<&FeatureFlagsWatch>) -> bool {
-    feature_flags.is_some_and(|feature_flags| {
-      feature_flags.get_bool(SHARED_CROSS_TOPIC_BLOBS_FEATURE_FLAG, false)
-    })
   }
 }
 
