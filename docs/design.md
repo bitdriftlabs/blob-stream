@@ -203,15 +203,18 @@ invariant.
 1. A producer buffers records independently for each `(topic, virtual_partition_id)`.
 2. A producer seals all currently buffered partition batches on the fixed `flush_max_delay_ms`
    cadence or when a batch reaches its record-count or payload-byte threshold. New records enter a
-   subsequent generation. For each available concurrency permit, the producer removes one
-   byte-bounded broker group from sealed state and spawns its dispatch task; unadmitted work remains
-   sealed until a permit returns. Membership updates refresh the cached route map but do not force
-   an early seal. The producer holds each permit through request preparation, the initial RPC, and
-   any retry backoff or retry RPCs. Retries for logical batches in one admitted group are sequential,
-   so the limit also bounds all producer RPC attempts. It does not preserve producer submission
-   order, including within one virtual partition. The broker starts all logical batches in a grouped
-   request concurrently and returns their results in request order. It assigns sequence ranges in
-   the order that it accepts requests and preserves that durable order.
+   subsequent generation. The producer maintains equally sized dispatch-task and request permit
+   pools. It acquires both permits before removing one byte-bounded broker group from sealed state;
+   unadmitted work remains sealed until both are available. The dispatch-task permit remains held
+   through terminal waiter notification, bounding retained group work. The initial RPC and each retry
+   attempt hold a request permit only while calling the broker, releasing it before response handling
+   or backoff. Retryable logical batches in one admitted group run as concurrent futures within that
+   bounded dispatch task, and each independently acquires request capacity while sharing the original
+   retry deadline. Membership updates refresh the cached route map but do not force an early seal.
+   This does not preserve producer submission order, including within one virtual partition. The
+   broker starts all logical batches in a grouped request concurrently and returns their results in
+   request order. It assigns sequence ranges in the order that it accepts requests and preserves that
+   durable order.
 3. `ProduceBatches` returns one ordered result per submitted partition batch. The producer
    resolves successful entries independently and retries only entries that were rejected or whose
    request outcome is ambiguous. It retains the legacy `ProduceBatch` RPC only for a staged

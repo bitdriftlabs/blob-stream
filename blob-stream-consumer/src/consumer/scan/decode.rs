@@ -40,6 +40,7 @@ impl ConsumerReaderImpl {
       byte_range,
     } = plan;
     let blob_read_started_at = Instant::now();
+    self.metrics.record_fallback_blob_range_request();
     let payload = match self
       .blob_store
       .get_range(&metadata.blob_key, byte_range.clone())
@@ -57,7 +58,7 @@ impl ConsumerReaderImpl {
     };
     self
       .metrics
-      .record_fallback_blob_range(blob_read_started_at, payload.len());
+      .record_fallback_blob_range_success(blob_read_started_at, payload.len());
 
     self.decode_segment_plan_payload(
       SegmentReadPlan {

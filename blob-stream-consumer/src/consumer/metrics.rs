@@ -174,8 +174,15 @@ impl ConsumerReaderMetrics {
       .set(i64::try_from(bytes).unwrap_or(i64::MAX));
   }
 
-  pub(in crate::consumer) fn record_fallback_blob_range(&self, started_at: Instant, bytes: usize) {
+  pub(in crate::consumer) fn record_fallback_blob_range_request(&self) {
     self.fallback_blob_range_requests.inc();
+  }
+
+  pub(in crate::consumer) fn record_fallback_blob_range_success(
+    &self,
+    started_at: Instant,
+    bytes: usize,
+  ) {
     self
       .fallback_blob_range_bytes
       .inc_by(u64::try_from(bytes).unwrap_or(u64::MAX));

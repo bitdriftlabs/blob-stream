@@ -2353,6 +2353,10 @@ async fn advances_cursor_and_dedupes_on_rescan() {
 
 #[tokio::test]
 async fn failed_scan_restores_cursor_before_retrying_undelivered_batches() {
+  let metrics = Helper::new();
+  let metrics_scope = metrics
+    .collector()
+    .scope("blob_stream_consumer_failed_fallback_read_test");
   let blob_store: Arc<dyn BlobStore> = Arc::new(FailSecondRangeBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
 
@@ -2388,7 +2392,7 @@ async fn failed_scan_restores_cursor_before_retrying_undelivered_batches() {
     metadata_store,
     rejecting_broker_metadata_query(),
     rejecting_broker_blob_range_query(),
-    &metrics_scope(),
+    &metrics_scope,
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
@@ -2397,6 +2401,11 @@ async fn failed_scan_restores_cursor_before_retrying_undelivered_batches() {
 
   assert!(reader.read_available(950).await.is_err());
   assert_eq!(reader.cursor(7), None);
+  metrics.assert_counter_eq(
+    2,
+    "blob_stream_consumer_failed_fallback_read_test:reader:fallback_blob_range_requests",
+    &labels!(),
+  );
 
   let batches = reader.read_available(950).await.unwrap();
   assert_eq!(
