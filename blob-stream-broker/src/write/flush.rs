@@ -689,7 +689,6 @@ impl FlushContext {
         .cmp(right.topic.as_str())
         .then_with(|| left.virtual_partition_id.cmp(&right.virtual_partition_id))
     });
-    metrics.record_metadata_publication_latency(publication_started_at);
     debug!("flush completed {} partition results", results.len());
     Ok(results)
   }

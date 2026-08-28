@@ -104,6 +104,20 @@ RUST_LOG=off cargo run -p blob-stream-integration-tests --bin blob-stream-stress
   --brokers 1 --producers 1 --consumers 1 --partitions 4 --records 100
 ```
 
+### Monorepo Worktree
+
+From the monorepo root, use the itest-backed Bazel launcher instead of starting Compose. It starts
+and reuses the isolated DynamoDB and LocalStack pool required by the stress runner, then passes the
+pool endpoints to the process. Separate invocations can run concurrently; each run uses isolated
+bucket and DynamoDB table names.
+
+Small workload:
+
+```bash
+RUST_LOG=off ./bazelw run //blob-stream/blob-stream-integration-tests:blob-stream-stress-itest -- \
+  --brokers 1 --producers 1 --consumers 1 --partitions 4 --records 100
+```
+
 A larger example:
 
 ```bash
@@ -112,6 +126,18 @@ RUST_LOG=off cargo run -p blob-stream-integration-tests --bin blob-stream-stress
   --payload-bytes 1024 --overall-timeout-seconds 600 --producer-timeout-seconds 600 \
   --drain-timeout-seconds 120
 ```
+
+Run the same larger workload through Bazel with:
+
+```bash
+RUST_LOG=off ./bazelw run //blob-stream/blob-stream-integration-tests:blob-stream-stress-itest -- \
+  --brokers 3 --producers 4 --consumers 3 --partitions 16 --records 100000 \
+  --payload-bytes 1024 --overall-timeout-seconds 600 --producer-timeout-seconds 600 \
+  --drain-timeout-seconds 120
+```
+
+Use `./bazelw run //tools/itest:pool-stop` when no itest invocation is active and a fresh local
+service pool is needed.
 
 The runner validates every acknowledged record and intentionally treats duplicate delivery as a
 stress-test failure, even though the service delivery contract is at least once. It reports active

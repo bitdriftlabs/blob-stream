@@ -349,7 +349,7 @@ impl ConsumerReaderImpl {
       ..Default::default()
     };
     let started_at = Instant::now();
-    self.metrics.record_broker_blob_range_attempt();
+    self.metrics.record_broker_blob_range_request();
     let response = query.read_blob_ranges(request).await;
     match response.and_then(|response| {
       decode_blob_range_response_for_ranges(
@@ -381,11 +381,9 @@ impl ConsumerReaderImpl {
                 BatchReadResult::Decoded { candidate, batch }
               })
               .collect();
-            self.metrics.record_broker_blob_range_delivery(
-              started_at,
-              payloads.len(),
-              delivered_bytes,
-            );
+            self
+              .metrics
+              .record_broker_blob_range_success(started_at, delivered_bytes);
             Ok(decoded)
           },
           Err(error) => {
@@ -401,7 +399,7 @@ impl ConsumerReaderImpl {
         }
       },
       Ok(BrokerBlobRangeRead::NotFound) => {
-        self.metrics.record_broker_blob_range_not_found(plans.len());
+        self.metrics.record_broker_blob_range_not_found();
         Ok(
           plans
             .into_iter()

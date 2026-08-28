@@ -647,11 +647,6 @@ async fn starts_all_batches_in_grouped_request_concurrently() -> Result<()> {
   metrics.assert_gauge_eq(0, "blob_stream_broker_test:grpc:active_batches", &labels!());
   metrics.assert_histogram_count(
     1,
-    "blob_stream_broker_test:grpc:grouped_request_batches",
-    &labels!(),
-  );
-  metrics.assert_histogram_count(
-    1,
     "blob_stream_broker_test:grpc:grouped_request_latency_seconds",
     &labels!(),
   );

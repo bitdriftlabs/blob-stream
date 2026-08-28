@@ -2353,6 +2353,10 @@ async fn advances_cursor_and_dedupes_on_rescan() {
 
 #[tokio::test]
 async fn failed_scan_restores_cursor_before_retrying_undelivered_batches() {
+  let metrics = Helper::new();
+  let metrics_scope = metrics
+    .collector()
+    .scope("blob_stream_consumer_failed_fallback_read_test");
   let blob_store: Arc<dyn BlobStore> = Arc::new(FailSecondRangeBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
 
@@ -2388,7 +2392,7 @@ async fn failed_scan_restores_cursor_before_retrying_undelivered_batches() {
     metadata_store,
     rejecting_broker_metadata_query(),
     rejecting_broker_blob_range_query(),
-    &metrics_scope(),
+    &metrics_scope,
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
@@ -2397,6 +2401,11 @@ async fn failed_scan_restores_cursor_before_retrying_undelivered_batches() {
 
   assert!(reader.read_available(950).await.is_err());
   assert_eq!(reader.cursor(7), None);
+  metrics.assert_counter_eq(
+    2,
+    "blob_stream_consumer_failed_fallback_read_test:reader:fallback_blob_range_requests",
+    &labels!(),
+  );
 
   let batches = reader.read_available(950).await.unwrap();
   assert_eq!(
@@ -3499,22 +3508,17 @@ async fn broker_blob_cache_groups_same_key_plans_and_decodes_validated_ranges() 
   let metric = "blob_stream_consumer_broker_blob_delivery_test:reader";
   metrics.assert_counter_eq(
     1,
-    &format!("{metric}:broker_blob_range_attempts"),
+    &format!("{metric}:broker_blob_range_requests"),
     &labels!(),
   );
   metrics.assert_counter_eq(
     1,
-    &format!("{metric}:broker_blob_range_deliveries"),
-    &labels!(),
-  );
-  metrics.assert_counter_eq(
-    2,
-    &format!("{metric}:broker_blob_range_delivery_items"),
+    &format!("{metric}:broker_blob_range_successes"),
     &labels!(),
   );
   metrics.assert_counter_eq(
     first_len.saturating_add(second_len),
-    &format!("{metric}:broker_blob_range_delivery_bytes"),
+    &format!("{metric}:broker_blob_range_bytes"),
     &labels!(),
   );
   metrics.assert_counter_eq(
@@ -3614,6 +3618,9 @@ async fn corrupt_broker_blob_payload_retries_the_complete_group_directly() {
     ],
   )
   .await;
+  let fallback_bytes = payloads.iter().fold(0_u64, |total, payload| {
+    total.saturating_add(u64::try_from(payload.len()).unwrap())
+  });
   let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_success(vec![
     Bytes::from(vec![0; payloads[0].len()]),
     payloads[1].clone(),
@@ -3644,12 +3651,12 @@ async fn corrupt_broker_blob_payload_retries_the_complete_group_directly() {
   let metric = "blob_stream_consumer_broker_blob_fallback_test:reader";
   metrics.assert_counter_eq(
     1,
-    &format!("{metric}:broker_blob_range_attempts"),
+    &format!("{metric}:broker_blob_range_requests"),
     &labels!(),
   );
   metrics.assert_counter_eq(
     0,
-    &format!("{metric}:broker_blob_range_deliveries"),
+    &format!("{metric}:broker_blob_range_successes"),
     &labels!(),
   );
   metrics.assert_counter_eq(
@@ -3657,13 +3664,27 @@ async fn corrupt_broker_blob_payload_retries_the_complete_group_directly() {
     &format!("{metric}:broker_blob_range_fallbacks"),
     &labels!(),
   );
+  metrics.assert_counter_eq(
+    2,
+    &format!("{metric}:fallback_blob_range_requests"),
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    fallback_bytes,
+    &format!("{metric}:fallback_blob_range_bytes"),
+    &labels!(),
+  );
 }
 
 #[tokio::test]
 async fn overloaded_broker_blob_response_retries_the_complete_group_directly() {
+  let metrics = Helper::new();
+  let metrics_scope = metrics
+    .collector()
+    .scope("blob_stream_consumer_broker_blob_overload_test");
   let blob_store = Arc::new(RecordingRangeBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
-  let _ = write_shared_blob_segments(
+  let (_, payloads) = write_shared_blob_segments(
     blob_store.as_ref(),
     metadata_store.as_ref(),
     "telemetry",
@@ -3684,6 +3705,9 @@ async fn overloaded_broker_blob_response_retries_the_complete_group_directly() {
     ],
   )
   .await;
+  let fallback_bytes = payloads.iter().fold(0_u64, |total, payload| {
+    total.saturating_add(u64::try_from(payload.len()).unwrap())
+  });
   let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_failure(
     BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED,
   )));
@@ -3699,7 +3723,7 @@ async fn overloaded_broker_blob_response_retries_the_complete_group_directly() {
     metadata_store,
     rejecting_broker_metadata_query(),
     query.clone(),
-    &metrics_scope(),
+    &metrics_scope,
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
@@ -3710,6 +3734,27 @@ async fn overloaded_broker_blob_response_retries_the_complete_group_directly() {
   assert_eq!(batches.len(), 2);
   assert_eq!(query.requests().len(), 1);
   assert_eq!(blob_store.ranges().len(), 2);
+  let metric = "blob_stream_consumer_broker_blob_overload_test:reader";
+  metrics.assert_counter_eq(
+    1,
+    &format!("{metric}:broker_blob_range_requests"),
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    1,
+    &format!("{metric}:broker_blob_range_fallbacks"),
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    2,
+    &format!("{metric}:fallback_blob_range_requests"),
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    fallback_bytes,
+    &format!("{metric}:fallback_blob_range_bytes"),
+    &labels!(),
+  );
 }
 
 #[tokio::test]
@@ -3971,7 +4016,7 @@ async fn authoritative_broker_blob_not_found_skips_direct_retry() {
   let metric = "blob_stream_consumer_broker_blob_not_found_test:reader";
   metrics.assert_counter_eq(
     1,
-    &format!("{metric}:broker_blob_range_attempts"),
+    &format!("{metric}:broker_blob_range_requests"),
     &labels!(),
   );
   metrics.assert_counter_eq(
@@ -3980,13 +4025,13 @@ async fn authoritative_broker_blob_not_found_skips_direct_retry() {
     &labels!(),
   );
   metrics.assert_counter_eq(
-    1,
-    &format!("{metric}:broker_blob_range_not_found_items"),
+    0,
+    &format!("{metric}:broker_blob_range_fallbacks"),
     &labels!(),
   );
   metrics.assert_counter_eq(
     0,
-    &format!("{metric}:broker_blob_range_fallbacks"),
+    &format!("{metric}:fallback_blob_range_requests"),
     &labels!(),
   );
 }
