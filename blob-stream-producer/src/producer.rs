@@ -144,7 +144,9 @@ pub enum ProducerError {
 #[async_trait]
 /// High-level producer interface.
 pub trait ProducerClient: Send + Sync {
-  /// Enqueue records and return terminal results in the same order as the input.
+  /// Enqueue records and return terminal results in the same order as the input. The configured
+  /// record and byte batch limits trigger a flush but do not split one bulk submission; dispatch
+  /// splits accumulated work only as needed to fit the 16 MiB grouped-request wire limit.
   async fn produce(&self, records: Vec<ProducerRecord>) -> Vec<Result<ProducerAck, ProducerError>>;
 
   /// Returns a handle for observing this producer's local runtime state.

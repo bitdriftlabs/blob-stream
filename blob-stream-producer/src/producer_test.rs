@@ -2292,6 +2292,7 @@ async fn initial_request_permit_wait_respects_retry_deadline() {
 
   let (first_key, second_key) = keys_for_distinct_partitions();
   let third_key = third_key_for_distinct_partition(&first_key, &second_key);
+  let collector = Collector::default();
   let (retry_entered_tx, mut retry_entered_rx) = mpsc::unbounded_channel();
   let transport = Arc::new(GroupedRetryGateTransport {
     retry_entered_tx,
@@ -2303,7 +2304,7 @@ async fn initial_request_permit_wait_respects_retry_deadline() {
       vec![topic_config()],
       Arc::new(TestBrokerDiscovery::new(single_broker_membership())),
       transport,
-      metrics_scope(),
+      collector.scope("blob_stream_producer_test"),
     )
     .await
     .unwrap(),
@@ -2349,6 +2350,13 @@ async fn initial_request_permit_wait_respects_retry_deadline() {
   assert!(
     retry_entered_rx.try_recv().is_err(),
     "expired initial dispatch must not enter transport"
+  );
+  let metrics = Helper::new_with_collector(collector);
+  metrics.assert_counter_eq(3, "blob_stream_producer_test:producer:failures", &labels!());
+  metrics.assert_histogram_count(
+    3,
+    "blob_stream_producer_test:producer:send_latency_seconds",
+    &labels!(),
   );
   let _ = initial.await;
 }

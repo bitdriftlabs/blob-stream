@@ -34,6 +34,16 @@ pub(super) fn notify_unassigned_batches(
   Ok(())
 }
 
+fn notify_terminal_group_error(
+  group: BrokerBatchGroup,
+  error: ProducerError,
+) -> Result<(), ProducerError> {
+  for batch in group.batches {
+    notify_completions(batch.completions, &Err(error.clone()));
+  }
+  Err(error)
+}
+
 fn notify_completions(
   completions: Vec<super::state::BulkCompletionSpan>,
   result: &Result<ProducerAck, ProducerError>,
@@ -67,7 +77,7 @@ pub(super) async fn send_grouped_batches_and_notify(
       Duration::try_from(producer_retry_deadline(&context.config))
         .expect("producer config validation requires a positive retry deadline"),
     );
-  let response = match acquire_request_permit(
+  let request_permit = match acquire_request_permit(
     &context.request_permits,
     &context.config,
     &context.metrics,
@@ -77,39 +87,41 @@ pub(super) async fn send_grouped_batches_and_notify(
   )
   .await
   {
-    Ok(request_permit) => {
-      let request_timeout =
-        request_timeout.min(retry_deadline.saturating_duration_since(context.retry_clock.now()));
-      if request_timeout.is_zero() {
-        drop(request_permit);
-        Err(anyhow!(retry_deadline_exhausted(
-          &context.config,
-          &context.metrics,
-          context.retry_clock.as_ref(),
-          retry_started_at,
-        )))
-      } else {
-        let _active_request =
-          bd_server_stats::stats::StackAutoGauge::new(&context.metrics.active_requests);
-        let response = tokio::time::timeout(
-          request_timeout,
-          context
-            .transport
-            .produce_batches(&group.broker_address, request, request_timeout),
-        )
-        .await
-        .unwrap_or_else(|_| {
-          Err(anyhow!(
-            "producer request timed out after {} ms",
-            request_timeout.as_millis()
-          ))
-        });
-        drop(request_permit);
-        response
-      }
-    },
-    Err(error) => Err(anyhow!(error)),
+    Ok(request_permit) => request_permit,
+    // Permit acquisition already accounts for terminal errors. Retrying the grouped batches
+    // would re-observe an expired deadline and duplicate that accounting.
+    Err(error) => return notify_terminal_group_error(group, error),
   };
+  let request_timeout =
+    request_timeout.min(retry_deadline.saturating_duration_since(context.retry_clock.now()));
+  if request_timeout.is_zero() {
+    drop(request_permit);
+    return notify_terminal_group_error(
+      group,
+      retry_deadline_exhausted(
+        &context.config,
+        &context.metrics,
+        context.retry_clock.as_ref(),
+        retry_started_at,
+      ),
+    );
+  }
+  let _active_request =
+    bd_server_stats::stats::StackAutoGauge::new(&context.metrics.active_requests);
+  let response = tokio::time::timeout(
+    request_timeout,
+    context
+      .transport
+      .produce_batches(&group.broker_address, request, request_timeout),
+  )
+  .await
+  .unwrap_or_else(|_| {
+    Err(anyhow!(
+      "producer request timed out after {} ms",
+      request_timeout.as_millis()
+    ))
+  });
+  drop(request_permit);
   let result_count = group.batches.len();
   let results = match response {
     Ok(response) if response.results.len() == result_count => {
