@@ -3,8 +3,11 @@ use super::routing::BrokerBatchGroup;
 use super::{ProducerAck, ProducerError};
 use blob_stream_proto::protos::blobstream::v1::broker::Record;
 use blob_stream_types::{MAX_PRODUCE_BATCHES_REQUEST_BYTES, VirtualPartitionId};
+use parking_lot::Mutex;
 use protobuf::Chars;
 use std::collections::{BTreeMap, VecDeque};
+use std::ops::Range;
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 // ProducerState has two ownership phases. `buffers` accumulates records per partition until a
@@ -16,28 +19,164 @@ use tokio::sync::oneshot;
 // BufferedRecord
 //
 
-// The record data accepted by `produce`, including the waiter that must receive its terminal
-// result and wire sizes calculated before acquiring the state mutex.
+// The record data accepted by `produce`, including the bulk completion slot that must
+// receive its terminal result and wire sizes calculated before acquiring the state mutex.
 pub(super) struct BufferedRecord {
   pub(super) topic: Chars,
   pub(super) virtual_partition_id: VirtualPartitionId,
   pub(super) proto_record: Record,
-  pub(super) waiter: oneshot::Sender<Result<ProducerAck, ProducerError>>,
+  pub(super) completion: RecordCompletion,
   pub(super) encoded_record_size: usize,
   pub(super) request_base_size: usize,
+}
+
+//
+// BulkCompletion
+//
+
+// A bulk call owns one result vector and receiver. Record handles retain the sender through
+// dispatch, and final destruction reports shutdown for every still-pending record.
+pub(super) struct BulkCompletion {
+  state: Mutex<BulkCompletionState>,
+}
+
+struct BulkCompletionState {
+  results: Vec<Option<Result<ProducerAck, ProducerError>>>,
+  remaining_records: usize,
+  result_tx: Option<oneshot::Sender<Vec<Result<ProducerAck, ProducerError>>>>,
+}
+
+impl BulkCompletion {
+  pub(super) fn new(
+    results: Vec<Option<Result<ProducerAck, ProducerError>>>,
+    remaining_records: usize,
+  ) -> (
+    Arc<Self>,
+    oneshot::Receiver<Vec<Result<ProducerAck, ProducerError>>>,
+  ) {
+    let (result_tx, result_rx) = oneshot::channel();
+    (
+      Arc::new(Self {
+        state: Mutex::new(BulkCompletionState {
+          results,
+          remaining_records,
+          result_tx: Some(result_tx),
+        }),
+      }),
+      result_rx,
+    )
+  }
+
+  fn complete(&self, result_range: Range<usize>, result: &Result<ProducerAck, ProducerError>) {
+    let mut state = self.state.lock();
+    let completed_count = result_range.end.saturating_sub(result_range.start);
+    assert!(
+      completed_count <= state.remaining_records,
+      "bulk completion cannot exceed its pending record count"
+    );
+    for slot in &mut state.results[result_range] {
+      assert!(slot.is_none(), "bulk record completed more than once");
+      *slot = Some(result.clone());
+    }
+    state.remaining_records -= completed_count;
+    if state.remaining_records > 0 {
+      return;
+    }
+
+    let results = std::mem::take(&mut state.results)
+      .into_iter()
+      .map(|result| result.expect("all bulk result slots must complete"))
+      .collect();
+    let result_tx = state
+      .result_tx
+      .take()
+      .expect("bulk completion sender is available until all records complete");
+    drop(state);
+    let _ = result_tx.send(results);
+  }
+}
+
+impl Drop for BulkCompletion {
+  fn drop(&mut self) {
+    let state = self.state.get_mut();
+    let Some(result_tx) = state.result_tx.take() else {
+      return;
+    };
+
+    let results = std::mem::take(&mut state.results)
+      .into_iter()
+      .map(|result| result.unwrap_or(Err(ProducerError::Shutdown)))
+      .collect();
+    let _ = result_tx.send(results);
+  }
+}
+
+//
+// RecordCompletion
+//
+
+// A record's position in its caller's ordered bulk result vector.
+pub(super) struct RecordCompletion {
+  completion: Arc<BulkCompletion>,
+  result_index: usize,
+}
+
+impl RecordCompletion {
+  pub(super) fn new(completion: Arc<BulkCompletion>, result_index: usize) -> Self {
+    Self {
+      completion,
+      result_index,
+    }
+  }
+}
+
+//
+// BulkCompletionSpan
+//
+
+// A contiguous range from one bulk call that receives the same terminal producer-batch result.
+pub(super) struct BulkCompletionSpan {
+  completion: Arc<BulkCompletion>,
+  result_range: Range<usize>,
+}
+
+impl BulkCompletionSpan {
+  pub(super) fn complete(self, result: &Result<ProducerAck, ProducerError>) {
+    self.completion.complete(self.result_range, result);
+  }
+}
+
+fn completion_spans(
+  completions: impl IntoIterator<Item = RecordCompletion>,
+) -> Vec<BulkCompletionSpan> {
+  let mut spans: Vec<BulkCompletionSpan> = Vec::new();
+  for completion in completions {
+    if let Some(last_span) = spans.last_mut()
+      && Arc::ptr_eq(&last_span.completion, &completion.completion)
+      && last_span.result_range.end == completion.result_index
+    {
+      last_span.result_range.end += 1;
+    } else {
+      spans.push(BulkCompletionSpan {
+        completion: completion.completion,
+        result_range: completion.result_index .. completion.result_index + 1,
+      });
+    }
+  }
+  spans
 }
 
 //
 // BufferedBatch
 //
 
-// One partition's records prepared for one broker RPC. Records and waiters remain aligned so a
-// dispatch result can be reported to every caller after the RPC completes.
+// One partition's records prepared for one broker RPC. Completion spans identify every caller
+// result slot that receives this batch's terminal result.
 pub(super) struct BufferedBatch {
   pub(super) topic: Chars,
   pub(super) virtual_partition_id: VirtualPartitionId,
   pub(super) records: Vec<Record>,
-  pub(super) waiters: Vec<oneshot::Sender<Result<ProducerAck, ProducerError>>>,
+  pub(super) completions: Vec<BulkCompletionSpan>,
 }
 
 // A sealed partition batch awaiting extraction into one or more bounded broker RPCs. A record
@@ -46,7 +185,7 @@ struct ReadyBatch {
   topic: Chars,
   virtual_partition_id: VirtualPartitionId,
   records: Vec<Record>,
-  waiters: VecDeque<oneshot::Sender<Result<ProducerAck, ProducerError>>>,
+  completions: VecDeque<RecordCompletion>,
   encoded_record_sizes: Vec<usize>,
   request_base_size: usize,
   next_record_index: usize,
@@ -72,7 +211,7 @@ impl ReadyBatch {
       return None;
     }
 
-    // Move selected records and their corresponding waiters out without shifting the unsent
+    // Move selected records and their completion handles out without shifting the unsent
     // suffix. `buffered_bytes` tracks payload bytes, unlike the wire-size budget above.
     let grouped_batch_size = encoded_grouped_message_size(request_size);
     let mut payload_bytes: usize = 0;
@@ -84,14 +223,12 @@ impl ReadyBatch {
         record
       })
       .collect();
-    let waiters = (start_index .. end_index)
-      .map(|_| {
-        self
-          .waiters
-          .pop_front()
-          .expect("ready batch has one waiter per record")
-      })
-      .collect();
+    let completions = completion_spans((start_index .. end_index).map(|_| {
+      self
+        .completions
+        .pop_front()
+        .expect("ready batch has one completion handle per record")
+    }));
     self.next_record_index = end_index;
     self.buffered_bytes = self.buffered_bytes.saturating_sub(payload_bytes);
     Some((
@@ -99,7 +236,7 @@ impl ReadyBatch {
         topic: self.topic.clone(),
         virtual_partition_id: self.virtual_partition_id,
         records,
-        waiters,
+        completions,
       },
       grouped_batch_size,
     ))
@@ -113,7 +250,7 @@ impl ReadyBatch {
 }
 
 // The result of sealing every currently accumulating partition. Unassigned batches are returned
-// so the caller can notify their waiters immediately instead of retaining unroutable work.
+// so the caller can notify their completions immediately instead of retaining unroutable work.
 pub(super) struct SealedBatches {
   pub(super) batch_count: usize,
   pub(super) unassigned: Vec<BufferedBatch>,
@@ -138,7 +275,7 @@ pub(super) struct BufferedPartitionStats {
 #[derive(Default)]
 pub(super) struct PartitionBuffer {
   pub(super) records: Vec<Record>,
-  pub(super) waiters: Vec<oneshot::Sender<Result<ProducerAck, ProducerError>>>,
+  pub(super) completions: Vec<RecordCompletion>,
   encoded_record_sizes: Vec<usize>,
   request_base_size: Option<usize>,
   pub(super) buffered_bytes: usize,
@@ -148,7 +285,7 @@ impl PartitionBuffer {
   fn push(
     &mut self,
     record: Record,
-    waiter: oneshot::Sender<Result<ProducerAck, ProducerError>>,
+    completion: RecordCompletion,
     encoded_record_size: usize,
     request_base_size: usize,
   ) {
@@ -163,7 +300,7 @@ impl PartitionBuffer {
     self.request_base_size = Some(request_base_size);
     self.buffered_bytes = self.buffered_bytes.saturating_add(record.payload.len());
     self.records.push(record);
-    self.waiters.push(waiter);
+    self.completions.push(completion);
     self.encoded_record_sizes.push(encoded_record_size);
   }
 
@@ -185,7 +322,7 @@ impl PartitionBuffer {
     // Move the complete partition batch into the ready phase. Each collection is emptied together
     // so their index-based correspondence remains intact for extraction and waiter notification.
     let records = std::mem::take(&mut self.records);
-    let waiters = std::mem::take(&mut self.waiters);
+    let completions = std::mem::take(&mut self.completions);
     let encoded_record_sizes = std::mem::take(&mut self.encoded_record_sizes);
     let request_base_size = self
       .request_base_size
@@ -197,7 +334,7 @@ impl PartitionBuffer {
       topic,
       virtual_partition_id,
       records,
-      waiters: VecDeque::from(waiters),
+      completions: VecDeque::from(completions),
       encoded_record_sizes,
       request_base_size,
       next_record_index: 0,
@@ -232,7 +369,7 @@ impl ProducerState {
       topic,
       virtual_partition_id,
       proto_record,
-      waiter,
+      completion,
       encoded_record_size,
       request_base_size,
     } = record;
@@ -242,7 +379,12 @@ impl ProducerState {
       .or_default()
       .entry(virtual_partition_id)
       .or_default();
-    buffer.push(proto_record, waiter, encoded_record_size, request_base_size);
+    buffer.push(
+      proto_record,
+      completion,
+      encoded_record_size,
+      request_base_size,
+    );
     buffer.should_flush_by_size(max_batch_records, max_batch_bytes)
   }
 
@@ -262,12 +404,12 @@ impl ProducerState {
         if let Some(batch) = buffer.take_batch(topic.clone(), virtual_partition_id) {
           batch_count += 1;
           let Some(broker_address) = broker_for(&topic, virtual_partition_id) else {
-            // Preserve record/waiter alignment while returning the routing failure to the caller.
+            // Preserve record/completion alignment while returning the routing failure to callers.
             unassigned.push(BufferedBatch {
               topic: batch.topic,
               virtual_partition_id: batch.virtual_partition_id,
               records: batch.records,
-              waiters: batch.waiters.into_iter().collect(),
+              completions: completion_spans(batch.completions),
             });
             continue;
           };
@@ -340,7 +482,7 @@ impl ProducerState {
               (topic.clone(), *virtual_partition_id),
               BufferedPartitionStats {
                 record_count: buffer.records.len(),
-                pending_ack_count: buffer.waiters.len(),
+                pending_ack_count: buffer.completions.len(),
                 payload_bytes: buffer.buffered_bytes,
               },
             )
@@ -357,7 +499,7 @@ impl ProducerState {
             payload_bytes: 0,
           });
         entry.record_count += ready_batch.records.len() - ready_batch.next_record_index;
-        entry.pending_ack_count += ready_batch.waiters.len();
+        entry.pending_ack_count += ready_batch.completions.len();
         entry.payload_bytes += ready_batch.buffered_bytes;
       }
     }

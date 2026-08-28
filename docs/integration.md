@@ -34,19 +34,29 @@ use blob_stream_producer::{
 let metrics_scope = Collector::default().scope("telemetry_ingester");
 let producer = ProducerClientImpl::from_runtime_config(runtime, metrics_scope).await?;
 
-let acknowledgement = producer
-  .produce(ProducerRecord::new(
+let results = producer
+  .produce(vec![ProducerRecord::new(
     "telemetry",
     record_key,
     payload,
     event_timestamp_ms,
-  ))
-  .await?;
+  )])
+  .await;
+let acknowledgement = results
+  .into_iter()
+  .next()
+  .expect("one submitted record has one result")?;
 ```
 
-`produce` batches records by topic and virtual partition, then resolves when the broker acknowledges
-that batch. Retrying an ambiguous request can deliver a record more than once, so downstream
-processing must remain idempotent. The producer client owns a background batch-flush task.
+`produce` validates and batches records by topic and virtual partition, then returns one terminal
+result per input record in input order. Retrying an ambiguous request can deliver a record more than
+once, so downstream processing must remain idempotent. The producer client owns a background
+batch-flush task.
+
+The configured producer record and payload-byte batch limits trigger a flush but do not split one
+bulk submission. A same-partition bulk can therefore exceed those thresholds before it is sealed;
+the dispatcher splits accumulated work only as needed to keep each grouped broker request within
+the 16 MiB wire limit.
 
 `ProducerRuntimeConfig` contains:
 

@@ -19,6 +19,7 @@ use blob_stream_consumer::{
   ConsumerReadConfig,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG,
 };
+use blob_stream_producer::test::ProducerClientTestExt;
 use blob_stream_producer::{
   ProducerAck,
   ProducerClient,
@@ -771,7 +772,7 @@ async fn run_producer(
     let producer_client = Arc::clone(&producer);
     submissions.push(async move {
       producer_client
-        .produce(ProducerRecord::new(
+        .produce_one(ProducerRecord::new(
           TOPIC.into(),
           key,
           identity.encode(payload_size).into(),

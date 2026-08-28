@@ -61,12 +61,12 @@ use parking_lot::Mutex;
 use protobuf::Chars;
 pub use retry::ProducerRetryClock;
 use routing::{ProducerRoutes, record_wire_sizes};
-use state::{BufferedRecord, ProducerState};
+use state::{BufferedRecord, BulkCompletion, ProducerState, RecordCompletion};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use thiserror::Error;
-use tokio::sync::{Notify, Semaphore, oneshot, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, timeout};
 pub use transport::{BrokerTransport, GrpcBrokerTransport};
@@ -144,8 +144,11 @@ pub enum ProducerError {
 #[async_trait]
 /// High-level producer interface.
 pub trait ProducerClient: Send + Sync {
-  /// Enqueue a record and wait for broker acknowledgement.
-  async fn produce(&self, record: ProducerRecord) -> Result<ProducerAck, ProducerError>;
+  /// Enqueue records and return terminal results in the same order as the input. The configured
+  /// record and byte batch limits trigger a flush but do not split one bulk submission; dispatch
+  /// splits accumulated work only as needed to fit the 16 MiB grouped-request wire limit.
+  async fn produce(&self, records: Vec<ProducerRecord>) -> Vec<Result<ProducerAck, ProducerError>>;
+
   /// Returns a handle for observing this producer's local runtime state.
   fn diagnostics(&self) -> Option<ProducerDiagnostics> {
     None
@@ -217,6 +220,38 @@ pub struct ProducerClientImpl {
   state: Arc<Mutex<ProducerState>>,
   flush_notify: Arc<Notify>,
   flush_task: JoinHandle<()>,
+}
+
+//
+// ProducerDispatchContext
+//
+
+// Immutable dependencies shared by the flush coordinator and its dispatch tasks. Keeping these
+// together makes each task capture one Arc rather than rebuilding its closure from every field.
+pub(in crate::producer) struct ProducerDispatchContext {
+  pub(in crate::producer) config: ProducerConfig,
+  pub(in crate::producer) topics: HashMap<Chars, ProducerTopicConfig>,
+  pub(in crate::producer) membership_rx: watch::Receiver<BrokerMembership>,
+  pub(in crate::producer) transport: Arc<dyn BrokerTransport>,
+  pub(in crate::producer) metrics: Arc<ProducerMetrics>,
+  pub(in crate::producer) retry_diagnostics: ProducerRetryDiagnostics,
+  pub(in crate::producer) retry_clock: Arc<dyn ProducerRetryClock>,
+  pub(in crate::producer) routes: ProducerRoutes,
+  pub(in crate::producer) request_permits: Arc<Semaphore>,
+}
+
+//
+// PreparedRecord
+//
+
+// Record data that was validated and sized before the producer state mutex is acquired.
+struct PreparedRecord {
+  result_index: usize,
+  topic: Chars,
+  virtual_partition_id: VirtualPartitionId,
+  proto_record: Record,
+  encoded_record_size: usize,
+  request_base_size: usize,
 }
 
 impl ProducerClientImpl {
@@ -324,6 +359,17 @@ impl ProducerClientImpl {
     let dispatch_task_permits = Arc::new(Semaphore::new(max_request_concurrency));
     let request_permits = Arc::new(Semaphore::new(max_request_concurrency));
     let flush_notify = Arc::new(Notify::new());
+    let dispatch_context = Arc::new(ProducerDispatchContext {
+      config: config.clone(),
+      topics: topic_map.clone(),
+      membership_rx: membership_rx.clone(),
+      transport: Arc::clone(&transport),
+      metrics: Arc::clone(&metrics),
+      retry_diagnostics: retry_diagnostics.clone(),
+      retry_clock: Arc::clone(&retry_clock),
+      routes: routes.clone(),
+      request_permits,
+    });
 
     log::info!(
       "producer initialized: writer_id={}, topics={}, flush_max_delay_ms={}, \
@@ -337,16 +383,9 @@ impl ProducerClientImpl {
 
     let flush_task = Self::spawn_flush_loop(
       Arc::clone(&state),
-      Arc::clone(&transport),
-      config.clone(),
-      topic_map.clone(),
+      dispatch_context,
       membership_rx.clone(),
-      Arc::clone(&metrics),
-      retry_diagnostics.clone(),
-      Arc::clone(&retry_clock),
-      routes.clone(),
       Arc::clone(&dispatch_task_permits),
-      Arc::clone(&request_permits),
       Arc::clone(&flush_notify),
     );
 
@@ -368,24 +407,15 @@ impl ProducerClientImpl {
 
   fn spawn_flush_loop(
     state: Arc<Mutex<ProducerState>>,
-    transport: Arc<dyn BrokerTransport>,
-    config: ProducerConfig,
-    topics: HashMap<Chars, ProducerTopicConfig>,
+    dispatch_context: Arc<ProducerDispatchContext>,
     mut membership_rx: watch::Receiver<BrokerMembership>,
-    metrics: Arc<ProducerMetrics>,
-    retry_diagnostics: ProducerRetryDiagnostics,
-    retry_clock: Arc<dyn ProducerRetryClock>,
-    routes: ProducerRoutes,
     dispatch_task_permits: Arc<Semaphore>,
-    request_permits: Arc<Semaphore>,
     flush_notify: Arc<Notify>,
   ) -> JoinHandle<()> {
     // Every flush trigger drains and packs all buffered partitions, maximizing each broker-scoped
     // RPC. Membership updates refresh routing but preserve the current batching cadence.
     tokio::spawn(async move {
-      // Dispatches share this read-only receiver while the loop keeps its receiver for updates.
-      let dispatch_membership_rx = membership_rx.clone();
-      let flush_delay = StdDuration::try_from(producer_flush_max_delay(&config))
+      let flush_delay = StdDuration::try_from(producer_flush_max_delay(&dispatch_context.config))
         .expect("producer config validation requires a positive flush max delay");
       let flush_sleep = tokio::time::sleep(flush_delay);
       tokio::pin!(flush_sleep);
@@ -399,8 +429,12 @@ impl ProducerClientImpl {
           changed = membership_rx.changed(), if !membership_closed => {
             if changed.is_ok() {
               let membership = membership_rx.borrow_and_update().clone();
-              routes.refresh(&config, &topics, &membership);
-              transport.reconcile_membership(&membership);
+              dispatch_context.routes.refresh(
+                &dispatch_context.config,
+                &dispatch_context.topics,
+                &membership,
+              );
+              dispatch_context.transport.reconcile_membership(&membership);
             } else {
               membership_closed = true;
             }
@@ -420,7 +454,7 @@ impl ProducerClientImpl {
         };
 
         if let Some(flush_triggered_by_size) = flush_triggered_by_size {
-          let assignment = routes.assignment_snapshot();
+          let assignment = dispatch_context.routes.assignment_snapshot();
           let sealed = state
             .lock()
             .seal_ready_generation(|topic, virtual_partition_id| {
@@ -433,9 +467,9 @@ impl ProducerClientImpl {
             });
           if sealed.batch_count > 0 {
             if flush_triggered_by_size {
-              metrics.flushes_max_size.inc();
+              dispatch_context.metrics.flushes_max_size.inc();
             } else {
-              metrics.flushes_max_delay.inc();
+              dispatch_context.metrics.flushes_max_delay.inc();
             }
             trace!(
               "producer flush loop sealed {} batch(es)",
@@ -444,7 +478,7 @@ impl ProducerClientImpl {
           }
           // Unassigned batches have notified their record waiters. This background task has no
           // caller to receive the terminal error.
-          let _ = notify_unassigned_batches(&metrics, sealed.unassigned);
+          let _ = notify_unassigned_batches(&dispatch_context.metrics, sealed.unassigned);
 
           // Each trigger-driven drain starts a new maximum-delay window for subsequent partial
           // batches.
@@ -455,40 +489,14 @@ impl ProducerClientImpl {
         // unsent work in ProducerState, so no batch must be reconstructed after admission fails.
         while let Ok(dispatch_task_permit) = Arc::clone(&dispatch_task_permits).try_acquire_owned()
         {
-          let Ok(initial_request_permit) = Arc::clone(&request_permits).try_acquire_owned() else {
-            drop(dispatch_task_permit);
-            break;
-          };
           let Some(group) = state.lock().take_next_ready_group() else {
-            drop(initial_request_permit);
             drop(dispatch_task_permit);
             break;
           };
-          let config = config.clone();
-          let topics = topics.clone();
-          let routes = routes.clone();
-          let membership_rx = dispatch_membership_rx.clone();
-          let transport = Arc::clone(&transport);
-          let metrics = Arc::clone(&metrics);
-          let retry_diagnostics = retry_diagnostics.clone();
-          let retry_clock = Arc::clone(&retry_clock);
-          let request_permits = Arc::clone(&request_permits);
+          let dispatch_context = Arc::clone(&dispatch_context);
           dispatches.spawn(async move {
-            send_grouped_batches_and_notify(
-              &config,
-              &topics,
-              &routes,
-              &membership_rx,
-              transport.as_ref(),
-              &metrics,
-              &retry_diagnostics,
-              retry_clock.as_ref(),
-              dispatch_task_permit,
-              initial_request_permit,
-              request_permits,
-              group,
-            )
-            .await
+            send_grouped_batches_and_notify(dispatch_context.as_ref(), dispatch_task_permit, group)
+              .await
           });
         }
       }
@@ -505,63 +513,98 @@ impl Drop for ProducerClientImpl {
 
 #[async_trait]
 impl ProducerClient for ProducerClientImpl {
-  async fn produce(&self, record: ProducerRecord) -> Result<ProducerAck, ProducerError> {
-    let ProducerRecord {
-      topic,
-      record_key,
-      payload,
-      event_ts_ms,
-    } = record;
-    let topic_config = self
-      .topics
-      .get(topic.as_str())
-      .ok_or_else(|| ProducerError::UnknownTopic(topic.clone()))?;
-
-    let virtual_partition_id =
-      compute_virtual_partition_id(&record_key, topic_config.partition_count, self.writer_id);
-    let proto_record = Record {
-      payload,
-      event_ts_ms,
-      ..Default::default()
-    };
-    let record_wire_sizes = record_wire_sizes(&topic, virtual_partition_id, &proto_record);
-    if !record_wire_sizes.fits_grouped_request() {
-      return Err(ProducerError::Rejected(format!(
-        "record exceeds the {MAX_PRODUCE_BATCHES_REQUEST_BYTES} byte request limit"
-      )));
+  async fn produce(&self, records: Vec<ProducerRecord>) -> Vec<Result<ProducerAck, ProducerError>> {
+    if records.is_empty() {
+      return Vec::new();
     }
 
-    let (tx, rx) = oneshot::channel();
-    let payload_len = proto_record.payload.len();
+    // Validate, partition, and measure before entering shared state. Invalid input occupies its
+    // result slot but does not prevent valid siblings from being accepted.
+    let mut results = std::iter::repeat_with(|| None)
+      .take(records.len())
+      .collect::<Vec<Option<Result<ProducerAck, ProducerError>>>>();
+    let mut prepared_records = Vec::with_capacity(records.len());
+    for (result_index, record) in records.into_iter().enumerate() {
+      let ProducerRecord {
+        topic,
+        record_key,
+        payload,
+        event_ts_ms,
+      } = record;
+      let Some(topic_config) = self.topics.get(topic.as_str()) else {
+        results[result_index] = Some(Err(ProducerError::UnknownTopic(topic)));
+        continue;
+      };
+      let virtual_partition_id =
+        compute_virtual_partition_id(&record_key, topic_config.partition_count, self.writer_id);
+      let proto_record = Record {
+        payload,
+        event_ts_ms,
+        ..Default::default()
+      };
+      let record_wire_sizes = record_wire_sizes(&topic, virtual_partition_id, &proto_record);
+      if !record_wire_sizes.fits_grouped_request() {
+        results[result_index] = Some(Err(ProducerError::Rejected(format!(
+          "record exceeds the {MAX_PRODUCE_BATCHES_REQUEST_BYTES} byte request limit"
+        ))));
+        continue;
+      }
+      prepared_records.push(PreparedRecord {
+        result_index,
+        topic,
+        virtual_partition_id,
+        proto_record,
+        encoded_record_size: record_wire_sizes.encoded_record_size,
+        request_base_size: record_wire_sizes.request_base_size,
+      });
+    }
 
-    trace!(
-      "record buffered: topic={topic}, virtual_partition_id={virtual_partition_id}, \
-       payload_bytes={payload_len}"
-    );
+    if prepared_records.is_empty() {
+      return results
+        .into_iter()
+        .map(|result| result.expect("invalid record result was populated"))
+        .collect();
+    }
+
+    let (completion, completion_rx) = BulkCompletion::new(results, prepared_records.len());
+    let completion_count = prepared_records.len();
     let size_flush_requested = {
       let mut guard = self.state.lock();
-      guard.push_record(
-        BufferedRecord {
-          topic,
-          virtual_partition_id,
-          proto_record,
-          waiter: tx,
-          encoded_record_size: record_wire_sizes.encoded_record_size,
-          request_base_size: record_wire_sizes.request_base_size,
-        },
-        self.max_batch_records,
-        self.max_batch_bytes,
-      )
+      let mut size_flush_requested = false;
+      for record in prepared_records {
+        size_flush_requested |= guard.push_record(
+          BufferedRecord {
+            topic: record.topic,
+            virtual_partition_id: record.virtual_partition_id,
+            proto_record: record.proto_record,
+            completion: RecordCompletion::new(Arc::clone(&completion), record.result_index),
+            encoded_record_size: record.encoded_record_size,
+            request_base_size: record.request_base_size,
+          },
+          self.max_batch_records,
+          self.max_batch_bytes,
+        );
+      }
+      size_flush_requested
     };
 
-    self.metrics.records_enqueued.inc();
-
+    self
+      .metrics
+      .records_enqueued
+      .inc_by(completion_count.try_into().unwrap_or_default());
+    trace!("bulk records buffered: record_count={completion_count}");
     if size_flush_requested {
-      trace!("size flush requested: virtual_partition_id={virtual_partition_id}");
+      trace!("size flush requested by bulk record admission");
       self.flush_notify.notify_one();
     }
 
-    rx.await.unwrap_or(Err(ProducerError::Shutdown))
+    // The record handles own the completion sender. If producer shutdown drops every handle,
+    // BulkCompletion::drop preserves immediate validation failures and fills pending slots with
+    // shutdown errors.
+    drop(completion);
+    completion_rx
+      .await
+      .expect("bulk completion sends a result vector before its sender is dropped")
   }
 
   fn diagnostics(&self) -> Option<ProducerDiagnostics> {

@@ -2,6 +2,8 @@
 //!
 //! This crate provides a batched, retrying producer client that routes records to broker nodes
 //! using rendezvous hashing over discovery membership.
+//! [`ProducerClient::produce`] accepts batches to amortize producer admission and completion
+//! overhead while preserving one ordered result per input record.
 //!
 //! # Quick Start
 //!
@@ -61,14 +63,15 @@
 //!   let metrics_scope = Collector::default().scope("blob_stream_producer_docs");
 //!   let producer = ProducerClientImpl::from_runtime_config(runtime, metrics_scope).await?;
 //!
-//!   let ack = producer
-//!     .produce(ProducerRecord::new(
+//!   let mut results = producer
+//!     .produce(vec![ProducerRecord::new(
 //!       "telemetry",
 //!       b"device-123".to_vec(),
 //!       b"payload".to_vec(),
 //!       1_700_000_000_000,
-//!     ))
-//!     .await?;
+//!     )])
+//!     .await;
+//!   let ack = results.pop().expect("one record produces one result")?;
 //!   println!(
 //!     "acked partition={}, attempts={}",
 //!     ack.virtual_partition_id, ack.attempts
@@ -80,6 +83,7 @@
 mod admin;
 mod config;
 mod producer;
+pub mod test;
 
 pub use config::{
   ProducerCompression,

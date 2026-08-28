@@ -7,6 +7,7 @@ use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, Nex
 use blob_stream_consumer::{ConsumerReadConfig, DEFAULT_MAX_METADATA_PUBLICATION_LAG};
 use blob_stream_integration_tests::test_framework as framework;
 use blob_stream_metadata_store::ConsumerGroupMember;
+use blob_stream_producer::test::ProducerClientTestExt;
 use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerError, ProducerRecord};
 use blob_stream_types::{
   ToProtoDuration,
@@ -265,7 +266,7 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
   let mut expected_ids = HashSet::new();
   let mut produced_partitions = HashSet::new();
   let first_id = "fit-001-0";
-  let first_produce = producer.produce(ProducerRecord::new(
+  let first_produce = producer.produce_one(ProducerRecord::new(
     TOPIC.into(),
     b"fit-001-key-0".to_vec(),
     first_id.as_bytes().to_vec().into(),
@@ -581,7 +582,7 @@ async fn response_loss_retry_during_broker_handoff_preserves_group_delivery_cont
       virtual_partition_id,
     )
     .await?;
-  let produce = producer.produce(ProducerRecord::new(
+  let produce = producer.produce_one(ProducerRecord::new(
     TOPIC.into(),
     key,
     id.as_bytes().to_vec().into(),
@@ -930,7 +931,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
   let mut expected_ids = HashSet::new();
   let mut produced_partitions = HashSet::new();
   let first_id = "fit-003-pre-reroute-0";
-  let first_produce = producer.produce(ProducerRecord::new(
+  let first_produce = producer.produce_one(ProducerRecord::new(
     TOPIC.into(),
     b"fit-003-key-pre-0".to_vec(),
     first_id.as_bytes().to_vec().into(),
@@ -1018,7 +1019,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
   .map_err(|_| anyhow::anyhow!("producer routes did not converge to the standby broker"))?;
   let first_post_id = "fit-003-post-reroute-12";
   let first_post_ack = complete_produce_with_manual_retries(
-    producer.produce(ProducerRecord::new(
+    producer.produce_one(ProducerRecord::new(
       TOPIC.into(),
       b"fit-003-key-post-12".to_vec(),
       first_post_id.as_bytes().to_vec().into(),
@@ -1034,7 +1035,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
   for message_id in 13 .. 36 {
     let id = format!("fit-003-post-reroute-{message_id}");
     let ack = complete_produce_with_manual_retries(
-      producer.produce(ProducerRecord::new(
+      producer.produce_one(ProducerRecord::new(
         TOPIC.into(),
         format!("fit-003-key-post-{message_id}").into_bytes(),
         id.as_bytes().to_vec().into(),
@@ -1131,7 +1132,7 @@ async fn producer_retry_deadline_respected_after_transport_failures() -> Result<
     .build()
     .await?;
 
-  let exhausted = producer.produce(ProducerRecord::new(
+  let exhausted = producer.produce_one(ProducerRecord::new(
     TOPIC.into(),
     b"fit-004-timeout".to_vec(),
     b"fit-004-timeout".to_vec().into(),
@@ -1277,7 +1278,7 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
   let mut expected_ids = HashSet::new();
   let mut produced_partitions = HashSet::new();
   let first_id = "fit-005-0";
-  let first_produce = producer.produce(ProducerRecord::new(
+  let first_produce = producer.produce_one(ProducerRecord::new(
     TOPIC.into(),
     b"fit-005-key-0".to_vec(),
     first_id.as_bytes().to_vec().into(),
@@ -1623,7 +1624,7 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
     .build()
     .await?;
 
-  let failed_produce = producer.produce(ProducerRecord::new(
+  let failed_produce = producer.produce_one(ProducerRecord::new(
     TOPIC.into(),
     b"fit-007-key".to_vec(),
     b"fit-007-failed".to_vec().into(),
@@ -1980,7 +1981,7 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
   for message_id in 0 .. 16 {
     let id = format!("fit-009-pre-reroute-{message_id}");
     let ack = complete_produce_with_manual_retries(
-      producer.produce(ProducerRecord::new(
+      producer.produce_one(ProducerRecord::new(
         TOPIC.into(),
         format!("fit-009-key-pre-{message_id}").into_bytes(),
         id.as_bytes().to_vec().into(),
@@ -2051,7 +2052,7 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
   for message_id in 16 .. 40 {
     let id = format!("fit-009-post-reroute-{message_id}");
     let ack = complete_produce_with_manual_retries(
-      producer.produce(ProducerRecord::new(
+      producer.produce_one(ProducerRecord::new(
         TOPIC.into(),
         format!("fit-009-key-post-{message_id}").into_bytes(),
         id.as_bytes().to_vec().into(),
@@ -3369,7 +3370,7 @@ async fn combined_network_and_metadata_faults_preserve_producer_publication() ->
   let mut expected_ids = HashSet::new();
   let mut produced_partitions = HashSet::new();
   let first_id = "fit-011-0";
-  let first_produce = producer.produce(ProducerRecord::new(
+  let first_produce = producer.produce_one(ProducerRecord::new(
     TOPIC.into(),
     b"fit-011-key-0".to_vec(),
     first_id.as_bytes().to_vec().into(),
@@ -3539,7 +3540,7 @@ async fn run_scripted_transport_fault_scenario() -> Result<Fit012Outcome> {
 
   let mut expected_ids = HashSet::new();
   let first_id = "fit-012-0";
-  let first_produce = producer.produce(ProducerRecord::new(
+  let first_produce = producer.produce_one(ProducerRecord::new(
     TOPIC.into(),
     b"fit-012-key-0".to_vec(),
     first_id.as_bytes().to_vec().into(),

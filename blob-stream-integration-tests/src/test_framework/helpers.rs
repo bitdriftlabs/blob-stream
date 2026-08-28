@@ -7,7 +7,8 @@ use blob_stream_consumer::consumer::{
   ConsumerReaderImpl,
   ReadCapacity,
 };
-use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerRecord};
+use blob_stream_producer::test::ProducerClientTestExt;
+use blob_stream_producer::{ProducerClientImpl, ProducerRecord};
 use blob_stream_types::VirtualPartitionId;
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
@@ -62,15 +63,15 @@ pub async fn produce_message_for_topic(
   key: Vec<u8>,
   id: &str,
 ) -> Result<blob_stream_producer::ProducerAck> {
-  let ack = producer
-    .produce(ProducerRecord::new(
+  producer
+    .produce_one(ProducerRecord::new(
       topic.to_string().into(),
       key,
       id.as_bytes().to_vec().into(),
       now_unix_millis(),
     ))
-    .await?;
-  Ok(ack)
+    .await
+    .map_err(Into::into)
 }
 
 pub async fn drain_reader_until(

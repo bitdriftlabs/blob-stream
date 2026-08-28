@@ -40,6 +40,7 @@ use blob_stream_metadata_store::{
   SegmentMetadata,
   SequenceReservationOutcome,
 };
+use blob_stream_producer::test::ProducerClientTestExt;
 use blob_stream_producer::{
   GrpcBrokerTransport,
   ProducerClient,
@@ -711,7 +712,7 @@ async fn broker_coalesces_same_partition_requests_into_one_consumer_batch() -> R
   let first_key = key.clone();
   let first = tokio::spawn(async move {
     first_producer
-      .produce(ProducerRecord::new(
+      .produce_one(ProducerRecord::new(
         TOPIC.into(),
         first_key,
         b"first".to_vec().into(),
@@ -748,7 +749,7 @@ async fn broker_coalesces_same_partition_requests_into_one_consumer_batch() -> R
   let second_producer = Arc::clone(&producer);
   let second = tokio::spawn(async move {
     second_producer
-      .produce(ProducerRecord::new(
+      .produce_one(ProducerRecord::new(
         TOPIC.into(),
         key,
         b"second".to_vec().into(),
@@ -4182,7 +4183,7 @@ async fn shared_cross_topic_blob_pulls_forward_a_fresh_topic() -> Result<()> {
   let first_producer = Arc::clone(&producer);
   let first = tokio::spawn(async move {
     first_producer
-      .produce(ProducerRecord::new(
+      .produce_one(ProducerRecord::new(
         TOPIC.into(),
         b"shared-first-key".to_vec(),
         b"shared-first".to_vec().into(),
@@ -4218,7 +4219,7 @@ async fn shared_cross_topic_blob_pulls_forward_a_fresh_topic() -> Result<()> {
   let second_producer = Arc::clone(&producer);
   let second = tokio::spawn(async move {
     second_producer
-      .produce(ProducerRecord::new(
+      .produce_one(ProducerRecord::new(
         SECOND_TOPIC.into(),
         b"shared-second-key".to_vec(),
         b"shared-second".to_vec().into(),
@@ -4373,7 +4374,7 @@ async fn shared_object_metadata_failure_is_isolated_and_retries() -> Result<()> 
   let first_producer = Arc::clone(&producer);
   let first = tokio::spawn(async move {
     first_producer
-      .produce(ProducerRecord::new(
+      .produce_one(ProducerRecord::new(
         TOPIC.into(),
         b"partial-first-key".to_vec(),
         b"partial-first".to_vec().into(),
@@ -4384,7 +4385,7 @@ async fn shared_object_metadata_failure_is_isolated_and_retries() -> Result<()> 
   let second_producer = Arc::clone(&producer);
   let second = tokio::spawn(async move {
     second_producer
-      .produce(ProducerRecord::new(
+      .produce_one(ProducerRecord::new(
         SECOND_TOPIC.into(),
         b"partial-second-key".to_vec(),
         b"partial-second".to_vec().into(),
@@ -4597,7 +4598,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
     )
     .expect("unix millis exceeds i64");
     let ack = boundary_producer
-      .produce(ProducerRecord::new(
+      .produce_one(ProducerRecord::new(
         TOPIC.into(),
         format!("boundary-key-{index}").into_bytes(),
         payload.clone().into(),
@@ -4627,7 +4628,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
       )
       .expect("unix millis exceeds i64");
       producer
-        .produce(ProducerRecord::new(
+        .produce_one(ProducerRecord::new(
           TOPIC.into(),
           b"batched-key".to_vec(),
           payload.into(),
