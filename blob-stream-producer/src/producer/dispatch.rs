@@ -1,26 +1,22 @@
 use super::metrics::ProducerMetrics;
 use super::protocol::broker_error_message;
-use super::retry::{ProducerRetryClock, acknowledge_batch, send_batch_with_retry};
-use super::routing::{BrokerBatchGroup, ProducerRoutes, produce_batch_request};
-use super::state::BufferedBatch;
-use super::{BrokerTransport, ProducerAck, ProducerError, ProducerRetryDiagnostics};
-use crate::config::{
-  ProducerConfig,
-  ProducerTopicConfig,
-  producer_request_timeout,
-  producer_retry_deadline,
+use super::retry::{
+  acknowledge_batch,
+  acquire_request_permit,
+  retry_deadline_exhausted,
+  send_batch_with_retry,
 };
+use super::routing::{BrokerBatchGroup, produce_batch_request};
+use super::state::BufferedBatch;
+use super::{ProducerAck, ProducerDispatchContext, ProducerError};
+use crate::config::{producer_request_timeout, producer_retry_deadline};
 use anyhow::anyhow;
 use bd_log_util::warn_every;
-use blob_stream_broker_discovery::BrokerMembership;
 use blob_stream_proto::protos::blobstream::v1::broker::{ProduceBatchesRequest, ProduceStatus};
 use futures::stream::{FuturesUnordered, StreamExt};
-use protobuf::Chars;
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 use time::ext::NumericalDuration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
+use tokio::sync::OwnedSemaphorePermit;
 
 pub(super) fn notify_unassigned_batches(
   metrics: &ProducerMetrics,
@@ -30,7 +26,7 @@ pub(super) fn notify_unassigned_batches(
   for batch in batches {
     metrics.no_brokers.inc();
     metrics.failures.inc();
-    notify_waiters(batch.waiters, &Err(ProducerError::NoBrokersAvailable));
+    notify_completions(batch.completions, &Err(ProducerError::NoBrokersAvailable));
   }
   if has_unassigned_batches {
     return Err(ProducerError::NoBrokersAvailable);
@@ -38,59 +34,81 @@ pub(super) fn notify_unassigned_batches(
   Ok(())
 }
 
-fn notify_waiters(
-  waiters: Vec<oneshot::Sender<Result<ProducerAck, ProducerError>>>,
+fn notify_completions(
+  completions: Vec<super::state::BulkCompletionSpan>,
   result: &Result<ProducerAck, ProducerError>,
 ) {
-  for waiter in waiters {
-    let _ = waiter.send(result.clone());
+  for completion in completions {
+    completion.complete(result);
   }
 }
 
 pub(super) async fn send_grouped_batches_and_notify(
-  config: &ProducerConfig,
-  topics: &HashMap<Chars, ProducerTopicConfig>,
-  routes: &ProducerRoutes,
-  membership_rx: &watch::Receiver<BrokerMembership>,
-  transport: &dyn BrokerTransport,
-  metrics: &ProducerMetrics,
-  retry_diagnostics: &ProducerRetryDiagnostics,
-  retry_clock: &dyn ProducerRetryClock,
+  context: &ProducerDispatchContext,
   dispatch_task_permit: OwnedSemaphorePermit,
-  initial_request_permit: OwnedSemaphorePermit,
-  request_permits: Arc<Semaphore>,
   group: BrokerBatchGroup,
 ) -> Result<(), ProducerError> {
   // The task permit bounds retained group work while request permits bound active transport calls.
   let _dispatch_task_permit = dispatch_task_permit;
-  let retry_started_at = retry_clock.now();
+  let retry_started_at = context.retry_clock.now();
 
   // The grouped RPC amortizes transport overhead, but each response remains an independent
-  // logical batch. A terminal response can therefore notify its record waiters immediately.
+  // logical batch. A terminal response can therefore complete its bulk spans immediately.
   let request = ProduceBatchesRequest {
     batches: group.batches.iter().map(produce_batch_request).collect(),
     ..Default::default()
   };
-  let request_timeout = Duration::try_from(producer_request_timeout(config))
+  let retry_deadline = retry_started_at
+    + Duration::try_from(producer_retry_deadline(&context.config))
+      .expect("producer config validation requires a positive retry deadline");
+  let request_timeout = Duration::try_from(producer_request_timeout(&context.config))
     .expect("producer config validation requires a positive request timeout")
     .min(
-      Duration::try_from(producer_retry_deadline(config))
+      Duration::try_from(producer_retry_deadline(&context.config))
         .expect("producer config validation requires a positive retry deadline"),
     );
-  let response = {
-    let _initial_request_permit = initial_request_permit;
-    let _active_request = bd_server_stats::stats::StackAutoGauge::new(&metrics.active_requests);
-    tokio::time::timeout(
-      request_timeout,
-      transport.produce_batches(&group.broker_address, request, request_timeout),
-    )
-    .await
-    .unwrap_or_else(|_| {
-      Err(anyhow!(
-        "producer request timed out after {} ms",
-        request_timeout.as_millis()
-      ))
-    })
+  let response = match acquire_request_permit(
+    &context.request_permits,
+    &context.config,
+    &context.metrics,
+    context.retry_clock.as_ref(),
+    retry_deadline,
+    retry_started_at,
+  )
+  .await
+  {
+    Ok(request_permit) => {
+      let request_timeout =
+        request_timeout.min(retry_deadline.saturating_duration_since(context.retry_clock.now()));
+      if request_timeout.is_zero() {
+        drop(request_permit);
+        Err(anyhow!(retry_deadline_exhausted(
+          &context.config,
+          &context.metrics,
+          context.retry_clock.as_ref(),
+          retry_started_at,
+        )))
+      } else {
+        let _active_request =
+          bd_server_stats::stats::StackAutoGauge::new(&context.metrics.active_requests);
+        let response = tokio::time::timeout(
+          request_timeout,
+          context
+            .transport
+            .produce_batches(&group.broker_address, request, request_timeout),
+        )
+        .await
+        .unwrap_or_else(|_| {
+          Err(anyhow!(
+            "producer request timed out after {} ms",
+            request_timeout.as_millis()
+          ))
+        });
+        drop(request_permit);
+        response
+      }
+    },
+    Err(error) => Err(anyhow!(error)),
   };
   let result_count = group.batches.len();
   let results = match response {
@@ -130,22 +148,22 @@ pub(super) async fn send_grouped_batches_and_notify(
       Some(ProduceStatus::PRODUCE_STATUS_OK) => {
         let result = Ok(acknowledge_batch(
           &batch,
-          metrics,
+          &context.metrics,
           1,
-          retry_clock,
+          context.retry_clock.as_ref(),
           retry_started_at,
         ));
-        notify_waiters(batch.waiters, &result);
+        notify_completions(batch.completions, &result);
       },
       Some(ProduceStatus::PRODUCE_STATUS_UNKNOWN_TOPIC) => {
         let result = Err(ProducerError::UnknownTopic(batch.topic.clone()));
-        notify_waiters(batch.waiters, &result);
+        notify_completions(batch.completions, &result);
         remember_first_error(&mut first_error, result);
       },
       Some(ProduceStatus::PRODUCE_STATUS_BAD_REQUEST) => {
         let response = initial_response.expect("bad request response must be present");
         let result = Err(ProducerError::Rejected(broker_error_message(&response)));
-        notify_waiters(batch.waiters, &result);
+        notify_completions(batch.completions, &result);
         remember_first_error(&mut first_error, result);
       },
       _ => {
@@ -155,24 +173,25 @@ pub(super) async fn send_grouped_batches_and_notify(
   }
 
   // Retry futures remain owned by this bounded dispatch task. Each future acquires request
-  // capacity independently, so one retryable batch cannot block sibling retry admission.
+  // capacity independently, so one retryable batch cannot block sibling retry admission. A very
+  // large overloaded grouped request can still create many waiting futures; cap this fan-out if
+  // retries become a material source of allocation or scheduler pressure.
   let mut retries = FuturesUnordered::new();
   for (batch, initial_response) in retryable_batches {
-    let request_permits = Arc::clone(&request_permits);
     retries.push(async move {
       let result = send_batch_with_retry(
-        config,
-        topics,
-        routes,
-        membership_rx,
-        transport,
+        &context.config,
+        &context.topics,
+        &context.routes,
+        &context.membership_rx,
+        context.transport.as_ref(),
         &batch,
-        metrics,
-        retry_diagnostics,
-        &request_permits,
+        &context.metrics,
+        &context.retry_diagnostics,
+        &context.request_permits,
         initial_response,
         1,
-        retry_clock,
+        context.retry_clock.as_ref(),
         retry_started_at,
       )
       .await;
@@ -180,7 +199,7 @@ pub(super) async fn send_grouped_batches_and_notify(
     });
   }
   while let Some((batch, result)) = retries.next().await {
-    notify_waiters(batch.waiters, &result);
+    notify_completions(batch.completions, &result);
     remember_first_error(&mut first_error, result);
   }
   first_error.map_or(Ok(()), Err)

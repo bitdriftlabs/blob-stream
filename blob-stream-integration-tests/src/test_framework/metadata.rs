@@ -22,7 +22,8 @@ use blob_stream_metadata_store::{
   ProducerPartitionLeaseStore,
   SegmentMetadata,
 };
-use blob_stream_producer::{ProducerClient, ProducerClientImpl, ProducerRecord};
+use blob_stream_producer::test::ProducerClientTestExt;
+use blob_stream_producer::{ProducerClientImpl, ProducerRecord};
 use blob_stream_proto::protos::blobstream::v1::broker::{
   ReadBlobRangesRequest,
   ReadBlobRangesResponse,
@@ -545,7 +546,7 @@ pub async fn produce_message_at_manual_time(
   let producer = Arc::clone(producer);
   let produce_task = tokio::spawn(async move {
     producer
-      .produce(ProducerRecord::new(
+      .produce_one(ProducerRecord::new(
         TOPIC.into(),
         key,
         payload.into(),
@@ -578,11 +579,10 @@ pub async fn produce_message_at_manual_time(
   .map_err(|_| anyhow!("producer request did not enter the broker buffer"))??;
   manual_time.advance(TimeDuration::seconds(60));
 
-  Ok(
-    produce_task
-      .await
-      .map_err(|error| anyhow!("manual-time producer task join error: {error}"))??,
-  )
+  produce_task
+    .await
+    .map_err(|error| anyhow!("manual-time producer task join error: {error}"))?
+    .map_err(Into::into)
 }
 
 pub async fn write_recovery_segment(

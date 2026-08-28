@@ -258,7 +258,7 @@ pub(super) async fn send_batch_with_retry(
   }
 }
 
-async fn acquire_request_permit(
+pub(super) async fn acquire_request_permit(
   request_permits: &Arc<Semaphore>,
   config: &ProducerConfig,
   metrics: &ProducerMetrics,
@@ -278,7 +278,17 @@ async fn acquire_request_permit(
   tokio::select! {
     biased;
     permit = Arc::clone(request_permits).acquire_owned() => {
-      permit.map_err(|_| ProducerError::Shutdown)
+      let permit = permit.map_err(|_| ProducerError::Shutdown)?;
+      if retry_deadline.saturating_duration_since(retry_clock.now()).is_zero() {
+        drop(permit);
+        return Err(retry_deadline_exhausted(
+          config,
+          metrics,
+          retry_clock,
+          retry_started_at,
+        ));
+      }
+      Ok(permit)
     },
     () = retry_clock.sleep(remaining) => Err(retry_deadline_exhausted(
       config,
@@ -289,7 +299,7 @@ async fn acquire_request_permit(
   }
 }
 
-fn retry_deadline_exhausted(
+pub(super) fn retry_deadline_exhausted(
   config: &ProducerConfig,
   metrics: &ProducerMetrics,
   retry_clock: &dyn ProducerRetryClock,

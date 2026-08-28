@@ -36,6 +36,11 @@ impl RecordWireSizes {
   pub(super) fn fits_grouped_request(&self) -> bool {
     self.grouped_batch_size <= MAX_PRODUCE_BATCHES_REQUEST_BYTES
   }
+
+  #[cfg(test)]
+  pub(super) fn grouped_batch_size(&self) -> usize {
+    self.grouped_batch_size
+  }
 }
 
 //
