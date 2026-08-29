@@ -93,16 +93,16 @@ pub fn writer_virtual_partitions(
 ) -> Vec<BrokerPartition> {
   let mut partitions = Vec::new();
   for (topic, partition_count, num_writers) in topics {
-    assert!(
+    debug_assert!(
       writer_id < num_writers,
       "writer_id {writer_id} is outside topic {topic} writer range {num_writers}"
     );
-    let virtual_partition_start = writer_id
-      .checked_mul(partition_count)
-      .expect("topic virtual partition offset exceeds u32");
-    let virtual_partition_end = virtual_partition_start
-      .checked_add(partition_count)
-      .expect("topic virtual partition count exceeds u32");
+    debug_assert!(
+      partition_count.checked_mul(num_writers).is_some(),
+      "topic {topic} virtual partition count exceeds u32"
+    );
+    let virtual_partition_start = writer_id.saturating_mul(partition_count);
+    let virtual_partition_end = virtual_partition_start.saturating_add(partition_count);
     for virtual_partition_id in virtual_partition_start .. virtual_partition_end {
       partitions.push(BrokerPartition {
         topic: topic.clone(),

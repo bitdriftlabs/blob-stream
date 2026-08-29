@@ -2,6 +2,19 @@ use super::*;
 use bytes::Bytes;
 
 #[test]
+fn virtual_partition_count_accepts_the_u32_limit() {
+  assert_eq!(virtual_partition_count(u32::MAX, 1), Ok(u32::MAX));
+}
+
+#[test]
+fn virtual_partition_count_rejects_overflow() {
+  assert_eq!(
+    virtual_partition_count(u32::MAX, 2),
+    Err(VirtualPartitionCountError)
+  );
+}
+
+#[test]
 fn default_metadata_publication_lag_is_fifteen_seconds() {
   assert_eq!(DEFAULT_MAX_METADATA_PUBLICATION_LAG, Duration::seconds(15));
 }

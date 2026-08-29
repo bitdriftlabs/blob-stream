@@ -18,7 +18,7 @@ pub use blob_stream_proto::protos::blobstream::v1::config::{
 use blob_stream_runtime_config::feature_flag_duration_milliseconds;
 #[cfg(test)]
 use blob_stream_types::ToProtoDuration;
-use blob_stream_types::{ProtoDurationExt, topic_metadata_window_size};
+use blob_stream_types::{ProtoDurationExt, topic_metadata_window_size, virtual_partition_count};
 use log::{debug, info, trace};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -254,6 +254,8 @@ pub fn validate_topic_config(topic: &ProducerTopicConfig) -> Result<()> {
   );
   proto_validate::validate(topic)?;
   topic_metadata_window_size(topic)?;
+  virtual_partition_count(topic.partition_count, topic.num_writers)
+    .map_err(|error| anyhow!("topic {}: {error}", topic.name))?;
   Ok(())
 }
 

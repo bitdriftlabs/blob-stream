@@ -22,6 +22,9 @@ runtime configuration, starts broker discovery, and starts the background batch-
 a `bd_server_stats::stats::Scope` from the embedding application's collector so producer metrics
 are exported with the rest of the application telemetry.
 
+For a runnable counterpart using static discovery, local S3/DynamoDB emulators, and the production
+producer and consumer entry points, see the [local end-to-end walkthrough](../examples/local-e2e/README.md).
+
 ```rust
 use bd_server_stats::stats::Collector;
 use blob_stream_producer::{

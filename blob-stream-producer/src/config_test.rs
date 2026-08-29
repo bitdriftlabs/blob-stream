@@ -4,12 +4,14 @@ use super::{
   ProducerCompression,
   ProducerConfig,
   ProducerRuntimeConfig,
+  ProducerTopicConfig,
   apply_producer_startup_overrides,
   producer_flush_max_delay,
   producer_max_batch_bytes,
   producer_max_batch_records,
   producer_max_request_concurrency,
   producer_retry_max_delay,
+  validate_topic_config,
 };
 use bd_runtime_config::loader::Loader;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
@@ -110,5 +112,21 @@ fn startup_overrides_reject_batch_record_overflow() {
     error
       .to_string()
       .contains("feature flag blob_stream_producer_max_batch_records exceeds u32")
+  );
+}
+
+#[test]
+fn topic_validation_rejects_virtual_partition_count_overflow() {
+  let mut topic = ProducerTopicConfig::new();
+  topic.name = "telemetry".into();
+  topic.partition_count = u32::MAX;
+  topic.num_writers = 2;
+  topic.retention = Duration::days(7).into_proto();
+
+  let error = validate_topic_config(&topic).unwrap_err();
+
+  assert_eq!(
+    error.to_string(),
+    "topic telemetry: partition_count * num_writers must fit within u32"
   );
 }

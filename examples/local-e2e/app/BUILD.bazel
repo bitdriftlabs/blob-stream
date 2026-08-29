@@ -1,0 +1,39 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("//tools/lint:linters.bzl", "rust_binary")
+load("//tools/rust:tests.bzl", "rust_library_with_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library_with_test(
+    name = "blob-stream-local-e2e",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/**/*.rs"],
+    ),
+    crate_name = "blob_stream_local_e2e",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    test_compile_data = [
+        "//blob-stream/examples/local-e2e:config/broker-1.yaml",
+        "//blob-stream/examples/local-e2e:config/broker-2.yaml",
+    ],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "producer",
+    srcs = ["src/bin/producer.rs"],
+    crate_name = "blob_stream_local_e2e_producer",
+    crate_root = "src/bin/producer.rs",
+    edition = "2024",
+    deps = all_crate_deps(normal = True) + [":blob-stream-local-e2e"],
+)
+
+rust_binary(
+    name = "consumer",
+    srcs = ["src/bin/consumer.rs"],
+    crate_name = "blob_stream_local_e2e_consumer",
+    crate_root = "src/bin/consumer.rs",
+    edition = "2024",
+    deps = all_crate_deps(normal = True) + [":blob-stream-local-e2e"],
+)

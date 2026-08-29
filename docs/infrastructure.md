@@ -50,7 +50,8 @@ metadata_store:
 Every broker, producer, and consumer using a topic must use the same `name`, `partition_count`,
 `num_writers`, and retention. A deployment's `writer_id` identifies one local writer/AZ domain; it
 must be in range for every configured topic, and its broker discovery must contain only brokers in
-that domain.
+that domain. The product of `partition_count` and `num_writers` must fit in a `u32` virtual
+partition ID.
 
 Important broker defaults are 64 MiB `flush_max_bytes`, 64 MiB `max_segment_bytes`, 1 second
 `flush_max_delay`, 10,000 `sequence_reservation_size`, a 30-second producer-partition

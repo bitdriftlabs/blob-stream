@@ -14,6 +14,15 @@
 - Write documentation as a current-state reference. Do not retain migration history, removed
   controls, or impossible configuration paths in current configuration and operations documents.
 
+## Rust Assertions
+
+- Do not use `assert!` in production code. Conditions reachable from configuration, network data,
+  user input, or external state must return an error or be rejected at the earliest normal boundary.
+- Use `debug_assert!` freely for internal invariants whose violation indicates a programming defect.
+  In hot or locked code, validate and construct errors before entering the path, then keep a nearby
+  debug assertion to document the proven invariant.
+- Test code may use ordinary assertions.
+
 ## Deterministic Integration Tests
 
 Follow [plans/TEST_AUDIT.md](plans/TEST_AUDIT.md). In addition:

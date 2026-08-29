@@ -1,0 +1,34 @@
+name: blob-stream-local-e2e
+
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "8000:8000"
+
+  localstack:
+    image: localstack/localstack:4.14.0
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+      SERVICES: s3
+    ports:
+      - "4566:4566"
+
+  bootstrap:
+    image: amazon/aws-cli:2.34.3
+    depends_on:
+      dynamodb:
+        condition: service_started
+      localstack:
+        condition: service_started
+    environment:
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: us-east-1
+      DYNAMODB_ENDPOINT: http://dynamodb:8000
+      S3_ENDPOINT: http://localstack:4566
+    volumes:
+      - ./bootstrap-resources.sh:/bootstrap-resources.sh:ro
+    entrypoint: ["/bin/sh", "/bootstrap-resources.sh"]
+    restart: "no"

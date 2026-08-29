@@ -91,6 +91,14 @@ docker compose up -d
 This starts DynamoDB Local at `http://localhost:8000` and LocalStack S3 at
 `http://localhost:4566`.
 
+## Local End-To-End Walkthrough
+
+For an interactive local system with two static-discovery brokers, a text producer, and a shared
+consumer group, use the [local end-to-end walkthrough](examples/local-e2e/README.md). It owns its
+own Docker Compose resources and uses Cargo commands for every user-facing process. The walkthrough
+is for observing normal producer, broker, and consumer behavior; use the stress runner below for
+an automated load and correctness check.
+
 ## Local Stress Runner
 
 The optional stress runner exercises in-process TCP brokers, LocalStack S3, DynamoDB Local, the

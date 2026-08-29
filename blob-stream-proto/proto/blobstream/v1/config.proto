@@ -157,6 +157,7 @@ message TopicConfig {
 
   // Number of producer clusters that may write to this topic.
   // No default; must be explicitly set to > 0.
+  // The product of this value and partition_count must fit in uint32.
   uint32 num_writers = 3 [(validate.rules).uint32.gt = 0];
 
   // Retention window used to drive storage TTL and lifecycle policies.

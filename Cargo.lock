@@ -1365,6 +1365,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "blob-stream-local-e2e"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bd-pgv",
+ "bd-server-stats",
+ "blob-stream-broker",
+ "blob-stream-consumer",
+ "blob-stream-producer",
+ "blob-stream-proto",
+ "blob-stream-types",
+ "clap",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "blob-stream-metadata-store"
 version = "0.1.0"
 dependencies = [
