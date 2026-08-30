@@ -1,4 +1,9 @@
-use super::{AllocationTransition, LeaseExpirationUpdate};
+use super::{
+  AllocationTransition,
+  AllocationTransitionDecision,
+  LeaseExpirationUpdate,
+  begin_allocation_transition,
+};
 use crate::write::buffer::{BufferedBatch, FlushCompletionError};
 use crate::write::state::WriteState;
 use blob_stream_metadata_store::{
@@ -78,4 +83,36 @@ fn fence_change_discards_buffered_batches_and_completes_them() {
     Some(offset_datetime_from_unix_millis(1_100))
   );
   assert_eq!(partition.lease_fence.as_deref(), Some(&fence(2)));
+}
+
+#[test]
+fn lease_maintenance_distinguishes_acquisition_from_renewal() {
+  let state = Arc::new(Mutex::new(WriteState::default()));
+  let acquired_at = offset_datetime_from_unix_millis(1_000);
+  let lease_expires_at = offset_datetime_from_unix_millis(1_100);
+
+  let AllocationTransitionDecision::Claimed(initial) =
+    begin_allocation_transition(&state, "telemetry", 0, 1, acquired_at, true, 10)
+  else {
+    panic!("initial lease maintenance must claim allocation");
+  };
+  assert!(initial.lease_was_expired);
+  initial.transition.finish(
+    LeaseExpirationUpdate::Set(Some(lease_expires_at)),
+    None,
+    None,
+  );
+
+  let AllocationTransitionDecision::Claimed(renewal) = begin_allocation_transition(
+    &state,
+    "telemetry",
+    0,
+    1,
+    offset_datetime_from_unix_millis(1_050),
+    true,
+    10,
+  ) else {
+    panic!("lease renewal must claim allocation");
+  };
+  assert!(!renewal.lease_was_expired);
 }

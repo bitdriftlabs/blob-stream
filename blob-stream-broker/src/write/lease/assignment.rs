@@ -241,6 +241,8 @@ impl WriteEngineImpl {
           .await
           {
             Ok(LeaseAcquireAndReserveOutcome::Acquired { lease, reservation }) => {
+              let lease_epoch = lease.fence.lease_epoch;
+              let lease_expiration_at = lease.lease_expiration_at;
               if let Some(reservation) = reservation.as_ref() {
                 metrics.record_sequence_reservation(reservation);
                 debug!(
@@ -268,6 +270,14 @@ impl WriteEngineImpl {
                 {
                   partition_state.draining = false;
                 }
+              }
+              if transition.lease_was_expired {
+                info!(
+                  "broker partition lease acquired: holder_id={holder_id}, \
+                   lease_session_id={lease_session_id}, topic={topic}, \
+                   virtual_partition_id={virtual_partition_id}, lease_epoch={lease_epoch}, \
+                   lease_expiration_at={lease_expiration_at}",
+                );
               }
             },
             Ok(LeaseAcquireAndReserveOutcome::HeldByOther(_)) => {

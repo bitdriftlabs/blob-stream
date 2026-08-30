@@ -61,6 +61,7 @@ pub(super) async fn send_grouped_batches_and_notify(
   // The task permit bounds retained group work while request permits bound active transport calls.
   let _dispatch_task_permit = dispatch_task_permit;
   let retry_started_at = context.retry_clock.now();
+  let initial_broker_address = group.broker_address.clone();
 
   // The grouped RPC amortizes transport overhead, but each response remains an independent
   // logical batch. A terminal response can therefore complete its bulk spans immediately.
@@ -190,6 +191,9 @@ pub(super) async fn send_grouped_batches_and_notify(
   // retries become a material source of allocation or scheduler pressure.
   let mut retries = FuturesUnordered::new();
   for (batch, initial_response) in retryable_batches {
+    let response_broker_address = initial_response
+      .as_ref()
+      .map(|_| initial_broker_address.clone());
     retries.push(async move {
       let result = send_batch_with_retry(
         &context.config,
@@ -202,6 +206,7 @@ pub(super) async fn send_grouped_batches_and_notify(
         &context.retry_diagnostics,
         &context.request_permits,
         initial_response,
+        response_broker_address,
         1,
         context.retry_clock.as_ref(),
         retry_started_at,

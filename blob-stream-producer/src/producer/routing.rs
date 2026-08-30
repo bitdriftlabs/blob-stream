@@ -10,6 +10,7 @@ use blob_stream_broker_discovery::{
 };
 use blob_stream_proto::protos::blobstream::v1::broker::{ProduceBatchRequest, Record};
 use blob_stream_types::{MAX_PRODUCE_BATCHES_REQUEST_BYTES, VirtualPartitionId};
+use log::info;
 use parking_lot::RwLock;
 use protobuf::{Chars, Message};
 use std::collections::{BTreeMap, HashMap};
@@ -88,11 +89,13 @@ impl ProducerRoutes {
 
     // Cache one deterministic assignment per membership snapshot. The same update can be seen by
     // the flush loop and an in-flight retry, so compare snapshots before rebuilding the map.
-    routes.assignment = Arc::new(broker_assignment(
+    let assignment = Arc::new(broker_assignment(
       topics,
       producer_writer_id(config),
       membership,
     ));
+    log_route_changes(&routes.assignment, &assignment);
+    routes.assignment = assignment;
     routes.membership = membership.clone();
   }
 
@@ -103,6 +106,37 @@ impl ProducerRoutes {
   pub(super) fn assignment_snapshot(&self) -> Arc<BrokerAssignment> {
     Arc::clone(&self.routes.read().assignment)
   }
+}
+
+fn log_route_changes(previous: &BrokerAssignment, next: &BrokerAssignment) {
+  for (partition, previous_broker) in previous {
+    match next.get(partition) {
+      Some(next_broker) if next_broker == previous_broker => {},
+      next_broker => log_route_change(partition, Some(previous_broker), next_broker),
+    }
+  }
+  for (partition, next_broker) in next {
+    if !previous.contains_key(partition) {
+      log_route_change(partition, None, Some(next_broker));
+    }
+  }
+}
+
+fn log_route_change(
+  partition: &BrokerPartition,
+  previous_broker: Option<&BrokerNode>,
+  next_broker: Option<&BrokerNode>,
+) {
+  info!(
+    "producer route changed: topic={}, virtual_partition_id={}, previous_broker_node_id={}, \
+     previous_broker_address={}, next_broker_node_id={}, next_broker_address={}",
+    partition.topic,
+    partition.virtual_partition_id,
+    previous_broker.map_or("", |broker| broker.node_id.as_str()),
+    previous_broker.map_or("", |broker| broker.address.as_str()),
+    next_broker.map_or("", |broker| broker.node_id.as_str()),
+    next_broker.map_or("", |broker| broker.address.as_str()),
+  );
 }
 
 pub(super) fn broker_assignment(
