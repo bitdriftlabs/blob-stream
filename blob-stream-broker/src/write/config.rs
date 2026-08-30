@@ -36,6 +36,7 @@ use blob_stream_types::{
   ProtoDurationExt,
   VirtualPartitionId,
   topic_metadata_window_size,
+  virtual_partition_count,
 };
 use hostname::get as get_hostname;
 use log::{debug, trace};
@@ -268,6 +269,8 @@ pub struct TopicInfo {
 impl TopicInfo {
   pub fn from_proto(proto: &TopicConfig) -> Result<Self> {
     let name = proto.name.clone();
+    virtual_partition_count(proto.partition_count, proto.num_writers)
+      .map_err(|error| anyhow!("topic {name}: {error}"))?;
 
     Ok(Self {
       name,

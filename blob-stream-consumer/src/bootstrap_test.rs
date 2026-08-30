@@ -1,6 +1,10 @@
 #![allow(clippy::unwrap_used)]
 
-use crate::bootstrap::{ConsumerBootstrapConfig, consumer_group_lease_ttl_buffer};
+use crate::bootstrap::{
+  ConsumerBootstrapConfig,
+  consumer_group_lease_ttl_buffer,
+  virtual_partitions_for_topic,
+};
 use crate::iterator::ConsumerIterator;
 use crate::{
   ConsumerConfigFactory,
@@ -99,6 +103,20 @@ fn consumer_group_lease_ttl_matches_topic_retention() {
   assert_eq!(
     consumer_group_lease_ttl_buffer(Duration::days(7)).unwrap(),
     Duration::days(7)
+  );
+}
+
+#[test]
+fn virtual_partitions_rejects_count_overflow() {
+  let mut topic = topic();
+  topic.partition_count = u32::MAX;
+  topic.num_writers = 2;
+
+  let error = virtual_partitions_for_topic(&topic).unwrap_err();
+
+  assert_eq!(
+    error.to_string(),
+    "topic telemetry: partition_count * num_writers must fit within u32"
   );
 }
 

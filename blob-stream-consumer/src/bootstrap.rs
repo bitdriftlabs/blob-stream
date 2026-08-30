@@ -50,7 +50,12 @@ use blob_stream_proto::protos::blobstream::v1::config::{
   MetadataStoreConfig,
   TopicConfig,
 };
-use blob_stream_types::{ProtoDurationExt, VirtualPartitionId, topic_metadata_window_size};
+use blob_stream_types::{
+  ProtoDurationExt,
+  VirtualPartitionId,
+  topic_metadata_window_size,
+  virtual_partition_count,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::Duration;
@@ -333,11 +338,8 @@ impl ConsumerIteratorImpl {
 }
 
 fn virtual_partitions_for_topic(topic: &TopicConfig) -> Result<Vec<VirtualPartitionId>> {
-  let total = topic.partition_count.saturating_mul(topic.num_writers);
-  ensure!(
-    total > 0,
-    "topic partition_count * num_writers must be greater than zero"
-  );
+  let total = virtual_partition_count(topic.partition_count, topic.num_writers)
+    .map_err(|error| anyhow!("topic {}: {error}", topic.name))?;
   Ok((0 .. total).collect())
 }
 

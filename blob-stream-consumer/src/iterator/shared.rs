@@ -2,7 +2,6 @@ use super::delivery::{DeliveredSourceRange, DeliveryState};
 use crate::diagnostics::ConsumerDiagnosticsRuntimeState;
 use bd_server_stats::stats::{ContributionGauge, Scope};
 use blob_stream_types::{CommittedSourceCheckpoint, VirtualPartitionId};
-use parking_lot::Mutex;
 use prometheus::{Histogram, IntCounter};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -193,7 +192,4 @@ impl ConsumerSharedState {
       self.diagnostics.last_committed_cursors.remove(partition_id);
     }
   }
-
-  #[allow(dead_code)]
-  fn assert_mutex_type(_: &Mutex<Self>) {}
 }

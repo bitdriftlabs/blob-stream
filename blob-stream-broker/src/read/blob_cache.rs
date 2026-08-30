@@ -4,6 +4,7 @@ mod tests;
 
 use crate::write::memory_pressure::MemoryPressureController;
 use anyhow::{Result, anyhow, ensure};
+use bd_log_util::warn_every;
 use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_time::TimeProvider;
 use blob_stream_blob_store::{BlobKey, BlobStore, BlobStoreError};
@@ -31,6 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use time::OffsetDateTime;
+use time::ext::NumericalDuration;
 use tokio::sync::Semaphore;
 
 const DEFAULT_REQUEST_TIMEOUT: time::Duration = time::Duration::seconds(30);
@@ -179,12 +181,16 @@ impl BlobCacheMetrics {
   }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, thiserror::Error)]
 enum BlobCacheError {
+  #[error("{0}")]
   BadRequest(String),
+  #[error("blob cache overloaded")]
   Overloaded,
+  #[error("blob not found")]
   NotFound,
-  Storage,
+  #[error("blob cache storage failure: {0:#}")]
+  Storage(Arc<anyhow::Error>),
 }
 
 impl BlobCache {
@@ -438,7 +444,7 @@ impl BlobCache {
             let blob = blob_store
               .get_with_cache_admission(&BlobKey::from(fetch_key.clone()), &admission)
               .await
-              .map_err(|error| blob_store_error(&error))?;
+              .map_err(blob_store_error)?;
             metrics
               .fetch_bytes
               .inc_by(u64::try_from(blob.len()).unwrap_or(u64::MAX));
@@ -515,6 +521,10 @@ impl BlobCache {
   }
 
   fn response_error(&self, error: BlobCacheError) -> ReadBlobRangesResponse {
+    warn_every!(
+      5.seconds(),
+      "broker blob cache request failed: error={error:#}"
+    );
     let (status, error_message) = match error {
       BlobCacheError::BadRequest(message) => (
         BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_BAD_REQUEST,
@@ -534,7 +544,7 @@ impl BlobCache {
           "blob not found".to_string(),
         )
       },
-      BlobCacheError::Storage => (
+      BlobCacheError::Storage(_) => (
         BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_STORAGE,
         "blob storage failure".to_string(),
       ),
@@ -616,10 +626,12 @@ impl BlobCache {
   }
 }
 
-fn blob_store_error(error: &BlobStoreError) -> BlobCacheError {
+fn blob_store_error(error: BlobStoreError) -> BlobCacheError {
   match error {
     BlobStoreError::NotFound { .. } => BlobCacheError::NotFound,
     BlobStoreError::AdmissionRejected { .. } => BlobCacheError::Overloaded,
-    BlobStoreError::InvalidRange { .. } | BlobStoreError::Read { .. } => BlobCacheError::Storage,
+    error @ (BlobStoreError::InvalidRange { .. } | BlobStoreError::Read { .. }) => {
+      BlobCacheError::Storage(Arc::new(anyhow!(error)))
+    },
   }
 }

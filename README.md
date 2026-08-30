@@ -51,6 +51,8 @@ after interrupted commits or rebalances, so applications must tolerate duplicate
 
 ### Deploy And Operate
 
+- [Local end-to-end walkthrough](examples/local-e2e/README.md): run static-discovery brokers,
+  interactive text producers, and consumer groups against local Docker Compose dependencies
 - [System design and correctness contract](docs/design.md)
 - [Infrastructure setup](docs/infrastructure.md): configuration, DynamoDB, S3, IAM, and Kubernetes
   discovery RBAC
@@ -64,6 +66,7 @@ after interrupted commits or rebalances, so applications must tolerate duplicate
 
 ### Contribute And Verify
 
+- Contributions must include a Developer Certificate of Origin sign-off. See [DCO](DCO).
 - [Development guide](DEVELOPMENT.md): standalone Cargo and monorepo Bazel workflows, local
   dependencies, stress runner, and Rust API documentation
 - [Integration-test audit](plans/TEST_AUDIT.md): deterministic test requirements and hardening work

@@ -70,12 +70,12 @@ impl BulkCompletion {
   fn complete(&self, result_range: Range<usize>, result: &Result<ProducerAck, ProducerError>) {
     let mut state = self.state.lock();
     let completed_count = result_range.end.saturating_sub(result_range.start);
-    assert!(
+    debug_assert!(
       completed_count <= state.remaining_records,
       "bulk completion cannot exceed its pending record count"
     );
     for slot in &mut state.results[result_range] {
-      assert!(slot.is_none(), "bulk record completed more than once");
+      debug_assert!(slot.is_none(), "bulk record completed more than once");
       *slot = Some(result.clone());
     }
     state.remaining_records -= completed_count;
@@ -291,7 +291,7 @@ impl PartitionBuffer {
   ) {
     // A ProduceBatchRequest's non-record fields must be identical for every record in this
     // partition buffer, so retain the first value and enforce the invariant for subsequent ones.
-    assert!(
+    debug_assert!(
       self
         .request_base_size
         .is_none_or(|existing| existing == request_base_size),
@@ -450,7 +450,7 @@ impl ProducerState {
       }
       group.push(next_batch);
     }
-    assert!(
+    debug_assert!(
       !group.is_empty(),
       "every ready batch contains a record that fits a grouped request"
     );

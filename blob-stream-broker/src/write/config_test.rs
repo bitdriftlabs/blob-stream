@@ -204,6 +204,21 @@ fn topic_defaults_metadata_publication_lag_to_fifteen_seconds() {
 }
 
 #[test]
+fn topic_rejects_virtual_partition_count_overflow() {
+  let mut topic_config = TopicConfig::new();
+  topic_config.name = "telemetry".into();
+  topic_config.partition_count = u32::MAX;
+  topic_config.num_writers = 2;
+
+  let error = TopicInfo::from_proto(&topic_config).unwrap_err();
+
+  assert_eq!(
+    error.to_string(),
+    "topic telemetry: partition_count * num_writers must fit within u32"
+  );
+}
+
+#[test]
 fn respects_explicit_sequence_reservation_size() {
   let mut broker_config = BrokerConfig::new();
   broker_config.writer_id = Some(0);

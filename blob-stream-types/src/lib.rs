@@ -20,6 +20,28 @@ use time::{Duration, OffsetDateTime};
 /// Identifier of a virtual partition (`logical_partition + writer_offset`).
 pub type VirtualPartitionId = u32;
 
+/// Error returned when a topic's virtual partition count exceeds `u32`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtualPartitionCountError;
+
+impl std::fmt::Display for VirtualPartitionCountError {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str("partition_count * num_writers must fit within u32")
+  }
+}
+
+impl std::error::Error for VirtualPartitionCountError {}
+
+/// Return the total number of virtual partitions for a topic.
+pub fn virtual_partition_count(
+  partition_count: u32,
+  num_writers: u32,
+) -> Result<u32, VirtualPartitionCountError> {
+  partition_count
+    .checked_mul(num_writers)
+    .ok_or(VirtualPartitionCountError)
+}
+
 /// Default duration of a metadata window used for segment keys and consumer scans.
 pub const DEFAULT_METADATA_WINDOW_SIZE: Duration = Duration::minutes(5);
 

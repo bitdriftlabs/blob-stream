@@ -1,0 +1,21 @@
+[package]
+edition = "2024"
+license = "Apache-2.0"
+name    = "blob-stream-local-e2e"
+publish = false
+version = "0.1.0"
+
+[dependencies]
+anyhow.workspace          = true
+bd-server-stats.workspace = true
+blob-stream-consumer.path = "../../../blob-stream-consumer"
+blob-stream-producer.path = "../../../blob-stream-producer"
+blob-stream-proto.path    = "../../../blob-stream-proto"
+blob-stream-types.path    = "../../../blob-stream-types"
+clap.workspace            = true
+time.workspace            = true
+tokio.workspace           = true
+
+[dev-dependencies]
+bd-pgv.workspace        = true
+blob-stream-broker.path = "../../../blob-stream-broker"

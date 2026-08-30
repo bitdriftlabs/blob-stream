@@ -1,0 +1,4 @@
+exports_files([
+    "config/broker-1.yaml",
+    "config/broker-2.yaml",
+])

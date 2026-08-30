@@ -323,6 +323,16 @@ fn config_rejects_nonpositive_idle_ttl_feature_flags() {
   assert!(BlobCacheConfig::from_broker_config(&BrokerConfig::new(), Some(&feature_flags)).is_err());
 }
 
+#[test]
+fn storage_errors_retain_the_blob_store_error_chain() {
+  let error = blob_store_error(BlobStoreError::Read {
+    key: "topic/blob".to_string(),
+    source: anyhow::anyhow!("injected AWS request failure"),
+  });
+
+  assert!(format!("{error:#}").contains("injected AWS request failure"));
+}
+
 #[tokio::test]
 async fn reads_exact_ranges_and_retains_the_full_blob() {
   let store = Arc::new(InMemoryBlobStore::new());

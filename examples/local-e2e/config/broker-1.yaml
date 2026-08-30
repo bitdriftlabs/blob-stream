@@ -1,0 +1,41 @@
+# Both broker files deliberately carry the complete static topology. Every broker, producer, and
+# consumer in this tutorial must route with this same node list and topic definition.
+broker:
+  bind_addr: "127.0.0.1:8080"
+  node_identity:
+    static_id: "local-broker-1"
+  discovery:
+    static:
+      nodes:
+        - node_id: "local-broker-1"
+          address: "127.0.0.1:8080"
+        - node_id: "local-broker-2"
+          address: "127.0.0.1:8081"
+  writer_id: 0
+  # This short delay makes one-line interactive writes visible promptly. Production workloads
+  # should size flushing from their throughput, latency, and object-store cost requirements.
+  flush_max_delay: "0.250s"
+
+topics:
+  - name: "local-text"
+    partition_count: 4
+    num_writers: 1
+    retention: "3600s"
+    metadata_window_size: "60s"
+    max_metadata_publication_lag: "1s"
+
+blob_store:
+  s3:
+    bucket: "blob-stream-local-e2e"
+    prefix: "local-text/"
+    region: "us-east-1"
+    endpoint: "http://127.0.0.1:4566"
+
+metadata_store:
+  dynamo:
+    region: "us-east-1"
+    endpoint: "http://127.0.0.1:8000"
+    segment_metadata_table_name: "blob_stream_local_e2e_segments"
+    producer_partition_lease_table_name: "blob_stream_local_e2e_producer_leases"
+    consumer_group_lease_table_name: "blob_stream_local_e2e_consumer_leases"
+    consumer_group_membership_table_name: "blob_stream_local_e2e_consumer_membership"
