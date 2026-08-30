@@ -52,6 +52,7 @@ pub(super) async fn send_batch_with_retry(
   retry_diagnostics: &ProducerRetryDiagnostics,
   request_permits: &Arc<Semaphore>,
   initial_response: Option<ProduceBatchResponse>,
+  initial_broker_address: Option<Chars>,
   completed_attempts: u32,
   retry_clock: &dyn ProducerRetryClock,
   retry_started_at: Instant,
@@ -65,6 +66,7 @@ pub(super) async fn send_batch_with_retry(
   let mut completed_attempts = completed_attempts;
   let mut initial_response = initial_response;
   let mut previous_owner: Option<Chars> = None;
+  let mut last_contacted_broker_address = initial_broker_address;
   let mut membership_updates = membership_rx.clone();
   let mut retried_after_not_lease_holder = None;
   let retry_deadline = retry_started_at
@@ -112,15 +114,6 @@ pub(super) async fn send_batch_with_retry(
     let owner_changed = previous_owner
       .as_deref()
       .is_some_and(|old| old != broker_node_id.as_str());
-    if owner_changed {
-      debug!(
-        "producer routing changed after retry: topic={}, virtual_partition_id={}, from={}, to={}",
-        batch.topic,
-        batch.virtual_partition_id,
-        previous_owner.as_deref().unwrap_or_default(),
-        broker_node_id
-      );
-    }
     if let Some(waited_for_membership_update) = retried_after_not_lease_holder.take() {
       if owner_changed {
         metrics.not_lease_holder_retry_changed_owner.inc();
@@ -147,6 +140,7 @@ pub(super) async fn send_batch_with_retry(
         "send attempt: topic={}, virtual_partition_id={}, attempt={}, broker={}",
         batch.topic, batch.virtual_partition_id, completed_attempts, broker_address
       );
+      last_contacted_broker_address = Some(broker_address.clone());
       let request_permit = acquire_request_permit(
         request_permits,
         config,
@@ -228,11 +222,12 @@ pub(super) async fn send_batch_with_retry(
     warn_every!(
       15.seconds(),
       "producer retrying batch: topic={}, virtual_partition_id={}, attempt={}, delay_ms={}, \
-       reason={retry_reason:?}, error={}",
+       broker_address={}, reason={retry_reason:?}, error={}",
       batch.topic,
       batch.virtual_partition_id,
       completed_attempts,
       delay.as_millis(),
+      last_contacted_broker_address.as_deref().unwrap_or_default(),
       current_error
     );
     if is_not_lease_holder {

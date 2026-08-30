@@ -157,6 +157,7 @@ pub(super) enum LeaseExpirationUpdate {
 pub(super) struct AllocationTransitionWork {
   pub(super) transition: AllocationTransition,
   pub(super) needs_lease: bool,
+  pub(super) lease_was_expired: bool,
   pub(super) reservation: Option<ReservationRequest>,
   pub(super) records_allocated_since_last_maintenance: Option<u64>,
 }
@@ -300,6 +301,7 @@ pub(super) fn begin_allocation_transition(
       finished: false,
     },
     needs_lease,
+    lease_was_expired,
     reservation,
     records_allocated_since_last_maintenance: renew_lease
       .then_some(records_allocated_since_last_maintenance),
