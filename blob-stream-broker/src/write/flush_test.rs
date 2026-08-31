@@ -51,7 +51,13 @@ async fn flush_plan_for_test(
   plan: &mut FlushPlan,
   metrics: &WriteMetrics,
 ) -> Result<Vec<FlushPartitionResult>, crate::write::WriteError> {
-  context.flush_plan_after(plan, metrics).await
+  context
+    .flush_plan_after(
+      plan,
+      metrics,
+      &Arc::new(Semaphore::new(super::MAX_CONCURRENT_METADATA_WRITES)),
+    )
+    .await
 }
 
 struct BlockingMetadataStore {

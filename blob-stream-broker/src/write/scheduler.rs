@@ -36,6 +36,7 @@ pub(super) async fn flush_plan_and_notify(
   metrics: &WriteMetrics,
   state: &Arc<Mutex<WriteState>>,
   _plan_permit: OwnedSemaphorePermit,
+  metadata_write_permits: &Arc<tokio::sync::Semaphore>,
 ) {
   let mut completions = Vec::new();
   for topic_plan in &mut plan.topics {
@@ -53,7 +54,9 @@ pub(super) async fn flush_plan_and_notify(
   }
 
   let flush_started = Instant::now();
-  let result = flush_context.flush_plan_after(&mut plan, metrics).await;
+  let result = flush_context
+    .flush_plan_after(&mut plan, metrics, metadata_write_permits)
+    .await;
   if result.as_ref().is_err()
     || result
       .as_ref()

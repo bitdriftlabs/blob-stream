@@ -1,5 +1,5 @@
 use super::super::config::EffectiveFlushConfig;
-use super::super::flush::FlushContext;
+use super::super::flush::{FlushContext, MAX_CONCURRENT_METADATA_WRITES};
 use super::super::metrics::WriteMetrics;
 use super::super::scheduler::{
   begin_shutdown_drain,
@@ -237,6 +237,9 @@ impl WriteEngineImpl {
     let flush_notifier = Arc::clone(&self.flush_notifier);
     let mut shutdown = self.shutdown_trigger_handle.make_shutdown();
     let flush_plan_permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT_FLUSH_PLANS));
+    // Plans run concurrently, so metadata capacity must be shared here rather than created by
+    // each plan. This is the broker-wide limit on active metadata-store writes.
+    let metadata_write_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_METADATA_WRITES));
 
     tokio::spawn(async move {
       let mut flush_config = *effective_flush_config.read();
@@ -271,10 +274,19 @@ impl WriteEngineImpl {
           let flush_context = flush_context.clone();
           let metrics = metrics.clone();
           let state = Arc::clone(&state);
+          let metadata_write_permits = Arc::clone(&metadata_write_permits);
           flushes.spawn(async move {
             let _active_flush =
               bd_server_stats::stats::StackAutoGauge::new(&metrics.active_flush_plans);
-            flush_plan_and_notify(&flush_context, plan, &metrics, &state, permit).await;
+            flush_plan_and_notify(
+              &flush_context,
+              plan,
+              &metrics,
+              &state,
+              permit,
+              &metadata_write_permits,
+            )
+            .await;
           });
           scheduled_flush = true;
         }

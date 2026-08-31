@@ -34,6 +34,7 @@ use blob_stream_types::{
   Window,
 };
 use bytes::{Bytes, BytesMut};
+use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
 use log::{debug, trace};
 use protobuf::Message;
@@ -45,10 +46,9 @@ use std::time::Instant;
 use time::ext::NumericalDuration;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-const MAX_CONCURRENT_METADATA_WRITES: usize = 8;
+pub(super) const MAX_CONCURRENT_METADATA_WRITES: usize = 8;
 
 #[cfg(test)]
 #[path = "./flush_test.rs"]
@@ -516,6 +516,9 @@ impl FlushContext {
     metrics: &WriteMetrics,
     metadata_write_permits: &Arc<Semaphore>,
   ) -> Result<Vec<FlushPartitionResult>, WriteError> {
+    // A normal topic can become one metadata row immediately. A topic with ordered predecessor
+    // dependencies is split below so each virtual partition can wait independently; successful
+    // partitions are merged again before the store write because they share one snowflake key.
     if topic
       .partition_states
       .values()
@@ -535,6 +538,8 @@ impl FlushContext {
     let mut ready_topics = Vec::new();
     let mut pending_topics = Vec::new();
     for (topic, mut predecessor) in topic.into_partition_topics() {
+      // A completed predecessor determines the outcome immediately. Pending predecessors stay
+      // separate so an unrelated partition in the same object does not inherit their failure.
       match predecessor
         .as_mut()
         .map(|predecessor| *predecessor.state_rx.borrow_and_update())
@@ -554,6 +559,8 @@ impl FlushContext {
         },
       }
     }
+    // Wait for every blocked partition concurrently. These waits do not use metadata capacity:
+    // the shared semaphore is acquired only immediately around the metadata-store write.
     let pending_results = futures::stream::iter(pending_topics)
       .map(|(topic, predecessor)| async move {
         if let Some(error) = wait_for_predecessor(predecessor).await {
@@ -574,6 +581,8 @@ impl FlushContext {
         ready_topics.push(topic);
       }
     }
+    // Splitting preserves dependency isolation, while merging preserves the storage invariant
+    // that all partitions for this topic/object share its one snowflake metadata key.
     if let Some(topic) = PersistedTopic::merge_partition_topics(ready_topics) {
       results.extend(
         self
@@ -596,6 +605,8 @@ impl FlushContext {
     metrics: &WriteMetrics,
     metadata_write_permits: &Arc<Semaphore>,
   ) -> Result<Vec<FlushPartitionResult>, WriteError> {
+    // This semaphore belongs to the engine's flush loop, not this plan. Concurrent plans queue
+    // here together, making the limit a broker-wide cap rather than a cap per plan or object.
     let _metadata_write_permit = metadata_write_permits.acquire().await.map_err(|error| {
       WriteError::Internal(anyhow::anyhow!("metadata write semaphore closed: {error}"))
     })?;
@@ -670,9 +681,12 @@ impl FlushContext {
     &self,
     plan: &mut FlushPlan,
     metrics: &WriteMetrics,
+    metadata_write_permits: &Arc<Semaphore>,
   ) -> Result<Vec<FlushPartitionResult>, WriteError> {
     let publication_started_at = Instant::now();
     let mut identity_predecessors = plan.identity_predecessors.clone();
+    // Allocate every predecessor's segment identity before constructing this plan's objects. The
+    // later metadata barrier remains separate, allowing blob uploads to overlap safely.
     if let Some(error) = wait_for_segment_identity(&mut identity_predecessors).await {
       mark_publication_complete(
         &plan.publication_completions,
@@ -691,9 +705,11 @@ impl FlushContext {
       },
     };
     mark_segment_identity_assigned(&plan.publication_completions);
-    let metadata_write_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_METADATA_WRITES));
     let mut results = Vec::new();
-    let mut metadata_publications = JoinSet::new();
+    // Metadata writes for completed objects overlap the next sequential blob upload. Keeping
+    // their futures in this plan, rather than spawning tasks, keeps their lifetime and errors
+    // owned by the plan while still allowing the futures to make progress during an upload wait.
+    let mut metadata_publications = FuturesUnordered::new();
     while let Some(object) = objects.next() {
       let publication_budget = object
         .topics
@@ -744,11 +760,24 @@ impl FlushContext {
         .envelope
         .blob_key
         .clone();
-      let blob_result = timeout(
+      let mut blob_write = Box::pin(timeout(
         remaining_budget,
         self.blob_store.put(&blob_key, object.payload.clone()),
-      )
-      .await;
+      ));
+      // FuturesUnordered is cooperative: it progresses only when polled. Poll it while the
+      // current blob upload is pending so a completed object can publish metadata without
+      // waiting for every later object in this plan to finish uploading.
+      let blob_result = loop {
+        if metadata_publications.is_empty() {
+          break blob_write.await;
+        }
+        tokio::select! {
+          result = &mut blob_write => break result,
+          Some(publication) = metadata_publications.next() => {
+            results.extend(publication?);
+          },
+        }
+      };
       if blob_result.is_err() || blob_result.as_ref().is_ok_and(Result::is_err) {
         if blob_result.is_err() {
           metrics.record_metadata_publication_deadline_exhausted_while_persisting();
@@ -801,23 +830,19 @@ impl FlushContext {
             .await;
         }
       }
-      let context = self.clone();
-      let metrics = metrics.clone();
-      let metadata_write_permits = Arc::clone(&metadata_write_permits);
-      metadata_publications.spawn(async move {
-        context
-          .persist_object_metadata(
-            object.topics,
-            publication_started_at,
-            &metrics,
-            metadata_write_permits,
-          )
-          .await
-      });
+      // Every plan shares the engine-owned semaphore. A plan may queue publication futures for
+      // several objects, but at most MAX_CONCURRENT_METADATA_WRITES calls reach the metadata
+      // store across the entire broker.
+      metadata_publications.push(self.persist_object_metadata(
+        object.topics,
+        publication_started_at,
+        metrics,
+        Arc::clone(metadata_write_permits),
+      ));
     }
 
-    while let Some(publication) = metadata_publications.join_next().await {
-      results.extend(publication.map_err(|error| WriteError::Internal(anyhow::anyhow!(error)))??);
+    while let Some(publication) = metadata_publications.next().await {
+      results.extend(publication?);
     }
     results.sort_by(|left, right| {
       left
@@ -838,6 +863,9 @@ impl FlushContext {
 
 impl PersistedTopic {
   fn merge_partition_topics(mut topics: Vec<Self>) -> Option<Self> {
+    // Partition topics are split only while waiting for independent predecessors. Rejoin every
+    // successful partition before persistence so the shared object has one metadata record and
+    // therefore one unambiguous snowflake key for this topic.
     let mut merged = topics.pop()?;
     for topic in topics {
       debug_assert_eq!(merged.envelope.window, topic.envelope.window);
@@ -881,6 +909,9 @@ impl PersistedTopic {
     segment_index
       .into_iter()
       .map(|(virtual_partition_id, batch_metadata)| {
+        // Keep the fence and predecessor together while this partition waits. The small one-key
+        // topic remains a valid metadata row if its predecessor succeeds, then merge restores
+        // all ready partitions before the row is written.
         let mut partition_state = partition_states
           .remove(&virtual_partition_id)
           .expect("segment index has matching partition state");
@@ -913,6 +944,9 @@ impl FlushContext {
     metrics: &WriteMetrics,
     metadata_write_permits: Arc<Semaphore>,
   ) -> Result<Vec<FlushPartitionResult>, WriteError> {
+    // Topic futures may wait on different predecessor epochs concurrently. This per-object bound
+    // limits queued dependency work, while actual metadata-store calls still pass through the
+    // shared broker-wide semaphore in persist_ready_topic_metadata.
     let topic_results = futures::stream::iter(topics.into_iter().map(|topic| {
       self.persist_topic_metadata(
         topic,
