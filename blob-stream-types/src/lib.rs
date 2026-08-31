@@ -91,6 +91,19 @@ pub const DEFAULT_MAX_METADATA_PUBLICATION_LAG: Duration = Duration::seconds(15)
 /// Maximum decoded bytes accepted for one broker produce RPC.
 pub const MAX_PRODUCE_BATCHES_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
+/// Maximum uncompressed gRPC body bytes for a decoded producer request at the configured limit.
+///
+/// gRPC prefixes every unary message with a one-byte compression flag and four-byte length.
+pub const MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES: usize = MAX_PRODUCE_BATCHES_REQUEST_BYTES + 5;
+
+/// Maximum raw Snappy bytes for one producer request's framed gRPC body.
+///
+/// This matches `snap::raw::max_compress_len`: a 32-byte overhead plus one byte for every six
+/// input bytes. The transport limit must admit this expansion before the decoder applies the
+/// protobuf-message limit above.
+pub const MAX_PRODUCE_BATCHES_SNAPPY_BODY_BYTES: usize =
+  32 + MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES + (MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES / 6);
+
 //
 // Serde Helpers
 //

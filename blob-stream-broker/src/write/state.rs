@@ -1,4 +1,4 @@
-use super::buffer::BufferState;
+use super::buffer::{BufferState, FlushPublicationDependency};
 use blob_stream_broker_discovery::BrokerMembership;
 use blob_stream_metadata_store::ProducerLeaseFence;
 use blob_stream_types::{SeqRange, VirtualPartitionId};
@@ -102,7 +102,8 @@ pub(super) struct PartitionState {
   pub(super) records_allocated_since_lease_maintenance: u64,
   pub(super) lease_expiration_at: Option<OffsetDateTime>,
   pub(super) lease_fence: Option<Arc<ProducerLeaseFence>>,
-  pub(super) flush_in_flight: bool,
+  pub(super) publication_tail: Option<FlushPublicationDependency>,
+  pub(super) outstanding_flushes: usize,
   pub(super) allocation_in_flight: bool,
   pub(super) allocation_started_at: Option<OffsetDateTime>,
   pub(super) allocation_notify: Arc<Notify>,
@@ -118,7 +119,7 @@ impl PartitionState {
   }
 
   pub(super) fn is_drained(&self) -> bool {
-    !self.flush_in_flight && !self.allocation_in_flight && self.buffer.batches.is_empty()
+    self.outstanding_flushes == 0 && !self.allocation_in_flight && self.buffer.batches.is_empty()
   }
 
   pub(super) fn reservation_target(&mut self, base_reservation_size: u64) -> u64 {

@@ -1,4 +1,11 @@
-use super::{BrokerGrpc, BrokerGrpcMetrics, blob_read_request_config, produce_request_config};
+use super::{
+  BrokerGrpc,
+  BrokerGrpcMetrics,
+  blob_read_request_config,
+  make_broker_router,
+  produce_request_config,
+};
+use crate::metrics::BrokerMetrics;
 use crate::read::blob_cache::{BlobCache, BlobCacheConfig, MAX_BLOB_READ_REQUEST_BYTES};
 use crate::read::metadata_cache::{MetadataCache, MetadataCacheConfig};
 use crate::write::memory_pressure::{MemoryPressureController, MemoryPressureSample};
@@ -6,6 +13,9 @@ use crate::write::{AdmissionController, TopicInfo, WriteConfig, WriteEngineBuild
 use anyhow::Result;
 use async_trait::async_trait;
 use bd_grpc::Handler;
+use bd_grpc::client::Client as GrpcClient;
+use bd_grpc::compression::Compression;
+use bd_grpc::service::ServiceMethod;
 use bd_server_stats::stats::Collector;
 use bd_server_stats::test::util::stats::Helper;
 use bd_shutdown::ComponentShutdownTrigger;
@@ -16,18 +26,29 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   BlobReadFailureStatus,
   ProduceBatchRequest,
   ProduceBatchesRequest,
+  ProduceBatchesResponse,
   ProduceStatus,
   ReadBlobRangesRequest,
+  ReadBlobRangesResponse,
   read_blob_ranges_response,
 };
 use blob_stream_proto::protos::blobstream::v1::config::{BrokerConfig, RuntimeConfig, TopicConfig};
 use blob_stream_test_utils::ManualTimeProvider;
-use blob_stream_types::{MAX_PRODUCE_BATCHES_REQUEST_BYTES, SeqRange, ToProtoDuration, new_record};
+use blob_stream_types::{
+  MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES,
+  MAX_PRODUCE_BATCHES_REQUEST_BYTES,
+  MAX_PRODUCE_BATCHES_SNAPPY_BODY_BYTES,
+  SeqRange,
+  ToProtoDuration,
+  new_record,
+};
 use http::{Extensions, HeaderMap};
 use prometheus::labels;
+use protobuf::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
+use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
 
 fn metadata_cache() -> Arc<MetadataCache> {
@@ -147,11 +168,11 @@ impl crate::write::WriteEngine for FailingWriteEngine {
 fn limits_produce_request_bytes() {
   assert_eq!(
     produce_request_config().max_request_bytes,
-    MAX_PRODUCE_BATCHES_REQUEST_BYTES
+    MAX_PRODUCE_BATCHES_SNAPPY_BODY_BYTES
   );
   assert_eq!(
     produce_request_config().max_decoded_request_bytes,
-    MAX_PRODUCE_BATCHES_REQUEST_BYTES
+    MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES
   );
 }
 
@@ -165,6 +186,182 @@ fn limits_blob_read_request_bytes() {
     blob_read_request_config().max_decoded_request_bytes,
     MAX_BLOB_READ_REQUEST_BYTES
   );
+}
+
+#[tokio::test]
+async fn router_accepts_produce_request_at_decoded_limit() -> Result<()> {
+  let request_with_largest_payload = ProduceBatchesRequest {
+    batches: vec![ProduceBatchRequest {
+      topic: "telemetry".into(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![0; MAX_PRODUCE_BATCHES_REQUEST_BYTES], 1)],
+      ..Default::default()
+    }],
+    ..Default::default()
+  };
+  let request_size = usize::try_from(request_with_largest_payload.compute_size())?;
+  let exact_payload_size = MAX_PRODUCE_BATCHES_REQUEST_BYTES
+    .checked_sub(request_size - MAX_PRODUCE_BATCHES_REQUEST_BYTES)
+    .expect("maximum payload must exceed the request limit");
+  let request = ProduceBatchesRequest {
+    batches: vec![ProduceBatchRequest {
+      topic: "telemetry".into(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![0; exact_payload_size], 1)],
+      ..Default::default()
+    }],
+    ..Default::default()
+  };
+  assert_eq!(
+    usize::try_from(request.compute_size())?,
+    MAX_PRODUCE_BATCHES_REQUEST_BYTES
+  );
+
+  let broker_metrics = BrokerMetrics::new();
+  let scope = broker_metrics.scope();
+  let blob_cache = Arc::new(BlobCache::new(
+    Arc::new(InMemoryBlobStore::new()),
+    BlobCacheConfig::from_broker_config(&BrokerConfig::new(), None)?,
+    MemoryPressureController::new_for_test_with_sample(
+      MemoryPressureSample {
+        allocated_bytes: 0,
+        limit_bytes: 1_000,
+      },
+      &scope,
+    ),
+    &scope,
+  ));
+  let router = make_broker_router(
+    Arc::new(PartialResponseWriteEngine),
+    metadata_cache(),
+    blob_cache,
+    &broker_metrics,
+  );
+  let listener = TcpListener::bind("127.0.0.1:0").await?;
+  let address = listener.local_addr()?;
+  let _server = tokio::spawn(async move {
+    axum::serve(listener, router.into_make_service())
+      .await
+      .expect("broker test server should run");
+  });
+
+  let client = GrpcClient::new_http(&address.to_string(), Duration::seconds(10), 1)?;
+  let method = ServiceMethod::<ProduceBatchesRequest, ProduceBatchesResponse>::new(
+    "BrokerService",
+    "ProduceBatches",
+  );
+  for compression in [Compression::None, Compression::Snappy] {
+    let response = client
+      .unary(
+        &method,
+        None,
+        request.clone(),
+        Duration::seconds(10),
+        compression,
+      )
+      .await?;
+
+    assert_eq!(response.results.len(), 1);
+    assert_eq!(
+      response.results[0].status,
+      ProduceStatus::PRODUCE_STATUS_OK.into()
+    );
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn router_serves_blob_response_at_configured_segment_limit() -> Result<()> {
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let scope = Collector::default().scope("blob_stream_broker_test");
+  let response_payload = bytes::Bytes::from(vec![7; MAX_BLOB_READ_REQUEST_BYTES + 1]);
+  let store = Arc::new(InMemoryBlobStore::new());
+  store
+    .put(
+      &blob_stream_blob_store::BlobKey::from("topic/blob"),
+      response_payload.clone(),
+    )
+    .await?;
+  let mut broker_config = BrokerConfig::new();
+  broker_config.max_segment_bytes = Some(u64::try_from(response_payload.len())?);
+  let cache = Arc::new(BlobCache::new(
+    store,
+    BlobCacheConfig::from_broker_config(&broker_config, None)?,
+    MemoryPressureController::new_for_test_with_sample(
+      MemoryPressureSample {
+        allocated_bytes: 0,
+        limit_bytes: 128 * 1024 * 1024,
+      },
+      &scope,
+    ),
+    &scope,
+  ));
+  let router = make_broker_router(
+    Arc::new(PartialResponseWriteEngine),
+    metadata_cache(),
+    cache,
+    &BrokerMetrics::new(),
+  );
+  let listener = TcpListener::bind("127.0.0.1:0").await?;
+  let address = listener.local_addr()?;
+  let _server = tokio::spawn(async move {
+    axum::serve(listener, router.into_make_service())
+      .await
+      .expect("broker test server should run");
+  });
+  let client = GrpcClient::new_http(&address.to_string(), Duration::seconds(10), 1)?;
+  let method = ServiceMethod::<ReadBlobRangesRequest, ReadBlobRangesResponse>::new(
+    "BrokerService",
+    "ReadBlobRanges",
+  );
+  let response = client
+    .unary(
+      &method,
+      None,
+      ReadBlobRangesRequest {
+        blob_key: "topic/blob".into(),
+        ranges: vec![BlobRangeRequest {
+          start: 0,
+          end: u64::try_from(response_payload.len())?,
+          ..Default::default()
+        }],
+        ..Default::default()
+      },
+      Duration::seconds(10),
+      Compression::None,
+    )
+    .await?;
+  let Some(read_blob_ranges_response::Result::Success(success)) = response.result else {
+    panic!("expected blob range success");
+  };
+  assert_eq!(success.ranges[0].payload, response_payload);
+
+  let rejected = client
+    .unary(
+      &method,
+      None,
+      ReadBlobRangesRequest {
+        blob_key: "topic/blob".into(),
+        ranges: vec![BlobRangeRequest {
+          start: 0,
+          end: u64::try_from(response_payload.len())? + 1,
+          ..Default::default()
+        }],
+        ..Default::default()
+      },
+      Duration::seconds(10),
+      Compression::None,
+    )
+    .await?;
+  let Some(read_blob_ranges_response::Result::Failure(failure)) = rejected.result else {
+    panic!("expected blob range failure");
+  };
+  assert_eq!(
+    failure.status,
+    BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_BAD_REQUEST.into()
+  );
+  shutdown_trigger.shutdown().await;
+  Ok(())
 }
 
 #[tokio::test]

@@ -20,12 +20,13 @@ This document describes the current implementation and its behavioral contracts.
   provide monotonic progress only within a virtual partition.
 - Consumers use cursors, not timestamp seeks. A new consumer group starts at its current aligned
   metadata window; a resumed group recovers from its committed metadata source through retention.
-- Brokers serve bounded cached metadata-window reads and a bounded raw blob-range RPC.
-  The blob-range service inspects an object's advertised content length and admits its complete
-  immutable body only when the Linux cgroup-aware memory monitor has enough headroom, before
-  streaming that body from storage. It then returns exact requested byte slices. Consumers group
-  the current pass's segment ranges by immutable blob key. A complete validated broker response
-  supplies raw bytes to the existing
+- Brokers serve bounded cached metadata-window reads and a bounded raw blob-range RPC. Blob-range
+  requests are limited to 16 MiB, while responses may contain up to the effective
+  `max_segment_bytes` setting of requested compressed bytes. The blob-range service inspects an
+  object's advertised content length and admits its complete immutable body only when the Linux
+  cgroup-aware memory monitor has enough headroom, before streaming that body from storage. It
+  then returns exact requested byte slices. Consumers group the current pass's segment ranges by
+  immutable blob key. A complete validated broker response supplies raw bytes to the existing
   consumer decoder; any unavailable, malformed, or retryable response reissues the whole group
   through direct blob storage. An authoritative broker `NOT_FOUND` follows the existing
   missing-batch path without a direct retry. There is no compaction, built-in authorization, or
@@ -172,12 +173,15 @@ data already covered by a cursor, then expose records in range order. A crash or
 transfer can leave unused values from a reserved block, creating gaps, but a new holder reserves
 only above the durable high-water mark and therefore cannot reuse a successfully reserved value.
 
-The broker serializes lease/refill/allocation transitions and durable flush plans for each virtual
-partition within one live broker. Later accepted batches buffer while an earlier plan uploads its
-blob and writes metadata, and therefore cannot become visible first from that broker. During a
-graceful membership handoff or orderly shutdown, the broker stops accepting new batches for the
-partition, drains its already accepted work, and only then voluntarily releases the producer
-lease. Flushes for different virtual partitions remain concurrent.
+The broker serializes lease/refill/allocation transitions for each virtual partition within one live
+broker. Later accepted batches buffer in a successor flush epoch while an earlier epoch persists.
+The broker assigns segment identities in epoch order, then successive epochs may encode and upload
+blobs concurrently, subject to a broker-wide upload bound. A plan starts metadata publication only
+after every blob upload in that plan has reached a terminal result. The broker publishes metadata
+for each partition in epoch order, so a later sequence range cannot become consumer-visible first.
+During a graceful membership handoff or orderly shutdown, the broker stops accepting new batches for
+the partition, drains its already accepted work, and only then voluntarily releases the producer
+lease.
 
 The optional `fenced_metadata_writes` mode supplies a durable cross-process publication fence. Each
 write engine creates a unique process session ID; acquisition by a new or expired session increments
@@ -217,8 +221,9 @@ invariant.
    durable order.
 3. `ProduceBatches` returns one ordered result per submitted partition batch. The producer
    resolves successful entries independently and retries only entries that were rejected or whose
-   request outcome is ambiguous. It retains the legacy `ProduceBatch` RPC only for a staged
-   broker-first deployment; new producers use `ProduceBatches` exclusively.
+   request outcome is ambiguous. Each `ProduceBatches` message has a 16 MiB decoded protobuf cap;
+   the broker also permits the fixed five-byte gRPC envelope. It retains the legacy `ProduceBatch`
+   RPC only for a staged broker-first deployment; new producers use `ProduceBatches` exclusively.
 4. The broker validates each topic and virtual partition, acquires or renews the
    producer-partition lease, and reserves sequence space as necessary.
 5. The broker samples jemalloc allocation against its Linux cgroup memory limit and rejects new
@@ -235,10 +240,11 @@ invariant.
    separately caps each serialized compressed object; it defaults to 64 MiB and can be changed live
    with `blob_stream_broker_max_segment_bytes`. A compressed partition batch that cannot be split
    is emitted alone when it exceeds that cap. A partition with a durable plan in progress continues
-   buffering its next epoch until that prior plan completes. A single bounded flush scheduler wakes
-   for eligible writes, timer ticks, and durable-plan completions; a completion immediately promotes
-   an eligible successor epoch. It runs at most four durable flush plans concurrently;
-  `write:active_flush_plans` reports its current occupancy.
+   buffering its next epoch until its normal byte or delay trigger. Successive epochs can then build
+   and upload blobs concurrently, while their metadata publication remains ordered. A single bounded
+   flush scheduler wakes for eligible writes, timer ticks, and durable-plan completions. It runs at
+   most four durable flush plans concurrently; `write:active_flush_plans` reports its current
+   occupancy.
 6. A flush coalesces each virtual partition's accepted batches into one `StoredRecordBatch`,
   compresses each serialized partition batch independently, and concatenates the stored bytes into
   bounded segment objects. One time-triggered object can contain contiguous sections for several
@@ -246,8 +252,8 @@ invariant.
   for every section. A successful row acknowledges only its own topic's partitions; a failed row
   remains retryable and can produce an at-least-once duplicate. With fenced metadata writes
   enabled, each row is a transaction conditioned on the snapshot lease fences for that row's topic.
-  Plans may run concurrently for different virtual partitions, but each virtual partition persists
-  plans in sequence order.
+  Plans may overlap for the same or different virtual partitions. Blob uploads may proceed in
+  parallel, but each virtual partition publishes plan metadata in sequence order.
 7. Only after both blob upload and metadata write succeed does the broker complete the waiting
    write and return `OK`. A producer acknowledgement therefore represents durable segment
    metadata, not merely in-memory buffering.
@@ -357,12 +363,14 @@ causes the consumer to use its original direct DynamoDB scan.
 The independently enabled raw blob path groups currently planned batch ranges by immutable blob
 key and sends each group to its deterministic local broker. The broker caches a bounded complete
 compressed object, shares one in-flight whole-object read for concurrent same-key requests, then
-returns only the requested ranges. Consumers retain decompression, validation, ordering, cursor
-progression, and direct blob-storage authority. `NOT_FOUND` is authoritative for an immutable
-object and preserves the existing missing-batch behavior; every other broker, protocol, admission,
-or timeout failure retries every range in the group directly from blob storage. The broker cache is
-best-effort: idle expiry or memory pressure removes retained objects without changing delivery
-semantics.
+returns only the requested ranges. A request is limited to 16 MiB of serialized range data and a
+response to the effective `max_segment_bytes` value of requested compressed bytes plus bounded
+protobuf range metadata. This covers normal objects; a larger unsplittable singleton retains the
+direct-storage fallback. Consumers retain decompression, validation, ordering, cursor progression,
+and direct blob-storage authority. `NOT_FOUND` is authoritative for an immutable object and
+preserves the existing missing-batch behavior; every other broker, protocol, admission, or timeout
+failure retries every range in the group directly from blob storage. The broker cache is best-effort:
+idle expiry or memory pressure removes retained objects without changing delivery semantics.
 
 Tail and Full Recovery metadata use independent byte-weighted Moka caches with a five-minute idle
 expiry. A retained entry is invalidated when it is stale or cannot cover the request. The broker

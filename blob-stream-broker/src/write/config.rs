@@ -49,7 +49,7 @@ use time::ext::NumericalDuration;
 use tokio::sync::watch;
 
 const DEFAULT_FLUSH_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_FLUSH_MAX_DELAY: Duration = Duration::seconds(1);
 const DEFAULT_LEASE_DURATION: Duration = Duration::seconds(30);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::seconds(10);
@@ -236,20 +236,27 @@ impl WriteConfig {
 
   #[must_use]
   pub(crate) fn max_segment_bytes(&self, feature_flags: Option<&FeatureFlagsWatch>) -> u64 {
-    let value = feature_flags.map_or(self.max_segment_bytes, |feature_flags| {
-      feature_flags.get_integer(MAX_SEGMENT_BYTES_FEATURE_FLAG, self.max_segment_bytes)
-    });
-    if value > 0 {
-      return value;
-    }
-
-    warn_every!(
-      15.seconds(),
-      "broker max segment bytes override must be greater than zero; using configured value {}",
-      self.max_segment_bytes
-    );
-    self.max_segment_bytes
+    effective_max_segment_bytes(self.max_segment_bytes, feature_flags)
   }
+}
+
+pub fn effective_max_segment_bytes(
+  configured_max_segment_bytes: u64,
+  feature_flags: Option<&FeatureFlagsWatch>,
+) -> u64 {
+  let value = feature_flags.map_or(configured_max_segment_bytes, |feature_flags| {
+    feature_flags.get_integer(MAX_SEGMENT_BYTES_FEATURE_FLAG, configured_max_segment_bytes)
+  });
+  if value > 0 {
+    return value;
+  }
+
+  warn_every!(
+    15.seconds(),
+    "broker max segment bytes override must be greater than zero; using configured value \
+     {configured_max_segment_bytes}"
+  );
+  configured_max_segment_bytes
 }
 
 //

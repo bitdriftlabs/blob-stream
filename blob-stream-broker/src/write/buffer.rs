@@ -5,7 +5,7 @@ use blob_stream_types::{BatchSummary, Record, SeqRange, VirtualPartitionId};
 use protobuf::Chars;
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 pub(super) type FlushCompletion = oneshot::Sender<Result<(), FlushCompletionError>>;
 
@@ -13,6 +13,46 @@ pub(super) type FlushCompletion = oneshot::Sender<Result<(), FlushCompletionErro
 pub(super) enum FlushCompletionError {
   LeaseFenceLost,
   Internal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FlushPublicationResult {
+  Succeeded,
+  Failed(FlushCompletionError),
+}
+
+//
+// FlushPublicationState
+//
+
+/// One partition flush epoch's progress through the two ordering barriers.
+///
+/// A successor must not allocate a segment identity before its predecessor reaches
+/// `SegmentIdentityAssigned`, otherwise concurrent plans could publish snowflake IDs out of
+/// order. Once that barrier is crossed, successors may encode and upload in parallel, but their
+/// metadata must wait for `Completed` so a later sequence range is never consumer-visible first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FlushPublicationState {
+  /// The predecessor has not assigned all of its segment identities.
+  Pending,
+  /// The predecessor's segment identities are fixed, but its metadata is not yet terminal.
+  SegmentIdentityAssigned,
+  /// The predecessor finished metadata publication, allowing successors to publish or fail.
+  Completed(FlushPublicationResult),
+}
+
+/// Receiver retained by a later epoch to observe one earlier epoch's ordering progress.
+#[derive(Clone, Debug)]
+pub(super) struct FlushPublicationDependency {
+  pub(super) state_rx: watch::Receiver<FlushPublicationState>,
+}
+
+/// Sender retained by the scheduled epoch until it reaches terminal metadata publication.
+#[derive(Debug)]
+pub(super) struct FlushPublicationCompletion {
+  pub(super) topic: Chars,
+  pub(super) virtual_partition_id: VirtualPartitionId,
+  pub(super) state_tx: watch::Sender<FlushPublicationState>,
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +158,7 @@ pub(super) struct FlushPlan {
   pub(super) topics: Vec<TopicFlushPlan>,
   pub(super) max_segment_bytes: u64,
   pub(super) shared_blob: bool,
+  pub(super) publication_completions: Vec<FlushPublicationCompletion>,
 }
 
 //
@@ -130,6 +171,8 @@ pub(super) struct FlushPartition {
   pub(super) lease_fence: Option<Arc<ProducerLeaseFence>>,
   pub(super) batches: Vec<BufferedBatch>,
   pub(super) trigger: FlushTrigger,
+  pub(super) publication_predecessor: Option<FlushPublicationDependency>,
+  pub(super) publication_state_tx: Option<watch::Sender<FlushPublicationState>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

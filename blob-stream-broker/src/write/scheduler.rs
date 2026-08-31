@@ -3,6 +3,10 @@ use super::buffer::{
   FlushPartition,
   FlushPartitionResult,
   FlushPlan,
+  FlushPublicationCompletion,
+  FlushPublicationDependency,
+  FlushPublicationResult,
+  FlushPublicationState,
   FlushTrigger,
   TopicFlushPlan,
 };
@@ -20,6 +24,7 @@ use std::collections::HashMap;
 use std::iter;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::OwnedSemaphorePermit;
 
 #[cfg(test)]
 #[path = "./scheduler_test.rs"]
@@ -30,21 +35,11 @@ pub(super) async fn flush_plan_and_notify(
   mut plan: FlushPlan,
   metrics: &WriteMetrics,
   state: &Arc<Mutex<WriteState>>,
+  _plan_permit: OwnedSemaphorePermit,
+  blob_upload_permits: &Arc<tokio::sync::Semaphore>,
+  metadata_write_permits: &Arc<tokio::sync::Semaphore>,
+  flush_notifier: &Arc<tokio::sync::Notify>,
 ) {
-  let flushed_partitions: Vec<_> = plan
-    .topics
-    .iter()
-    .map(|topic_plan| {
-      (
-        topic_plan.topic.clone(),
-        topic_plan
-          .partitions
-          .iter()
-          .map(|partition| partition.virtual_partition_id)
-          .collect::<Vec<_>>(),
-      )
-    })
-    .collect();
   let mut completions = Vec::new();
   for topic_plan in &mut plan.topics {
     for partition in &mut topic_plan.partitions {
@@ -61,7 +56,15 @@ pub(super) async fn flush_plan_and_notify(
   }
 
   let flush_started = Instant::now();
-  let result = flush_context.flush_plan(&mut plan, metrics).await;
+  let result = flush_context
+    .flush_plan_after(
+      &mut plan,
+      metrics,
+      blob_upload_permits,
+      metadata_write_permits,
+      flush_notifier,
+    )
+    .await;
   if result.as_ref().is_err()
     || result
       .as_ref()
@@ -72,9 +75,6 @@ pub(super) async fn flush_plan_and_notify(
   metrics
     .flush_latency_seconds
     .observe(flush_started.elapsed().as_secs_f64());
-  for (topic, virtual_partition_ids) in flushed_partitions {
-    mark_flush_complete(state, &topic, &virtual_partition_ids);
-  }
   let fallback_error = result
     .as_ref()
     .err()
@@ -83,13 +83,19 @@ pub(super) async fn flush_plan_and_notify(
       _ => FlushCompletionError::Internal,
     });
   let partition_results = result.unwrap_or_default();
+  mark_flush_complete(
+    state,
+    plan.publication_completions,
+    &partition_results,
+    fallback_error,
+  );
   for (topic, virtual_partition_id, completion) in completions {
-    let error = partition_results
-      .iter()
-      .find(|result: &&FlushPartitionResult| {
-        result.topic == topic && result.virtual_partition_id == virtual_partition_id
-      })
-      .map_or(Some(fallback_error), |result| result.error);
+    let error = partition_result_error(
+      &partition_results,
+      &topic,
+      virtual_partition_id,
+      fallback_error,
+    );
     let completion_result = error.map_or(Ok(()), Err);
     let _ignored = completion.send(completion_result);
   }
@@ -97,34 +103,79 @@ pub(super) async fn flush_plan_and_notify(
 
 fn mark_flush_complete(
   state: &Arc<Mutex<WriteState>>,
-  topic: &Chars,
-  virtual_partition_ids: &[blob_stream_types::VirtualPartitionId],
+  publication_completions: Vec<FlushPublicationCompletion>,
+  partition_results: &[FlushPartitionResult],
+  fallback_error: FlushCompletionError,
 ) {
   let mut drain_notifiers = Vec::new();
   {
     let mut state = state.lock();
-    for virtual_partition_id in virtual_partition_ids {
-      let Some(partition_state) =
-        state.partition_state_mut_if_present(topic.as_str(), *virtual_partition_id)
+    for completion in publication_completions {
+      let error = partition_result_error(
+        partition_results,
+        &completion.topic,
+        completion.virtual_partition_id,
+        fallback_error,
+      );
+      completion
+        .state_tx
+        .send_replace(FlushPublicationState::Completed(error.map_or(
+          FlushPublicationResult::Succeeded,
+          FlushPublicationResult::Failed,
+        )));
+      let Some(partition_state) = state
+        .partition_state_mut_if_present(completion.topic.as_str(), completion.virtual_partition_id)
       else {
         continue;
       };
-      partition_state.flush_in_flight = false;
+      debug_assert!(partition_state.outstanding_flushes > 0);
+      partition_state.outstanding_flushes = partition_state.outstanding_flushes.saturating_sub(1);
+      if partition_state
+        .publication_tail
+        .as_ref()
+        .is_some_and(|tail| {
+          matches!(
+            *tail.state_rx.borrow(),
+            FlushPublicationState::Completed(FlushPublicationResult::Failed(_))
+          )
+        })
+      {
+        // A retry must begin a new publication chain after the failed chain has unwound. A
+        // successor replaces the tail before it can observe its predecessor's failure, so this
+        // only clears the tail after the final dependent plan reaches its terminal result.
+        partition_state.publication_tail = None;
+      }
       trace!(
         "broker flush completion updated partition state: topic={topic}, \
-         virtual_partition_id={virtual_partition_id}, allocation_in_flight={}, \
-         buffered_batches={}, draining={}",
-        partition_state.allocation_in_flight,
-        partition_state.buffer.batches.len(),
-        partition_state.draining,
+         virtual_partition_id={virtual_partition_id}, \
+         allocation_in_flight={allocation_in_flight}, buffered_batches={buffered_batches}, \
+         outstanding_flushes={outstanding_flushes}, draining={draining}",
+        topic = completion.topic,
+        virtual_partition_id = completion.virtual_partition_id,
+        allocation_in_flight = partition_state.allocation_in_flight,
+        buffered_batches = partition_state.buffer.batches.len(),
+        outstanding_flushes = partition_state.outstanding_flushes,
+        draining = partition_state.draining,
       );
       drain_notifiers.push(Arc::clone(&partition_state.drain_notify));
     }
   }
   for drain_notify in drain_notifiers {
-    trace!("broker flush completion notifying partition drain waiter: topic={topic}");
+    trace!("broker flush completion notifying partition drain waiter");
     drain_notify.notify_waiters();
   }
+}
+
+fn partition_result_error(
+  partition_results: &[FlushPartitionResult],
+  topic: &Chars,
+  virtual_partition_id: blob_stream_types::VirtualPartitionId,
+  fallback_error: FlushCompletionError,
+) -> Option<FlushCompletionError> {
+  partition_results
+    .iter()
+    .find(|result| result.topic == *topic && result.virtual_partition_id == virtual_partition_id)
+    .map_or(Some(fallback_error), |result| result.error)
 }
 
 fn take_flush_partition(
@@ -156,12 +207,22 @@ fn take_flush_partition(
   }
 
   partition_state.buffer.reset();
-  partition_state.flush_in_flight = true;
+  // Each epoch advances through one state machine. Its successor may begin assigning identities
+  // at `SegmentIdentityAssigned`, but it cannot publish metadata until `Completed`.
+  let (publication_state_tx, publication_state_rx) =
+    tokio::sync::watch::channel(FlushPublicationState::Pending);
+  let publication_predecessor = partition_state.publication_tail.clone();
+  partition_state.publication_tail = Some(FlushPublicationDependency {
+    state_rx: publication_state_rx,
+  });
+  partition_state.outstanding_flushes = partition_state.outstanding_flushes.saturating_add(1);
   Some(FlushPartition {
     virtual_partition_id,
     lease_fence,
     batches,
     trigger,
+    publication_predecessor,
+    publication_state_tx: Some(publication_state_tx),
   })
 }
 
@@ -170,9 +231,6 @@ fn flush_trigger(
   now: time::OffsetDateTime,
   flush_config: &EffectiveFlushConfig,
 ) -> Option<FlushTrigger> {
-  if partition_state.flush_in_flight {
-    return None;
-  }
   if partition_state.draining {
     Some(FlushTrigger::LeaseDrain)
   } else {
@@ -197,8 +255,11 @@ fn take_flush_partitions(
     .filter_map(|virtual_partition_id| {
       let partition_state =
         state.partition_state_mut_if_present(topic.as_str(), virtual_partition_id)?;
-      if partition_state.flush_in_flight
-        || (matches!(trigger, FlushTrigger::MaxDelay) && partition_state.draining)
+      if (matches!(trigger, FlushTrigger::MaxDelay) && partition_state.draining)
+        || partition_state
+          .publication_tail
+          .as_ref()
+          .is_some_and(|tail| matches!(*tail.state_rx.borrow(), FlushPublicationState::Pending))
       {
         None
       } else {
@@ -292,7 +353,6 @@ pub(super) fn collect_next_flush_plan(
       .partition_state(topic.as_str(), *virtual_partition_id)
       .and_then(|partition_state| {
         if shared_time_flush
-          && !partition_state.flush_in_flight
           && !partition_state.draining
           && !partition_state.buffer.batches.is_empty()
         {
@@ -405,10 +465,25 @@ pub(super) fn collect_next_flush_plan(
   let shared_blob = selected_shared_blob?;
   let mut topics = topic_plans.into_values().collect::<Vec<_>>();
   topics.sort_by(|left, right| left.topic.as_str().cmp(right.topic.as_str()));
+  let mut publication_completions = Vec::new();
+  for topic_plan in &mut topics {
+    for partition in &mut topic_plan.partitions {
+      let state_tx = partition
+        .publication_state_tx
+        .take()
+        .expect("selected flush partition has a publication state sender");
+      publication_completions.push(FlushPublicationCompletion {
+        topic: topic_plan.topic.clone(),
+        virtual_partition_id: partition.virtual_partition_id,
+        state_tx,
+      });
+    }
+  }
   Some(FlushPlan {
     topics,
     max_segment_bytes: config.max_segment_bytes(feature_flags),
     shared_blob,
+    publication_completions,
   })
 }
 
