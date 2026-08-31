@@ -179,8 +179,9 @@ The broker assigns segment identities in epoch order, then successive epochs may
 blobs concurrently, subject to a broker-wide upload bound. A plan starts metadata publication only
 after every blob upload in that plan has reached a terminal result. The broker publishes metadata
 for each partition in epoch order, so a later sequence range cannot become consumer-visible first.
-During a graceful membership handoff or orderly shutdown, the broker stops accepting new batches for the partition,
-drains its already accepted work, and only then voluntarily releases the producer lease.
+During a graceful membership handoff or orderly shutdown, the broker stops accepting new batches for
+the partition, drains its already accepted work, and only then voluntarily releases the producer
+lease.
 
 The optional `fenced_metadata_writes` mode supplies a durable cross-process publication fence. Each
 write engine creates a unique process session ID; acquisition by a new or expired session increments
@@ -220,9 +221,9 @@ invariant.
    durable order.
 3. `ProduceBatches` returns one ordered result per submitted partition batch. The producer
    resolves successful entries independently and retries only entries that were rejected or whose
-  request outcome is ambiguous. Each `ProduceBatches` message has a 16 MiB decoded protobuf cap;
-  the broker also permits the fixed five-byte gRPC envelope. It retains the legacy `ProduceBatch`
-  RPC only for a staged broker-first deployment; new producers use `ProduceBatches` exclusively.
+   request outcome is ambiguous. Each `ProduceBatches` message has a 16 MiB decoded protobuf cap;
+   the broker also permits the fixed five-byte gRPC envelope. It retains the legacy `ProduceBatch`
+   RPC only for a staged broker-first deployment; new producers use `ProduceBatches` exclusively.
 4. The broker validates each topic and virtual partition, acquires or renews the
    producer-partition lease, and reserves sequence space as necessary.
 5. The broker samples jemalloc allocation against its Linux cgroup memory limit and rejects new
@@ -238,12 +239,12 @@ invariant.
    flush pulls them forward, and lease-drain flushes remain partition-local. `max_segment_bytes`
    separately caps each serialized compressed object; it defaults to 64 MiB and can be changed live
    with `blob_stream_broker_max_segment_bytes`. A compressed partition batch that cannot be split
-  is emitted alone when it exceeds that cap. A partition with a durable plan in progress continues
-  buffering its next epoch until its normal byte or delay trigger. Successive epochs can then build
-  and upload blobs concurrently, while their metadata publication remains ordered. A single bounded
-  flush scheduler wakes for eligible writes, timer ticks, and durable-plan completions. It runs at
-  most four durable flush plans concurrently; `write:active_flush_plans` reports its current
-  occupancy.
+   is emitted alone when it exceeds that cap. A partition with a durable plan in progress continues
+   buffering its next epoch until its normal byte or delay trigger. Successive epochs can then build
+   and upload blobs concurrently, while their metadata publication remains ordered. A single bounded
+   flush scheduler wakes for eligible writes, timer ticks, and durable-plan completions. It runs at
+   most four durable flush plans concurrently; `write:active_flush_plans` reports its current
+   occupancy.
 6. A flush coalesces each virtual partition's accepted batches into one `StoredRecordBatch`,
   compresses each serialized partition batch independently, and concatenates the stored bytes into
   bounded segment objects. One time-triggered object can contain contiguous sections for several
