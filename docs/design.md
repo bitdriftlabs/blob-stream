@@ -107,8 +107,11 @@ and accept writes for that lease key.
 
 Broker configuration sets both the lease duration and the producer-lease heartbeat interval. The
 heartbeat must be shorter than the lease duration; it renews every producer-partition lease owned
-by the broker. Increasing both reduces DynamoDB renewal writes but extends recovery after an
-ungraceful broker loss. Graceful membership changes release moved leases explicitly.
+by the broker. A failed acquisition because another holder is still live retries after 250 ms with
+exponential backoff capped at 2 seconds. Increasing both reduces DynamoDB renewal writes but
+extends recovery after an ungraceful broker loss. During graceful membership changes and shutdown,
+the broker stops accepting new work, drains accepted work while renewing the lease before its
+existing expiry, and then releases moved leases explicitly.
 
 Broker admin state reports its configured writer ID, local membership as `{node_id, address}`,
 and one ownership row per local writer-scoped virtual partition. Each row distinguishes the
@@ -861,7 +864,7 @@ defaults are:
 | Broker flush delay | 1 second |
 | Broker sequence reservation | 10,000 base sequence values per virtual partition |
 | Broker segment compression | zstd, level 3 |
-| Producer batch records | 1,000 |
+| Producer batch records | 10,000 |
 | Producer batch payload bytes | 1 MiB |
 | Producer flush delay | 200 ms |
 | Producer retry deadline | 30 seconds |

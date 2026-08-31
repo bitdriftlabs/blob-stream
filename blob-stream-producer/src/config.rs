@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use time::Duration;
 
-const DEFAULT_MAX_BATCH_RECORDS: u32 = 1_000;
+const DEFAULT_MAX_BATCH_RECORDS: u32 = 10_000;
 const DEFAULT_MAX_BATCH_BYTES: u32 = 1_048_576;
 const DEFAULT_FLUSH_MAX_DELAY: Duration = Duration::milliseconds(200);
 const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::milliseconds(25);

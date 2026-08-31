@@ -1,10 +1,11 @@
 #![allow(clippy::unwrap_used)]
 
 use crate::write::{TopicInfo, WriteConfig, WriteEngineBuilder, WriteEngineImpl};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use bd_server_stats::stats::Collector;
 use bd_shutdown::ComponentShutdownTrigger;
+use bd_time::TimeProvider;
 use blob_stream_blob_store::InMemoryBlobStore;
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{
@@ -27,6 +28,7 @@ use blob_stream_types::{
 use protobuf::Chars;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration as StdDuration;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::{Semaphore, mpsc, watch};
@@ -35,6 +37,107 @@ struct BlockingReleaseLeaseStore {
   inner: InMemoryProducerPartitionLeaseStore,
   started_tx: mpsc::UnboundedSender<VirtualPartitionId>,
   release: Arc<Semaphore>,
+}
+
+struct TransientHeartbeatLeaseStore {
+  inner: InMemoryProducerPartitionLeaseStore,
+  heartbeat_failures_remaining: AtomicUsize,
+}
+
+#[async_trait]
+impl ProducerPartitionLeaseStore for TransientHeartbeatLeaseStore {
+  async fn get_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+  ) -> Result<Option<ProducerPartitionLease>> {
+    self.inner.get_lease(key).await
+  }
+
+  async fn acquire_lease(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    lease_session_id: String,
+    now: OffsetDateTime,
+    lease_duration: Duration,
+  ) -> Result<LeaseAcquireOutcome> {
+    self
+      .inner
+      .acquire_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .await
+  }
+
+  async fn acquire_lease_and_reserve_sequences(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    lease_session_id: String,
+    now: OffsetDateTime,
+    lease_duration: Duration,
+    reservation_size: Option<u64>,
+  ) -> Result<LeaseAcquireAndReserveOutcome> {
+    self
+      .inner
+      .acquire_lease_and_reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now,
+        lease_duration,
+        reservation_size,
+      )
+      .await
+  }
+
+  async fn heartbeat_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    lease_session_id: &str,
+    now: OffsetDateTime,
+    lease_duration: Duration,
+  ) -> Result<LeaseHeartbeatOutcome> {
+    if self
+      .heartbeat_failures_remaining
+      .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+        remaining.checked_sub(1)
+      })
+      .is_ok()
+    {
+      return Err(anyhow!("injected transient heartbeat failure"));
+    }
+    self
+      .inner
+      .heartbeat_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .await
+  }
+
+  async fn reserve_sequences(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    lease_session_id: &str,
+    now: OffsetDateTime,
+    reservation_size: u64,
+  ) -> Result<SequenceReservationOutcome> {
+    self
+      .inner
+      .reserve_sequences(key, holder_id, lease_session_id, now, reservation_size)
+      .await
+  }
+
+  async fn release_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    lease_session_id: &str,
+    now: OffsetDateTime,
+  ) -> Result<blob_stream_metadata_store::LeaseReleaseOutcome> {
+    self
+      .inner
+      .release_lease(key, holder_id, lease_session_id, now)
+      .await
+  }
 }
 
 #[async_trait]
@@ -347,6 +450,7 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
   ));
   let flush_notifier = Arc::new(tokio::sync::Notify::new());
   let metrics = super::super::super::metrics::WriteMetrics::new(&metrics_scope());
+  let time_provider = ManualTimeProvider::new(offset_datetime_from_unix_millis(1_000));
   let lifecycle_hooks: Option<Arc<dyn super::super::super::BrokerLifecycleHooks>> =
     Some(Arc::new(super::super::super::NoopBrokerLifecycleHooks));
   let releases = WriteEngineImpl::release_partition_leases(
@@ -357,7 +461,9 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
     "node-a",
     "session-a",
     vec![("telemetry".into(), 0), ("telemetry".into(), 1)],
-    offset_datetime_from_unix_millis(1_000),
+    &time_provider,
+    Duration::seconds(60),
+    Duration::seconds(10),
     lifecycle_hooks.as_ref(),
   );
   tokio::pin!(releases);
@@ -373,6 +479,89 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
   assert_eq!(HashSet::from([first, second]), HashSet::from([0, 1]));
   release.add_permits(2);
   releases.await;
+}
+
+#[tokio::test]
+async fn transient_drain_heartbeat_failure_retries_before_lease_expiry() -> Result<()> {
+  let initial_time = offset_datetime_from_unix_millis(1_000);
+  let time_provider = ManualTimeProvider::new(initial_time);
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".into(),
+    virtual_partition_id: 0,
+  };
+  let lease_store: Arc<dyn ProducerPartitionLeaseStore> = Arc::new(TransientHeartbeatLeaseStore {
+    inner: InMemoryProducerPartitionLeaseStore::new(),
+    heartbeat_failures_remaining: AtomicUsize::new(1),
+  });
+  lease_store
+    .acquire_lease(
+      key.clone(),
+      "node-a".to_string(),
+      "session-a".to_string(),
+      initial_time,
+      Duration::seconds(10),
+    )
+    .await?;
+  let state = Arc::new(parking_lot::Mutex::new(
+    super::super::super::state::WriteState::default(),
+  ));
+  {
+    let mut state = state.lock();
+    let partition_state = state.partition_state_mut("telemetry", 0);
+    partition_state.outstanding_flushes = 1;
+    partition_state.lease_expiration_at = Some(initial_time + Duration::seconds(10));
+  }
+
+  let wait_for_drain = WriteEngineImpl::wait_for_partition_drain(
+    &lease_store,
+    &state,
+    &key,
+    "node-a",
+    "session-a",
+    &time_provider,
+    initial_time + Duration::seconds(5),
+    Duration::seconds(10),
+    Duration::seconds(5),
+  );
+  tokio::pin!(wait_for_drain);
+
+  let initial_sleep = tokio::select! {
+    () = &mut wait_for_drain => panic!("drain completed before the initial heartbeat"),
+    registration = time_provider.wait_for_sleep_registration_after(0) => registration,
+  };
+  time_provider.advance(Duration::seconds(5));
+  let retry_sleep = tokio::select! {
+    () = &mut wait_for_drain => panic!("drain completed before retrying the failed heartbeat"),
+    registration = time_provider.wait_for_sleep_registration_after(initial_sleep) => registration,
+  };
+  time_provider.advance(Duration::milliseconds(250));
+  tokio::select! {
+    () = &mut wait_for_drain => panic!("drain completed before retrying the failed heartbeat"),
+    registration = time_provider.wait_for_sleep_registration_after(retry_sleep) => {
+      let _ = registration;
+    },
+  }
+  time_provider.advance(Duration::seconds(5));
+
+  let takeover = lease_store
+    .acquire_lease(
+      key.clone(),
+      "node-b".to_string(),
+      "session-b".to_string(),
+      time_provider.now(),
+      Duration::seconds(10),
+    )
+    .await?;
+  assert!(matches!(takeover, LeaseAcquireOutcome::HeldByOther(_)));
+
+  {
+    let mut state = state.lock();
+    let partition_state = state.partition_state_mut("telemetry", 0);
+    partition_state.outstanding_flushes = 0;
+    partition_state.drain_notify.notify_waiters();
+  }
+  wait_for_drain.await;
+  Ok(())
 }
 
 async fn wait_for_all_partitions(mut predicate: impl AsyncFnMut() -> bool) -> bool {
@@ -534,6 +723,148 @@ async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Resul
     })
     .await,
     "node-a did not reacquire leases after rejoining membership"
+  );
+
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn lease_assignment_retries_held_partition_before_heartbeat() -> Result<()> {
+  let partition_count = 1;
+  let topics = make_topic(partition_count);
+  let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
+  let initial_time = offset_datetime_from_unix_millis(1_000);
+  let time_provider = Arc::new(ManualTimeProvider::new(initial_time));
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".into(),
+    virtual_partition_id: virtual_partition_for_logical(0, partition_count, 0),
+  };
+  lease_store
+    .acquire_lease(
+      key.clone(),
+      "old-node".to_string(),
+      "old-session".to_string(),
+      initial_time,
+      Duration::seconds(60),
+    )
+    .await?;
+
+  let mut config = WriteConfig::with_defaults();
+  config.lease_duration = Duration::seconds(60);
+  config.heartbeat_interval = Duration::seconds(40);
+  let (_membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
+    node_id: "new-node".into(),
+    address: "10.0.0.2:8080".into(),
+  }]));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+
+  let _engine = WriteEngineBuilder::new(
+    config,
+    topics,
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    lease_store.clone(),
+    "new-node".to_string(),
+    shutdown_trigger.make_handle(),
+    &metrics_scope(),
+  )
+  .membership_rx(membership_rx)
+  .lease_session_id("new-session".to_string())
+  .time_provider(time_provider.clone())
+  .build()?;
+
+  time_provider.wait_until_sleeping(2).await;
+  lease_store
+    .release_lease(&key, "old-node", "old-session", initial_time)
+    .await?;
+  time_provider.advance(Duration::milliseconds(250));
+
+  assert!(
+    wait_for_all_partitions(|| {
+      all_partitions_held_by(
+        &lease_store,
+        "new-node",
+        partition_count,
+        initial_time + Duration::milliseconds(250),
+      )
+    })
+    .await,
+    "new node did not retry lease acquisition before its heartbeat interval"
+  );
+
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_assignment_does_not_retry_held_partition_on_early_heartbeat() -> Result<()> {
+  let partition_count = 1;
+  let topics = make_topic(partition_count);
+  let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
+  let initial_time = offset_datetime_from_unix_millis(1_000);
+  let time_provider = Arc::new(ManualTimeProvider::new(initial_time));
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".into(),
+    virtual_partition_id: virtual_partition_for_logical(0, partition_count, 0),
+  };
+  lease_store
+    .acquire_lease(
+      key.clone(),
+      "old-node".to_string(),
+      "old-session".to_string(),
+      initial_time,
+      Duration::seconds(60),
+    )
+    .await?;
+
+  let mut config = WriteConfig::with_defaults();
+  config.lease_duration = Duration::seconds(60);
+  config.heartbeat_interval = Duration::milliseconds(10);
+  let (_membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
+    node_id: "new-node".into(),
+    address: "10.0.0.2:8080".into(),
+  }]));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+
+  let _engine = WriteEngineBuilder::new(
+    config,
+    topics,
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    lease_store.clone(),
+    "new-node".to_string(),
+    shutdown_trigger.make_handle(),
+    &metrics_scope(),
+  )
+  .membership_rx(membership_rx)
+  .lease_session_id("new-session".to_string())
+  .time_provider(time_provider.clone())
+  .build()?;
+
+  time_provider.wait_until_sleeping(2).await;
+  lease_store
+    .release_lease(&key, "old-node", "old-session", initial_time)
+    .await?;
+
+  tokio::time::advance(StdDuration::from_millis(10)).await;
+  tokio::task::yield_now().await;
+  assert!(
+    !all_partitions_held_by(&lease_store, "new-node", partition_count, initial_time).await,
+    "heartbeat retried lease acquisition before the scheduled retry"
+  );
+
+  time_provider.advance(Duration::milliseconds(250));
+  tokio::task::yield_now().await;
+  assert!(
+    all_partitions_held_by(
+      &lease_store,
+      "new-node",
+      partition_count,
+      initial_time + Duration::milliseconds(250)
+    )
+    .await,
+    "scheduled retry did not acquire the released lease"
   );
 
   shutdown_trigger.shutdown().await;
