@@ -8,6 +8,7 @@ use crate::write::buffer::{
   FlushPlan,
   FlushPublicationDependency,
   FlushPublicationResult,
+  FlushPublicationState,
   FlushTrigger,
   TopicFlushPlan,
 };
@@ -235,8 +236,7 @@ fn flush_partition(virtual_partition_id: u32, payload: &[u8]) -> FlushPartition 
     }],
     trigger: FlushTrigger::MaxDelay,
     publication_predecessor: None,
-    identity_result_tx: None,
-    publication_result_tx: None,
+    publication_state_tx: None,
   }
 }
 
@@ -379,8 +379,7 @@ fn merge_partition_batches_preserves_order_and_combines_metadata() -> Result<()>
       ],
       trigger: FlushTrigger::MaxBytes,
       publication_predecessor: None,
-      identity_result_tx: None,
-      publication_result_tx: None,
+      publication_state_tx: None,
     })?;
 
   assert_eq!(virtual_partition_id, 4);
@@ -426,8 +425,7 @@ fn merge_partition_batches_rejects_noncontiguous_ranges() {
     ],
     trigger: FlushTrigger::MaxBytes,
     publication_predecessor: None,
-    identity_result_tx: None,
-    publication_result_tx: None,
+    publication_state_tx: None,
   });
 
   let Err(error) = result else {
@@ -473,8 +471,7 @@ async fn lost_fence_does_not_fall_back_to_ordinary_metadata_write() -> Result<()
         }],
         trigger: FlushTrigger::MaxBytes,
         publication_predecessor: None,
-        identity_result_tx: None,
-        publication_result_tx: None,
+        publication_state_tx: None,
       }],
       max_metadata_publication_lag: time::Duration::seconds(1),
       metadata_window_size: time::Duration::minutes(5),
@@ -602,15 +599,11 @@ async fn failed_predecessor_does_not_reject_independent_shared_partition() -> Re
     Arc::new(ManualTimeProvider::new(now)),
     None,
   );
-  let (_identity_tx, identity_rx) = watch::channel(Some(FlushPublicationResult::Succeeded));
-  let (_result_tx, result_rx) = watch::channel(Some(FlushPublicationResult::Failed(
-    FlushCompletionError::Internal,
-  )));
+  let (_state_tx, state_rx) = watch::channel(FlushPublicationState::Completed(
+    FlushPublicationResult::Failed(FlushCompletionError::Internal),
+  ));
   let mut topic = topic_flush_plan("telemetry".into(), 0, b"first");
-  topic.partitions[0].publication_predecessor = Some(FlushPublicationDependency {
-    identity_rx,
-    result_rx,
-  });
+  topic.partitions[0].publication_predecessor = Some(FlushPublicationDependency { state_rx });
   topic.partitions.push(flush_partition(1, b"second"));
   let mut plan = FlushPlan {
     topics: vec![topic],

@@ -21,18 +21,38 @@ pub(super) enum FlushPublicationResult {
   Failed(FlushCompletionError),
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct FlushPublicationDependency {
-  pub(super) identity_rx: watch::Receiver<Option<FlushPublicationResult>>,
-  pub(super) result_rx: watch::Receiver<Option<FlushPublicationResult>>,
+//
+// FlushPublicationState
+//
+
+/// One partition flush epoch's progress through the two ordering barriers.
+///
+/// A successor must not allocate a segment identity before its predecessor reaches
+/// `SegmentIdentityAssigned`, otherwise concurrent plans could publish snowflake IDs out of
+/// order. Once that barrier is crossed, successors may encode and upload in parallel, but their
+/// metadata must wait for `Completed` so a later sequence range is never consumer-visible first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FlushPublicationState {
+  /// The predecessor has not assigned all of its segment identities.
+  Pending,
+  /// The predecessor's segment identities are fixed, but its metadata is not yet terminal.
+  SegmentIdentityAssigned,
+  /// The predecessor finished metadata publication, allowing successors to publish or fail.
+  Completed(FlushPublicationResult),
 }
 
+/// Receiver retained by a later epoch to observe one earlier epoch's ordering progress.
+#[derive(Clone, Debug)]
+pub(super) struct FlushPublicationDependency {
+  pub(super) state_rx: watch::Receiver<FlushPublicationState>,
+}
+
+/// Sender retained by the scheduled epoch until it reaches terminal metadata publication.
 #[derive(Debug)]
 pub(super) struct FlushPublicationCompletion {
   pub(super) topic: Chars,
   pub(super) virtual_partition_id: VirtualPartitionId,
-  pub(super) identity_tx: watch::Sender<Option<FlushPublicationResult>>,
-  pub(super) result_tx: watch::Sender<Option<FlushPublicationResult>>,
+  pub(super) state_tx: watch::Sender<FlushPublicationState>,
 }
 
 #[derive(Clone, Debug)]
@@ -153,8 +173,7 @@ pub(super) struct FlushPartition {
   pub(super) batches: Vec<BufferedBatch>,
   pub(super) trigger: FlushTrigger,
   pub(super) publication_predecessor: Option<FlushPublicationDependency>,
-  pub(super) identity_result_tx: Option<watch::Sender<Option<FlushPublicationResult>>>,
-  pub(super) publication_result_tx: Option<watch::Sender<Option<FlushPublicationResult>>>,
+  pub(super) publication_state_tx: Option<watch::Sender<FlushPublicationState>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -6,6 +6,7 @@ use super::buffer::{
   FlushPlan,
   FlushPublicationDependency,
   FlushPublicationResult,
+  FlushPublicationState,
   TopicFlushPlan,
 };
 use super::metrics::WriteMetrics;
@@ -536,17 +537,21 @@ impl FlushContext {
     for (topic, mut predecessor) in topic.into_partition_topics() {
       match predecessor
         .as_mut()
-        .and_then(|predecessor| *predecessor.result_rx.borrow_and_update())
+        .map(|predecessor| *predecessor.state_rx.borrow_and_update())
       {
-        None if predecessor.is_none() => ready_topics.push(topic),
-        Some(FlushPublicationResult::Succeeded) => ready_topics.push(topic),
-        Some(FlushPublicationResult::Failed(error)) => {
+        None => ready_topics.push(topic),
+        Some(FlushPublicationState::Completed(FlushPublicationResult::Succeeded)) => {
+          ready_topics.push(topic);
+        },
+        Some(FlushPublicationState::Completed(FlushPublicationResult::Failed(error))) => {
           results.extend(PersistedObject::failure_results(
             std::slice::from_ref(&topic),
             error,
           ));
         },
-        None => pending_topics.push((topic, predecessor)),
+        Some(FlushPublicationState::Pending | FlushPublicationState::SegmentIdentityAssigned) => {
+          pending_topics.push((topic, predecessor));
+        },
       }
     }
     let pending_results = futures::stream::iter(pending_topics)
@@ -668,8 +673,8 @@ impl FlushContext {
   ) -> Result<Vec<FlushPartitionResult>, WriteError> {
     let publication_started_at = Instant::now();
     let mut identity_predecessors = plan.identity_predecessors.clone();
-    if let Some(error) = wait_for_identity_predecessors(&mut identity_predecessors).await {
-      mark_identity_complete(
+    if let Some(error) = wait_for_segment_identity(&mut identity_predecessors).await {
+      mark_publication_complete(
         &plan.publication_completions,
         FlushPublicationResult::Failed(error),
       );
@@ -678,17 +683,14 @@ impl FlushContext {
     let mut objects = match self.build_objects(plan).await {
       Ok(objects) => objects.into_iter(),
       Err(error) => {
-        mark_identity_complete(
+        mark_publication_complete(
           &plan.publication_completions,
           FlushPublicationResult::Failed(FlushCompletionError::Internal),
         );
         return Err(error.into());
       },
     };
-    mark_identity_complete(
-      &plan.publication_completions,
-      FlushPublicationResult::Succeeded,
-    );
+    mark_segment_identity_assigned(&plan.publication_completions);
     let metadata_write_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_METADATA_WRITES));
     let mut results = Vec::new();
     let mut metadata_publications = JoinSet::new();
@@ -946,27 +948,34 @@ fn plan_failure_results(
     .collect()
 }
 
-fn mark_identity_complete(
-  completions: &[super::buffer::FlushPublicationCompletion],
-  result: FlushPublicationResult,
-) {
+/// Release successor identity assignment after every object in this epoch has a fixed identity.
+/// Metadata publication is deliberately not complete yet, so successors still wait before they
+/// make their own metadata visible.
+fn mark_segment_identity_assigned(completions: &[super::buffer::FlushPublicationCompletion]) {
   for completion in completions {
-    completion.identity_tx.send_replace(Some(result));
+    completion
+      .state_tx
+      .send_replace(FlushPublicationState::SegmentIdentityAssigned);
   }
 }
 
-async fn wait_for_identity_predecessors(
+/// Wait only for the predecessor's identity barrier. A successful identity assignment permits
+/// concurrent encoding and blob upload; a terminal failure rejects this successor before it can
+/// create an unpublishable segment.
+async fn wait_for_segment_identity(
   predecessors: &mut [FlushPublicationDependency],
 ) -> Option<FlushCompletionError> {
   for predecessor in predecessors {
     loop {
-      if let Some(result) = *predecessor.identity_rx.borrow_and_update() {
-        if let FlushPublicationResult::Failed(error) = result {
+      match *predecessor.state_rx.borrow_and_update() {
+        FlushPublicationState::Pending => {},
+        FlushPublicationState::SegmentIdentityAssigned
+        | FlushPublicationState::Completed(FlushPublicationResult::Succeeded) => break,
+        FlushPublicationState::Completed(FlushPublicationResult::Failed(error)) => {
           return Some(error);
-        }
-        break;
+        },
       }
-      if predecessor.identity_rx.changed().await.is_err() {
+      if predecessor.state_rx.changed().await.is_err() {
         return Some(FlushCompletionError::Internal);
       }
     }
@@ -974,18 +983,34 @@ async fn wait_for_identity_predecessors(
   None
 }
 
+/// Signal terminal failure before identity assignment so every successor waiting on this epoch
+/// receives the same outcome from the shared state machine.
+fn mark_publication_complete(
+  completions: &[super::buffer::FlushPublicationCompletion],
+  result: FlushPublicationResult,
+) {
+  for completion in completions {
+    completion
+      .state_tx
+      .send_replace(FlushPublicationState::Completed(result));
+  }
+}
+
+/// Wait for terminal metadata publication. Seeing `SegmentIdentityAssigned` is not enough here:
+/// a successor may have uploaded its blob, but must not publish a later sequence range first.
 async fn wait_for_predecessor(
   mut predecessor: Option<FlushPublicationDependency>,
 ) -> Option<FlushCompletionError> {
   let predecessor = predecessor.as_mut()?;
   loop {
-    if let Some(result) = *predecessor.result_rx.borrow_and_update() {
-      if let super::buffer::FlushPublicationResult::Failed(error) = result {
+    match *predecessor.state_rx.borrow_and_update() {
+      FlushPublicationState::Pending | FlushPublicationState::SegmentIdentityAssigned => {},
+      FlushPublicationState::Completed(FlushPublicationResult::Succeeded) => return None,
+      FlushPublicationState::Completed(FlushPublicationResult::Failed(error)) => {
         return Some(error);
-      }
-      return None;
+      },
     }
-    if predecessor.result_rx.changed().await.is_err() {
+    if predecessor.state_rx.changed().await.is_err() {
       return Some(FlushCompletionError::Internal);
     }
   }

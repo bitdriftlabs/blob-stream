@@ -6,6 +6,7 @@ use super::buffer::{
   FlushPublicationCompletion,
   FlushPublicationDependency,
   FlushPublicationResult,
+  FlushPublicationState,
   FlushTrigger,
   TopicFlushPlan,
 };
@@ -105,10 +106,12 @@ fn mark_flush_complete(
         completion.virtual_partition_id,
         fallback_error,
       );
-      completion.result_tx.send_replace(Some(error.map_or(
-        FlushPublicationResult::Succeeded,
-        FlushPublicationResult::Failed,
-      )));
+      completion
+        .state_tx
+        .send_replace(FlushPublicationState::Completed(error.map_or(
+          FlushPublicationResult::Succeeded,
+          FlushPublicationResult::Failed,
+        )));
       let Some(partition_state) = state
         .partition_state_mut_if_present(completion.topic.as_str(), completion.virtual_partition_id)
       else {
@@ -121,8 +124,8 @@ fn mark_flush_complete(
         .as_ref()
         .is_some_and(|tail| {
           matches!(
-            *tail.result_rx.borrow(),
-            Some(FlushPublicationResult::Failed(_))
+            *tail.state_rx.borrow(),
+            FlushPublicationState::Completed(FlushPublicationResult::Failed(_))
           )
         })
       {
@@ -193,12 +196,13 @@ fn take_flush_partition(
   }
 
   partition_state.buffer.reset();
-  let (identity_result_tx, identity_result_rx) = tokio::sync::watch::channel(None);
-  let (publication_result_tx, publication_result_rx) = tokio::sync::watch::channel(None);
+  // Each epoch advances through one state machine. Its successor may begin assigning identities
+  // at `SegmentIdentityAssigned`, but it cannot publish metadata until `Completed`.
+  let (publication_state_tx, publication_state_rx) =
+    tokio::sync::watch::channel(FlushPublicationState::Pending);
   let publication_predecessor = partition_state.publication_tail.clone();
   partition_state.publication_tail = Some(FlushPublicationDependency {
-    identity_rx: identity_result_rx,
-    result_rx: publication_result_rx,
+    state_rx: publication_state_rx,
   });
   partition_state.outstanding_flushes = partition_state.outstanding_flushes.saturating_add(1);
   Some(FlushPartition {
@@ -207,8 +211,7 @@ fn take_flush_partition(
     batches,
     trigger,
     publication_predecessor,
-    identity_result_tx: Some(identity_result_tx),
-    publication_result_tx: Some(publication_result_tx),
+    publication_state_tx: Some(publication_state_tx),
   })
 }
 
@@ -453,19 +456,14 @@ pub(super) fn collect_next_flush_plan(
       if let Some(predecessor) = partition.publication_predecessor.clone() {
         identity_predecessors.push(predecessor);
       }
-      let identity_tx = partition
-        .identity_result_tx
+      let state_tx = partition
+        .publication_state_tx
         .take()
-        .expect("selected flush partition has an identity completion sender");
-      let publication_result_tx = partition
-        .publication_result_tx
-        .take()
-        .expect("selected flush partition has a publication completion sender");
+        .expect("selected flush partition has a publication state sender");
       publication_completions.push(FlushPublicationCompletion {
         topic: topic_plan.topic.clone(),
         virtual_partition_id: partition.virtual_partition_id,
-        identity_tx,
-        result_tx: publication_result_tx,
+        state_tx,
       });
     }
   }
