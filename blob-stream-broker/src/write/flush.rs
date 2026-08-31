@@ -42,11 +42,10 @@ use sonyflake::Sonyflake;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
-use std::time::Instant;
 use time::ext::NumericalDuration;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::Semaphore;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 
 pub(super) const MAX_CONCURRENT_METADATA_WRITES: usize = 8;
 
@@ -481,12 +480,30 @@ impl FlushContext {
     })
   }
 
-  async fn build_objects(&self, plan: &mut FlushPlan) -> Result<Vec<PersistedObject>> {
+  async fn build_objects(
+    &self,
+    plan: &mut FlushPlan,
+  ) -> Result<(Vec<PersistedObject>, Vec<FlushPartitionResult>)> {
     let topic_plans = std::mem::take(&mut plan.topics);
     let mut current = ObjectBuilder::new();
     let mut objects = Vec::new();
+    let mut failed_partitions = Vec::new();
     for mut topic_plan in topic_plans {
       for partition in std::mem::take(&mut topic_plan.partitions) {
+        let virtual_partition_id = partition.virtual_partition_id;
+        if let Some(error) =
+          wait_for_segment_identity(partition.publication_predecessor.clone()).await
+        {
+          // The scheduler leaves pending predecessors buffered, so this immediate failure is
+          // local to a predecessor that already reached a terminal failed state. Keep unrelated
+          // partitions in this plan independent rather than abandoning their durable work.
+          failed_partitions.push(FlushPartitionResult {
+            topic: topic_plan.topic.clone(),
+            virtual_partition_id,
+            error: Some(error),
+          });
+          continue;
+        }
         let encoded = self.encode_partition(&topic_plan, partition)?;
         if !current.is_empty() && current.would_exceed(&encoded, plan.max_segment_bytes) {
           objects.push(
@@ -506,7 +523,7 @@ impl FlushContext {
           .await?,
       );
     }
-    Ok(objects)
+    Ok((objects, failed_partitions))
   }
 
   async fn persist_topic_metadata(
@@ -681,20 +698,12 @@ impl FlushContext {
     &self,
     plan: &mut FlushPlan,
     metrics: &WriteMetrics,
+    blob_upload_permits: &Arc<Semaphore>,
     metadata_write_permits: &Arc<Semaphore>,
+    flush_notifier: &Arc<tokio::sync::Notify>,
   ) -> Result<Vec<FlushPartitionResult>, WriteError> {
     let publication_started_at = Instant::now();
-    let mut identity_predecessors = plan.identity_predecessors.clone();
-    // Allocate every predecessor's segment identity before constructing this plan's objects. The
-    // later metadata barrier remains separate, allowing blob uploads to overlap safely.
-    if let Some(error) = wait_for_segment_identity(&mut identity_predecessors).await {
-      mark_publication_complete(
-        &plan.publication_completions,
-        FlushPublicationResult::Failed(error),
-      );
-      return Ok(plan_failure_results(plan, error));
-    }
-    let objects = match self.build_objects(plan).await {
+    let (objects, mut results) = match self.build_objects(plan).await {
       Ok(objects) => objects,
       Err(error) => {
         mark_publication_complete(
@@ -704,8 +713,11 @@ impl FlushContext {
         return Err(error.into());
       },
     };
-    mark_segment_identity_assigned(&plan.publication_completions);
-    let mut results = Vec::new();
+    mark_segment_identity_assigned(&plan.publication_completions, &results);
+    // A successor may have remained buffered solely for this identity barrier. Wake the flush
+    // loop now, rather than waiting for this plan's potentially slower upload/metadata terminal
+    // state, so unrelated ready work can continue.
+    flush_notifier.notify_waiters();
     let mut blob_uploads = FuturesUnordered::new();
     for object in objects {
       let publication_budget = object
@@ -719,15 +731,15 @@ impl FlushContext {
           "metadata publication deadline must not be negative"
         ))
       })?;
-      let Some(remaining_budget) = publication_budget.checked_sub(publication_started_at.elapsed())
-      else {
+      let deadline = publication_started_at + publication_budget;
+      if Instant::now() >= deadline {
         metrics.record_metadata_publication_deadline_exhausted_before_persistence();
         results.extend(PersistedObject::failure_results(
           &object.topics,
           FlushCompletionError::Internal,
         ));
         continue;
-      };
+      }
       for topic in &object.topics {
         if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
           lifecycle_hooks
@@ -743,6 +755,14 @@ impl FlushContext {
             .await;
         }
       }
+      if Instant::now() >= deadline {
+        metrics.record_metadata_publication_deadline_exhausted_before_persistence();
+        results.extend(PersistedObject::failure_results(
+          &object.topics,
+          FlushCompletionError::Internal,
+        ));
+        continue;
+      }
       let blob_key = object
         .topics
         .first()
@@ -752,12 +772,20 @@ impl FlushContext {
         .clone();
       let blob_store = Arc::clone(&self.blob_store);
       let payload = object.payload.clone();
+      let blob_upload_permits = Arc::clone(blob_upload_permits);
       // Register every upload before polling for a result. Object identities and payloads are
       // immutable at this point, so separate objects have no blob-store dependency. Metadata is
-      // intentionally deferred until this entire phase finishes: blob storage is the slow path,
-      // and a plan should use that time to fan out its writes rather than serialize them.
+      // intentionally deferred until this entire phase finishes. The broker-wide semaphore
+      // bounds the storage burst, and the absolute deadline covers both queueing and I/O.
       blob_uploads.push(async move {
-        let result = timeout(remaining_budget, blob_store.put(&blob_key, payload)).await;
+        let result = timeout_at(deadline, async {
+          let _blob_upload_permit = blob_upload_permits
+            .acquire()
+            .await
+            .map_err(|error| anyhow::anyhow!("blob upload semaphore closed: {error}"))?;
+          blob_store.put(&blob_key, payload).await
+        })
+        .await;
         (object, result)
       });
     }
@@ -961,34 +989,25 @@ impl FlushContext {
   }
 }
 
-fn plan_failure_results(
-  plan: &FlushPlan,
-  error: FlushCompletionError,
-) -> Vec<FlushPartitionResult> {
-  plan
-    .topics
-    .iter()
-    .flat_map(|topic| {
-      topic
-        .partitions
-        .iter()
-        .map(|partition| FlushPartitionResult {
-          topic: topic.topic.clone(),
-          virtual_partition_id: partition.virtual_partition_id,
-          error: Some(error),
-        })
-    })
-    .collect()
-}
-
 /// Release successor identity assignment after every object in this epoch has a fixed identity.
 /// Metadata publication is deliberately not complete yet, so successors still wait before they
 /// make their own metadata visible.
-fn mark_segment_identity_assigned(completions: &[super::buffer::FlushPublicationCompletion]) {
+fn mark_segment_identity_assigned(
+  completions: &[super::buffer::FlushPublicationCompletion],
+  failed_partitions: &[FlushPartitionResult],
+) {
   for completion in completions {
-    completion
-      .state_tx
-      .send_replace(FlushPublicationState::SegmentIdentityAssigned);
+    let state = failed_partitions
+      .iter()
+      .find(|result| {
+        result.topic == completion.topic
+          && result.virtual_partition_id == completion.virtual_partition_id
+      })
+      .and_then(|result| result.error)
+      .map_or(FlushPublicationState::SegmentIdentityAssigned, |error| {
+        FlushPublicationState::Completed(FlushPublicationResult::Failed(error))
+      });
+    completion.state_tx.send_replace(state);
   }
 }
 
@@ -996,24 +1015,22 @@ fn mark_segment_identity_assigned(completions: &[super::buffer::FlushPublication
 /// concurrent encoding and blob upload; a terminal failure rejects this successor before it can
 /// create an unpublishable segment.
 async fn wait_for_segment_identity(
-  predecessors: &mut [FlushPublicationDependency],
+  mut predecessor: Option<FlushPublicationDependency>,
 ) -> Option<FlushCompletionError> {
-  for predecessor in predecessors {
-    loop {
-      match *predecessor.state_rx.borrow_and_update() {
-        FlushPublicationState::Pending => {},
-        FlushPublicationState::SegmentIdentityAssigned
-        | FlushPublicationState::Completed(FlushPublicationResult::Succeeded) => break,
-        FlushPublicationState::Completed(FlushPublicationResult::Failed(error)) => {
-          return Some(error);
-        },
-      }
-      if predecessor.state_rx.changed().await.is_err() {
-        return Some(FlushCompletionError::Internal);
-      }
+  let predecessor = predecessor.as_mut()?;
+  loop {
+    match *predecessor.state_rx.borrow_and_update() {
+      FlushPublicationState::Pending => {},
+      FlushPublicationState::SegmentIdentityAssigned
+      | FlushPublicationState::Completed(FlushPublicationResult::Succeeded) => return None,
+      FlushPublicationState::Completed(FlushPublicationResult::Failed(error)) => {
+        return Some(error);
+      },
+    }
+    if predecessor.state_rx.changed().await.is_err() {
+      return Some(FlushCompletionError::Internal);
     }
   }
-  None
 }
 
 /// Signal terminal failure before identity assignment so every successor waiting on this epoch

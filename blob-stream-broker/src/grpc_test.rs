@@ -37,6 +37,7 @@ use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::{
   MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES,
   MAX_PRODUCE_BATCHES_REQUEST_BYTES,
+  MAX_PRODUCE_BATCHES_SNAPPY_BODY_BYTES,
   SeqRange,
   ToProtoDuration,
   new_record,
@@ -167,6 +168,10 @@ impl crate::write::WriteEngine for FailingWriteEngine {
 fn limits_produce_request_bytes() {
   assert_eq!(
     produce_request_config().max_request_bytes,
+    MAX_PRODUCE_BATCHES_SNAPPY_BODY_BYTES
+  );
+  assert_eq!(
+    produce_request_config().max_decompressed_request_bytes,
     MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES
   );
   assert_eq!(
@@ -249,21 +254,23 @@ async fn router_accepts_produce_request_at_decoded_limit() -> Result<()> {
     "BrokerService",
     "ProduceBatches",
   );
-  let response = client
-    .unary(
-      &method,
-      None,
-      request,
-      Duration::seconds(10),
-      Compression::None,
-    )
-    .await?;
+  for compression in [Compression::None, Compression::Snappy] {
+    let response = client
+      .unary(
+        &method,
+        None,
+        request.clone(),
+        Duration::seconds(10),
+        compression,
+      )
+      .await?;
 
-  assert_eq!(response.results.len(), 1);
-  assert_eq!(
-    response.results[0].status,
-    ProduceStatus::PRODUCE_STATUS_OK.into()
-  );
+    assert_eq!(response.results.len(), 1);
+    assert_eq!(
+      response.results[0].status,
+      ProduceStatus::PRODUCE_STATUS_OK.into()
+    );
+  }
   Ok(())
 }
 

@@ -36,3 +36,4 @@ pub use hooks::{BrokerLifecycleHooks, NoopBrokerLifecycleHooks};
 pub(crate) use metrics::ProduceOutcomeMetrics;
 pub(super) const DEFAULT_ZSTD_LEVEL: i32 = 3;
 pub(super) const MAX_IN_FLIGHT_FLUSH_PLANS: usize = 4;
+pub(super) const MAX_CONCURRENT_BLOB_UPLOADS: usize = 8;

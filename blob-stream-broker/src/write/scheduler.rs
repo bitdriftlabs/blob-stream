@@ -36,7 +36,9 @@ pub(super) async fn flush_plan_and_notify(
   metrics: &WriteMetrics,
   state: &Arc<Mutex<WriteState>>,
   _plan_permit: OwnedSemaphorePermit,
+  blob_upload_permits: &Arc<tokio::sync::Semaphore>,
   metadata_write_permits: &Arc<tokio::sync::Semaphore>,
+  flush_notifier: &Arc<tokio::sync::Notify>,
 ) {
   let mut completions = Vec::new();
   for topic_plan in &mut plan.topics {
@@ -55,7 +57,13 @@ pub(super) async fn flush_plan_and_notify(
 
   let flush_started = Instant::now();
   let result = flush_context
-    .flush_plan_after(&mut plan, metrics, metadata_write_permits)
+    .flush_plan_after(
+      &mut plan,
+      metrics,
+      blob_upload_permits,
+      metadata_write_permits,
+      flush_notifier,
+    )
     .await;
   if result.as_ref().is_err()
     || result
@@ -247,7 +255,12 @@ fn take_flush_partitions(
     .filter_map(|virtual_partition_id| {
       let partition_state =
         state.partition_state_mut_if_present(topic.as_str(), virtual_partition_id)?;
-      if matches!(trigger, FlushTrigger::MaxDelay) && partition_state.draining {
+      if (matches!(trigger, FlushTrigger::MaxDelay) && partition_state.draining)
+        || partition_state
+          .publication_tail
+          .as_ref()
+          .is_some_and(|tail| matches!(*tail.state_rx.borrow(), FlushPublicationState::Pending))
+      {
         None
       } else {
         take_flush_partition(
@@ -452,13 +465,9 @@ pub(super) fn collect_next_flush_plan(
   let shared_blob = selected_shared_blob?;
   let mut topics = topic_plans.into_values().collect::<Vec<_>>();
   topics.sort_by(|left, right| left.topic.as_str().cmp(right.topic.as_str()));
-  let mut identity_predecessors = Vec::new();
   let mut publication_completions = Vec::new();
   for topic_plan in &mut topics {
     for partition in &mut topic_plan.partitions {
-      if let Some(predecessor) = partition.publication_predecessor.clone() {
-        identity_predecessors.push(predecessor);
-      }
       let state_tx = partition
         .publication_state_tx
         .take()
@@ -474,7 +483,6 @@ pub(super) fn collect_next_flush_plan(
     topics,
     max_segment_bytes: config.max_segment_bytes(feature_flags),
     shared_blob,
-    identity_predecessors,
     publication_completions,
   })
 }

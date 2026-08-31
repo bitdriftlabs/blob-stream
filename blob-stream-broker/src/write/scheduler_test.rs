@@ -1,5 +1,12 @@
 use super::collect_next_flush_plan;
-use crate::write::buffer::{BufferedBatch, FlushCompletionError, FlushPlan, FlushTrigger};
+use crate::write::buffer::{
+  BufferedBatch,
+  FlushCompletionError,
+  FlushPlan,
+  FlushPublicationDependency,
+  FlushPublicationState,
+  FlushTrigger,
+};
 use crate::write::config::{
   FLUSH_MAX_BYTES_FEATURE_FLAG,
   FLUSH_MAX_DELAY_FEATURE_FLAG,
@@ -15,6 +22,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::Duration;
+use tokio::sync::watch;
 
 fn fence() -> ProducerLeaseFence {
   ProducerLeaseFence {
@@ -674,4 +682,69 @@ fn shared_time_flush_excludes_draining_peer_partitions() {
     drain_plan.topics[0].partitions[0].trigger,
     FlushTrigger::LeaseDrain
   ));
+}
+
+#[test]
+fn pending_identity_predecessor_stays_buffered_without_blocking_peer_partition() {
+  let state = Arc::new(Mutex::new(WriteState::default()));
+  let (identity_tx, identity_rx) = watch::channel(FlushPublicationState::Pending);
+  {
+    let mut state = state.lock();
+    for virtual_partition_id in 0 .. 2 {
+      state
+        .partition_state_mut("telemetry", virtual_partition_id)
+        .buffer
+        .push(
+          BufferedBatch {
+            records: vec![new_record(vec![1], 0)],
+            summary: BatchSummary {
+              record_count: 1,
+              payload_bytes: 1,
+            },
+            seq_range: SeqRange { start: 0, end: 0 },
+            acceptance_fence: None,
+            completion: None,
+          },
+          offset_datetime_from_unix_millis(0),
+        );
+    }
+    state.partition_state_mut("telemetry", 0).publication_tail = Some(FlushPublicationDependency {
+      state_rx: identity_rx,
+    });
+  }
+
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  let plans = collect_all_flush_plans(
+    &state,
+    offset_datetime_from_unix_millis(1_000),
+    &config,
+    None,
+    &topics(),
+  );
+
+  assert_eq!(plans.len(), 1);
+  assert_eq!(plans[0].topics[0].partitions.len(), 1);
+  assert_eq!(plans[0].topics[0].partitions[0].virtual_partition_id, 1);
+  assert_eq!(
+    state
+      .lock()
+      .partition_state("telemetry", 0)
+      .expect("pending partition remains present")
+      .buffer
+      .batches
+      .len(),
+    1
+  );
+
+  identity_tx.send_replace(FlushPublicationState::SegmentIdentityAssigned);
+  let plans = collect_all_flush_plans(
+    &state,
+    offset_datetime_from_unix_millis(1_000),
+    &config,
+    None,
+    &topics(),
+  );
+  assert_eq!(plans.len(), 1);
+  assert_eq!(plans[0].topics[0].partitions[0].virtual_partition_id, 0);
 }

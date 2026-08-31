@@ -173,13 +173,13 @@ data already covered by a cursor, then expose records in range order. A crash or
 transfer can leave unused values from a reserved block, creating gaps, but a new holder reserves
 only above the durable high-water mark and therefore cannot reuse a successfully reserved value.
 
-graceful membership handoff or orderly shutdown, the broker stops accepting new batches for the
 The broker serializes lease/refill/allocation transitions for each virtual partition within one live
 broker. Later accepted batches buffer in a successor flush epoch while an earlier epoch persists.
 The broker assigns segment identities in epoch order, then successive epochs may encode and upload
-blobs concurrently. The broker publishes their metadata in epoch order, so a later sequence range
-cannot become consumer-visible first. During a graceful
-membership handoff or orderly shutdown, the broker stops accepting new batches for the partition,
+blobs concurrently, subject to a broker-wide upload bound. A plan starts metadata publication only
+after every blob upload in that plan has reached a terminal result. The broker publishes metadata
+for each partition in epoch order, so a later sequence range cannot become consumer-visible first.
+During a graceful membership handoff or orderly shutdown, the broker stops accepting new batches for the partition,
 drains its already accepted work, and only then voluntarily releases the producer lease.
 
 The optional `fenced_metadata_writes` mode supplies a durable cross-process publication fence. Each

@@ -1,5 +1,4 @@
 use super::{FlushContext, SnowflakeGenerator};
-use crate::write::WriteConfig;
 use crate::write::buffer::{
   BufferedBatch,
   FlushCompletionError,
@@ -13,6 +12,7 @@ use crate::write::buffer::{
   TopicFlushPlan,
 };
 use crate::write::metrics::WriteMetrics;
+use crate::write::{BrokerLifecycleHooks, WriteConfig};
 use anyhow::Result;
 use async_trait::async_trait;
 use bd_server_stats::stats::Collector;
@@ -38,7 +38,14 @@ use blob_stream_metadata_store::{
   SegmentMetadata,
 };
 use blob_stream_test_utils::ManualTimeProvider;
-use blob_stream_types::{BatchSummary, SeqRange, SnowflakeId, Window, new_record};
+use blob_stream_types::{
+  BatchSummary,
+  SeqRange,
+  SnowflakeId,
+  VirtualPartitionId,
+  Window,
+  new_record,
+};
 use bytes::Bytes;
 use prometheus::labels;
 use std::sync::Arc;
@@ -51,11 +58,28 @@ async fn flush_plan_for_test(
   plan: &mut FlushPlan,
   metrics: &WriteMetrics,
 ) -> Result<Vec<FlushPartitionResult>, crate::write::WriteError> {
+  flush_plan_with_upload_permits_for_test(
+    context,
+    plan,
+    metrics,
+    Arc::new(Semaphore::new(crate::write::MAX_CONCURRENT_BLOB_UPLOADS)),
+  )
+  .await
+}
+
+async fn flush_plan_with_upload_permits_for_test(
+  context: &FlushContext,
+  plan: &mut FlushPlan,
+  metrics: &WriteMetrics,
+  blob_upload_permits: Arc<Semaphore>,
+) -> Result<Vec<FlushPartitionResult>, crate::write::WriteError> {
   context
     .flush_plan_after(
       plan,
       metrics,
+      &blob_upload_permits,
       &Arc::new(Semaphore::new(super::MAX_CONCURRENT_METADATA_WRITES)),
+      &Arc::new(tokio::sync::Notify::new()),
     )
     .await
 }
@@ -74,6 +98,27 @@ struct FailingBlobStore;
 struct BlockingBlobStore {
   started_tx: mpsc::UnboundedSender<()>,
   release: Arc<Semaphore>,
+}
+
+struct BlockingBeforeFlushPersistHook {
+  started_tx: mpsc::UnboundedSender<()>,
+  release: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl BrokerLifecycleHooks for BlockingBeforeFlushPersistHook {
+  async fn before_flush_persist(&self, _topic: &str, _partitions: &[VirtualPartitionId]) {
+    self
+      .started_tx
+      .send(())
+      .expect("before flush persist receiver must remain available");
+    self
+      .release
+      .acquire()
+      .await
+      .expect("before flush persist release gate must remain available")
+      .forget();
+  }
 }
 
 #[async_trait]
@@ -306,7 +351,6 @@ async fn object_build_resnaps_time_after_sonyflake_sequence_overflow() -> Result
     topics: vec![topic],
     max_segment_bytes: 1,
     shared_blob: false,
-    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
 
@@ -316,10 +360,11 @@ async fn object_build_resnaps_time_after_sonyflake_sequence_overflow() -> Result
   });
   time_provider.wait_until_sleeping(1).await;
   time_provider.advance(time::Duration::milliseconds(10));
-  let objects = objects.await??;
+  let (objects, failures) = objects.await??;
   let last_topic = &objects.last().expect("513 bounded objects").topics[0];
   let refreshed_at = now.saturating_add(time::Duration::milliseconds(10));
 
+  assert!(failures.is_empty());
   assert_eq!(objects.len(), 513);
   assert_eq!(
     last_topic.envelope.snowflake_id.timestamp(),
@@ -492,7 +537,6 @@ async fn lost_fence_does_not_fall_back_to_ordinary_metadata_write() -> Result<()
     }],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: false,
-    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
 
@@ -540,7 +584,6 @@ async fn shared_object_metadata_writes_start_concurrently() -> Result<()> {
     ],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: true,
-    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
   let flush_context = context.clone();
@@ -578,7 +621,6 @@ async fn shared_blob_upload_failure_prevents_every_metadata_publication() -> Res
     ],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: true,
-    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
   let collector = Collector::default();
@@ -622,7 +664,6 @@ async fn failed_predecessor_does_not_reject_independent_shared_partition() -> Re
     topics: vec![topic],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: true,
-    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
 
@@ -680,7 +721,6 @@ async fn uploads_all_plan_objects_before_starting_metadata_publication() -> Resu
     ],
     max_segment_bytes: 1,
     shared_blob: true,
-    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
   let metrics = WriteMetrics::new(&Collector::default().scope("flush_test"));
@@ -695,12 +735,153 @@ async fn uploads_all_plan_objects_before_starting_metadata_publication() -> Resu
     Err(mpsc::error::TryRecvError::Empty)
   ));
 
-  blob_release.add_permits(2);
+  blob_release.add_permits(1);
+  tokio::task::yield_now().await;
+  assert!(matches!(
+    metadata_started_rx.try_recv(),
+    Err(mpsc::error::TryRecvError::Empty)
+  ));
+  assert!(!flush.is_finished());
+
+  blob_release.add_permits(1);
   receive_metadata_write(&mut metadata_started_rx).await;
   metadata_release.add_permits(2);
   let results = flush.await??;
   assert_eq!(results.len(), 2);
   assert!(results.iter().all(|result| result.error.is_none()));
+  Ok(())
+}
+
+#[tokio::test]
+async fn blob_upload_permits_bound_concurrent_plans() -> Result<()> {
+  let now = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
+  let (blob_started_tx, mut blob_started_rx) = mpsc::unbounded_channel();
+  let blob_release = Arc::new(Semaphore::new(0));
+  let context = FlushContext::new(
+    WriteConfig::with_defaults(),
+    Arc::new(BlockingBlobStore {
+      started_tx: blob_started_tx,
+      release: Arc::clone(&blob_release),
+    }),
+    Arc::new(InMemoryMetadataStore::new()),
+    SnowflakeGenerator::with_machine_id(1)?,
+    Arc::new(ManualTimeProvider::new(now)),
+    None,
+  );
+  let upload_permits = Arc::new(Semaphore::new(2));
+  let metrics = WriteMetrics::new(&Collector::default().scope("flush_test"));
+  let mut first_plan = FlushPlan {
+    topics: vec![
+      topic_flush_plan("first-a".into(), 0, b"first-a"),
+      topic_flush_plan("first-b".into(), 0, b"first-b"),
+    ],
+    max_segment_bytes: 1,
+    shared_blob: true,
+    publication_completions: Vec::new(),
+  };
+  let mut second_plan = FlushPlan {
+    topics: vec![
+      topic_flush_plan("second-a".into(), 0, b"second-a"),
+      topic_flush_plan("second-b".into(), 0, b"second-b"),
+    ],
+    max_segment_bytes: 1,
+    shared_blob: true,
+    publication_completions: Vec::new(),
+  };
+  let first_context = context.clone();
+  let first_metrics = metrics.clone();
+  let first_permits = Arc::clone(&upload_permits);
+  let first_flush = tokio::spawn(async move {
+    flush_plan_with_upload_permits_for_test(
+      &first_context,
+      &mut first_plan,
+      &first_metrics,
+      first_permits,
+    )
+    .await
+  });
+  let second_context = context.clone();
+  let second_metrics = metrics.clone();
+  let second_permits = Arc::clone(&upload_permits);
+  let second_flush = tokio::spawn(async move {
+    flush_plan_with_upload_permits_for_test(
+      &second_context,
+      &mut second_plan,
+      &second_metrics,
+      second_permits,
+    )
+    .await
+  });
+
+  receive_blob_upload(&mut blob_started_rx).await;
+  receive_blob_upload(&mut blob_started_rx).await;
+  tokio::task::yield_now().await;
+  assert!(matches!(
+    blob_started_rx.try_recv(),
+    Err(mpsc::error::TryRecvError::Empty)
+  ));
+
+  blob_release.add_permits(2);
+  receive_blob_upload(&mut blob_started_rx).await;
+  receive_blob_upload(&mut blob_started_rx).await;
+  blob_release.add_permits(2);
+
+  assert_eq!(first_flush.await??.len(), 2);
+  assert_eq!(second_flush.await??.len(), 2);
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn upload_deadline_includes_pre_upload_hook_delay() -> Result<()> {
+  let test_started_at = tokio::time::Instant::now();
+  let now = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
+  let (hook_started_tx, mut hook_started_rx) = mpsc::unbounded_channel();
+  let hook_release = Arc::new(Semaphore::new(0));
+  let (blob_started_tx, _blob_started_rx) = mpsc::unbounded_channel();
+  let metadata_store = Arc::new(InMemoryMetadataStore::new());
+  let context = FlushContext::new(
+    WriteConfig::with_defaults(),
+    Arc::new(BlockingBlobStore {
+      started_tx: blob_started_tx,
+      release: Arc::new(Semaphore::new(0)),
+    }),
+    metadata_store.clone(),
+    SnowflakeGenerator::with_machine_id(1)?,
+    Arc::new(ManualTimeProvider::new(now)),
+    Some(Arc::new(BlockingBeforeFlushPersistHook {
+      started_tx: hook_started_tx,
+      release: Arc::clone(&hook_release),
+    })),
+  );
+  let mut topic = topic_flush_plan("telemetry".into(), 0, b"payload");
+  topic.max_metadata_publication_lag = time::Duration::milliseconds(1);
+  let mut plan = FlushPlan {
+    topics: vec![topic],
+    max_segment_bytes: 1,
+    shared_blob: false,
+    publication_completions: Vec::new(),
+  };
+  let metrics = WriteMetrics::new(&Collector::default().scope("flush_test"));
+  let flush = tokio::spawn(async move { flush_plan_for_test(&context, &mut plan, &metrics).await });
+
+  receive_blob_upload(&mut hook_started_rx).await;
+  tokio::time::advance(std::time::Duration::from_millis(2)).await;
+  assert_eq!(
+    tokio::time::Instant::now().duration_since(test_started_at),
+    std::time::Duration::from_millis(2)
+  );
+  hook_release.add_permits(1);
+
+  let results = flush.await??;
+  assert_eq!(results.len(), 1);
+  assert_eq!(results[0].error, Some(FlushCompletionError::Internal));
+  let window = Window::for_timestamp(now, time::Duration::minutes(5)).key("telemetry");
+  assert!(
+    metadata_store
+      .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Eventual)
+      .await?
+      .is_empty()
+  );
   Ok(())
 }
 
@@ -722,7 +903,6 @@ async fn capped_flush_keeps_published_object_results_when_later_object_expires()
     topics: vec![topic_flush_plan("first".into(), 0, b"first"), expired_topic],
     max_segment_bytes: 1,
     shared_blob: true,
-    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
   let collector = Collector::default();
@@ -770,7 +950,6 @@ async fn shared_object_uses_each_topics_metadata_window() -> Result<()> {
     topics: vec![topic_flush_plan("first".into(), 0, b"first"), second_topic],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: true,
-    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
   let collector = Collector::default();
@@ -817,7 +996,6 @@ async fn oversized_single_partition_object_is_counted() -> Result<()> {
     )],
     max_segment_bytes: 1,
     shared_blob: false,
-    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
 

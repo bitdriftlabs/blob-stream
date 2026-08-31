@@ -10,6 +10,7 @@ use super::super::state::WriteState;
 use super::super::{
   AdmissionController,
   BrokerLifecycleHooks,
+  MAX_CONCURRENT_BLOB_UPLOADS,
   MAX_IN_FLIGHT_FLUSH_PLANS,
   TopicInfo,
   WriteConfig,
@@ -237,6 +238,9 @@ impl WriteEngineImpl {
     let flush_notifier = Arc::clone(&self.flush_notifier);
     let mut shutdown = self.shutdown_trigger_handle.make_shutdown();
     let flush_plan_permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT_FLUSH_PLANS));
+    // Each plan may split into several objects. Share upload capacity across every plan so a
+    // small live segment cap cannot fan one broker out into an unbounded storage-write burst.
+    let blob_upload_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_BLOB_UPLOADS));
     // Plans run concurrently, so metadata capacity must be shared here rather than created by
     // each plan. This is the broker-wide limit on active metadata-store writes.
     let metadata_write_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_METADATA_WRITES));
@@ -274,7 +278,9 @@ impl WriteEngineImpl {
           let flush_context = flush_context.clone();
           let metrics = metrics.clone();
           let state = Arc::clone(&state);
+          let blob_upload_permits = Arc::clone(&blob_upload_permits);
           let metadata_write_permits = Arc::clone(&metadata_write_permits);
+          let flush_notifier = Arc::clone(&flush_notifier);
           flushes.spawn(async move {
             let _active_flush =
               bd_server_stats::stats::StackAutoGauge::new(&metrics.active_flush_plans);
@@ -284,7 +290,9 @@ impl WriteEngineImpl {
               &metrics,
               &state,
               permit,
+              &blob_upload_permits,
               &metadata_write_permits,
+              &flush_notifier,
             )
             .await;
           });

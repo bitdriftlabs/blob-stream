@@ -26,7 +26,11 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   ReadMetadataWindowRequest,
   ReadMetadataWindowResponse,
 };
-use blob_stream_types::{MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES, MAX_PRODUCE_BATCHES_REQUEST_BYTES};
+use blob_stream_types::{
+  MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES,
+  MAX_PRODUCE_BATCHES_REQUEST_BYTES,
+  MAX_PRODUCE_BATCHES_SNAPPY_BODY_BYTES,
+};
 use futures::future::join_all;
 use http::{Extensions, HeaderMap};
 use log::trace;
@@ -423,8 +427,11 @@ pub fn make_broker_router(
 }
 
 fn produce_request_config() -> UnaryRequestConfig {
+  // Snappy wraps the complete framed gRPC body, so its raw transport allowance must cover the
+  // codec's worst-case expansion. The decoder still applies the smaller protobuf message limit.
   UnaryRequestConfig {
-    max_request_bytes: MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES,
+    max_request_bytes: MAX_PRODUCE_BATCHES_SNAPPY_BODY_BYTES,
+    max_decompressed_request_bytes: MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES,
     max_decoded_request_bytes: MAX_PRODUCE_BATCHES_REQUEST_BYTES,
     ..UnaryRequestConfig::default()
   }
