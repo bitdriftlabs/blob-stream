@@ -171,12 +171,8 @@ fn limits_produce_request_bytes() {
     MAX_PRODUCE_BATCHES_SNAPPY_BODY_BYTES
   );
   assert_eq!(
-    produce_request_config().max_decompressed_request_bytes,
-    MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES
-  );
-  assert_eq!(
     produce_request_config().max_decoded_request_bytes,
-    MAX_PRODUCE_BATCHES_REQUEST_BYTES
+    MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES
   );
 }
 
