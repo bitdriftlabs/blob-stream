@@ -175,9 +175,10 @@ only above the durable high-water mark and therefore cannot reuse a successfully
 
 graceful membership handoff or orderly shutdown, the broker stops accepting new batches for the
 The broker serializes lease/refill/allocation transitions for each virtual partition within one live
-broker. Later accepted batches buffer in a successor flush epoch while an earlier epoch persists;
-successive epochs may encode and upload blobs concurrently. The broker publishes their metadata in
-epoch order, so a later sequence range cannot become consumer-visible first. During a graceful
+broker. Later accepted batches buffer in a successor flush epoch while an earlier epoch persists.
+The broker assigns segment identities in epoch order, then successive epochs may encode and upload
+blobs concurrently. The broker publishes their metadata in epoch order, so a later sequence range
+cannot become consumer-visible first. During a graceful
 membership handoff or orderly shutdown, the broker stops accepting new batches for the partition,
 drains its already accepted work, and only then voluntarily releases the producer lease.
 

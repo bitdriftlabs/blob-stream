@@ -271,7 +271,7 @@ async fn router_accepts_produce_request_at_decoded_limit() -> Result<()> {
 async fn router_serves_blob_response_at_configured_segment_limit() -> Result<()> {
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let scope = Collector::default().scope("blob_stream_broker_test");
-  let response_payload = bytes::Bytes::from(vec![7; 64]);
+  let response_payload = bytes::Bytes::from(vec![7; MAX_BLOB_READ_REQUEST_BYTES + 1]);
   let store = Arc::new(InMemoryBlobStore::new());
   store
     .put(
@@ -287,7 +287,7 @@ async fn router_serves_blob_response_at_configured_segment_limit() -> Result<()>
     MemoryPressureController::new_for_test_with_sample(
       MemoryPressureSample {
         allocated_bytes: 0,
-        limit_bytes: 1_000,
+        limit_bytes: 128 * 1024 * 1024,
       },
       &scope,
     ),
@@ -341,7 +341,7 @@ async fn router_serves_blob_response_at_configured_segment_limit() -> Result<()>
         blob_key: "topic/blob".into(),
         ranges: vec![BlobRangeRequest {
           start: 0,
-          end: 65,
+          end: u64::try_from(response_payload.len())? + 1,
           ..Default::default()
         }],
         ..Default::default()

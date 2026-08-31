@@ -251,9 +251,8 @@ impl WriteEngineImpl {
           return;
         }
 
-        // Reserve a slot before moving buffered batches out of WriteState. The spawned task owns
-        // the permit through encoding and blob upload, then releases it before waiting on ordered
-        // metadata publication so blocked predecessors cannot stall unrelated uploads.
+        // Reserve a plan slot before moving batches out of WriteState. The permit and active-plan
+        // gauge remain held through terminal notification, bounding all outstanding plans.
         let mut scheduled_flush = false;
         while let Ok(permit) = Arc::clone(&flush_plan_permits).try_acquire_owned() {
           let Some(plan) = collect_next_flush_plan(
@@ -272,19 +271,10 @@ impl WriteEngineImpl {
           let flush_context = flush_context.clone();
           let metrics = metrics.clone();
           let state = Arc::clone(&state);
-          let flush_notifier = Arc::clone(&flush_notifier);
           flushes.spawn(async move {
             let _active_flush =
               bd_server_stats::stats::StackAutoGauge::new(&metrics.active_flush_plans);
-            flush_plan_and_notify(
-              &flush_context,
-              plan,
-              &metrics,
-              &state,
-              permit,
-              flush_notifier.as_ref(),
-            )
-            .await;
+            flush_plan_and_notify(&flush_context, plan, &metrics, &state, permit).await;
           });
           scheduled_flush = true;
         }

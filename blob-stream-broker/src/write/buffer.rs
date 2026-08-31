@@ -23,6 +23,7 @@ pub(super) enum FlushPublicationResult {
 
 #[derive(Clone, Debug)]
 pub(super) struct FlushPublicationDependency {
+  pub(super) identity_rx: watch::Receiver<Option<FlushPublicationResult>>,
   pub(super) result_rx: watch::Receiver<Option<FlushPublicationResult>>,
 }
 
@@ -30,6 +31,7 @@ pub(super) struct FlushPublicationDependency {
 pub(super) struct FlushPublicationCompletion {
   pub(super) topic: Chars,
   pub(super) virtual_partition_id: VirtualPartitionId,
+  pub(super) identity_tx: watch::Sender<Option<FlushPublicationResult>>,
   pub(super) result_tx: watch::Sender<Option<FlushPublicationResult>>,
 }
 
@@ -136,6 +138,7 @@ pub(super) struct FlushPlan {
   pub(super) topics: Vec<TopicFlushPlan>,
   pub(super) max_segment_bytes: u64,
   pub(super) shared_blob: bool,
+  pub(super) identity_predecessors: Vec<FlushPublicationDependency>,
   pub(super) publication_completions: Vec<FlushPublicationCompletion>,
 }
 
@@ -150,6 +153,7 @@ pub(super) struct FlushPartition {
   pub(super) batches: Vec<BufferedBatch>,
   pub(super) trigger: FlushTrigger,
   pub(super) publication_predecessor: Option<FlushPublicationDependency>,
+  pub(super) identity_result_tx: Option<watch::Sender<Option<FlushPublicationResult>>>,
   pub(super) publication_result_tx: Option<watch::Sender<Option<FlushPublicationResult>>>,
 }
 

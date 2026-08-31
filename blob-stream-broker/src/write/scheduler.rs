@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::iter;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{Notify, OwnedSemaphorePermit};
+use tokio::sync::OwnedSemaphorePermit;
 
 #[cfg(test)]
 #[path = "./scheduler_test.rs"]
@@ -34,8 +34,7 @@ pub(super) async fn flush_plan_and_notify(
   mut plan: FlushPlan,
   metrics: &WriteMetrics,
   state: &Arc<Mutex<WriteState>>,
-  upload_permit: OwnedSemaphorePermit,
-  flush_notifier: &Notify,
+  _plan_permit: OwnedSemaphorePermit,
 ) {
   let mut completions = Vec::new();
   for topic_plan in &mut plan.topics {
@@ -53,14 +52,7 @@ pub(super) async fn flush_plan_and_notify(
   }
 
   let flush_started = Instant::now();
-  let result = flush_context
-    .flush_plan_after(
-      &mut plan,
-      metrics,
-      Some(upload_permit),
-      Some(flush_notifier),
-    )
-    .await;
+  let result = flush_context.flush_plan_after(&mut plan, metrics).await;
   if result.as_ref().is_err()
     || result
       .as_ref()
@@ -201,9 +193,11 @@ fn take_flush_partition(
   }
 
   partition_state.buffer.reset();
+  let (identity_result_tx, identity_result_rx) = tokio::sync::watch::channel(None);
   let (publication_result_tx, publication_result_rx) = tokio::sync::watch::channel(None);
   let publication_predecessor = partition_state.publication_tail.clone();
   partition_state.publication_tail = Some(FlushPublicationDependency {
+    identity_rx: identity_result_rx,
     result_rx: publication_result_rx,
   });
   partition_state.outstanding_flushes = partition_state.outstanding_flushes.saturating_add(1);
@@ -213,6 +207,7 @@ fn take_flush_partition(
     batches,
     trigger,
     publication_predecessor,
+    identity_result_tx: Some(identity_result_tx),
     publication_result_tx: Some(publication_result_tx),
   })
 }
@@ -451,9 +446,17 @@ pub(super) fn collect_next_flush_plan(
   let shared_blob = selected_shared_blob?;
   let mut topics = topic_plans.into_values().collect::<Vec<_>>();
   topics.sort_by(|left, right| left.topic.as_str().cmp(right.topic.as_str()));
+  let mut identity_predecessors = Vec::new();
   let mut publication_completions = Vec::new();
   for topic_plan in &mut topics {
     for partition in &mut topic_plan.partitions {
+      if let Some(predecessor) = partition.publication_predecessor.clone() {
+        identity_predecessors.push(predecessor);
+      }
+      let identity_tx = partition
+        .identity_result_tx
+        .take()
+        .expect("selected flush partition has an identity completion sender");
       let publication_result_tx = partition
         .publication_result_tx
         .take()
@@ -461,6 +464,7 @@ pub(super) fn collect_next_flush_plan(
       publication_completions.push(FlushPublicationCompletion {
         topic: topic_plan.topic.clone(),
         virtual_partition_id: partition.virtual_partition_id,
+        identity_tx,
         result_tx: publication_result_tx,
       });
     }
@@ -469,6 +473,7 @@ pub(super) fn collect_next_flush_plan(
     topics,
     max_segment_bytes: config.max_segment_bytes(feature_flags),
     shared_blob,
+    identity_predecessors,
     publication_completions,
   })
 }

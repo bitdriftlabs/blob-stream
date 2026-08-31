@@ -2091,6 +2091,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
     .time_provider(time_provider.clone())
     .build()?,
   );
+  time_provider.wait_until_sleeping(1).await;
 
   let first_engine = Arc::clone(&engine);
   let first = tokio::spawn(async move {
@@ -2192,10 +2193,24 @@ async fn same_partition_time_flushes_upload_in_parallel_and_publish_in_order() -
       })
       .await
   });
-  tokio::task::yield_now().await;
+  for _ in 0 .. 100 {
+    if engine
+      .state
+      .lock()
+      .partition_state("telemetry", 0)
+      .is_some_and(|partition| partition.buffer.batches.len() == 1)
+    {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+  let sleep_registrations = time_provider.sleep_registration_count();
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
   receive_blob_write(&mut entered_rx).await;
+  time_provider
+    .wait_for_sleep_registration_after(sleep_registrations)
+    .await;
 
   let second_engine = Arc::clone(&engine);
   let second = tokio::spawn(async move {
@@ -2207,7 +2222,17 @@ async fn same_partition_time_flushes_upload_in_parallel_and_publish_in_order() -
       })
       .await
   });
-  tokio::task::yield_now().await;
+  for _ in 0 .. 100 {
+    if engine
+      .state
+      .lock()
+      .partition_state("telemetry", 0)
+      .is_some_and(|partition| partition.buffer.batches.len() == 1)
+    {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
   receive_blob_write(&mut entered_rx).await;
@@ -2429,6 +2454,7 @@ async fn successor_metadata_waits_for_successful_predecessor_publication() -> Re
     )
     .await?;
   assert_eq!(segments.len(), 2);
+  assert!(segments[0].snowflake_id < segments[1].snowflake_id);
   Ok(())
 }
 
@@ -2500,7 +2526,7 @@ async fn metadata_waiting_epochs_do_not_block_unrelated_blob_uploads() -> Result
     .expect("first metadata write should start");
 
   let mut waiting_epochs = Vec::new();
-  for record in 2 ..= 4 {
+  for record in 2 ..= 3 {
     let engine = Arc::clone(&engine);
     waiting_epochs.push(tokio::spawn(async move {
       engine

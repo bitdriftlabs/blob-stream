@@ -4,6 +4,7 @@ use crate::write::buffer::{
   BufferedBatch,
   FlushCompletionError,
   FlushPartition,
+  FlushPartitionResult,
   FlushPlan,
   FlushPublicationDependency,
   FlushPublicationResult,
@@ -43,6 +44,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use time::OffsetDateTime;
 use tokio::sync::{Semaphore, mpsc, watch};
+
+async fn flush_plan_for_test(
+  context: &FlushContext,
+  plan: &mut FlushPlan,
+  metrics: &WriteMetrics,
+) -> Result<Vec<FlushPartitionResult>, crate::write::WriteError> {
+  context.flush_plan_after(plan, metrics).await
+}
 
 struct BlockingMetadataStore {
   started_tx: mpsc::UnboundedSender<String>,
@@ -226,6 +235,7 @@ fn flush_partition(virtual_partition_id: u32, payload: &[u8]) -> FlushPartition 
     }],
     trigger: FlushTrigger::MaxDelay,
     publication_predecessor: None,
+    identity_result_tx: None,
     publication_result_tx: None,
   }
 }
@@ -283,6 +293,7 @@ async fn object_build_resnaps_time_after_sonyflake_sequence_overflow() -> Result
     topics: vec![topic],
     max_segment_bytes: 1,
     shared_blob: false,
+    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
 
@@ -368,6 +379,7 @@ fn merge_partition_batches_preserves_order_and_combines_metadata() -> Result<()>
       ],
       trigger: FlushTrigger::MaxBytes,
       publication_predecessor: None,
+      identity_result_tx: None,
       publication_result_tx: None,
     })?;
 
@@ -414,6 +426,7 @@ fn merge_partition_batches_rejects_noncontiguous_ranges() {
     ],
     trigger: FlushTrigger::MaxBytes,
     publication_predecessor: None,
+    identity_result_tx: None,
     publication_result_tx: None,
   });
 
@@ -460,6 +473,7 @@ async fn lost_fence_does_not_fall_back_to_ordinary_metadata_write() -> Result<()
         }],
         trigger: FlushTrigger::MaxBytes,
         publication_predecessor: None,
+        identity_result_tx: None,
         publication_result_tx: None,
       }],
       max_metadata_publication_lag: time::Duration::seconds(1),
@@ -468,12 +482,11 @@ async fn lost_fence_does_not_fall_back_to_ordinary_metadata_write() -> Result<()
     }],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: false,
+    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
 
-  let results = context
-    .flush_plan(&mut plan, &WriteMetrics::new(&scope))
-    .await?;
+  let results = flush_plan_for_test(&context, &mut plan, &WriteMetrics::new(&scope)).await?;
   assert_eq!(results.len(), 1);
   assert_eq!(
     results[0].error,
@@ -517,13 +530,14 @@ async fn shared_object_metadata_writes_start_concurrently() -> Result<()> {
     ],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: true,
+    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
   let flush_context = context.clone();
   let flush_metrics = metrics.clone();
   let flush = tokio::spawn(async move {
     let mut plan = plan;
-    flush_context.flush_plan(&mut plan, &flush_metrics).await
+    flush_plan_for_test(&flush_context, &mut plan, &flush_metrics).await
   });
 
   let first_topic = receive_metadata_write(&mut started_rx).await;
@@ -554,12 +568,13 @@ async fn shared_blob_upload_failure_prevents_every_metadata_publication() -> Res
     ],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: true,
+    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
   let collector = Collector::default();
   let metrics = WriteMetrics::new(&collector.scope("flush_test"));
 
-  let results = context.flush_plan(&mut plan, &metrics).await?;
+  let results = flush_plan_for_test(&context, &mut plan, &metrics).await?;
 
   assert_eq!(results.len(), 2);
   assert!(results.iter().all(|result| result.error.is_some()));
@@ -587,25 +602,30 @@ async fn failed_predecessor_does_not_reject_independent_shared_partition() -> Re
     Arc::new(ManualTimeProvider::new(now)),
     None,
   );
+  let (_identity_tx, identity_rx) = watch::channel(Some(FlushPublicationResult::Succeeded));
   let (_result_tx, result_rx) = watch::channel(Some(FlushPublicationResult::Failed(
     FlushCompletionError::Internal,
   )));
   let mut topic = topic_flush_plan("telemetry".into(), 0, b"first");
-  topic.partitions[0].publication_predecessor = Some(FlushPublicationDependency { result_rx });
+  topic.partitions[0].publication_predecessor = Some(FlushPublicationDependency {
+    identity_rx,
+    result_rx,
+  });
   topic.partitions.push(flush_partition(1, b"second"));
   let mut plan = FlushPlan {
     topics: vec![topic],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: true,
+    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
 
-  let results = context
-    .flush_plan(
-      &mut plan,
-      &WriteMetrics::new(&Collector::default().scope("flush_test")),
-    )
-    .await?;
+  let results = flush_plan_for_test(
+    &context,
+    &mut plan,
+    &WriteMetrics::new(&Collector::default().scope("flush_test")),
+  )
+  .await?;
 
   assert_eq!(results.len(), 2);
   assert!(results.iter().any(|result| {
@@ -655,10 +675,11 @@ async fn earlier_object_metadata_starts_while_later_upload_is_blocked() -> Resul
     ],
     max_segment_bytes: 1,
     shared_blob: true,
+    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
   let metrics = WriteMetrics::new(&Collector::default().scope("flush_test"));
-  let flush = tokio::spawn(async move { context.flush_plan(&mut plan, &metrics).await });
+  let flush = tokio::spawn(async move { flush_plan_for_test(&context, &mut plan, &metrics).await });
 
   second_started_rx
     .recv()
@@ -693,12 +714,13 @@ async fn capped_flush_keeps_published_object_results_when_later_object_expires()
     topics: vec![topic_flush_plan("first".into(), 0, b"first"), expired_topic],
     max_segment_bytes: 1,
     shared_blob: true,
+    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
   let collector = Collector::default();
   let metrics = WriteMetrics::new(&collector.scope("flush_test"));
 
-  let results = context.flush_plan(&mut plan, &metrics).await?;
+  let results = flush_plan_for_test(&context, &mut plan, &metrics).await?;
 
   assert_eq!(results.len(), 2);
   assert!(
@@ -740,12 +762,13 @@ async fn shared_object_uses_each_topics_metadata_window() -> Result<()> {
     topics: vec![topic_flush_plan("first".into(), 0, b"first"), second_topic],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: true,
+    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
   let collector = Collector::default();
   let metrics = WriteMetrics::new(&collector.scope("flush_test"));
 
-  context.flush_plan(&mut plan, &metrics).await?;
+  flush_plan_for_test(&context, &mut plan, &metrics).await?;
 
   let first_window = Window::for_timestamp(now, time::Duration::minutes(5)).key("first");
   let second_window = Window::for_timestamp(now, time::Duration::minutes(10)).key("second");
@@ -786,15 +809,16 @@ async fn oversized_single_partition_object_is_counted() -> Result<()> {
     )],
     max_segment_bytes: 1,
     shared_blob: false,
+    identity_predecessors: Vec::new(),
     publication_completions: Vec::new(),
   };
 
-  context
-    .flush_plan(
-      &mut plan,
-      &WriteMetrics::new(&collector.scope("flush_test")),
-    )
-    .await?;
+  flush_plan_for_test(
+    &context,
+    &mut plan,
+    &WriteMetrics::new(&collector.scope("flush_test")),
+  )
+  .await?;
   metrics.assert_counter_eq(
     1,
     "flush_test:write:flush_oversized_single_partition_objects_total",
