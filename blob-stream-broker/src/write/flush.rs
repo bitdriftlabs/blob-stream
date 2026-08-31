@@ -4,6 +4,8 @@ use super::buffer::{
   FlushPartition,
   FlushPartitionResult,
   FlushPlan,
+  FlushPublicationDependency,
+  FlushPublicationResult,
   TopicFlushPlan,
 };
 use super::metrics::WriteMetrics;
@@ -41,6 +43,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use time::ext::NumericalDuration;
 use time::{Duration, OffsetDateTime};
+use tokio::sync::{Notify, OwnedSemaphorePermit};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 const MAX_CONCURRENT_METADATA_WRITES: usize = 8;
@@ -94,7 +98,7 @@ impl SnowflakeGenerator {
 // SegmentEnvelope
 //
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct SegmentEnvelope {
   window: TopicWindowKey,
   snowflake_id: SnowflakeId,
@@ -106,7 +110,8 @@ struct SegmentEnvelope {
 
 struct PersistedTopic {
   envelope: SegmentEnvelope,
-  fences: Option<Vec<ProducerPartitionFence>>,
+  fences: Option<HashMap<VirtualPartitionId, ProducerPartitionFence>>,
+  publication_predecessors: HashMap<VirtualPartitionId, FlushPublicationDependency>,
   max_metadata_publication_lag: time::Duration,
 }
 
@@ -145,6 +150,7 @@ struct EncodedPartition {
   payload: Bytes,
   metadata: BatchMetadata,
   fence: Option<ProducerPartitionFence>,
+  publication_predecessor: Option<FlushPublicationDependency>,
   max_metadata_publication_lag: time::Duration,
   metadata_window_size: time::Duration,
 }
@@ -154,7 +160,8 @@ struct ObjectTopicBuilder {
   max_metadata_publication_lag: time::Duration,
   metadata_window_size: time::Duration,
   segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
-  fences: Option<Vec<ProducerPartitionFence>>,
+  fences: Option<HashMap<VirtualPartitionId, ProducerPartitionFence>>,
+  publication_predecessors: HashMap<VirtualPartitionId, FlushPublicationDependency>,
 }
 
 struct ObjectBuilder {
@@ -201,22 +208,30 @@ impl ObjectBuilder {
         max_metadata_publication_lag: encoded.max_metadata_publication_lag,
         metadata_window_size: encoded.metadata_window_size,
         segment_index: HashMap::new(),
-        fences: encoded.fence.as_ref().map(|_| Vec::new()),
+        fences: encoded.fence.as_ref().map(|_| HashMap::new()),
+        publication_predecessors: HashMap::new(),
       });
       self
         .topics
         .last_mut()
         .expect("new topic section is present")
     };
-    topic
+    let replaced = topic
       .segment_index
       .insert(encoded.virtual_partition_id, vec![metadata]);
+    debug_assert!(replaced.is_none());
     if let Some(fence) = encoded.fence {
       topic
         .fences
         .as_mut()
         .expect("fenced partition has a fenced topic section")
-        .push(fence);
+        .insert(encoded.virtual_partition_id, fence);
+    }
+    if let Some(predecessor) = encoded.publication_predecessor {
+      let replaced = topic
+        .publication_predecessors
+        .insert(encoded.virtual_partition_id, predecessor);
+      debug_assert!(replaced.is_none());
     }
   }
 
@@ -253,6 +268,7 @@ impl ObjectBuilder {
             created_at: now,
           },
           fences: topic.fences,
+          publication_predecessors: topic.publication_predecessors,
           max_metadata_publication_lag: topic.max_metadata_publication_lag,
         }
       })
@@ -448,6 +464,7 @@ impl FlushContext {
     } else {
       None
     };
+    let publication_predecessor = partition.publication_predecessor.clone();
     let (virtual_partition_id, records, summary, seq_range) =
       Self::merge_partition_batches(partition)?;
     let payload = self.compress_batch(Self::encode_batch(virtual_partition_id, records)?)?;
@@ -461,6 +478,7 @@ impl FlushContext {
         payload_bytes: summary.payload_bytes,
       },
       fence,
+      publication_predecessor,
       max_metadata_publication_lag: topic_plan.max_metadata_publication_lag,
       metadata_window_size: topic_plan.metadata_window_size,
     })
@@ -500,17 +518,70 @@ impl FlushContext {
     publication_started_at: Instant,
     metrics: &WriteMetrics,
   ) -> Result<Vec<FlushPartitionResult>, WriteError> {
+    if topic.publication_predecessors.is_empty() {
+      return self
+        .persist_ready_topic_metadata(topic, publication_started_at, metrics)
+        .await;
+    }
+
+    let mut results = Vec::new();
+    let mut ready_topics = Vec::new();
+    let mut pending_topics = Vec::new();
+    for (topic, mut predecessor) in topic.into_partition_topics() {
+      match predecessor
+        .as_mut()
+        .and_then(|predecessor| *predecessor.result_rx.borrow_and_update())
+      {
+        None if predecessor.is_none() => ready_topics.push(topic),
+        Some(FlushPublicationResult::Succeeded) => ready_topics.push(topic),
+        Some(FlushPublicationResult::Failed(error)) => {
+          results.extend(PersistedObject::failure_results(
+            std::slice::from_ref(&topic),
+            error,
+          ));
+        },
+        None => pending_topics.push((topic, predecessor)),
+      }
+    }
+    if let Some(topic) = PersistedTopic::merge_partition_topics(ready_topics) {
+      results.extend(
+        self
+          .persist_ready_topic_metadata(topic, publication_started_at, metrics)
+          .await?,
+      );
+    }
+    let pending_results = futures::stream::iter(pending_topics)
+      .map(|(topic, predecessor)| async move {
+        if let Some(error) = wait_for_predecessor(predecessor).await {
+          return Ok(PersistedObject::failure_results(
+            std::slice::from_ref(&topic),
+            error,
+          ));
+        }
+        self
+          .persist_ready_topic_metadata(topic, publication_started_at, metrics)
+          .await
+      })
+      .buffer_unordered(MAX_CONCURRENT_METADATA_WRITES)
+      .try_collect::<Vec<_>>()
+      .await
+      .map(|pending_results| pending_results.into_iter().flatten().collect::<Vec<_>>())?;
+    results.extend(pending_results);
+    Ok(results)
+  }
+
+  async fn persist_ready_topic_metadata(
+    &self,
+    topic: PersistedTopic,
+    publication_started_at: Instant,
+    metrics: &WriteMetrics,
+  ) -> Result<Vec<FlushPartitionResult>, WriteError> {
     let virtual_partition_ids = topic
       .envelope
       .segment_index
       .keys()
       .copied()
       .collect::<Vec<_>>();
-    if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
-      lifecycle_hooks
-        .blob_persisted(topic.envelope.window.topic.as_str(), &virtual_partition_ids)
-        .await;
-    }
     let topic_name = topic.envelope.window.topic.clone();
     let metadata_publication_budget =
       std::time::Duration::try_from(topic.max_metadata_publication_lag).map_err(|_| {
@@ -522,6 +593,9 @@ impl FlushContext {
       metadata_publication_budget.checked_sub(publication_started_at.elapsed());
     let metadata_published_at = self.time_provider.now();
     let metadata = topic.envelope.into_metadata(metadata_published_at);
+    let fences = topic
+      .fences
+      .map(|fences| fences.into_values().collect::<Vec<_>>());
     let error = match metadata_remaining_budget {
       None => {
         metrics.record_metadata_publication_deadline_exhausted_before_persistence();
@@ -531,7 +605,7 @@ impl FlushContext {
         remaining_budget,
         self.metadata_store.write_segment(
           metadata,
-          topic.fences.as_deref(),
+          fences.as_deref(),
           metadata_published_at.unix_timestamp_ms(),
         ),
       )
@@ -567,14 +641,26 @@ impl FlushContext {
     )
   }
 
+  #[cfg(test)]
   pub(super) async fn flush_plan(
     &self,
     plan: &mut FlushPlan,
     metrics: &WriteMetrics,
   ) -> Result<Vec<FlushPartitionResult>, WriteError> {
+    self.flush_plan_after(plan, metrics, None, None).await
+  }
+
+  pub(super) async fn flush_plan_after(
+    &self,
+    plan: &mut FlushPlan,
+    metrics: &WriteMetrics,
+    upload_permit: Option<OwnedSemaphorePermit>,
+    flush_notifier: Option<&Notify>,
+  ) -> Result<Vec<FlushPartitionResult>, WriteError> {
     let publication_started_at = Instant::now();
     let mut objects = self.build_objects(plan).await?.into_iter();
     let mut results = Vec::new();
+    let mut metadata_publications = JoinSet::new();
     while let Some(object) = objects.next() {
       let publication_budget = object
         .topics
@@ -627,7 +713,7 @@ impl FlushContext {
         .clone();
       let blob_result = timeout(
         remaining_budget,
-        self.blob_store.put(&blob_key, object.payload),
+        self.blob_store.put(&blob_key, object.payload.clone()),
       )
       .await;
       if blob_result.is_err() || blob_result.as_ref().is_ok_and(Result::is_err) {
@@ -669,18 +755,34 @@ impl FlushContext {
         object.shared_blob,
         object.oversized_singleton
       );
-      // Metadata rows determine acknowledgement independently, even when their data shares a
-      // single uploaded object. Bound the fan-out so a wide shared flush cannot overwhelm storage.
-      let topic_results = futures::stream::iter(
-        object
-          .topics
-          .into_iter()
-          .map(|topic| self.persist_topic_metadata(topic, publication_started_at, metrics)),
-      )
-      .buffer_unordered(MAX_CONCURRENT_METADATA_WRITES)
-      .try_collect::<Vec<_>>()
-      .await?;
-      results.extend(topic_results.into_iter().flatten());
+      for topic in &object.topics {
+        if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+          let virtual_partition_ids = topic
+            .envelope
+            .segment_index
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+          lifecycle_hooks
+            .blob_persisted(topic.envelope.window.topic.as_str(), &virtual_partition_ids)
+            .await;
+        }
+      }
+      let context = self.clone();
+      let metrics = metrics.clone();
+      metadata_publications.spawn(async move {
+        context
+          .persist_object_metadata(object.topics, publication_started_at, &metrics)
+          .await
+      });
+    }
+
+    drop(upload_permit);
+    if let Some(flush_notifier) = flush_notifier {
+      flush_notifier.notify_one();
+    }
+    while let Some(publication) = metadata_publications.join_next().await {
+      results.extend(publication.map_err(|error| WriteError::Internal(anyhow::anyhow!(error)))??);
     }
     results.sort_by(|left, right| {
       left
@@ -696,5 +798,98 @@ impl FlushContext {
   #[must_use]
   pub(super) fn config(&self) -> &WriteConfig {
     &self.config
+  }
+}
+
+impl PersistedTopic {
+  fn merge_partition_topics(mut topics: Vec<Self>) -> Option<Self> {
+    let mut merged = topics.pop()?;
+    for topic in topics {
+      debug_assert_eq!(merged.envelope.window, topic.envelope.window);
+      debug_assert_eq!(merged.envelope.snowflake_id, topic.envelope.snowflake_id);
+      debug_assert_eq!(merged.envelope.blob_key, topic.envelope.blob_key);
+      debug_assert!(merged.publication_predecessors.is_empty());
+      debug_assert!(topic.publication_predecessors.is_empty());
+      merged
+        .envelope
+        .segment_index
+        .extend(topic.envelope.segment_index);
+      match (&mut merged.fences, topic.fences) {
+        (Some(merged_fences), Some(fences)) => merged_fences.extend(fences),
+        (None, None) => {},
+        _ => debug_assert!(false, "all partitions in a topic have matching fence mode"),
+      }
+    }
+    Some(merged)
+  }
+
+  fn into_partition_topics(self) -> Vec<(Self, Option<FlushPublicationDependency>)> {
+    self
+      .envelope
+      .segment_index
+      .keys()
+      .copied()
+      .map(|virtual_partition_id| {
+        let mut envelope = self.envelope.clone();
+        envelope
+          .segment_index
+          .retain(|id, _| *id == virtual_partition_id);
+        let fences = self.fences.as_ref().and_then(|fences| {
+          fences
+            .get(&virtual_partition_id)
+            .cloned()
+            .map(|fence| HashMap::from([(virtual_partition_id, fence)]))
+        });
+        let predecessor = self
+          .publication_predecessors
+          .get(&virtual_partition_id)
+          .cloned();
+        (
+          Self {
+            envelope,
+            fences,
+            publication_predecessors: HashMap::new(),
+            max_metadata_publication_lag: self.max_metadata_publication_lag,
+          },
+          predecessor,
+        )
+      })
+      .collect()
+  }
+}
+
+impl FlushContext {
+  async fn persist_object_metadata(
+    &self,
+    topics: Vec<PersistedTopic>,
+    publication_started_at: Instant,
+    metrics: &WriteMetrics,
+  ) -> Result<Vec<FlushPartitionResult>, WriteError> {
+    let topic_results = futures::stream::iter(
+      topics
+        .into_iter()
+        .map(|topic| self.persist_topic_metadata(topic, publication_started_at, metrics)),
+    )
+    .buffer_unordered(MAX_CONCURRENT_METADATA_WRITES)
+    .try_collect::<Vec<_>>()
+    .await?;
+    Ok(topic_results.into_iter().flatten().collect())
+  }
+}
+
+async fn wait_for_predecessor(
+  mut predecessor: Option<FlushPublicationDependency>,
+) -> Option<FlushCompletionError> {
+  let predecessor = predecessor.as_mut()?;
+  loop {
+    if let Some(result) = *predecessor.result_rx.borrow_and_update() {
+      if let super::buffer::FlushPublicationResult::Failed(error) = result {
+        return Some(error);
+      }
+      return None;
+    }
+    if predecessor.result_rx.changed().await.is_err() {
+      return Some(FlushCompletionError::Internal);
+    }
   }
 }

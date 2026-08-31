@@ -3,6 +3,7 @@
 mod tests;
 
 use crate::write::memory_pressure::MemoryPressureController;
+use crate::write::{DEFAULT_MAX_SEGMENT_BYTES, effective_max_segment_bytes};
 use anyhow::{Result, anyhow, ensure};
 use bd_log_util::warn_every;
 use bd_runtime_config::feature_flags::FeatureFlagsWatch;
@@ -25,7 +26,6 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use moka::future::Cache;
 use parking_lot::Mutex;
-use protobuf::Message;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,11 +47,13 @@ type SharedFetch = Shared<BoxFuture<'static, std::result::Result<Bytes, BlobCach
 // BlobCacheConfig
 //
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct BlobCacheConfig {
   request_timeout: Duration,
   idle_ttl: Duration,
   max_fetches: usize,
+  max_segment_bytes: u64,
+  feature_flags: Option<FeatureFlagsWatch>,
 }
 
 impl BlobCacheConfig {
@@ -91,7 +93,15 @@ impl BlobCacheConfig {
         anyhow!("feature flag {BLOB_CACHE_IDLE_TTL_FEATURE_FLAG} exceeds supported range")
       })?,
       max_fetches: DEFAULT_MAX_FETCHES,
+      max_segment_bytes: broker
+        .max_segment_bytes
+        .unwrap_or(DEFAULT_MAX_SEGMENT_BYTES),
+      feature_flags: feature_flags.cloned(),
     })
+  }
+
+  fn max_response_payload_bytes(&self) -> u64 {
+    effective_max_segment_bytes(self.max_segment_bytes, self.feature_flags.as_ref())
   }
 }
 
@@ -203,12 +213,14 @@ impl BlobCache {
   ) -> Self {
     let metrics = BlobCacheMetrics::new(metrics_scope);
     let evictions = metrics.evictions.clone();
+    let idle_ttl = config.idle_ttl;
+    let max_fetches = config.max_fetches;
     let cache = Self {
       blob_store,
       config,
       pressure,
       entries: Cache::builder()
-        .time_to_idle(config.idle_ttl)
+        .time_to_idle(idle_ttl)
         .weigher(|_key: &String, value: &Bytes| u32::try_from(value.len()).unwrap_or(u32::MAX))
         .eviction_listener(move |_key, _value, cause| {
           if cause.was_evicted() {
@@ -218,7 +230,7 @@ impl BlobCache {
         .build(),
       logical_idle_expiry: None,
       in_flight: Mutex::new(HashMap::new()),
-      fetch_permits: Arc::new(Semaphore::new(config.max_fetches)),
+      fetch_permits: Arc::new(Semaphore::new(max_fetches)),
       cache_generation: Arc::new(AtomicU64::new(0)),
       failures: AtomicU64::new(0),
       metrics,
@@ -239,6 +251,7 @@ impl BlobCache {
     let evictions = metrics.evictions.clone();
     let last_access = Arc::new(Mutex::new(HashMap::new()));
     let eviction_last_access = Arc::clone(&last_access);
+    let max_fetches = config.max_fetches;
     let cache = Self {
       blob_store,
       config,
@@ -257,7 +270,7 @@ impl BlobCache {
         time_provider,
       }),
       in_flight: Mutex::new(HashMap::new()),
-      fetch_permits: Arc::new(Semaphore::new(config.max_fetches)),
+      fetch_permits: Arc::new(Semaphore::new(max_fetches)),
       cache_generation: Arc::new(AtomicU64::new(0)),
       failures: AtomicU64::new(0),
       metrics,
@@ -274,32 +287,23 @@ impl BlobCache {
   pub async fn read(self: &Arc<Self>, request: ReadBlobRangesRequest) -> ReadBlobRangesResponse {
     let started = std::time::Instant::now();
     self.metrics.requests.inc();
-    let response = match Self::validate_request(&request) {
+    let response = match self.validate_request(&request) {
       Ok(()) => {
         match tokio::time::timeout(self.config.request_timeout, self.read_ranges(&request)).await {
-          Ok(Ok(payloads)) => {
-            let response = ReadBlobRangesResponse {
-              result: Some(read_blob_ranges_response::Result::Success(
-                BlobReadSuccess {
-                  ranges: payloads
-                    .into_iter()
-                    .map(|payload| BlobRangeResult {
-                      payload,
-                      ..Default::default()
-                    })
-                    .collect(),
-                  ..Default::default()
-                },
-              )),
-              ..Default::default()
-            };
-            if response.compute_size()
-              > u64::try_from(MAX_BLOB_READ_REQUEST_BYTES).unwrap_or(u64::MAX)
-            {
-              self.response_error(BlobCacheError::Overloaded)
-            } else {
-              response
-            }
+          Ok(Ok(payloads)) => ReadBlobRangesResponse {
+            result: Some(read_blob_ranges_response::Result::Success(
+              BlobReadSuccess {
+                ranges: payloads
+                  .into_iter()
+                  .map(|payload| BlobRangeResult {
+                    payload,
+                    ..Default::default()
+                  })
+                  .collect(),
+                ..Default::default()
+              },
+            )),
+            ..Default::default()
           },
           Ok(Err(error)) => self.response_error(error),
           Err(_) => self.response_error(BlobCacheError::Overloaded),
@@ -346,7 +350,7 @@ impl BlobCache {
     snapshot
   }
 
-  fn validate_request(request: &ReadBlobRangesRequest) -> Result<()> {
+  fn validate_request(&self, request: &ReadBlobRangesRequest) -> Result<()> {
     ensure!(!request.blob_key.is_empty(), "blob request has no blob key");
     ensure!(!request.ranges.is_empty(), "blob request has no ranges");
     let mut response_bytes = 0_u64;
@@ -360,8 +364,9 @@ impl BlobCache {
         .ok_or_else(|| anyhow!("blob response bytes overflow"))?;
     }
     ensure!(
-      response_bytes <= u64::try_from(MAX_BLOB_READ_REQUEST_BYTES).unwrap_or(u64::MAX),
-      "blob response exceeds the unary body limit"
+      response_bytes <= self.config.max_response_payload_bytes(),
+      "blob response exceeds the {} byte payload limit",
+      self.config.max_response_payload_bytes(),
     );
     Ok(())
   }

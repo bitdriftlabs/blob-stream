@@ -26,7 +26,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   ReadMetadataWindowRequest,
   ReadMetadataWindowResponse,
 };
-use blob_stream_types::MAX_PRODUCE_BATCHES_REQUEST_BYTES;
+use blob_stream_types::{MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES, MAX_PRODUCE_BATCHES_REQUEST_BYTES};
 use futures::future::join_all;
 use http::{Extensions, HeaderMap};
 use log::trace;
@@ -345,14 +345,20 @@ pub fn make_broker_router(
   let produce_batch_router = UnaryRouterBuilder::new(&produce_batch_method, grpc.clone())
     .request_config(produce_request_config())
     .error_handler(|error| {
-      warn_every!(15.seconds(), "broker gRPC handler error: {error}");
+      warn_every!(
+        15.seconds(),
+        "broker ProduceBatch gRPC handler error: {error}"
+      );
     })
     .build()
     .expect("legacy broker gRPC router should build");
   let produce_batches_router = UnaryRouterBuilder::new(&produce_batches_method, grpc.clone())
     .request_config(produce_request_config())
     .error_handler(|error| {
-      warn_every!(15.seconds(), "broker gRPC handler error: {error}");
+      warn_every!(
+        15.seconds(),
+        "broker ProduceBatches gRPC handler error: {error}"
+      );
     })
     .build()
     .expect("batched broker gRPC router should build");
@@ -361,7 +367,7 @@ pub fn make_broker_router(
     .error_handler(|error| {
       warn_every!(
         15.seconds(),
-        "broker metadata cache gRPC handler error: {error}"
+        "broker ReadMetadataWindow gRPC handler error: {error}"
       );
     })
     .build()
@@ -371,7 +377,7 @@ pub fn make_broker_router(
     .error_handler(|error| {
       warn_every!(
         15.seconds(),
-        "broker blob cache gRPC handler error: {error}"
+        "broker ReadBlobRanges gRPC handler error: {error}"
       );
     })
     .build()
@@ -418,7 +424,7 @@ pub fn make_broker_router(
 
 fn produce_request_config() -> UnaryRequestConfig {
   UnaryRequestConfig {
-    max_request_bytes: MAX_PRODUCE_BATCHES_REQUEST_BYTES,
+    max_request_bytes: MAX_PRODUCE_BATCHES_GRPC_BODY_BYTES,
     max_decoded_request_bytes: MAX_PRODUCE_BATCHES_REQUEST_BYTES,
     ..UnaryRequestConfig::default()
   }

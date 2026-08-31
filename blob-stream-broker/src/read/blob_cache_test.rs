@@ -173,6 +173,8 @@ fn cache_with_idle_ttl(
       request_timeout: Duration::from_secs(1),
       idle_ttl,
       max_fetches: DEFAULT_MAX_FETCHES,
+      max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
+      feature_flags: None,
     },
     pressure,
     &Collector::default().scope("blob_cache_test"),
@@ -190,6 +192,8 @@ fn cache_with_max_fetches(
       request_timeout: Duration::from_secs(1),
       idle_ttl: Duration::from_secs(30),
       max_fetches,
+      max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
+      feature_flags: None,
     },
     pressure,
     &Collector::default().scope("blob_cache_test"),
@@ -208,6 +212,8 @@ fn cache_with_idle_ttl_and_clock(
       request_timeout: Duration::from_secs(1),
       idle_ttl,
       max_fetches: DEFAULT_MAX_FETCHES,
+      max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
+      feature_flags: None,
     },
     pressure,
     time_provider,
@@ -311,6 +317,26 @@ fn config_defaults_idle_ttl_to_ten_seconds() {
   let config = BlobCacheConfig::from_broker_config(&BrokerConfig::new(), None).unwrap();
 
   assert_eq!(config.idle_ttl, Duration::from_secs(10));
+}
+
+#[test]
+fn config_response_payload_limit_tracks_max_segment_bytes() {
+  let mut broker_config = BrokerConfig::new();
+  broker_config.max_segment_bytes = Some(8 * 1024 * 1024);
+  let feature_flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag("blob_stream_broker_max_segment_bytes", 4 * 1024 * 1024),
+  ));
+  let config =
+    BlobCacheConfig::from_broker_config(&broker_config, Some(&feature_flags.snapshot_watch()))
+      .unwrap();
+
+  assert_eq!(config.max_response_payload_bytes(), 4 * 1024 * 1024);
+  feature_flags.update(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag("blob_stream_broker_max_segment_bytes", 2 * 1024 * 1024),
+  ));
+  assert_eq!(config.max_response_payload_bytes(), 2 * 1024 * 1024);
 }
 
 #[test]
@@ -470,11 +496,9 @@ async fn invalid_range_does_not_read_or_cache() {
 async fn request_over_the_wire_response_limit_does_not_read_or_cache() {
   let store = Arc::new(CountingBlobStore::new());
   let cache = cache(Arc::clone(&store) as Arc<dyn BlobStore>, pressure(0, 1_000));
+  let response_payload_limit = cache.config.max_response_payload_bytes();
   let response = cache
-    .read(request(&[(
-      0,
-      u64::try_from(MAX_BLOB_READ_REQUEST_BYTES).unwrap() + 1,
-    )]))
+    .read(request(&[(0, response_payload_limit + 1)]))
     .await;
 
   let Some(read_blob_ranges_response::Result::Failure(failure)) = response.result else {
@@ -485,6 +509,25 @@ async fn request_over_the_wire_response_limit_does_not_read_or_cache() {
     BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_BAD_REQUEST.into()
   );
   assert_eq!(store.get_calls.load(Ordering::Relaxed), 0);
+  assert_eq!(cache.snapshot().await.entry_count, 0);
+}
+
+#[tokio::test]
+async fn request_at_response_payload_limit_reaches_storage() {
+  let store = Arc::new(CountingBlobStore::new());
+  let cache = cache(Arc::clone(&store) as Arc<dyn BlobStore>, pressure(0, 1_000));
+  let response_payload_limit = cache.config.max_response_payload_bytes();
+
+  let response = cache.read(request(&[(0, response_payload_limit)])).await;
+
+  let Some(read_blob_ranges_response::Result::Failure(failure)) = response.result else {
+    panic!("expected failure");
+  };
+  assert_eq!(
+    failure.status,
+    BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_NOT_FOUND.into()
+  );
+  assert_eq!(store.get_calls.load(Ordering::Relaxed), 1);
   assert_eq!(cache.snapshot().await.entry_count, 0);
 }
 
@@ -692,6 +735,8 @@ async fn records_cache_fetch_and_response_metrics() {
       request_timeout: Duration::from_secs(1),
       idle_ttl: Duration::from_secs(30),
       max_fetches: DEFAULT_MAX_FETCHES,
+      max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
+      feature_flags: None,
     },
     pressure(0, 1_000),
     &collector.scope("blob_cache_metrics_test"),
@@ -772,6 +817,8 @@ async fn timed_out_request_keeps_fetch_cleanup_running() {
       request_timeout: Duration::from_millis(1),
       idle_ttl: Duration::from_secs(30),
       max_fetches: DEFAULT_MAX_FETCHES,
+      max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
+      feature_flags: None,
     },
     Arc::clone(&pressure),
     &Collector::default().scope("blob_cache_test"),

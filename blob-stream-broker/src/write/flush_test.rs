@@ -2,8 +2,11 @@ use super::{FlushContext, SnowflakeGenerator};
 use crate::write::WriteConfig;
 use crate::write::buffer::{
   BufferedBatch,
+  FlushCompletionError,
   FlushPartition,
   FlushPlan,
+  FlushPublicationDependency,
+  FlushPublicationResult,
   FlushTrigger,
   TopicFlushPlan,
 };
@@ -39,7 +42,7 @@ use prometheus::labels;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use time::OffsetDateTime;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 
 struct BlockingMetadataStore {
   started_tx: mpsc::UnboundedSender<String>,
@@ -52,10 +55,54 @@ struct LostFenceMetadataStore {
 
 struct FailingBlobStore;
 
+struct BlockSecondBlobStore {
+  writes: AtomicUsize,
+  second_started_tx: mpsc::UnboundedSender<()>,
+  release_second: Arc<Semaphore>,
+}
+
 #[async_trait]
 impl BlobStore for FailingBlobStore {
   async fn put(&self, _key: &BlobKey, _payload: Bytes) -> Result<()> {
     anyhow::bail!("blob write failed")
+  }
+
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("reads are not used by this test: {range:?}"),
+    })
+  }
+
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    let _ = admission;
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("cache admission reads are not used by this test"),
+    })
+  }
+}
+
+#[async_trait]
+impl BlobStore for BlockSecondBlobStore {
+  async fn put(&self, _key: &BlobKey, _payload: Bytes) -> Result<()> {
+    if self.writes.fetch_add(1, Ordering::Relaxed) == 1 {
+      self
+        .second_started_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("second upload receiver dropped"))?;
+      self
+        .release_second
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("second upload release gate closed"))?
+        .forget();
+    }
+    Ok(())
   }
 
   async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
@@ -178,6 +225,8 @@ fn flush_partition(virtual_partition_id: u32, payload: &[u8]) -> FlushPartition 
       completion: None,
     }],
     trigger: FlushTrigger::MaxDelay,
+    publication_predecessor: None,
+    publication_result_tx: None,
   }
 }
 
@@ -234,6 +283,7 @@ async fn object_build_resnaps_time_after_sonyflake_sequence_overflow() -> Result
     topics: vec![topic],
     max_segment_bytes: 1,
     shared_blob: false,
+    publication_completions: Vec::new(),
   };
 
   let objects = tokio::spawn(async move {
@@ -317,6 +367,8 @@ fn merge_partition_batches_preserves_order_and_combines_metadata() -> Result<()>
         },
       ],
       trigger: FlushTrigger::MaxBytes,
+      publication_predecessor: None,
+      publication_result_tx: None,
     })?;
 
   assert_eq!(virtual_partition_id, 4);
@@ -361,6 +413,8 @@ fn merge_partition_batches_rejects_noncontiguous_ranges() {
       },
     ],
     trigger: FlushTrigger::MaxBytes,
+    publication_predecessor: None,
+    publication_result_tx: None,
   });
 
   let Err(error) = result else {
@@ -405,6 +459,8 @@ async fn lost_fence_does_not_fall_back_to_ordinary_metadata_write() -> Result<()
           completion: None,
         }],
         trigger: FlushTrigger::MaxBytes,
+        publication_predecessor: None,
+        publication_result_tx: None,
       }],
       max_metadata_publication_lag: time::Duration::seconds(1),
       metadata_window_size: time::Duration::minutes(5),
@@ -412,6 +468,7 @@ async fn lost_fence_does_not_fall_back_to_ordinary_metadata_write() -> Result<()
     }],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: false,
+    publication_completions: Vec::new(),
   };
 
   let results = context
@@ -460,6 +517,7 @@ async fn shared_object_metadata_writes_start_concurrently() -> Result<()> {
     ],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: true,
+    publication_completions: Vec::new(),
   };
   let flush_context = context.clone();
   let flush_metrics = metrics.clone();
@@ -496,6 +554,7 @@ async fn shared_blob_upload_failure_prevents_every_metadata_publication() -> Res
     ],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: true,
+    publication_completions: Vec::new(),
   };
   let collector = Collector::default();
   let metrics = WriteMetrics::new(&collector.scope("flush_test"));
@@ -517,6 +576,106 @@ async fn shared_blob_upload_failure_prevents_every_metadata_publication() -> Res
 }
 
 #[tokio::test]
+async fn failed_predecessor_does_not_reject_independent_shared_partition() -> Result<()> {
+  let now = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
+  let metadata_store = Arc::new(InMemoryMetadataStore::new());
+  let context = FlushContext::new(
+    WriteConfig::with_defaults(),
+    Arc::new(InMemoryBlobStore::new()),
+    metadata_store.clone(),
+    SnowflakeGenerator::with_machine_id(1)?,
+    Arc::new(ManualTimeProvider::new(now)),
+    None,
+  );
+  let (_result_tx, result_rx) = watch::channel(Some(FlushPublicationResult::Failed(
+    FlushCompletionError::Internal,
+  )));
+  let mut topic = topic_flush_plan("telemetry".into(), 0, b"first");
+  topic.partitions[0].publication_predecessor = Some(FlushPublicationDependency { result_rx });
+  topic.partitions.push(flush_partition(1, b"second"));
+  let mut plan = FlushPlan {
+    topics: vec![topic],
+    max_segment_bytes: 64 * 1024 * 1024,
+    shared_blob: true,
+    publication_completions: Vec::new(),
+  };
+
+  let results = context
+    .flush_plan(
+      &mut plan,
+      &WriteMetrics::new(&Collector::default().scope("flush_test")),
+    )
+    .await?;
+
+  assert_eq!(results.len(), 2);
+  assert!(results.iter().any(|result| {
+    result.virtual_partition_id == 0 && result.error == Some(FlushCompletionError::Internal)
+  }));
+  assert!(
+    results
+      .iter()
+      .any(|result| result.virtual_partition_id == 1 && result.error.is_none())
+  );
+  let window = Window::for_timestamp(now, time::Duration::minutes(5)).key("telemetry");
+  let segments = metadata_store
+    .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Eventual)
+    .await?;
+  assert_eq!(segments.len(), 1);
+  assert_eq!(segments[0].segment_index.len(), 1);
+  assert!(segments[0].segment_index.contains_key(&1));
+  Ok(())
+}
+
+#[tokio::test]
+async fn earlier_object_metadata_starts_while_later_upload_is_blocked() -> Result<()> {
+  let now = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
+  let (metadata_started_tx, mut metadata_started_rx) = mpsc::unbounded_channel();
+  let metadata_release = Arc::new(Semaphore::new(0));
+  let (second_started_tx, mut second_started_rx) = mpsc::unbounded_channel();
+  let second_release = Arc::new(Semaphore::new(0));
+  let context = FlushContext::new(
+    WriteConfig::with_defaults(),
+    Arc::new(BlockSecondBlobStore {
+      writes: AtomicUsize::new(0),
+      second_started_tx,
+      release_second: Arc::clone(&second_release),
+    }),
+    Arc::new(BlockingMetadataStore {
+      started_tx: metadata_started_tx,
+      release: Arc::clone(&metadata_release),
+    }),
+    SnowflakeGenerator::with_machine_id(1)?,
+    Arc::new(ManualTimeProvider::new(now)),
+    None,
+  );
+  let mut plan = FlushPlan {
+    topics: vec![
+      topic_flush_plan("first".into(), 0, b"first"),
+      topic_flush_plan("second".into(), 0, b"second"),
+    ],
+    max_segment_bytes: 1,
+    shared_blob: true,
+    publication_completions: Vec::new(),
+  };
+  let metrics = WriteMetrics::new(&Collector::default().scope("flush_test"));
+  let flush = tokio::spawn(async move { context.flush_plan(&mut plan, &metrics).await });
+
+  second_started_rx
+    .recv()
+    .await
+    .expect("second upload should be blocked");
+  assert_eq!(
+    receive_metadata_write(&mut metadata_started_rx).await,
+    "first"
+  );
+
+  second_release.add_permits(1);
+  metadata_release.add_permits(2);
+  assert_eq!(flush.await??.len(), 2);
+  Ok(())
+}
+
+#[tokio::test]
 async fn capped_flush_keeps_published_object_results_when_later_object_expires() -> Result<()> {
   let now = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
   let metadata_store = Arc::new(InMemoryMetadataStore::new());
@@ -534,6 +693,7 @@ async fn capped_flush_keeps_published_object_results_when_later_object_expires()
     topics: vec![topic_flush_plan("first".into(), 0, b"first"), expired_topic],
     max_segment_bytes: 1,
     shared_blob: true,
+    publication_completions: Vec::new(),
   };
   let collector = Collector::default();
   let metrics = WriteMetrics::new(&collector.scope("flush_test"));
@@ -580,6 +740,7 @@ async fn shared_object_uses_each_topics_metadata_window() -> Result<()> {
     topics: vec![topic_flush_plan("first".into(), 0, b"first"), second_topic],
     max_segment_bytes: 64 * 1024 * 1024,
     shared_blob: true,
+    publication_completions: Vec::new(),
   };
   let collector = Collector::default();
   let metrics = WriteMetrics::new(&collector.scope("flush_test"));
@@ -625,6 +786,7 @@ async fn oversized_single_partition_object_is_counted() -> Result<()> {
     )],
     max_segment_bytes: 1,
     shared_blob: false,
+    publication_completions: Vec::new(),
   };
 
   context

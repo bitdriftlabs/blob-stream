@@ -329,7 +329,7 @@ fn fenced_flush_drops_batches_without_an_acceptance_fence() {
     .partition_state("telemetry", 0)
     .expect("partition exists");
   assert!(partition.buffer.batches.is_empty());
-  assert!(!partition.flush_in_flight);
+  assert_eq!(partition.outstanding_flushes, 0);
 }
 
 #[test]
@@ -453,7 +453,7 @@ fn no_op_planning_keeps_multiple_topic_partitions_buffered() {
       .partition_state(topic, virtual_partition_id)
       .expect("partition remains buffered");
     assert_eq!(partition.buffer.batches.len(), 1);
-    assert!(!partition.flush_in_flight);
+    assert_eq!(partition.outstanding_flushes, 0);
   }
 }
 

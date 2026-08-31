@@ -29,6 +29,7 @@ pub use api::{
   WriteRequest,
   WriteResponse,
 };
+pub(crate) use config::{DEFAULT_MAX_SEGMENT_BYTES, effective_max_segment_bytes};
 pub use config::{RuntimeWriteEngineBuilder, TopicInfo, WriteConfig, build_runtime_metadata_store};
 pub use engine::{AdmissionController, WriteEngineBuilder, WriteEngineImpl};
 pub use hooks::{BrokerLifecycleHooks, NoopBrokerLifecycleHooks};

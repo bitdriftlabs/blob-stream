@@ -82,6 +82,24 @@ struct BlockingBlobStore {
   release: Arc<Semaphore>,
 }
 
+struct NotifyingBlobStore {
+  entered_tx: mpsc::UnboundedSender<String>,
+}
+
+struct GatedFirstMetadataStore {
+  inner: Arc<InMemoryMetadataStore>,
+  entered_tx: mpsc::UnboundedSender<()>,
+  release_first: Arc<Semaphore>,
+  first_write: AtomicBool,
+}
+
+struct BlockingFirstMetadataStore {
+  inner: Arc<InMemoryMetadataStore>,
+  entered_tx: mpsc::UnboundedSender<()>,
+  release_first: Arc<Semaphore>,
+  first_write: AtomicBool,
+}
+
 struct GatedReservationLeaseStore {
   inner: InMemoryProducerPartitionLeaseStore,
   entered_tx: mpsc::UnboundedSender<()>,
@@ -192,6 +210,108 @@ impl BlobStore for BlockingBlobStore {
       key: key.as_str().to_string(),
       source: anyhow::anyhow!("cache admission reads are not used by this test"),
     })
+  }
+}
+
+#[async_trait]
+impl BlobStore for NotifyingBlobStore {
+  async fn put(&self, key: &BlobKey, _payload: Bytes) -> Result<()> {
+    self
+      .entered_tx
+      .send(key.as_str().to_string())
+      .map_err(|_| anyhow::anyhow!("test receiver dropped"))
+  }
+
+  async fn get_range(&self, key: &BlobKey, range: ByteRange) -> BlobStoreResult<Bytes> {
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("reads are not used by this test: {range:?}"),
+    })
+  }
+
+  async fn get_with_cache_admission(
+    &self,
+    key: &BlobKey,
+    admission: &BlobCacheAdmission,
+  ) -> BlobStoreResult<Bytes> {
+    let _ = admission;
+    Err(BlobStoreError::Read {
+      key: key.as_str().to_string(),
+      source: anyhow::anyhow!("cache admission reads are not used by this test"),
+    })
+  }
+}
+
+#[async_trait]
+impl MetadataStore for GatedFirstMetadataStore {
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> MetadataWriteResult {
+    if self.first_write.swap(false, Ordering::SeqCst) {
+      self
+        .entered_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("test receiver dropped"))?;
+      self
+        .release_first
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("test gate closed"))?
+        .forget();
+      return Err(anyhow::anyhow!("metadata write failed").into());
+    }
+    self.inner.write_segment(metadata, fences, now_ts_ms).await
+  }
+
+  async fn scan_window_from_snowflake(
+    &self,
+    window: &blob_stream_types::TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
+  ) -> Result<Vec<SegmentMetadata>> {
+    self
+      .inner
+      .scan_window_from_snowflake(window, min_snowflake, consistency)
+      .await
+  }
+}
+
+#[async_trait]
+impl MetadataStore for BlockingFirstMetadataStore {
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> MetadataWriteResult {
+    if self.first_write.swap(false, Ordering::SeqCst) {
+      self
+        .entered_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("test receiver dropped"))?;
+      self
+        .release_first
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("test gate closed"))?
+        .forget();
+    }
+    self.inner.write_segment(metadata, fences, now_ts_ms).await
+  }
+
+  async fn scan_window_from_snowflake(
+    &self,
+    window: &blob_stream_types::TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
+  ) -> Result<Vec<SegmentMetadata>> {
+    self
+      .inner
+      .scan_window_from_snowflake(window, min_snowflake, consistency)
+      .await
   }
 }
 
@@ -2020,14 +2140,14 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
 }
 
 #[tokio::test(start_paused = true)]
-async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
+async fn same_partition_time_flushes_upload_in_parallel_and_publish_in_order() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
     now_ms,
   )));
   let shutdown_trigger = ComponentShutdownTrigger::default();
   let mut config = WriteConfig::with_defaults();
-  config.flush_max_bytes = 1;
+  config.flush_max_bytes = 1_024;
   config.flush_max_delay = TimeDuration::milliseconds(10);
 
   let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
@@ -2072,6 +2192,9 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
       })
       .await
   });
+  tokio::task::yield_now().await;
+  time_provider.advance(config.flush_max_delay);
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
   receive_blob_write(&mut entered_rx).await;
 
   let second_engine = Arc::clone(&engine);
@@ -2085,15 +2208,27 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
       .await
   });
   tokio::task::yield_now().await;
-  assert!(entered_rx.try_recv().is_err());
+  time_provider.advance(config.flush_max_delay);
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
+  receive_blob_write(&mut entered_rx).await;
   assert!(!second.is_finished());
+
+  let window = Window::for_timestamp(time_provider.now(), TimeDuration::seconds(60));
+  assert!(
+    metadata_store
+      .scan_window_from_snowflake(
+        &window.key("telemetry"),
+        None,
+        MetadataReadConsistency::Eventual,
+      )
+      .await?
+      .is_empty()
+  );
 
   release_first.add_permits(1);
   first.await??;
-  receive_blob_write(&mut entered_rx).await;
   second.await??;
 
-  let window = Window::for_timestamp(time_provider.now(), TimeDuration::seconds(60));
   let segments = metadata_store
     .scan_window_from_snowflake(
       &window.key("telemetry"),
@@ -2117,8 +2252,291 @@ async fn same_partition_flush_waits_for_prior_plan_to_persist() -> Result<()> {
   Ok(())
 }
 
+#[tokio::test(start_paused = true)]
+async fn failed_predecessor_prevents_successor_metadata_publication() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  let (blob_entered_tx, mut blob_entered_rx) = mpsc::unbounded_channel();
+  let (metadata_entered_tx, mut metadata_entered_rx) = mpsc::unbounded_channel();
+  let release_first_metadata = Arc::new(Semaphore::new(0));
+  let inner_metadata_store = Arc::new(InMemoryMetadataStore::new());
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config,
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+          metadata_window_size: TimeDuration::seconds(60),
+        },
+      )]),
+      Arc::new(NotifyingBlobStore {
+        entered_tx: blob_entered_tx,
+      }),
+      Arc::new(GatedFirstMetadataStore {
+        inner: inner_metadata_store.clone(),
+        entered_tx: metadata_entered_tx,
+        release_first: Arc::clone(&release_first_metadata),
+        first_write: AtomicBool::new(true),
+      }),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider.clone())
+    .build()?,
+  );
+
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  receive_blob_write(&mut blob_entered_rx).await;
+  metadata_entered_rx
+    .recv()
+    .await
+    .expect("first metadata write started");
+
+  let second_engine = Arc::clone(&engine);
+  let second = tokio::spawn(async move {
+    second_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![2], 20)],
+      })
+      .await
+  });
+  receive_blob_write(&mut blob_entered_rx).await;
+  assert!(metadata_entered_rx.try_recv().is_err());
+
+  release_first_metadata.add_permits(1);
+  assert!(first.await?.is_err());
+  assert!(second.await?.is_err());
+
+  let window = Window::for_timestamp(time_provider.now(), TimeDuration::seconds(60));
+  assert!(
+    inner_metadata_store
+      .scan_window_from_snowflake(
+        &window.key("telemetry"),
+        None,
+        MetadataReadConsistency::Eventual,
+      )
+      .await?
+      .is_empty()
+  );
+  Ok(())
+}
+
 #[tokio::test]
-async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> Result<()> {
+async fn successor_metadata_waits_for_successful_predecessor_publication() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  let (blob_entered_tx, mut blob_entered_rx) = mpsc::unbounded_channel();
+  let (metadata_entered_tx, mut metadata_entered_rx) = mpsc::unbounded_channel();
+  let release_first_metadata = Arc::new(Semaphore::new(0));
+  let metadata_store = Arc::new(InMemoryMetadataStore::new());
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config,
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+          metadata_window_size: TimeDuration::seconds(60),
+        },
+      )]),
+      Arc::new(NotifyingBlobStore {
+        entered_tx: blob_entered_tx,
+      }),
+      Arc::new(BlockingFirstMetadataStore {
+        inner: metadata_store.clone(),
+        entered_tx: metadata_entered_tx,
+        release_first: Arc::clone(&release_first_metadata),
+        first_write: AtomicBool::new(true),
+      }),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider.clone())
+    .build()?,
+  );
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  receive_blob_write(&mut blob_entered_rx).await;
+  metadata_entered_rx
+    .recv()
+    .await
+    .expect("first metadata write should start");
+
+  let second_engine = Arc::clone(&engine);
+  let second = tokio::spawn(async move {
+    second_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![2], 20)],
+      })
+      .await
+  });
+  receive_blob_write(&mut blob_entered_rx).await;
+  assert!(metadata_entered_rx.try_recv().is_err());
+
+  release_first_metadata.add_permits(1);
+  first.await??;
+  second.await??;
+  let window = Window::for_timestamp(time_provider.now(), TimeDuration::seconds(60));
+  let segments = metadata_store
+    .scan_window_from_snowflake(
+      &window.key("telemetry"),
+      None,
+      MetadataReadConsistency::Eventual,
+    )
+    .await?;
+  assert_eq!(segments.len(), 2);
+  Ok(())
+}
+
+#[tokio::test]
+async fn metadata_waiting_epochs_do_not_block_unrelated_blob_uploads() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  let (blob_entered_tx, mut blob_entered_rx) = mpsc::unbounded_channel();
+  let (metadata_entered_tx, mut metadata_entered_rx) = mpsc::unbounded_channel();
+  let release_first_metadata = Arc::new(Semaphore::new(0));
+  let metadata_store = Arc::new(InMemoryMetadataStore::new());
+  let topics = ["telemetry", "independent"]
+    .into_iter()
+    .map(|topic| {
+      (
+        topic.into(),
+        TopicInfo {
+          name: topic.into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+          metadata_window_size: TimeDuration::seconds(60),
+        },
+      )
+    })
+    .collect();
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config,
+      topics,
+      Arc::new(NotifyingBlobStore {
+        entered_tx: blob_entered_tx,
+      }),
+      Arc::new(GatedFirstMetadataStore {
+        inner: metadata_store,
+        entered_tx: metadata_entered_tx,
+        release_first: Arc::clone(&release_first_metadata),
+        first_write: AtomicBool::new(true),
+      }),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider)
+    .build()?,
+  );
+
+  let first_engine = Arc::clone(&engine);
+  let first = tokio::spawn(async move {
+    first_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 10)],
+      })
+      .await
+  });
+  receive_blob_write(&mut blob_entered_rx).await;
+  metadata_entered_rx
+    .recv()
+    .await
+    .expect("first metadata write should start");
+
+  let mut waiting_epochs = Vec::new();
+  for record in 2 ..= 4 {
+    let engine = Arc::clone(&engine);
+    waiting_epochs.push(tokio::spawn(async move {
+      engine
+        .produce_batch(WriteRequest {
+          topic: "telemetry".into(),
+          virtual_partition_id: 0,
+          records: vec![new_record(vec![record], i64::from(record))],
+        })
+        .await
+    }));
+    receive_blob_write(&mut blob_entered_rx).await;
+  }
+
+  let independent_engine = Arc::clone(&engine);
+  let independent = tokio::spawn(async move {
+    independent_engine
+      .produce_batch(WriteRequest {
+        topic: "independent".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![5], 50)],
+      })
+      .await
+  });
+  receive_blob_write(&mut blob_entered_rx).await;
+
+  release_first_metadata.add_permits(1);
+  assert!(first.await?.is_err());
+  for epoch in waiting_epochs {
+    assert!(epoch.await?.is_err());
+  }
+  independent.await??;
+  Ok(())
+}
+
+#[tokio::test]
+async fn membership_handoff_drains_pipelined_flushes_before_releasing_lease() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
     now_ms,
@@ -2189,6 +2607,7 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
       .await
   });
   tokio::task::yield_now().await;
+  receive_blob_write(&mut entered_rx).await;
   assert!(!buffered.is_finished());
 
   membership_tx.send(BrokerMembership::new(vec![BrokerNode {
@@ -2226,7 +2645,6 @@ async fn membership_handoff_drains_in_flight_flush_before_releasing_lease() -> R
 
   release.add_permits(1);
   first.await??;
-  receive_blob_write(&mut entered_rx).await;
 
   let still_held_by_a = lease_store
     .acquire_lease(

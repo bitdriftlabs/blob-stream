@@ -450,9 +450,9 @@ impl WriteEngineImpl {
         // and the await below.
         trace!(
           "broker partition drain state: topic={topic}, \
-           virtual_partition_id={virtual_partition_id}, flush_in_flight={}, \
+           virtual_partition_id={virtual_partition_id}, outstanding_flushes={}, \
            allocation_in_flight={}, buffered_batches={}, draining={}",
-          partition_state.flush_in_flight,
+          partition_state.outstanding_flushes,
           partition_state.allocation_in_flight,
           partition_state.buffer.batches.len(),
           partition_state.draining,

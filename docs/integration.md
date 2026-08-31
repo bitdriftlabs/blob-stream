@@ -59,7 +59,8 @@ batch-flush task.
 The configured producer record and payload-byte batch limits trigger a flush but do not split one
 bulk submission. A same-partition bulk can therefore exceed those thresholds before it is sealed;
 the dispatcher splits accumulated work only as needed to keep each grouped broker request within
-the 16 MiB wire limit.
+the 16 MiB decoded protobuf limit. The broker additionally allows the fixed five-byte unary gRPC
+envelope, so a legal decoded request is not rejected at the transport boundary.
 
 `ProducerRuntimeConfig` contains:
 
@@ -73,6 +74,8 @@ The producer returns an acknowledgement with the selected virtual partition and 
 Persistent `NOT_LEASE_HOLDER`, overload, or transport errors are retried until
 `retry_deadline_ms` expires. See [Metrics](metrics.md) and the broker ownership runbook in
 [Operations](operations.md) before changing retry or batch settings to hide an availability issue.
+An error result is not durable delivery; callers must inspect every result and apply their own
+retry or spooling policy when records cannot be lost.
 
 The optional `ProducerClient::diagnostics()` handle exposes the selected broker route, known
 membership, per-partition buffers, and bounded retry samples. Mount
