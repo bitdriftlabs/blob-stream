@@ -2731,6 +2731,8 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
   config.flush_max_delay = TimeDuration::milliseconds(60_000);
+  config.lease_duration = TimeDuration::seconds(10);
+  config.heartbeat_interval = TimeDuration::seconds(5);
 
   let (_membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
     node_id: "node-a".into(),
@@ -2781,6 +2783,7 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
   });
   receive_blob_write(&mut entered_rx).await;
 
+  let sleep_registrations = time_provider.sleep_registration_count();
   let shutdown = tokio::spawn(async move {
     shutdown_trigger.shutdown().await;
   });
@@ -2802,9 +2805,20 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
   assert!(matches!(held_by_a, LeaseAcquireOutcome::HeldByOther(_)));
   assert!(!shutdown.is_finished());
 
-  time_provider.wait_until_sleeping(1).await;
-  time_provider.advance(TimeDuration::seconds(11));
-  tokio::task::yield_now().await;
+  let heartbeat_sleep = tokio::time::timeout(
+    StdDuration::from_secs(1),
+    time_provider.wait_for_sleep_registration_after(sleep_registrations),
+  )
+  .await
+  .expect("drain did not schedule a heartbeat");
+  time_provider.advance(TimeDuration::seconds(5));
+  tokio::time::timeout(
+    StdDuration::from_secs(1),
+    time_provider.wait_for_sleep_registration_after(heartbeat_sleep),
+  )
+  .await
+  .expect("drain heartbeat did not complete and reschedule");
+  time_provider.advance(TimeDuration::seconds(6));
 
   let held_after_heartbeat = lease_store
     .acquire_lease(

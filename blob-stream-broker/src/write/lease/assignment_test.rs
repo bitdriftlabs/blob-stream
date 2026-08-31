@@ -1,10 +1,11 @@
 #![allow(clippy::unwrap_used)]
 
 use crate::write::{TopicInfo, WriteConfig, WriteEngineBuilder, WriteEngineImpl};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use bd_server_stats::stats::Collector;
 use bd_shutdown::ComponentShutdownTrigger;
+use bd_time::TimeProvider;
 use blob_stream_blob_store::InMemoryBlobStore;
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{
@@ -27,6 +28,7 @@ use blob_stream_types::{
 use protobuf::Chars;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration as StdDuration;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::{Semaphore, mpsc, watch};
@@ -35,6 +37,107 @@ struct BlockingReleaseLeaseStore {
   inner: InMemoryProducerPartitionLeaseStore,
   started_tx: mpsc::UnboundedSender<VirtualPartitionId>,
   release: Arc<Semaphore>,
+}
+
+struct TransientHeartbeatLeaseStore {
+  inner: InMemoryProducerPartitionLeaseStore,
+  heartbeat_failures_remaining: AtomicUsize,
+}
+
+#[async_trait]
+impl ProducerPartitionLeaseStore for TransientHeartbeatLeaseStore {
+  async fn get_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+  ) -> Result<Option<ProducerPartitionLease>> {
+    self.inner.get_lease(key).await
+  }
+
+  async fn acquire_lease(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    lease_session_id: String,
+    now: OffsetDateTime,
+    lease_duration: Duration,
+  ) -> Result<LeaseAcquireOutcome> {
+    self
+      .inner
+      .acquire_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .await
+  }
+
+  async fn acquire_lease_and_reserve_sequences(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    lease_session_id: String,
+    now: OffsetDateTime,
+    lease_duration: Duration,
+    reservation_size: Option<u64>,
+  ) -> Result<LeaseAcquireAndReserveOutcome> {
+    self
+      .inner
+      .acquire_lease_and_reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now,
+        lease_duration,
+        reservation_size,
+      )
+      .await
+  }
+
+  async fn heartbeat_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    lease_session_id: &str,
+    now: OffsetDateTime,
+    lease_duration: Duration,
+  ) -> Result<LeaseHeartbeatOutcome> {
+    if self
+      .heartbeat_failures_remaining
+      .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+        remaining.checked_sub(1)
+      })
+      .is_ok()
+    {
+      return Err(anyhow!("injected transient heartbeat failure"));
+    }
+    self
+      .inner
+      .heartbeat_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .await
+  }
+
+  async fn reserve_sequences(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    lease_session_id: &str,
+    now: OffsetDateTime,
+    reservation_size: u64,
+  ) -> Result<SequenceReservationOutcome> {
+    self
+      .inner
+      .reserve_sequences(key, holder_id, lease_session_id, now, reservation_size)
+      .await
+  }
+
+  async fn release_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    lease_session_id: &str,
+    now: OffsetDateTime,
+  ) -> Result<blob_stream_metadata_store::LeaseReleaseOutcome> {
+    self
+      .inner
+      .release_lease(key, holder_id, lease_session_id, now)
+      .await
+  }
 }
 
 #[async_trait]
@@ -376,6 +479,89 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
   assert_eq!(HashSet::from([first, second]), HashSet::from([0, 1]));
   release.add_permits(2);
   releases.await;
+}
+
+#[tokio::test]
+async fn transient_drain_heartbeat_failure_retries_before_lease_expiry() -> Result<()> {
+  let initial_time = offset_datetime_from_unix_millis(1_000);
+  let time_provider = ManualTimeProvider::new(initial_time);
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".into(),
+    virtual_partition_id: 0,
+  };
+  let lease_store: Arc<dyn ProducerPartitionLeaseStore> = Arc::new(TransientHeartbeatLeaseStore {
+    inner: InMemoryProducerPartitionLeaseStore::new(),
+    heartbeat_failures_remaining: AtomicUsize::new(1),
+  });
+  lease_store
+    .acquire_lease(
+      key.clone(),
+      "node-a".to_string(),
+      "session-a".to_string(),
+      initial_time,
+      Duration::seconds(10),
+    )
+    .await?;
+  let state = Arc::new(parking_lot::Mutex::new(
+    super::super::super::state::WriteState::default(),
+  ));
+  {
+    let mut state = state.lock();
+    let partition_state = state.partition_state_mut("telemetry", 0);
+    partition_state.outstanding_flushes = 1;
+    partition_state.lease_expiration_at = Some(initial_time + Duration::seconds(10));
+  }
+
+  let wait_for_drain = WriteEngineImpl::wait_for_partition_drain(
+    &lease_store,
+    &state,
+    &key,
+    "node-a",
+    "session-a",
+    &time_provider,
+    initial_time + Duration::seconds(5),
+    Duration::seconds(10),
+    Duration::seconds(5),
+  );
+  tokio::pin!(wait_for_drain);
+
+  let initial_sleep = tokio::select! {
+    () = &mut wait_for_drain => panic!("drain completed before the initial heartbeat"),
+    registration = time_provider.wait_for_sleep_registration_after(0) => registration,
+  };
+  time_provider.advance(Duration::seconds(5));
+  let retry_sleep = tokio::select! {
+    () = &mut wait_for_drain => panic!("drain completed before retrying the failed heartbeat"),
+    registration = time_provider.wait_for_sleep_registration_after(initial_sleep) => registration,
+  };
+  time_provider.advance(Duration::milliseconds(250));
+  tokio::select! {
+    () = &mut wait_for_drain => panic!("drain completed before retrying the failed heartbeat"),
+    registration = time_provider.wait_for_sleep_registration_after(retry_sleep) => {
+      let _ = registration;
+    },
+  }
+  time_provider.advance(Duration::seconds(5));
+
+  let takeover = lease_store
+    .acquire_lease(
+      key.clone(),
+      "node-b".to_string(),
+      "session-b".to_string(),
+      time_provider.now(),
+      Duration::seconds(10),
+    )
+    .await?;
+  assert!(matches!(takeover, LeaseAcquireOutcome::HeldByOther(_)));
+
+  {
+    let mut state = state.lock();
+    let partition_state = state.partition_state_mut("telemetry", 0);
+    partition_state.outstanding_flushes = 0;
+    partition_state.drain_notify.notify_waiters();
+  }
+  wait_for_drain.await;
+  Ok(())
 }
 
 async fn wait_for_all_partitions(mut predicate: impl AsyncFnMut() -> bool) -> bool {

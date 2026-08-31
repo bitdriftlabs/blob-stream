@@ -36,17 +36,41 @@ use time::OffsetDateTime;
 use time::ext::NumericalDuration;
 use tokio::sync::watch;
 
-const LEASE_ACQUISITION_RETRY_INITIAL_DELAY: time::Duration = time::Duration::milliseconds(250);
-const LEASE_ACQUISITION_RETRY_MAX_DELAY: time::Duration = time::Duration::seconds(2);
+const LEASE_RETRY_INITIAL_DELAY: time::Duration = time::Duration::milliseconds(250);
+const LEASE_RETRY_MAX_DELAY: time::Duration = time::Duration::seconds(2);
 
 //
-// PendingLeaseAcquisition
+// LeaseRetrySchedule
 //
 
 #[derive(Clone, Copy, Debug)]
-struct PendingLeaseAcquisition {
+struct LeaseRetrySchedule {
   next_retry_at: OffsetDateTime,
   retry_delay: time::Duration,
+}
+
+impl LeaseRetrySchedule {
+  fn new(next_retry_at: OffsetDateTime) -> Self {
+    Self {
+      next_retry_at,
+      retry_delay: LEASE_RETRY_INITIAL_DELAY,
+    }
+  }
+
+  fn schedule_retry(&mut self, now: OffsetDateTime) -> time::Duration {
+    let delay = self.retry_delay;
+    self.next_retry_at = now + delay;
+    self.retry_delay = self
+      .retry_delay
+      .saturating_mul(2)
+      .min(LEASE_RETRY_MAX_DELAY);
+    delay
+  }
+
+  fn reset(&mut self, next_retry_at: OffsetDateTime) {
+    self.next_retry_at = next_retry_at;
+    self.retry_delay = LEASE_RETRY_INITIAL_DELAY;
+  }
 }
 
 impl WriteEngineImpl {
@@ -107,7 +131,7 @@ impl WriteEngineImpl {
       let mut membership_updates_open = true;
       let mut assignment_activated = false;
       let mut previously_assigned: HashSet<(Chars, VirtualPartitionId)> = HashSet::new();
-      let mut pending_acquisitions: HashMap<(Chars, VirtualPartitionId), PendingLeaseAcquisition> =
+      let mut pending_acquisitions: HashMap<(Chars, VirtualPartitionId), LeaseRetrySchedule> =
         HashMap::new();
 
       loop {
@@ -325,19 +349,10 @@ impl WriteEngineImpl {
               }
             },
             Ok(LeaseAcquireAndReserveOutcome::HeldByOther(_)) => {
-              let retry =
-                pending_acquisitions
-                  .entry(partition)
-                  .or_insert(PendingLeaseAcquisition {
-                    next_retry_at: now + LEASE_ACQUISITION_RETRY_INITIAL_DELAY,
-                    retry_delay: LEASE_ACQUISITION_RETRY_INITIAL_DELAY,
-                  });
-              let scheduled_retry_delay = retry.retry_delay;
-              retry.next_retry_at = now + scheduled_retry_delay;
-              retry.retry_delay = retry
-                .retry_delay
-                .saturating_mul(2)
-                .min(LEASE_ACQUISITION_RETRY_MAX_DELAY);
+              let retry = pending_acquisitions
+                .entry(partition)
+                .or_insert_with(|| LeaseRetrySchedule::new(now));
+              let scheduled_retry_delay = retry.schedule_retry(now);
               debug!(
                 "broker lease acquisition deferred: holder_id={holder_id}, topic={topic}, \
                  virtual_partition_id={virtual_partition_id}, retry_at={}, retry_delay_ms={}",
@@ -388,11 +403,15 @@ impl WriteEngineImpl {
       virtual_partition_id,
     };
 
-    {
+    let next_heartbeat_at = {
       let mut state = state.lock();
       let partition_state = state.partition_state_mut(topic, virtual_partition_id);
       partition_state.draining = true;
-    }
+      partition_state.lease_expiration_at.map_or_else(
+        || time_provider.now(),
+        |expiration| expiration - heartbeat_interval,
+      )
+    };
     metrics.lease_drain_starts_total.inc();
     info!(
       "broker partition drain started: holder_id={holder_id}, topic={topic}, \
@@ -412,7 +431,7 @@ impl WriteEngineImpl {
       holder_id,
       lease_session_id,
       time_provider,
-      time_provider.now() + heartbeat_interval,
+      next_heartbeat_at,
       lease_duration,
       heartbeat_interval,
     )
@@ -511,11 +530,12 @@ impl WriteEngineImpl {
     holder_id: &str,
     lease_session_id: &str,
     time_provider: &dyn TimeProvider,
-    mut next_heartbeat_at: OffsetDateTime,
+    next_heartbeat_at: OffsetDateTime,
     lease_duration: time::Duration,
     heartbeat_interval: time::Duration,
   ) {
     let mut lease_held = true;
+    let mut heartbeat_retry = LeaseRetrySchedule::new(next_heartbeat_at);
     loop {
       let notified = state
         .lock()
@@ -555,7 +575,8 @@ impl WriteEngineImpl {
         key.topic, key.virtual_partition_id,
       );
       if lease_held {
-        let heartbeat_delay = (next_heartbeat_at - time_provider.now()).max(time::Duration::ZERO);
+        let heartbeat_delay =
+          (heartbeat_retry.next_retry_at - time_provider.now()).max(time::Duration::ZERO);
         tokio::select! {
           () = notified => {
             trace!(
@@ -582,7 +603,7 @@ impl WriteEngineImpl {
                 {
                   partition_state.lease_expiration_at = Some(lease.lease_expiration_at);
                 }
-                next_heartbeat_at = time_provider.now() + heartbeat_interval;
+                heartbeat_retry.reset(time_provider.now() + heartbeat_interval);
               },
               Ok(LeaseHeartbeatOutcome::HeldByOther(_) | LeaseHeartbeatOutcome::Expired) => {
                 lease_held = false;
@@ -594,13 +615,14 @@ impl WriteEngineImpl {
                 );
               },
               Err(error) => {
-                lease_held = false;
+                let retry_delay = heartbeat_retry.schedule_retry(time_provider.now());
                 warn_every!(
                   15.seconds(),
                   "broker partition drain lease heartbeat failed: holder_id={holder_id}, \
-                   topic={}, virtual_partition_id={}, error={error:#}",
+                   topic={}, virtual_partition_id={}, retry_delay_ms={}, error={error:#}",
                   key.topic,
                   key.virtual_partition_id,
+                  retry_delay.whole_milliseconds(),
                 );
               },
             }
