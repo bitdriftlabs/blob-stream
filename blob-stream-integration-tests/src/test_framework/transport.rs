@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use blob_stream_broker::write::{WriteEngine, WriteError, WriteRequest};
 use blob_stream_broker_discovery::BrokerNode;
-use blob_stream_producer::BrokerTransport as ProducerBrokerTransport;
+use blob_stream_producer::{BrokerTransport as ProducerBrokerTransport, ProducerCompression};
 use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchResponse,
   ProduceBatchesRequest,
@@ -660,7 +660,12 @@ impl ProducerBrokerTransport for InMemoryProducerTransport {
     broker_address: &Chars,
     request: ProduceBatchesRequest,
     request_timeout: Duration,
+    compression: ProducerCompression,
   ) -> Result<ProduceBatchesResponse> {
+    // This transport directly forwards decoded protobuf requests to the in-memory write engine.
+    // Compression only applies to the gRPC wire representation.
+    let _ = compression;
+
     let node_id = broker_address
       .as_str()
       .strip_prefix("inmemory://")
