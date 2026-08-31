@@ -154,16 +154,23 @@ pub fn compression_as_grpc(compression: ProducerCompression) -> Compression {
   }
 }
 
-/// Apply startup-only feature flags that affect this producer process's local batching and retry.
-pub fn apply_producer_startup_overrides(
-  feature_flags: &FeatureFlagsWatch,
-  runtime: &mut ProducerRuntimeConfig,
-) -> Result<()> {
-  let producer = runtime
-    .producer
-    .as_mut()
-    .ok_or_else(|| anyhow!("producer config is required"))?;
+/// Clone the static configuration and apply feature flags supported by a running producer.
+pub fn producer_config_with_runtime_overrides(
+  config: &ProducerConfig,
+  feature_flags: Option<&FeatureFlagsWatch>,
+) -> Result<ProducerConfig> {
+  let mut effective_config = config.clone();
+  if let Some(feature_flags) = feature_flags {
+    apply_producer_runtime_overrides(feature_flags, &mut effective_config)?;
+  }
+  validate_producer_config(&effective_config)?;
+  Ok(effective_config)
+}
 
+fn apply_producer_runtime_overrides(
+  feature_flags: &FeatureFlagsWatch,
+  producer: &mut ProducerConfig,
+) -> Result<()> {
   producer.max_batch_records = Some(flag_u32(
     feature_flags,
     MAX_BATCH_RECORDS_FEATURE_FLAG,
@@ -189,26 +196,40 @@ pub fn apply_producer_startup_overrides(
     RETRY_MAX_DELAY_FEATURE_FLAG,
     producer_retry_max_delay(producer),
   )?;
-  producer.connect_timeout = feature_flag_duration_milliseconds(
-    feature_flags,
-    CONNECT_TIMEOUT_FEATURE_FLAG,
-    producer_connect_timeout(producer),
-  )?;
   producer.request_timeout = feature_flag_duration_milliseconds(
     feature_flags,
     REQUEST_TIMEOUT_FEATURE_FLAG,
     producer_request_timeout(producer),
+  )?;
+  let compression_name = feature_flags.get_string(
+    COMPRESSION_FEATURE_FLAG,
+    &Arc::new(current_compression_name(producer_compression(producer))),
+  );
+  producer.compression = Some(parse_compression(compression_name.as_ref())?);
+  Ok(())
+}
+
+/// Apply startup-only feature flags that affect this producer process's local batching and retry.
+pub fn apply_producer_startup_overrides(
+  feature_flags: &FeatureFlagsWatch,
+  runtime: &mut ProducerRuntimeConfig,
+) -> Result<()> {
+  let producer = runtime
+    .producer
+    .as_mut()
+    .ok_or_else(|| anyhow!("producer config is required"))?;
+
+  apply_producer_runtime_overrides(feature_flags, producer)?;
+  producer.connect_timeout = feature_flag_duration_milliseconds(
+    feature_flags,
+    CONNECT_TIMEOUT_FEATURE_FLAG,
+    producer_connect_timeout(producer),
   )?;
   producer.max_request_concurrency = Some(flag_u64(
     feature_flags,
     MAX_REQUEST_CONCURRENCY_FEATURE_FLAG,
     producer_max_request_concurrency(producer),
   ));
-  let compression_name = feature_flags.get_string(
-    COMPRESSION_FEATURE_FLAG,
-    &Arc::new(current_compression_name(producer_compression(producer))),
-  );
-  producer.compression = Some(parse_compression(compression_name.as_ref())?);
   info!("blob-stream producer runtime config after applying feature flag overrides: {runtime}");
   Ok(())
 }

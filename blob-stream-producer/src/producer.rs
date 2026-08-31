@@ -17,6 +17,7 @@ use crate::config::{
   ProducerTopicConfig,
   apply_producer_startup_overrides,
   into_discovery,
+  producer_config_with_runtime_overrides,
   producer_flush_max_delay,
   producer_max_batch_bytes,
   producer_max_batch_records,
@@ -28,6 +29,7 @@ use crate::config::{
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use async_trait::async_trait;
+use bd_log_util::warn_every;
 use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Scope;
 use blob_stream_broker_discovery::{
@@ -57,7 +59,7 @@ pub use diagnostics::{
 use dispatch::{notify_unassigned_batches, send_grouped_batches_and_notify};
 use log::{debug, trace};
 use metrics::ProducerMetrics;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use protobuf::Chars;
 pub use retry::ProducerRetryClock;
 use routing::{ProducerRoutes, record_wire_sizes};
@@ -66,6 +68,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use thiserror::Error;
+use time::ext::NumericalDuration;
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, timeout};
@@ -162,6 +165,8 @@ pub trait ProducerClient: Send + Sync {
 /// Builder for a producer and its runtime dependencies.
 pub struct ProducerClientBuilder {
   config: ProducerConfig,
+  runtime_config: ProducerConfig,
+  feature_flags: Option<FeatureFlagsWatch>,
   topics: Vec<ProducerTopicConfig>,
   discovery: Arc<dyn BrokerDiscovery>,
   transport: Arc<dyn BrokerTransport>,
@@ -180,7 +185,9 @@ impl ProducerClientBuilder {
     metrics_scope: Scope,
   ) -> Self {
     Self {
+      runtime_config: config.clone(),
       config,
+      feature_flags: None,
       topics,
       discovery,
       transport,
@@ -193,6 +200,16 @@ impl ProducerClientBuilder {
   #[must_use]
   pub fn retry_clock(mut self, retry_clock: Arc<dyn ProducerRetryClock>) -> Self {
     self.retry_clock = retry_clock;
+    self
+  }
+
+  fn runtime_feature_flags(
+    mut self,
+    runtime_config: ProducerConfig,
+    feature_flags: FeatureFlagsWatch,
+  ) -> Self {
+    self.runtime_config = runtime_config;
+    self.feature_flags = Some(feature_flags);
     self
   }
 
@@ -209,9 +226,8 @@ impl ProducerClientBuilder {
 /// Default producer implementation with discovery, batching, and retry handling.
 pub struct ProducerClientImpl {
   config: ProducerConfig,
+  runtime_settings: Arc<RwLock<Arc<ProducerConfig>>>,
   writer_id: u32,
-  max_batch_records: usize,
-  max_batch_bytes: usize,
   topics: HashMap<Chars, ProducerTopicConfig>,
   membership_rx: watch::Receiver<BrokerMembership>,
   metrics: Arc<ProducerMetrics>,
@@ -226,10 +242,11 @@ pub struct ProducerClientImpl {
 // ProducerDispatchContext
 //
 
-// Immutable dependencies shared by the flush coordinator and its dispatch tasks. Keeping these
-// together makes each task capture one Arc rather than rebuilding its closure from every field.
+// Shared dependencies for the flush coordinator and dispatch tasks. Each dispatch captures the
+// effective producer config as one Arc, so retries retain a consistent local snapshot.
 pub(in crate::producer) struct ProducerDispatchContext {
   pub(in crate::producer) config: ProducerConfig,
+  pub(in crate::producer) runtime_settings: Arc<RwLock<Arc<ProducerConfig>>>,
   pub(in crate::producer) topics: HashMap<Chars, ProducerTopicConfig>,
   pub(in crate::producer) membership_rx: watch::Receiver<BrokerMembership>,
   pub(in crate::producer) transport: Arc<dyn BrokerTransport>,
@@ -260,6 +277,14 @@ impl ProducerClientImpl {
     runtime: ProducerRuntimeConfig,
     metrics_scope: Scope,
   ) -> Result<Self> {
+    Self::from_runtime_config_inner(runtime, metrics_scope, None).await
+  }
+
+  async fn from_runtime_config_inner(
+    runtime: ProducerRuntimeConfig,
+    metrics_scope: Scope,
+    runtime_feature_flags: Option<(ProducerConfig, FeatureFlagsWatch)>,
+  ) -> Result<Self> {
     validate_runtime_config(&runtime)?;
     let config = runtime
       .producer
@@ -273,9 +298,17 @@ impl ProducerClientImpl {
     let discovery = into_discovery(discovery_config)?;
     let transport: Arc<dyn BrokerTransport> = Arc::new(GrpcBrokerTransport::new(config.clone()));
 
-    ProducerClientBuilder::new(config, runtime.topics, discovery, transport, metrics_scope)
-      .build()
-      .await
+    let builder =
+      ProducerClientBuilder::new(config, runtime.topics, discovery, transport, metrics_scope);
+    match runtime_feature_flags {
+      Some((runtime_config, feature_flags)) => {
+        builder
+          .runtime_feature_flags(runtime_config, feature_flags)
+          .build()
+          .await
+      },
+      None => builder.build().await,
+    }
   }
 
   /// Construct a producer after applying its startup-only feature flag overrides.
@@ -284,9 +317,20 @@ impl ProducerClientImpl {
     metrics_scope: Scope,
     feature_flags: &FeatureFlagsWatch,
   ) -> Result<Self> {
+    validate_runtime_config(&runtime)?;
+    let configured_producer = runtime
+      .producer
+      .as_ref()
+      .ok_or_else(|| anyhow!("producer config is required"))?
+      .clone();
     apply_producer_startup_overrides(feature_flags, &mut runtime)?;
     debug!("constructing producer after applying startup-only feature flag overrides");
-    Self::from_runtime_config(runtime, metrics_scope).await
+    Self::from_runtime_config_inner(
+      runtime,
+      metrics_scope,
+      Some((configured_producer, feature_flags.clone())),
+    )
+    .await
   }
 
   /// Construct a producer from explicit configuration and runtime dependencies.
@@ -305,6 +349,8 @@ impl ProducerClientImpl {
   async fn build(builder: ProducerClientBuilder) -> Result<Self> {
     let ProducerClientBuilder {
       config,
+      runtime_config,
+      feature_flags,
       topics,
       discovery,
       transport,
@@ -313,9 +359,10 @@ impl ProducerClientImpl {
     } = builder;
 
     validate_producer_config(&config)?;
+    let runtime_settings = Arc::new(RwLock::new(Arc::new(
+      producer_config_with_runtime_overrides(&runtime_config, feature_flags.as_ref())?,
+    )));
     let writer_id = producer_writer_id(&config);
-    let max_batch_records = producer_max_batch_records(&config) as usize;
-    let max_batch_bytes = producer_max_batch_bytes(&config) as usize;
 
     let mut topic_map = HashMap::new();
     for topic in topics {
@@ -361,6 +408,7 @@ impl ProducerClientImpl {
     let flush_notify = Arc::new(Notify::new());
     let dispatch_context = Arc::new(ProducerDispatchContext {
       config: config.clone(),
+      runtime_settings: Arc::clone(&runtime_settings),
       topics: topic_map.clone(),
       membership_rx: membership_rx.clone(),
       transport: Arc::clone(&transport),
@@ -371,14 +419,15 @@ impl ProducerClientImpl {
       request_permits,
     });
 
+    let initial_runtime_config = Arc::clone(&runtime_settings.read());
     log::info!(
       "producer initialized: writer_id={}, topics={}, flush_max_delay_ms={}, \
        max_batch_records={}, max_batch_bytes={}",
       writer_id,
       topic_map.len(),
-      producer_flush_max_delay(&config).whole_milliseconds(),
-      producer_max_batch_records(&config),
-      producer_max_batch_bytes(&config)
+      producer_flush_max_delay(initial_runtime_config.as_ref()).whole_milliseconds(),
+      producer_max_batch_records(initial_runtime_config.as_ref()),
+      producer_max_batch_bytes(initial_runtime_config.as_ref())
     );
 
     let flush_task = Self::spawn_flush_loop(
@@ -387,13 +436,14 @@ impl ProducerClientImpl {
       membership_rx.clone(),
       Arc::clone(&dispatch_task_permits),
       Arc::clone(&flush_notify),
+      runtime_config,
+      feature_flags,
     );
 
     Ok(Self {
       config,
+      runtime_settings,
       writer_id,
-      max_batch_records,
-      max_batch_bytes,
       topics: topic_map,
       membership_rx,
       metrics,
@@ -411,18 +461,23 @@ impl ProducerClientImpl {
     mut membership_rx: watch::Receiver<BrokerMembership>,
     dispatch_task_permits: Arc<Semaphore>,
     flush_notify: Arc<Notify>,
+    runtime_config: ProducerConfig,
+    feature_flags: Option<FeatureFlagsWatch>,
   ) -> JoinHandle<()> {
     // Every flush trigger drains and packs all buffered partitions, maximizing each broker-scoped
     // RPC. Membership updates refresh routing but preserve the current batching cadence.
     tokio::spawn(async move {
-      let flush_delay = StdDuration::try_from(producer_flush_max_delay(&dispatch_context.config))
-        .expect("producer config validation requires a positive flush max delay");
+      let flush_delay = StdDuration::try_from(producer_flush_max_delay(
+        dispatch_context.runtime_settings.read().as_ref(),
+      ))
+      .expect("producer config validation requires a positive flush max delay");
       let flush_sleep = tokio::time::sleep(flush_delay);
       tokio::pin!(flush_sleep);
       // Keep dispatches owned by the flush task so producer shutdown cancels RPCs and retries.
       // The task permit bounds dispatch lifetimes; request permits bound active transport calls.
       let mut dispatches = JoinSet::new();
       let mut membership_closed = false;
+      let mut feature_flag_changes = feature_flags;
 
       loop {
         let flush_triggered_by_size = tokio::select! {
@@ -439,6 +494,39 @@ impl ProducerClientImpl {
               membership_closed = true;
             }
             // Membership affects the next route selection, not when buffered work is sent.
+            None
+          },
+          feature_flag_change = async {
+            let Some(feature_flags) = feature_flag_changes.as_mut() else {
+              std::future::pending().await
+            };
+            feature_flags.changed().await
+          }, if feature_flag_changes.is_some() => {
+            match feature_flag_change {
+              Ok(()) => {
+                let feature_flags = feature_flag_changes
+                  .as_mut()
+                  .expect("feature flag watch remains present after a successful change");
+                feature_flags.borrow_and_update();
+                match producer_config_with_runtime_overrides(&runtime_config, Some(feature_flags)) {
+                  Ok(updated_config) => {
+                    *dispatch_context.runtime_settings.write() = Arc::new(updated_config);
+                    debug!("producer runtime feature flag settings reloaded");
+                  },
+                  Err(error) => {
+                    warn_every!(
+                      15.seconds(),
+                      "producer runtime feature flag snapshot was invalid; retaining previous \
+                       settings: {error}"
+                    );
+                  },
+                }
+              },
+              Err(error) => {
+                feature_flag_changes = None;
+                debug!("producer feature flag watch closed: {error}");
+              },
+            }
             None
           },
           () = &mut flush_sleep => Some(false),
@@ -482,7 +570,13 @@ impl ProducerClientImpl {
 
           // Each trigger-driven drain starts a new maximum-delay window for subsequent partial
           // batches.
-          flush_sleep.as_mut().reset(Instant::now() + flush_delay);
+          let next_flush_delay = StdDuration::try_from(producer_flush_max_delay(
+            dispatch_context.runtime_settings.read().as_ref(),
+          ))
+          .expect("producer config validation requires a positive flush max delay");
+          flush_sleep
+            .as_mut()
+            .reset(Instant::now() + next_flush_delay);
         }
 
         // Acquire a task slot before removing the next ready group. The ready broker FIFO keeps
@@ -517,6 +611,7 @@ impl ProducerClient for ProducerClientImpl {
     if records.is_empty() {
       return Vec::new();
     }
+    let runtime_config = Arc::clone(&self.runtime_settings.read());
 
     // Validate, partition, and measure before entering shared state. Invalid input occupies its
     // result slot but does not prevent valid siblings from being accepted.
@@ -581,8 +676,8 @@ impl ProducerClient for ProducerClientImpl {
             encoded_record_size: record.encoded_record_size,
             request_base_size: record.request_base_size,
           },
-          self.max_batch_records,
-          self.max_batch_bytes,
+          producer_max_batch_records(runtime_config.as_ref()) as usize,
+          producer_max_batch_bytes(runtime_config.as_ref()) as usize,
         );
       }
       size_flush_requested
@@ -610,6 +705,7 @@ impl ProducerClient for ProducerClientImpl {
   fn diagnostics(&self) -> Option<ProducerDiagnostics> {
     Some(ProducerDiagnostics::new(
       self.config.clone(),
+      Arc::clone(&self.runtime_settings),
       self.topics.clone(),
       self.membership_rx.clone(),
       self.routes.clone(),

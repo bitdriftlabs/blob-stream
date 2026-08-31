@@ -6,6 +6,7 @@ use super::{
   ProducerRuntimeConfig,
   ProducerTopicConfig,
   apply_producer_startup_overrides,
+  producer_config_with_runtime_overrides,
   producer_flush_max_delay,
   producer_max_batch_bytes,
   producer_max_batch_records,
@@ -112,6 +113,93 @@ fn startup_overrides_reject_batch_record_overflow() {
     error
       .to_string()
       .contains("feature flag blob_stream_producer_max_batch_records exceeds u32")
+  );
+}
+
+#[test]
+fn runtime_overrides_adopt_live_values_and_revert_to_static_config() {
+  let flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag("blob_stream_producer_max_batch_records", 321)
+      .with_integer_flag("blob_stream_producer_max_batch_bytes", 2_048)
+      .with_integer_flag("blob_stream_producer_flush_max_delay_ms", 10)
+      .with_integer_flag("blob_stream_producer_retry_base_delay_ms", 20)
+      .with_integer_flag("blob_stream_producer_retry_max_delay_ms", 30)
+      .with_integer_flag("blob_stream_producer_request_timeout_ms", 40)
+      .with_string_flag("blob_stream_producer_compression", "none"),
+  ));
+  let runtime = runtime_config();
+  let producer = runtime.producer.as_ref().unwrap();
+  let feature_flags = flags.snapshot_watch();
+
+  let settings = producer_config_with_runtime_overrides(producer, Some(&feature_flags)).unwrap();
+  assert_eq!(producer_max_batch_records(&settings), 321);
+  assert_eq!(producer_max_batch_bytes(&settings), 2_048);
+  assert_eq!(
+    producer_flush_max_delay(&settings),
+    Duration::milliseconds(10)
+  );
+  assert_eq!(
+    super::producer_retry_base_delay(&settings),
+    Duration::milliseconds(20)
+  );
+  assert_eq!(
+    producer_retry_max_delay(&settings),
+    Duration::milliseconds(30)
+  );
+  assert_eq!(
+    super::producer_request_timeout(&settings),
+    Duration::milliseconds(40)
+  );
+  assert_eq!(
+    super::producer_compression(&settings),
+    ProducerCompression::PRODUCER_COMPRESSION_NONE
+  );
+
+  flags.update(Arc::new(DefaultFeatureFlags::default()));
+
+  let settings = producer_config_with_runtime_overrides(producer, Some(&feature_flags)).unwrap();
+  assert_eq!(producer_max_batch_records(&settings), 10_000);
+  assert_eq!(producer_max_batch_bytes(&settings), 42);
+  assert_eq!(
+    producer_flush_max_delay(&settings),
+    Duration::milliseconds(123)
+  );
+  assert_eq!(
+    super::producer_retry_base_delay(&settings),
+    Duration::milliseconds(25)
+  );
+  assert_eq!(
+    producer_retry_max_delay(&settings),
+    Duration::milliseconds(456)
+  );
+  assert_eq!(
+    super::producer_request_timeout(&settings),
+    Duration::seconds(5)
+  );
+  assert_eq!(
+    super::producer_compression(&settings),
+    ProducerCompression::PRODUCER_COMPRESSION_SNAPPY
+  );
+}
+
+#[test]
+fn runtime_overrides_reject_invalid_live_snapshot() {
+  let flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag("blob_stream_producer_max_batch_records", 0)
+      .with_integer_flag("blob_stream_producer_retry_base_delay_ms", 100)
+      .with_integer_flag("blob_stream_producer_retry_max_delay_ms", 10)
+      .with_string_flag("blob_stream_producer_compression", "unsupported"),
+  ));
+  let runtime = runtime_config();
+  let producer = runtime.producer.as_ref().unwrap();
+  let feature_flags = flags.snapshot_watch();
+
+  let error = producer_config_with_runtime_overrides(producer, Some(&feature_flags)).unwrap_err();
+  assert_eq!(
+    error.to_string(),
+    "invalid blob-stream compression override: unsupported"
   );
 }
 

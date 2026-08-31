@@ -1,7 +1,7 @@
 use crate::config::{
+  ProducerCompression,
   ProducerConfig,
   compression_as_grpc,
-  producer_compression,
   producer_connect_timeout,
   producer_max_request_concurrency,
 };
@@ -38,6 +38,7 @@ pub trait BrokerTransport: Send + Sync {
     broker_address: &Chars,
     request: ProduceBatchesRequest,
     request_timeout: Duration,
+    compression: ProducerCompression,
   ) -> Result<ProduceBatchesResponse>;
 
   /// Retire any transport resources for brokers absent from the current discovery snapshot.
@@ -109,6 +110,7 @@ impl BrokerTransport for GrpcBrokerTransport {
     broker_address: &Chars,
     request: ProduceBatchesRequest,
     request_timeout: Duration,
+    compression: ProducerCompression,
   ) -> Result<ProduceBatchesResponse> {
     let client = self.client_for_address(broker_address)?;
     let service_method = ServiceMethod::<ProduceBatchesRequest, ProduceBatchesResponse>::new(
@@ -123,7 +125,7 @@ impl BrokerTransport for GrpcBrokerTransport {
         None,
         request,
         request_timeout,
-        compression_as_grpc(producer_compression(&self.config)),
+        compression_as_grpc(compression),
       )
       .await
       .map_err(|error| anyhow!(error.to_string()))?;
