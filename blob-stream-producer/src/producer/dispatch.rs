@@ -9,11 +9,12 @@ use super::retry::{
 use super::routing::{BrokerBatchGroup, produce_batch_request};
 use super::state::BufferedBatch;
 use super::{ProducerAck, ProducerDispatchContext, ProducerError};
-use crate::config::{producer_request_timeout, producer_retry_deadline};
+use crate::config::{producer_compression, producer_request_timeout, producer_retry_deadline};
 use anyhow::anyhow;
 use bd_log_util::warn_every;
 use blob_stream_proto::protos::blobstream::v1::broker::{ProduceBatchesRequest, ProduceStatus};
 use futures::stream::{FuturesUnordered, StreamExt};
+use std::sync::Arc;
 use std::time::Duration;
 use time::ext::NumericalDuration;
 use tokio::sync::OwnedSemaphorePermit;
@@ -60,6 +61,7 @@ pub(super) async fn send_grouped_batches_and_notify(
 ) -> Result<(), ProducerError> {
   // The task permit bounds retained group work while request permits bound active transport calls.
   let _dispatch_task_permit = dispatch_task_permit;
+  let runtime_config = Arc::clone(&context.runtime_settings.read());
   let retry_started_at = context.retry_clock.now();
   let initial_broker_address = group.broker_address.clone();
 
@@ -72,7 +74,7 @@ pub(super) async fn send_grouped_batches_and_notify(
   let retry_deadline = retry_started_at
     + Duration::try_from(producer_retry_deadline(&context.config))
       .expect("producer config validation requires a positive retry deadline");
-  let request_timeout = Duration::try_from(producer_request_timeout(&context.config))
+  let request_timeout = Duration::try_from(producer_request_timeout(runtime_config.as_ref()))
     .expect("producer config validation requires a positive request timeout")
     .min(
       Duration::try_from(producer_retry_deadline(&context.config))
@@ -111,9 +113,12 @@ pub(super) async fn send_grouped_batches_and_notify(
     bd_server_stats::stats::StackAutoGauge::new(&context.metrics.active_requests);
   let response = tokio::time::timeout(
     request_timeout,
-    context
-      .transport
-      .produce_batches(&group.broker_address, request, request_timeout),
+    context.transport.produce_batches(
+      &group.broker_address,
+      request,
+      request_timeout,
+      producer_compression(runtime_config.as_ref()),
+    ),
   )
   .await
   .unwrap_or_else(|_| {
@@ -191,12 +196,14 @@ pub(super) async fn send_grouped_batches_and_notify(
   // retries become a material source of allocation or scheduler pressure.
   let mut retries = FuturesUnordered::new();
   for (batch, initial_response) in retryable_batches {
+    let retry_config = Arc::clone(&runtime_config);
     let response_broker_address = initial_response
       .as_ref()
       .map(|_| initial_broker_address.clone());
     retries.push(async move {
       let result = send_batch_with_retry(
         &context.config,
+        retry_config.as_ref(),
         &context.topics,
         &context.routes,
         &context.membership_rx,

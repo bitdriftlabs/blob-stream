@@ -37,13 +37,14 @@ blob ranges from broker caches, retrying direct storage only after a retryable b
 | Broker blob-cache startup | `blob_stream_broker_blob_cache_idle_ttl_ms` | Restart the broker | Sets positive idle retention for complete immutable blobs; absent means 10 seconds. Blob requests remain limited to 16 MiB; broker responses allow the effective `max_segment_bytes` amount of requested compressed bytes, covering normal segment objects. The broker admits each object from its reported content length and current cgroup headroom before reading its body. Cgroup-aware memory admission can flush entries or disable cache admission without disabling direct consumer reads. |
 | Broker write path | `blob_stream_broker_flush_max_bytes`, `blob_stream_broker_flush_max_delay_ms`, `blob_stream_broker_max_segment_bytes` | Live | A time-due local partition always pulls every available buffered non-draining local topic section into bounded shared objects. Positive byte overrides and positive delay overrides no greater than `flush_max_delay` apply at the next scheduler timer cycle; invalid values retain static configuration. Positive segment-cap overrides apply to future flush plans. Independently byte-triggered and lease-drain work remain local. |
 | Consumer startup | `blob_stream_consumer_idle_poll_delay_ms`, `blob_stream_consumer_max_idle_poll_delay_ms`, `blob_stream_consumer_lease_duration_ms`, `blob_stream_consumer_heartbeat_interval_ms`, `blob_stream_consumer_rebalance_interval_ms` | Rebuild or restart the iterator | Changes local polling and consumer-group scheduling. Persistent lease state stores absolute expiry timestamps, so members may use different local durations. |
-| Producer startup | `blob_stream_producer_max_batch_records`, `blob_stream_producer_max_batch_bytes`, `blob_stream_producer_flush_max_delay_ms`, `blob_stream_producer_retry_base_delay_ms`, `blob_stream_producer_retry_max_delay_ms`, `blob_stream_producer_connect_timeout_ms`, `blob_stream_producer_request_timeout_ms`, `blob_stream_producer_max_request_concurrency`, `blob_stream_producer_compression` | Recreate or restart the producer | Changes local batching, retry, request, concurrency, and compression behavior. |
+| Producer batching and dispatch | `blob_stream_producer_max_batch_records`, `blob_stream_producer_max_batch_bytes`, `blob_stream_producer_flush_max_delay_ms`, `blob_stream_producer_retry_base_delay_ms`, `blob_stream_producer_retry_max_delay_ms`, `blob_stream_producer_request_timeout_ms`, `blob_stream_producer_compression` | Live | Batch limits apply to the next `produce` admission, flush delay to the next timer cycle, and retry/request/compression settings to the next broker group dispatch. A group and all of its retries retain one snapshot. |
+| Producer startup | `blob_stream_producer_connect_timeout_ms`, `blob_stream_producer_max_request_concurrency` | Recreate or restart the producer | These settings construct cached gRPC clients and producer-wide dispatch/request permit pools. |
 
 Validate feature-flag rollouts against the configured fallback values. Missing or nonpositive broker
 write-path overrides, and broker delay overrides above `flush_max_delay`, retain the configured
-value. Invalid producer duration or integer overrides fail producer construction; invalid consumer
-startup duration overrides fail iterator construction. A running consumer continues with its
-already-applied startup settings.
+value. Invalid producer overrides fail construction; a running producer retains its previous
+effective values when a runtime snapshot is invalid. Invalid consumer startup duration overrides
+fail iterator construction. A running consumer continues with its already-applied startup settings.
 
 ## HTTP Endpoints
 

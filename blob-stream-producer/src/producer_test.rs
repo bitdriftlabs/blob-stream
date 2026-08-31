@@ -28,13 +28,22 @@ use super::{
   ProducerRetryReason,
   compute_virtual_partition_id,
 };
-use crate::config::{producer_config_with_defaults, producer_writer_id, validate_producer_config};
+use crate::config::{
+  producer_compression,
+  producer_config_with_defaults,
+  producer_max_batch_records,
+  producer_request_timeout,
+  producer_writer_id,
+  validate_producer_config,
+};
 use crate::test::ProducerClientTestExt;
 use crate::{ProducerCompression, ProducerConfig, ProducerTopicConfig};
 use anyhow::anyhow;
 use async_trait::async_trait;
+use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
 use bd_server_stats::test::util::stats::Helper;
+use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode, BrokerPartition};
 use blob_stream_proto::protos::blobstream::v1::broker::{
   ProduceBatchRequest,
@@ -58,6 +67,22 @@ use tokio::time::{Instant, timeout};
 fn unused_record_completion() -> RecordCompletion {
   let (completion, _result_rx) = BulkCompletion::new(vec![None], 1);
   RecordCompletion::new(completion, 0)
+}
+
+async fn wait_for_runtime_config(
+  producer: &ProducerClientImpl,
+  expected: impl Fn(&ProducerConfig) -> bool,
+) {
+  timeout(Duration::from_secs(1), async {
+    loop {
+      if expected(producer.runtime_settings.read().as_ref()) {
+        return;
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("producer runtime config should reload after a feature flag update");
 }
 
 #[tokio::test]
@@ -126,6 +151,8 @@ impl blob_stream_broker_discovery::BrokerDiscovery for TestBrokerDiscovery {
 struct SentBatch {
   broker_address: Chars,
   batches: Vec<ProduceBatchRequest>,
+  request_timeout: Duration,
+  compression: ProducerCompression,
 }
 
 #[derive(Default)]
@@ -161,12 +188,15 @@ impl super::BrokerTransport for FakeBrokerTransport {
     broker_address: &Chars,
     request: ProduceBatchesRequest,
     request_timeout: Duration,
+    compression: ProducerCompression,
   ) -> anyhow::Result<ProduceBatchesResponse> {
     assert!(!request_timeout.is_zero());
     let batch_count = request.batches.len();
     self.sent.lock().await.push(SentBatch {
       broker_address: broker_address.clone(),
       batches: request.batches,
+      request_timeout,
+      compression,
     });
 
     self.responses.lock().await.pop_front().map_or_else(
@@ -204,6 +234,7 @@ impl super::BrokerTransport for MembershipUpdateTransport {
     broker_address: &Chars,
     request: ProduceBatchesRequest,
     request_timeout: Duration,
+    compression: ProducerCompression,
   ) -> anyhow::Result<ProduceBatchesResponse> {
     assert!(!request_timeout.is_zero());
     let attempt = {
@@ -211,6 +242,8 @@ impl super::BrokerTransport for MembershipUpdateTransport {
       sent.push(SentBatch {
         broker_address: broker_address.clone(),
         batches: request.batches,
+        request_timeout,
+        compression,
       });
       sent.len()
     };
@@ -262,6 +295,7 @@ impl super::BrokerTransport for GroupedRetryGateTransport {
     _broker_address: &Chars,
     request: ProduceBatchesRequest,
     request_timeout: Duration,
+    _compression: ProducerCompression,
   ) -> anyhow::Result<ProduceBatchesResponse> {
     assert!(!request_timeout.is_zero());
     if request.batches.len() > 1 {
@@ -310,6 +344,7 @@ impl super::BrokerTransport for MixedGroupedRetryGateTransport {
     _broker_address: &Chars,
     request: ProduceBatchesRequest,
     request_timeout: Duration,
+    _compression: ProducerCompression,
   ) -> anyhow::Result<ProduceBatchesResponse> {
     assert!(!request_timeout.is_zero());
     if request.batches.len() > 1 {
@@ -360,6 +395,7 @@ impl super::BrokerTransport for GatedBrokerTransport {
     _broker_address: &Chars,
     request: ProduceBatchesRequest,
     request_timeout: Duration,
+    _compression: ProducerCompression,
   ) -> anyhow::Result<ProduceBatchesResponse> {
     assert!(!request_timeout.is_zero());
     for batch in &request.batches {
@@ -1010,6 +1046,7 @@ async fn bad_request_status_is_terminal_in_retry_path() {
 
   let error = send_batch_with_retry(
     &config,
+    &config,
     &topics,
     &routes,
     &membership,
@@ -1086,6 +1123,7 @@ async fn not_lease_holder_waits_longer_when_membership_is_unchanged() {
   };
 
   let result = send_batch_with_retry(
+    &config,
     &config,
     &topics,
     &routes,
@@ -1352,6 +1390,131 @@ async fn batches_by_partition_and_acks_waiters() {
   let sent = transport.sent.lock().await;
   assert_eq!(sent.len(), 1);
   assert_eq!(sent[0].batches[0].records.len(), 2);
+}
+
+#[tokio::test]
+async fn live_batch_limit_is_sampled_when_records_are_admitted() {
+  let mut config = default_config();
+  config.max_batch_records = Some(2);
+  config.flush_max_delay = TimeDuration::seconds(60).into_proto();
+  let flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let transport = Arc::new(FakeBrokerTransport::default());
+  let producer = Arc::new(
+    ProducerClientBuilder::new(
+      config.clone(),
+      vec![topic_config()],
+      discovery,
+      transport.clone(),
+      metrics_scope(),
+    )
+    .runtime_feature_flags(config, flags.snapshot_watch())
+    .build()
+    .await
+    .unwrap(),
+  );
+
+  let first_producer = Arc::clone(&producer);
+  let first = tokio::spawn(async move {
+    first_producer
+      .produce_one(ProducerRecord::new(
+        "telemetry".into(),
+        b"live-batch-limit".to_vec(),
+        vec![1].into(),
+        100,
+      ))
+      .await
+  });
+  wait_for_buffered_partitions(producer.as_ref(), 1).await;
+
+  flags.update(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag("blob_stream_producer_max_batch_records", 1),
+  ));
+  wait_for_runtime_config(producer.as_ref(), |runtime_config| {
+    producer_max_batch_records(runtime_config) == 1
+  })
+  .await;
+  let second_producer = Arc::clone(&producer);
+  let second = tokio::spawn(async move {
+    second_producer
+      .produce_one(ProducerRecord::new(
+        "telemetry".into(),
+        b"live-batch-limit".to_vec(),
+        vec![2].into(),
+        101,
+      ))
+      .await
+  });
+
+  first.await.unwrap().unwrap();
+  second.await.unwrap().unwrap();
+  let sent = transport.sent.lock().await;
+  assert_eq!(sent.len(), 1);
+  assert_eq!(sent[0].batches[0].records.len(), 2);
+}
+
+#[tokio::test]
+async fn live_dispatch_settings_apply_to_the_next_group() {
+  let config = default_config();
+  let flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
+  let discovery = Arc::new(TestBrokerDiscovery::new(membership()));
+  let transport = Arc::new(FakeBrokerTransport::default());
+  let producer = ProducerClientBuilder::new(
+    config.clone(),
+    vec![topic_config()],
+    discovery,
+    transport.clone(),
+    metrics_scope(),
+  )
+  .runtime_feature_flags(config, flags.snapshot_watch())
+  .build()
+  .await
+  .unwrap();
+
+  producer
+    .produce_one(ProducerRecord::new(
+      "telemetry".into(),
+      b"initial-dispatch-settings".to_vec(),
+      vec![1].into(),
+      100,
+    ))
+    .await
+    .unwrap();
+
+  flags.update(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag("blob_stream_producer_request_timeout_ms", 10)
+      .with_string_flag("blob_stream_producer_compression", "none"),
+  ));
+  wait_for_runtime_config(&producer, |runtime_config| {
+    producer_request_timeout(runtime_config) == TimeDuration::milliseconds(10)
+      && producer_compression(runtime_config) == ProducerCompression::PRODUCER_COMPRESSION_NONE
+  })
+  .await;
+  producer
+    .produce_one(ProducerRecord::new(
+      "telemetry".into(),
+      b"updated-dispatch-settings".to_vec(),
+      vec![2].into(),
+      101,
+    ))
+    .await
+    .unwrap();
+
+  let sent = transport.sent.lock().await;
+  assert_eq!(sent.len(), 2);
+  assert!(
+    (Duration::from_millis(900) ..= Duration::from_secs(1)).contains(&sent[0].request_timeout)
+  );
+  assert_eq!(
+    sent[0].compression,
+    ProducerCompression::PRODUCER_COMPRESSION_SNAPPY
+  );
+  assert_eq!(sent[1].request_timeout, Duration::from_millis(10));
+  assert_eq!(
+    sent[1].compression,
+    ProducerCompression::PRODUCER_COMPRESSION_NONE
+  );
 }
 
 #[tokio::test]
@@ -2857,6 +3020,7 @@ async fn retry_deadline_clips_the_retry_delay() {
 
   let result = send_batch_with_retry(
     &config,
+    &config,
     &topics,
     &routes,
     &membership,
@@ -2901,6 +3065,7 @@ async fn retry_deadline_bounds_request_permit_wait() {
   };
 
   let result = send_batch_with_retry(
+    &config,
     &config,
     &topics,
     &routes,
@@ -2951,6 +3116,7 @@ async fn retry_releases_request_permit_before_backoff() {
   let retry_diagnostics = super::ProducerRetryDiagnostics::default();
 
   let retry = send_batch_with_retry(
+    &config,
     &config,
     &topics,
     &routes,
