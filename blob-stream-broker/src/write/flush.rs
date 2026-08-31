@@ -694,8 +694,8 @@ impl FlushContext {
       );
       return Ok(plan_failure_results(plan, error));
     }
-    let mut objects = match self.build_objects(plan).await {
-      Ok(objects) => objects.into_iter(),
+    let objects = match self.build_objects(plan).await {
+      Ok(objects) => objects,
       Err(error) => {
         mark_publication_complete(
           &plan.publication_completions,
@@ -706,11 +706,8 @@ impl FlushContext {
     };
     mark_segment_identity_assigned(&plan.publication_completions);
     let mut results = Vec::new();
-    // Metadata writes for completed objects overlap the next sequential blob upload. Keeping
-    // their futures in this plan, rather than spawning tasks, keeps their lifetime and errors
-    // owned by the plan while still allowing the futures to make progress during an upload wait.
-    let mut metadata_publications = FuturesUnordered::new();
-    while let Some(object) = objects.next() {
+    let mut blob_uploads = FuturesUnordered::new();
+    for object in objects {
       let publication_budget = object
         .topics
         .iter()
@@ -729,13 +726,7 @@ impl FlushContext {
           &object.topics,
           FlushCompletionError::Internal,
         ));
-        for object in objects {
-          results.extend(PersistedObject::failure_results(
-            &object.topics,
-            FlushCompletionError::Internal,
-          ));
-        }
-        break;
+        continue;
       };
       for topic in &object.topics {
         if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
@@ -752,7 +743,6 @@ impl FlushContext {
             .await;
         }
       }
-      let payload_bytes = object.payload.len();
       let blob_key = object
         .topics
         .first()
@@ -760,24 +750,20 @@ impl FlushContext {
         .envelope
         .blob_key
         .clone();
-      let mut blob_write = Box::pin(timeout(
-        remaining_budget,
-        self.blob_store.put(&blob_key, object.payload.clone()),
-      ));
-      // FuturesUnordered is cooperative: it progresses only when polled. Poll it while the
-      // current blob upload is pending so a completed object can publish metadata without
-      // waiting for every later object in this plan to finish uploading.
-      let blob_result = loop {
-        if metadata_publications.is_empty() {
-          break blob_write.await;
-        }
-        tokio::select! {
-          result = &mut blob_write => break result,
-          Some(publication) = metadata_publications.next() => {
-            results.extend(publication?);
-          },
-        }
-      };
+      let blob_store = Arc::clone(&self.blob_store);
+      let payload = object.payload.clone();
+      // Register every upload before polling for a result. Object identities and payloads are
+      // immutable at this point, so separate objects have no blob-store dependency. Metadata is
+      // intentionally deferred until this entire phase finishes: blob storage is the slow path,
+      // and a plan should use that time to fan out its writes rather than serialize them.
+      blob_uploads.push(async move {
+        let result = timeout(remaining_budget, blob_store.put(&blob_key, payload)).await;
+        (object, result)
+      });
+    }
+
+    let mut uploaded_objects = Vec::new();
+    while let Some((object, blob_result)) = blob_uploads.next().await {
       if blob_result.is_err() || blob_result.as_ref().is_ok_and(Result::is_err) {
         if blob_result.is_err() {
           metrics.record_metadata_publication_deadline_exhausted_while_persisting();
@@ -788,6 +774,14 @@ impl FlushContext {
         ));
         continue;
       }
+      let payload_bytes = object.payload.len();
+      let blob_key = object
+        .topics
+        .first()
+        .expect("persisted object has at least one topic")
+        .envelope
+        .blob_key
+        .clone();
       metrics.record_uploaded_object(payload_bytes, object.oversized_singleton);
       if object.oversized_singleton {
         let topic = object
@@ -830,9 +824,14 @@ impl FlushContext {
             .await;
         }
       }
-      // Every plan shares the engine-owned semaphore. A plan may queue publication futures for
-      // several objects, but at most MAX_CONCURRENT_METADATA_WRITES calls reach the metadata
-      // store across the entire broker.
+      uploaded_objects.push(object);
+    }
+
+    // Metadata publication begins only after every blob upload has reached a terminal outcome.
+    // Every plan shares the engine-owned semaphore, so these futures may be queued together but
+    // at most MAX_CONCURRENT_METADATA_WRITES calls reach the metadata store across the broker.
+    let mut metadata_publications = FuturesUnordered::new();
+    for object in uploaded_objects {
       metadata_publications.push(self.persist_object_metadata(
         object.topics,
         publication_started_at,

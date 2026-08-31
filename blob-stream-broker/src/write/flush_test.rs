@@ -71,10 +71,9 @@ struct LostFenceMetadataStore {
 
 struct FailingBlobStore;
 
-struct BlockSecondBlobStore {
-  writes: AtomicUsize,
-  second_started_tx: mpsc::UnboundedSender<()>,
-  release_second: Arc<Semaphore>,
+struct BlockingBlobStore {
+  started_tx: mpsc::UnboundedSender<()>,
+  release: Arc<Semaphore>,
 }
 
 #[async_trait]
@@ -104,20 +103,18 @@ impl BlobStore for FailingBlobStore {
 }
 
 #[async_trait]
-impl BlobStore for BlockSecondBlobStore {
+impl BlobStore for BlockingBlobStore {
   async fn put(&self, _key: &BlobKey, _payload: Bytes) -> Result<()> {
-    if self.writes.fetch_add(1, Ordering::Relaxed) == 1 {
-      self
-        .second_started_tx
-        .send(())
-        .map_err(|_| anyhow::anyhow!("second upload receiver dropped"))?;
-      self
-        .release_second
-        .acquire()
-        .await
-        .map_err(|_| anyhow::anyhow!("second upload release gate closed"))?
-        .forget();
-    }
+    self
+      .started_tx
+      .send(())
+      .map_err(|_| anyhow::anyhow!("blob upload receiver dropped"))?;
+    self
+      .release
+      .acquire()
+      .await
+      .map_err(|_| anyhow::anyhow!("blob upload release gate closed"))?
+      .forget();
     Ok(())
   }
 
@@ -254,6 +251,16 @@ async fn receive_metadata_write(receiver: &mut mpsc::UnboundedReceiver<String>) 
     tokio::task::yield_now().await;
   }
   panic!("expected metadata write did not begin");
+}
+
+async fn receive_blob_upload(receiver: &mut mpsc::UnboundedReceiver<()>) {
+  for _ in 0 .. 100 {
+    if receiver.try_recv().is_ok() {
+      return;
+    }
+    tokio::task::yield_now().await;
+  }
+  panic!("expected blob upload did not begin");
 }
 
 #[tokio::test]
@@ -646,18 +653,17 @@ async fn failed_predecessor_does_not_reject_independent_shared_partition() -> Re
 }
 
 #[tokio::test]
-async fn earlier_object_metadata_starts_while_later_upload_is_blocked() -> Result<()> {
+async fn uploads_all_plan_objects_before_starting_metadata_publication() -> Result<()> {
   let now = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
   let (metadata_started_tx, mut metadata_started_rx) = mpsc::unbounded_channel();
   let metadata_release = Arc::new(Semaphore::new(0));
-  let (second_started_tx, mut second_started_rx) = mpsc::unbounded_channel();
-  let second_release = Arc::new(Semaphore::new(0));
+  let (blob_started_tx, mut blob_started_rx) = mpsc::unbounded_channel();
+  let blob_release = Arc::new(Semaphore::new(0));
   let context = FlushContext::new(
     WriteConfig::with_defaults(),
-    Arc::new(BlockSecondBlobStore {
-      writes: AtomicUsize::new(0),
-      second_started_tx,
-      release_second: Arc::clone(&second_release),
+    Arc::new(BlockingBlobStore {
+      started_tx: blob_started_tx,
+      release: Arc::clone(&blob_release),
     }),
     Arc::new(BlockingMetadataStore {
       started_tx: metadata_started_tx,
@@ -680,18 +686,21 @@ async fn earlier_object_metadata_starts_while_later_upload_is_blocked() -> Resul
   let metrics = WriteMetrics::new(&Collector::default().scope("flush_test"));
   let flush = tokio::spawn(async move { flush_plan_for_test(&context, &mut plan, &metrics).await });
 
-  second_started_rx
-    .recv()
-    .await
-    .expect("second upload should be blocked");
-  assert_eq!(
-    receive_metadata_write(&mut metadata_started_rx).await,
-    "first"
-  );
+  // Both uploads must start while the first remains held. A sequential implementation cannot
+  // produce the second signal until the first permit is released.
+  receive_blob_upload(&mut blob_started_rx).await;
+  receive_blob_upload(&mut blob_started_rx).await;
+  assert!(matches!(
+    metadata_started_rx.try_recv(),
+    Err(mpsc::error::TryRecvError::Empty)
+  ));
 
-  second_release.add_permits(1);
+  blob_release.add_permits(2);
+  receive_metadata_write(&mut metadata_started_rx).await;
   metadata_release.add_permits(2);
-  assert_eq!(flush.await??.len(), 2);
+  let results = flush.await??;
+  assert_eq!(results.len(), 2);
+  assert!(results.iter().all(|result| result.error.is_none()));
   Ok(())
 }
 
