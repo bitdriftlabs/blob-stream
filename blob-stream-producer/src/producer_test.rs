@@ -1434,6 +1434,14 @@ async fn live_batch_limit_is_sampled_when_records_are_admitted() {
     producer_max_batch_records(runtime_config) == 1
   })
   .await;
+  assert_eq!(
+    producer
+      .diagnostics()
+      .unwrap()
+      .state_snapshot()
+      .max_batch_records,
+    1
+  );
   let second_producer = Arc::clone(&producer);
   let second = tokio::spawn(async move {
     second_producer

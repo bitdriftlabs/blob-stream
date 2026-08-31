@@ -705,6 +705,7 @@ impl ProducerClient for ProducerClientImpl {
   fn diagnostics(&self) -> Option<ProducerDiagnostics> {
     Some(ProducerDiagnostics::new(
       self.config.clone(),
+      Arc::clone(&self.runtime_settings),
       self.topics.clone(),
       self.membership_rx.clone(),
       self.routes.clone(),

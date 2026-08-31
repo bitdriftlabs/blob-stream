@@ -10,7 +10,7 @@ use crate::config::{
 };
 use blob_stream_broker_discovery::{BrokerMembership, writer_virtual_partitions};
 use blob_stream_types::{ProtoDurationExt, VirtualPartitionId, serialize_as_string};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use protobuf::Chars;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -170,6 +170,7 @@ pub struct ProducerPartitionBufferSnapshot {
 #[derive(Clone)]
 pub struct ProducerDiagnostics {
   config: ProducerConfig,
+  runtime_settings: Arc<RwLock<Arc<ProducerConfig>>>,
   topics: HashMap<Chars, ProducerTopicConfig>,
   membership_rx: watch::Receiver<BrokerMembership>,
   routes: ProducerRoutes,
@@ -180,6 +181,7 @@ pub struct ProducerDiagnostics {
 impl ProducerDiagnostics {
   pub(super) fn new(
     config: ProducerConfig,
+    runtime_settings: Arc<RwLock<Arc<ProducerConfig>>>,
     topics: HashMap<Chars, ProducerTopicConfig>,
     membership_rx: watch::Receiver<BrokerMembership>,
     routes: ProducerRoutes,
@@ -188,6 +190,7 @@ impl ProducerDiagnostics {
   ) -> Self {
     Self {
       config,
+      runtime_settings,
       topics,
       membership_rx,
       routes,
@@ -205,6 +208,7 @@ impl ProducerDiagnostics {
   pub fn state_snapshot(&self) -> ProducerStateSnapshot {
     let generated_at = time::OffsetDateTime::now_utc();
     let writer_id = producer_writer_id(&self.config);
+    let runtime_config = Arc::clone(&self.runtime_settings.read());
     let membership = self.membership_rx.borrow().clone();
     let mut brokers = membership
       .nodes()
@@ -295,10 +299,10 @@ impl ProducerDiagnostics {
     ProducerStateSnapshot {
       generated_at,
       writer_id,
-      max_batch_records: producer_max_batch_records(&self.config),
-      max_batch_bytes: producer_max_batch_bytes(&self.config),
+      max_batch_records: producer_max_batch_records(runtime_config.as_ref()),
+      max_batch_bytes: producer_max_batch_bytes(runtime_config.as_ref()),
       flush_max_delay_ms: u64::try_from(
-        producer_flush_max_delay(&self.config).whole_milliseconds(),
+        producer_flush_max_delay(runtime_config.as_ref()).whole_milliseconds(),
       )
       .expect("producer config validation requires a positive flush max delay"),
       brokers,
