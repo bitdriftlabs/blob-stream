@@ -40,7 +40,7 @@ fn startup_overrides_preserve_configured_values_without_flags() {
   apply_producer_startup_overrides(&flags.snapshot_watch(), &mut runtime).unwrap();
 
   let producer = runtime.producer.as_ref().unwrap();
-  assert_eq!(producer_max_batch_records(producer), 1_000);
+  assert_eq!(producer_max_batch_records(producer), 10_000);
   assert_eq!(producer_max_batch_bytes(producer), 42);
   assert_eq!(
     producer_flush_max_delay(producer),

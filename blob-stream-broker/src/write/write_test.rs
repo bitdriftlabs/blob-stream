@@ -1210,6 +1210,8 @@ async fn successful_sequence_reservation_records_metrics() -> Result<()> {
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
   config.flush_max_delay = TimeDuration::milliseconds(60_000);
+  config.lease_duration = TimeDuration::seconds(10);
+  config.heartbeat_interval = TimeDuration::seconds(5);
 
   let collector = Collector::default();
   let scope = collector.scope("blob_stream_broker_test");
@@ -2763,7 +2765,7 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
       &metrics_scope(),
     )
     .membership_rx(membership_rx)
-    .time_provider(time_provider)
+    .time_provider(time_provider.clone())
     .build()?,
   );
 
@@ -2800,6 +2802,24 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
   assert!(matches!(held_by_a, LeaseAcquireOutcome::HeldByOther(_)));
   assert!(!shutdown.is_finished());
 
+  time_provider.wait_until_sleeping(1).await;
+  time_provider.advance(TimeDuration::seconds(11));
+  tokio::task::yield_now().await;
+
+  let held_after_heartbeat = lease_store
+    .acquire_lease(
+      key.clone(),
+      "node-b".to_string(),
+      "node-b-session".to_string(),
+      time_provider.now(),
+      TimeDuration::milliseconds(30_000),
+    )
+    .await?;
+  assert!(matches!(
+    held_after_heartbeat,
+    LeaseAcquireOutcome::HeldByOther(_)
+  ));
+
   release.add_permits(1);
   produce.await??;
   tokio::time::timeout(StdDuration::from_secs(1), shutdown)
@@ -2811,7 +2831,7 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
       key,
       "node-b".to_string(),
       "node-b-session".to_string(),
-      offset_datetime_from_unix_millis(now_ms),
+      time_provider.now(),
       TimeDuration::milliseconds(30_000),
     )
     .await?;

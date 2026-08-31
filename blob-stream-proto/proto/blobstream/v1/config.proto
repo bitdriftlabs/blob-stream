@@ -296,7 +296,7 @@ message ProducerConfig {
   optional uint32 writer_id = 1;
 
   // Maximum records in a producer-side batch.
-  // Default when unset: 1,000 records.
+  // Default when unset: 10,000 records.
   optional uint32 max_batch_records = 2 [(validate.rules).uint32.gt = 0];
 
   // Maximum uncompressed payload bytes in a producer-side batch.

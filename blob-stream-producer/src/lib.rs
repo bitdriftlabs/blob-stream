@@ -31,7 +31,7 @@
 //!
 //!   let mut producer = ProducerConfig::new();
 //!   producer.writer_id = Some(0);
-//!   producer.max_batch_records = Some(1000);
+//!   producer.max_batch_records = Some(10_000);
 //!   producer.max_batch_bytes = Some(1_048_576);
 //!   producer.flush_max_delay = Duration::milliseconds(200).into_proto();
 //!   producer.retry_base_delay = Duration::milliseconds(25).into_proto();

@@ -347,6 +347,7 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
   ));
   let flush_notifier = Arc::new(tokio::sync::Notify::new());
   let metrics = super::super::super::metrics::WriteMetrics::new(&metrics_scope());
+  let time_provider = ManualTimeProvider::new(offset_datetime_from_unix_millis(1_000));
   let lifecycle_hooks: Option<Arc<dyn super::super::super::BrokerLifecycleHooks>> =
     Some(Arc::new(super::super::super::NoopBrokerLifecycleHooks));
   let releases = WriteEngineImpl::release_partition_leases(
@@ -357,7 +358,9 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
     "node-a",
     "session-a",
     vec![("telemetry".into(), 0), ("telemetry".into(), 1)],
-    offset_datetime_from_unix_millis(1_000),
+    &time_provider,
+    Duration::seconds(60),
+    Duration::seconds(10),
     lifecycle_hooks.as_ref(),
   );
   tokio::pin!(releases);
@@ -534,6 +537,148 @@ async fn lease_assignment_reacquires_partitions_after_membership_flap() -> Resul
     })
     .await,
     "node-a did not reacquire leases after rejoining membership"
+  );
+
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn lease_assignment_retries_held_partition_before_heartbeat() -> Result<()> {
+  let partition_count = 1;
+  let topics = make_topic(partition_count);
+  let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
+  let initial_time = offset_datetime_from_unix_millis(1_000);
+  let time_provider = Arc::new(ManualTimeProvider::new(initial_time));
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".into(),
+    virtual_partition_id: virtual_partition_for_logical(0, partition_count, 0),
+  };
+  lease_store
+    .acquire_lease(
+      key.clone(),
+      "old-node".to_string(),
+      "old-session".to_string(),
+      initial_time,
+      Duration::seconds(60),
+    )
+    .await?;
+
+  let mut config = WriteConfig::with_defaults();
+  config.lease_duration = Duration::seconds(60);
+  config.heartbeat_interval = Duration::seconds(40);
+  let (_membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
+    node_id: "new-node".into(),
+    address: "10.0.0.2:8080".into(),
+  }]));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+
+  let _engine = WriteEngineBuilder::new(
+    config,
+    topics,
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    lease_store.clone(),
+    "new-node".to_string(),
+    shutdown_trigger.make_handle(),
+    &metrics_scope(),
+  )
+  .membership_rx(membership_rx)
+  .lease_session_id("new-session".to_string())
+  .time_provider(time_provider.clone())
+  .build()?;
+
+  time_provider.wait_until_sleeping(2).await;
+  lease_store
+    .release_lease(&key, "old-node", "old-session", initial_time)
+    .await?;
+  time_provider.advance(Duration::milliseconds(250));
+
+  assert!(
+    wait_for_all_partitions(|| {
+      all_partitions_held_by(
+        &lease_store,
+        "new-node",
+        partition_count,
+        initial_time + Duration::milliseconds(250),
+      )
+    })
+    .await,
+    "new node did not retry lease acquisition before its heartbeat interval"
+  );
+
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_assignment_does_not_retry_held_partition_on_early_heartbeat() -> Result<()> {
+  let partition_count = 1;
+  let topics = make_topic(partition_count);
+  let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
+  let initial_time = offset_datetime_from_unix_millis(1_000);
+  let time_provider = Arc::new(ManualTimeProvider::new(initial_time));
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".into(),
+    virtual_partition_id: virtual_partition_for_logical(0, partition_count, 0),
+  };
+  lease_store
+    .acquire_lease(
+      key.clone(),
+      "old-node".to_string(),
+      "old-session".to_string(),
+      initial_time,
+      Duration::seconds(60),
+    )
+    .await?;
+
+  let mut config = WriteConfig::with_defaults();
+  config.lease_duration = Duration::seconds(60);
+  config.heartbeat_interval = Duration::milliseconds(10);
+  let (_membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
+    node_id: "new-node".into(),
+    address: "10.0.0.2:8080".into(),
+  }]));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+
+  let _engine = WriteEngineBuilder::new(
+    config,
+    topics,
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    lease_store.clone(),
+    "new-node".to_string(),
+    shutdown_trigger.make_handle(),
+    &metrics_scope(),
+  )
+  .membership_rx(membership_rx)
+  .lease_session_id("new-session".to_string())
+  .time_provider(time_provider.clone())
+  .build()?;
+
+  time_provider.wait_until_sleeping(2).await;
+  lease_store
+    .release_lease(&key, "old-node", "old-session", initial_time)
+    .await?;
+
+  tokio::time::advance(StdDuration::from_millis(10)).await;
+  tokio::task::yield_now().await;
+  assert!(
+    !all_partitions_held_by(&lease_store, "new-node", partition_count, initial_time).await,
+    "heartbeat retried lease acquisition before the scheduled retry"
+  );
+
+  time_provider.advance(Duration::milliseconds(250));
+  tokio::task::yield_now().await;
+  assert!(
+    all_partitions_held_by(
+      &lease_store,
+      "new-node",
+      partition_count,
+      initial_time + Duration::milliseconds(250)
+    )
+    .await,
+    "scheduled retry did not acquire the released lease"
   );
 
   shutdown_trigger.shutdown().await;

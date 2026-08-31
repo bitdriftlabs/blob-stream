@@ -12,6 +12,7 @@ use super::super::state::WriteState;
 use super::super::{BrokerLifecycleHooks, TopicInfo, WriteEngineImpl};
 use super::acquire_lease_and_reserve_sequences;
 use bd_log_util::warn_every;
+use bd_time::TimeProvider;
 use blob_stream_broker_discovery::{
   BrokerMembership,
   balanced_assignment,
@@ -19,6 +20,7 @@ use blob_stream_broker_discovery::{
 };
 use blob_stream_metadata_store::{
   LeaseAcquireAndReserveOutcome,
+  LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
   ProducerPartitionLeaseKey,
 };
@@ -33,6 +35,19 @@ use std::time::Duration as StdDuration;
 use time::OffsetDateTime;
 use time::ext::NumericalDuration;
 use tokio::sync::watch;
+
+const LEASE_ACQUISITION_RETRY_INITIAL_DELAY: time::Duration = time::Duration::milliseconds(250);
+const LEASE_ACQUISITION_RETRY_MAX_DELAY: time::Duration = time::Duration::seconds(2);
+
+//
+// PendingLeaseAcquisition
+//
+
+#[derive(Clone, Copy, Debug)]
+struct PendingLeaseAcquisition {
+  next_retry_at: OffsetDateTime,
+  retry_delay: time::Duration,
+}
 
 impl WriteEngineImpl {
   pub(super) fn owned_virtual_partitions(
@@ -64,8 +79,9 @@ impl WriteEngineImpl {
     &self,
     mut membership_rx: watch::Receiver<BrokerMembership>,
   ) {
-    let interval =
-      StdDuration::try_from(self.config.heartbeat_interval).unwrap_or(StdDuration::from_secs(1));
+    let heartbeat_interval = self.config.heartbeat_interval;
+    let heartbeat_tick_interval =
+      StdDuration::try_from(heartbeat_interval).unwrap_or(StdDuration::from_secs(1));
     let topics = self.topics.clone();
     let holder_id = self.holder_id.clone();
     let lease_session_id = self.lease_session_id.clone();
@@ -81,17 +97,37 @@ impl WriteEngineImpl {
     let mut shutdown = self.shutdown_trigger_handle.make_shutdown();
 
     tokio::spawn(async move {
-      let mut ticker = tokio::time::interval(interval);
+      // Lease-store timestamps and takeover retries use the injected TimeProvider, but recurring
+      // maintenance measures local elapsed time. Keeping it on Tokio's monotonic clock prevents
+      // manual test jumps across historical windows from applying missed heartbeats at one final
+      // timestamp, which would incorrectly expire and reacquire a healthy lease fence.
+      let mut heartbeat_ticker = tokio::time::interval(heartbeat_tick_interval);
       // If the watch sender closes, we continue on ticker-only cadence so lease maintenance keeps
       // running instead of silently stalling.
       let mut membership_updates_open = true;
       let mut assignment_activated = false;
       let mut previously_assigned: HashSet<(Chars, VirtualPartitionId)> = HashSet::new();
+      let mut pending_acquisitions: HashMap<(Chars, VirtualPartitionId), PendingLeaseAcquisition> =
+        HashMap::new();
 
       loop {
+        let next_acquisition_retry = pending_acquisitions
+          .values()
+          .map(|retry| retry.next_retry_at)
+          .min();
+        let acquisition_retry_sleep = async {
+          let Some(next_retry_at) = next_acquisition_retry else {
+            std::future::pending().await
+          };
+          let delay = (next_retry_at - time_provider.now()).max(time::Duration::ZERO);
+          time_provider.sleep(delay).await;
+        };
+        tokio::pin!(acquisition_retry_sleep);
+
         let shutting_down = if membership_updates_open {
           tokio::select! {
-            _ = ticker.tick() => false,
+            _ = heartbeat_ticker.tick() => false,
+            () = &mut acquisition_retry_sleep => false,
             changed = membership_rx.changed() => {
               if changed.is_err() {
                 membership_updates_open = false;
@@ -102,7 +138,8 @@ impl WriteEngineImpl {
           }
         } else {
           tokio::select! {
-            _ = ticker.tick() => false,
+            _ = heartbeat_ticker.tick() => false,
+            () = &mut acquisition_retry_sleep => false,
             () = shutdown.cancelled() => true,
           }
         };
@@ -134,7 +171,9 @@ impl WriteEngineImpl {
             &holder_id,
             &lease_session_id,
             partitions,
-            time_provider.now(),
+            time_provider.as_ref(),
+            lease_duration,
+            heartbeat_interval,
             lifecycle_hooks.as_ref(),
           )
           .await;
@@ -146,16 +185,10 @@ impl WriteEngineImpl {
         // authoritative ownership.
         if !assignment_activated {
           let Some(nodes) = membership.nodes() else {
-            if shutting_down {
-              break;
-            }
             continue;
           };
           let self_is_member = nodes.iter().any(|node| node.node_id.as_str() == holder_id);
           if !self_is_member {
-            if shutting_down {
-              break;
-            }
             continue;
           }
           assignment_activated = true;
@@ -166,6 +199,7 @@ impl WriteEngineImpl {
 
         let owned = Self::owned_virtual_partitions(&topics, writer_id, &holder_id, &membership);
         let currently_owned: HashSet<(Chars, VirtualPartitionId)> = owned.iter().cloned().collect();
+        pending_acquisitions.retain(|partition, _| currently_owned.contains(partition));
 
         let gained_partitions = sorted_partition_delta(&currently_owned, &previously_assigned);
         let lost_partitions = sorted_partition_delta(&previously_assigned, &currently_owned);
@@ -190,7 +224,9 @@ impl WriteEngineImpl {
           &holder_id,
           &lease_session_id,
           lost_partitions,
-          time_provider.now(),
+          time_provider.as_ref(),
+          lease_duration,
+          heartbeat_interval,
           lifecycle_hooks.as_ref(),
         )
         .await;
@@ -199,6 +235,13 @@ impl WriteEngineImpl {
         previously_assigned = currently_owned;
 
         for (topic, virtual_partition_id) in owned {
+          let partition = (topic.clone(), virtual_partition_id);
+          if pending_acquisitions
+            .get(&partition)
+            .is_some_and(|retry| retry.next_retry_at > time_provider.now())
+          {
+            continue;
+          }
           let key = ProducerPartitionLeaseKey {
             topic: topic.clone(),
             virtual_partition_id,
@@ -241,6 +284,7 @@ impl WriteEngineImpl {
           .await
           {
             Ok(LeaseAcquireAndReserveOutcome::Acquired { lease, reservation }) => {
+              pending_acquisitions.remove(&partition);
               let lease_epoch = lease.fence.lease_epoch;
               let lease_expiration_at = lease.lease_expiration_at;
               if let Some(reservation) = reservation.as_ref() {
@@ -281,11 +325,31 @@ impl WriteEngineImpl {
               }
             },
             Ok(LeaseAcquireAndReserveOutcome::HeldByOther(_)) => {
+              let retry =
+                pending_acquisitions
+                  .entry(partition)
+                  .or_insert(PendingLeaseAcquisition {
+                    next_retry_at: now + LEASE_ACQUISITION_RETRY_INITIAL_DELAY,
+                    retry_delay: LEASE_ACQUISITION_RETRY_INITIAL_DELAY,
+                  });
+              let scheduled_retry_delay = retry.retry_delay;
+              retry.next_retry_at = now + scheduled_retry_delay;
+              retry.retry_delay = retry
+                .retry_delay
+                .saturating_mul(2)
+                .min(LEASE_ACQUISITION_RETRY_MAX_DELAY);
+              debug!(
+                "broker lease acquisition deferred: holder_id={holder_id}, topic={topic}, \
+                 virtual_partition_id={virtual_partition_id}, retry_at={}, retry_delay_ms={}",
+                retry.next_retry_at,
+                scheduled_retry_delay.whole_milliseconds(),
+              );
               transition
                 .transition
                 .finish(LeaseExpirationUpdate::Set(None), None, None);
             },
             Err(error) => {
+              pending_acquisitions.remove(&partition);
               if reservation_request.is_some() {
                 metrics.sequence_reservation_failures_total.inc();
               }
@@ -314,7 +378,9 @@ impl WriteEngineImpl {
     lease_session_id: &str,
     topic: &Chars,
     virtual_partition_id: VirtualPartitionId,
-    now: OffsetDateTime,
+    time_provider: &dyn TimeProvider,
+    lease_duration: time::Duration,
+    heartbeat_interval: time::Duration,
     lifecycle_hooks: Option<&Arc<dyn BrokerLifecycleHooks>>,
   ) {
     let key = ProducerPartitionLeaseKey {
@@ -339,10 +405,18 @@ impl WriteEngineImpl {
     }
     flush_notifier.notify_one();
 
-    // TODO(mattklein123): Renew the producer lease while waiting for a drain that can approach
-    // the lease duration. The default 30-second lease makes this unlikely in normal operation,
-    // but a slow blob upload can otherwise let a successor acquire before this drain completes.
-    Self::wait_for_partition_drain(state, topic, virtual_partition_id).await;
+    Self::wait_for_partition_drain(
+      lease_store,
+      state,
+      &key,
+      holder_id,
+      lease_session_id,
+      time_provider,
+      time_provider.now() + heartbeat_interval,
+      lease_duration,
+      heartbeat_interval,
+    )
+    .await;
     metrics.lease_drain_completions_total.inc();
     info!(
       "broker partition drain complete: holder_id={holder_id}, topic={topic}, \
@@ -358,7 +432,7 @@ impl WriteEngineImpl {
     }
 
     match lease_store
-      .release_lease(&key, holder_id, lease_session_id, now)
+      .release_lease(&key, holder_id, lease_session_id, time_provider.now())
       .await
     {
       Ok(
@@ -401,7 +475,9 @@ impl WriteEngineImpl {
     holder_id: &str,
     lease_session_id: &str,
     partitions: Vec<(Chars, VirtualPartitionId)>,
-    now: OffsetDateTime,
+    time_provider: &dyn TimeProvider,
+    lease_duration: time::Duration,
+    heartbeat_interval: time::Duration,
     lifecycle_hooks: Option<&Arc<dyn BrokerLifecycleHooks>>,
   ) {
     let mut releases = FuturesUnordered::new();
@@ -416,7 +492,9 @@ impl WriteEngineImpl {
           lease_session_id,
           &topic,
           virtual_partition_id,
-          now,
+          time_provider,
+          lease_duration,
+          heartbeat_interval,
           lifecycle_hooks,
         )
         .await;
@@ -427,14 +505,21 @@ impl WriteEngineImpl {
   }
 
   async fn wait_for_partition_drain(
+    lease_store: &Arc<dyn blob_stream_metadata_store::ProducerPartitionLeaseStore>,
     state: &Arc<parking_lot::Mutex<WriteState>>,
-    topic: &str,
-    virtual_partition_id: VirtualPartitionId,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    lease_session_id: &str,
+    time_provider: &dyn TimeProvider,
+    mut next_heartbeat_at: OffsetDateTime,
+    lease_duration: time::Duration,
+    heartbeat_interval: time::Duration,
   ) {
+    let mut lease_held = true;
     loop {
       let notified = state
         .lock()
-        .partition_state(topic, virtual_partition_id)
+        .partition_state(key.topic.as_str(), key.virtual_partition_id)
         .map(|partition_state| partition_state.drain_notify.clone().notified_owned());
       let Some(notified) = notified else {
         return;
@@ -443,15 +528,18 @@ impl WriteEngineImpl {
       notified.as_mut().enable();
       let is_drained = {
         let state = state.lock();
-        let Some(partition_state) = state.partition_state(topic, virtual_partition_id) else {
+        let Some(partition_state) =
+          state.partition_state(key.topic.as_str(), key.virtual_partition_id)
+        else {
           return;
         };
         // Register before checking state so a flush completion cannot notify between the check
         // and the await below.
         trace!(
-          "broker partition drain state: topic={topic}, \
-           virtual_partition_id={virtual_partition_id}, outstanding_flushes={}, \
-           allocation_in_flight={}, buffered_batches={}, draining={}",
+          "broker partition drain state: topic={}, virtual_partition_id={}, \
+           outstanding_flushes={}, allocation_in_flight={}, buffered_batches={}, draining={}",
+          key.topic,
+          key.virtual_partition_id,
           partition_state.outstanding_flushes,
           partition_state.allocation_in_flight,
           partition_state.buffer.batches.len(),
@@ -463,14 +551,68 @@ impl WriteEngineImpl {
         return;
       }
       trace!(
-        "broker partition drain waiting: topic={topic}, \
-         virtual_partition_id={virtual_partition_id}"
+        "broker partition drain waiting: topic={}, virtual_partition_id={}",
+        key.topic, key.virtual_partition_id,
       );
-      notified.await;
-      trace!(
-        "broker partition drain notified: topic={topic}, \
-         virtual_partition_id={virtual_partition_id}"
-      );
+      if lease_held {
+        let heartbeat_delay = (next_heartbeat_at - time_provider.now()).max(time::Duration::ZERO);
+        tokio::select! {
+          () = notified => {
+            trace!(
+              "broker partition drain notified: topic={}, virtual_partition_id={}",
+              key.topic,
+              key.virtual_partition_id,
+            );
+          },
+          () = time_provider.sleep(heartbeat_delay) => {
+            match lease_store
+              .heartbeat_lease(
+                key,
+                holder_id,
+                lease_session_id,
+                time_provider.now(),
+                lease_duration,
+              )
+              .await
+            {
+              Ok(LeaseHeartbeatOutcome::Renewed(lease)) => {
+                let mut state = state.lock();
+                if let Some(partition_state) =
+                  state.partition_state_mut_if_present(key.topic.as_str(), key.virtual_partition_id)
+                {
+                  partition_state.lease_expiration_at = Some(lease.lease_expiration_at);
+                }
+                next_heartbeat_at = time_provider.now() + heartbeat_interval;
+              },
+              Ok(LeaseHeartbeatOutcome::HeldByOther(_) | LeaseHeartbeatOutcome::Expired) => {
+                lease_held = false;
+                info!(
+                  "broker partition drain lost lease: holder_id={holder_id}, topic={}, \
+                   virtual_partition_id={}",
+                  key.topic,
+                  key.virtual_partition_id,
+                );
+              },
+              Err(error) => {
+                lease_held = false;
+                warn_every!(
+                  15.seconds(),
+                  "broker partition drain lease heartbeat failed: holder_id={holder_id}, \
+                   topic={}, virtual_partition_id={}, error={error:#}",
+                  key.topic,
+                  key.virtual_partition_id,
+                );
+              },
+            }
+          },
+        }
+      } else {
+        notified.await;
+        trace!(
+          "broker partition drain notified: topic={}, virtual_partition_id={}",
+          key.topic, key.virtual_partition_id,
+        );
+      }
     }
   }
 }
