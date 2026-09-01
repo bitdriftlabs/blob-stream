@@ -993,7 +993,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tower",
- "tower-http 0.7.0",
+ "tower-http 0.7.1",
  "unwrap-infallible",
  "urlencoding",
 ]
@@ -1485,6 +1485,7 @@ dependencies = [
  "bytes",
  "serde",
  "serde_json",
+ "siphasher",
  "sonyflake",
  "time",
 ]
@@ -4716,6 +4717,12 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "siphasher"
+version = "0.3.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38b58827f4464d87d377d175e90bf58eb00fd8716ff0a62f80356b5e61555d0d"
 
 [[package]]
 name = "sketches-rust"

@@ -11,8 +11,8 @@ pub use blob_stream_proto::protos::blobstream::v1::broker::Record;
 use blob_stream_proto::protos::blobstream::v1::config::TopicConfig;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize, Serializer};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use siphasher::sip::SipHasher13;
+use std::hash::Hasher;
 use std::num::TryFromIntError;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
@@ -171,10 +171,20 @@ pub fn offset_datetime_from_unix_seconds(timestamp_seconds: i64) -> OffsetDateTi
 #[must_use]
 /// Compute logical partition from a record key and partition count.
 pub fn logical_partition_for_key(record_key: &[u8], partition_count: u32) -> u32 {
-  let mut hasher = DefaultHasher::new();
-  record_key.hash(&mut hasher);
-  let logical_partition = hasher.finish() % u64::from(partition_count);
+  let logical_partition = partition_hash(record_key) % u64::from(partition_count);
   u32::try_from(logical_partition).unwrap_or(0)
+}
+
+/// Compute the fixed hash used to map producer record keys to logical partitions.
+///
+/// This is SipHash-1-3 with zero keys. It matches `DefaultHasher::new()` in Rust 1.98 on existing
+/// 64-bit little-endian deployments, while encoding the byte-slice length as little-endian `u64`
+/// followed by raw bytes so mappings remain stable across target architectures and Rust upgrades.
+fn partition_hash(record_key: &[u8]) -> u64 {
+  let mut hasher = SipHasher13::new_with_keys(0, 0);
+  hasher.write(&(record_key.len() as u64).to_le_bytes());
+  hasher.write(record_key);
+  hasher.finish()
 }
 
 #[must_use]

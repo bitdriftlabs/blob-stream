@@ -16,10 +16,12 @@ use super::api::{
 };
 use crate::write::allocation::{
   AllocationTransitionDecision,
+  AllocationTransitionFinish,
   LeaseExpirationUpdate,
   begin_allocation_transition,
 };
 use crate::write::buffer::{BufferedBatch, FlushCompletionError};
+use crate::write::lease::LeaseAcquisitionOrigin;
 use crate::write::memory_pressure::MemoryPressureController;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -83,6 +85,17 @@ impl WriteEngine for WriteEngineImpl {
       let now = self.time_provider.now();
       let buffered = {
         let mut state = self.state.lock();
+        // This is the fast-path counterpart to the transition-level check below. It prevents a
+        // stale local lease or reservation from accepting a request after membership moved it.
+        if state
+          .assignment_generation_for_partition(topic.as_str(), virtual_partition_id)
+          .is_none()
+        {
+          return Err(WriteError::NotLeaseHolder {
+            topic: topic.clone(),
+            virtual_partition_id,
+          });
+        }
         let partition_state = state.partition_state_mut(topic.as_str(), virtual_partition_id);
         if partition_state.draining {
           let error = WriteError::NotLeaseHolder {
@@ -147,7 +160,7 @@ impl WriteEngine for WriteEngineImpl {
         self.config.reservation_size,
       );
       match decision {
-        AllocationTransitionDecision::Draining => {
+        AllocationTransitionDecision::NotAssigned | AllocationTransitionDecision::Draining => {
           let error = WriteError::NotLeaseHolder {
             topic: topic.clone(),
             virtual_partition_id,
@@ -172,7 +185,7 @@ impl WriteEngine for WriteEngineImpl {
                 reservation = Some(range);
               },
               Err(error) => {
-                work
+                let _ = work
                   .transition
                   .finish(LeaseExpirationUpdate::Preserve, None, None);
                 return Err(error);
@@ -181,7 +194,7 @@ impl WriteEngine for WriteEngineImpl {
             (true, None) => match self.ensure_lease(&topic, virtual_partition_id, now).await {
               Ok(lease) => acquired_lease = Some(lease),
               Err(error) => {
-                work
+                let _ = work
                   .transition
                   .finish(LeaseExpirationUpdate::Preserve, None, None);
                 return Err(error);
@@ -193,7 +206,7 @@ impl WriteEngine for WriteEngineImpl {
             {
               Ok(range) => reservation = Some(range),
               Err(error) => {
-                work
+                let _ = work
                   .transition
                   .finish(LeaseExpirationUpdate::Preserve, None, None);
                 return Err(error);
@@ -206,8 +219,15 @@ impl WriteEngine for WriteEngineImpl {
             .map_or(LeaseExpirationUpdate::Preserve, |lease| {
               LeaseExpirationUpdate::Set(Some(lease.lease_expiration_at))
             });
-          if work.lease_was_expired
-            && let Some(lease) = acquired_lease.as_ref()
+          let assignment_generation = work.assignment_generation;
+          let lease_was_expired = work.lease_was_expired;
+          let acquired_lease_for_log = acquired_lease.clone();
+          let finish = work
+            .transition
+            .finish(lease_expiration_update, acquired_lease, reservation);
+          if finish == AllocationTransitionFinish::Applied
+            && lease_was_expired
+            && let Some(lease) = acquired_lease_for_log.as_ref()
           {
             Self::log_lease_acquired(
               &self.holder_id,
@@ -215,11 +235,17 @@ impl WriteEngine for WriteEngineImpl {
               &topic,
               virtual_partition_id,
               lease,
+              LeaseAcquisitionOrigin::InlineProduce,
+              assignment_generation,
             );
           }
-          work
-            .transition
-            .finish(lease_expiration_update, acquired_lease, reservation);
+          if finish == AllocationTransitionFinish::StaleAssignment {
+            trace!(
+              "broker inline lease transition completed after assignment changed: topic={topic}, \
+               virtual_partition_id={virtual_partition_id}, \
+               assignment_generation={assignment_generation}"
+            );
+          }
         },
       }
     };

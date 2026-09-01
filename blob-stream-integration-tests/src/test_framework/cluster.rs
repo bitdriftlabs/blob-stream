@@ -183,6 +183,7 @@ pub struct ClusterHarness {
   consumer_membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   partition_count: u32,
   topic_num_writers: u32,
+  broker_writer_id: u32,
   broker_flush_max_delay: Duration,
   fenced_metadata_writes: bool,
   transport: Arc<dyn BrokerTransport>,
@@ -200,9 +201,11 @@ pub struct ClusterHarness {
 /// Builds a cluster with no external storage dependencies.
 pub struct InMemoryClusterHarnessBuilder {
   broker_count: usize,
+  machine_id_offset: u16,
   metadata_store: Option<Arc<dyn MetadataStore>>,
   partition_count: u32,
   topic_num_writers: u32,
+  broker_writer_id: u32,
   broker_flush_max_delay: Duration,
   start_with_all_nodes: bool,
   broker_time_provider: Arc<dyn TimeProvider>,
@@ -210,6 +213,13 @@ pub struct InMemoryClusterHarnessBuilder {
 }
 
 impl InMemoryClusterHarnessBuilder {
+  /// Offset this cluster's Sonyflake machine IDs when it shares blob storage with another pool.
+  #[must_use]
+  pub fn machine_id_offset(mut self, machine_id_offset: u16) -> Self {
+    self.machine_id_offset = machine_id_offset;
+    self
+  }
+
   #[must_use]
   pub fn metadata_store(mut self, metadata_store: Arc<dyn MetadataStore>) -> Self {
     self.metadata_store = Some(metadata_store);
@@ -283,6 +293,7 @@ impl InMemoryClusterHarnessBuilder {
     ClusterHarness::start_from_builder(
       Some(store_fault_controller),
       self.broker_count,
+      self.machine_id_offset,
       blob_store,
       metadata_store,
       lease_store,
@@ -290,6 +301,7 @@ impl InMemoryClusterHarnessBuilder {
       consumer_membership_store,
       self.partition_count,
       self.topic_num_writers,
+      self.broker_writer_id,
       self.broker_flush_max_delay,
       false,
       self.start_with_all_nodes,
@@ -309,10 +321,12 @@ impl InMemoryClusterHarnessBuilder {
 pub struct ClusterHarnessBuilder<'a> {
   resources: &'a IntegrationResources,
   broker_count: usize,
+  machine_id_offset: u16,
   blob_store: Option<Arc<dyn BlobStore>>,
   metadata_store: Option<Arc<dyn MetadataStore>>,
   partition_count: u32,
   topic_num_writers: u32,
+  broker_writer_id: u32,
   broker_flush_max_delay: Duration,
   fenced_metadata_writes: bool,
   start_with_all_nodes: bool,
@@ -323,6 +337,13 @@ pub struct ClusterHarnessBuilder<'a> {
 }
 
 impl ClusterHarnessBuilder<'_> {
+  /// Offset this cluster's Sonyflake machine IDs when it shares blob storage with another pool.
+  #[must_use]
+  pub fn machine_id_offset(mut self, machine_id_offset: u16) -> Self {
+    self.machine_id_offset = machine_id_offset;
+    self
+  }
+
   pub fn blob_store(mut self, blob_store: Arc<dyn BlobStore>) -> Self {
     self.blob_store = Some(blob_store);
     self
@@ -335,6 +356,13 @@ impl ClusterHarnessBuilder<'_> {
 
   pub fn topic_num_writers(mut self, topic_num_writers: u32) -> Self {
     self.topic_num_writers = topic_num_writers;
+    self
+  }
+
+  /// Select the producer writer domain served by every broker in this cluster.
+  #[must_use]
+  pub fn broker_writer_id(mut self, broker_writer_id: u32) -> Self {
+    self.broker_writer_id = broker_writer_id;
     self
   }
 
@@ -421,6 +449,7 @@ impl ClusterHarnessBuilder<'_> {
     ClusterHarness::start_from_builder(
       Some(self.resources.store_fault_controller()),
       self.broker_count,
+      self.machine_id_offset,
       blob_store,
       metadata_store,
       lease_store,
@@ -428,6 +457,7 @@ impl ClusterHarnessBuilder<'_> {
       consumer_membership_store,
       self.partition_count,
       self.topic_num_writers,
+      self.broker_writer_id,
       self.broker_flush_max_delay,
       self.fenced_metadata_writes,
       self.start_with_all_nodes,
@@ -448,10 +478,12 @@ impl ClusterHarness {
     ClusterHarnessBuilder {
       resources,
       broker_count,
+      machine_id_offset: 0,
       blob_store: None,
       metadata_store: None,
       partition_count: PARTITION_COUNT,
       topic_num_writers: 1,
+      broker_writer_id: 0,
       broker_flush_max_delay: Duration::from_millis(10),
       fenced_metadata_writes: false,
       start_with_all_nodes: false,
@@ -466,9 +498,11 @@ impl ClusterHarness {
   pub fn in_memory(broker_count: usize) -> InMemoryClusterHarnessBuilder {
     InMemoryClusterHarnessBuilder {
       broker_count,
+      machine_id_offset: 0,
       metadata_store: None,
       partition_count: PARTITION_COUNT,
       topic_num_writers: 1,
+      broker_writer_id: 0,
       broker_flush_max_delay: Duration::from_millis(10),
       start_with_all_nodes: false,
       broker_time_provider: Arc::new(SystemTimeProvider),
@@ -479,6 +513,7 @@ impl ClusterHarness {
   async fn start_from_builder(
     store_fault_controller: Option<StoreFaultController>,
     broker_count: usize,
+    machine_id_offset: u16,
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
     lease_store: Arc<dyn ProducerPartitionLeaseStore>,
@@ -486,6 +521,7 @@ impl ClusterHarness {
     consumer_membership_store: Arc<dyn ConsumerGroupMembershipStore>,
     partition_count: u32,
     topic_num_writers: u32,
+    broker_writer_id: u32,
     broker_flush_max_delay: Duration,
     fenced_metadata_writes: bool,
     start_with_all_nodes: bool,
@@ -499,6 +535,12 @@ impl ClusterHarness {
     }
     if topic_num_writers == 0 {
       return Err(anyhow!("topic_num_writers must be greater than zero"));
+    }
+    if broker_writer_id >= topic_num_writers {
+      return Err(anyhow!(
+        "broker_writer_id must be less than topic_num_writers: {broker_writer_id} >= \
+         {topic_num_writers}"
+      ));
     }
     if broker_flush_max_delay.is_zero() {
       return Err(anyhow!("broker_flush_max_delay must be greater than zero"));
@@ -527,7 +569,9 @@ impl ClusterHarness {
       .enumerate()
       .map(|(index, node)| {
         let machine_id = u16::try_from(index)
-          .map_err(|_| anyhow!("broker count exceeds Sonyflake machine ID capacity"))?;
+          .ok()
+          .and_then(|machine_id| machine_id_offset.checked_add(machine_id))
+          .ok_or_else(|| anyhow!("cluster machine ID range exceeds u16 capacity"))?;
         Ok((node.node_id.clone(), machine_id))
       })
       .collect::<Result<HashMap<_, _>>>()?;
@@ -561,6 +605,7 @@ impl ClusterHarness {
       consumer_membership_store,
       partition_count,
       topic_num_writers,
+      broker_writer_id,
       broker_flush_max_delay,
       fenced_metadata_writes,
       transport,
@@ -862,6 +907,7 @@ impl ClusterHarness {
       Arc::clone(&self.lease_store),
       partition_count,
       topic_num_writers,
+      self.broker_writer_id,
       self.broker_flush_max_delay,
       self.fenced_metadata_writes,
       broker_shutdown_trigger.make_handle(),
@@ -986,6 +1032,7 @@ fn build_write_engine(
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
   partition_count: u32,
   topic_num_writers: u32,
+  broker_writer_id: u32,
   broker_flush_max_delay: Duration,
   fenced_metadata_writes: bool,
   shutdown_trigger_handle: ComponentShutdownTriggerHandle,
@@ -1008,7 +1055,7 @@ fn build_write_engine(
   }
 
   let mut config = WriteConfig::with_defaults();
-  config.writer_id = 0;
+  config.writer_id = broker_writer_id;
   config.flush_max_delay = time::Duration::try_from(broker_flush_max_delay)
     .map_err(|_| anyhow!("broker_flush_max_delay exceeds time::Duration bounds"))?;
   config.flush_max_bytes = 1024;

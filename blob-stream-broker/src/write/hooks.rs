@@ -20,6 +20,9 @@ pub trait BrokerLifecycleHooks: Send + Sync {
   /// Runs after a partition is marked draining and before its accepted work drains.
   async fn lease_drain_started(&self, _topic: &str, _virtual_partition_id: VirtualPartitionId) {}
 
+  /// Runs after a membership snapshot publishes its local write assignment.
+  async fn assignment_published(&self) {}
+
   /// Runs after a draining partition has no buffered or in-flight accepted work.
   async fn partition_drained(&self, _topic: &str, _virtual_partition_id: VirtualPartitionId) {}
 

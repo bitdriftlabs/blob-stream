@@ -181,10 +181,23 @@ impl<'a> WriteEngineBuilder<'a> {
       },
       |membership_rx| membership_rx.borrow().clone(),
     );
-    let state = Arc::new(Mutex::new(WriteState {
-      membership: initial_membership,
-      ..Default::default()
-    }));
+    let mut write_state = WriteState::with_membership(initial_membership.clone());
+    if initial_membership
+      .nodes()
+      .is_some_and(|nodes| nodes.iter().any(|node| node.node_id.as_str() == holder_id))
+    {
+      // A builder without discovery supplies a one-node initialized snapshot. A supplied watch
+      // can also already be initialized. In both cases, publish the same plan synchronously so
+      // a request cannot observe an authoritative member before the assignment task is polled.
+      let partitions = WriteEngineImpl::owned_virtual_partitions(
+        &topics,
+        config.writer_id,
+        &holder_id,
+        &initial_membership,
+      );
+      write_state.publish_assignment(&partitions);
+    }
+    let state = Arc::new(Mutex::new(write_state));
     let flush_context = FlushContext::new(
       config.clone(),
       blob_store,
