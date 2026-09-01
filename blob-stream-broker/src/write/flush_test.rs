@@ -350,7 +350,6 @@ async fn object_build_resnaps_time_after_sonyflake_sequence_overflow() -> Result
   let plan = FlushPlan {
     topics: vec![topic],
     max_segment_bytes: 1,
-    shared_blob: false,
     publication_completions: Vec::new(),
   };
 
@@ -385,6 +384,39 @@ async fn object_build_resnaps_time_after_sonyflake_sequence_overflow() -> Result
   Ok(())
 }
 
+#[tokio::test]
+async fn every_object_uses_a_shared_blob_key() -> Result<()> {
+  let now = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
+  let context = FlushContext::new(
+    WriteConfig::with_defaults(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    SnowflakeGenerator::with_machine_id(1)?,
+    Arc::new(ManualTimeProvider::new(now)),
+    None,
+  );
+  let mut topic = topic_flush_plan("telemetry".into(), 0, b"first");
+  topic.partitions.push(flush_partition(1, b"second"));
+  let mut plan = FlushPlan {
+    topics: vec![topic],
+    max_segment_bytes: 64 * 1024 * 1024,
+    publication_completions: Vec::new(),
+  };
+
+  let (objects, failures) = context
+    .build_objects(
+      &mut plan,
+      &WriteMetrics::new(&Collector::default().scope("flush_test")),
+    )
+    .await?;
+
+  assert!(failures.is_empty());
+  assert_eq!(objects.len(), 1);
+  assert_eq!(objects[0].topics.len(), 1);
+  assert!(objects[0].blob_key.as_str().starts_with("shared/"));
+  Ok(())
+}
+
 #[test]
 fn shared_blob_keys_include_the_window_start() {
   let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
@@ -401,15 +433,7 @@ fn shared_blob_keys_include_the_window_start() {
   );
 
   assert_eq!(
-    context
-      .make_blob_key("telemetry", &window, SnowflakeId(42))
-      .as_str(),
-    "telemetry/1699999800/42.bin"
-  );
-  assert_eq!(
-    context
-      .make_shared_blob_key(&window, SnowflakeId(42))
-      .as_str(),
+    context.make_blob_key(&window, SnowflakeId(42)).as_str(),
     "shared/1699999800/42.bin"
   );
 }
@@ -543,7 +567,6 @@ async fn lost_fence_does_not_fall_back_to_ordinary_metadata_write() -> Result<()
       fenced_metadata_writes: true,
     }],
     max_segment_bytes: 64 * 1024 * 1024,
-    shared_blob: false,
     publication_completions: Vec::new(),
   };
 
@@ -590,7 +613,6 @@ async fn shared_object_metadata_writes_start_concurrently() -> Result<()> {
       topic_flush_plan("second".into(), 0, b"second"),
     ],
     max_segment_bytes: 64 * 1024 * 1024,
-    shared_blob: true,
     publication_completions: Vec::new(),
   };
   let flush_context = context.clone();
@@ -627,7 +649,6 @@ async fn shared_blob_upload_failure_prevents_every_metadata_publication() -> Res
       topic_flush_plan("second".into(), 0, b"second"),
     ],
     max_segment_bytes: 64 * 1024 * 1024,
-    shared_blob: true,
     publication_completions: Vec::new(),
   };
   let collector = Collector::default();
@@ -670,7 +691,6 @@ async fn failed_predecessor_does_not_reject_independent_shared_partition() -> Re
   let mut plan = FlushPlan {
     topics: vec![topic],
     max_segment_bytes: 64 * 1024 * 1024,
-    shared_blob: true,
     publication_completions: Vec::new(),
   };
 
@@ -727,7 +747,6 @@ async fn uploads_all_plan_objects_before_starting_metadata_publication() -> Resu
       topic_flush_plan("second".into(), 0, b"second"),
     ],
     max_segment_bytes: 1,
-    shared_blob: true,
     publication_completions: Vec::new(),
   };
   let metrics = WriteMetrics::new(&Collector::default().scope("flush_test"));
@@ -783,7 +802,6 @@ async fn blob_upload_permits_bound_concurrent_plans() -> Result<()> {
       topic_flush_plan("first-b".into(), 0, b"first-b"),
     ],
     max_segment_bytes: 1,
-    shared_blob: true,
     publication_completions: Vec::new(),
   };
   let mut second_plan = FlushPlan {
@@ -792,7 +810,6 @@ async fn blob_upload_permits_bound_concurrent_plans() -> Result<()> {
       topic_flush_plan("second-b".into(), 0, b"second-b"),
     ],
     max_segment_bytes: 1,
-    shared_blob: true,
     publication_completions: Vec::new(),
   };
   let first_context = context.clone();
@@ -865,7 +882,6 @@ async fn upload_deadline_includes_pre_upload_hook_delay() -> Result<()> {
   let mut plan = FlushPlan {
     topics: vec![topic],
     max_segment_bytes: 1,
-    shared_blob: false,
     publication_completions: Vec::new(),
   };
   let metrics = WriteMetrics::new(&Collector::default().scope("flush_test"));
@@ -909,7 +925,6 @@ async fn capped_flush_keeps_published_object_results_when_later_object_expires()
   let mut plan = FlushPlan {
     topics: vec![topic_flush_plan("first".into(), 0, b"first"), expired_topic],
     max_segment_bytes: 1,
-    shared_blob: true,
     publication_completions: Vec::new(),
   };
   let collector = Collector::default();
@@ -956,7 +971,6 @@ async fn shared_object_uses_each_topics_metadata_window() -> Result<()> {
   let mut plan = FlushPlan {
     topics: vec![topic_flush_plan("first".into(), 0, b"first"), second_topic],
     max_segment_bytes: 64 * 1024 * 1024,
-    shared_blob: true,
     publication_completions: Vec::new(),
   };
   let collector = Collector::default();
@@ -1002,7 +1016,6 @@ async fn oversized_single_partition_object_is_counted() -> Result<()> {
       b"oversized-payload",
     )],
     max_segment_bytes: 1,
-    shared_blob: false,
     publication_completions: Vec::new(),
   };
 

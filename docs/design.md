@@ -290,15 +290,15 @@ an ambiguous failure can produce a duplicate batch, which is part of the at-leas
 Segments are stored through the blob-store abstraction, backed by S3 in production and an
 in-memory implementation in tests.
 
-Time-triggered objects use a shared key:
+All segment objects use a shared key:
 
 ```
 <optional-prefix>/shared/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>
 ```
 
-Shared objects can contain sections for topics with different retention periods. Configure the S3
+Objects can contain sections for topics with different retention periods. Configure the S3
 lifecycle rule for the `shared/` prefix to retain objects for at least the maximum retention of all
-topics eligible to share in the deployment, plus the metadata TTL buffer.
+topics in the deployment, plus the metadata TTL buffer.
 
 The extension records whether stored batches use zstd or no compression. A segment is not
 compressed as one monolithic payload. It is a concatenation of individually serialized and

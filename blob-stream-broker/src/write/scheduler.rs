@@ -333,7 +333,9 @@ pub(super) fn collect_next_flush_plan(
   // The scheduler acquires one permit before calling this function, so this pass builds exactly
   // one durable plan. A shared time plan may include a single compatible section per topic.
   let mut topic_plans = HashMap::<Chars, TopicFlushPlan>::new();
-  let mut selected_shared_blob = None;
+  // This controls only which topic sections may join the same scheduler pass. Flush assembly
+  // stores every resulting object under the shared blob namespace.
+  let mut selected_shared_time_flush = None;
   let mut last_planned_topic = None;
 
   for (topic, virtual_partition_id) in partition_keys
@@ -377,8 +379,8 @@ pub(super) fn collect_next_flush_plan(
         || (fenced_metadata_writes && existing_partition_count == MAX_FENCED_METADATA_PARTITIONS)
     });
     let shared_time_plan = matches!(trigger, FlushTrigger::MaxDelay) && requires_new_topic_plan;
-    let joins_selected_plan = selected_shared_blob.is_none_or(|selected_shared_blob| {
-      if selected_shared_blob {
+    let joins_selected_plan = selected_shared_time_flush.is_none_or(|shared_time_flush| {
+      if shared_time_flush {
         // A shared plan may add another topic, or more partitions for a topic already in its
         // current chunk. A second chunk for that topic requires a later scheduler pass.
         shared_time_plan && (!requires_new_topic_plan || existing_topic_plan.is_none())
@@ -444,7 +446,7 @@ pub(super) fn collect_next_flush_plan(
           fenced_metadata_writes,
         },
       );
-      selected_shared_blob.get_or_insert(shared_time_plan);
+      selected_shared_time_flush.get_or_insert(shared_time_plan);
 
       // Only advance fairness after this pass has claimed work. Skipped partitions leave the
       // cursor unchanged, so a later selection can resume from the same eligible work.
@@ -462,7 +464,7 @@ pub(super) fn collect_next_flush_plan(
     state.last_flush_topic = Some(last_planned_topic);
   }
 
-  let shared_blob = selected_shared_blob?;
+  selected_shared_time_flush?;
   let mut topics = topic_plans.into_values().collect::<Vec<_>>();
   topics.sort_by(|left, right| left.topic.as_str().cmp(right.topic.as_str()));
   let mut publication_completions = Vec::new();
@@ -482,7 +484,6 @@ pub(super) fn collect_next_flush_plan(
   Some(FlushPlan {
     topics,
     max_segment_bytes: config.max_segment_bytes(feature_flags),
-    shared_blob,
     publication_completions,
   })
 }
