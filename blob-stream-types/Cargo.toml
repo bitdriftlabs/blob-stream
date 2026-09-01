@@ -14,6 +14,7 @@ blob-stream-blob-store = { path = "../blob-stream-blob-store" }
 blob-stream-proto      = { path = "../blob-stream-proto" }
 bytes.workspace        = true
 serde.workspace        = true
+siphasher.workspace    = true
 sonyflake.workspace    = true
 time.workspace         = true
 

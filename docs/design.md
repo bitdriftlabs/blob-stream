@@ -45,6 +45,13 @@ logical partition:
 logical_partition_id = hash(record_key) % partition_count
 ```
 
+`hash(record_key)` is SipHash-1-3 with both 64-bit keys set to zero, a little-endian 64-bit
+byte-slice length prefix, and the raw record-key bytes. This preserves the Rust 1.98
+`DefaultHasher::new()` mapping used by existing 64-bit little-endian producer deployments while
+making the partitioning contract independent of the target architecture. The implementation writes
+those bytes explicitly rather than delegating to the standard-library `Hash` trait, so partition
+assignment remains stable across Rust upgrades and deployment architectures.
+
 Each producer deployment has a static `writer_id` in the range `[0, num_writers)`. It maps a
 logical partition to a virtual partition:
 
@@ -94,11 +101,14 @@ Broker discovery distinguishes a pending initial watch value from an initialized
 snapshot. A producer and a broker-collapsed consumer metadata client wait up to 10 seconds for an
 initialized snapshot before creating routes; otherwise construction fails. A broker starts its
 listener while discovery is pending so Kubernetes can mark the pod ready and include it in
-Endpoints, but it performs no lease acquisition, renewal, release, or assignment reconciliation
-until an initialized membership contains its own node ID. An initialized membership without the
-local node after that activation is a real ownership loss; an initialized empty membership owns no
-partitions and has no producer route. This prevents a pod from temporarily claiming every partition
-while Kubernetes publishes its initial Endpoint set.
+Endpoints, but it performs no lease acquisition until an initialized membership contains its own
+node ID. Every membership snapshot, including pending, empty, or foreign membership, replaces the
+broker's local write-admission set. The broker accepts a virtual-partition write only when the
+current deterministic plan contains that partition; rejection occurs before it creates local state,
+acquires a lease, or reserves sequences. An initialized membership without the local node after
+activation is an ownership loss, and an initialized empty membership owns no partitions and has no
+producer route. This prevents a pod from temporarily claiming every partition while Kubernetes
+publishes its initial Endpoint set.
 
 Each broker fences writes through a producer-partition lease. A lease key contains topic, the
 virtual partition ID. The virtual partition calculation already includes writer identity, so the
@@ -110,8 +120,12 @@ heartbeat must be shorter than the lease duration; it renews every producer-part
 by the broker. A failed acquisition because another holder is still live retries after 250 ms with
 exponential backoff capped at 2 seconds. Increasing both reduces DynamoDB renewal writes but
 extends recovery after an ungraceful broker loss. During graceful membership changes and shutdown,
-the broker stops accepting new work, drains accepted work while renewing the lease before its
-existing expiry, and then releases moved leases explicitly.
+the broker first removes moved partitions from local write admission, drains already accepted work
+while renewing the lease before its existing expiry, and then releases moved leases explicitly.
+Reconciliation also drains and releases any locally tracked lease outside the current plan, covering
+state left by an older inline-acquisition path rather than waiting for its TTL to expire. Lease
+acquisition logs record whether acquisition was requested inline by `ProduceBatch` or by assignment
+maintenance, plus the assignment-set generation that authorized it.
 
 Broker admin state reports its configured writer ID, local membership as `{node_id, address}`,
 and one ownership row per local writer-scoped virtual partition. Each row distinguishes the

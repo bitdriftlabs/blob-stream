@@ -62,6 +62,7 @@ serde             = { version = "1.0.229", features = ["derive"] }
 serde_dynamo      = "4.3.0"
 serde_json        = { version = "1.0.151" }
 serde_yaml        = "0.9.34"
+siphasher         = "=0.3.11"
 sonyflake         = { git = "https://github.com/mattklein123/sonyflake-rs.git" }
 thiserror         = "2.0.20"
 tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }

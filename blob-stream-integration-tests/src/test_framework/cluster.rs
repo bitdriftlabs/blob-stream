@@ -183,6 +183,7 @@ pub struct ClusterHarness {
   consumer_membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   partition_count: u32,
   topic_num_writers: u32,
+  broker_writer_id: u32,
   broker_flush_max_delay: Duration,
   fenced_metadata_writes: bool,
   transport: Arc<dyn BrokerTransport>,
@@ -203,6 +204,7 @@ pub struct InMemoryClusterHarnessBuilder {
   metadata_store: Option<Arc<dyn MetadataStore>>,
   partition_count: u32,
   topic_num_writers: u32,
+  broker_writer_id: u32,
   broker_flush_max_delay: Duration,
   start_with_all_nodes: bool,
   broker_time_provider: Arc<dyn TimeProvider>,
@@ -290,6 +292,7 @@ impl InMemoryClusterHarnessBuilder {
       consumer_membership_store,
       self.partition_count,
       self.topic_num_writers,
+      self.broker_writer_id,
       self.broker_flush_max_delay,
       false,
       self.start_with_all_nodes,
@@ -313,6 +316,7 @@ pub struct ClusterHarnessBuilder<'a> {
   metadata_store: Option<Arc<dyn MetadataStore>>,
   partition_count: u32,
   topic_num_writers: u32,
+  broker_writer_id: u32,
   broker_flush_max_delay: Duration,
   fenced_metadata_writes: bool,
   start_with_all_nodes: bool,
@@ -335,6 +339,13 @@ impl ClusterHarnessBuilder<'_> {
 
   pub fn topic_num_writers(mut self, topic_num_writers: u32) -> Self {
     self.topic_num_writers = topic_num_writers;
+    self
+  }
+
+  /// Select the producer writer domain served by every broker in this cluster.
+  #[must_use]
+  pub fn broker_writer_id(mut self, broker_writer_id: u32) -> Self {
+    self.broker_writer_id = broker_writer_id;
     self
   }
 
@@ -428,6 +439,7 @@ impl ClusterHarnessBuilder<'_> {
       consumer_membership_store,
       self.partition_count,
       self.topic_num_writers,
+      self.broker_writer_id,
       self.broker_flush_max_delay,
       self.fenced_metadata_writes,
       self.start_with_all_nodes,
@@ -452,6 +464,7 @@ impl ClusterHarness {
       metadata_store: None,
       partition_count: PARTITION_COUNT,
       topic_num_writers: 1,
+      broker_writer_id: 0,
       broker_flush_max_delay: Duration::from_millis(10),
       fenced_metadata_writes: false,
       start_with_all_nodes: false,
@@ -469,6 +482,7 @@ impl ClusterHarness {
       metadata_store: None,
       partition_count: PARTITION_COUNT,
       topic_num_writers: 1,
+      broker_writer_id: 0,
       broker_flush_max_delay: Duration::from_millis(10),
       start_with_all_nodes: false,
       broker_time_provider: Arc::new(SystemTimeProvider),
@@ -486,6 +500,7 @@ impl ClusterHarness {
     consumer_membership_store: Arc<dyn ConsumerGroupMembershipStore>,
     partition_count: u32,
     topic_num_writers: u32,
+    broker_writer_id: u32,
     broker_flush_max_delay: Duration,
     fenced_metadata_writes: bool,
     start_with_all_nodes: bool,
@@ -499,6 +514,12 @@ impl ClusterHarness {
     }
     if topic_num_writers == 0 {
       return Err(anyhow!("topic_num_writers must be greater than zero"));
+    }
+    if broker_writer_id >= topic_num_writers {
+      return Err(anyhow!(
+        "broker_writer_id must be less than topic_num_writers: {broker_writer_id} >= \
+         {topic_num_writers}"
+      ));
     }
     if broker_flush_max_delay.is_zero() {
       return Err(anyhow!("broker_flush_max_delay must be greater than zero"));
@@ -561,6 +582,7 @@ impl ClusterHarness {
       consumer_membership_store,
       partition_count,
       topic_num_writers,
+      broker_writer_id,
       broker_flush_max_delay,
       fenced_metadata_writes,
       transport,
@@ -862,6 +884,7 @@ impl ClusterHarness {
       Arc::clone(&self.lease_store),
       partition_count,
       topic_num_writers,
+      self.broker_writer_id,
       self.broker_flush_max_delay,
       self.fenced_metadata_writes,
       broker_shutdown_trigger.make_handle(),
@@ -986,6 +1009,7 @@ fn build_write_engine(
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
   partition_count: u32,
   topic_num_writers: u32,
+  broker_writer_id: u32,
   broker_flush_max_delay: Duration,
   fenced_metadata_writes: bool,
   shutdown_trigger_handle: ComponentShutdownTriggerHandle,
@@ -1008,7 +1032,7 @@ fn build_write_engine(
   }
 
   let mut config = WriteConfig::with_defaults();
-  config.writer_id = 0;
+  config.writer_id = broker_writer_id;
   config.flush_max_delay = time::Duration::try_from(broker_flush_max_delay)
     .map_err(|_| anyhow!("broker_flush_max_delay exceeds time::Duration bounds"))?;
   config.flush_max_bytes = 1024;

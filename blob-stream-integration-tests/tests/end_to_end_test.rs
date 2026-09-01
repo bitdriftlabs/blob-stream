@@ -5930,26 +5930,35 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
     panic!("failed to find key for logical partition {logical_partition_id} within search budget");
   }
 
-  // Step 1: Start one broker with a topic configured for two writers.
+  // Step 1: Start a broker pool for each independent producer writer domain. Both pools share
+  // durable storage so the consumer can merge their disjoint virtual partitions.
   let resources = IntegrationResources::create().await?;
-  let mut cluster = ClusterHarness::builder(&resources, 1)
+  let mut writer_0_cluster = ClusterHarness::builder(&resources, 1)
     .topic_num_writers(2)
     .start()
     .await?;
-  let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
+  let mut writer_1_cluster = ClusterHarness::builder(&resources, 1)
+    .topic_num_writers(2)
+    .broker_writer_id(1)
+    .start()
+    .await?;
+  let writer_0_discovery: Arc<dyn BrokerDiscovery> =
+    Arc::new(writer_0_cluster.producer_discovery());
+  let writer_1_discovery: Arc<dyn BrokerDiscovery> =
+    Arc::new(writer_1_cluster.producer_discovery());
 
   // Step 2: Create producers for writer 0 and writer 1 on the same topic.
   let producer_writer_0 = new_producer(
     producer_config_with_writer_id(0),
     vec![producer_topic_named_with_writers(TOPIC, 2)],
-    Arc::clone(&discovery),
+    writer_0_discovery,
     metrics_scope("blob_stream_producer_it"),
   )
   .await?;
   let producer_writer_1 = new_producer(
     producer_config_with_writer_id(1),
     vec![producer_topic_named_with_writers(TOPIC, 2)],
-    Arc::clone(&discovery),
+    writer_1_discovery,
     metrics_scope("blob_stream_producer_it"),
   )
   .await?;
@@ -6081,7 +6090,8 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
   let duplicate_scan = reader.read_available(now_unix_seconds()).await?;
   assert!(duplicate_scan.is_empty());
 
-  cluster.shutdown().await;
+  writer_0_cluster.shutdown().await;
+  writer_1_cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())
 }

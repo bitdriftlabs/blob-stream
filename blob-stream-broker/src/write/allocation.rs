@@ -22,6 +22,7 @@ pub(super) struct AllocationTransition {
   state: Arc<Mutex<WriteState>>,
   topic: String,
   virtual_partition_id: VirtualPartitionId,
+  assignment_generation: u64,
   reset_sequence_allocation_on_finish: bool,
   finished: bool,
 }
@@ -32,8 +33,8 @@ impl AllocationTransition {
     lease_expiration_update: LeaseExpirationUpdate,
     lease: Option<ProducerPartitionLease>,
     reservation: Option<SeqRange>,
-  ) {
-    self.finish_inner(lease_expiration_update, lease, reservation, None);
+  ) -> AllocationTransitionFinish {
+    self.finish_inner(lease_expiration_update, lease, reservation, None)
   }
 
   pub(super) fn finish_lease_maintenance(
@@ -42,13 +43,13 @@ impl AllocationTransition {
     lease: Option<ProducerPartitionLease>,
     reservation: Option<SeqRange>,
     records_allocated_since_last_maintenance: u64,
-  ) {
+  ) -> AllocationTransitionFinish {
     self.finish_inner(
       lease_expiration_update,
       lease,
       reservation,
       Some(records_allocated_since_last_maintenance),
-    );
+    )
   }
 
   fn finish_inner(
@@ -57,9 +58,9 @@ impl AllocationTransition {
     lease: Option<ProducerPartitionLease>,
     reservation: Option<SeqRange>,
     records_allocated_since_last_maintenance: Option<u64>,
-  ) {
+  ) -> AllocationTransitionFinish {
     if self.finished {
-      return;
+      return AllocationTransitionFinish::StaleAssignment;
     }
 
     trace!(
@@ -76,45 +77,62 @@ impl AllocationTransition {
       self.reset_sequence_allocation_on_finish,
     );
 
-    let (allocation_notify, drain_notify, stale_completions) = {
+    let (finish, allocation_notify, drain_notify, stale_completions) = {
       let mut state = self.state.lock();
-      let partition_state = state.partition_state_mut(&self.topic, self.virtual_partition_id);
+      let assignment_is_current = state.assignment_generation_is_current(
+        &self.topic,
+        self.virtual_partition_id,
+        self.assignment_generation,
+      );
+      let Some(partition_state) =
+        state.partition_state_mut_if_present(&self.topic, self.virtual_partition_id)
+      else {
+        self.finished = true;
+        return AllocationTransitionFinish::StaleAssignment;
+      };
       let mut stale_completions = Vec::new();
-      if let LeaseExpirationUpdate::Set(lease_expiration_at) = lease_expiration_update {
-        partition_state.lease_expiration_at = lease_expiration_at;
-      }
-      if let Some(lease) = lease {
-        let lease_fence = Some(Arc::new(lease.fence));
-        if partition_state.lease_fence != lease_fence {
-          stale_completions = partition_state.buffer.discard();
+      if assignment_is_current {
+        if let LeaseExpirationUpdate::Set(lease_expiration_at) = lease_expiration_update {
+          partition_state.lease_expiration_at = lease_expiration_at;
         }
-        partition_state.lease_fence = lease_fence;
-      } else if matches!(lease_expiration_update, LeaseExpirationUpdate::Set(None)) {
-        stale_completions = partition_state.buffer.discard();
-        partition_state.lease_fence = None;
-      }
-      if matches!(lease_expiration_update, LeaseExpirationUpdate::Set(None))
-        || (self.reset_sequence_allocation_on_finish
-          && matches!(lease_expiration_update, LeaseExpirationUpdate::Set(Some(_))))
-      {
-        partition_state.reset_sequence_allocation();
-      }
-      if let Some(reservation) = reservation {
-        partition_state
-          .seq_allocator
-          .install_or_extend_reservation(reservation);
-      }
-      if let Some(records_allocated_since_last_maintenance) =
-        records_allocated_since_last_maintenance
-        && matches!(lease_expiration_update, LeaseExpirationUpdate::Set(Some(_)))
-      {
-        partition_state.records_allocated_since_lease_maintenance = partition_state
-          .records_allocated_since_lease_maintenance
-          .saturating_sub(records_allocated_since_last_maintenance);
+        if let Some(lease) = lease {
+          let lease_fence = Some(Arc::new(lease.fence));
+          if partition_state.lease_fence != lease_fence {
+            stale_completions = partition_state.buffer.discard();
+          }
+          partition_state.lease_fence = lease_fence;
+        } else if matches!(lease_expiration_update, LeaseExpirationUpdate::Set(None)) {
+          stale_completions = partition_state.buffer.discard();
+          partition_state.lease_fence = None;
+        }
+        if matches!(lease_expiration_update, LeaseExpirationUpdate::Set(None))
+          || (self.reset_sequence_allocation_on_finish
+            && matches!(lease_expiration_update, LeaseExpirationUpdate::Set(Some(_))))
+        {
+          partition_state.reset_sequence_allocation();
+        }
+        if let Some(reservation) = reservation {
+          partition_state
+            .seq_allocator
+            .install_or_extend_reservation(reservation);
+        }
+        if let Some(records_allocated_since_last_maintenance) =
+          records_allocated_since_last_maintenance
+          && matches!(lease_expiration_update, LeaseExpirationUpdate::Set(Some(_)))
+        {
+          partition_state.records_allocated_since_lease_maintenance = partition_state
+            .records_allocated_since_lease_maintenance
+            .saturating_sub(records_allocated_since_last_maintenance);
+        }
       }
       partition_state.allocation_in_flight = false;
       partition_state.allocation_started_at = None;
       (
+        if assignment_is_current {
+          AllocationTransitionFinish::Applied
+        } else {
+          AllocationTransitionFinish::StaleAssignment
+        },
         Arc::clone(&partition_state.allocation_notify),
         Arc::clone(&partition_state.drain_notify),
         stale_completions,
@@ -131,13 +149,24 @@ impl AllocationTransition {
     for completion in stale_completions {
       let _ignored = completion.send(Err(FlushCompletionError::LeaseFenceLost));
     }
+    finish
   }
 }
 
 impl Drop for AllocationTransition {
   fn drop(&mut self) {
-    self.finish_inner(LeaseExpirationUpdate::Preserve, None, None, None);
+    let _ = self.finish_inner(LeaseExpirationUpdate::Preserve, None, None, None);
   }
+}
+
+//
+// AllocationTransitionFinish
+//
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AllocationTransitionFinish {
+  Applied,
+  StaleAssignment,
 }
 
 //
@@ -156,6 +185,7 @@ pub(super) enum LeaseExpirationUpdate {
 
 pub(super) struct AllocationTransitionWork {
   pub(super) transition: AllocationTransition,
+  pub(super) assignment_generation: u64,
   pub(super) needs_lease: bool,
   pub(super) lease_was_expired: bool,
   pub(super) reservation: Option<ReservationRequest>,
@@ -196,6 +226,7 @@ fn maintenance_high_utilization_threshold(target_size: u64) -> u64 {
 //
 
 pub(super) enum AllocationTransitionDecision {
+  NotAssigned,
   Draining,
   Ready,
   Waiting(OwnedNotified),
@@ -212,6 +243,17 @@ pub(super) fn begin_allocation_transition(
   base_reservation_size: u64,
 ) -> AllocationTransitionDecision {
   let mut state_guard = state.lock();
+  let Some(assignment_generation) =
+    state_guard.assignment_generation_for_partition(topic, virtual_partition_id)
+  else {
+    // Check authorization before `partition_state_mut` so an unassigned request cannot create
+    // state that a later membership reconciliation mistakes for a locally held partition.
+    trace!(
+      "broker allocation rejected by assignment: topic={topic}, \
+       virtual_partition_id={virtual_partition_id}, renew_lease={renew_lease}"
+    );
+    return AllocationTransitionDecision::NotAssigned;
+  };
   let partition_state = state_guard.partition_state_mut(topic, virtual_partition_id);
   if partition_state.draining && !renew_lease {
     return AllocationTransitionDecision::Draining;
@@ -297,9 +339,11 @@ pub(super) fn begin_allocation_transition(
       state: Arc::clone(state),
       topic: topic.to_string(),
       virtual_partition_id,
+      assignment_generation,
       reset_sequence_allocation_on_finish: lease_was_expired,
       finished: false,
     },
+    assignment_generation,
     needs_lease,
     lease_was_expired,
     reservation,

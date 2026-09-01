@@ -4,7 +4,7 @@ use blob_stream_metadata_store::ProducerLeaseFence;
 use blob_stream_types::{SeqRange, VirtualPartitionId};
 use log::debug;
 use protobuf::Chars;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::Notify;
@@ -16,11 +16,66 @@ use tokio::sync::Notify;
 #[derive(Debug, Default)]
 pub(super) struct WriteState {
   pub(super) membership: BrokerMembership,
+  // Membership updates and allocation transitions share this mutex. Keeping authorization here
+  // makes the decision to admit a request atomic with creating or mutating its partition state.
+  assignment: LocalAssignment,
   pub(super) topics: HashMap<Chars, TopicState>,
   pub(super) last_flush_topic: Option<Chars>,
 }
 
 impl WriteState {
+  pub(super) fn with_membership(membership: BrokerMembership) -> Self {
+    Self {
+      membership,
+      ..Self::default()
+    }
+  }
+
+  pub(super) fn publish_assignment(&mut self, partitions: &[(Chars, VirtualPartitionId)]) -> u64 {
+    let partitions =
+      partitions
+        .iter()
+        .fold(HashMap::new(), |mut partitions, (topic, partition)| {
+          partitions
+            .entry(topic.clone())
+            .or_insert_with(HashSet::new)
+            .insert(*partition);
+          partitions
+        });
+    if self.assignment.partitions != partitions {
+      self.assignment.generation = self.assignment.generation.saturating_add(1);
+      self.assignment.partitions = partitions;
+    }
+    self.assignment.active = true;
+    self.assignment.generation
+  }
+
+  pub(super) fn assignment_generation_is_current(
+    &self,
+    topic: &str,
+    virtual_partition_id: VirtualPartitionId,
+    assignment_generation: u64,
+  ) -> bool {
+    self.assignment_generation_for_partition(topic, virtual_partition_id)
+      == Some(assignment_generation)
+  }
+
+  pub(super) fn assignment_generation_for_partition(
+    &self,
+    topic: &str,
+    virtual_partition_id: VirtualPartitionId,
+  ) -> Option<u64> {
+    // A pending discovery snapshot is not an authorization to write. Once activated, an empty
+    // partition set is authoritative and therefore rejects every foreground allocation.
+    (self.assignment.active
+      && self
+        .assignment
+        .partitions
+        .get(topic)
+        .is_some_and(|partitions| partitions.contains(&virtual_partition_id)))
+    .then_some(self.assignment.generation)
+  }
+
   pub(super) fn partition_state_mut(
     &mut self,
     topic: &str,
@@ -67,6 +122,49 @@ impl WriteState {
       .and_then(|topic_state| topic_state.partitions.get_mut(&virtual_partition_id))
   }
 
+  pub(super) fn clear_terminally_released_partition(
+    &mut self,
+    topic: &str,
+    virtual_partition_id: VirtualPartitionId,
+  ) {
+    let assignment_is_current = self
+      .assignment_generation_for_partition(topic, virtual_partition_id)
+      .is_some();
+    let should_remove = self
+      .partition_state_mut_if_present(topic, virtual_partition_id)
+      .is_some_and(|partition_state| {
+        // A terminal release fences the old lease even if a later membership update has already
+        // restored the partition. Keep that state for maintenance to reacquire, but retire an
+        // unassigned drained partition so reconciliation does not release it every heartbeat.
+        partition_state.lease_expiration_at = None;
+        partition_state.lease_fence = None;
+        partition_state.reset_sequence_allocation();
+        !assignment_is_current && partition_state.draining && partition_state.is_drained()
+      });
+    if !should_remove {
+      return;
+    }
+
+    let remove_topic = {
+      let topic_state = self
+        .topics
+        .get_mut(topic)
+        .expect("terminal release state was present immediately before removal");
+      topic_state.partitions.remove(&virtual_partition_id);
+      topic_state.partitions.is_empty()
+    };
+    if remove_topic {
+      self.topics.remove(topic);
+      if self
+        .last_flush_topic
+        .as_ref()
+        .is_some_and(|last_flush_topic| last_flush_topic.as_str() == topic)
+      {
+        self.last_flush_topic = None;
+      }
+    }
+  }
+
   pub(super) fn partition_keys(&self) -> Vec<(Chars, VirtualPartitionId)> {
     self
       .topics
@@ -79,6 +177,21 @@ impl WriteState {
       })
       .collect()
   }
+}
+
+//
+// LocalAssignment
+//
+
+#[derive(Debug, Default)]
+struct LocalAssignment {
+  // `active` distinguishes discovery pending from an initialized snapshot that simply assigns no
+  // local partitions. Both cases reject writes, but the distinction is useful to lifecycle code.
+  active: bool,
+  generation: u64,
+  // This layout retains owned topic names but lets the foreground `&str` lookup borrow directly
+  // from the topic map, avoiding an allocation for every admitted producer request.
+  partitions: HashMap<Chars, HashSet<VirtualPartitionId>>,
 }
 
 //

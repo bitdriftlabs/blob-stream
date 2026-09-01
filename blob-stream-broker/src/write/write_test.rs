@@ -12,6 +12,7 @@ use super::{
   WriteEngine,
   WriteEngineBuilder,
   WriteEngineImpl,
+  WriteError,
   WriteRequest,
 };
 use anyhow::Result;
@@ -105,6 +106,18 @@ struct GatedReservationLeaseStore {
   entered_tx: mpsc::UnboundedSender<()>,
   release_first: Arc<Semaphore>,
   first_reservation: AtomicBool,
+}
+
+//
+// GatedLeaseAcquireStore
+//
+
+/// Blocks one lease acquisition after the caller enables the gate.
+struct GatedLeaseAcquireStore {
+  inner: Arc<InMemoryProducerPartitionLeaseStore>,
+  entered_tx: mpsc::UnboundedSender<()>,
+  release: Arc<Semaphore>,
+  block_next: AtomicBool,
 }
 
 struct FailsTopicMetadataStore {
@@ -428,6 +441,117 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
   }
 }
 
+#[async_trait]
+impl ProducerPartitionLeaseStore for GatedLeaseAcquireStore {
+  async fn get_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+  ) -> Result<Option<ProducerPartitionLease>> {
+    self.inner.get_lease(key).await
+  }
+
+  async fn acquire_lease(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    lease_session_id: String,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
+  ) -> Result<LeaseAcquireOutcome> {
+    if self.block_next.swap(false, Ordering::AcqRel) {
+      self
+        .entered_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("test receiver dropped"))?;
+      self
+        .release
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("test gate closed"))?
+        .forget();
+    }
+    self
+      .inner
+      .acquire_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .await
+  }
+
+  async fn acquire_lease_and_reserve_sequences(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    lease_session_id: String,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
+    reservation_size: Option<u64>,
+  ) -> Result<LeaseAcquireAndReserveOutcome> {
+    if self.block_next.swap(false, Ordering::AcqRel) {
+      self
+        .entered_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("test receiver dropped"))?;
+      self
+        .release
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("test gate closed"))?
+        .forget();
+    }
+    self
+      .inner
+      .acquire_lease_and_reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now,
+        lease_duration,
+        reservation_size,
+      )
+      .await
+  }
+
+  async fn heartbeat_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    lease_session_id: &str,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
+  ) -> Result<LeaseHeartbeatOutcome> {
+    self
+      .inner
+      .heartbeat_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .await
+  }
+
+  async fn reserve_sequences(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    lease_session_id: &str,
+    now: OffsetDateTime,
+    reservation_size: u64,
+  ) -> Result<SequenceReservationOutcome> {
+    self
+      .inner
+      .reserve_sequences(key, holder_id, lease_session_id, now, reservation_size)
+      .await
+  }
+
+  async fn release_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    lease_session_id: &str,
+    now: OffsetDateTime,
+  ) -> Result<LeaseReleaseOutcome> {
+    self
+      .inner
+      .release_lease(key, holder_id, lease_session_id, now)
+      .await
+  }
+}
+
 fn std_duration(duration: TimeDuration) -> StdDuration {
   StdDuration::try_from(duration).unwrap()
 }
@@ -436,9 +560,360 @@ fn metrics_scope() -> bd_server_stats::stats::Scope {
   Collector::default().scope("blob_stream_broker_test")
 }
 
+fn state_with_local_telemetry_assignment() -> Arc<parking_lot::Mutex<WriteState>> {
+  let mut state = WriteState::default();
+  // These allocation-focused tests bypass discovery, so they construct the same authoritative
+  // local assignment that a production membership update would publish before allocation.
+  state.publish_assignment(&[("telemetry".into(), 0)]);
+  Arc::new(parking_lot::Mutex::new(state))
+}
+
+fn make_engine_with_membership(
+  time_provider: Arc<ManualTimeProvider>,
+  membership_rx: watch::Receiver<BrokerMembership>,
+  shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
+  partition_count: u32,
+) -> Result<(
+  Arc<WriteEngineImpl>,
+  Arc<InMemoryProducerPartitionLeaseStore>,
+)> {
+  let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
+  let engine = make_engine_with_membership_and_lease_store(
+    time_provider,
+    membership_rx,
+    shutdown_trigger_handle,
+    partition_count,
+    &(lease_store.clone() as Arc<dyn ProducerPartitionLeaseStore>),
+  )?;
+  Ok((engine, lease_store))
+}
+
+fn make_engine_with_membership_and_lease_store(
+  time_provider: Arc<ManualTimeProvider>,
+  membership_rx: watch::Receiver<BrokerMembership>,
+  shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
+  partition_count: u32,
+  lease_store: &Arc<dyn ProducerPartitionLeaseStore>,
+) -> Result<Arc<WriteEngineImpl>> {
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  let topics = HashMap::from([(
+    "telemetry".into(),
+    TopicInfo {
+      name: "telemetry".into(),
+      partition_count,
+      num_writers: 1,
+      retention: TimeDuration::days(7),
+      max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+      metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
+    },
+  )]);
+  let engine = WriteEngineBuilder::new(
+    config,
+    topics,
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    Arc::clone(lease_store),
+    "node-a".to_string(),
+    shutdown_trigger_handle,
+    &metrics_scope(),
+  )
+  .membership_rx(membership_rx)
+  .time_provider(time_provider)
+  .build()?;
+  Ok(Arc::new(engine))
+}
+
+#[tokio::test]
+async fn produce_rejects_pending_and_foreign_membership_without_creating_a_lease() -> Result<()> {
+  let now = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let (membership_tx, membership_rx) = watch::channel(BrokerMembership::default());
+  let (engine, lease_store) = make_engine_with_membership(
+    now.clone(),
+    membership_rx,
+    shutdown_trigger.make_handle(),
+    1,
+  )?;
+  let request = || WriteRequest {
+    topic: "telemetry".into(),
+    virtual_partition_id: 0,
+    records: vec![new_record(vec![1], 1)],
+  };
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".into(),
+    virtual_partition_id: 0,
+  };
+
+  // Pending discovery and an initialized snapshot without this node are both non-authoritative
+  // for local writes. Neither may create state that could later acquire a lease.
+  assert!(matches!(
+    engine.produce_batch(request()).await,
+    Err(WriteError::NotLeaseHolder { .. })
+  ));
+  assert!(engine.state.lock().partition_keys().is_empty());
+  assert!(lease_store.get_lease(&key).await?.is_none());
+
+  membership_tx.send(BrokerMembership::new(Vec::new()))?;
+  tokio::task::yield_now().await;
+  assert!(matches!(
+    engine.produce_batch(request()).await,
+    Err(WriteError::NotLeaseHolder { .. })
+  ));
+  assert!(engine.state.lock().partition_keys().is_empty());
+  assert!(lease_store.get_lease(&key).await?.is_none());
+
+  membership_tx.send(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
+  }]))?;
+  tokio::task::yield_now().await;
+  assert!(matches!(
+    engine.produce_batch(request()).await,
+    Err(WriteError::NotLeaseHolder { .. })
+  ));
+  assert!(engine.state.lock().partition_keys().is_empty());
+  assert!(lease_store.get_lease(&key).await?.is_none());
+
+  Ok(())
+}
+
+#[tokio::test]
+async fn produce_rejects_stale_local_allocation_after_membership_handoff() -> Result<()> {
+  let now = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
+  }]));
+  let (engine, _lease_store) =
+    make_engine_with_membership(now, membership_rx, shutdown_trigger.make_handle(), 1)?;
+  let request = || WriteRequest {
+    topic: "telemetry".into(),
+    virtual_partition_id: 0,
+    records: vec![new_record(vec![1], 1)],
+  };
+
+  // The initial snapshot is authoritative at construction, so this write installs a local
+  // lease/reservation. The next membership update must fence that cached allocation immediately.
+  engine.produce_batch(request()).await?;
+  membership_tx.send(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
+  }]))?;
+  for _ in 0 .. 100 {
+    if engine
+      .state
+      .lock()
+      .assignment_generation_for_partition("telemetry", 0)
+      .is_none()
+    {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+
+  assert!(matches!(
+    engine.produce_batch(request()).await,
+    Err(WriteError::NotLeaseHolder { .. })
+  ));
+  Ok(())
+}
+
+#[tokio::test]
+async fn foreground_acquire_completed_after_membership_handoff_is_released() -> Result<()> {
+  let initial_time = offset_datetime_from_unix_millis(1_700_000_000_000);
+  let time_provider = Arc::new(ManualTimeProvider::new(initial_time));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
+  }]));
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let inner = Arc::new(InMemoryProducerPartitionLeaseStore::new());
+  let lease_store = Arc::new(GatedLeaseAcquireStore {
+    inner: inner.clone(),
+    entered_tx,
+    release: Arc::clone(&release),
+    block_next: AtomicBool::new(false),
+  });
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".into(),
+    virtual_partition_id: 0,
+  };
+  let engine = make_engine_with_membership_and_lease_store(
+    time_provider.clone(),
+    membership_rx,
+    shutdown_trigger.make_handle(),
+    1,
+    &(lease_store.clone() as Arc<dyn ProducerPartitionLeaseStore>),
+  )?;
+
+  // Establish maintenance ownership before expiring it. The gate then isolates the foreground
+  // reacquisition from the assignment loop's normal initial lease acquisition.
+  let mut initial_lease = None;
+  for _ in 0 .. 100 {
+    initial_lease = inner.get_lease(&key).await?;
+    if initial_lease.is_some() {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+  let initial_lease = initial_lease.expect("initial maintenance lease was not acquired");
+  time_provider.advance(initial_lease.lease_expiration_at - time_provider.now());
+  lease_store.block_next.store(true, Ordering::Release);
+
+  let foreground_engine = Arc::clone(&engine);
+  let foreground = tokio::spawn(async move {
+    foreground_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 1)],
+      })
+      .await
+  });
+  let mut entered_acquire_gate = false;
+  for _ in 0 .. 100 {
+    if entered_rx.try_recv().is_ok() {
+      entered_acquire_gate = true;
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+  assert!(
+    entered_acquire_gate,
+    "foreground acquire did not reach its lease-store gate"
+  );
+
+  membership_tx.send(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
+  }]))?;
+  for _ in 0 .. 100 {
+    if engine
+      .state
+      .lock()
+      .assignment_generation_for_partition("telemetry", 0)
+      .is_none()
+    {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+  assert!(
+    engine
+      .state
+      .lock()
+      .assignment_generation_for_partition("telemetry", 0)
+      .is_none(),
+    "membership handoff did not withdraw foreground authorization"
+  );
+
+  release.add_permits(1);
+  assert!(matches!(
+    foreground.await.expect("foreground task must not panic"),
+    Err(WriteError::NotLeaseHolder { .. })
+  ));
+  for _ in 0 .. 100 {
+    if engine
+      .state
+      .lock()
+      .partition_state("telemetry", 0)
+      .is_none()
+    {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+  assert!(
+    engine
+      .state
+      .lock()
+      .partition_state("telemetry", 0)
+      .is_none(),
+    "handoff release did not retire the stale foreground state"
+  );
+  assert!(matches!(
+    inner
+      .acquire_lease(
+        key,
+        "node-b".to_string(),
+        "session-b".to_string(),
+        time_provider.now(),
+        TimeDuration::seconds(60),
+      )
+      .await?,
+    LeaseAcquireOutcome::Acquired(_)
+  ));
+
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn produce_rejects_partition_planned_for_another_healthy_broker() -> Result<()> {
+  let now = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let (_membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![
+    BrokerNode {
+      node_id: "node-a".into(),
+      address: "10.0.0.1:8080".into(),
+    },
+    BrokerNode {
+      node_id: "node-b".into(),
+      address: "10.0.0.2:8080".into(),
+    },
+  ]));
+  let (engine, lease_store) =
+    make_engine_with_membership(now, membership_rx, shutdown_trigger.make_handle(), 2)?;
+  let virtual_partition_id = (0 .. 2)
+    .find(|partition| {
+      engine
+        .state
+        .lock()
+        .assignment_generation_for_partition("telemetry", *partition)
+        .is_none()
+    })
+    .expect("two healthy brokers must split two virtual partitions");
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".into(),
+    virtual_partition_id,
+  };
+
+  // A local discovery member is not automatically authorized for every partition. This verifies
+  // the foreground path uses its partition-specific assignment rather than only membership.
+  assert!(matches!(
+    engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id,
+        records: vec![new_record(vec![1], 1)],
+      })
+      .await,
+    Err(WriteError::NotLeaseHolder { .. })
+  ));
+  assert!(
+    engine
+      .state
+      .lock()
+      .partition_state("telemetry", virtual_partition_id)
+      .is_none()
+  );
+  assert!(lease_store.get_lease(&key).await?.is_none());
+  Ok(())
+}
+
 #[test]
 fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
-  let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
+  let state = state_with_local_telemetry_assignment();
   let initial = begin_allocation_transition(
     &state,
     "telemetry",
@@ -493,7 +968,7 @@ fn foreground_exhaustion_doubles_the_adaptive_reservation_target() {
 
 #[test]
 fn maintenance_top_up_extends_the_current_reservation() {
-  let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
+  let state = state_with_local_telemetry_assignment();
   let initial = begin_allocation_transition(
     &state,
     "telemetry",
@@ -568,7 +1043,7 @@ fn maintenance_top_up_extends_the_current_reservation() {
 
 #[test]
 fn maintenance_high_utilization_doubles_the_adaptive_reservation_target() {
-  let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
+  let state = state_with_local_telemetry_assignment();
   let initial = begin_allocation_transition(
     &state,
     "telemetry",
@@ -622,7 +1097,7 @@ fn maintenance_high_utilization_doubles_the_adaptive_reservation_target() {
 
 #[test]
 fn maintenance_high_utilization_waits_until_another_window_is_needed() {
-  let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
+  let state = state_with_local_telemetry_assignment();
   let initial = begin_allocation_transition(
     &state,
     "telemetry",
@@ -677,7 +1152,7 @@ fn maintenance_high_utilization_waits_until_another_window_is_needed() {
 
 #[test]
 fn lease_reacquisition_discards_stale_sequence_capacity() {
-  let state = Arc::new(parking_lot::Mutex::new(WriteState::default()));
+  let state = state_with_local_telemetry_assignment();
   let initial = begin_allocation_transition(
     &state,
     "telemetry",

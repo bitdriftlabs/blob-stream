@@ -1,5 +1,7 @@
 use super::*;
 use bytes::Bytes;
+use siphasher::sip::SipHasher13;
+use std::hash::Hasher;
 
 #[test]
 fn virtual_partition_count_accepts_the_u32_limit() {
@@ -22,6 +24,38 @@ fn default_metadata_publication_lag_is_fifteen_seconds() {
 #[test]
 fn default_metadata_window_is_five_minutes() {
   assert_eq!(DEFAULT_METADATA_WINDOW_SIZE, Duration::minutes(5));
+}
+
+#[test]
+fn partition_hash_matches_legacy_64_bit_little_endian_default_hasher() {
+  // These hashes are `DefaultHasher::new()` outputs from Rust 1.98 on 64-bit little-endian
+  // targets. They lock the compatible legacy mappings, zero keys, and SipHash-1-3 rounds.
+  for (record_key, expected_hash) in [
+    (b"".as_slice(), 0xbd60_acb6_58c7_9e45),
+    (b"a".as_slice(), 0xbeb9_a6bb_f61b_58b4),
+    (b"telemetry".as_slice(), 0x082f_9fc9_2c2b_b490),
+    (b"partition-key-177".as_slice(), 0x2555_fd88_a87d_0004),
+    (&[0, 1, 2, 3, 255], 0xcd61_9664_a138_6abe),
+  ] {
+    assert_eq!(partition_hash(record_key), expected_hash);
+  }
+}
+
+#[test]
+fn partition_hash_explicitly_encodes_a_little_endian_u64_slice_length() {
+  for record_key in [b"".as_slice(), b"telemetry".as_slice(), &[0, 1, 2, 3, 255]] {
+    let mut portable_hasher = SipHasher13::new_with_keys(0, 0);
+    portable_hasher.write(&(record_key.len() as u64).to_le_bytes());
+    portable_hasher.write(record_key);
+
+    assert_eq!(partition_hash(record_key), portable_hasher.finish());
+  }
+}
+
+#[test]
+fn logical_partition_uses_the_portable_fixed_hash() {
+  assert_eq!(logical_partition_for_key(b"partition-key-177", 17), 9);
+  assert_eq!(logical_partition_for_key(&[0, 1, 2, 3, 255], 17), 11);
 }
 
 #[test]

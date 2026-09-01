@@ -19,6 +19,25 @@ use time::{Duration, OffsetDateTime};
 
 mod assignment;
 
+//
+// LeaseAcquisitionOrigin
+//
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum LeaseAcquisitionOrigin {
+  InlineProduce,
+  AssignmentMaintenance,
+}
+
+impl LeaseAcquisitionOrigin {
+  const fn as_str(self) -> &'static str {
+    match self {
+      Self::InlineProduce => "inline_produce",
+      Self::AssignmentMaintenance => "assignment_maintenance",
+    }
+  }
+}
+
 pub(super) async fn acquire_lease_and_reserve_sequences(
   lease_store: &Arc<dyn ProducerPartitionLeaseStore>,
   holder_id: &str,
@@ -56,12 +75,17 @@ impl WriteEngineImpl {
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
     lease: &ProducerPartitionLease,
+    acquisition_origin: LeaseAcquisitionOrigin,
+    assignment_generation: u64,
   ) {
     info!(
-      "broker partition lease acquired: holder_id={holder_id}, \
+      "broker partition lease acquired: acquisition_origin={}, \
+       assignment_generation={assignment_generation}, holder_id={holder_id}, \
        lease_session_id={lease_session_id}, topic={topic}, \
        virtual_partition_id={virtual_partition_id}, lease_epoch={}, lease_expiration_at={}",
-      lease.fence.lease_epoch, lease.lease_expiration_at,
+      acquisition_origin.as_str(),
+      lease.fence.lease_epoch,
+      lease.lease_expiration_at,
     );
   }
 
