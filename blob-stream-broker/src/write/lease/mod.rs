@@ -5,12 +5,13 @@ use bd_log_util::warn_every;
 use blob_stream_metadata_store::{
   LeaseAcquireAndReserveOutcome,
   LeaseAcquireOutcome,
+  ProducerPartitionLease,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
   SequenceReservationOutcome,
 };
 use blob_stream_types::{SeqRange, VirtualPartitionId};
-use log::debug;
+use log::{debug, info};
 use std::sync::Arc;
 use std::time::Instant;
 use time::ext::NumericalDuration;
@@ -49,6 +50,21 @@ pub(super) async fn acquire_lease_and_reserve_sequences(
 }
 
 impl WriteEngineImpl {
+  pub(super) fn log_lease_acquired(
+    holder_id: &str,
+    lease_session_id: &str,
+    topic: &str,
+    virtual_partition_id: VirtualPartitionId,
+    lease: &ProducerPartitionLease,
+  ) {
+    info!(
+      "broker partition lease acquired: holder_id={holder_id}, \
+       lease_session_id={lease_session_id}, topic={topic}, \
+       virtual_partition_id={virtual_partition_id}, lease_epoch={}, lease_expiration_at={}",
+      lease.fence.lease_epoch, lease.lease_expiration_at,
+    );
+  }
+
   pub(super) async fn ensure_lease(
     &self,
     topic: &str,

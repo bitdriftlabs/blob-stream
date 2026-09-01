@@ -206,6 +206,17 @@ impl WriteEngine for WriteEngineImpl {
             .map_or(LeaseExpirationUpdate::Preserve, |lease| {
               LeaseExpirationUpdate::Set(Some(lease.lease_expiration_at))
             });
+          if work.lease_was_expired
+            && let Some(lease) = acquired_lease.as_ref()
+          {
+            Self::log_lease_acquired(
+              &self.holder_id,
+              &self.lease_session_id,
+              &topic,
+              virtual_partition_id,
+              lease,
+            );
+          }
           work
             .transition
             .finish(lease_expiration_update, acquired_lease, reservation);

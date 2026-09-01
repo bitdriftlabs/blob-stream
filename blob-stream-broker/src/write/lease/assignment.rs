@@ -309,8 +309,6 @@ impl WriteEngineImpl {
           {
             Ok(LeaseAcquireAndReserveOutcome::Acquired { lease, reservation }) => {
               pending_acquisitions.remove(&partition);
-              let lease_epoch = lease.fence.lease_epoch;
-              let lease_expiration_at = lease.lease_expiration_at;
               if let Some(reservation) = reservation.as_ref() {
                 metrics.record_sequence_reservation(reservation);
                 debug!(
@@ -323,6 +321,15 @@ impl WriteEngineImpl {
               }
               let lease_expiration_update =
                 LeaseExpirationUpdate::Set(Some(lease.lease_expiration_at));
+              if transition.lease_was_expired {
+                Self::log_lease_acquired(
+                  &holder_id,
+                  &lease_session_id,
+                  &topic,
+                  virtual_partition_id,
+                  &lease,
+                );
+              }
               transition.transition.finish_lease_maintenance(
                 lease_expiration_update,
                 Some(lease),
@@ -338,14 +345,6 @@ impl WriteEngineImpl {
                 {
                   partition_state.draining = false;
                 }
-              }
-              if transition.lease_was_expired {
-                info!(
-                  "broker partition lease acquired: holder_id={holder_id}, \
-                   lease_session_id={lease_session_id}, topic={topic}, \
-                   virtual_partition_id={virtual_partition_id}, lease_epoch={lease_epoch}, \
-                   lease_expiration_at={lease_expiration_at}",
-                );
               }
             },
             Ok(LeaseAcquireAndReserveOutcome::HeldByOther(_)) => {
