@@ -170,7 +170,6 @@ impl BrokerGrpc {
 
     // A stalled backend must not keep an incoming RPC (and its allocation transition) alive
     // indefinitely. Dropping this future releases the transition through its cancellation cleanup.
-    let write_started = Instant::now();
     let result = match tokio::time::timeout(
       self.produce_request_timeout,
       self.write_engine.produce_batch(write_request),
@@ -204,12 +203,9 @@ impl BrokerGrpc {
       },
     };
 
-    self.produce_outcomes.record_result(
-      &result,
-      record_count as u64,
-      payload_bytes,
-      write_started.elapsed(),
-    );
+    self
+      .produce_outcomes
+      .record_result(&result, record_count as u64, payload_bytes);
 
     let status = match &result {
       Ok(_) => ProduceStatus::PRODUCE_STATUS_OK,

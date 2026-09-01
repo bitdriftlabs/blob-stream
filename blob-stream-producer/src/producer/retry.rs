@@ -71,6 +71,7 @@ pub(super) async fn send_batch_with_retry(
   let mut last_contacted_broker_address = initial_broker_address;
   let mut membership_updates = membership_rx.clone();
   let mut retried_after_not_lease_holder = None;
+  let mut initial_retry_pending = initial_response.is_none();
   let retry_deadline = retry_started_at
     + Duration::try_from(producer_retry_deadline(config))
       .expect("producer config validation requires a positive retry deadline");
@@ -83,6 +84,12 @@ pub(super) async fn send_batch_with_retry(
         retry_clock,
         retry_started_at,
       ));
+    }
+    // A missing response means the initial grouped request failed or was malformed. This task is
+    // about to make its first per-batch replacement request, so account for that scheduled retry.
+    if initial_retry_pending {
+      metrics.retries.inc();
+      initial_retry_pending = false;
     }
 
     let (broker_node_id, broker_address) = routes

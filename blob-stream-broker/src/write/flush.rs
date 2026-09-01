@@ -483,6 +483,7 @@ impl FlushContext {
   async fn build_objects(
     &self,
     plan: &mut FlushPlan,
+    metrics: &WriteMetrics,
   ) -> Result<(Vec<PersistedObject>, Vec<FlushPartitionResult>)> {
     let topic_plans = std::mem::take(&mut plan.topics);
     let mut current = ObjectBuilder::new();
@@ -506,6 +507,7 @@ impl FlushContext {
         }
         let encoded = self.encode_partition(&topic_plan, partition)?;
         if !current.is_empty() && current.would_exceed(&encoded, plan.max_segment_bytes) {
+          metrics.flush_max_segment_size_splits_total.inc();
           objects.push(
             current
               .finish(self, plan.shared_blob, plan.max_segment_bytes)
@@ -703,7 +705,7 @@ impl FlushContext {
     flush_notifier: &Arc<tokio::sync::Notify>,
   ) -> Result<Vec<FlushPartitionResult>, WriteError> {
     let publication_started_at = Instant::now();
-    let (objects, mut results) = match self.build_objects(plan).await {
+    let (objects, mut results) = match self.build_objects(plan, metrics).await {
       Ok(objects) => objects,
       Err(error) => {
         mark_publication_complete(

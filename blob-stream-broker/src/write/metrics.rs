@@ -29,11 +29,11 @@ pub(super) struct WriteMetrics {
   pub(super) sequence_reservation_records_total: prometheus::IntCounter,
   pub(super) sequence_reservation_failures_total: prometheus::IntCounter,
   pub(super) sequence_reservation_latency_seconds: prometheus::Histogram,
-  pub(super) flush_batches_total: prometheus::IntCounter,
   pub(super) flush_batches_max_bytes_total: prometheus::IntCounter,
   pub(super) flush_batches_max_delay_total: prometheus::IntCounter,
   pub(super) flush_batches_lease_drain_total: prometheus::IntCounter,
   pub(super) flush_partitions_total: prometheus::IntCounter,
+  pub(super) flush_max_segment_size_splits_total: prometheus::IntCounter,
   pub(super) active_flush_plans: prometheus::IntGauge,
   pub(super) flush_failures_total: prometheus::IntCounter,
   pub(super) flush_latency_seconds: prometheus::Histogram,
@@ -58,11 +58,11 @@ impl WriteMetrics {
       sequence_reservation_records_total: scope.counter("sequence_reservation_records_total"),
       sequence_reservation_failures_total: scope.counter("sequence_reservation_failures_total"),
       sequence_reservation_latency_seconds: scope.histogram("sequence_reservation_latency_seconds"),
-      flush_batches_total: scope.counter("flush_batches_total"),
       flush_batches_max_bytes_total: scope.counter("flush_batches_max_bytes_total"),
       flush_batches_max_delay_total: scope.counter("flush_batches_max_delay_total"),
       flush_batches_lease_drain_total: scope.counter("flush_batches_lease_drain_total"),
       flush_partitions_total: scope.counter("flush_partitions_total"),
+      flush_max_segment_size_splits_total: scope.counter("flush_max_segment_size_splits_total"),
       active_flush_plans: scope.gauge("active_flush_plans"),
       flush_failures_total: scope.counter("flush_failures_total"),
       flush_latency_seconds: scope.histogram("flush_latency_seconds"),
@@ -90,9 +90,6 @@ impl WriteMetrics {
           .flush_partitions_total
           .inc_by(topic_plan.partitions.len() as u64);
         for partition in &topic_plan.partitions {
-          self
-            .flush_batches_total
-            .inc_by(partition.batches.len() as u64);
           match partition.trigger {
             FlushTrigger::MaxBytes => self
               .flush_batches_max_bytes_total
@@ -123,7 +120,6 @@ pub struct ProduceOutcomeMetrics {
   not_lease_holder_total: prometheus::IntCounter,
   overloaded_total: prometheus::IntCounter,
   unknown_topic_total: prometheus::IntCounter,
-  latency_seconds: prometheus::Histogram,
 }
 
 impl ProduceOutcomeMetrics {
@@ -138,7 +134,6 @@ impl ProduceOutcomeMetrics {
       not_lease_holder_total: scope.counter("produce_not_lease_holder_total"),
       overloaded_total: scope.counter("produce_overloaded_total"),
       unknown_topic_total: scope.counter("produce_unknown_topic_total"),
-      latency_seconds: scope.histogram("produce_latency_seconds"),
     }
   }
 
@@ -162,9 +157,7 @@ impl ProduceOutcomeMetrics {
     result: &std::result::Result<WriteResponse, WriteError>,
     record_count: u64,
     payload_bytes: u64,
-    elapsed: std::time::Duration,
   ) {
-    self.latency_seconds.observe(elapsed.as_secs_f64());
     match result {
       Ok(_) => {
         self.ok_total.inc();
