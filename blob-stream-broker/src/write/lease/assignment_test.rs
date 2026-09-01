@@ -37,6 +37,36 @@ use std::time::Duration as StdDuration;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::{Semaphore, mpsc, watch};
 
+#[test]
+fn acquisition_retry_ignores_in_flight_partitions() {
+  let initial_time = offset_datetime_from_unix_millis(1_000);
+  let due_partition = (Chars::from("due"), 0);
+  let later_partition = (Chars::from("later"), 1);
+  let pending_acquisitions = HashMap::from([
+    (
+      due_partition.clone(),
+      super::LeaseRetrySchedule::new(initial_time),
+    ),
+    (
+      later_partition.clone(),
+      super::LeaseRetrySchedule::new(initial_time + Duration::milliseconds(250)),
+    ),
+  ]);
+
+  assert_eq!(
+    super::next_acquisition_retry_at(&pending_acquisitions, &HashSet::new()),
+    Some(initial_time)
+  );
+  assert_eq!(
+    super::next_acquisition_retry_at(&pending_acquisitions, &HashSet::from([due_partition]),),
+    Some(initial_time + Duration::milliseconds(250))
+  );
+  assert_eq!(
+    super::next_acquisition_retry_at(&pending_acquisitions, &HashSet::from([later_partition]),),
+    Some(initial_time)
+  );
+}
+
 struct BlockingReleaseLeaseStore {
   inner: InMemoryProducerPartitionLeaseStore,
   started_tx: mpsc::UnboundedSender<VirtualPartitionId>,

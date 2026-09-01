@@ -67,7 +67,7 @@ use protobuf::Chars;
 use serde_json::to_value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration as StdDuration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::{Semaphore, mpsc, watch};
@@ -133,6 +133,7 @@ struct GatedLeaseAcquireStore {
   inner: Arc<InMemoryProducerPartitionLeaseStore>,
   entered_tx: mpsc::UnboundedSender<()>,
   release: Arc<Semaphore>,
+  acquire_and_reserve_attempts: AtomicUsize,
   block_next: AtomicBool,
 }
 
@@ -533,6 +534,9 @@ impl ProducerPartitionLeaseStore for GatedLeaseAcquireStore {
     lease_duration: TimeDuration,
     reservation_size: Option<u64>,
   ) -> Result<LeaseAcquireAndReserveOutcome> {
+    self
+      .acquire_and_reserve_attempts
+      .fetch_add(1, Ordering::AcqRel);
     if self.block_next.swap(false, Ordering::AcqRel) {
       self
         .entered_tx
@@ -901,6 +905,7 @@ async fn foreground_acquire_completed_after_membership_handoff_is_released() -> 
     inner: inner.clone(),
     entered_tx,
     release: Arc::clone(&release),
+    acquire_and_reserve_attempts: AtomicUsize::new(0),
     block_next: AtomicBool::new(true),
   });
   let key = ProducerPartitionLeaseKey {
@@ -1034,6 +1039,7 @@ async fn membership_handoff_publishes_while_maintenance_acquire_is_in_flight() -
     inner: Arc::new(InMemoryProducerPartitionLeaseStore::new()),
     entered_tx: acquire_entered_tx,
     release: Arc::clone(&acquire_release),
+    acquire_and_reserve_attempts: AtomicUsize::new(0),
     block_next: AtomicBool::new(true),
   });
   let engine = make_engine_with_membership_and_lease_store(
@@ -1072,6 +1078,99 @@ async fn membership_handoff_publishes_while_maintenance_acquire_is_in_flight() -
   );
 
   acquire_release.add_permits(1);
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn maintenance_success_clears_retry_after_foreground_acquisition() -> Result<()> {
+  let initial_time = offset_datetime_from_unix_millis(1_700_000_000_000);
+  let time_provider = Arc::new(ManualTimeProvider::new(initial_time));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let (_membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
+  }]));
+  let (acquire_entered_tx, mut acquire_entered_rx) = mpsc::unbounded_channel();
+  let acquire_release = Arc::new(Semaphore::new(0));
+  let inner = Arc::new(InMemoryProducerPartitionLeaseStore::new());
+  let lease_store = Arc::new(GatedLeaseAcquireStore {
+    inner: inner.clone(),
+    entered_tx: acquire_entered_tx,
+    release: Arc::clone(&acquire_release),
+    acquire_and_reserve_attempts: AtomicUsize::new(0),
+    block_next: AtomicBool::new(false),
+  });
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".into(),
+    virtual_partition_id: 0,
+  };
+  inner
+    .acquire_lease(
+      key.clone(),
+      "old-node".to_string(),
+      "old-session".to_string(),
+      initial_time,
+      TimeDuration::seconds(60),
+    )
+    .await?;
+  let engine = make_engine_with_membership_and_lease_store(
+    time_provider.clone(),
+    membership_rx,
+    shutdown_trigger.make_handle(),
+    1,
+    &(lease_store.clone() as Arc<dyn ProducerPartitionLeaseStore>),
+    None,
+  )?;
+
+  // The initial maintenance attempt is held by the old owner and schedules a logical retry.
+  time_provider.wait_until_sleeping(2).await;
+  assert_eq!(
+    lease_store
+      .acquire_and_reserve_attempts
+      .load(Ordering::Acquire),
+    1
+  );
+  inner
+    .release_lease(&key, "old-node", "old-session", initial_time)
+    .await?;
+  engine
+    .produce_batch(WriteRequest {
+      topic: "telemetry".into(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![1], 1)],
+    })
+    .await?;
+  assert_eq!(
+    lease_store
+      .acquire_and_reserve_attempts
+      .load(Ordering::Acquire),
+    2
+  );
+
+  // The due maintenance retry renews the foreground lease. Block it so the completion and any
+  // incorrectly scheduled follow-up call are observed through lifecycle gates.
+  lease_store.block_next.store(true, Ordering::Release);
+  time_provider.advance(TimeDuration::milliseconds(250));
+  acquire_entered_rx
+    .recv()
+    .await
+    .expect("maintenance retry did not reach its lease-store gate");
+  lease_store.block_next.store(true, Ordering::Release);
+  acquire_release.add_permits(1);
+  assert!(
+    tokio::time::timeout(StdDuration::from_millis(1), acquire_entered_rx.recv())
+      .await
+      .is_err(),
+    "successful maintenance renewal immediately retried a stale schedule"
+  );
+  assert_eq!(
+    lease_store
+      .acquire_and_reserve_attempts
+      .load(Ordering::Acquire),
+    3
+  );
+
   shutdown_trigger.shutdown().await;
   Ok(())
 }

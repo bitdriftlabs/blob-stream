@@ -113,6 +113,17 @@ impl LeaseRetrySchedule {
   }
 }
 
+fn next_acquisition_retry_at(
+  pending_acquisitions: &HashMap<PartitionKey, LeaseRetrySchedule>,
+  in_flight_acquisitions: &HashSet<PartitionKey>,
+) -> Option<OffsetDateTime> {
+  pending_acquisitions
+    .iter()
+    .filter(|(partition, _)| !in_flight_acquisitions.contains(*partition))
+    .map(|(_, retry)| retry.next_retry_at)
+    .min()
+}
+
 impl WriteEngineImpl {
   pub(in crate::write) fn owned_virtual_partitions(
     topics: &HashMap<Chars, TopicInfo>,
@@ -206,10 +217,8 @@ impl WriteEngineImpl {
       loop {
         // Failed acquisitions retry on logical time. A missing retry becomes a permanently
         // pending future, allowing the select below to express one uniform wake-up source.
-        let next_acquisition_retry = pending_acquisitions
-          .values()
-          .map(|retry| retry.next_retry_at)
-          .min();
+        let next_acquisition_retry =
+          next_acquisition_retry_at(&pending_acquisitions, &in_flight_acquisitions);
         let acquisition_retry_sleep = async {
           let Some(next_retry_at) = next_acquisition_retry else {
             std::future::pending().await
@@ -445,8 +454,10 @@ impl WriteEngineImpl {
                   partition_state.draining = false;
                 }
               }
-              if finish == AllocationTransitionFinish::Applied && transition.lease_was_expired {
+              if finish == AllocationTransitionFinish::Applied {
                 pending_acquisitions.remove(&partition);
+              }
+              if finish == AllocationTransitionFinish::Applied && transition.lease_was_expired {
                 Self::log_lease_acquired(
                   &holder_id,
                   &lease_session_id,
