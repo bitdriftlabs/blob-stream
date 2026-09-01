@@ -1372,22 +1372,28 @@ async fn shutdown_waits_for_in_flight_lease_release() -> Result<()> {
     address: "10.0.0.1:8080".into(),
   }]));
   let (release_entered_tx, mut release_entered_rx) = mpsc::unbounded_channel();
+  let (release_failed_tx, mut release_failed_rx) = mpsc::unbounded_channel();
+  let (published_tx, _published_rx) = mpsc::unbounded_channel();
+  let (before_release_tx, mut before_release_rx) = mpsc::unbounded_channel();
   let release = Arc::new(Semaphore::new(0));
   let lease_store = Arc::new(GatedLeaseReleaseStore {
     inner: Arc::new(InMemoryProducerPartitionLeaseStore::new()),
     entered_tx: release_entered_tx,
-    failed_tx: None,
+    failed_tx: Some(release_failed_tx),
     release: Arc::clone(&release),
     block_next: AtomicBool::new(false),
-    fail_next: AtomicBool::new(false),
+    fail_next: AtomicBool::new(true),
   });
   let engine = make_engine_with_membership_and_lease_store(
-    now,
+    now.clone(),
     membership_rx,
     shutdown_trigger.make_handle(),
     1,
     &(lease_store.clone() as Arc<dyn ProducerPartitionLeaseStore>),
-    None,
+    Some(Arc::new(NotifyingLeaseLifecycleHook {
+      published_tx,
+      before_release_tx,
+    })),
   )?;
   let request = WriteRequest {
     topic: "telemetry".into(),
@@ -1396,16 +1402,39 @@ async fn shutdown_waits_for_in_flight_lease_release() -> Result<()> {
   };
   engine.produce_batch(request).await?;
 
+  let sleep_registrations = now.sleep_registration_count();
   lease_store.block_next.store(true, Ordering::Release);
   drop(membership_tx);
   let shutdown = tokio::spawn(async move { shutdown_trigger.shutdown().await });
+  release_failed_rx
+    .recv()
+    .await
+    .expect("shutdown release did not fail at its test gate");
+  before_release_rx
+    .recv()
+    .await
+    .expect("shutdown drain did not begin lease release");
+  now
+    .wait_for_sleep_registration_after(sleep_registrations)
+    .await;
+  assert!(
+    !shutdown.is_finished(),
+    "shutdown completed after a transient release failure"
+  );
+
+  // The retry reaches the store gate without starting another drain or lifecycle transition.
+  now.advance(TimeDuration::milliseconds(250));
   release_entered_rx
     .recv()
     .await
-    .expect("shutdown release did not reach its gate");
+    .expect("shutdown release retry did not reach its gate");
   assert!(
     !shutdown.is_finished(),
-    "shutdown completed before lease release"
+    "shutdown completed before the release retry"
+  );
+  assert!(
+    before_release_rx.try_recv().is_err(),
+    "shutdown release retry repeated the drain-to-release lifecycle transition"
   );
 
   release.add_permits(1);
