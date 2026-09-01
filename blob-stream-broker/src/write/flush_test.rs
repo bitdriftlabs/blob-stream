@@ -354,9 +354,11 @@ async fn object_build_resnaps_time_after_sonyflake_sequence_overflow() -> Result
     publication_completions: Vec::new(),
   };
 
+  let collector = Collector::default();
+  let metrics = WriteMetrics::new(&collector.scope("flush_test"));
   let objects = tokio::spawn(async move {
     let mut plan = plan;
-    context.build_objects(&mut plan).await
+    context.build_objects(&mut plan, &metrics).await
   });
   time_provider.wait_until_sleeping(1).await;
   time_provider.advance(time::Duration::milliseconds(10));
@@ -366,6 +368,11 @@ async fn object_build_resnaps_time_after_sonyflake_sequence_overflow() -> Result
 
   assert!(failures.is_empty());
   assert_eq!(objects.len(), 513);
+  Helper::new_with_collector(collector).assert_counter_eq(
+    512,
+    "flush_test:write:flush_max_segment_size_splits_total",
+    &labels!(),
+  );
   assert_eq!(
     last_topic.envelope.snowflake_id.timestamp(),
     SnowflakeId::minimum_for_timestamp(refreshed_at).timestamp()

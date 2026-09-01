@@ -29,11 +29,11 @@ pub(super) struct WriteMetrics {
   pub(super) sequence_reservation_records_total: prometheus::IntCounter,
   pub(super) sequence_reservation_failures_total: prometheus::IntCounter,
   pub(super) sequence_reservation_latency_seconds: prometheus::Histogram,
-  pub(super) flush_batches_total: prometheus::IntCounter,
   pub(super) flush_batches_max_bytes_total: prometheus::IntCounter,
   pub(super) flush_batches_max_delay_total: prometheus::IntCounter,
   pub(super) flush_batches_lease_drain_total: prometheus::IntCounter,
   pub(super) flush_partitions_total: prometheus::IntCounter,
+  pub(super) flush_max_segment_size_splits_total: prometheus::IntCounter,
   pub(super) active_flush_plans: prometheus::IntGauge,
   pub(super) flush_failures_total: prometheus::IntCounter,
   pub(super) flush_latency_seconds: prometheus::Histogram,
@@ -58,11 +58,11 @@ impl WriteMetrics {
       sequence_reservation_records_total: scope.counter("sequence_reservation_records_total"),
       sequence_reservation_failures_total: scope.counter("sequence_reservation_failures_total"),
       sequence_reservation_latency_seconds: scope.histogram("sequence_reservation_latency_seconds"),
-      flush_batches_total: scope.counter("flush_batches_total"),
       flush_batches_max_bytes_total: scope.counter("flush_batches_max_bytes_total"),
       flush_batches_max_delay_total: scope.counter("flush_batches_max_delay_total"),
       flush_batches_lease_drain_total: scope.counter("flush_batches_lease_drain_total"),
       flush_partitions_total: scope.counter("flush_partitions_total"),
+      flush_max_segment_size_splits_total: scope.counter("flush_max_segment_size_splits_total"),
       active_flush_plans: scope.gauge("active_flush_plans"),
       flush_failures_total: scope.counter("flush_failures_total"),
       flush_latency_seconds: scope.histogram("flush_latency_seconds"),
@@ -90,9 +90,6 @@ impl WriteMetrics {
           .flush_partitions_total
           .inc_by(topic_plan.partitions.len() as u64);
         for partition in &topic_plan.partitions {
-          self
-            .flush_batches_total
-            .inc_by(partition.batches.len() as u64);
           match partition.trigger {
             FlushTrigger::MaxBytes => self
               .flush_batches_max_bytes_total
