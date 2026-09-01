@@ -5,6 +5,7 @@ mod tests;
 use super::super::allocation::{
   AllocationTransitionDecision,
   AllocationTransitionFinish,
+  AllocationTransitionWork,
   LeaseExpirationUpdate,
   begin_allocation_transition,
 };
@@ -12,6 +13,7 @@ use super::super::metrics::WriteMetrics;
 use super::super::state::WriteState;
 use super::super::{BrokerLifecycleHooks, TopicInfo, WriteEngineImpl};
 use super::{LeaseAcquisitionOrigin, acquire_lease_and_reserve_sequences};
+use anyhow::Result;
 use bd_log_util::warn_every;
 use bd_time::TimeProvider;
 use blob_stream_broker_discovery::{
@@ -40,6 +42,21 @@ use tokio::sync::watch;
 
 const LEASE_RETRY_INITIAL_DELAY: time::Duration = time::Duration::milliseconds(250);
 const LEASE_RETRY_MAX_DELAY: time::Duration = time::Duration::seconds(2);
+
+// A partition key is carried through supervisor completions so the coordinator can update the
+// matching pending set before it recomputes effective write admission.
+type PartitionKey = (Chars, VirtualPartitionId);
+
+// An acquisition task either observes that the partition no longer needs work, or returns the
+// still-owned allocation transition with its remote result. Holding the transition in the future
+// keeps `allocation_in_flight` set until the coordinator applies or fences that result.
+type MaintenanceAcquisitionCompletion = (
+  PartitionKey,
+  Option<(
+    AllocationTransitionWork,
+    Result<LeaseAcquireAndReserveOutcome>,
+  )>,
+);
 
 //
 // LeaseReleaseReason
@@ -149,20 +166,46 @@ impl WriteEngineImpl {
       // manual test jumps across historical windows from applying missed heartbeats at one final
       // timestamp, which would incorrectly expire and reacquire a healthy lease fence.
       let mut heartbeat_ticker = tokio::time::interval(heartbeat_tick_interval);
+      // This task is the single coordinator for assignment state. It never awaits lease-store I/O
+      // directly: membership changes, remote acquisition completions, and release completions
+      // must all remain independently pollable.
+      //
       // If the watch sender closes, we continue on ticker-only cadence so lease maintenance keeps
       // running instead of silently stalling.
       let mut membership_updates_open = true;
+      // Set when a membership snapshot or release completion changes the effective admission set.
       let mut assignment_refresh_needed = true;
+      // Maintenance is a periodic reconciliation pass. Completion of a fast lease call must not
+      // immediately launch another pass, or a ready future can starve membership processing.
+      let mut maintenance_refresh_needed = true;
       let mut assignment_activated = false;
-      let mut previously_desired: HashSet<(Chars, VirtualPartitionId)> = HashSet::new();
+      // Desired ownership is the newest deterministic membership plan. `owned` below is the
+      // stricter effective admission set after excluding partitions with a release in progress.
+      let mut previously_desired: HashSet<PartitionKey> = HashSet::new();
       let mut pending_acquisitions: HashMap<(Chars, VirtualPartitionId), LeaseRetrySchedule> =
         HashMap::new();
+      // Only one maintenance transition may exist for a partition. Its future owns the
+      // transition until its result is applied, which also gives release drains a reliable
+      // `allocation_in_flight` dependency to wait on after a membership loss.
+      let mut in_flight_acquisitions = HashSet::new();
+      // A partition remains out of effective admission until this set no longer contains it.
+      // This matters when a newer membership snapshot returns the partition while an old
+      // conditional release request is already in flight.
       let mut pending_releases: HashSet<(Chars, VirtualPartitionId)> = HashSet::new();
+      // Release tasks include drain, lease heartbeat, and conditional-release retry. They are
+      // retained through a terminal result because cancelling a remote conditional mutation does
+      // not prove that DynamoDB did not apply it.
       let mut release_supervisor =
         FuturesUnordered::<BoxFuture<'static, (Chars, VirtualPartitionId)>>::new();
+      // Acquisition tasks may wait behind a foreground transition or perform remote I/O. Keeping
+      // them here prevents either wait from delaying membership publication.
+      let mut acquisition_supervisor =
+        FuturesUnordered::<BoxFuture<'static, MaintenanceAcquisitionCompletion>>::new();
       let mut owned = Vec::new();
 
       loop {
+        // Failed acquisitions retry on logical time. A missing retry becomes a permanently
+        // pending future, allowing the select below to express one uniform wake-up source.
         let next_acquisition_retry = pending_acquisitions
           .values()
           .map(|retry| retry.next_retry_at)
@@ -176,34 +219,59 @@ impl WriteEngineImpl {
         };
         tokio::pin!(acquisition_retry_sleep);
 
+        // Each turn consumes exactly one ready source, then applies any membership snapshot
+        // before installing a completed acquisition. That ordering is the local linearization
+        // point between an external membership change and an external lease response.
         let mut membership_changed = false;
-        let completed_release = if membership_updates_open {
+        let mut completed_release = None;
+        let mut completed_acquisition = None;
+        if membership_updates_open {
           tokio::select! {
-            _ = heartbeat_ticker.tick() => None,
-            () = &mut acquisition_retry_sleep => None,
-            completed_release = release_supervisor.next(),
-            if !release_supervisor.is_empty() => completed_release,
+            _ = heartbeat_ticker.tick() => maintenance_refresh_needed = true,
+            () = &mut acquisition_retry_sleep => maintenance_refresh_needed = true,
+            completed = release_supervisor.next(),
+            if !release_supervisor.is_empty() => completed_release = completed,
+            completed = acquisition_supervisor.next(),
+            if !acquisition_supervisor.is_empty() => completed_acquisition = completed,
             changed = membership_rx.changed() => {
               membership_changed = true;
               if changed.is_err() {
                 membership_updates_open = false;
               }
-              None
             }
             () = shutdown.cancelled() => break,
-          }
+          };
         } else {
           tokio::select! {
-            _ = heartbeat_ticker.tick() => None,
-            () = &mut acquisition_retry_sleep => None,
-            completed_release = release_supervisor.next(),
-            if !release_supervisor.is_empty() => completed_release,
+            _ = heartbeat_ticker.tick() => maintenance_refresh_needed = true,
+            () = &mut acquisition_retry_sleep => maintenance_refresh_needed = true,
+            completed = release_supervisor.next(),
+            if !release_supervisor.is_empty() => completed_release = completed,
+            completed = acquisition_supervisor.next(),
+            if !acquisition_supervisor.is_empty() => completed_acquisition = completed,
             () = shutdown.cancelled() => break,
-          }
-        };
+          };
+        }
         if let Some(partition) = completed_release {
+          // A terminal handoff may make a returned desired partition admissible again.
           pending_releases.remove(&partition);
           assignment_refresh_needed = true;
+        }
+
+        // A lease future and membership update may become ready in the same scheduler turn.
+        // Publish the update first whenever it is already waiting so the allocation transition
+        // applies its result only if its captured authorization generation is still current.
+        if !membership_changed && membership_updates_open {
+          match membership_rx.has_changed() {
+            Ok(true) => {
+              membership_changed = true;
+              if membership_rx.changed().await.is_err() {
+                membership_updates_open = false;
+              }
+            },
+            Ok(false) => {},
+            Err(_) => membership_updates_open = false,
+          }
         }
 
         let membership = membership_rx.borrow().clone();
@@ -290,8 +358,7 @@ impl WriteEngineImpl {
             let lifecycle_hooks = lifecycle_hooks.clone();
             release_supervisor.push(
               async move {
-                let mut retry = LeaseRetrySchedule::new(time_provider.now());
-                while !Self::release_partition_lease(
+                Self::release_partition_lease(
                   &lease_store,
                   &state,
                   &flush_notifier,
@@ -306,11 +373,7 @@ impl WriteEngineImpl {
                   heartbeat_interval,
                   lifecycle_hooks.as_ref(),
                 )
-                .await
-                {
-                  let retry_delay = retry.schedule_retry(time_provider.now());
-                  time_provider.sleep(retry_delay).await;
-                }
+                .await;
                 partition
               }
               .boxed(),
@@ -327,6 +390,7 @@ impl WriteEngineImpl {
             .collect();
           previously_desired = currently_desired;
           assignment_refresh_needed = false;
+          maintenance_refresh_needed = true;
           {
             let mut guard = state.lock();
             guard.membership = membership.clone();
@@ -337,66 +401,26 @@ impl WriteEngineImpl {
           }
         }
 
-        for (topic, virtual_partition_id) in &owned {
-          let partition = (topic.clone(), *virtual_partition_id);
-          if pending_acquisitions
-            .get(&partition)
-            .is_some_and(|retry| retry.next_retry_at > time_provider.now())
-          {
-            continue;
-          }
-          let key = ProducerPartitionLeaseKey {
-            topic: topic.clone(),
-            virtual_partition_id: *virtual_partition_id,
-          };
-
-          let now = time_provider.now();
-          let transition = loop {
-            match begin_allocation_transition(
-              &state,
-              topic.as_str(),
-              *virtual_partition_id,
-              1,
-              now,
-              true,
-              base_reservation_size,
-            ) {
-              // A later membership update either removed this partition from authorization or
-              // started its drain, so maintenance must not renew a lease it no longer owns.
-              AllocationTransitionDecision::NotAssigned
-              | AllocationTransitionDecision::Draining => break None,
-              AllocationTransitionDecision::Ready => {
-                unreachable!("lease renewal always needs an allocation transition")
-              },
-              AllocationTransitionDecision::Waiting(notified) => notified.await,
-              AllocationTransitionDecision::Claimed(transition) => break Some(transition),
-            }
-          };
-          let Some(transition) = transition else {
+        if let Some((partition, completion)) = completed_acquisition {
+          // Membership was refreshed above when already available. `finish_*` repeats the
+          // generation check under WriteState's lock, so a response racing a later publication
+          // can clear its in-flight marker but cannot install stale lease or reservation state.
+          in_flight_acquisitions.remove(&partition);
+          let Some((transition, outcome)) = completion else {
             continue;
           };
-
-          let reservation_request = transition.reservation;
-          match acquire_lease_and_reserve_sequences(
-            &lease_store,
-            &holder_id,
-            &lease_session_id,
-            key,
-            now,
-            lease_duration,
-            reservation_request.map(|request| request.size),
-            &metrics,
-          )
-          .await
-          {
+          let (topic, virtual_partition_id) = &partition;
+          match outcome {
             Ok(LeaseAcquireAndReserveOutcome::Acquired { lease, reservation }) => {
-              pending_acquisitions.remove(&partition);
+              // A stale successful remote acquisition is still useful to record in metrics. Its
+              // allocation transition refuses to install local authority and wakes the release
+              // task scheduled by the newer membership snapshot to conditionally revoke it.
               if let Some(reservation) = reservation.as_ref() {
                 metrics.record_sequence_reservation(reservation);
                 debug!(
                   "broker sequence reservation coalesced with lease maintenance: topic={topic}, \
                    virtual_partition_id={virtual_partition_id}, reason={:?}, start={}, end={}",
-                  reservation_request.map(|request| request.reason),
+                  transition.reservation.map(|request| request.reason),
                   reservation.start,
                   reservation.end,
                 );
@@ -422,6 +446,7 @@ impl WriteEngineImpl {
                 }
               }
               if finish == AllocationTransitionFinish::Applied && transition.lease_was_expired {
+                pending_acquisitions.remove(&partition);
                 Self::log_lease_acquired(
                   &holder_id,
                   &lease_session_id,
@@ -434,36 +459,115 @@ impl WriteEngineImpl {
               }
             },
             Ok(LeaseAcquireAndReserveOutcome::HeldByOther(_)) => {
-              let retry = pending_acquisitions
-                .entry(partition)
-                .or_insert_with(|| LeaseRetrySchedule::new(now));
-              let scheduled_retry_delay = retry.schedule_retry(now);
-              debug!(
-                "broker lease acquisition deferred: holder_id={holder_id}, topic={topic}, \
-                 virtual_partition_id={virtual_partition_id}, retry_at={}, retry_delay_ms={}",
-                retry.next_retry_at,
-                scheduled_retry_delay.whole_milliseconds(),
-              );
-              let _ = transition
-                .transition
-                .finish(LeaseExpirationUpdate::Set(None), None, None);
+              let finish =
+                transition
+                  .transition
+                  .finish(LeaseExpirationUpdate::Set(None), None, None);
+              if finish == AllocationTransitionFinish::Applied {
+                let retry = pending_acquisitions
+                  .entry(partition.clone())
+                  .or_insert_with(|| LeaseRetrySchedule::new(time_provider.now()));
+                let scheduled_retry_delay = retry.schedule_retry(time_provider.now());
+                debug!(
+                  "broker lease acquisition deferred: holder_id={holder_id}, topic={topic}, \
+                   virtual_partition_id={virtual_partition_id}, retry_at={}, retry_delay_ms={}",
+                  retry.next_retry_at,
+                  scheduled_retry_delay.whole_milliseconds(),
+                );
+              }
             },
             Err(error) => {
-              pending_acquisitions.remove(&partition);
-              if reservation_request.is_some() {
+              let reservation_requested = transition.reservation.is_some();
+              let finish =
+                transition
+                  .transition
+                  .finish(LeaseExpirationUpdate::Preserve, None, None);
+              if finish == AllocationTransitionFinish::Applied {
+                pending_acquisitions.remove(&partition);
+              }
+              if reservation_requested {
                 metrics.sequence_reservation_failures_total.inc();
               }
               warn_every!(
                 15.seconds(),
                 "lease self-assignment acquire/reserve failed: topic={topic}, \
-                 virtual_partition_id={virtual_partition_id}, requested_size={:?}, error={error:#}",
-                reservation_request.map(|request| request.size),
+                 virtual_partition_id={virtual_partition_id}, error={error:#}",
               );
-              let _ = transition
-                .transition
-                .finish(LeaseExpirationUpdate::Preserve, None, None);
             },
           }
+        }
+
+        // Do not start another maintenance operation under a membership snapshot that has
+        // already arrived. The next select consumes it without waiting on any remote I/O.
+        if membership_updates_open && membership_rx.has_changed().unwrap_or(false) {
+          continue;
+        }
+
+        if !maintenance_refresh_needed {
+          continue;
+        }
+        maintenance_refresh_needed = false;
+
+        for (topic, virtual_partition_id) in &owned {
+          let topic = topic.clone();
+          let virtual_partition_id = *virtual_partition_id;
+          let partition = (topic.clone(), virtual_partition_id);
+          if in_flight_acquisitions.contains(&partition)
+            || pending_acquisitions
+              .get(&partition)
+              .is_some_and(|retry| retry.next_retry_at > time_provider.now())
+          {
+            continue;
+          }
+          in_flight_acquisitions.insert(partition.clone());
+          let state = Arc::clone(&state);
+          let lease_store = Arc::clone(&lease_store);
+          let holder_id = holder_id.clone();
+          let lease_session_id = lease_session_id.clone();
+          let time_provider = Arc::clone(&time_provider);
+          let metrics = metrics.clone();
+          acquisition_supervisor.push(
+            async move {
+              // A foreground allocation can own the transition first. Waiting happens inside the
+              // supervisor rather than this coordinator so membership changes remain responsive.
+              let transition = loop {
+                match begin_allocation_transition(
+                  &state,
+                  topic.as_str(),
+                  virtual_partition_id,
+                  1,
+                  time_provider.now(),
+                  true,
+                  base_reservation_size,
+                ) {
+                  AllocationTransitionDecision::NotAssigned
+                  | AllocationTransitionDecision::Draining => return (partition, None),
+                  AllocationTransitionDecision::Ready => {
+                    unreachable!("lease renewal always needs an allocation transition")
+                  },
+                  AllocationTransitionDecision::Waiting(notified) => notified.await,
+                  AllocationTransitionDecision::Claimed(transition) => break transition,
+                }
+              };
+              let key = ProducerPartitionLeaseKey {
+                topic: topic.clone(),
+                virtual_partition_id,
+              };
+              let outcome = acquire_lease_and_reserve_sequences(
+                &lease_store,
+                &holder_id,
+                &lease_session_id,
+                key,
+                time_provider.now(),
+                lease_duration,
+                transition.reservation.map(|request| request.size),
+                &metrics,
+              )
+              .await;
+              (partition, Some((transition, outcome)))
+            }
+            .boxed(),
+          );
         }
       }
 
@@ -499,8 +603,7 @@ impl WriteEngineImpl {
         let lifecycle_hooks = lifecycle_hooks.clone();
         release_supervisor.push(
           async move {
-            let mut retry = LeaseRetrySchedule::new(time_provider.now());
-            while !Self::release_partition_lease(
+            Self::release_partition_lease(
               &lease_store,
               &state,
               &flush_notifier,
@@ -515,17 +618,22 @@ impl WriteEngineImpl {
               heartbeat_interval,
               lifecycle_hooks.as_ref(),
             )
-            .await
-            {
-              let retry_delay = retry.schedule_retry(time_provider.now());
-              time_provider.sleep(retry_delay).await;
-            }
+            .await;
             partition
           }
           .boxed(),
         );
       }
-      while release_supervisor.next().await.is_some() {}
+      // The release drain waits for outstanding allocation transitions. Keep polling completed
+      // acquisition futures during shutdown so their transitions clear that state and wake the
+      // corresponding drain; dropping either supervisor would make remote mutation ordering
+      // unknowable.
+      while !release_supervisor.is_empty() || !acquisition_supervisor.is_empty() {
+        tokio::select! {
+          _ = release_supervisor.next(), if !release_supervisor.is_empty() => {},
+          _ = acquisition_supervisor.next(), if !acquisition_supervisor.is_empty() => {},
+        }
+      }
     });
   }
 
@@ -543,7 +651,9 @@ impl WriteEngineImpl {
     lease_duration: time::Duration,
     heartbeat_interval: time::Duration,
     lifecycle_hooks: Option<&Arc<dyn BrokerLifecycleHooks>>,
-  ) -> bool {
+  ) {
+    // Draining is performed once for this handoff. Only the conditional release itself retries;
+    // repeating the drain would duplicate lifecycle hooks and make one handoff look like several.
     let key = ProducerPartitionLeaseKey {
       topic: topic.clone(),
       virtual_partition_id,
@@ -552,7 +662,7 @@ impl WriteEngineImpl {
       let mut state = state.lock();
       let Some(partition_state) = state.partition_state_mut_if_present(topic, virtual_partition_id)
       else {
-        return true;
+        return;
       };
       partition_state.draining = true;
       partition_state.lease_expiration_at.map_or_else(
@@ -600,41 +710,49 @@ impl WriteEngineImpl {
         .await;
     }
 
-    match lease_store
-      .release_lease(&key, holder_id, lease_session_id, time_provider.now())
-      .await
-    {
-      Ok(
-        LeaseReleaseOutcome::Released
-        | LeaseReleaseOutcome::Expired
-        | LeaseReleaseOutcome::HeldByOther(_),
-      ) => {
-        // Clear local lease/allocator state immediately to avoid accepting writes based on stale
-        // in-memory lease data after ownership moved away. Retire terminally released unassigned
-        // state so defensive reconciliation does not perform a release on every heartbeat.
-        {
-          let mut state = state.lock();
-          state.clear_terminally_released_partition(topic, virtual_partition_id);
-        }
-        if let Some(lifecycle_hooks) = lifecycle_hooks {
-          lifecycle_hooks
-            .lease_released(topic.as_str(), virtual_partition_id)
-            .await;
-        }
-        info!(
-          "broker partition lease released: release_reason={}, holder_id={holder_id}, \
-           topic={topic}, virtual_partition_id={virtual_partition_id}",
-          release_reason.as_str(),
-        );
-        true
-      },
-      Err(error) => {
-        warn_every!(
-          15.seconds(),
-          "lease self-assignment release failed: {error}"
-        );
-        false
-      },
+    // A release error leaves the remote mutation outcome unknown. Retain the task and retry the
+    // same conditional operation until the store reports Released, Expired, or HeldByOther.
+    let mut release_retry = LeaseRetrySchedule::new(time_provider.now());
+    loop {
+      match lease_store
+        .release_lease(&key, holder_id, lease_session_id, time_provider.now())
+        .await
+      {
+        Ok(
+          LeaseReleaseOutcome::Released
+          | LeaseReleaseOutcome::Expired
+          | LeaseReleaseOutcome::HeldByOther(_),
+        ) => {
+          // Clear local lease/allocator state immediately to avoid accepting writes based on stale
+          // in-memory lease data after ownership moved away. Retire terminally released unassigned
+          // state so defensive reconciliation does not perform a release on every heartbeat.
+          {
+            let mut state = state.lock();
+            state.clear_terminally_released_partition(topic, virtual_partition_id);
+          }
+          if let Some(lifecycle_hooks) = lifecycle_hooks {
+            lifecycle_hooks
+              .lease_released(topic.as_str(), virtual_partition_id)
+              .await;
+          }
+          info!(
+            "broker partition lease released: release_reason={}, holder_id={holder_id}, \
+             topic={topic}, virtual_partition_id={virtual_partition_id}",
+            release_reason.as_str(),
+          );
+          return;
+        },
+        Err(error) => {
+          let retry_delay = release_retry.schedule_retry(time_provider.now());
+          warn_every!(
+            15.seconds(),
+            "lease self-assignment release failed: topic={topic}, \
+             virtual_partition_id={virtual_partition_id}, retry_delay_ms={}, error={error:#}",
+            retry_delay.whole_milliseconds(),
+          );
+          time_provider.sleep(retry_delay).await;
+        },
+      }
     }
   }
 
@@ -649,6 +767,8 @@ impl WriteEngineImpl {
     lease_duration: time::Duration,
     heartbeat_interval: time::Duration,
   ) {
+    // Continue heartbeating while accepted writes drain. If the lease is lost, draining still
+    // waits for local work so state can be retired safely, but no further heartbeat is attempted.
     let mut lease_held = true;
     let mut heartbeat_retry = LeaseRetrySchedule::new(next_heartbeat_at);
     loop {

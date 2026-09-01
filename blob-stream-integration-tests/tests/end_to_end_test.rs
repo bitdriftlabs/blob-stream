@@ -5940,6 +5940,7 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
   let mut writer_1_cluster = ClusterHarness::builder(&resources, 1)
     .topic_num_writers(2)
     .broker_writer_id(1)
+    .machine_id_offset(512)
     .start()
     .await?;
   let writer_0_discovery: Arc<dyn BrokerDiscovery> =

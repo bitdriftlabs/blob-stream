@@ -201,6 +201,7 @@ pub struct ClusterHarness {
 /// Builds a cluster with no external storage dependencies.
 pub struct InMemoryClusterHarnessBuilder {
   broker_count: usize,
+  machine_id_offset: u16,
   metadata_store: Option<Arc<dyn MetadataStore>>,
   partition_count: u32,
   topic_num_writers: u32,
@@ -212,6 +213,13 @@ pub struct InMemoryClusterHarnessBuilder {
 }
 
 impl InMemoryClusterHarnessBuilder {
+  /// Offset this cluster's Sonyflake machine IDs when it shares blob storage with another pool.
+  #[must_use]
+  pub fn machine_id_offset(mut self, machine_id_offset: u16) -> Self {
+    self.machine_id_offset = machine_id_offset;
+    self
+  }
+
   #[must_use]
   pub fn metadata_store(mut self, metadata_store: Arc<dyn MetadataStore>) -> Self {
     self.metadata_store = Some(metadata_store);
@@ -285,6 +293,7 @@ impl InMemoryClusterHarnessBuilder {
     ClusterHarness::start_from_builder(
       Some(store_fault_controller),
       self.broker_count,
+      self.machine_id_offset,
       blob_store,
       metadata_store,
       lease_store,
@@ -312,6 +321,7 @@ impl InMemoryClusterHarnessBuilder {
 pub struct ClusterHarnessBuilder<'a> {
   resources: &'a IntegrationResources,
   broker_count: usize,
+  machine_id_offset: u16,
   blob_store: Option<Arc<dyn BlobStore>>,
   metadata_store: Option<Arc<dyn MetadataStore>>,
   partition_count: u32,
@@ -327,6 +337,13 @@ pub struct ClusterHarnessBuilder<'a> {
 }
 
 impl ClusterHarnessBuilder<'_> {
+  /// Offset this cluster's Sonyflake machine IDs when it shares blob storage with another pool.
+  #[must_use]
+  pub fn machine_id_offset(mut self, machine_id_offset: u16) -> Self {
+    self.machine_id_offset = machine_id_offset;
+    self
+  }
+
   pub fn blob_store(mut self, blob_store: Arc<dyn BlobStore>) -> Self {
     self.blob_store = Some(blob_store);
     self
@@ -432,6 +449,7 @@ impl ClusterHarnessBuilder<'_> {
     ClusterHarness::start_from_builder(
       Some(self.resources.store_fault_controller()),
       self.broker_count,
+      self.machine_id_offset,
       blob_store,
       metadata_store,
       lease_store,
@@ -460,6 +478,7 @@ impl ClusterHarness {
     ClusterHarnessBuilder {
       resources,
       broker_count,
+      machine_id_offset: 0,
       blob_store: None,
       metadata_store: None,
       partition_count: PARTITION_COUNT,
@@ -479,6 +498,7 @@ impl ClusterHarness {
   pub fn in_memory(broker_count: usize) -> InMemoryClusterHarnessBuilder {
     InMemoryClusterHarnessBuilder {
       broker_count,
+      machine_id_offset: 0,
       metadata_store: None,
       partition_count: PARTITION_COUNT,
       topic_num_writers: 1,
@@ -493,6 +513,7 @@ impl ClusterHarness {
   async fn start_from_builder(
     store_fault_controller: Option<StoreFaultController>,
     broker_count: usize,
+    machine_id_offset: u16,
     blob_store: Arc<dyn BlobStore>,
     metadata_store: Arc<dyn MetadataStore>,
     lease_store: Arc<dyn ProducerPartitionLeaseStore>,
@@ -548,7 +569,9 @@ impl ClusterHarness {
       .enumerate()
       .map(|(index, node)| {
         let machine_id = u16::try_from(index)
-          .map_err(|_| anyhow!("broker count exceeds Sonyflake machine ID capacity"))?;
+          .ok()
+          .and_then(|machine_id| machine_id_offset.checked_add(machine_id))
+          .ok_or_else(|| anyhow!("cluster machine ID range exceeds u16 capacity"))?;
         Ok((node.node_id.clone(), machine_id))
       })
       .collect::<Result<HashMap<_, _>>>()?;

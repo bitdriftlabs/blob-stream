@@ -56,6 +56,7 @@ use blob_stream_types::{
   CompressionCodec,
   SeqRange,
   SnowflakeId,
+  VirtualPartitionId,
   Window,
   new_record,
   offset_datetime_from_unix_millis,
@@ -90,6 +91,16 @@ struct NotifyingBlobStore {
 
 struct NotifyingAssignmentHook {
   published_tx: mpsc::UnboundedSender<()>,
+}
+
+//
+// NotifyingLeaseLifecycleHook
+//
+
+/// Signals assignment publication and the one-time transition from draining to release retry.
+struct NotifyingLeaseLifecycleHook {
+  published_tx: mpsc::UnboundedSender<()>,
+  before_release_tx: mpsc::UnboundedSender<()>,
 }
 
 struct GatedFirstMetadataStore {
@@ -278,6 +289,17 @@ impl BlobStore for NotifyingBlobStore {
 impl BrokerLifecycleHooks for NotifyingAssignmentHook {
   async fn assignment_published(&self) {
     let _ignored = self.published_tx.send(());
+  }
+}
+
+#[async_trait]
+impl BrokerLifecycleHooks for NotifyingLeaseLifecycleHook {
+  async fn assignment_published(&self) {
+    let _ignored = self.published_tx.send(());
+  }
+
+  async fn before_lease_release(&self, _topic: &str, _virtual_partition_id: VirtualPartitionId) {
+    let _ignored = self.before_release_tx.send(());
   }
 }
 
@@ -996,6 +1018,65 @@ async fn foreground_acquire_completed_after_membership_handoff_is_released() -> 
 }
 
 #[tokio::test]
+async fn membership_handoff_publishes_while_maintenance_acquire_is_in_flight() -> Result<()> {
+  let now = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
+  }]));
+  let (acquire_entered_tx, mut acquire_entered_rx) = mpsc::unbounded_channel();
+  let (published_tx, mut published_rx) = mpsc::unbounded_channel();
+  let acquire_release = Arc::new(Semaphore::new(0));
+  let lease_store = Arc::new(GatedLeaseAcquireStore {
+    inner: Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+    entered_tx: acquire_entered_tx,
+    release: Arc::clone(&acquire_release),
+    block_next: AtomicBool::new(true),
+  });
+  let engine = make_engine_with_membership_and_lease_store(
+    now,
+    membership_rx,
+    shutdown_trigger.make_handle(),
+    1,
+    &(lease_store as Arc<dyn ProducerPartitionLeaseStore>),
+    Some(Arc::new(NotifyingAssignmentHook { published_tx })),
+  )?;
+
+  published_rx
+    .recv()
+    .await
+    .expect("initial membership assignment was not published");
+  acquire_entered_rx
+    .recv()
+    .await
+    .expect("initial maintenance acquire did not reach its gate");
+
+  membership_tx.send(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
+  }]))?;
+  published_rx
+    .recv()
+    .await
+    .expect("handoff membership assignment was blocked by maintenance acquire");
+  assert!(
+    engine
+      .state
+      .lock()
+      .assignment_generation_for_partition("telemetry", 0)
+      .is_none(),
+    "handoff did not revoke admission while maintenance acquire was blocked"
+  );
+
+  acquire_release.add_permits(1);
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test]
 async fn newer_membership_revokes_admission_while_previous_handoff_drains() -> Result<()> {
   let now = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
     1_700_000_000_000,
@@ -1198,6 +1279,7 @@ async fn reassignment_waits_for_terminal_release_retry_before_readmission() -> R
   let (release_entered_tx, mut release_entered_rx) = mpsc::unbounded_channel();
   let (release_failed_tx, mut release_failed_rx) = mpsc::unbounded_channel();
   let (published_tx, mut published_rx) = mpsc::unbounded_channel();
+  let (before_release_tx, mut before_release_rx) = mpsc::unbounded_channel();
   let release = Arc::new(Semaphore::new(0));
   let lease_store = Arc::new(GatedLeaseReleaseStore {
     inner: Arc::new(InMemoryProducerPartitionLeaseStore::new()),
@@ -1213,7 +1295,10 @@ async fn reassignment_waits_for_terminal_release_retry_before_readmission() -> R
     shutdown_trigger.make_handle(),
     1,
     &(lease_store.clone() as Arc<dyn ProducerPartitionLeaseStore>),
-    Some(Arc::new(NotifyingAssignmentHook { published_tx })),
+    Some(Arc::new(NotifyingLeaseLifecycleHook {
+      published_tx,
+      before_release_tx,
+    })),
   )?;
   let request = || WriteRequest {
     topic: "telemetry".into(),
@@ -1237,6 +1322,10 @@ async fn reassignment_waits_for_terminal_release_retry_before_readmission() -> R
     .recv()
     .await
     .expect("lease release did not fail at its test gate");
+  before_release_rx
+    .recv()
+    .await
+    .expect("drained partition did not begin lease release");
   now
     .wait_for_sleep_registration_after(sleep_registrations)
     .await;
@@ -1262,6 +1351,10 @@ async fn reassignment_waits_for_terminal_release_retry_before_readmission() -> R
     .recv()
     .await
     .expect("terminal retry completion did not republish the restored assignment");
+  assert!(
+    before_release_rx.try_recv().is_err(),
+    "retry repeated the drain-to-release lifecycle transition"
+  );
   engine.produce_batch(request()).await?;
 
   shutdown_trigger.shutdown().await;

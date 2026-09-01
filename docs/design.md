@@ -113,13 +113,14 @@ publishes its initial Endpoint set.
 Each broker fences writes through a producer-partition lease. A lease key contains topic, the
 virtual partition ID. The virtual partition calculation already includes writer identity, so the
 broker writer ID is not duplicated in the key. Only the active lease holder can reserve sequences
-and accept writes for that lease key. Lease drains and releases run independently from membership
-consumption. A later membership snapshot therefore updates write admission immediately even while
-an earlier ownership loss drains accepted work. If a newer snapshot restores local ownership of a
-partition being released, that partition remains outside effective write admission until the old
-release reaches a terminal outcome; assignment maintenance then reacquires it under the latest
-membership plan. Release work is never cancelled because a conditional remote release may complete
-after its caller stops waiting.
+and accept writes for that lease key. Lease drains, releases, and acquisition maintenance run
+independently from membership consumption. A later membership snapshot therefore updates write
+admission immediately even while an earlier ownership loss drains accepted work or an earlier
+lease acquisition is still in flight. If a newer snapshot restores local ownership of a partition
+being released, that partition remains outside effective write admission until the old release
+reaches a terminal outcome; assignment maintenance then reacquires it under the latest membership
+plan. Release work is never cancelled because a conditional remote release may complete after its
+caller stops waiting.
 
 Broker configuration sets both the lease duration and the producer-lease heartbeat interval. The
 heartbeat must be shorter than the lease duration; it renews every producer-partition lease owned
