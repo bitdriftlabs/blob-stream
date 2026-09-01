@@ -3120,7 +3120,8 @@ async fn retry_releases_request_permit_before_backoff() {
     records: Vec::new(),
     completions: Vec::new(),
   };
-  let metrics = super::ProducerMetrics::new(&metrics_scope());
+  let collector = Collector::default();
+  let metrics = super::ProducerMetrics::new(&collector.scope("blob_stream_producer_test"));
   let retry_diagnostics = super::ProducerRetryDiagnostics::default();
 
   let retry = send_batch_with_retry(
@@ -3148,6 +3149,11 @@ async fn retry_releases_request_permit_before_backoff() {
 
   assert_eq!(request_permits.available_permits(), 1);
   assert_eq!(transport.sent.lock().await.len(), 1);
+  Helper::new_with_collector(collector).assert_counter_eq(
+    2,
+    "blob_stream_producer_test:producer:retries",
+    &labels!(),
+  );
   release.add_permits(1);
   assert!(retry.await.is_ok());
   assert_eq!(transport.sent.lock().await.len(), 2);
