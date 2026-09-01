@@ -26,8 +26,9 @@ use blob_stream_metadata_store::{
   ProducerPartitionLeaseKey,
 };
 use blob_stream_types::VirtualPartitionId;
-use futures::StreamExt;
+use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 use log::{debug, info, trace};
 use protobuf::Chars;
 use std::collections::{HashMap, HashSet};
@@ -153,9 +154,12 @@ impl WriteEngineImpl {
       let mut membership_updates_open = true;
       let mut assignment_refresh_needed = true;
       let mut assignment_activated = false;
-      let mut previously_assigned: HashSet<(Chars, VirtualPartitionId)> = HashSet::new();
+      let mut previously_desired: HashSet<(Chars, VirtualPartitionId)> = HashSet::new();
       let mut pending_acquisitions: HashMap<(Chars, VirtualPartitionId), LeaseRetrySchedule> =
         HashMap::new();
+      let mut pending_releases: HashSet<(Chars, VirtualPartitionId)> = HashSet::new();
+      let mut release_supervisor =
+        FuturesUnordered::<BoxFuture<'static, (Chars, VirtualPartitionId)>>::new();
       let mut owned = Vec::new();
 
       loop {
@@ -173,63 +177,36 @@ impl WriteEngineImpl {
         tokio::pin!(acquisition_retry_sleep);
 
         let mut membership_changed = false;
-        let shutting_down = if membership_updates_open {
+        let completed_release = if membership_updates_open {
           tokio::select! {
-            _ = heartbeat_ticker.tick() => false,
-            () = &mut acquisition_retry_sleep => false,
+            _ = heartbeat_ticker.tick() => None,
+            () = &mut acquisition_retry_sleep => None,
+            completed_release = release_supervisor.next(),
+            if !release_supervisor.is_empty() => completed_release,
             changed = membership_rx.changed() => {
               membership_changed = true;
               if changed.is_err() {
                 membership_updates_open = false;
               }
-              false
+              None
             }
-            () = shutdown.cancelled() => true,
+            () = shutdown.cancelled() => break,
           }
         } else {
           tokio::select! {
-            _ = heartbeat_ticker.tick() => false,
-            () = &mut acquisition_retry_sleep => false,
-            () = shutdown.cancelled() => true,
+            _ = heartbeat_ticker.tick() => None,
+            () = &mut acquisition_retry_sleep => None,
+            completed_release = release_supervisor.next(),
+            if !release_supervisor.is_empty() => completed_release,
+            () = shutdown.cancelled() => break,
           }
         };
+        if let Some(partition) = completed_release {
+          pending_releases.remove(&partition);
+          assignment_refresh_needed = true;
+        }
 
         let membership = membership_rx.borrow().clone();
-        if shutting_down {
-          let mut partitions: HashSet<_> = owned_partitions_for_shutdown(&state);
-          partitions.extend(Self::owned_virtual_partitions(
-            &topics,
-            writer_id,
-            &holder_id,
-            &membership,
-          ));
-          let mut partitions = partitions.into_iter().collect::<Vec<_>>();
-          partitions.sort_unstable();
-          info!(
-            "broker releasing drained leases for shutdown: holder_id={holder_id}, \
-             partitions={partitions:?}"
-          );
-          Self::release_partition_leases(
-            &lease_store,
-            &state,
-            &flush_notifier,
-            &metrics,
-            &holder_id,
-            &lease_session_id,
-            partitions
-              .into_iter()
-              .map(|(topic, virtual_partition_id)| {
-                (topic, virtual_partition_id, LeaseReleaseReason::Shutdown)
-              })
-              .collect(),
-            time_provider.as_ref(),
-            lease_duration,
-            heartbeat_interval,
-            lifecycle_hooks.as_ref(),
-          )
-          .await;
-          return;
-        }
 
         if assignment_refresh_needed || membership_changed {
           // Kubernetes does not publish this pod to Endpoints until it is ready. Lease acquisition
@@ -249,32 +226,25 @@ impl WriteEngineImpl {
 
           // A previously activated broker immediately releases its ownership when it disappears
           // from a later snapshot. Before first activation this is simply the empty admission set.
-          let next_owned = if assignment_activated && self_is_member {
+          let next_desired_owned = if assignment_activated && self_is_member {
             Self::owned_virtual_partitions(&topics, writer_id, &holder_id, &membership)
           } else {
             Vec::new()
           };
-          let currently_owned: HashSet<(Chars, VirtualPartitionId)> =
-            next_owned.iter().cloned().collect();
-          let tracked_partitions = {
-            let mut guard = state.lock();
-            guard.membership = membership.clone();
-            // Publishing the set before starting asynchronous releases ensures every later
-            // foreground transition observes the new membership decision under the same lock.
-            guard.publish_assignment(&next_owned);
-            guard.partition_keys()
-          };
-          pending_acquisitions.retain(|partition, _| currently_owned.contains(partition));
+          let currently_desired: HashSet<(Chars, VirtualPartitionId)> =
+            next_desired_owned.iter().cloned().collect();
+          let tracked_partitions = state.lock().partition_keys();
+          pending_acquisitions.retain(|partition, _| currently_desired.contains(partition));
 
-          let gained_partitions = sorted_partition_delta(&currently_owned, &previously_assigned);
-          let lost_partitions = sorted_partition_delta(&previously_assigned, &currently_owned);
+          let gained_partitions = sorted_partition_delta(&currently_desired, &previously_desired);
+          let lost_partitions = sorted_partition_delta(&previously_desired, &currently_desired);
           if !gained_partitions.is_empty() || !lost_partitions.is_empty() {
             info!(
               "broker partition assignment changed: holder_id={holder_id}, membership_nodes={:?}, \
                assigned_partitions={}, gained_partitions={gained_partitions:?}, \
                lost_partitions={lost_partitions:?}",
               membership.nodes().unwrap_or_default(),
-              currently_owned.len(),
+              currently_desired.len(),
             );
           }
 
@@ -292,7 +262,7 @@ impl WriteEngineImpl {
             .collect::<HashMap<_, _>>();
           let mut release_partitions = lost_partitions;
           for partition in tracked_partitions {
-            if !currently_owned.contains(&partition) {
+            if !currently_desired.contains(&partition) {
               release_partitions
                 .entry(partition)
                 .or_insert(LeaseReleaseReason::DefensiveReconciliation);
@@ -304,26 +274,67 @@ impl WriteEngineImpl {
             .collect::<Vec<_>>();
           release_partitions
             .sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-          Self::release_partition_leases(
-            &lease_store,
-            &state,
-            &flush_notifier,
-            &metrics,
-            &holder_id,
-            &lease_session_id,
-            release_partitions,
-            time_provider.as_ref(),
-            lease_duration,
-            heartbeat_interval,
-            lifecycle_hooks.as_ref(),
-          )
-          .await;
 
-          // Record assignment after reconciling releases so the next membership update can
-          // calculate its delta. Heartbeats reuse this vector without rebuilding ownership sets.
-          previously_assigned = currently_owned;
-          owned = next_owned;
+          for (topic, virtual_partition_id, release_reason) in release_partitions {
+            let partition = (topic.clone(), virtual_partition_id);
+            if !pending_releases.insert(partition.clone()) {
+              continue;
+            }
+            let lease_store = Arc::clone(&lease_store);
+            let state = Arc::clone(&state);
+            let flush_notifier = Arc::clone(&flush_notifier);
+            let metrics = metrics.clone();
+            let holder_id = holder_id.clone();
+            let lease_session_id = lease_session_id.clone();
+            let time_provider = Arc::clone(&time_provider);
+            let lifecycle_hooks = lifecycle_hooks.clone();
+            release_supervisor.push(
+              async move {
+                let mut retry = LeaseRetrySchedule::new(time_provider.now());
+                while !Self::release_partition_lease(
+                  &lease_store,
+                  &state,
+                  &flush_notifier,
+                  &metrics,
+                  &holder_id,
+                  &lease_session_id,
+                  &topic,
+                  virtual_partition_id,
+                  release_reason,
+                  time_provider.as_ref(),
+                  lease_duration,
+                  heartbeat_interval,
+                  lifecycle_hooks.as_ref(),
+                )
+                .await
+                {
+                  let retry_delay = retry.schedule_retry(time_provider.now());
+                  time_provider.sleep(retry_delay).await;
+                }
+                partition
+              }
+              .boxed(),
+            );
+          }
+
+          // A returned partition must complete its prior handoff before it can be admitted
+          // again. This keeps every old drain/revocation alive while the latest membership is
+          // still consumed promptly for unrelated partitions.
+          owned = next_desired_owned
+            .iter()
+            .filter(|partition| !pending_releases.contains(partition))
+            .cloned()
+            .collect();
+          previously_desired = currently_desired;
           assignment_refresh_needed = false;
+          {
+            let mut guard = state.lock();
+            guard.membership = membership.clone();
+            guard.publish_assignment(&owned);
+          }
+          if let Some(lifecycle_hooks) = lifecycle_hooks.as_ref() {
+            lifecycle_hooks.assignment_published().await;
+          }
         }
 
         for (topic, virtual_partition_id) in &owned {
@@ -455,6 +466,66 @@ impl WriteEngineImpl {
           }
         }
       }
+
+      // Stop admitting immediately, then retain all existing handoffs and add any remaining
+      // locally tracked partition to the concurrent shutdown release set.
+      state.lock().publish_assignment(&[]);
+      let membership = membership_rx.borrow().clone();
+      let mut partitions: HashSet<_> = owned_partitions_for_shutdown(&state);
+      partitions.extend(Self::owned_virtual_partitions(
+        &topics,
+        writer_id,
+        &holder_id,
+        &membership,
+      ));
+      let mut partitions = partitions.into_iter().collect::<Vec<_>>();
+      partitions.sort_unstable();
+      info!(
+        "broker releasing drained leases for shutdown: holder_id={holder_id}, \
+         partitions={partitions:?}"
+      );
+      for (topic, virtual_partition_id) in partitions {
+        let partition = (topic.clone(), virtual_partition_id);
+        if !pending_releases.insert(partition.clone()) {
+          continue;
+        }
+        let lease_store = Arc::clone(&lease_store);
+        let state = Arc::clone(&state);
+        let flush_notifier = Arc::clone(&flush_notifier);
+        let metrics = metrics.clone();
+        let holder_id = holder_id.clone();
+        let lease_session_id = lease_session_id.clone();
+        let time_provider = Arc::clone(&time_provider);
+        let lifecycle_hooks = lifecycle_hooks.clone();
+        release_supervisor.push(
+          async move {
+            let mut retry = LeaseRetrySchedule::new(time_provider.now());
+            while !Self::release_partition_lease(
+              &lease_store,
+              &state,
+              &flush_notifier,
+              &metrics,
+              &holder_id,
+              &lease_session_id,
+              &topic,
+              virtual_partition_id,
+              LeaseReleaseReason::Shutdown,
+              time_provider.as_ref(),
+              lease_duration,
+              heartbeat_interval,
+              lifecycle_hooks.as_ref(),
+            )
+            .await
+            {
+              let retry_delay = retry.schedule_retry(time_provider.now());
+              time_provider.sleep(retry_delay).await;
+            }
+            partition
+          }
+          .boxed(),
+        );
+      }
+      while release_supervisor.next().await.is_some() {}
     });
   }
 
@@ -472,17 +543,16 @@ impl WriteEngineImpl {
     lease_duration: time::Duration,
     heartbeat_interval: time::Duration,
     lifecycle_hooks: Option<&Arc<dyn BrokerLifecycleHooks>>,
-  ) {
+  ) -> bool {
     let key = ProducerPartitionLeaseKey {
       topic: topic.clone(),
       virtual_partition_id,
     };
-
     let next_heartbeat_at = {
       let mut state = state.lock();
       let Some(partition_state) = state.partition_state_mut_if_present(topic, virtual_partition_id)
       else {
-        return;
+        return true;
       };
       partition_state.draining = true;
       partition_state.lease_expiration_at.map_or_else(
@@ -556,52 +626,16 @@ impl WriteEngineImpl {
            topic={topic}, virtual_partition_id={virtual_partition_id}",
           release_reason.as_str(),
         );
+        true
       },
       Err(error) => {
         warn_every!(
           15.seconds(),
           "lease self-assignment release failed: {error}"
         );
+        false
       },
     }
-  }
-
-  async fn release_partition_leases(
-    lease_store: &Arc<dyn blob_stream_metadata_store::ProducerPartitionLeaseStore>,
-    state: &Arc<parking_lot::Mutex<WriteState>>,
-    flush_notifier: &Arc<tokio::sync::Notify>,
-    metrics: &WriteMetrics,
-    holder_id: &str,
-    lease_session_id: &str,
-    partitions: Vec<(Chars, VirtualPartitionId, LeaseReleaseReason)>,
-    time_provider: &dyn TimeProvider,
-    lease_duration: time::Duration,
-    heartbeat_interval: time::Duration,
-    lifecycle_hooks: Option<&Arc<dyn BrokerLifecycleHooks>>,
-  ) {
-    let mut releases = FuturesUnordered::new();
-    for (topic, virtual_partition_id, release_reason) in partitions {
-      releases.push(async move {
-        Self::release_partition_lease(
-          lease_store,
-          state,
-          flush_notifier,
-          metrics,
-          holder_id,
-          lease_session_id,
-          &topic,
-          virtual_partition_id,
-          release_reason,
-          time_provider,
-          lease_duration,
-          heartbeat_interval,
-          lifecycle_hooks,
-        )
-        .await;
-      });
-    }
-
-    while releases.next().await.is_some() {}
   }
 
   async fn wait_for_partition_drain(
@@ -618,10 +652,12 @@ impl WriteEngineImpl {
     let mut lease_held = true;
     let mut heartbeat_retry = LeaseRetrySchedule::new(next_heartbeat_at);
     loop {
-      let notified = state
-        .lock()
-        .partition_state(key.topic.as_str(), key.virtual_partition_id)
-        .map(|partition_state| partition_state.drain_notify.clone().notified_owned());
+      let notified = {
+        let state = state.lock();
+        state
+          .partition_state(key.topic.as_str(), key.virtual_partition_id)
+          .map(|partition_state| partition_state.drain_notify.clone().notified_owned())
+      };
       let Some(notified) = notified else {
         return;
       };

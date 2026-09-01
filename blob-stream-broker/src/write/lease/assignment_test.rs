@@ -27,6 +27,8 @@ use blob_stream_types::{
   offset_datetime_from_unix_millis,
   virtual_partition_for_logical,
 };
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use protobuf::Chars;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -514,6 +516,44 @@ async fn all_partitions_expired(
   true
 }
 
+async fn release_partition_leases(
+  lease_store: &Arc<dyn ProducerPartitionLeaseStore>,
+  state: &Arc<parking_lot::Mutex<super::super::super::state::WriteState>>,
+  flush_notifier: &Arc<tokio::sync::Notify>,
+  metrics: &super::super::super::metrics::WriteMetrics,
+  holder_id: &str,
+  lease_session_id: &str,
+  partitions: Vec<(Chars, VirtualPartitionId, super::LeaseReleaseReason)>,
+  time_provider: &dyn TimeProvider,
+  lease_duration: Duration,
+  heartbeat_interval: Duration,
+  lifecycle_hooks: Option<&Arc<dyn super::super::super::BrokerLifecycleHooks>>,
+) {
+  let mut releases = FuturesUnordered::new();
+  for (topic, virtual_partition_id, release_reason) in partitions {
+    releases.push(async move {
+      WriteEngineImpl::release_partition_lease(
+        lease_store,
+        state,
+        flush_notifier,
+        metrics,
+        holder_id,
+        lease_session_id,
+        &topic,
+        virtual_partition_id,
+        release_reason,
+        time_provider,
+        lease_duration,
+        heartbeat_interval,
+        lifecycle_hooks,
+      )
+      .await;
+    });
+  }
+
+  while releases.next().await.is_some() {}
+}
+
 #[tokio::test]
 async fn releases_partitions_in_parallel_after_their_drains_complete() {
   let (started_tx, mut started_rx) = mpsc::unbounded_channel();
@@ -536,7 +576,7 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
   let time_provider = ManualTimeProvider::new(offset_datetime_from_unix_millis(1_000));
   let lifecycle_hooks: Option<Arc<dyn super::super::super::BrokerLifecycleHooks>> =
     Some(Arc::new(super::super::super::NoopBrokerLifecycleHooks));
-  let releases = WriteEngineImpl::release_partition_leases(
+  let releases = release_partition_leases(
     &lease_store,
     &state,
     &flush_notifier,

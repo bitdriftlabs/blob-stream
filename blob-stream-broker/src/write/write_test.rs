@@ -7,6 +7,7 @@ use super::allocation::{
 };
 use super::state::WriteState;
 use super::{
+  BrokerLifecycleHooks,
   TopicInfo,
   WriteConfig,
   WriteEngine,
@@ -87,6 +88,10 @@ struct NotifyingBlobStore {
   entered_tx: mpsc::UnboundedSender<String>,
 }
 
+struct NotifyingAssignmentHook {
+  published_tx: mpsc::UnboundedSender<()>,
+}
+
 struct GatedFirstMetadataStore {
   inner: Arc<InMemoryMetadataStore>,
   entered_tx: mpsc::UnboundedSender<()>,
@@ -118,6 +123,20 @@ struct GatedLeaseAcquireStore {
   entered_tx: mpsc::UnboundedSender<()>,
   release: Arc<Semaphore>,
   block_next: AtomicBool,
+}
+
+//
+// GatedLeaseReleaseStore
+//
+
+/// Blocks one lease release after the caller enables the gate.
+struct GatedLeaseReleaseStore {
+  inner: Arc<InMemoryProducerPartitionLeaseStore>,
+  entered_tx: mpsc::UnboundedSender<()>,
+  failed_tx: Option<mpsc::UnboundedSender<()>>,
+  release: Arc<Semaphore>,
+  block_next: AtomicBool,
+  fail_next: AtomicBool,
 }
 
 struct FailsTopicMetadataStore {
@@ -252,6 +271,13 @@ impl BlobStore for NotifyingBlobStore {
       key: key.as_str().to_string(),
       source: anyhow::anyhow!("cache admission reads are not used by this test"),
     })
+  }
+}
+
+#[async_trait]
+impl BrokerLifecycleHooks for NotifyingAssignmentHook {
+  async fn assignment_published(&self) {
+    let _ignored = self.published_tx.send(());
   }
 }
 
@@ -552,6 +578,113 @@ impl ProducerPartitionLeaseStore for GatedLeaseAcquireStore {
   }
 }
 
+#[async_trait]
+impl ProducerPartitionLeaseStore for GatedLeaseReleaseStore {
+  async fn get_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+  ) -> Result<Option<ProducerPartitionLease>> {
+    self.inner.get_lease(key).await
+  }
+
+  async fn acquire_lease(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    lease_session_id: String,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
+  ) -> Result<LeaseAcquireOutcome> {
+    self
+      .inner
+      .acquire_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .await
+  }
+
+  async fn acquire_lease_and_reserve_sequences(
+    &self,
+    key: ProducerPartitionLeaseKey,
+    holder_id: String,
+    lease_session_id: String,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
+    reservation_size: Option<u64>,
+  ) -> Result<LeaseAcquireAndReserveOutcome> {
+    self
+      .inner
+      .acquire_lease_and_reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now,
+        lease_duration,
+        reservation_size,
+      )
+      .await
+  }
+
+  async fn heartbeat_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    lease_session_id: &str,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
+  ) -> Result<LeaseHeartbeatOutcome> {
+    self
+      .inner
+      .heartbeat_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .await
+  }
+
+  async fn reserve_sequences(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    lease_session_id: &str,
+    now: OffsetDateTime,
+    reservation_size: u64,
+  ) -> Result<SequenceReservationOutcome> {
+    self
+      .inner
+      .reserve_sequences(key, holder_id, lease_session_id, now, reservation_size)
+      .await
+  }
+
+  async fn release_lease(
+    &self,
+    key: &ProducerPartitionLeaseKey,
+    holder_id: &str,
+    lease_session_id: &str,
+    now: OffsetDateTime,
+  ) -> Result<LeaseReleaseOutcome> {
+    if self.fail_next.swap(false, Ordering::AcqRel) {
+      if let Some(failed_tx) = &self.failed_tx {
+        failed_tx
+          .send(())
+          .map_err(|_| anyhow::anyhow!("test receiver dropped"))?;
+      }
+      return Err(anyhow::anyhow!("injected lease release failure"));
+    }
+    if self.block_next.swap(false, Ordering::AcqRel) {
+      self
+        .entered_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("test receiver dropped"))?;
+      self
+        .release
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("test gate closed"))?
+        .forget();
+    }
+    self
+      .inner
+      .release_lease(key, holder_id, lease_session_id, now)
+      .await
+  }
+}
+
 fn std_duration(duration: TimeDuration) -> StdDuration {
   StdDuration::try_from(duration).unwrap()
 }
@@ -584,6 +717,7 @@ fn make_engine_with_membership(
     shutdown_trigger_handle,
     partition_count,
     &(lease_store.clone() as Arc<dyn ProducerPartitionLeaseStore>),
+    None,
   )?;
   Ok((engine, lease_store))
 }
@@ -594,6 +728,7 @@ fn make_engine_with_membership_and_lease_store(
   shutdown_trigger_handle: bd_shutdown::ComponentShutdownTriggerHandle,
   partition_count: u32,
   lease_store: &Arc<dyn ProducerPartitionLeaseStore>,
+  lifecycle_hooks: Option<Arc<dyn BrokerLifecycleHooks>>,
 ) -> Result<Arc<WriteEngineImpl>> {
   let mut config = WriteConfig::with_defaults();
   config.flush_max_bytes = 1;
@@ -608,7 +743,8 @@ fn make_engine_with_membership_and_lease_store(
       metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
     },
   )]);
-  let engine = WriteEngineBuilder::new(
+  let scope = metrics_scope();
+  let mut builder = WriteEngineBuilder::new(
     config,
     topics,
     Arc::new(InMemoryBlobStore::new()),
@@ -616,11 +752,14 @@ fn make_engine_with_membership_and_lease_store(
     Arc::clone(lease_store),
     "node-a".to_string(),
     shutdown_trigger_handle,
-    &metrics_scope(),
+    &scope,
   )
   .membership_rx(membership_rx)
-  .time_provider(time_provider)
-  .build()?;
+  .time_provider(time_provider);
+  if let Some(lifecycle_hooks) = lifecycle_hooks {
+    builder = builder.lifecycle_hooks(lifecycle_hooks);
+  }
+  let engine = builder.build()?;
   Ok(Arc::new(engine))
 }
 
@@ -752,6 +891,7 @@ async fn foreground_acquire_completed_after_membership_handoff_is_released() -> 
     shutdown_trigger.make_handle(),
     1,
     &(lease_store.clone() as Arc<dyn ProducerPartitionLeaseStore>),
+    None,
   )?;
 
   // The engine's initial maintenance acquisition must complete before the test expires its lease.
@@ -852,6 +992,331 @@ async fn foreground_acquire_completed_after_membership_handoff_is_released() -> 
   ));
 
   shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn newer_membership_revokes_admission_while_previous_handoff_drains() -> Result<()> {
+  let now = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let node_a = BrokerNode {
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
+  };
+  let node_b = BrokerNode {
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
+  };
+  let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![node_a.clone()]));
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let (published_tx, mut published_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  config.flush_max_delay = TimeDuration::seconds(60);
+  let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config,
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 2,
+          num_writers: 1,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+          metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
+        },
+      )]),
+      Arc::new(BlockingBlobStore {
+        entered_tx,
+        release: Arc::clone(&release),
+      }),
+      Arc::new(InMemoryMetadataStore::new()),
+      lease_store,
+      "node-a".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .membership_rx(membership_rx)
+    .time_provider(now)
+    .lifecycle_hooks(Arc::new(NotifyingAssignmentHook { published_tx }))
+    .build()?,
+  );
+  published_rx
+    .recv()
+    .await
+    .expect("initial membership assignment was not published");
+
+  let split_membership = BrokerMembership::new(vec![node_a, node_b.clone()]);
+  let split_owned =
+    WriteEngineImpl::owned_virtual_partitions(&engine.topics, 0, "node-a", &split_membership);
+  let retained_partition = split_owned
+    .iter()
+    .find_map(|(topic, partition)| (topic.as_str() == "telemetry").then_some(*partition))
+    .expect("node-a must retain one of two partitions after scale-out");
+  let draining_partition = (0 .. 2)
+    .find(|partition| *partition != retained_partition)
+    .expect("node-a must hand off one of two partitions after scale-out");
+
+  let produce_engine = Arc::clone(&engine);
+  let produce = tokio::spawn(async move {
+    produce_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id: draining_partition,
+        records: vec![new_record(vec![1], 1)],
+      })
+      .await
+  });
+  receive_blob_write(&mut entered_rx).await;
+
+  membership_tx.send(split_membership)?;
+  published_rx
+    .recv()
+    .await
+    .expect("scale-out membership assignment was not published");
+  wait_for_partition_draining_start(&engine, draining_partition).await;
+
+  // The blocked drain must not delay consuming this new snapshot and revoking the retained
+  // partition's admission. The lifecycle event establishes that the latest snapshot was applied.
+  membership_tx.send(BrokerMembership::new(vec![node_b]))?;
+  published_rx
+    .recv()
+    .await
+    .expect("newer membership assignment was not published");
+  assert!(
+    engine
+      .state
+      .lock()
+      .assignment_generation_for_partition("telemetry", retained_partition)
+      .is_none(),
+    "newer membership did not revoke the retained partition admission"
+  );
+
+  release.add_permits(1);
+  produce.await??;
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn reassignment_waits_for_in_flight_release_before_readmission() -> Result<()> {
+  let now = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let node_a = BrokerNode {
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
+  };
+  let node_b = BrokerNode {
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
+  };
+  let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![node_a.clone()]));
+  let (release_entered_tx, mut release_entered_rx) = mpsc::unbounded_channel();
+  let (published_tx, mut published_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let lease_store = Arc::new(GatedLeaseReleaseStore {
+    inner: Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+    entered_tx: release_entered_tx,
+    failed_tx: None,
+    release: Arc::clone(&release),
+    block_next: AtomicBool::new(true),
+    fail_next: AtomicBool::new(false),
+  });
+  let engine = make_engine_with_membership_and_lease_store(
+    now,
+    membership_rx,
+    shutdown_trigger.make_handle(),
+    1,
+    &(lease_store.clone() as Arc<dyn ProducerPartitionLeaseStore>),
+    Some(Arc::new(NotifyingAssignmentHook { published_tx })),
+  )?;
+  let request = || WriteRequest {
+    topic: "telemetry".into(),
+    virtual_partition_id: 0,
+    records: vec![new_record(vec![1], 1)],
+  };
+
+  published_rx
+    .recv()
+    .await
+    .expect("initial membership assignment was not published");
+  engine.produce_batch(request()).await?;
+
+  membership_tx.send(BrokerMembership::new(vec![node_b.clone()]))?;
+  published_rx
+    .recv()
+    .await
+    .expect("handoff membership assignment was not published");
+  release_entered_rx
+    .recv()
+    .await
+    .expect("lease release did not reach its gate");
+
+  membership_tx.send(BrokerMembership::new(vec![node_a]))?;
+  published_rx
+    .recv()
+    .await
+    .expect("restored membership assignment was not published");
+  assert!(matches!(
+    engine.produce_batch(request()).await,
+    Err(WriteError::NotLeaseHolder { .. })
+  ));
+
+  release.add_permits(1);
+  published_rx
+    .recv()
+    .await
+    .expect("release completion did not republish the restored assignment");
+  engine.produce_batch(request()).await?;
+
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn reassignment_waits_for_terminal_release_retry_before_readmission() -> Result<()> {
+  let now = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let node_a = BrokerNode {
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
+  };
+  let node_b = BrokerNode {
+    node_id: "node-b".into(),
+    address: "10.0.0.2:8080".into(),
+  };
+  let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![node_a.clone()]));
+  let (release_entered_tx, mut release_entered_rx) = mpsc::unbounded_channel();
+  let (release_failed_tx, mut release_failed_rx) = mpsc::unbounded_channel();
+  let (published_tx, mut published_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let lease_store = Arc::new(GatedLeaseReleaseStore {
+    inner: Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+    entered_tx: release_entered_tx,
+    failed_tx: Some(release_failed_tx),
+    release: Arc::clone(&release),
+    block_next: AtomicBool::new(false),
+    fail_next: AtomicBool::new(true),
+  });
+  let engine = make_engine_with_membership_and_lease_store(
+    now.clone(),
+    membership_rx,
+    shutdown_trigger.make_handle(),
+    1,
+    &(lease_store.clone() as Arc<dyn ProducerPartitionLeaseStore>),
+    Some(Arc::new(NotifyingAssignmentHook { published_tx })),
+  )?;
+  let request = || WriteRequest {
+    topic: "telemetry".into(),
+    virtual_partition_id: 0,
+    records: vec![new_record(vec![1], 1)],
+  };
+
+  published_rx
+    .recv()
+    .await
+    .expect("initial membership assignment was not published");
+  engine.produce_batch(request()).await?;
+
+  let sleep_registrations = now.sleep_registration_count();
+  membership_tx.send(BrokerMembership::new(vec![node_b]))?;
+  published_rx
+    .recv()
+    .await
+    .expect("handoff membership assignment was not published");
+  release_failed_rx
+    .recv()
+    .await
+    .expect("lease release did not fail at its test gate");
+  now
+    .wait_for_sleep_registration_after(sleep_registrations)
+    .await;
+
+  lease_store.block_next.store(true, Ordering::Release);
+  membership_tx.send(BrokerMembership::new(vec![node_a]))?;
+  published_rx
+    .recv()
+    .await
+    .expect("restored membership assignment was not published");
+  assert!(matches!(
+    engine.produce_batch(request()).await,
+    Err(WriteError::NotLeaseHolder { .. })
+  ));
+
+  now.advance(TimeDuration::milliseconds(250));
+  release_entered_rx
+    .recv()
+    .await
+    .expect("retry release did not reach its gate");
+  release.add_permits(1);
+  published_rx
+    .recv()
+    .await
+    .expect("terminal retry completion did not republish the restored assignment");
+  engine.produce_batch(request()).await?;
+
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_in_flight_lease_release() -> Result<()> {
+  let now = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let (membership_tx, membership_rx) = watch::channel(BrokerMembership::new(vec![BrokerNode {
+    node_id: "node-a".into(),
+    address: "10.0.0.1:8080".into(),
+  }]));
+  let (release_entered_tx, mut release_entered_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let lease_store = Arc::new(GatedLeaseReleaseStore {
+    inner: Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+    entered_tx: release_entered_tx,
+    failed_tx: None,
+    release: Arc::clone(&release),
+    block_next: AtomicBool::new(false),
+    fail_next: AtomicBool::new(false),
+  });
+  let engine = make_engine_with_membership_and_lease_store(
+    now,
+    membership_rx,
+    shutdown_trigger.make_handle(),
+    1,
+    &(lease_store.clone() as Arc<dyn ProducerPartitionLeaseStore>),
+    None,
+  )?;
+  let request = WriteRequest {
+    topic: "telemetry".into(),
+    virtual_partition_id: 0,
+    records: vec![new_record(vec![1], 1)],
+  };
+  engine.produce_batch(request).await?;
+
+  lease_store.block_next.store(true, Ordering::Release);
+  drop(membership_tx);
+  let shutdown = tokio::spawn(async move { shutdown_trigger.shutdown().await });
+  release_entered_rx
+    .recv()
+    .await
+    .expect("shutdown release did not reach its gate");
+  assert!(
+    !shutdown.is_finished(),
+    "shutdown completed before lease release"
+  );
+
+  release.add_permits(1);
+  shutdown.await?;
   Ok(())
 }
 
@@ -1411,14 +1876,14 @@ async fn receive_blob_write(receiver: &mut mpsc::UnboundedReceiver<String>) -> S
   panic!("expected blob write did not begin");
 }
 
-async fn wait_for_partition_draining_start(engine: &WriteEngineImpl) {
+async fn wait_for_partition_draining_start(engine: &WriteEngineImpl, virtual_partition_id: u32) {
   for _ in 0 .. 100 {
     let draining = {
       let state = engine.state.lock();
       state
         .topics
         .get("telemetry")
-        .and_then(|topic_state| topic_state.partitions.get(&0))
+        .and_then(|topic_state| topic_state.partitions.get(&virtual_partition_id))
         .is_some_and(|partition_state| partition_state.draining)
     };
     if draining {
@@ -3116,7 +3581,7 @@ async fn membership_handoff_drains_pipelined_flushes_before_releasing_lease() ->
     node_id: "node-b".into(),
     address: "10.0.0.2:8080".into(),
   }]))?;
-  wait_for_partition_draining_start(&engine).await;
+  wait_for_partition_draining_start(&engine, 0).await;
 
   let second = engine
     .produce_batch(WriteRequest {
@@ -3261,7 +3726,7 @@ async fn component_shutdown_drains_in_flight_flush_before_releasing_lease() -> R
   let shutdown = tokio::spawn(async move {
     shutdown_trigger.shutdown().await;
   });
-  wait_for_partition_draining_start(&engine).await;
+  wait_for_partition_draining_start(&engine, 0).await;
 
   let key = ProducerPartitionLeaseKey {
     topic: "telemetry".into(),
