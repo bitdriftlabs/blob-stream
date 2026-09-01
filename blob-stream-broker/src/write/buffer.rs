@@ -157,7 +157,6 @@ pub(super) struct TopicFlushPlan {
 pub(super) struct FlushPlan {
   pub(super) topics: Vec<TopicFlushPlan>,
   pub(super) max_segment_bytes: u64,
-  pub(super) shared_blob: bool,
   pub(super) publication_completions: Vec<FlushPublicationCompletion>,
 }
 

@@ -104,21 +104,21 @@ struct SegmentEnvelope {
   snowflake_id: SnowflakeId,
   blob_key: BlobKey,
   compression: blob_stream_types::Compression,
-  segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
   created_at: OffsetDateTime,
 }
 
 struct PersistedTopic {
   envelope: SegmentEnvelope,
-  partition_states: HashMap<VirtualPartitionId, PartitionPublicationState>,
+  partitions: HashMap<VirtualPartitionId, PersistedPartition>,
   max_metadata_publication_lag: time::Duration,
 }
 
 struct PersistedObject {
+  blob_key: BlobKey,
   payload: Bytes,
   topics: Vec<PersistedTopic>,
-  shared_blob: bool,
-  oversized_singleton: bool,
+  publication_budget: time::Duration,
+  oversized_partition: Option<(String, VirtualPartitionId)>,
 }
 
 impl PersistedObject {
@@ -130,8 +130,7 @@ impl PersistedObject {
       .iter()
       .flat_map(|topic| {
         topic
-          .envelope
-          .segment_index
+          .partitions
           .keys()
           .map(|virtual_partition_id| FlushPartitionResult {
             topic: topic.envelope.window.topic.clone().into(),
@@ -159,29 +158,37 @@ struct PartitionPublicationState {
   publication_predecessor: Option<FlushPublicationDependency>,
 }
 
+struct PersistedPartition {
+  metadata: Vec<BatchMetadata>,
+  publication_state: PartitionPublicationState,
+}
+
 struct ObjectTopicBuilder {
   topic: protobuf::Chars,
   max_metadata_publication_lag: time::Duration,
   metadata_window_size: time::Duration,
-  segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
-  partition_states: HashMap<VirtualPartitionId, PartitionPublicationState>,
+  partitions: HashMap<VirtualPartitionId, PersistedPartition>,
 }
 
 struct ObjectBuilder {
   payload: BytesMut,
   topics: Vec<ObjectTopicBuilder>,
+  blob_window_size: time::Duration,
+  oversized_partition: Option<(String, VirtualPartitionId)>,
 }
 
 impl ObjectBuilder {
-  fn new() -> Self {
+  fn new(encoded: EncodedPartition) -> Self {
+    let mut payload = BytesMut::new();
+    let (mut topic_builder, virtual_partition_id, partition) =
+      Self::build_partition(&mut payload, encoded);
+    topic_builder.insert_partition(virtual_partition_id, partition);
     Self {
-      payload: BytesMut::new(),
-      topics: Vec::new(),
+      payload,
+      blob_window_size: topic_builder.metadata_window_size,
+      oversized_partition: Some((topic_builder.topic.to_string(), virtual_partition_id)),
+      topics: vec![topic_builder],
     }
-  }
-
-  fn is_empty(&self) -> bool {
-    self.payload.is_empty()
   }
 
   fn would_exceed(&self, encoded: &EncodedPartition, max_segment_bytes: u64) -> bool {
@@ -191,66 +198,90 @@ impl ObjectBuilder {
       > max_segment_bytes
   }
 
-  fn push(&mut self, encoded: EncodedPartition) {
-    let start = u64::try_from(self.payload.len()).unwrap_or(u64::MAX);
-    self.payload.extend_from_slice(&encoded.payload);
-    let end = u64::try_from(self.payload.len()).unwrap_or(u64::MAX);
-    let metadata = BatchMetadata {
-      byte_range: blob_stream_types::ByteRange { start, end },
-      ..encoded.metadata
-    };
-    let topic = if let Some(topic) = self
+  fn push(mut self, encoded: EncodedPartition) -> Self {
+    let (topic_builder, virtual_partition_id, partition) =
+      Self::build_partition(&mut self.payload, encoded);
+    self.oversized_partition = None;
+    if let Some(existing_topic) = self
       .topics
       .iter_mut()
-      .find(|topic| topic.topic == encoded.topic)
+      .find(|existing_topic| existing_topic.topic == topic_builder.topic)
     {
-      topic
+      existing_topic.insert_partition(virtual_partition_id, partition);
     } else {
-      self.topics.push(ObjectTopicBuilder {
-        topic: encoded.topic.clone(),
-        max_metadata_publication_lag: encoded.max_metadata_publication_lag,
-        metadata_window_size: encoded.metadata_window_size,
-        segment_index: HashMap::new(),
-        partition_states: HashMap::new(),
-      });
-      self
-        .topics
-        .last_mut()
-        .expect("new topic section is present")
-    };
-    let replaced = topic
-      .segment_index
-      .insert(encoded.virtual_partition_id, vec![metadata]);
-    debug_assert!(replaced.is_none());
-    let replaced = topic.partition_states.insert(
-      encoded.virtual_partition_id,
-      PartitionPublicationState {
-        fence: encoded.fence,
-        publication_predecessor: encoded.publication_predecessor,
-      },
-    );
-    debug_assert!(replaced.is_none());
+      let mut topic_builder = topic_builder;
+      topic_builder.insert_partition(virtual_partition_id, partition);
+      self.topics.push(topic_builder);
+    }
+    self
   }
 
-  async fn finish(
-    self,
-    context: &FlushContext,
-    shared_blob: bool,
-    max_segment_bytes: u64,
-  ) -> Result<PersistedObject> {
-    let Self { payload, topics } = self;
+  fn build_partition(
+    object_payload: &mut BytesMut,
+    encoded: EncodedPartition,
+  ) -> (ObjectTopicBuilder, VirtualPartitionId, PersistedPartition) {
+    let EncodedPartition {
+      topic,
+      virtual_partition_id,
+      payload: encoded_payload,
+      metadata: encoded_metadata,
+      fence,
+      publication_predecessor,
+      max_metadata_publication_lag,
+      metadata_window_size,
+    } = encoded;
+    let start = u64::try_from(object_payload.len()).unwrap_or(u64::MAX);
+    object_payload.extend_from_slice(&encoded_payload);
+    let end = u64::try_from(object_payload.len()).unwrap_or(u64::MAX);
+    let metadata = BatchMetadata {
+      byte_range: blob_stream_types::ByteRange { start, end },
+      ..encoded_metadata
+    };
+    let partition = PersistedPartition {
+      metadata: vec![metadata],
+      publication_state: PartitionPublicationState {
+        fence,
+        publication_predecessor,
+      },
+    };
+    let topic_builder = ObjectTopicBuilder {
+      topic,
+      max_metadata_publication_lag,
+      metadata_window_size,
+      partitions: HashMap::new(),
+    };
+    (topic_builder, virtual_partition_id, partition)
+  }
+
+  async fn finish(self, context: &FlushContext, max_segment_bytes: u64) -> Result<PersistedObject> {
+    let Self {
+      payload,
+      topics,
+      blob_window_size,
+      oversized_partition,
+    } = self;
     let (snowflake_id, now) = context
       .snowflake
       .next(context.time_provider.as_ref())
       .await?;
-    let topic = topics.first().expect("nonempty object has a topic section");
-    let window = Window::for_timestamp(now, topic.metadata_window_size);
-    let blob_key = if shared_blob || topics.len() > 1 {
-      context.make_shared_blob_key(&window, snowflake_id)
-    } else {
-      context.make_blob_key(topic.topic.as_str(), &window, snowflake_id)
-    };
+    let publication_budget = topics
+      .iter()
+      .map(|topic| topic.max_metadata_publication_lag)
+      .min()
+      .unwrap_or_else(|| unreachable!("object builders always contain an initial partition"));
+    let window = Window::for_timestamp(now, blob_window_size);
+    let blob_key = context.make_blob_key(&window, snowflake_id);
     let compression = context.config.compression.clone();
+    let oversized_partition =
+      if u64::try_from(payload.len()).unwrap_or(u64::MAX) > max_segment_bytes {
+        debug_assert!(
+          oversized_partition.is_some(),
+          "oversized segment object must contain one partition"
+        );
+        oversized_partition
+      } else {
+        None
+      };
     let topics = topics
       .into_iter()
       .map(|topic| {
@@ -261,20 +292,19 @@ impl ObjectBuilder {
             snowflake_id,
             blob_key: blob_key.clone(),
             compression: compression.clone(),
-            segment_index: topic.segment_index,
             created_at: now,
           },
-          partition_states: topic.partition_states,
+          partitions: topic.partitions,
           max_metadata_publication_lag: topic.max_metadata_publication_lag,
         }
       })
-      .collect();
-    let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+      .collect::<Vec<_>>();
     Ok(PersistedObject {
+      blob_key,
       payload: payload.freeze(),
       topics,
-      shared_blob,
-      oversized_singleton: payload_len > max_segment_bytes,
+      publication_budget,
+      oversized_partition,
     })
   }
 }
@@ -282,6 +312,7 @@ impl ObjectBuilder {
 impl SegmentEnvelope {
   fn into_metadata(
     self,
+    segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
     metadata_published_at: OffsetDateTime,
   ) -> blob_stream_metadata_store::SegmentMetadata {
     blob_stream_metadata_store::SegmentMetadata::new(
@@ -289,7 +320,7 @@ impl SegmentEnvelope {
       self.snowflake_id,
       self.blob_key,
       self.compression,
-      self.segment_index,
+      segment_index,
       self.created_at,
       metadata_published_at,
     )
@@ -329,7 +360,7 @@ impl FlushContext {
     }
   }
 
-  fn make_blob_key(&self, namespace: &str, window: &Window, snowflake_id: SnowflakeId) -> BlobKey {
+  fn make_blob_key(&self, window: &Window, snowflake_id: SnowflakeId) -> BlobKey {
     let extension = match self.config.compression.codec {
       CompressionCodec::None => "bin",
       CompressionCodec::Zstd => "zst",
@@ -344,7 +375,7 @@ impl FlushContext {
       }
     }
 
-    key.push_str(namespace);
+    key.push_str("shared");
     key.push('/');
     key.push_str(&window.start.unix_timestamp().to_string());
     key.push('/');
@@ -354,11 +385,6 @@ impl FlushContext {
 
     BlobKey::new(key)
   }
-
-  fn make_shared_blob_key(&self, window: &Window, snowflake_id: SnowflakeId) -> BlobKey {
-    self.make_blob_key("shared", window, snowflake_id)
-  }
-
   fn encode_batch(virtual_partition_id: VirtualPartitionId, records: Vec<Record>) -> Result<Bytes> {
     let proto_batch = StoredRecordBatch {
       virtual_partition_id,
@@ -486,7 +512,7 @@ impl FlushContext {
     metrics: &WriteMetrics,
   ) -> Result<(Vec<PersistedObject>, Vec<FlushPartitionResult>)> {
     let topic_plans = std::mem::take(&mut plan.topics);
-    let mut current = ObjectBuilder::new();
+    let mut current: Option<ObjectBuilder> = None;
     let mut objects = Vec::new();
     let mut failed_partitions = Vec::new();
     for mut topic_plan in topic_plans {
@@ -506,24 +532,19 @@ impl FlushContext {
           continue;
         }
         let encoded = self.encode_partition(&topic_plan, partition)?;
-        if !current.is_empty() && current.would_exceed(&encoded, plan.max_segment_bytes) {
-          metrics.flush_max_segment_size_splits_total.inc();
-          objects.push(
-            current
-              .finish(self, plan.shared_blob, plan.max_segment_bytes)
-              .await?,
-          );
-          current = ObjectBuilder::new();
-        }
-        current.push(encoded);
+        current = Some(match current {
+          Some(current) if current.would_exceed(&encoded, plan.max_segment_bytes) => {
+            metrics.flush_max_segment_size_splits_total.inc();
+            objects.push(current.finish(self, plan.max_segment_bytes).await?);
+            ObjectBuilder::new(encoded)
+          },
+          Some(current) => current.push(encoded),
+          None => ObjectBuilder::new(encoded),
+        });
       }
     }
-    if !current.is_empty() {
-      objects.push(
-        current
-          .finish(self, plan.shared_blob, plan.max_segment_bytes)
-          .await?,
-      );
+    if let Some(current) = current {
+      objects.push(current.finish(self, plan.max_segment_bytes).await?);
     }
     Ok((objects, failed_partitions))
   }
@@ -538,11 +559,12 @@ impl FlushContext {
     // A normal topic can become one metadata row immediately. A topic with ordered predecessor
     // dependencies is split below so each virtual partition can wait independently; successful
     // partitions are merged again before the store write because they share one snowflake key.
-    if topic
-      .partition_states
-      .values()
-      .all(|state| state.publication_predecessor.is_none())
-    {
+    if topic.partitions.values().all(|partition| {
+      partition
+        .publication_state
+        .publication_predecessor
+        .is_none()
+    }) {
       return self
         .persist_ready_topic_metadata_with_permit(
           topic,
@@ -629,28 +651,31 @@ impl FlushContext {
     let _metadata_write_permit = metadata_write_permits.acquire().await.map_err(|error| {
       WriteError::Internal(anyhow::anyhow!("metadata write semaphore closed: {error}"))
     })?;
-    let virtual_partition_ids = topic
-      .envelope
-      .segment_index
-      .keys()
-      .copied()
-      .collect::<Vec<_>>();
-    let topic_name = topic.envelope.window.topic.clone();
-    let metadata_publication_budget =
-      std::time::Duration::try_from(topic.max_metadata_publication_lag).map_err(|_| {
-        WriteError::Internal(anyhow::anyhow!(
-          "metadata publication deadline must not be negative"
-        ))
-      })?;
+    let PersistedTopic {
+      envelope,
+      partitions,
+      max_metadata_publication_lag,
+    } = topic;
+    let metadata_publication_budget = std::time::Duration::try_from(max_metadata_publication_lag)
+      .map_err(|_| {
+      WriteError::Internal(anyhow::anyhow!(
+        "metadata publication deadline must not be negative"
+      ))
+    })?;
     let metadata_remaining_budget =
       metadata_publication_budget.checked_sub(publication_started_at.elapsed());
     let metadata_published_at = self.time_provider.now();
-    let metadata = topic.envelope.into_metadata(metadata_published_at);
-    let fences = topic
-      .partition_states
-      .into_values()
-      .map(|state| state.fence)
-      .collect::<Option<Vec<_>>>();
+    let topic_name = envelope.window.topic.clone();
+    let mut virtual_partition_ids = Vec::with_capacity(partitions.len());
+    let mut segment_index = HashMap::with_capacity(partitions.len());
+    let mut fences = Vec::with_capacity(partitions.len());
+    for (virtual_partition_id, partition) in partitions {
+      virtual_partition_ids.push(virtual_partition_id);
+      segment_index.insert(virtual_partition_id, partition.metadata);
+      fences.push(partition.publication_state.fence);
+    }
+    let metadata = envelope.into_metadata(segment_index, metadata_published_at);
+    let fences = fences.into_iter().collect::<Option<Vec<_>>>();
     let error = match metadata_remaining_budget {
       None => {
         metrics.record_metadata_publication_deadline_exhausted_before_persistence();
@@ -722,17 +747,12 @@ impl FlushContext {
     flush_notifier.notify_waiters();
     let mut blob_uploads = FuturesUnordered::new();
     for object in objects {
-      let publication_budget = object
-        .topics
-        .iter()
-        .map(|topic| topic.max_metadata_publication_lag)
-        .min()
-        .expect("persisted object has at least one topic");
-      let publication_budget = std::time::Duration::try_from(publication_budget).map_err(|_| {
-        WriteError::Internal(anyhow::anyhow!(
-          "metadata publication deadline must not be negative"
-        ))
-      })?;
+      let publication_budget =
+        std::time::Duration::try_from(object.publication_budget).map_err(|_| {
+          WriteError::Internal(anyhow::anyhow!(
+            "metadata publication deadline must not be negative"
+          ))
+        })?;
       let deadline = publication_started_at + publication_budget;
       if Instant::now() >= deadline {
         metrics.record_metadata_publication_deadline_exhausted_before_persistence();
@@ -747,12 +767,7 @@ impl FlushContext {
           lifecycle_hooks
             .before_flush_persist(
               topic.envelope.window.topic.as_str(),
-              &topic
-                .envelope
-                .segment_index
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
+              &topic.partitions.keys().copied().collect::<Vec<_>>(),
             )
             .await;
         }
@@ -765,13 +780,7 @@ impl FlushContext {
         ));
         continue;
       }
-      let blob_key = object
-        .topics
-        .first()
-        .expect("persisted object has at least one topic")
-        .envelope
-        .blob_key
-        .clone();
+      let blob_key = object.blob_key.clone();
       let blob_store = Arc::clone(&self.blob_store);
       let payload = object.payload.clone();
       let blob_upload_permits = Arc::clone(blob_upload_permits);
@@ -805,50 +814,28 @@ impl FlushContext {
         continue;
       }
       let payload_bytes = object.payload.len();
-      let blob_key = object
-        .topics
-        .first()
-        .expect("persisted object has at least one topic")
-        .envelope
-        .blob_key
-        .clone();
-      metrics.record_uploaded_object(payload_bytes, object.oversized_singleton);
-      if object.oversized_singleton {
-        let topic = object
-          .topics
-          .first()
-          .expect("oversized object has one topic section");
-        let virtual_partition_id = topic
-          .envelope
-          .segment_index
-          .keys()
-          .next()
-          .expect("oversized object has one partition");
+      let blob_key = &object.blob_key;
+      metrics.record_uploaded_object(payload_bytes, object.oversized_partition.is_some());
+      if let Some((topic, virtual_partition_id)) = &object.oversized_partition {
         warn_every!(
           15.seconds(),
           "broker persisted oversized single-partition object: topic={}, \
            virtual_partition_id={virtual_partition_id}, payload_bytes={payload_bytes}, \
            max_segment_bytes={}",
-          topic.envelope.window.topic,
+          topic,
           plan.max_segment_bytes
         );
       }
       debug!(
-        "persisted segment object: blob_key={}, payload_bytes={payload_bytes}, topics={}, \
-         shared={}, oversized_singleton={}",
+        "persisted shared segment object: blob_key={}, payload_bytes={payload_bytes}, topics={}, \
+         oversized_singleton={}",
         blob_key.as_str(),
         object.topics.len(),
-        object.shared_blob,
-        object.oversized_singleton
+        object.oversized_partition.is_some()
       );
       for topic in &object.topics {
         if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
-          let virtual_partition_ids = topic
-            .envelope
-            .segment_index
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
+          let virtual_partition_ids = topic.partitions.keys().copied().collect::<Vec<_>>();
           lifecycle_hooks
             .blob_persisted(topic.envelope.window.topic.as_str(), &virtual_partition_ids)
             .await;
@@ -900,23 +887,19 @@ impl PersistedTopic {
       debug_assert_eq!(merged.envelope.window, topic.envelope.window);
       debug_assert_eq!(merged.envelope.snowflake_id, topic.envelope.snowflake_id);
       debug_assert_eq!(merged.envelope.blob_key, topic.envelope.blob_key);
-      debug_assert!(
-        merged
-          .partition_states
-          .values()
-          .all(|state| state.publication_predecessor.is_none())
-      );
-      debug_assert!(
-        topic
-          .partition_states
-          .values()
-          .all(|state| state.publication_predecessor.is_none())
-      );
-      merged
-        .envelope
-        .segment_index
-        .extend(topic.envelope.segment_index);
-      merged.partition_states.extend(topic.partition_states);
+      debug_assert!(merged.partitions.values().all(|partition| {
+        partition
+          .publication_state
+          .publication_predecessor
+          .is_none()
+      }));
+      debug_assert!(topic.partitions.values().all(|partition| {
+        partition
+          .publication_state
+          .publication_predecessor
+          .is_none()
+      }));
+      merged.partitions.extend(topic.partitions);
     }
     Some(merged)
   }
@@ -924,44 +907,37 @@ impl PersistedTopic {
   fn into_partition_topics(self) -> Vec<(Self, Option<FlushPublicationDependency>)> {
     let Self {
       envelope,
-      mut partition_states,
+      partitions,
       max_metadata_publication_lag,
     } = self;
-    let SegmentEnvelope {
-      window,
-      snowflake_id,
-      blob_key,
-      compression,
-      segment_index,
-      created_at,
-    } = envelope;
-    segment_index
+    partitions
       .into_iter()
-      .map(|(virtual_partition_id, batch_metadata)| {
+      .map(|(virtual_partition_id, mut partition)| {
         // Keep the fence and predecessor together while this partition waits. The small one-key
         // topic remains a valid metadata row if its predecessor succeeds, then merge restores
         // all ready partitions before the row is written.
-        let mut partition_state = partition_states
-          .remove(&virtual_partition_id)
-          .expect("segment index has matching partition state");
-        let predecessor = partition_state.publication_predecessor.take();
+        let predecessor = partition.publication_state.publication_predecessor.take();
         (
           Self {
-            envelope: SegmentEnvelope {
-              window: window.clone(),
-              snowflake_id,
-              blob_key: blob_key.clone(),
-              compression: compression.clone(),
-              segment_index: HashMap::from([(virtual_partition_id, batch_metadata)]),
-              created_at,
-            },
-            partition_states: HashMap::from([(virtual_partition_id, partition_state)]),
+            envelope: envelope.clone(),
+            partitions: HashMap::from([(virtual_partition_id, partition)]),
             max_metadata_publication_lag,
           },
           predecessor,
         )
       })
       .collect()
+  }
+}
+
+impl ObjectTopicBuilder {
+  fn insert_partition(
+    &mut self,
+    virtual_partition_id: VirtualPartitionId,
+    partition: PersistedPartition,
+  ) {
+    let replaced = self.partitions.insert(virtual_partition_id, partition);
+    debug_assert!(replaced.is_none());
   }
 }
 

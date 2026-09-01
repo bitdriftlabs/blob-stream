@@ -173,7 +173,6 @@ fn shared_fenced_flushes_keep_topic_chunks_within_transaction_limit() {
   );
 
   assert_eq!(plans.len(), 2);
-  assert!(plans.iter().all(|plan| plan.shared_blob));
   assert!(plans.iter().all(|plan| plan.topics.len() == 2));
   let mut partition_counts = plans
     .iter()
@@ -242,7 +241,6 @@ fn live_feature_flag_updates_apply_to_new_flush_plans() {
   );
 
   assert_eq!(plans.len(), 1);
-  assert!(plans[0].shared_blob);
   assert_eq!(plans[0].max_segment_bytes, 1);
   assert_eq!(plans[0].topics.len(), 2);
 }
@@ -393,7 +391,6 @@ fn shared_time_flush_pulls_forward_buffered_topics() {
   );
 
   assert_eq!(plans.len(), 1);
-  assert!(plans[0].shared_blob);
   assert_eq!(plans[0].topics.len(), 2);
   assert!(plans[0].topics.iter().all(|topic| {
     topic.partitions.len() == 2
@@ -510,7 +507,6 @@ fn shared_time_flush_keeps_independently_byte_triggered_work_local() {
   );
 
   assert_eq!(plans.len(), 2);
-  assert!(plans.iter().all(|plan| !plan.shared_blob));
   assert!(
     plans
       .iter()
@@ -560,7 +556,6 @@ fn shared_time_flushes_order_topics_by_name() {
   );
 
   assert_eq!(plans.len(), 1);
-  assert!(plans[0].shared_blob);
   assert_eq!(
     plans[0]
       .topics
@@ -613,7 +608,6 @@ fn shared_time_flushes_group_all_topics_in_one_plan() {
   );
 
   assert_eq!(plans.len(), 1);
-  assert!(plans[0].shared_blob);
   assert_eq!(plans[0].topics.len(), 5);
 }
 
@@ -664,7 +658,7 @@ fn shared_time_flush_excludes_draining_peer_partitions() {
   );
 
   assert_eq!(plans.len(), 2);
-  let shared_plan = plans.iter().find(|plan| plan.shared_blob).unwrap();
+  let shared_plan = plans.iter().find(|plan| plan.topics.len() == 2).unwrap();
   assert_eq!(shared_plan.topics.len(), 2);
   assert_eq!(
     shared_plan
@@ -676,7 +670,15 @@ fn shared_time_flush_excludes_draining_peer_partitions() {
       .virtual_partition_id,
     0
   );
-  let drain_plan = plans.iter().find(|plan| !plan.shared_blob).unwrap();
+  let drain_plan = plans
+    .iter()
+    .find(|plan| {
+      matches!(
+        plan.topics[0].partitions[0].trigger,
+        FlushTrigger::LeaseDrain
+      )
+    })
+    .unwrap();
   assert_eq!(drain_plan.topics[0].partitions[0].virtual_partition_id, 1);
   assert!(matches!(
     drain_plan.topics[0].partitions[0].trigger,
