@@ -120,7 +120,6 @@ pub struct ProduceOutcomeMetrics {
   not_lease_holder_total: prometheus::IntCounter,
   overloaded_total: prometheus::IntCounter,
   unknown_topic_total: prometheus::IntCounter,
-  latency_seconds: prometheus::Histogram,
 }
 
 impl ProduceOutcomeMetrics {
@@ -135,7 +134,6 @@ impl ProduceOutcomeMetrics {
       not_lease_holder_total: scope.counter("produce_not_lease_holder_total"),
       overloaded_total: scope.counter("produce_overloaded_total"),
       unknown_topic_total: scope.counter("produce_unknown_topic_total"),
-      latency_seconds: scope.histogram("produce_latency_seconds"),
     }
   }
 
@@ -159,9 +157,7 @@ impl ProduceOutcomeMetrics {
     result: &std::result::Result<WriteResponse, WriteError>,
     record_count: u64,
     payload_bytes: u64,
-    elapsed: std::time::Duration,
   ) {
-    self.latency_seconds.observe(elapsed.as_secs_f64());
     match result {
       Ok(_) => {
         self.ok_total.inc();

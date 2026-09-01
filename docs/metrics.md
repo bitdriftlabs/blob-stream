@@ -152,7 +152,6 @@ only when whole-object overfetch and broker resource use remain acceptable.
 | `produce_records_total`, `produce_payload_bytes_total`, `produce_ok_total` | Counters | Records, raw payload bytes, and batches with a durable `OK` outcome. |
 | `produce_rejected_records_total`, `produce_rejected_payload_bytes_total` | Counters | Records and payload bytes in definitively rejected batches. |
 | `produce_not_lease_holder_total`, `produce_overloaded_total`, `produce_unknown_topic_total` | Counters | Rejections classified as ownership/fence loss, overload or internal transient failure, and unknown topic. |
-| `produce_latency_seconds` | Histogram | Write-engine attempt latency before the gRPC response is formed. |
 | `admission_rejections_total` | Counter | Batches rejected by broker admission control before normal write processing. |
 | `sequence_reservations_total`, `sequence_reservation_records_total`, `sequence_reservation_failures_total`, `sequence_reservation_latency_seconds` | Counters, histogram | Durable Hi-Lo range reservations, sequence capacity obtained, reservation failures, and reservation latency. |
 | `flush_partitions_total` | Counter | Partition plans included in flushes. |
