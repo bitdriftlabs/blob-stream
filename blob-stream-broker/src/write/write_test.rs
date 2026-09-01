@@ -740,7 +740,7 @@ async fn foreground_acquire_completed_after_membership_handoff_is_released() -> 
     inner: inner.clone(),
     entered_tx,
     release: Arc::clone(&release),
-    block_next: AtomicBool::new(false),
+    block_next: AtomicBool::new(true),
   });
   let key = ProducerPartitionLeaseKey {
     topic: "telemetry".into(),
@@ -754,17 +754,24 @@ async fn foreground_acquire_completed_after_membership_handoff_is_released() -> 
     &(lease_store.clone() as Arc<dyn ProducerPartitionLeaseStore>),
   )?;
 
-  // Establish maintenance ownership before expiring it. The gate then isolates the foreground
-  // reacquisition from the assignment loop's normal initial lease acquisition.
-  let mut initial_lease = None;
-  for _ in 0 .. 100 {
-    initial_lease = inner.get_lease(&key).await?;
-    if initial_lease.is_some() {
-      break;
-    }
-    tokio::task::yield_now().await;
-  }
-  let initial_lease = initial_lease.expect("initial maintenance lease was not acquired");
+  // The engine's initial maintenance acquisition must complete before the test expires its lease.
+  // Gate that acquisition directly rather than assuming it has run after a fixed number of yields.
+  entered_rx
+    .recv()
+    .await
+    .expect("initial maintenance acquire did not reach its lease-store gate");
+  release.add_permits(1);
+  engine
+    .produce_batch(WriteRequest {
+      topic: "telemetry".into(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![1], 1)],
+    })
+    .await?;
+  let initial_lease = inner
+    .get_lease(&key)
+    .await?
+    .expect("initial maintenance lease was not acquired");
   time_provider.advance(initial_lease.lease_expiration_at - time_provider.now());
   lease_store.block_next.store(true, Ordering::Release);
 
@@ -778,18 +785,10 @@ async fn foreground_acquire_completed_after_membership_handoff_is_released() -> 
       })
       .await
   });
-  let mut entered_acquire_gate = false;
-  for _ in 0 .. 100 {
-    if entered_rx.try_recv().is_ok() {
-      entered_acquire_gate = true;
-      break;
-    }
-    tokio::task::yield_now().await;
-  }
-  assert!(
-    entered_acquire_gate,
-    "foreground acquire did not reach its lease-store gate"
-  );
+  entered_rx
+    .recv()
+    .await
+    .expect("foreground acquire did not reach its lease-store gate");
 
   membership_tx.send(BrokerMembership::new(vec![BrokerNode {
     node_id: "node-b".into(),
