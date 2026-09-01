@@ -99,15 +99,14 @@ the complete inventory and rollout behavior.
 Production brokers write segment objects and consumers range-read them. Brokers also need read
 access when serving the optional raw blob cache. Configure an S3 bucket in the same region as the
 deployment, grant brokers read/write access and consumers read access, and choose an optional prefix
-for isolation. Segment keys use:
+for isolation. Every segment object uses:
 
 ```text
-<prefix>/<topic>/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>
+<prefix>/shared/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>
 ```
 
-Time-triggered objects use `<prefix>/shared/<window_start_unix_seconds>/<snowflake_id>.<zst|bin>`.
 Configure the lifecycle rule for the `shared/` prefix to retain objects for at least the maximum
-retention of every topic eligible to share, plus the metadata TTL buffer.
+retention of every topic in the deployment, plus the metadata TTL buffer.
 
 Configure the S3 lifecycle so objects remain available for at least the topic retention period plus
 the metadata TTL buffer. DynamoDB TTL deletion is asynchronous; expiring S3 objects first can leave
