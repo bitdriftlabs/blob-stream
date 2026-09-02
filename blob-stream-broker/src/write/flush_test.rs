@@ -384,6 +384,58 @@ async fn object_build_resnaps_time_after_sonyflake_sequence_overflow() -> Result
   Ok(())
 }
 
+#[test]
+fn target_fill_boundaries_preserve_the_minimum_contiguous_object_count() {
+  let target_fill_groups = |partition_bytes: &[u64], max_segment_bytes| {
+    super::target_fill_object_groups(
+      partition_bytes
+        .iter()
+        .copied()
+        .map(|partition_bytes| (partition_bytes, partition_bytes))
+        .collect(),
+      max_segment_bytes,
+    )
+    .into_iter()
+    .map(|group| {
+      std::iter::once(group.first)
+        .chain(group.remaining)
+        .collect::<Vec<_>>()
+    })
+    .collect::<Vec<_>>()
+  };
+
+  assert!(target_fill_groups(&[], 100).is_empty());
+  assert_eq!(
+    target_fill_groups(&[50, 50, 50], 100),
+    vec![vec![50, 50], vec![50]]
+  );
+
+  // This sequence was previously split into four objects by an early-close decision. The
+  // suffix feasibility check retains the cap-minimum layout: [41, 56], [46], [61].
+  assert_eq!(
+    target_fill_groups(&[41, 56, 46, 61], 100),
+    vec![vec![41, 56], vec![46], vec![61]]
+  );
+  assert_eq!(
+    super::minimum_suffix_object_counts(&[41, 56, 46, 61], 100),
+    vec![3, 3, 2, 1, 0]
+  );
+
+  // An earlier boundary remains useful when the suffix can still fit in its minimum three
+  // objects. This retains four objects overall rather than falling back to next-fit packing.
+  assert_eq!(
+    target_fill_groups(&[3, 7, 1, 10, 1], 10),
+    vec![vec![3], vec![7, 1], vec![10], vec![1]]
+  );
+
+  // An oversized partition is indivisible, but it must not cause a later bounded suffix to
+  // inherit its conceptual cap units. The suffix remains [40, 60], [40].
+  assert_eq!(
+    target_fill_groups(&[120, 40, 60, 40], 100),
+    vec![vec![120], vec![40, 60], vec![40]]
+  );
+}
+
 #[tokio::test]
 async fn object_build_balances_uneven_partitions_preserving_source_order() -> Result<()> {
   let now = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
