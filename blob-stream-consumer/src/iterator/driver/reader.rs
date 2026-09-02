@@ -38,6 +38,11 @@ impl ConsumerDriver {
             committed_at_ms: recovered_cursor.committed_ts_ms,
           },
         );
+        shared_state
+          .active_partitions
+          .entry(*partition_id)
+          .or_default()
+          .delivery_gap_baseline = Some(recovered_cursor.committed_cursor.seq_end);
       }
     }
 

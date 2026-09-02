@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 pub(super) struct ConsumerIteratorMetrics {
   pub(super) batches_delivered: IntCounter,
   pub(super) records_delivered: IntCounter,
+  pub(super) delivery_gap_events: IntCounter,
   pub(super) retries: IntCounter,
   pub(super) failures: IntCounter,
   pub(super) revocations: IntCounter,
@@ -61,6 +62,7 @@ impl ConsumerIteratorMetrics {
     Self {
       batches_delivered: scope.counter("batches_delivered"),
       records_delivered: scope.counter("records_delivered"),
+      delivery_gap_events: scope.counter("delivery_gap_events"),
       retries: scope.counter("retries"),
       failures: scope.counter("failures"),
       revocations: scope.counter("revocations"),
@@ -123,6 +125,7 @@ pub struct PendingCommit {
 pub struct ActivePartitionState {
   pub(crate) pending_commit: Option<PendingCommit>,
   pub(crate) delivered_source_ranges: Vec<DeliveredSourceRange>,
+  pub(crate) delivery_gap_baseline: Option<u64>,
 }
 
 //

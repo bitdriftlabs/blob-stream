@@ -130,9 +130,10 @@ extends recovery after an ungraceful broker loss. During graceful membership cha
 the broker first removes moved partitions from local write admission, drains already accepted work
 while renewing the lease before its existing expiry, and then releases moved leases explicitly.
 Reconciliation also drains and releases any locally tracked lease outside the current plan, covering
-state left by an older inline-acquisition path rather than waiting for its TTL to expire. Lease
-acquisition logs record whether acquisition was requested inline by `ProduceBatch` or by assignment
-maintenance, plus the assignment-set generation that authorized it.
+an asynchronous acquisition that succeeded after the membership update withdrew its local write
+authorization, rather than waiting for its TTL to expire. Lease acquisition logs record whether
+acquisition was requested inline by `ProduceBatch` or by assignment maintenance, plus the
+assignment-set generation that authorized it.
 
 Broker admin state reports its configured writer ID, local membership as `{node_id, address}`,
 and one ownership row per local writer-scoped virtual partition. Each row distinguishes the
@@ -193,9 +194,12 @@ use `grpc:request_timeouts_total` for those ambiguous outcomes.
 The broker coalesces all accepted producer batches for one virtual partition in a flush plan into
 one stored batch and one metadata index entry. The stored sequence range spans the contiguous
 accepted ranges, and records retain broker acceptance order. Consumers use that range to skip
-data already covered by a cursor, then expose records in range order. A crash or ownership
-transfer can leave unused values from a reserved block, creating gaps, but a new holder reserves
-only above the durable high-water mark and therefore cannot reuse a successfully reserved value.
+data already covered by a cursor, then expose records in range order. A graceful membership
+handoff or orderly shutdown drains accepted work before atomically releasing its fenced lease and
+rolling the durable high-water mark back to the last assigned sequence. Its successor therefore
+continues without a reservation gap. An ungraceful crash, lease expiry, lost fence, or unknown
+release outcome retains the durable high-water mark; any unused tail is then intentionally not
+reused and can create a gap.
 
 The broker serializes lease/refill/allocation transitions for each virtual partition within one live
 broker. Later accepted batches buffer in a successor flush epoch while an earlier epoch persists.
@@ -206,6 +210,15 @@ for each partition in epoch order, so a later sequence range cannot become consu
 During a graceful membership handoff or orderly shutdown, the broker stops accepting new batches for
 the partition, drains its already accepted work, and only then voluntarily releases the producer
 lease.
+
+Consumer iterator metrics report application-visible discontinuities with `delivery_gap_events`.
+The baseline comes from the partition's recovered durable committed cursor and advances only when
+`next()` returns a record. A restarted consumer or a new owner after a rebalance recovers that
+cursor and therefore reports a gap before its first post-recovery delivery. "Fresh" means this
+consumer group has no durable committed cursor for the partition, not merely that this iterator was
+newly assigned the partition. A seek resets the baseline to the requested offset, so intentionally
+skipped records before a forward seek and replay after a backward seek do not produce false gap
+reports. A truly fresh group partition has no baseline until its first delivered record.
 
 The optional `fenced_metadata_writes` mode supplies a durable cross-process publication fence. Each
 write engine creates a unique process session ID; acquisition by a new or expired session increments

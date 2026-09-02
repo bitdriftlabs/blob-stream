@@ -4,6 +4,7 @@ use crate::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
+  LeaseReleaseSequenceProgress,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
   SequenceReservationOutcome,
@@ -168,9 +169,9 @@ async fn fences_stale_broker_sessions() {
   let release = store
     .release_lease(
       &key,
-      "broker-a",
-      "session-1",
+      &first.fence,
       offset_datetime_from_unix_millis(1_150),
+      LeaseReleaseSequenceProgress::Preserve,
     )
     .await
     .expect("stale release");
@@ -329,7 +330,7 @@ async fn releases_lease_for_current_holder() {
   let store = InMemoryProducerPartitionLeaseStore::new();
   let key = lease_key();
 
-  store
+  let lease = store
     .acquire_lease(
       key.clone(),
       "broker-a".to_string(),
@@ -339,6 +340,9 @@ async fn releases_lease_for_current_holder() {
     )
     .await
     .expect("acquire lease");
+  let LeaseAcquireOutcome::Acquired(lease) = lease else {
+    panic!("expected acquired lease");
+  };
 
   let reservation = store
     .reserve_sequences(
@@ -358,9 +362,9 @@ async fn releases_lease_for_current_holder() {
   let outcome = store
     .release_lease(
       &key,
-      "broker-a",
-      "session-a",
+      &lease.fence,
       offset_datetime_from_unix_millis(1_000),
+      LeaseReleaseSequenceProgress::Preserve,
     )
     .await
     .expect("release lease");
@@ -404,6 +408,241 @@ async fn releases_lease_for_current_holder() {
   };
   assert_eq!(reservation.range.start, 5);
   assert_eq!(reservation.range.end, 6);
+}
+
+#[tokio::test]
+async fn release_reclaims_unused_sequence_reservation_tail() {
+  let store = InMemoryProducerPartitionLeaseStore::new();
+  let key = lease_key();
+
+  let acquired = store
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-a".to_string(),
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+      Some(10),
+    )
+    .await
+    .expect("acquire and reserve");
+  let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = acquired else {
+    panic!("expected acquired lease");
+  };
+  assert_eq!(reservation, Some(SeqRange { start: 0, end: 9 }));
+
+  let outcome = store
+    .release_lease(
+      &key,
+      &lease.fence,
+      offset_datetime_from_unix_millis(1_000),
+      LeaseReleaseSequenceProgress::Set(Some(2)),
+    )
+    .await
+    .expect("release lease with used progress");
+  assert_eq!(outcome, LeaseReleaseOutcome::Released);
+
+  let acquired = store
+    .acquire_lease_and_reserve_sequences(
+      key,
+      "broker-b".to_string(),
+      "session-b".to_string(),
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+      Some(2),
+    )
+    .await
+    .expect("successor acquire and reserve");
+  let LeaseAcquireAndReserveOutcome::Acquired { reservation, .. } = acquired else {
+    panic!("expected successor acquisition");
+  };
+  assert_eq!(reservation, Some(SeqRange { start: 3, end: 4 }));
+}
+
+#[tokio::test]
+async fn release_reclaims_an_entirely_unused_initial_reservation() {
+  let store = InMemoryProducerPartitionLeaseStore::new();
+  let key = lease_key();
+
+  let acquired = store
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-a".to_string(),
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+      Some(10),
+    )
+    .await
+    .expect("acquire and reserve");
+  let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = acquired else {
+    panic!("expected acquired lease");
+  };
+  assert_eq!(reservation, Some(SeqRange { start: 0, end: 9 }));
+
+  let outcome = store
+    .release_lease(
+      &key,
+      &lease.fence,
+      offset_datetime_from_unix_millis(1_000),
+      LeaseReleaseSequenceProgress::Set(None),
+    )
+    .await
+    .expect("release lease with no used sequences");
+  assert_eq!(outcome, LeaseReleaseOutcome::Released);
+
+  let acquired = store
+    .acquire_lease_and_reserve_sequences(
+      key,
+      "broker-b".to_string(),
+      "session-b".to_string(),
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+      Some(2),
+    )
+    .await
+    .expect("successor acquire and reserve");
+  let LeaseAcquireAndReserveOutcome::Acquired { reservation, .. } = acquired else {
+    panic!("expected successor acquisition");
+  };
+  assert_eq!(reservation, Some(SeqRange { start: 0, end: 1 }));
+}
+
+#[tokio::test]
+async fn later_graceful_release_reclaims_its_unused_reservation_tail() {
+  let store = InMemoryProducerPartitionLeaseStore::new();
+  let key = lease_key();
+
+  let LeaseAcquireAndReserveOutcome::Acquired { lease, .. } = store
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-a".to_string(),
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+      Some(10),
+    )
+    .await
+    .expect("acquire first lease")
+  else {
+    panic!("expected first lease acquisition");
+  };
+  store
+    .release_lease(
+      &key,
+      &lease.fence,
+      offset_datetime_from_unix_millis(1_000),
+      LeaseReleaseSequenceProgress::Set(Some(2)),
+    )
+    .await
+    .expect("release first lease");
+
+  let LeaseAcquireAndReserveOutcome::Acquired {
+    lease,
+    reservation: Some(reservation),
+  } = store
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "broker-b".to_string(),
+      "session-b".to_string(),
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+      Some(10),
+    )
+    .await
+    .expect("acquire second lease")
+  else {
+    panic!("expected second lease acquisition and reservation");
+  };
+  assert_eq!(reservation, SeqRange { start: 3, end: 12 });
+  store
+    .release_lease(
+      &key,
+      &lease.fence,
+      offset_datetime_from_unix_millis(1_000),
+      LeaseReleaseSequenceProgress::Set(Some(4)),
+    )
+    .await
+    .expect("release second lease");
+
+  let LeaseAcquireAndReserveOutcome::Acquired {
+    reservation: Some(reservation),
+    ..
+  } = store
+    .acquire_lease_and_reserve_sequences(
+      key,
+      "broker-c".to_string(),
+      "session-c".to_string(),
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+      Some(2),
+    )
+    .await
+    .expect("acquire third lease")
+  else {
+    panic!("expected third lease acquisition and reservation");
+  };
+  assert_eq!(reservation, SeqRange { start: 5, end: 6 });
+}
+
+#[tokio::test]
+async fn stale_release_cannot_lower_a_successor_reservation() {
+  let store = InMemoryProducerPartitionLeaseStore::new();
+  let key = lease_key();
+  let LeaseAcquireAndReserveOutcome::Acquired {
+    lease: stale_lease, ..
+  } = store
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-a".to_string(),
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+      Some(10),
+    )
+    .await
+    .expect("acquire first lease")
+  else {
+    panic!("expected first lease acquisition");
+  };
+  let LeaseAcquireAndReserveOutcome::Acquired {
+    reservation: Some(reservation),
+    ..
+  } = store
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "broker-b".to_string(),
+      "session-b".to_string(),
+      offset_datetime_from_unix_millis(1_100),
+      Duration::milliseconds(100),
+      Some(2),
+    )
+    .await
+    .expect("acquire successor lease")
+  else {
+    panic!("expected successor lease acquisition and reservation");
+  };
+  assert_eq!(reservation, SeqRange { start: 10, end: 11 });
+
+  let release = store
+    .release_lease(
+      &key,
+      &stale_lease.fence,
+      offset_datetime_from_unix_millis(1_100),
+      LeaseReleaseSequenceProgress::Set(Some(2)),
+    )
+    .await
+    .expect("stale release");
+  assert!(matches!(release, LeaseReleaseOutcome::HeldByOther(_)));
+  assert_eq!(
+    store
+      .get_lease(&key)
+      .await
+      .expect("lookup successor lease")
+      .expect("successor lease remains")
+      .max_allocated_seq,
+    Some(11)
+  );
 }
 
 #[tokio::test]

@@ -14,6 +14,7 @@ use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, Nex
 use blob_stream_consumer::{ConsumerReadConfig, DEFAULT_MAX_METADATA_PUBLICATION_LAG};
 use blob_stream_metadata_store::{
   LeaseReleaseOutcome,
+  LeaseReleaseSequenceProgress,
   MetadataReadConsistency,
   MetadataStore,
   MetadataWriteError,
@@ -105,9 +106,9 @@ impl MetadataStore for FenceInvalidatingMetadataStore {
       .lease_store
       .release_lease(
         &fence.key,
-        &fence.fence.holder_id,
-        &fence.fence.lease_session_id,
+        &fence.fence,
         offset_datetime_from_unix_millis(now_ts_ms),
+        LeaseReleaseSequenceProgress::Preserve,
       )
       .await?;
     if release != LeaseReleaseOutcome::Released {
