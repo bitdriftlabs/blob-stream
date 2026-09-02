@@ -35,7 +35,7 @@ use log::{debug, info, trace};
 use protobuf::Chars;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 use time::OffsetDateTime;
 use time::ext::NumericalDuration;
 use tokio::sync::watch;
@@ -669,16 +669,29 @@ impl WriteEngineImpl {
       topic: topic.clone(),
       virtual_partition_id,
     };
-    let next_heartbeat_at = {
+    let drain_started_at = Instant::now();
+    let (
+      next_heartbeat_at,
+      initial_buffered_batches,
+      initial_buffered_bytes,
+      initial_outstanding_flushes,
+      initial_allocation_in_flight,
+    ) = {
       let mut state = state.lock();
       let Some(partition_state) = state.partition_state_mut_if_present(topic, virtual_partition_id)
       else {
         return;
       };
       partition_state.draining = true;
-      partition_state.lease_expiration_at.map_or_else(
-        || time_provider.now(),
-        |expiration| expiration - heartbeat_interval,
+      (
+        partition_state.lease_expiration_at.map_or_else(
+          || time_provider.now(),
+          |expiration| expiration - heartbeat_interval,
+        ),
+        partition_state.buffer.batches.len(),
+        partition_state.buffer.buffered_bytes,
+        partition_state.outstanding_flushes,
+        partition_state.allocation_in_flight,
       )
     };
     metrics.lease_drain_starts_total.inc();
@@ -709,8 +722,13 @@ impl WriteEngineImpl {
     metrics.lease_drain_completions_total.inc();
     info!(
       "broker partition drain complete: release_reason={}, holder_id={holder_id}, topic={topic}, \
-       virtual_partition_id={virtual_partition_id}",
-      release_reason.as_str()
+       virtual_partition_id={virtual_partition_id}, drain_duration_ms={}, \
+       initial_buffered_batches={initial_buffered_batches}, \
+       initial_buffered_bytes={initial_buffered_bytes}, \
+       initial_outstanding_flushes={initial_outstanding_flushes}, \
+       initial_allocation_in_flight={initial_allocation_in_flight}",
+      release_reason.as_str(),
+      drain_started_at.elapsed().as_millis(),
     );
     if let Some(lifecycle_hooks) = lifecycle_hooks {
       lifecycle_hooks

@@ -230,21 +230,21 @@ invariant.
 
 1. A producer buffers records independently for each `(topic, virtual_partition_id)`.
 2. A producer seals all currently buffered partition batches on the `flush_max_delay_ms` cadence or
-  when a batch reaches its record-count or payload-byte threshold. It samples live batch limits
-  when admitting a `produce` call and samples a live flush delay only when scheduling its next
-  cadence interval; existing buffers and an already scheduled interval retain their prior values.
-  New records enter a subsequent generation. The producer maintains equally sized dispatch-task
-  and request permit pools. It acquires both permits before removing one byte-bounded broker group
-  from sealed state; unadmitted work remains sealed until both are available. The dispatch-task
-  permit remains held through terminal waiter notification, bounding retained group work. The
-  initial RPC and each retry attempt hold a request permit only while calling the broker, releasing
-  it before response handling or backoff. Retryable logical batches in one admitted group run as
-  concurrent futures within that bounded dispatch task, and each independently acquires request
-  capacity while sharing the original retry deadline. Membership updates refresh the cached route
-  map but do not force an early seal. This does not preserve producer submission order, including
-  within one virtual partition. The broker starts all logical batches in a grouped request
-  concurrently and returns their results in request order. It assigns sequence ranges in the order
-  that it accepts requests and preserves that durable order.
+   when a batch reaches its record-count or payload-byte threshold. It samples live batch limits
+   when admitting a `produce` call and samples a live flush delay only when scheduling its next
+   cadence interval; existing buffers and an already scheduled interval retain their prior values.
+   New records enter a subsequent generation. The producer maintains equally sized dispatch-task
+   and request permit pools. It acquires both permits before removing one byte-bounded broker group
+   from sealed state; unadmitted work remains sealed until both are available. The dispatch-task
+   permit remains held through terminal waiter notification, bounding retained group work. The
+   initial RPC and each retry attempt hold a request permit only while calling the broker, releasing
+   it before response handling or backoff. Retryable logical batches in one admitted group run as
+   concurrent futures within that bounded dispatch task, and each independently acquires request
+   capacity while sharing the original retry deadline. Membership updates refresh the cached route
+   map but do not force an early seal. This does not preserve producer submission order, including
+   within one virtual partition. The broker starts all logical batches in a grouped request
+   concurrently and returns their results in request order. It assigns sequence ranges in the order
+   that it accepts requests and preserves that durable order.
 3. `ProduceBatches` returns one ordered result per submitted partition batch. The producer
    resolves successful entries independently and retries only entries that were rejected or whose
    request outcome is ambiguous. Each `ProduceBatches` message has a 16 MiB decoded protobuf cap;
@@ -264,22 +264,25 @@ invariant.
    larger blobs and fewer S3 PUTs. Byte-threshold flushes remain local unless a time-due shared
    flush pulls them forward, and lease-drain flushes remain partition-local. `max_segment_bytes`
    separately caps each serialized compressed object; it defaults to 64 MiB and can be changed live
-   with `blob_stream_broker_max_segment_bytes`. A compressed partition batch that cannot be split
-   is emitted alone when it exceeds that cap. A partition with a durable plan in progress continues
-   buffering its next epoch until its normal byte or delay trigger. Successive epochs can then build
-   and upload blobs concurrently, while their metadata publication remains ordered. A single bounded
-   flush scheduler wakes for eligible writes, timer ticks, and durable-plan completions. It runs at
-   most four durable flush plans concurrently; `write:active_flush_plans` reports its current
-   occupancy.
+   with `blob_stream_broker_max_segment_bytes`. After each partition batch is serialized and
+   compressed, the broker chooses deterministic contiguous object boundaries that target an equal
+   share of the remaining bytes while preserving scheduler source order. A compressed partition
+   batch that cannot be split is emitted alone when it exceeds that cap. A partition with a durable
+   plan in progress continues buffering its next epoch until its normal byte or delay trigger.
+   Successive epochs can then build and upload blobs concurrently, while their metadata publication
+   remains ordered. A single bounded flush scheduler wakes for eligible writes, timer ticks, and
+   durable-plan completions. It runs at most four durable flush plans concurrently;
+  `write:active_flush_plans` reports its current occupancy.
 6. A flush coalesces each virtual partition's accepted batches into one `StoredRecordBatch`,
-  compresses each serialized partition batch independently, and concatenates the stored bytes into
-  bounded segment objects. One time-triggered object can contain contiguous sections for several
-  topics. The broker uploads each object once, then writes one ordinary topic-local metadata row
-  for every section. A successful row acknowledges only its own topic's partitions; a failed row
-  remains retryable and can produce an at-least-once duplicate. With fenced metadata writes
-  enabled, each row is a transaction conditioned on the snapshot lease fences for that row's topic.
-  Plans may overlap for the same or different virtual partitions. Blob uploads may proceed in
-  parallel, but each virtual partition publishes plan metadata in sequence order.
+   compresses each serialized partition batch independently, and concatenates the stored bytes into
+   bounded segment objects. One time-triggered object can contain contiguous sections for several
+   topics, and a topic can continue in a subsequent object. The broker uploads each object once,
+   then writes one ordinary topic-local metadata row for every section. A successful row
+   acknowledges only its own topic's partitions; a failed row remains retryable and can produce an
+   at-least-once duplicate. With fenced metadata writes enabled, each row is a transaction
+   conditioned on the snapshot lease fences for that row's topic. Plans may overlap for the same or
+   different virtual partitions. Blob uploads may proceed in parallel, but each virtual partition
+   publishes plan metadata in sequence order.
 7. Only after both blob upload and metadata write succeed does the broker complete the waiting
    write and return `OK`. A producer acknowledgement therefore represents durable segment
    metadata, not merely in-memory buffering.
