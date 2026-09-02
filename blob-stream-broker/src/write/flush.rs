@@ -198,6 +198,12 @@ impl ObjectBuilder {
       > max_segment_bytes
   }
 
+  fn cap_units(&self, max_segment_bytes: u64) -> u64 {
+    u64::try_from(self.payload.len())
+      .unwrap_or(u64::MAX)
+      .div_ceil(max_segment_bytes)
+  }
+
   fn push(mut self, encoded: EncodedPartition) -> Self {
     let (topic_builder, virtual_partition_id, partition) =
       Self::build_partition(&mut self.payload, encoded);
@@ -512,8 +518,7 @@ impl FlushContext {
     metrics: &WriteMetrics,
   ) -> Result<(Vec<PersistedObject>, Vec<FlushPartitionResult>)> {
     let topic_plans = std::mem::take(&mut plan.topics);
-    let mut current: Option<ObjectBuilder> = None;
-    let mut objects = Vec::new();
+    let mut encoded_partitions = Vec::new();
     let mut failed_partitions = Vec::new();
     for mut topic_plan in topic_plans {
       for partition in std::mem::take(&mut topic_plan.partitions) {
@@ -531,20 +536,62 @@ impl FlushContext {
           });
           continue;
         }
-        let encoded = self.encode_partition(&topic_plan, partition)?;
-        current = Some(match current {
-          Some(current) if current.would_exceed(&encoded, plan.max_segment_bytes) => {
-            metrics.flush_max_segment_size_splits_total.inc();
-            objects.push(current.finish(self, plan.max_segment_bytes).await?);
-            ObjectBuilder::new(encoded)
-          },
-          Some(current) => current.push(encoded),
-          None => ObjectBuilder::new(encoded),
-        });
+        encoded_partitions.push(self.encode_partition(&topic_plan, partition)?);
       }
     }
+
+    // Partition sections remain in scheduler order, but their encoded sizes determine where to
+    // close objects. Targeting an equal share of the remaining bytes avoids a full first object
+    // followed by a much smaller tail without scattering one topic across arbitrary bins.
+    let mut remaining_bytes = encoded_partitions.iter().fold(0_u64, |total, partition| {
+      total.saturating_add(u64::try_from(partition.payload.len()).unwrap_or(u64::MAX))
+    });
+    let encoded_partition_count = u64::try_from(encoded_partitions.len()).unwrap_or(u64::MAX);
+    let mut remaining_object_count = remaining_bytes.div_ceil(plan.max_segment_bytes);
+    let mut builders = Vec::new();
+    let mut current: Option<ObjectBuilder> = None;
+    for (index, encoded) in encoded_partitions.into_iter().enumerate() {
+      let encoded_bytes = u64::try_from(encoded.payload.len()).unwrap_or(u64::MAX);
+      let partitions_after = encoded_partition_count
+        .saturating_sub(u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1));
+      current = Some(match current {
+        Some(current) if current.would_exceed(&encoded, plan.max_segment_bytes) => {
+          let cap_units = current.cap_units(plan.max_segment_bytes);
+          builders.push(current);
+          remaining_object_count = remaining_object_count.saturating_sub(cap_units);
+          ObjectBuilder::new(encoded)
+        },
+        Some(current) => {
+          let current_bytes = u64::try_from(current.payload.len()).unwrap_or(u64::MAX);
+          let candidate_bytes = current_bytes.saturating_add(encoded_bytes);
+          let target_bytes = current_bytes
+            .saturating_add(remaining_bytes)
+            .div_ceil(remaining_object_count.max(1));
+          let can_close = remaining_object_count > 1
+            && partitions_after >= remaining_object_count.saturating_sub(1);
+          if can_close
+            && current_bytes.abs_diff(target_bytes) < candidate_bytes.abs_diff(target_bytes)
+          {
+            builders.push(current);
+            remaining_object_count = remaining_object_count.saturating_sub(1);
+            ObjectBuilder::new(encoded)
+          } else {
+            current.push(encoded)
+          }
+        },
+        None => ObjectBuilder::new(encoded),
+      });
+      remaining_bytes = remaining_bytes.saturating_sub(encoded_bytes);
+    }
     if let Some(current) = current {
-      objects.push(current.finish(self, plan.max_segment_bytes).await?);
+      builders.push(current);
+    }
+    let mut objects = Vec::with_capacity(builders.len());
+    for (index, builder) in builders.into_iter().enumerate() {
+      if index > 0 {
+        metrics.flush_max_segment_size_splits_total.inc();
+      }
+      objects.push(builder.finish(self, plan.max_segment_bytes).await?);
     }
     Ok((objects, failed_partitions))
   }

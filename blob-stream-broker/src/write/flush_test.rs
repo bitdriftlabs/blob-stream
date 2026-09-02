@@ -385,6 +385,130 @@ async fn object_build_resnaps_time_after_sonyflake_sequence_overflow() -> Result
 }
 
 #[tokio::test]
+async fn object_build_balances_uneven_partitions_preserving_source_order() -> Result<()> {
+  let now = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
+  let mut config = WriteConfig::with_defaults();
+  config.compression = blob_stream_types::Compression::none();
+  let context = FlushContext::new(
+    config,
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    SnowflakeGenerator::with_machine_id(1)?,
+    Arc::new(ManualTimeProvider::new(now)),
+    None,
+  );
+  let mut telemetry = topic_flush_plan("telemetry".into(), 0, &[0; 100]);
+  telemetry.partitions = vec![flush_partition(0, &[0; 100]), flush_partition(1, &[1; 100])];
+  let mut diagnostics = topic_flush_plan("diagnostics".into(), 0, &[2; 10]);
+  diagnostics.partitions = vec![flush_partition(2, &[2; 10]), flush_partition(3, &[3; 10])];
+  let mut plan = FlushPlan {
+    topics: vec![telemetry, diagnostics],
+    max_segment_bytes: 220,
+    publication_completions: Vec::new(),
+  };
+  let collector = Collector::default();
+  let metrics = WriteMetrics::new(&collector.scope("flush_test"));
+
+  let (objects, failures) = context.build_objects(&mut plan, &metrics).await?;
+
+  assert!(failures.is_empty());
+  assert_eq!(objects.len(), 2);
+  assert!(objects.iter().all(|object| object.payload.len() <= 220));
+  let partition_ids_in_serialized_order = |object: &super::PersistedObject| {
+    let mut partitions = object
+      .topics
+      .iter()
+      .flat_map(|topic| {
+        topic
+          .partitions
+          .iter()
+          .map(|(virtual_partition_id, partition)| {
+            (
+              partition.metadata[0].byte_range.start,
+              topic.envelope.window.topic.clone(),
+              *virtual_partition_id,
+            )
+          })
+      })
+      .collect::<Vec<_>>();
+    partitions.sort_unstable();
+    partitions
+      .into_iter()
+      .map(|(_, topic, virtual_partition_id)| (topic, virtual_partition_id))
+      .collect::<Vec<_>>()
+  };
+  assert_eq!(
+    partition_ids_in_serialized_order(&objects[0]),
+    vec![("telemetry".to_string(), 0)]
+  );
+  assert_eq!(
+    partition_ids_in_serialized_order(&objects[1]),
+    vec![
+      ("telemetry".to_string(), 1),
+      ("diagnostics".to_string(), 2),
+      ("diagnostics".to_string(), 3),
+    ]
+  );
+  assert!(
+    objects[0].payload.len() >= 100,
+    "first object must contain the initial partition"
+  );
+  assert!(
+    objects[1].payload.len() > objects[0].payload.len(),
+    "target-fill must avoid the sequential full-object-plus-tiny-tail layout"
+  );
+  Helper::new_with_collector(collector).assert_counter_eq(
+    1,
+    "flush_test:write:flush_max_segment_size_splits_total",
+    &labels!(),
+  );
+  Ok(())
+}
+
+#[tokio::test]
+async fn oversized_partition_does_not_oversplit_later_partitions() -> Result<()> {
+  let now = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
+  let mut config = WriteConfig::with_defaults();
+  config.compression = blob_stream_types::Compression::none();
+  let context = FlushContext::new(
+    config,
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    SnowflakeGenerator::with_machine_id(1)?,
+    Arc::new(ManualTimeProvider::new(now)),
+    None,
+  );
+  let mut topic = topic_flush_plan("telemetry".into(), 0, &[0; 300]);
+  topic.partitions = vec![
+    flush_partition(0, &[0; 300]),
+    flush_partition(1, &[1; 20]),
+    flush_partition(2, &[2; 20]),
+  ];
+  let mut plan = FlushPlan {
+    topics: vec![topic],
+    max_segment_bytes: 100,
+    publication_completions: Vec::new(),
+  };
+  let collector = Collector::default();
+  let metrics = WriteMetrics::new(&collector.scope("flush_test"));
+
+  let (objects, failures) = context.build_objects(&mut plan, &metrics).await?;
+
+  assert!(failures.is_empty());
+  assert_eq!(objects.len(), 2);
+  assert!(objects[0].payload.len() > 100);
+  assert!(objects[1].payload.len() <= 100);
+  assert_eq!(objects[0].topics[0].partitions.len(), 1);
+  assert_eq!(objects[1].topics[0].partitions.len(), 2);
+  Helper::new_with_collector(collector).assert_counter_eq(
+    1,
+    "flush_test:write:flush_max_segment_size_splits_total",
+    &labels!(),
+  );
+  Ok(())
+}
+
+#[tokio::test]
 async fn every_object_uses_a_shared_blob_key() -> Result<()> {
   let now = OffsetDateTime::from_unix_timestamp(1_700_000_000)?;
   let context = FlushContext::new(
