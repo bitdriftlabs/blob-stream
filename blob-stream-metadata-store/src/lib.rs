@@ -297,19 +297,6 @@ pub enum LeaseReleaseOutcome {
 }
 
 //
-// LeaseReleaseSequenceProgress
-//
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/// Sequence high-watermark update applied atomically with a fenced lease release.
-pub enum LeaseReleaseSequenceProgress {
-  /// Leave the durable high watermark unchanged.
-  Preserve,
-  /// Replace the durable high watermark with the last sequence used by the releasing broker.
-  Set(Option<u64>),
-}
-
-//
 // ProducerPartitionLeaseStore
 //
 
@@ -368,9 +355,9 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
   async fn release_lease(
     &self,
     key: &ProducerPartitionLeaseKey,
-    fence: &ProducerLeaseFence,
+    holder_id: &str,
+    lease_session_id: &str,
     now: OffsetDateTime,
-    sequence_progress: LeaseReleaseSequenceProgress,
   ) -> Result<LeaseReleaseOutcome>;
 }
 

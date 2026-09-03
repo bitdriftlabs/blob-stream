@@ -26,11 +26,9 @@ use blob_stream_metadata_store::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
-  LeaseReleaseSequenceProgress,
   MetadataReadConsistency,
   MetadataStore,
   MetadataWriteResult,
-  ProducerLeaseFence,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
   SegmentMetadata,
@@ -1052,9 +1050,9 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
   async fn release_lease(
     &self,
     key: &ProducerPartitionLeaseKey,
-    fence: &ProducerLeaseFence,
+    holder_id: &str,
+    lease_session_id: &str,
     now: OffsetDateTime,
-    sequence_progress: LeaseReleaseSequenceProgress,
   ) -> Result<LeaseReleaseOutcome> {
     let effects = self
       .controller
@@ -1084,7 +1082,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .release_lease(key, fence, now, sequence_progress)
+      .release_lease(key, holder_id, lease_session_id, now)
       .await;
     self
       .controller

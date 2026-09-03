@@ -74,9 +74,8 @@ pub(in crate::consumer) type RecoveryMetadataCacheKey = (VirtualPartitionId, i64
 //   concurrent seq assignment.
 //
 // - Monotonic sequence assignment: The sequence allocator (Hi-Lo reservation) hands out strictly
-//   increasing seq values per virtual partition. Drained graceful releases reclaim unused
-//   reservation tails; ungraceful loss may retain a tail as a gap. Overlapping/reused seq ranges
-//   are not allowed.
+//   increasing seq values per virtual partition. Reservations may introduce gaps, but
+//   overlapping/reused seq ranges are not allowed.
 //
 // - Retry semantics preserve monotonic progress: If routing is stale or lease ownership changes,
 //   producers retry to the current lease holder. The accepted batch still receives seq ranges from

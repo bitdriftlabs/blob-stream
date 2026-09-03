@@ -5,7 +5,6 @@ use crate::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
-  LeaseReleaseSequenceProgress,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
   SequenceReservationOutcome,
@@ -355,7 +354,7 @@ async fn releases_lease_for_current_holder() -> Result<()> {
   let store = default_lease_store(client.clone(), table_name.clone());
   let key = lease_key();
 
-  let lease = store
+  store
     .acquire_lease(
       key.clone(),
       "broker-a".to_string(),
@@ -364,9 +363,6 @@ async fn releases_lease_for_current_holder() -> Result<()> {
       TimeDuration::milliseconds(100),
     )
     .await?;
-  let LeaseAcquireOutcome::Acquired(lease) = lease else {
-    panic!("expected acquired lease");
-  };
 
   let reservation = store
     .reserve_sequences(
@@ -385,9 +381,9 @@ async fn releases_lease_for_current_holder() -> Result<()> {
   let release = store
     .release_lease(
       &key,
-      &lease.fence,
+      "broker-a",
+      "session-a",
       offset_datetime_from_unix_millis(1_000),
-      LeaseReleaseSequenceProgress::Preserve,
     )
     .await?;
   assert!(matches!(release, LeaseReleaseOutcome::Released));
@@ -427,246 +423,6 @@ async fn releases_lease_for_current_holder() -> Result<()> {
   };
   assert_eq!(reservation.range.start, 5);
   assert_eq!(reservation.range.end, 6);
-
-  client.delete_table().table_name(table_name).send().await?;
-  Ok(())
-}
-
-#[tokio::test]
-async fn expired_release_preserves_sequence_reservation() -> Result<()> {
-  let client = dynamo_client().await?;
-  let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
-  create_leases_table(&client, &table_name).await?;
-
-  let store = default_lease_store(client.clone(), table_name.clone());
-  let key = lease_key();
-  let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = store
-    .acquire_lease_and_reserve_sequences(
-      key.clone(),
-      "broker-a".to_string(),
-      "session-a".to_string(),
-      offset_datetime_from_unix_millis(1_000),
-      TimeDuration::milliseconds(100),
-      Some(5),
-    )
-    .await?
-  else {
-    panic!("expected acquired lease");
-  };
-  assert_eq!(reservation.map(|reservation| reservation.end), Some(4));
-
-  let outcome = store
-    .release_lease(
-      &key,
-      &lease.fence,
-      offset_datetime_from_unix_millis(1_100),
-      LeaseReleaseSequenceProgress::Set(Some(2)),
-    )
-    .await?;
-  assert_eq!(outcome, LeaseReleaseOutcome::Expired);
-  assert_eq!(
-    store
-      .get_lease(&key)
-      .await?
-      .expect("expired lease row should remain readable")
-      .max_allocated_seq,
-    Some(4)
-  );
-
-  client.delete_table().table_name(table_name).send().await?;
-  Ok(())
-}
-
-#[tokio::test]
-async fn release_reclaims_unused_sequence_reservation_tail() -> Result<()> {
-  let client = dynamo_client().await?;
-  let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
-  create_leases_table(&client, &table_name).await?;
-
-  let store = default_lease_store(client.clone(), table_name.clone());
-  let key = lease_key();
-  let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = store
-    .acquire_lease_and_reserve_sequences(
-      key.clone(),
-      "broker-a".to_string(),
-      "session-a".to_string(),
-      offset_datetime_from_unix_millis(1_000),
-      TimeDuration::milliseconds(100),
-      Some(10),
-    )
-    .await?
-  else {
-    panic!("expected acquired lease");
-  };
-  assert_eq!(
-    reservation,
-    Some(blob_stream_types::SeqRange { start: 0, end: 9 })
-  );
-
-  assert_eq!(
-    store
-      .release_lease(
-        &key,
-        &lease.fence,
-        offset_datetime_from_unix_millis(1_000),
-        LeaseReleaseSequenceProgress::Set(Some(2)),
-      )
-      .await?,
-    LeaseReleaseOutcome::Released
-  );
-  let LeaseAcquireAndReserveOutcome::Acquired { reservation, .. } = store
-    .acquire_lease_and_reserve_sequences(
-      key,
-      "broker-b".to_string(),
-      "session-b".to_string(),
-      offset_datetime_from_unix_millis(1_000),
-      TimeDuration::milliseconds(100),
-      Some(2),
-    )
-    .await?
-  else {
-    panic!("expected successor acquisition");
-  };
-  assert_eq!(
-    reservation,
-    Some(blob_stream_types::SeqRange { start: 3, end: 4 })
-  );
-
-  client.delete_table().table_name(table_name).send().await?;
-  Ok(())
-}
-
-#[tokio::test]
-async fn release_reclaims_an_entirely_unused_initial_reservation() -> Result<()> {
-  let client = dynamo_client().await?;
-  let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
-  create_leases_table(&client, &table_name).await?;
-
-  let store = default_lease_store(client.clone(), table_name.clone());
-  let key = lease_key();
-  let LeaseAcquireAndReserveOutcome::Acquired { lease, .. } = store
-    .acquire_lease_and_reserve_sequences(
-      key.clone(),
-      "broker-a".to_string(),
-      "session-a".to_string(),
-      offset_datetime_from_unix_millis(1_000),
-      TimeDuration::milliseconds(100),
-      Some(10),
-    )
-    .await?
-  else {
-    panic!("expected acquired lease");
-  };
-
-  assert_eq!(
-    store
-      .release_lease(
-        &key,
-        &lease.fence,
-        offset_datetime_from_unix_millis(1_000),
-        LeaseReleaseSequenceProgress::Set(None),
-      )
-      .await?,
-    LeaseReleaseOutcome::Released
-  );
-  assert_eq!(
-    store
-      .get_lease(&key)
-      .await?
-      .expect("released lease row should remain readable")
-      .max_allocated_seq,
-    None
-  );
-  let LeaseAcquireAndReserveOutcome::Acquired { reservation, .. } = store
-    .acquire_lease_and_reserve_sequences(
-      key,
-      "broker-b".to_string(),
-      "session-b".to_string(),
-      offset_datetime_from_unix_millis(1_000),
-      TimeDuration::milliseconds(100),
-      Some(2),
-    )
-    .await?
-  else {
-    panic!("expected successor acquisition");
-  };
-  assert_eq!(
-    reservation,
-    Some(blob_stream_types::SeqRange { start: 0, end: 1 })
-  );
-
-  client.delete_table().table_name(table_name).send().await?;
-  Ok(())
-}
-
-#[tokio::test]
-async fn stale_release_cannot_lower_a_successor_reservation() -> Result<()> {
-  let client = dynamo_client().await?;
-  let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
-  create_leases_table(&client, &table_name).await?;
-
-  let store = default_lease_store(client.clone(), table_name.clone());
-  let key = lease_key();
-  let LeaseAcquireAndReserveOutcome::Acquired { lease, .. } = store
-    .acquire_lease_and_reserve_sequences(
-      key.clone(),
-      "broker-a".to_string(),
-      "session-a".to_string(),
-      offset_datetime_from_unix_millis(1_000),
-      TimeDuration::milliseconds(100),
-      Some(10),
-    )
-    .await?
-  else {
-    panic!("expected first acquisition");
-  };
-  store
-    .release_lease(
-      &key,
-      &lease.fence,
-      offset_datetime_from_unix_millis(1_000),
-      LeaseReleaseSequenceProgress::Set(Some(2)),
-    )
-    .await?;
-  let LeaseAcquireAndReserveOutcome::Acquired {
-    lease: successor,
-    reservation,
-  } = store
-    .acquire_lease_and_reserve_sequences(
-      key.clone(),
-      "broker-b".to_string(),
-      "session-b".to_string(),
-      offset_datetime_from_unix_millis(1_000),
-      TimeDuration::milliseconds(100),
-      Some(2),
-    )
-    .await?
-  else {
-    panic!("expected successor acquisition");
-  };
-  assert_eq!(
-    reservation,
-    Some(blob_stream_types::SeqRange { start: 3, end: 4 })
-  );
-
-  assert!(matches!(
-    store
-      .release_lease(
-        &key,
-        &lease.fence,
-        offset_datetime_from_unix_millis(1_000),
-        LeaseReleaseSequenceProgress::Set(None),
-      )
-      .await?,
-    LeaseReleaseOutcome::HeldByOther(_)
-  ));
-  assert_eq!(
-    store
-      .get_lease(&key)
-      .await?
-      .expect("successor lease should remain readable"),
-    successor
-  );
 
   client.delete_table().table_name(table_name).send().await?;
   Ok(())
