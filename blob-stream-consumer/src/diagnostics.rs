@@ -1,6 +1,7 @@
 use crate::config::ConsumerGroupConfig;
 use crate::iterator::{ConsumerDeliveryState, ConsumerSharedState};
 use blob_stream_metadata_store::{
+  ConsumerGroupArmFreshStartOutcome,
   ConsumerGroupAssignmentPlan,
   ConsumerGroupLease,
   ConsumerGroupLeaseStore,
@@ -206,6 +207,21 @@ pub struct ConsumerSourceCheckpointSnapshot {
   pub snowflake_id: u64,
 }
 
+//
+// ConsumerFreshStartMarkerSnapshot
+//
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// Durable cursor-recovery instruction awaiting a consumer restart or reassignment.
+pub struct ConsumerFreshStartMarkerSnapshot {
+  pub marker_id: String,
+  pub source_checkpoint: ConsumerSourceCheckpointSnapshot,
+  #[serde(with = "time::serde::rfc3339")]
+  pub target_window_start: OffsetDateTime,
+  #[serde(with = "time::serde::rfc3339")]
+  pub armed_at: OffsetDateTime,
+}
+
 #[derive(Clone)]
 pub struct ConsumerCommittedCursorSnapshot {
   pub offset: u64,
@@ -228,6 +244,7 @@ pub struct ConsumerGroupPartitionLeaseSnapshot {
   pub committed_source_checkpoint: Option<ConsumerSourceCheckpointSnapshot>,
   #[serde(with = "time::serde::rfc3339::option")]
   pub committed_at: Option<OffsetDateTime>,
+  pub fresh_start_marker: Option<ConsumerFreshStartMarkerSnapshot>,
 }
 
 //
@@ -337,6 +354,7 @@ pub struct ConsumerDiagnostics {
   shared_state: Arc<Mutex<ConsumerSharedState>>,
   prefetch_max_bytes: u64,
   lease_store: Arc<dyn ConsumerGroupLeaseStore>,
+  metadata_window_size: time::Duration,
 }
 
 impl ConsumerDiagnostics {
@@ -345,12 +363,14 @@ impl ConsumerDiagnostics {
     shared_state: Arc<Mutex<ConsumerSharedState>>,
     prefetch_max_bytes: u64,
     lease_store: Arc<dyn ConsumerGroupLeaseStore>,
+    metadata_window_size: time::Duration,
   ) -> Self {
     Self {
       group_config,
       shared_state,
       prefetch_max_bytes,
       lease_store,
+      metadata_window_size,
     }
   }
 
@@ -543,6 +563,145 @@ impl ConsumerDiagnostics {
   pub fn admin_router(self) -> axum::Router {
     crate::admin::router(self)
   }
+
+  pub async fn arm_next_window_fresh_start(
+    &self,
+    virtual_partition_ids: Vec<VirtualPartitionId>,
+    dry_run: bool,
+  ) -> Result<Vec<ConsumerArmFreshStartResult>, anyhow::Error> {
+    let now = OffsetDateTime::now_utc();
+    let mut results = Vec::with_capacity(virtual_partition_ids.len());
+    for virtual_partition_id in virtual_partition_ids {
+      let key = blob_stream_metadata_store::ConsumerGroupLeaseKey {
+        topic: self.group_config.topic.to_string(),
+        group_id: self.group_config.group_id.to_string(),
+        virtual_partition_id,
+      };
+      if dry_run {
+        let outcome = self
+          .lease_store
+          .list_group_leases(&key.topic, &key.group_id)
+          .await?
+          .into_iter()
+          .find(|lease| lease.key.virtual_partition_id == virtual_partition_id);
+        results.push(ConsumerArmFreshStartResult::from_existing_lease(
+          virtual_partition_id,
+          outcome,
+          self.metadata_window_size,
+        )?);
+        continue;
+      }
+      let marker_id = uuid::Uuid::new_v4().to_string();
+      let outcome = self
+        .lease_store
+        .arm_next_window_fresh_start(&key, self.metadata_window_size, marker_id, now)
+        .await?;
+      results.push(ConsumerArmFreshStartResult::from_arm_outcome(
+        virtual_partition_id,
+        outcome,
+      ));
+    }
+    Ok(results)
+  }
+}
+
+//
+// ConsumerArmFreshStartResult
+//
+
+#[derive(Debug, Serialize)]
+/// One partition result from the fresh-start marker administration endpoint.
+pub struct ConsumerArmFreshStartResult {
+  pub virtual_partition_id: VirtualPartitionId,
+  pub outcome: ConsumerArmFreshStartResultOutcome,
+  pub target_window_start: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+/// Operator-visible outcome for one fresh-start marker request.
+pub enum ConsumerArmFreshStartResultOutcome {
+  Armed,
+  AlreadyArmed,
+  MissingSourceCheckpoint,
+  MissingLease,
+  WouldArm,
+}
+
+impl ConsumerArmFreshStartResult {
+  fn from_arm_outcome(
+    virtual_partition_id: VirtualPartitionId,
+    outcome: ConsumerGroupArmFreshStartOutcome,
+  ) -> Self {
+    match outcome {
+      ConsumerGroupArmFreshStartOutcome::Armed(lease) => Self {
+        virtual_partition_id,
+        outcome: ConsumerArmFreshStartResultOutcome::Armed,
+        target_window_start: lease
+          .fresh_start_marker
+          .map(|marker| offset_datetime_from_unix_seconds(marker.target_window_start_unix_seconds)),
+      },
+      ConsumerGroupArmFreshStartOutcome::AlreadyArmed(lease) => Self {
+        virtual_partition_id,
+        outcome: ConsumerArmFreshStartResultOutcome::AlreadyArmed,
+        target_window_start: lease
+          .fresh_start_marker
+          .map(|marker| offset_datetime_from_unix_seconds(marker.target_window_start_unix_seconds)),
+      },
+      ConsumerGroupArmFreshStartOutcome::MissingSourceCheckpoint(_) => Self {
+        virtual_partition_id,
+        outcome: ConsumerArmFreshStartResultOutcome::MissingSourceCheckpoint,
+        target_window_start: None,
+      },
+      ConsumerGroupArmFreshStartOutcome::MissingLease => Self {
+        virtual_partition_id,
+        outcome: ConsumerArmFreshStartResultOutcome::MissingLease,
+        target_window_start: None,
+      },
+    }
+  }
+
+  fn from_existing_lease(
+    virtual_partition_id: VirtualPartitionId,
+    lease: Option<ConsumerGroupLease>,
+    metadata_window_size: time::Duration,
+  ) -> Result<Self, anyhow::Error> {
+    let Some(lease) = lease else {
+      return Ok(Self {
+        virtual_partition_id,
+        outcome: ConsumerArmFreshStartResultOutcome::MissingLease,
+        target_window_start: None,
+      });
+    };
+    if let Some(marker) = lease.fresh_start_marker {
+      return Ok(Self {
+        virtual_partition_id,
+        outcome: ConsumerArmFreshStartResultOutcome::AlreadyArmed,
+        target_window_start: Some(offset_datetime_from_unix_seconds(
+          marker.target_window_start_unix_seconds,
+        )),
+      });
+    }
+    let Some(source_checkpoint) = lease
+      .committed_cursor
+      .and_then(|cursor| cursor.source_checkpoint)
+    else {
+      return Ok(Self {
+        virtual_partition_id,
+        outcome: ConsumerArmFreshStartResultOutcome::MissingSourceCheckpoint,
+        target_window_start: None,
+      });
+    };
+    let target_window_start = source_checkpoint
+      .window_start_unix_seconds
+      .checked_add(metadata_window_size.whole_seconds())
+      .ok_or_else(|| anyhow::anyhow!("fresh start target window overflow"))?;
+    Ok(Self {
+      virtual_partition_id,
+      outcome: ConsumerArmFreshStartResultOutcome::WouldArm,
+      target_window_start: Some(offset_datetime_from_unix_seconds(target_window_start)),
+    })
+  }
 }
 
 pub fn assignment_plan_snapshot(
@@ -670,6 +829,7 @@ fn group_partition_lease_snapshot(
       committed_offset: None,
       committed_source_checkpoint: None,
       committed_at: None,
+      fresh_start_marker: None,
     };
   };
 
@@ -691,6 +851,16 @@ fn group_partition_lease_snapshot(
         snowflake_id: checkpoint.snowflake_id,
       }),
     committed_at: lease.committed_ts_ms.map(offset_datetime_from_unix_millis),
+    fresh_start_marker: lease
+      .fresh_start_marker
+      .map(|marker| ConsumerFreshStartMarkerSnapshot {
+        marker_id: marker.marker_id,
+        source_checkpoint: source_checkpoint_snapshot(&marker.source_checkpoint),
+        target_window_start: offset_datetime_from_unix_seconds(
+          marker.target_window_start_unix_seconds,
+        ),
+        armed_at: offset_datetime_from_unix_millis(marker.armed_at_ts_ms),
+      }),
   }
 }
 

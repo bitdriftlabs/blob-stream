@@ -16,8 +16,41 @@ use super::{
   oneshot,
   record_reader_diagnostics,
 };
+use blob_stream_metadata_store::FreshStartMarker;
 
 impl ConsumerDriver {
+  pub(in crate::iterator) fn mark_fresh_at_windows(
+    &mut self,
+    fresh_start_markers: HashMap<VirtualPartitionId, FreshStartMarker>,
+  ) -> Result<()> {
+    if fresh_start_markers.is_empty() {
+      return Ok(());
+    }
+    let target_window_starts = fresh_start_markers
+      .into_iter()
+      .map(|(partition_id, marker)| (partition_id, marker.target_window_start_unix_seconds))
+      .collect::<HashMap<_, _>>();
+
+    if let Some(reader) = &mut self.reader {
+      for (partition_id, target_window_start) in target_window_starts {
+        reader.mark_fresh_at_window(partition_id, target_window_start);
+      }
+      record_reader_diagnostics(reader, &self.shared_state);
+      return Ok(());
+    }
+
+    self
+      .reader_command_tx
+      .as_ref()
+      .ok_or_else(|| anyhow!("consumer reader is unavailable"))?
+      .send(ConsumerReaderCommand::MarkFreshAtWindows {
+        target_window_starts,
+      })
+      .map_err(|_| anyhow!("consumer reader worker stopped"))?;
+    self.reader_command_notify.notify_one();
+    Ok(())
+  }
+
   pub(in crate::iterator) fn hydrate_cursors(
     &mut self,
     recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,

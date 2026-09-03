@@ -3,6 +3,7 @@
 mod tests;
 
 use crate::{
+  ConsumerGroupArmFreshStartOutcome,
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupCommitOutcome,
   ConsumerGroupHeartbeatOutcome,
@@ -12,6 +13,7 @@ use crate::{
   ConsumerGroupLeaseStore,
   ConsumerGroupLeaseTransition,
   ConsumerGroupReleaseOutcome,
+  FreshStartMarker,
   consumer_group_lease_transition,
 };
 use anyhow::{Result, anyhow};
@@ -84,6 +86,7 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
           last_heartbeat_ts_ms: now_ts_ms,
           committed_cursor: None,
           committed_ts_ms: None,
+          fresh_start_marker: None,
           graceful_release_ts_ms: None,
         };
         guard.insert(key.clone(), lease.clone());
@@ -143,6 +146,52 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     }
   }
 
+  async fn arm_next_window_fresh_start(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    metadata_window_size: Duration,
+    marker_id: String,
+    now: OffsetDateTime,
+  ) -> Result<ConsumerGroupArmFreshStartOutcome> {
+    let metadata_window_seconds = metadata_window_size.whole_seconds();
+    if metadata_window_seconds <= 0 {
+      return Err(anyhow!("metadata window size must be positive"));
+    }
+    let armed_at_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds in-memory millisecond range"))?;
+    let mut guard = self.leases.write();
+    let Some(state) = guard.get_mut(key) else {
+      return Ok(ConsumerGroupArmFreshStartOutcome::MissingLease);
+    };
+    if state.fresh_start_marker.is_some() {
+      return Ok(ConsumerGroupArmFreshStartOutcome::AlreadyArmed(
+        state.to_lease(key.clone()),
+      ));
+    }
+    let Some(source_checkpoint) = state
+      .committed_cursor
+      .as_ref()
+      .and_then(|cursor| cursor.source_checkpoint.clone())
+    else {
+      return Ok(ConsumerGroupArmFreshStartOutcome::MissingSourceCheckpoint(
+        state.to_lease(key.clone()),
+      ));
+    };
+    let target_window_start_unix_seconds = source_checkpoint
+      .window_start_unix_seconds
+      .checked_add(metadata_window_seconds)
+      .ok_or_else(|| anyhow!("fresh start target window overflow"))?;
+    state.fresh_start_marker = Some(FreshStartMarker {
+      marker_id,
+      source_checkpoint,
+      target_window_start_unix_seconds,
+      armed_at_ts_ms,
+    });
+    Ok(ConsumerGroupArmFreshStartOutcome::Armed(
+      state.to_lease(key.clone()),
+    ))
+  }
+
   async fn heartbeat_partition(
     &self,
     key: &ConsumerGroupLeaseKey,
@@ -151,6 +200,29 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     now: OffsetDateTime,
     lease_duration: Duration,
     committed_cursor: Option<CommittedCursor>,
+  ) -> Result<ConsumerGroupHeartbeatOutcome> {
+    self
+      .heartbeat_partition_consuming_fresh_start_marker(
+        key,
+        owner_id,
+        generation,
+        now,
+        lease_duration,
+        committed_cursor,
+        None,
+      )
+      .await
+  }
+
+  async fn heartbeat_partition_consuming_fresh_start_marker(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
+    committed_cursor: Option<CommittedCursor>,
+    consumed_fresh_start_marker_id: Option<String>,
   ) -> Result<ConsumerGroupHeartbeatOutcome> {
     trace!(
       "consumer lease(memory) heartbeat: topic={}, group_id={}, partition={}, owner_id={}, \
@@ -184,6 +256,16 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     state.last_heartbeat_ts_ms = now_ts_ms;
 
     if let Some(cursor) = committed_cursor {
+      if let Some(marker_id) = consumed_fresh_start_marker_id {
+        let marker_matches = state
+          .fresh_start_marker
+          .as_ref()
+          .is_some_and(|marker| marker.marker_id == marker_id);
+        if !marker_matches {
+          return Err(anyhow!("fresh start marker changed before cursor commit"));
+        }
+        state.fresh_start_marker = None;
+      }
       state.committed_cursor = Some(cursor);
       state.committed_ts_ms = Some(now_ts_ms);
     }
@@ -200,6 +282,27 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     generation: u64,
     now: OffsetDateTime,
     committed_cursor: CommittedCursor,
+  ) -> Result<ConsumerGroupCommitOutcome> {
+    self
+      .commit_cursor_consuming_fresh_start_marker(
+        key,
+        owner_id,
+        generation,
+        now,
+        committed_cursor,
+        None,
+      )
+      .await
+  }
+
+  async fn commit_cursor_consuming_fresh_start_marker(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now: OffsetDateTime,
+    committed_cursor: CommittedCursor,
+    consumed_fresh_start_marker_id: Option<String>,
   ) -> Result<ConsumerGroupCommitOutcome> {
     trace!(
       "consumer lease(memory) commit: topic={}, group_id={}, partition={}, owner_id={}, \
@@ -230,6 +333,16 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
       ));
     }
 
+    if let Some(marker_id) = consumed_fresh_start_marker_id {
+      let marker_matches = state
+        .fresh_start_marker
+        .as_ref()
+        .is_some_and(|marker| marker.marker_id == marker_id);
+      if !marker_matches {
+        return Err(anyhow!("fresh start marker changed before cursor commit"));
+      }
+      state.fresh_start_marker = None;
+    }
     state.committed_cursor = Some(committed_cursor);
     state.committed_ts_ms = Some(now_ts_ms);
 
@@ -288,6 +401,7 @@ struct LeaseState {
   last_heartbeat_ts_ms: i64,
   committed_cursor: Option<CommittedCursor>,
   committed_ts_ms: Option<i64>,
+  fresh_start_marker: Option<FreshStartMarker>,
   graceful_release_ts_ms: Option<i64>,
 }
 
@@ -305,6 +419,7 @@ impl LeaseState {
       last_heartbeat_ts_ms: self.last_heartbeat_ts_ms,
       committed_cursor: self.committed_cursor.clone(),
       committed_ts_ms: self.committed_ts_ms,
+      fresh_start_marker: self.fresh_start_marker.clone(),
     }
   }
 }
