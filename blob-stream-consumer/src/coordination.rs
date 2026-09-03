@@ -857,7 +857,10 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
             fresh_start_markers.insert(partition_id, marker);
           } else if newly_owned {
             self.fresh_start_markers.remove(&partition_id);
-          } else if let Some(committed_cursor) = lease.committed_cursor {
+          }
+          if lease.fresh_start_marker.is_none()
+            && let Some(committed_cursor) = lease.committed_cursor
+          {
             recovered_cursors.insert(
               partition_id,
               RecoveredCursor {
