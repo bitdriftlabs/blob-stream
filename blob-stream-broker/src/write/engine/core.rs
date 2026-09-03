@@ -1,3 +1,4 @@
+use super::super::adaptive_flush_delay::AdaptiveFlushDelay;
 use super::super::config::EffectiveFlushConfig;
 use super::super::flush::{FlushContext, MAX_CONCURRENT_METADATA_WRITES};
 use super::super::metrics::WriteMetrics;
@@ -28,6 +29,7 @@ use blob_stream_metadata_store::{
   MetadataStore,
   ProducerPartitionLeaseStore,
 };
+use log::debug;
 use parking_lot::{Mutex, RwLock};
 use protobuf::Chars;
 use std::collections::HashMap;
@@ -223,9 +225,10 @@ impl<'a> WriteEngineBuilder<'a> {
       Arc::clone(&time_provider),
       lifecycle_hooks.clone(),
     );
-    let effective_flush_config = Arc::new(RwLock::new(
-      config.effective_flush_config(feature_flags.as_ref()),
-    ));
+    let initial_flush_config = config.effective_flush_config(feature_flags.as_ref());
+    let effective_flush_config = Arc::new(RwLock::new(initial_flush_config));
+    let metrics = WriteMetrics::new(metrics_scope);
+    metrics.set_adaptive_flush_max_delay(initial_flush_config.max_delay);
     let admission = admission.unwrap_or_else(|| {
       MemoryPressureController::new(&shutdown_trigger_handle, &metrics_scope.scope("write"))
     });
@@ -239,7 +242,7 @@ impl<'a> WriteEngineBuilder<'a> {
       holder_id,
       lease_session_id: lease_session_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
       time_provider,
-      metrics: WriteMetrics::new(metrics_scope),
+      metrics,
       state,
       effective_flush_config,
       flush_notifier: Arc::new(Notify::new()),
@@ -278,6 +281,8 @@ impl WriteEngineImpl {
 
     tokio::spawn(async move {
       let mut flush_config = *effective_flush_config.read();
+      let mut adaptive_flush_delay = AdaptiveFlushDelay::new(flush_config.adaptive_flush_delay);
+      flush_config.max_delay = adaptive_flush_delay.current_delay();
       let mut flush_tick =
         Box::pin(time_provider.sleep(flush_config.max_delay.max(TimeDuration::milliseconds(1))));
       let mut flushes = JoinSet::new();
@@ -325,7 +330,7 @@ impl WriteEngineImpl {
               &metadata_write_permits,
               &flush_notifier,
             )
-            .await;
+            .await
           });
           scheduled_flush = true;
         }
@@ -345,7 +350,10 @@ impl WriteEngineImpl {
               flush_config = flush_context
                 .config()
                 .effective_flush_config(feature_flags.as_ref());
+              adaptive_flush_delay.reconfigure(flush_config.adaptive_flush_delay);
+              flush_config.max_delay = adaptive_flush_delay.current_delay();
               *effective_flush_config.write() = flush_config;
+              metrics.set_adaptive_flush_max_delay(flush_config.max_delay);
               flush_config_needs_reload = false;
             }
             flush_tick = Box::pin(time_provider.sleep(
@@ -368,8 +376,28 @@ impl WriteEngineImpl {
           },
           () = flush_notifier.notified() => {},
           Some(result) = flushes.join_next(), if !flushes.is_empty() => {
-            if let Err(error) = result {
-              log::error!("broker flush task failed: {error}");
+            match result {
+              Ok(feedback) => {
+                if adaptive_flush_delay.record_flush_result(
+                  feedback.split_count,
+                  feedback.successful,
+                ) {
+                  flush_config.max_delay = adaptive_flush_delay.current_delay();
+                  *effective_flush_config.write() = flush_config;
+                  metrics.set_adaptive_flush_max_delay(flush_config.max_delay);
+                  flush_tick = Box::pin(time_provider.sleep(
+                    flush_config.max_delay.max(TimeDuration::milliseconds(1)),
+                  ));
+                  debug!(
+                    "broker adaptive flush max delay adjusted: delay_ms={}, split_count={}, \
+                     successful={}",
+                    flush_config.max_delay.whole_milliseconds(),
+                    feedback.split_count,
+                    feedback.successful
+                  );
+                }
+              },
+              Err(error) => log::error!("broker flush task failed: {error}"),
             }
           },
         }

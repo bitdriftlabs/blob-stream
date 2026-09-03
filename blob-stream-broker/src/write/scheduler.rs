@@ -11,7 +11,7 @@ use super::buffer::{
   TopicFlushPlan,
 };
 use super::config::EffectiveFlushConfig;
-use super::flush::FlushContext;
+use super::flush::{FlushContext, FlushPlanCompletion};
 use super::metrics::WriteMetrics;
 use super::state::{PartitionState, WriteState};
 use super::{TopicInfo, WriteConfig};
@@ -30,6 +30,15 @@ use tokio::sync::OwnedSemaphorePermit;
 #[path = "./scheduler_test.rs"]
 mod tests;
 
+//
+// FlushPlanFeedback
+//
+
+pub(super) struct FlushPlanFeedback {
+  pub(super) split_count: u64,
+  pub(super) successful: bool,
+}
+
 pub(super) async fn flush_plan_and_notify(
   flush_context: &FlushContext,
   mut plan: FlushPlan,
@@ -39,7 +48,7 @@ pub(super) async fn flush_plan_and_notify(
   blob_upload_permits: &Arc<tokio::sync::Semaphore>,
   metadata_write_permits: &Arc<tokio::sync::Semaphore>,
   flush_notifier: &Arc<tokio::sync::Notify>,
-) {
+) -> FlushPlanFeedback {
   let mut completions = Vec::new();
   for topic_plan in &mut plan.topics {
     for partition in &mut topic_plan.partitions {
@@ -65,11 +74,13 @@ pub(super) async fn flush_plan_and_notify(
       flush_notifier,
     )
     .await;
-  if result.as_ref().is_err()
-    || result
-      .as_ref()
-      .is_ok_and(|results| results.iter().any(|result| result.error.is_some()))
-  {
+  let successful = result.as_ref().is_ok_and(|completion| {
+    completion
+      .partition_results
+      .iter()
+      .all(|result| result.error.is_none())
+  });
+  if !successful {
     metrics.flush_failures_total.inc();
   }
   metrics
@@ -82,7 +93,13 @@ pub(super) async fn flush_plan_and_notify(
       super::WriteError::LeaseFenceLost => FlushCompletionError::LeaseFenceLost,
       _ => FlushCompletionError::Internal,
     });
-  let partition_results = result.unwrap_or_default();
+  let FlushPlanCompletion {
+    partition_results,
+    split_count,
+  } = result.unwrap_or(FlushPlanCompletion {
+    partition_results: Vec::new(),
+    split_count: 0,
+  });
   mark_flush_complete(
     state,
     plan.publication_completions,
@@ -98,6 +115,11 @@ pub(super) async fn flush_plan_and_notify(
     );
     let completion_result = error.map_or(Ok(()), Err);
     let _ignored = completion.send(completion_result);
+  }
+
+  FlushPlanFeedback {
+    split_count,
+    successful,
   }
 }
 

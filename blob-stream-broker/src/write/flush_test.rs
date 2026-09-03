@@ -82,6 +82,7 @@ async fn flush_plan_with_upload_permits_for_test(
       &Arc::new(tokio::sync::Notify::new()),
     )
     .await
+    .map(|completion| completion.partition_results)
 }
 
 struct BlockingMetadataStore {
@@ -361,7 +362,7 @@ async fn object_build_resnaps_time_after_sonyflake_sequence_overflow() -> Result
   });
   time_provider.wait_until_sleeping(1).await;
   time_provider.advance(time::Duration::milliseconds(10));
-  let (objects, failures) = objects.await??;
+  let (objects, failures, _) = objects.await??;
   let last_topic = &objects.last().expect("513 bounded objects").topics[0];
   let refreshed_at = now.saturating_add(time::Duration::milliseconds(10));
 
@@ -461,7 +462,7 @@ async fn object_build_balances_uneven_partitions_preserving_source_order() -> Re
   let collector = Collector::default();
   let metrics = WriteMetrics::new(&collector.scope("flush_test"));
 
-  let (objects, failures) = context.build_objects(&mut plan, &metrics).await?;
+  let (objects, failures, _) = context.build_objects(&mut plan, &metrics).await?;
 
   assert!(failures.is_empty());
   assert_eq!(objects.len(), 2);
@@ -544,7 +545,7 @@ async fn oversized_partition_does_not_oversplit_later_partitions() -> Result<()>
   let collector = Collector::default();
   let metrics = WriteMetrics::new(&collector.scope("flush_test"));
 
-  let (objects, failures) = context.build_objects(&mut plan, &metrics).await?;
+  let (objects, failures, _) = context.build_objects(&mut plan, &metrics).await?;
 
   assert!(failures.is_empty());
   assert_eq!(objects.len(), 2);
@@ -579,7 +580,7 @@ async fn every_object_uses_a_shared_blob_key() -> Result<()> {
     publication_completions: Vec::new(),
   };
 
-  let (objects, failures) = context
+  let (objects, failures, _) = context
     .build_objects(
       &mut plan,
       &WriteMetrics::new(&Collector::default().scope("flush_test")),

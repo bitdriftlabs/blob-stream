@@ -4525,6 +4525,171 @@ async fn time_flush_groups_topics_into_one_durable_plan() -> Result<()> {
 }
 
 #[tokio::test(start_paused = true)]
+async fn adaptive_flush_delay_requires_consecutive_split_and_unsplit_plans() -> Result<()> {
+  let now_ms = 1_700_000_000_000;
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    now_ms,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let collector = Collector::default();
+  let metrics = Helper::new_with_collector(collector.clone());
+  let scope = collector.scope("blob_stream_broker_test");
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1_024;
+  config.flush_max_delay = TimeDuration::milliseconds(10);
+  config.adaptive_flush_max_delay_enabled = true;
+  config.adaptive_flush_max_delay_floor = Some(TimeDuration::milliseconds(2));
+  config.max_segment_bytes = 1;
+  config.compression = blob_stream_types::Compression::none();
+  let topics = ["first", "second"].map(|name| {
+    (
+      name.into(),
+      TopicInfo {
+        name: name.into(),
+        partition_count: 1,
+        num_writers: 1,
+        retention: TimeDuration::days(7),
+        max_metadata_publication_lag: TimeDuration::milliseconds(30_000),
+        metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
+      },
+    )
+  });
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config.clone(),
+      HashMap::from(topics),
+      Arc::new(InMemoryBlobStore::new()),
+      Arc::new(InMemoryMetadataStore::new()),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &scope,
+    )
+    .time_provider(time_provider.clone())
+    .build()?,
+  );
+
+  for sequence in 0 .. 3 {
+    let first = Arc::clone(&engine);
+    let first_write = tokio::spawn(async move {
+      first
+        .produce_batch(WriteRequest {
+          topic: "first".into(),
+          virtual_partition_id: 0,
+          records: vec![new_record(vec![1], sequence * 2 + 1)],
+        })
+        .await
+    });
+    let second = Arc::clone(&engine);
+    let second_write = tokio::spawn(async move {
+      second
+        .produce_batch(WriteRequest {
+          topic: "second".into(),
+          virtual_partition_id: 0,
+          records: vec![new_record(vec![2], sequence * 2 + 2)],
+        })
+        .await
+    });
+    for _ in 0 .. 100 {
+      let buffered_batches = engine
+        .state_snapshot()
+        .await
+        .topics
+        .iter()
+        .flat_map(|topic| &topic.local_partitions)
+        .map(|partition| partition.buffered_batch_count)
+        .sum::<usize>();
+      if buffered_batches == 2 {
+        break;
+      }
+      tokio::task::yield_now().await;
+    }
+    assert_eq!(
+      engine
+        .state_snapshot()
+        .await
+        .topics
+        .iter()
+        .flat_map(|topic| &topic.local_partitions)
+        .map(|partition| partition.buffered_batch_count)
+        .sum::<usize>(),
+      2
+    );
+    time_provider.advance(config.flush_max_delay);
+    tokio::time::advance(std_duration(config.flush_max_delay)).await;
+    first_write.await??;
+    second_write.await??;
+  }
+  for _ in 0 .. 100 {
+    if engine.state_snapshot().await.effective_flush_max_delay == StdDuration::from_millis(8) {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+
+  metrics.assert_gauge_eq(
+    8,
+    "blob_stream_broker_test:write:adaptive_flush_max_delay_ms",
+    &labels!(),
+  );
+
+  let adaptive_delay = TimeDuration::milliseconds(8);
+  for sequence in 0 .. 3 {
+    let recovery_engine = Arc::clone(&engine);
+    let recovery_write = tokio::spawn(async move {
+      recovery_engine
+        .produce_batch(WriteRequest {
+          topic: "first".into(),
+          virtual_partition_id: 0,
+          records: vec![new_record(vec![3], sequence + 7)],
+        })
+        .await
+    });
+    for _ in 0 .. 100 {
+      let buffered_batches = engine
+        .state_snapshot()
+        .await
+        .topics
+        .iter()
+        .flat_map(|topic| &topic.local_partitions)
+        .map(|partition| partition.buffered_batch_count)
+        .sum::<usize>();
+      if buffered_batches == 1 {
+        break;
+      }
+      tokio::task::yield_now().await;
+    }
+    assert_eq!(
+      engine
+        .state_snapshot()
+        .await
+        .topics
+        .iter()
+        .flat_map(|topic| &topic.local_partitions)
+        .map(|partition| partition.buffered_batch_count)
+        .sum::<usize>(),
+      1
+    );
+    time_provider.advance(adaptive_delay);
+    tokio::time::advance(std_duration(adaptive_delay)).await;
+    recovery_write.await??;
+  }
+  for _ in 0 .. 100 {
+    if engine.state_snapshot().await.effective_flush_max_delay == StdDuration::from_millis(9) {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+
+  metrics.assert_gauge_eq(
+    9,
+    "blob_stream_broker_test:write:adaptive_flush_max_delay_ms",
+    &labels!(),
+  );
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
 async fn time_flush_notifies_only_the_plan_that_failed() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(

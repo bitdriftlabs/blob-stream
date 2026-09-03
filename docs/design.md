@@ -276,21 +276,32 @@ invariant.
    reaches `flush_max_delay_ms`. `blob_stream_broker_flush_max_bytes` and
    `blob_stream_broker_flush_max_delay_ms` are positive live integer overrides. The scheduler
    snapshots them when it starts its next timer cycle; an existing cycle and already selected plans
-   retain their prior values. A time-due partition establishes a flush cadence for the local broker
-   and includes every available buffered, non-draining virtual partition across its local topics in
-   the same plan. This can flush younger peer buffers before their individual delay to produce
-   larger blobs and fewer S3 PUTs. Byte-threshold flushes remain local unless a time-due shared
-   flush pulls them forward, and lease-drain flushes remain partition-local. `max_segment_bytes`
-   separately caps each serialized compressed object; it defaults to 64 MiB and can be changed live
-   with `blob_stream_broker_max_segment_bytes`. After each partition batch is serialized and
-   compressed, the broker chooses deterministic contiguous object boundaries that target an equal
-   share of the remaining bytes while preserving scheduler source order. A compressed partition
-   batch that cannot be split is emitted alone when it exceeds that cap. A partition with a durable
-   plan in progress continues buffering its next epoch until its normal byte or delay trigger.
-   Successive epochs can then build and upload blobs concurrently, while their metadata publication
-   remains ordered. A single bounded flush scheduler wakes for eligible writes, timer ticks, and
-   durable-plan completions. It runs at most four durable flush plans concurrently;
-  `write:active_flush_plans` reports its current occupancy.
+  retain their prior values. `adaptive_flush_max_delay_enabled` and its watched
+  `blob_stream_broker_adaptive_flush_max_delay_enabled` override default to true. When enabled,
+   three consecutive completed plans with `s` additional segment-cap object boundaries each derive a
+   target of `max(floor, ceil(current_delay / (s + 1)))` and reduce the next delay by one quarter of
+   the distance to that target, rounding up. Three consecutive successful plans with no additional
+   object boundaries recover by half of the remaining distance to the live maximum; a failed unsplit
+   plan or the opposite outcome resets the streak. Every adjustment resets its streak, requiring
+   three fresh matching outcomes before a later adjustment. The static
+   `adaptive_flush_max_delay_floor` or watched `blob_stream_broker_adaptive_flush_max_delay_floor_ms`
+   sets the lower bound. An absent floor is half the current live maximum delay, and the scheduler
+   clamps every floor to that maximum. The controller is broker-wide and affects only future
+   scheduler cycles. A time-due partition establishes a flush cadence for the local broker and
+   includes every available buffered, non-draining virtual partition across its local topics in the
+   same plan. This can flush younger peer buffers before their individual delay to produce larger
+   blobs and fewer S3 PUTs. Byte-threshold flushes remain local unless a time-due shared flush pulls
+   them forward, and lease-drain flushes remain partition-local. `max_segment_bytes` separately caps
+   each serialized compressed object; it defaults to 64 MiB and can be changed live with
+   `blob_stream_broker_max_segment_bytes`. After each partition batch is serialized and compressed,
+   the broker chooses deterministic contiguous object boundaries that target an equal share of the
+   remaining bytes while preserving scheduler source order. A compressed partition batch that cannot
+   be split is emitted alone when it exceeds that cap. A partition with a durable plan in progress
+   continues buffering its next epoch until its normal byte or delay trigger. Successive epochs can
+   then build and upload blobs concurrently, while their metadata publication remains ordered. A
+   single bounded flush scheduler wakes for eligible writes, timer ticks, and durable-plan
+   completions. It runs at most four durable flush plans concurrently; `write:active_flush_plans`
+   reports its current occupancy.
 6. A flush coalesces each virtual partition's accepted batches into one `StoredRecordBatch`,
    compresses each serialized partition batch independently, and concatenates the stored bytes into
    bounded segment objects. One time-triggered object can contain contiguous sections for several

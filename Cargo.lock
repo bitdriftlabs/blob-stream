@@ -993,7 +993,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tower",
- "tower-http 0.7.1",
+ "tower-http 0.7.0",
  "unwrap-infallible",
  "urlencoding",
 ]

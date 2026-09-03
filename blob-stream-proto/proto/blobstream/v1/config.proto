@@ -77,6 +77,13 @@ message BrokerConfig {
   // Deadline for one blob-cache RPC, including blob storage, slicing, and encoding. Default when
   // unset: 30 seconds.
   google.protobuf.Duration blob_cache_request_timeout = 17 [(validate.rules).duration.gt = {}];
+
+  // Adapt the broker-wide flush maximum delay after segment-cap splits. Default when unset: true.
+  optional bool adaptive_flush_max_delay_enabled = 18;
+
+  // Lower bound for adaptive_flush_max_delay_enabled. Default when unset: half the current
+  // effective flush_max_delay. Runtime max-delay overrides remain the upper bound.
+  google.protobuf.Duration adaptive_flush_max_delay_floor = 19 [(validate.rules).duration.gt = {}];
 }
 
 // Filesystem paths used to reload broker feature flags.

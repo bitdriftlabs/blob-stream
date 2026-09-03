@@ -59,6 +59,10 @@ pub const FENCED_METADATA_WRITES_FEATURE_FLAG: &str = "blob_stream_broker_fenced
 pub const FLUSH_MAX_BYTES_FEATURE_FLAG: &str = "blob_stream_broker_flush_max_bytes";
 pub const FLUSH_MAX_DELAY_FEATURE_FLAG: &str = "blob_stream_broker_flush_max_delay_ms";
 pub const MAX_SEGMENT_BYTES_FEATURE_FLAG: &str = "blob_stream_broker_max_segment_bytes";
+pub const ADAPTIVE_FLUSH_MAX_DELAY_ENABLED_FEATURE_FLAG: &str =
+  "blob_stream_broker_adaptive_flush_max_delay_enabled";
+pub const ADAPTIVE_FLUSH_MAX_DELAY_FLOOR_FEATURE_FLAG: &str =
+  "blob_stream_broker_adaptive_flush_max_delay_floor_ms";
 
 #[cfg(test)]
 #[path = "./config_test.rs"]
@@ -80,6 +84,8 @@ pub struct WriteConfig {
   pub flush_max_bytes: u64,
   pub max_segment_bytes: u64,
   pub flush_max_delay: Duration,
+  pub adaptive_flush_max_delay_enabled: bool,
+  pub adaptive_flush_max_delay_floor: Option<Duration>,
   pub lease_duration: Duration,
   pub heartbeat_interval: Duration,
   pub reservation_size: u64,
@@ -98,6 +104,19 @@ pub struct WriteConfig {
 pub struct EffectiveFlushConfig {
   pub(crate) max_bytes: u64,
   pub(crate) max_delay: Duration,
+  pub(super) adaptive_flush_delay: AdaptiveFlushDelayConfig,
+}
+
+//
+// AdaptiveFlushDelayConfig
+//
+
+/// Adaptive flush-delay settings resolved against the live maximum delay override.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AdaptiveFlushDelayConfig {
+  pub(super) enabled: bool,
+  pub(super) floor: Duration,
+  pub(super) max_delay: Duration,
 }
 
 impl WriteConfig {
@@ -107,6 +126,8 @@ impl WriteConfig {
       flush_max_bytes: DEFAULT_FLUSH_MAX_BYTES,
       max_segment_bytes: DEFAULT_MAX_SEGMENT_BYTES,
       flush_max_delay: DEFAULT_FLUSH_MAX_DELAY,
+      adaptive_flush_max_delay_enabled: true,
+      adaptive_flush_max_delay_floor: None,
       lease_duration: DEFAULT_LEASE_DURATION,
       heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
       reservation_size: DEFAULT_RESERVATION_SIZE,
@@ -133,6 +154,20 @@ impl WriteConfig {
 
     if let Some(flush_max_delay) = broker.flush_max_delay.as_ref() {
       config.flush_max_delay = flush_max_delay.to_time_duration();
+    }
+    config.adaptive_flush_max_delay_enabled =
+      broker.adaptive_flush_max_delay_enabled.unwrap_or(true);
+    if let Some(floor) = broker.adaptive_flush_max_delay_floor.as_ref() {
+      let floor = floor.to_time_duration();
+      ensure!(
+        floor.whole_milliseconds() > 0,
+        "broker adaptive_flush_max_delay_floor must be at least one millisecond"
+      );
+      ensure!(
+        floor <= config.flush_max_delay,
+        "broker adaptive_flush_max_delay_floor must not exceed flush_max_delay"
+      );
+      config.adaptive_flush_max_delay_floor = Some(floor);
     }
 
     config.lease_duration = broker
@@ -227,9 +262,49 @@ impl WriteConfig {
         self.flush_max_delay
       });
 
+    let adaptive_enabled =
+      feature_flags.map_or(self.adaptive_flush_max_delay_enabled, |feature_flags| {
+        feature_flags.get_bool(
+          ADAPTIVE_FLUSH_MAX_DELAY_ENABLED_FEATURE_FLAG,
+          self.adaptive_flush_max_delay_enabled,
+        )
+      });
+    let default_floor_milliseconds = (max_delay.whole_milliseconds() / 2).max(1);
+    let default_floor =
+      Duration::milliseconds(i64::try_from(default_floor_milliseconds).unwrap_or(i64::MAX));
+    let configured_floor = self
+      .adaptive_flush_max_delay_floor
+      .unwrap_or(default_floor)
+      .clamp(Duration::milliseconds(1), max_delay);
+    let configured_floor_milliseconds = configured_floor.whole_milliseconds();
+    let floor_milliseconds = feature_flags.map_or(configured_floor_milliseconds, |feature_flags| {
+      i128::from(feature_flags.get_integer(
+        ADAPTIVE_FLUSH_MAX_DELAY_FLOOR_FEATURE_FLAG,
+        u64::try_from(configured_floor_milliseconds).unwrap_or(1),
+      ))
+    });
+    let adaptive_floor = i64::try_from(floor_milliseconds)
+      .ok()
+      .filter(|milliseconds| *milliseconds > 0)
+      .map(Duration::milliseconds)
+      .filter(|floor| *floor <= max_delay)
+      .unwrap_or_else(|| {
+        warn_every!(
+          15.seconds(),
+          "broker adaptive flush max delay floor override must be positive and no greater than \
+           effective max delay {max_delay}; using configured value"
+        );
+        configured_floor
+      });
+
     EffectiveFlushConfig {
       max_bytes,
       max_delay,
+      adaptive_flush_delay: AdaptiveFlushDelayConfig {
+        enabled: adaptive_enabled,
+        floor: adaptive_floor,
+        max_delay,
+      },
     }
   }
 
