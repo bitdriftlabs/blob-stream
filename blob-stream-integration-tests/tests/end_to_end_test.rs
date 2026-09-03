@@ -31,6 +31,7 @@ use blob_stream_metadata_store::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
+  LeaseReleaseSequenceProgress,
   MAX_FENCED_METADATA_PARTITIONS,
   MetadataReadConsistency,
   MetadataStore,
@@ -463,9 +464,9 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
   let release = lease_store
     .release_lease(
       &key,
-      "broker-a",
-      "session-1",
+      &first.fence,
       offset_datetime_from_unix_millis(1_150),
+      LeaseReleaseSequenceProgress::Preserve,
     )
     .await?;
   assert!(matches!(release, LeaseReleaseOutcome::HeldByOther(_)));
@@ -3843,6 +3844,118 @@ async fn graceful_broker_restart_waits_for_partition_drain_before_lease_release(
       .as_ref()
       .is_some_and(|cursor| cursor.seq_end >= delivered.1 && cursor.source_checkpoint.is_some())
   );
+
+  Box::new(consumer).shutdown().await?;
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
+// High-level: verifies a graceful broker restart reclaims the unused portion of its Hi-Lo block.
+#[tokio::test]
+async fn graceful_broker_restart_reclaims_unused_sequence_reservation() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let mut cluster = ClusterHarness::builder(&resources, 1).start().await?;
+  let node = cluster
+    .live_nodes()
+    .into_iter()
+    .next()
+    .ok_or_else(|| anyhow!("expected a broker node"))?;
+  let mut runtime = consumer_runtime_config("restart-reservation-consumer");
+  runtime
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow!("restart reservation consumer read config missing"))?
+    .strongly_consistent_metadata_reads = Some(true);
+  let mut consumer = cluster.create_consumer(&runtime).await?;
+  consumer.start()?;
+  let virtual_partition_id = 0;
+  wait_for_broker_lease_ownership(
+    &cluster,
+    &node.node_id,
+    TOPIC,
+    &[virtual_partition_id],
+    Instant::now() + Duration::from_secs(10),
+  )
+  .await?;
+
+  let first = cluster
+    .write_engine_by_id(&node.node_id)?
+    .produce_batch(WriteRequest {
+      topic: TOPIC.into(),
+      virtual_partition_id,
+      records: vec![new_record(
+        b"restart-reservation-first".to_vec(),
+        now_unix_millis(),
+      )],
+    })
+    .await?;
+  assert_eq!(first.seq_range, SeqRange { start: 0, end: 0 });
+
+  let restarted_node = cluster.restart_broker_by_id(&node.node_id).await?;
+  wait_for_broker_lease_ownership(
+    &cluster,
+    &restarted_node.node_id,
+    TOPIC,
+    &[virtual_partition_id],
+    Instant::now() + Duration::from_secs(10),
+  )
+  .await?;
+  let second = cluster
+    .write_engine_by_id(&restarted_node.node_id)?
+    .produce_batch(WriteRequest {
+      topic: TOPIC.into(),
+      virtual_partition_id,
+      records: vec![new_record(
+        b"restart-reservation-second".to_vec(),
+        now_unix_millis(),
+      )],
+    })
+    .await?;
+  assert_eq!(
+    second.seq_range,
+    SeqRange {
+      start: first.seq_range.end + 1,
+      end: first.seq_range.end + 1,
+    }
+  );
+
+  let expected_offsets = HashMap::from([
+    (
+      "restart-reservation-first".to_string(),
+      first.seq_range.start,
+    ),
+    (
+      "restart-reservation-second".to_string(),
+      second.seq_range.start,
+    ),
+  ]);
+  let mut delivered_offsets = HashMap::new();
+  timeout(Duration::from_secs(10), async {
+    while delivered_offsets.len() < expected_offsets.len() {
+      match consumer.next().await? {
+        NextResult::Revoked(revoked) => revoked.complete().await,
+        NextResult::Record(record) => {
+          assert_eq!(record.virtual_partition_id, virtual_partition_id);
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          let expected_offset = expected_offsets
+            .get(id.as_str())
+            .ok_or_else(|| anyhow!("unexpected restart reservation record: {id}"))?;
+          assert_eq!(record.offset, *expected_offset);
+          assert!(
+            delivered_offsets.insert(id, record.offset).is_none(),
+            "consumer delivered a restart reservation record more than once"
+          );
+          consumer.store_offset(record.virtual_partition_id, record.offset)?;
+        },
+      }
+    }
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| anyhow!("consumer did not deliver both restart reservation records"))??;
+  assert_eq!(delivered_offsets, expected_offsets);
+  let _ = consumer.commit().await?;
 
   Box::new(consumer).shutdown().await?;
   cluster.shutdown().await;

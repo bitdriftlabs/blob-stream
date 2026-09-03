@@ -15,6 +15,7 @@ use blob_stream_metadata_store::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
+  LeaseReleaseSequenceProgress,
   ProducerLeaseFence,
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
@@ -23,6 +24,7 @@ use blob_stream_metadata_store::{
 };
 use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::{
+  SeqRange,
   VirtualPartitionId,
   offset_datetime_from_unix_millis,
   virtual_partition_for_logical,
@@ -145,9 +147,9 @@ impl ProducerPartitionLeaseStore for TerminalReleaseLeaseStore {
   async fn release_lease(
     &self,
     _key: &ProducerPartitionLeaseKey,
-    _holder_id: &str,
-    _lease_session_id: &str,
+    _fence: &ProducerLeaseFence,
     _now: OffsetDateTime,
+    _sequence_progress: LeaseReleaseSequenceProgress,
   ) -> Result<LeaseReleaseOutcome> {
     self.release_calls.fetch_add(1, Ordering::AcqRel);
     Ok(self.outcome.clone())
@@ -239,13 +241,13 @@ impl ProducerPartitionLeaseStore for TransientHeartbeatLeaseStore {
   async fn release_lease(
     &self,
     key: &ProducerPartitionLeaseKey,
-    holder_id: &str,
-    lease_session_id: &str,
+    fence: &ProducerLeaseFence,
     now: OffsetDateTime,
+    sequence_progress: LeaseReleaseSequenceProgress,
   ) -> Result<blob_stream_metadata_store::LeaseReleaseOutcome> {
     self
       .inner
-      .release_lease(key, holder_id, lease_session_id, now)
+      .release_lease(key, fence, now, sequence_progress)
       .await
   }
 }
@@ -326,9 +328,9 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
   async fn release_lease(
     &self,
     key: &ProducerPartitionLeaseKey,
-    holder_id: &str,
-    lease_session_id: &str,
+    fence: &ProducerLeaseFence,
     now: OffsetDateTime,
+    sequence_progress: LeaseReleaseSequenceProgress,
   ) -> Result<blob_stream_metadata_store::LeaseReleaseOutcome> {
     self
       .started_tx
@@ -342,7 +344,7 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
       .forget();
     self
       .inner
-      .release_lease(key, holder_id, lease_session_id, now)
+      .release_lease(key, fence, now, sequence_progress)
       .await
   }
 }
@@ -598,8 +600,15 @@ async fn releases_partitions_in_parallel_after_their_drains_complete() {
   ));
   {
     let mut state = state.lock();
-    state.partition_state_mut("telemetry", 0);
-    state.partition_state_mut("telemetry", 1);
+    for virtual_partition_id in 0 .. 2 {
+      state
+        .partition_state_mut("telemetry", virtual_partition_id)
+        .lease_fence = Some(Arc::new(ProducerLeaseFence {
+        holder_id: "node-a".to_string(),
+        lease_epoch: 1,
+        lease_session_id: "session-a".to_string(),
+      }));
+    }
   }
   let flush_notifier = Arc::new(tokio::sync::Notify::new());
   let metrics = super::super::super::metrics::WriteMetrics::new(&metrics_scope());
@@ -676,7 +685,12 @@ async fn terminal_release_outcomes_retire_unassigned_partition_state() {
     let state = Arc::new(parking_lot::Mutex::new(
       super::super::super::state::WriteState::default(),
     ));
-    state.lock().partition_state_mut("telemetry", 0);
+    state.lock().partition_state_mut("telemetry", 0).lease_fence =
+      Some(Arc::new(ProducerLeaseFence {
+        holder_id: "node-a".to_string(),
+        lease_epoch: 1,
+        lease_session_id: "session-a".to_string(),
+      }));
     let flush_notifier = Arc::new(tokio::sync::Notify::new());
     let metrics = super::super::super::metrics::WriteMetrics::new(&metrics_scope());
     let time_provider = ManualTimeProvider::new(now);
@@ -704,6 +718,94 @@ async fn terminal_release_outcomes_retire_unassigned_partition_state() {
     assert!(state.lock().partition_keys().is_empty());
     assert_eq!(lease_store_impl.release_calls.load(Ordering::Acquire), 1);
   }
+}
+
+#[tokio::test]
+async fn stale_live_maintenance_release_reclaims_all_unused_tails() -> Result<()> {
+  let now = offset_datetime_from_unix_millis(1_000);
+  let key = ProducerPartitionLeaseKey {
+    topic: "telemetry".into(),
+    virtual_partition_id: 0,
+  };
+  let lease_store_impl = Arc::new(InMemoryProducerPartitionLeaseStore::new());
+  let lease_store: Arc<dyn ProducerPartitionLeaseStore> = lease_store_impl.clone();
+  let LeaseAcquireAndReserveOutcome::Acquired { .. } = lease_store
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "node-a".to_string(),
+      "session-a".to_string(),
+      now,
+      Duration::seconds(60),
+      Some(10),
+    )
+    .await?
+  else {
+    panic!("expected initial lease acquisition");
+  };
+  let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = lease_store
+    .acquire_lease_and_reserve_sequences(
+      key.clone(),
+      "node-a".to_string(),
+      "session-a".to_string(),
+      now,
+      Duration::seconds(60),
+      Some(20),
+    )
+    .await?
+  else {
+    panic!("expected maintenance lease acquisition");
+  };
+  assert_eq!(reservation, Some(SeqRange { start: 10, end: 29 }));
+
+  let state = Arc::new(parking_lot::Mutex::new(
+    super::super::super::state::WriteState::default(),
+  ));
+  {
+    let mut state = state.lock();
+    let partition_state = state.partition_state_mut("telemetry", 0);
+    partition_state.lease_expiration_at = Some(lease.lease_expiration_at);
+    partition_state.uninstalled_lease_acquisition =
+      Some(super::super::super::state::UninstalledLeaseAcquisition {
+        fence: lease.fence,
+        sequence_progress: LeaseReleaseSequenceProgress::Set(Some(7)),
+      });
+  }
+  let flush_notifier = Arc::new(tokio::sync::Notify::new());
+  let metrics = super::super::super::metrics::WriteMetrics::new(&metrics_scope());
+  let time_provider = ManualTimeProvider::new(now);
+
+  WriteEngineImpl::release_partition_lease(
+    &lease_store,
+    &state,
+    &flush_notifier,
+    &metrics,
+    "node-a",
+    "session-a",
+    &key.topic,
+    key.virtual_partition_id,
+    super::LeaseReleaseReason::AssignmentLoss,
+    &time_provider,
+    Duration::seconds(60),
+    Duration::seconds(10),
+    None,
+  )
+  .await;
+
+  let LeaseAcquireAndReserveOutcome::Acquired { reservation, .. } = lease_store_impl
+    .acquire_lease_and_reserve_sequences(
+      key,
+      "node-b".to_string(),
+      "session-b".to_string(),
+      now,
+      Duration::seconds(60),
+      Some(1),
+    )
+    .await?
+  else {
+    panic!("expected successor lease acquisition");
+  };
+  assert_eq!(reservation, Some(SeqRange { start: 8, end: 8 }));
+  Ok(())
 }
 
 #[tokio::test]
@@ -965,7 +1067,7 @@ async fn lease_assignment_retries_held_partition_before_heartbeat() -> Result<()
     topic: "telemetry".into(),
     virtual_partition_id: virtual_partition_for_logical(0, partition_count, 0),
   };
-  lease_store
+  let LeaseAcquireOutcome::Acquired(old_lease) = lease_store
     .acquire_lease(
       key.clone(),
       "old-node".to_string(),
@@ -973,7 +1075,10 @@ async fn lease_assignment_retries_held_partition_before_heartbeat() -> Result<()
       initial_time,
       Duration::seconds(60),
     )
-    .await?;
+    .await?
+  else {
+    panic!("expected old owner lease acquisition");
+  };
 
   let mut config = WriteConfig::with_defaults();
   config.lease_duration = Duration::seconds(60);
@@ -1001,7 +1106,12 @@ async fn lease_assignment_retries_held_partition_before_heartbeat() -> Result<()
 
   time_provider.wait_until_sleeping(2).await;
   lease_store
-    .release_lease(&key, "old-node", "old-session", initial_time)
+    .release_lease(
+      &key,
+      &old_lease.fence,
+      initial_time,
+      LeaseReleaseSequenceProgress::Preserve,
+    )
     .await?;
   time_provider.advance(Duration::milliseconds(250));
 
@@ -1033,7 +1143,7 @@ async fn lease_assignment_does_not_retry_held_partition_on_early_heartbeat() -> 
     topic: "telemetry".into(),
     virtual_partition_id: virtual_partition_for_logical(0, partition_count, 0),
   };
-  lease_store
+  let LeaseAcquireOutcome::Acquired(old_lease) = lease_store
     .acquire_lease(
       key.clone(),
       "old-node".to_string(),
@@ -1041,7 +1151,10 @@ async fn lease_assignment_does_not_retry_held_partition_on_early_heartbeat() -> 
       initial_time,
       Duration::seconds(60),
     )
-    .await?;
+    .await?
+  else {
+    panic!("expected old owner lease acquisition");
+  };
 
   let mut config = WriteConfig::with_defaults();
   config.lease_duration = Duration::seconds(60);
@@ -1069,7 +1182,12 @@ async fn lease_assignment_does_not_retry_held_partition_on_early_heartbeat() -> 
 
   time_provider.wait_until_sleeping(2).await;
   lease_store
-    .release_lease(&key, "old-node", "old-session", initial_time)
+    .release_lease(
+      &key,
+      &old_lease.fence,
+      initial_time,
+      LeaseReleaseSequenceProgress::Preserve,
+    )
     .await?;
 
   tokio::time::advance(StdDuration::from_millis(10)).await;
@@ -1216,98 +1334,6 @@ async fn shutdown_releases_currently_owned_leases() -> Result<()> {
     tokio::time::sleep(StdDuration::from_millis(20)).await;
   }
   assert!(released, "shutdown did not release leases promptly");
-
-  Ok(())
-}
-
-#[tokio::test]
-async fn reconciliation_releases_a_tracked_legacy_lease_outside_the_assignment() -> Result<()> {
-  let now = offset_datetime_from_unix_millis(1_000);
-  let time_provider = Arc::new(ManualTimeProvider::new(now));
-  let membership = BrokerMembership::new(vec![
-    BrokerNode {
-      node_id: "node-a".into(),
-      address: "10.0.0.1:8080".into(),
-    },
-    BrokerNode {
-      node_id: "node-b".into(),
-      address: "10.0.0.2:8080".into(),
-    },
-  ]);
-  let topics = make_topic(2);
-  let assigned_to_a = WriteEngineImpl::owned_virtual_partitions(&topics, 0, "node-a", &membership)
-    .into_iter()
-    .collect::<HashSet<_>>();
-  let unassigned_partition = (0 .. 2)
-    .find(|partition| !assigned_to_a.contains(&(Chars::from("telemetry"), *partition)))
-    .expect("two-node assignment leaves one partition for node-b");
-  let key = ProducerPartitionLeaseKey {
-    topic: "telemetry".into(),
-    virtual_partition_id: unassigned_partition,
-  };
-  let lease_store = Arc::new(InMemoryProducerPartitionLeaseStore::new());
-  let (membership_tx, membership_rx) = watch::channel(BrokerMembership::default());
-  let shutdown_trigger = ComponentShutdownTrigger::default();
-
-  let engine = WriteEngineBuilder::new(
-    WriteConfig::with_defaults(),
-    topics,
-    Arc::new(InMemoryBlobStore::new()),
-    Arc::new(InMemoryMetadataStore::new()),
-    lease_store.clone(),
-    "node-a".to_string(),
-    shutdown_trigger.make_handle(),
-    &metrics_scope(),
-  )
-  .membership_rx(membership_rx)
-  .lease_session_id("session-a".to_string())
-  .time_provider(time_provider.clone())
-  .build()?;
-
-  // Seed the state produced by the old inline path before publishing membership. The partition is
-  // not in node-a's plan, so a delta-only reconciler would never attempt this prompt release.
-  lease_store
-    .acquire_lease(
-      key.clone(),
-      "node-a".to_string(),
-      "session-a".to_string(),
-      now,
-      Duration::seconds(60),
-    )
-    .await?;
-  {
-    let mut state = engine.state.lock();
-    let partition_state = state.partition_state_mut("telemetry", unassigned_partition);
-    partition_state.lease_expiration_at = Some(now + Duration::seconds(60));
-  }
-
-  membership_tx.send(membership)?;
-  assert!(
-    wait_for_all_partitions(|| async {
-      matches!(
-        lease_store
-          .acquire_lease(
-            key.clone(),
-            "node-b".to_string(),
-            "session-b".to_string(),
-            now,
-            Duration::seconds(60),
-          )
-          .await,
-        Ok(LeaseAcquireOutcome::Acquired(_))
-      )
-    })
-    .await,
-    "legacy lease was not released when membership became authoritative"
-  );
-  assert!(
-    engine
-      .state
-      .lock()
-      .partition_state("telemetry", unassigned_partition)
-      .is_none(),
-    "terminal reconciliation must retire state so later heartbeats do not release it again"
-  );
 
   Ok(())
 }

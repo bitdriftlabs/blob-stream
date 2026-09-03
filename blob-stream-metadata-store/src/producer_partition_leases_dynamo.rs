@@ -18,6 +18,7 @@ use crate::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
+  LeaseReleaseSequenceProgress,
   ProducerLeaseFence,
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
@@ -587,24 +588,28 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
   async fn release_lease(
     &self,
     key: &ProducerPartitionLeaseKey,
-    holder_id: &str,
-    lease_session_id: &str,
+    fence: &ProducerLeaseFence,
     now: OffsetDateTime,
+    sequence_progress: LeaseReleaseSequenceProgress,
   ) -> Result<LeaseReleaseOutcome> {
     trace!(
       "producer lease(dynamo) release: table={}, topic={}, partition={}, holder_id={}",
-      self.table_name, key.topic, key.virtual_partition_id, holder_id
+      self.table_name, key.topic, key.virtual_partition_id, fence.holder_id
     );
     let now_ts_ms = unix_millis_from_offset_datetime(now)
       .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
     let mut values = HashMap::new();
     values.insert(
       ":holder".to_string(),
-      AttributeValue::S(holder_id.to_string()),
+      AttributeValue::S(fence.holder_id.clone()),
     );
     values.insert(
       ":session".to_string(),
-      AttributeValue::S(lease_session_id.to_string()),
+      AttributeValue::S(fence.lease_session_id.clone()),
+    );
+    values.insert(
+      ":epoch".to_string(),
+      AttributeValue::N(fence.lease_epoch.to_string()),
     );
     values.insert(
       ":expired".to_string(),
@@ -615,8 +620,27 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer)?.to_string()),
     );
 
-    let update = format!("SET {ATTR_EXPIRES} = :expired, {ATTR_TTL} = :ttl");
-    let condition = format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session");
+    let update = match sequence_progress {
+      LeaseReleaseSequenceProgress::Preserve => {
+        format!("SET {ATTR_EXPIRES} = :expired, {ATTR_TTL} = :ttl")
+      },
+      LeaseReleaseSequenceProgress::Set(Some(max_allocated_seq)) => {
+        values.insert(
+          ":max_allocated_seq".to_string(),
+          AttributeValue::N(max_allocated_seq.to_string()),
+        );
+        format!(
+          "SET {ATTR_EXPIRES} = :expired, {ATTR_TTL} = :ttl, {ATTR_MAX_SEQ} = :max_allocated_seq"
+        )
+      },
+      LeaseReleaseSequenceProgress::Set(None) => {
+        format!("SET {ATTR_EXPIRES} = :expired, {ATTR_TTL} = :ttl REMOVE {ATTR_MAX_SEQ}")
+      },
+    };
+    let condition = format!(
+      "{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EPOCH} = :epoch AND \
+       {ATTR_EXPIRES} > :expired"
+    );
     let response = retry_dynamo_transaction_conflicts(
       "producer_lease_release",
       || {

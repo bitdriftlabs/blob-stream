@@ -41,9 +41,11 @@ use blob_stream_metadata_store::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
+  LeaseReleaseSequenceProgress,
   MetadataReadConsistency,
   MetadataStore,
   MetadataWriteResult,
+  ProducerLeaseFence,
   ProducerPartitionFence,
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
@@ -479,13 +481,13 @@ impl ProducerPartitionLeaseStore for GatedReservationLeaseStore {
   async fn release_lease(
     &self,
     key: &ProducerPartitionLeaseKey,
-    holder_id: &str,
-    lease_session_id: &str,
+    fence: &ProducerLeaseFence,
     now: OffsetDateTime,
+    sequence_progress: LeaseReleaseSequenceProgress,
   ) -> Result<LeaseReleaseOutcome> {
     self
       .inner
-      .release_lease(key, holder_id, lease_session_id, now)
+      .release_lease(key, fence, now, sequence_progress)
       .await
   }
 }
@@ -593,13 +595,13 @@ impl ProducerPartitionLeaseStore for GatedLeaseAcquireStore {
   async fn release_lease(
     &self,
     key: &ProducerPartitionLeaseKey,
-    holder_id: &str,
-    lease_session_id: &str,
+    fence: &ProducerLeaseFence,
     now: OffsetDateTime,
+    sequence_progress: LeaseReleaseSequenceProgress,
   ) -> Result<LeaseReleaseOutcome> {
     self
       .inner
-      .release_lease(key, holder_id, lease_session_id, now)
+      .release_lease(key, fence, now, sequence_progress)
       .await
   }
 }
@@ -680,9 +682,9 @@ impl ProducerPartitionLeaseStore for GatedLeaseReleaseStore {
   async fn release_lease(
     &self,
     key: &ProducerPartitionLeaseKey,
-    holder_id: &str,
-    lease_session_id: &str,
+    fence: &ProducerLeaseFence,
     now: OffsetDateTime,
+    sequence_progress: LeaseReleaseSequenceProgress,
   ) -> Result<LeaseReleaseOutcome> {
     if self.fail_next.swap(false, Ordering::AcqRel) {
       if let Some(failed_tx) = &self.failed_tx {
@@ -706,7 +708,7 @@ impl ProducerPartitionLeaseStore for GatedLeaseReleaseStore {
     }
     self
       .inner
-      .release_lease(key, holder_id, lease_session_id, now)
+      .release_lease(key, fence, now, sequence_progress)
       .await
   }
 }
@@ -890,7 +892,8 @@ async fn produce_rejects_stale_local_allocation_after_membership_handoff() -> Re
 }
 
 #[tokio::test]
-async fn foreground_acquire_completed_after_membership_handoff_is_released() -> Result<()> {
+async fn foreground_acquire_completed_after_membership_handoff_reclaims_its_reservation()
+-> Result<()> {
   let initial_time = offset_datetime_from_unix_millis(1_700_000_000_000);
   let time_provider = Arc::new(ManualTimeProvider::new(initial_time));
   let shutdown_trigger = ComponentShutdownTrigger::default();
@@ -939,6 +942,9 @@ async fn foreground_acquire_completed_after_membership_handoff_is_released() -> 
     .get_lease(&key)
     .await?
     .expect("initial maintenance lease was not acquired");
+  let initial_high_watermark = initial_lease
+    .max_allocated_seq
+    .expect("initial maintenance lease must reserve sequences");
   time_provider.advance(initial_lease.lease_expiration_at - time_provider.now());
   lease_store.block_next.store(true, Ordering::Release);
 
@@ -1005,18 +1011,31 @@ async fn foreground_acquire_completed_after_membership_handoff_is_released() -> 
       .is_none(),
     "handoff release did not retire the stale foreground state"
   );
-  assert!(matches!(
-    inner
-      .acquire_lease(
-        key,
-        "node-b".to_string(),
-        "session-b".to_string(),
-        time_provider.now(),
-        TimeDuration::seconds(60),
-      )
-      .await?,
-    LeaseAcquireOutcome::Acquired(_)
-  ));
+  let LeaseAcquireAndReserveOutcome::Acquired {
+    reservation: Some(reservation),
+    ..
+  } = inner
+    .acquire_lease_and_reserve_sequences(
+      key,
+      "node-b".to_string(),
+      "session-b".to_string(),
+      time_provider.now(),
+      TimeDuration::seconds(60),
+      Some(1),
+    )
+    .await?
+  else {
+    panic!("node-b did not acquire the released lease and reserve sequences");
+  };
+  // The expired initial lease can retain its own unused tail, but the successful acquisition
+  // that raced this handoff did not assign any record and must not add another gap.
+  assert_eq!(
+    reservation,
+    SeqRange {
+      start: initial_high_watermark + 1,
+      end: initial_high_watermark + 1,
+    }
+  );
 
   shutdown_trigger.shutdown().await;
   Ok(())
@@ -1105,7 +1124,7 @@ async fn maintenance_success_clears_retry_after_foreground_acquisition() -> Resu
     topic: "telemetry".into(),
     virtual_partition_id: 0,
   };
-  inner
+  let LeaseAcquireOutcome::Acquired(old_lease) = inner
     .acquire_lease(
       key.clone(),
       "old-node".to_string(),
@@ -1113,7 +1132,10 @@ async fn maintenance_success_clears_retry_after_foreground_acquisition() -> Resu
       initial_time,
       TimeDuration::seconds(60),
     )
-    .await?;
+    .await?
+  else {
+    panic!("expected old owner lease acquisition");
+  };
   let engine = make_engine_with_membership_and_lease_store(
     time_provider.clone(),
     membership_rx,
@@ -1132,7 +1154,12 @@ async fn maintenance_success_clears_retry_after_foreground_acquisition() -> Resu
     1
   );
   inner
-    .release_lease(&key, "old-node", "old-session", initial_time)
+    .release_lease(
+      &key,
+      &old_lease.fence,
+      initial_time,
+      LeaseReleaseSequenceProgress::Preserve,
+    )
     .await?;
   engine
     .produce_batch(WriteRequest {
@@ -1915,6 +1942,7 @@ fn nonadjacent_reservation_replaces_remaining_capacity() {
   let mut allocator = super::state::SeqAllocator {
     reservation: Some(SeqRange { start: 0, end: 9 }),
     next_seq: 5,
+    used_high_watermark: Some(4),
   };
 
   allocator.install_or_extend_reservation(SeqRange { start: 20, end: 29 });
@@ -2604,6 +2632,62 @@ async fn same_partition_requests_serialize_sequence_reservations() -> Result<()>
   let second = second.await??;
   assert_eq!(first.seq_range, SeqRange { start: 0, end: 0 });
   assert_eq!(second.seq_range, SeqRange { start: 1, end: 1 });
+  Ok(())
+}
+
+#[tokio::test]
+async fn request_spans_adjacent_reservations_without_a_sequence_gap() -> Result<()> {
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  config.reservation_size = 2;
+  let (engine, _metadata_store) =
+    make_engine(time_provider, config, shutdown_trigger.make_handle())?;
+
+  let first = engine
+    .produce_batch(WriteRequest {
+      topic: "telemetry".into(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![1], 10)],
+    })
+    .await?;
+  let second = engine
+    .produce_batch(WriteRequest {
+      topic: "telemetry".into(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![2], 20), new_record(vec![3], 21)],
+    })
+    .await?;
+
+  assert_eq!(first.seq_range, SeqRange { start: 0, end: 0 });
+  assert_eq!(second.seq_range, SeqRange { start: 1, end: 2 });
+  Ok(())
+}
+
+#[tokio::test]
+async fn initial_request_larger_than_the_reservation_size_has_no_sequence_gap() -> Result<()> {
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1;
+  config.reservation_size = 1;
+  let (engine, _metadata_store) =
+    make_engine(time_provider, config, shutdown_trigger.make_handle())?;
+
+  let response = engine
+    .produce_batch(WriteRequest {
+      topic: "telemetry".into(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![1], 10), new_record(vec![2], 11)],
+    })
+    .await?;
+
+  assert_eq!(response.seq_range, SeqRange { start: 0, end: 1 });
   Ok(())
 }
 

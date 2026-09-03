@@ -12,9 +12,11 @@
 use super::shared::{ActivePartitionState, ConsumerIteratorMetrics};
 use super::{ConsumerRecord, NextResult};
 use crate::consumer::ConsumerBatch;
+use bd_log_util::warn_every;
 use blob_stream_types::{CommittedSourceCheckpoint, Record, VirtualPartitionId};
 use log::debug;
 use std::collections::{HashMap, HashSet, VecDeque};
+use time::ext::NumericalDuration;
 
 //
 // BufferedBatch
@@ -102,6 +104,12 @@ impl DeliveryState {
             .saturating_sub(u64::try_from(record.payload.len()).unwrap_or(u64::MAX));
           let offset = current_batch.next_offset;
           current_batch.next_offset = current_batch.next_offset.saturating_add(1);
+          record_delivery_offset(
+            active_partitions,
+            current_batch.virtual_partition_id,
+            offset,
+            metrics,
+          );
           record_delivered_source(
             active_partitions,
             current_batch.virtual_partition_id,
@@ -159,6 +167,33 @@ impl DeliveryState {
       .retain(|batch| !partitions.contains(&batch.virtual_partition_id));
     self.buffered_bytes = self.batches.iter().map(prefetched_batch_bytes).sum();
   }
+}
+
+/// Record the application-visible sequence boundary for one partition.
+fn record_delivery_offset(
+  active_partitions: &mut HashMap<VirtualPartitionId, ActivePartitionState>,
+  virtual_partition_id: VirtualPartitionId,
+  offset: u64,
+  metrics: &ConsumerIteratorMetrics,
+) {
+  let Some(partition_state) = active_partitions.get_mut(&virtual_partition_id) else {
+    return;
+  };
+  if let Some(expected_offset) = partition_state
+    .delivery_gap_baseline
+    .and_then(|baseline| baseline.checked_add(1))
+    && offset > expected_offset
+  {
+    let missing_sequences = offset - expected_offset;
+    metrics.delivery_gap_events.inc();
+    warn_every!(
+      15.seconds(),
+      "consumer delivery gap: partition={virtual_partition_id}, \
+       expected_offset={expected_offset}, received_offset={offset}, \
+       missing_sequences={missing_sequences}"
+    );
+  }
+  partition_state.delivery_gap_baseline = Some(offset);
 }
 
 /// Record source provenance in compact consecutive ranges for `store_offset` validation.

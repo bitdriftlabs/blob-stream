@@ -2,9 +2,9 @@
 #[path = "./allocation_test.rs"]
 mod tests;
 
-use super::state::WriteState;
+use super::state::{UninstalledLeaseAcquisition, WriteState};
 use crate::write::buffer::FlushCompletionError;
-use blob_stream_metadata_store::ProducerPartitionLease;
+use blob_stream_metadata_store::{LeaseReleaseSequenceProgress, ProducerPartitionLease};
 use blob_stream_types::{SeqRange, VirtualPartitionId};
 use log::trace;
 use parking_lot::Mutex;
@@ -23,6 +23,7 @@ pub(super) struct AllocationTransition {
   topic: String,
   virtual_partition_id: VirtualPartitionId,
   assignment_generation: u64,
+  lease_was_expired: bool,
   reset_sequence_allocation_on_finish: bool,
   finished: bool,
 }
@@ -124,6 +125,30 @@ impl AllocationTransition {
             .records_allocated_since_lease_maintenance
             .saturating_sub(records_allocated_since_last_maintenance);
         }
+      } else if let Some(lease) = lease {
+        // An acquisition can cross a membership handoff:
+        // 1. This transition starts its remote acquire while this broker owns the partition.
+        // 2. Membership revokes the partition and starts its drain/release task.
+        // 3. The remote acquire succeeds, but this generation is no longer authorized to install
+        //    its fence or return records to the producer.
+        //
+        // The release task waits for this transition. A live lease's existing allocator has only
+        // assigned sequences through its used watermark, so reclaim both its unused tail and the
+        // returned reservation. After expiry, retain the earlier durable watermark because that
+        // tail may no longer be known safe to reuse.
+        let sequence_progress = if self.lease_was_expired {
+          reservation
+            .as_ref()
+            .map_or(LeaseReleaseSequenceProgress::Preserve, |reservation| {
+              LeaseReleaseSequenceProgress::Set(reservation.start.checked_sub(1))
+            })
+        } else {
+          LeaseReleaseSequenceProgress::Set(partition_state.seq_allocator.used_high_watermark())
+        };
+        partition_state.uninstalled_lease_acquisition = Some(UninstalledLeaseAcquisition {
+          fence: lease.fence,
+          sequence_progress,
+        });
       }
       partition_state.allocation_in_flight = false;
       partition_state.allocation_started_at = None;
@@ -293,7 +318,12 @@ pub(super) fn begin_allocation_transition(
         partition_state.reservation_target(base_reservation_size)
       },
     };
-    Some(ReservationRequest { size, reason })
+    Some(ReservationRequest {
+      // A request is assigned one contiguous sequence range. An initial reservation must cover
+      // the whole request; later adjacent reservations extend the current range before allocation.
+      size: size.max(record_count),
+      reason,
+    })
   } else if renew_lease && remaining_capacity < records_allocated_since_last_maintenance {
     // Grow only when a new window is needed. High utilization then doubles the next window so
     // normal burst timing relative to maintenance cannot delay convergence indefinitely.
@@ -308,7 +338,10 @@ pub(super) fn begin_allocation_transition(
         ReservationReason::MaintenanceTopUp,
       )
     };
-    Some(ReservationRequest { size, reason })
+    Some(ReservationRequest {
+      size: size.max(record_count),
+      reason,
+    })
   } else {
     None
   };
@@ -340,6 +373,7 @@ pub(super) fn begin_allocation_transition(
       topic: topic.to_string(),
       virtual_partition_id,
       assignment_generation,
+      lease_was_expired,
       reset_sequence_allocation_on_finish: lease_was_expired,
       finished: false,
     },

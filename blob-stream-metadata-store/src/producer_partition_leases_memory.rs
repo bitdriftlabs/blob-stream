@@ -7,6 +7,7 @@ use crate::{
   LeaseAcquireOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
+  LeaseReleaseSequenceProgress,
   ProducerLeaseFence,
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
@@ -223,13 +224,13 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
   async fn release_lease(
     &self,
     key: &ProducerPartitionLeaseKey,
-    holder_id: &str,
-    lease_session_id: &str,
+    fence: &ProducerLeaseFence,
     now: OffsetDateTime,
+    sequence_progress: LeaseReleaseSequenceProgress,
   ) -> Result<LeaseReleaseOutcome> {
     trace!(
       "producer lease(memory) release: topic={}, partition={}, holder_id={}",
-      key.topic, key.virtual_partition_id, holder_id
+      key.topic, key.virtual_partition_id, fence.holder_id
     );
     let mut guard = self.leases.write();
     let Some(mut state) = guard.get(key).cloned() else {
@@ -240,12 +241,18 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       return Ok(LeaseReleaseOutcome::Expired);
     }
 
-    if state.holder_id != holder_id || state.lease_session_id != lease_session_id {
+    if state.holder_id != fence.holder_id
+      || state.lease_epoch != fence.lease_epoch
+      || state.lease_session_id != fence.lease_session_id
+    {
       return Ok(LeaseReleaseOutcome::HeldByOther(
         state.to_lease(key.clone()),
       ));
     }
 
+    if let LeaseReleaseSequenceProgress::Set(max_allocated_seq) = sequence_progress {
+      state.max_allocated_seq = max_allocated_seq;
+    }
     state.lease_expiration_at = now;
     guard.insert(key.clone(), state);
     Ok(LeaseReleaseOutcome::Released)
