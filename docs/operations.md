@@ -172,7 +172,9 @@ reassigned owner consumes on its first new cursor commit.
    ```
 
 4. Verify every response is `armed` or already `already_armed`, then perform a rolling restart of
-   the affected consumers. Do not expect the current owner to reset during the same process.
+   the affected consumers. A per-partition `failed` result includes its storage error; re-run the
+   preview and resolve that row before restarting. Do not expect the current owner to reset during
+   the same process.
 5. Watch `GET /state`: a new owner first reports the `fresh` reader mode at the target window, then
    recovers every retained window through its current cutover before switching to `fast`. Restart
    promptly to minimize this bounded recovery. Once it commits newly processed data, the marker

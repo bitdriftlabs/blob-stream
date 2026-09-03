@@ -2691,6 +2691,7 @@ async fn consumer_restart_fresh_start_marker_replaces_poisoned_cursor() -> Resul
     loop {
       match timeout(Duration::from_millis(250), consumer_a.next()).await {
         Err(_) => {
+          consumer_time.wait_until_sleeping(1).await;
           consumer_time.advance(TimeDuration::seconds(1));
           tokio::task::yield_now().await;
         },
@@ -2834,6 +2835,7 @@ async fn consumer_restart_fresh_start_marker_replaces_poisoned_cursor() -> Resul
     loop {
       match timeout(Duration::from_millis(250), consumer_b.next()).await {
         Err(_) => {
+          consumer_time.wait_until_sleeping(1).await;
           consumer_time.advance(TimeDuration::seconds(1));
           tokio::task::yield_now().await;
         },

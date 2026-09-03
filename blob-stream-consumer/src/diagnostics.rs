@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "./diagnostics_test.rs"]
+mod tests;
+
 use crate::config::ConsumerGroupConfig;
 use crate::iterator::{ConsumerDeliveryState, ConsumerSharedState};
 use blob_stream_metadata_store::{
@@ -601,14 +605,14 @@ impl ConsumerDiagnostics {
         continue;
       }
       let marker_id = uuid::Uuid::new_v4().to_string();
-      let outcome = self
+      let result = self
         .lease_store
         .arm_next_window_fresh_start(&key, self.metadata_window_size, marker_id, now)
-        .await?;
-      results.push(ConsumerArmFreshStartResult::from_arm_outcome(
-        virtual_partition_id,
-        outcome,
-      ));
+        .await;
+      results.push(match result {
+        Ok(outcome) => ConsumerArmFreshStartResult::from_arm_outcome(virtual_partition_id, outcome),
+        Err(error) => ConsumerArmFreshStartResult::from_arm_error(virtual_partition_id, &error),
+      });
     }
     Ok(results)
   }
@@ -624,6 +628,8 @@ pub struct ConsumerArmFreshStartResult {
   pub virtual_partition_id: VirtualPartitionId,
   pub outcome: ConsumerArmFreshStartResultOutcome,
   pub target_window_start: Option<OffsetDateTime>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -635,6 +641,7 @@ pub enum ConsumerArmFreshStartResultOutcome {
   MissingSourceCheckpoint,
   MissingLease,
   WouldArm,
+  Failed,
 }
 
 impl ConsumerArmFreshStartResult {
@@ -649,6 +656,7 @@ impl ConsumerArmFreshStartResult {
         target_window_start: lease
           .fresh_start_marker
           .map(|marker| offset_datetime_from_unix_seconds(marker.target_window_start_unix_seconds)),
+        error: None,
       },
       ConsumerGroupArmFreshStartOutcome::AlreadyArmed(lease) => Self {
         virtual_partition_id,
@@ -656,16 +664,19 @@ impl ConsumerArmFreshStartResult {
         target_window_start: lease
           .fresh_start_marker
           .map(|marker| offset_datetime_from_unix_seconds(marker.target_window_start_unix_seconds)),
+        error: None,
       },
       ConsumerGroupArmFreshStartOutcome::MissingSourceCheckpoint(_) => Self {
         virtual_partition_id,
         outcome: ConsumerArmFreshStartResultOutcome::MissingSourceCheckpoint,
         target_window_start: None,
+        error: None,
       },
       ConsumerGroupArmFreshStartOutcome::MissingLease => Self {
         virtual_partition_id,
         outcome: ConsumerArmFreshStartResultOutcome::MissingLease,
         target_window_start: None,
+        error: None,
       },
     }
   }
@@ -680,6 +691,7 @@ impl ConsumerArmFreshStartResult {
         virtual_partition_id,
         outcome: ConsumerArmFreshStartResultOutcome::MissingLease,
         target_window_start: None,
+        error: None,
       });
     };
     if let Some(marker) = lease.fresh_start_marker {
@@ -689,6 +701,7 @@ impl ConsumerArmFreshStartResult {
         target_window_start: Some(offset_datetime_from_unix_seconds(
           marker.target_window_start_unix_seconds,
         )),
+        error: None,
       });
     }
     let Some(source_checkpoint) = lease
@@ -699,6 +712,7 @@ impl ConsumerArmFreshStartResult {
         virtual_partition_id,
         outcome: ConsumerArmFreshStartResultOutcome::MissingSourceCheckpoint,
         target_window_start: None,
+        error: None,
       });
     };
     let target_window_start = source_checkpoint
@@ -709,7 +723,17 @@ impl ConsumerArmFreshStartResult {
       virtual_partition_id,
       outcome: ConsumerArmFreshStartResultOutcome::WouldArm,
       target_window_start: Some(offset_datetime_from_unix_seconds(target_window_start)),
+      error: None,
     })
+  }
+
+  fn from_arm_error(virtual_partition_id: VirtualPartitionId, error: &anyhow::Error) -> Self {
+    Self {
+      virtual_partition_id,
+      outcome: ConsumerArmFreshStartResultOutcome::Failed,
+      target_window_start: None,
+      error: Some(format!("{error:#}")),
+    }
   }
 }
 
