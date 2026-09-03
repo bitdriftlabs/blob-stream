@@ -1,6 +1,6 @@
 use super::buffer::{BufferState, FlushPublicationDependency};
 use blob_stream_broker_discovery::BrokerMembership;
-use blob_stream_metadata_store::{LeaseReleaseSequenceProgress, ProducerLeaseFence};
+use blob_stream_metadata_store::ProducerLeaseFence;
 use blob_stream_types::{SeqRange, VirtualPartitionId};
 use log::debug;
 use protobuf::Chars;
@@ -215,7 +215,6 @@ pub(super) struct PartitionState {
   pub(super) records_allocated_since_lease_maintenance: u64,
   pub(super) lease_expiration_at: Option<OffsetDateTime>,
   pub(super) lease_fence: Option<Arc<ProducerLeaseFence>>,
-  pub(super) uninstalled_lease_acquisition: Option<UninstalledLeaseAcquisition>,
   pub(super) publication_tail: Option<FlushPublicationDependency>,
   pub(super) outstanding_flushes: usize,
   pub(super) allocation_in_flight: bool,
@@ -223,16 +222,6 @@ pub(super) struct PartitionState {
   pub(super) allocation_notify: Arc<Notify>,
   pub(super) draining: bool,
   pub(super) drain_notify: Arc<Notify>,
-}
-
-//
-// UninstalledLeaseAcquisition
-//
-
-#[derive(Debug)]
-pub(super) struct UninstalledLeaseAcquisition {
-  pub(super) fence: ProducerLeaseFence,
-  pub(super) sequence_progress: LeaseReleaseSequenceProgress,
 }
 
 impl PartitionState {
@@ -265,7 +254,6 @@ impl PartitionState {
 
   pub(super) fn reset_sequence_allocation(&mut self) {
     self.seq_allocator = SeqAllocator::default();
-    self.uninstalled_lease_acquisition = None;
     self.adaptive_reservation_size = None;
     self.records_allocated_since_lease_maintenance = 0;
   }
@@ -279,7 +267,6 @@ impl PartitionState {
 pub(super) struct SeqAllocator {
   pub(super) reservation: Option<SeqRange>,
   pub(super) next_seq: u64,
-  pub(super) used_high_watermark: Option<u64>,
 }
 
 impl SeqAllocator {
@@ -315,18 +302,12 @@ impl SeqAllocator {
     let start = self.next_seq;
     let end = start.checked_add(count.saturating_sub(1))?;
     self.next_seq = end.saturating_add(1);
-    self.used_high_watermark = Some(end);
     Some(SeqRange { start, end })
-  }
-
-  pub(super) fn used_high_watermark(&self) -> Option<u64> {
-    self.reservation.as_ref().and(self.used_high_watermark)
   }
 
   pub(super) fn install_or_extend_reservation(&mut self, range: SeqRange) {
     if self.reservation.is_none() {
       self.next_seq = range.start;
-      self.used_high_watermark = range.start.checked_sub(1);
       self.reservation = Some(range);
       return;
     }
@@ -350,10 +331,6 @@ impl SeqAllocator {
          previous_end={}, replacement_start={}, replacement_end={}",
         reservation.start, reservation.end, range.start, range.end
       );
-      self.used_high_watermark = match (self.used_high_watermark, range.start.checked_sub(1)) {
-        (Some(previous), Some(new_minimum)) => Some(previous.max(new_minimum)),
-        (previous, new_minimum) => previous.or(new_minimum),
-      };
     }
 
     self.next_seq = range.start;

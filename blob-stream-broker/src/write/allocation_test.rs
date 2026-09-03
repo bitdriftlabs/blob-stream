@@ -8,7 +8,6 @@ use super::{
 use crate::write::buffer::{BufferedBatch, FlushCompletionError};
 use crate::write::state::WriteState;
 use blob_stream_metadata_store::{
-  LeaseReleaseSequenceProgress,
   ProducerLeaseFence,
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
@@ -62,7 +61,6 @@ fn fence_change_discards_buffered_batches_and_completes_them() {
     topic: "telemetry".to_string(),
     virtual_partition_id: 0,
     assignment_generation: 1,
-    lease_was_expired: false,
     reset_sequence_allocation_on_finish: true,
     finished: false,
   }
@@ -187,61 +185,6 @@ fn stale_assignment_completion_discards_lease_and_reservation() {
   assert!(partition_state.lease_fence.is_none());
   assert!(partition_state.seq_allocator.reservation.is_none());
   assert!(!partition_state.allocation_in_flight);
-}
-
-#[test]
-fn stale_live_lease_maintenance_reclaims_the_existing_unused_tail() {
-  let state = state_with_local_telemetry_assignment();
-  let now = offset_datetime_from_unix_millis(1_000);
-  {
-    let mut state = state.lock();
-    let partition_state = state.partition_state_mut("telemetry", 0);
-    partition_state.lease_expiration_at = Some(now + time::Duration::seconds(60));
-    partition_state
-      .seq_allocator
-      .install_or_extend_reservation(SeqRange { start: 0, end: 9 });
-    assert_eq!(
-      partition_state.seq_allocator.allocate(8),
-      Some(SeqRange { start: 0, end: 7 })
-    );
-    partition_state.records_allocated_since_lease_maintenance = 8;
-  }
-  let AllocationTransitionDecision::Claimed(transition) =
-    begin_allocation_transition(&state, "telemetry", 0, 1, now, true, 10)
-  else {
-    panic!("high-utilization maintenance must claim allocation");
-  };
-  assert!(!transition.lease_was_expired);
-  assert_eq!(transition.reservation.expect("must top up").size, 20);
-
-  state.lock().publish_assignment(&[]);
-  let finish = transition.transition.finish_lease_maintenance(
-    LeaseExpirationUpdate::Set(Some(now + time::Duration::seconds(60))),
-    Some(ProducerPartitionLease {
-      key: ProducerPartitionLeaseKey {
-        topic: "telemetry".into(),
-        virtual_partition_id: 0,
-      },
-      fence: fence(1),
-      lease_expiration_at: now + time::Duration::seconds(60),
-      max_allocated_seq: Some(29),
-    }),
-    Some(SeqRange { start: 10, end: 29 }),
-    8,
-  );
-
-  assert_eq!(finish, AllocationTransitionFinish::StaleAssignment);
-  assert_eq!(
-    state
-      .lock()
-      .partition_state("telemetry", 0)
-      .expect("draining partition state must remain until release")
-      .uninstalled_lease_acquisition
-      .as_ref()
-      .expect("stale acquisition must retain a release fence")
-      .sequence_progress,
-    LeaseReleaseSequenceProgress::Set(Some(7))
-  );
 }
 
 #[test]

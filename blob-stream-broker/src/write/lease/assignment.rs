@@ -25,7 +25,6 @@ use blob_stream_metadata_store::{
   LeaseAcquireAndReserveOutcome,
   LeaseHeartbeatOutcome,
   LeaseReleaseOutcome,
-  LeaseReleaseSequenceProgress,
   ProducerPartitionLeaseKey,
 };
 use blob_stream_types::VirtualPartitionId;
@@ -326,10 +325,9 @@ impl WriteEngineImpl {
             );
           }
 
-          // Reconcile both calculated ownership loss and locally tracked state. An asynchronous
-          // acquisition can succeed after this membership update fenced its local authorization,
-          // leaving a tracked release to perform even though the partition is absent from the
-          // calculated assignment delta.
+          // Reconcile both calculated ownership loss and locally tracked state. The latter catches
+          // leases created by old versions of the inline path, which were never in the assignment
+          // delta and would otherwise survive until TTL expiry.
           let lost_partitions = lost_partitions
             .into_iter()
             .map(|(topic, virtual_partition_id)| {
@@ -741,49 +739,19 @@ impl WriteEngineImpl {
         .await;
     }
 
-    // The drain barrier proves every assigned sequence has either reached a terminal flush
-    // outcome or has been rejected. Reuse this fence and watermark for retries so a stale
-    // release cannot lower a successor's reservation.
-    let release = {
-      let state = state.lock();
-      state
-        .partition_state(topic.as_str(), virtual_partition_id)
-        .and_then(|partition_state| {
-          partition_state
-            .uninstalled_lease_acquisition
-            .as_ref()
-            .map_or_else(
-              || {
-                partition_state.lease_fence.as_ref().map(|lease_fence| {
-                  let sequence_progress = if partition_state.seq_allocator.has_reservation() {
-                    LeaseReleaseSequenceProgress::Set(
-                      partition_state.seq_allocator.used_high_watermark(),
-                    )
-                  } else {
-                    LeaseReleaseSequenceProgress::Preserve
-                  };
-                  ((**lease_fence).clone(), sequence_progress)
-                })
-              },
-              |acquisition| Some((acquisition.fence.clone(), acquisition.sequence_progress)),
-            )
-        })
-    };
-    let Some((mut release_fence, mut sequence_progress)) = release else {
-      let mut state = state.lock();
-      state.clear_terminally_released_partition(topic, virtual_partition_id);
-      return;
-    };
-
     // A release error leaves the remote mutation outcome unknown. Retain the task and retry the
     // same conditional operation until the store reports Released, Expired, or HeldByOther.
     let mut release_retry = LeaseRetrySchedule::new(time_provider.now());
     loop {
       match lease_store
-        .release_lease(&key, &release_fence, time_provider.now(), sequence_progress)
+        .release_lease(&key, holder_id, lease_session_id, time_provider.now())
         .await
       {
-        Ok(LeaseReleaseOutcome::Released | LeaseReleaseOutcome::Expired) => {
+        Ok(
+          LeaseReleaseOutcome::Released
+          | LeaseReleaseOutcome::Expired
+          | LeaseReleaseOutcome::HeldByOther(_),
+        ) => {
           // Clear local lease/allocator state immediately to avoid accepting writes based on stale
           // in-memory lease data after ownership moved away. Retire terminally released unassigned
           // state so defensive reconciliation does not perform a release on every heartbeat.
@@ -801,20 +769,6 @@ impl WriteEngineImpl {
              topic={topic}, virtual_partition_id={virtual_partition_id}",
             release_reason.as_str(),
           );
-          return;
-        },
-        Ok(LeaseReleaseOutcome::HeldByOther(lease))
-          if lease.fence.holder_id == holder_id
-            && lease.fence.lease_session_id == lease_session_id =>
-        {
-          // An acquisition replaced the local fence after the drain snapshot. Its reservation
-          // was never installed, so retain the durable watermark when retrying its new fence.
-          release_fence = lease.fence;
-          sequence_progress = LeaseReleaseSequenceProgress::Preserve;
-        },
-        Ok(LeaseReleaseOutcome::HeldByOther(_)) => {
-          let mut state = state.lock();
-          state.clear_terminally_released_partition(topic, virtual_partition_id);
           return;
         },
         Err(error) => {
