@@ -252,18 +252,24 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
       ));
     }
 
+    let marker_matches = consumed_fresh_start_marker_id
+      .as_ref()
+      .is_none_or(|marker_id| {
+        committed_cursor.is_some()
+          && state
+            .fresh_start_marker
+            .as_ref()
+            .is_some_and(|marker| marker.marker_id == *marker_id)
+      });
+    if !marker_matches {
+      return Err(anyhow!("fresh start marker changed before cursor commit"));
+    }
+
     state.lease_expiration_ts_ms = expires_at(now_ts_ms, lease_duration_ms)?;
     state.last_heartbeat_ts_ms = now_ts_ms;
 
     if let Some(cursor) = committed_cursor {
-      if let Some(marker_id) = consumed_fresh_start_marker_id {
-        let marker_matches = state
-          .fresh_start_marker
-          .as_ref()
-          .is_some_and(|marker| marker.marker_id == marker_id);
-        if !marker_matches {
-          return Err(anyhow!("fresh start marker changed before cursor commit"));
-        }
+      if consumed_fresh_start_marker_id.is_some() {
         state.fresh_start_marker = None;
       }
       state.committed_cursor = Some(cursor);

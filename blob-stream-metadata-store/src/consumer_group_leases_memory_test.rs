@@ -287,6 +287,30 @@ async fn fresh_start_marker_survives_normal_commit_and_requires_matching_consump
       && marker.target_window_start_unix_seconds == 1_500
   ));
 
+  let error = store
+    .heartbeat_partition_consuming_fresh_start_marker(
+      &key,
+      "member-a",
+      1,
+      offset_datetime_from_unix_millis(1_025),
+      Duration::milliseconds(100),
+      Some(cursor(key.virtual_partition_id, 11)),
+      Some("marker-b".to_string()),
+    )
+    .await
+    .expect_err("mismatched marker must reject the heartbeat atomically");
+  assert!(error.to_string().contains("fresh start marker changed"));
+  let lease = store
+    .list_group_leases("topic-a", "group-a")
+    .await
+    .expect("list retained lease")
+    .into_iter()
+    .next()
+    .expect("retained lease");
+  assert_eq!(lease.lease_expiration_ts_ms, 1_100);
+  assert_eq!(lease.last_heartbeat_ts_ms, 1_000);
+  assert!(lease.fresh_start_marker.is_some());
+
   let normal_commit = store
     .commit_cursor(
       &key,

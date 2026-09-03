@@ -431,6 +431,22 @@ async fn fresh_start_marker_persists_until_matching_cursor_commit() -> Result<()
   };
   assert!(lease.fresh_start_marker.is_some());
 
+  let idle_heartbeat = store
+    .heartbeat_partition_consuming_fresh_start_marker(
+      &key,
+      "member-a",
+      1,
+      offset_datetime_from_unix_millis(1_045),
+      TimeDuration::milliseconds(100),
+      None,
+      Some("marker-a".to_string()),
+    )
+    .await?;
+  let ConsumerGroupHeartbeatOutcome::Renewed(lease) = idle_heartbeat else {
+    panic!("expected marker-bearing idle heartbeat to renew");
+  };
+  assert!(lease.fresh_start_marker.is_some());
+
   let reset_commit = store
     .commit_cursor_consuming_fresh_start_marker(
       &key,

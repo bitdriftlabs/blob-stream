@@ -566,7 +566,9 @@ impl ConsumerGroupCoordinatorImpl {
       };
       let member_id = member_id.clone();
       let committed_cursor = cursors.get(&partition_id).cloned();
-      let consumed_fresh_start_marker_id = fresh_start_markers.get(&partition_id).cloned();
+      let consumed_fresh_start_marker_id = committed_cursor
+        .as_ref()
+        .and_then(|_| fresh_start_markers.get(&partition_id).cloned());
       async move {
         let outcome = match operation {
           LeaseMaintenanceOperation::Heartbeat => match lease_store
@@ -627,9 +629,7 @@ impl ConsumerGroupCoordinatorImpl {
       };
       match outcome {
         LeaseMaintenanceOutcome::Renewed(lease) => {
-          if matches!(operation, LeaseMaintenanceOperation::CommitCursor)
-            && lease.fresh_start_marker.is_none()
-          {
+          if lease.fresh_start_marker.is_none() {
             self.fresh_start_markers.remove(&partition_id);
           }
           self.owned.insert(partition_id, lease);
@@ -655,6 +655,7 @@ impl ConsumerGroupCoordinatorImpl {
         },
         LeaseMaintenanceOutcome::Expired => {
           self.owned.remove(&partition_id);
+          self.fresh_start_markers.remove(&partition_id);
           fenced.push(partition_id);
           info!(
             "consumer lease expired before heartbeat: topic={}, group_id={}, partition={}, \
@@ -854,6 +855,8 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
               .fresh_start_markers
               .insert(partition_id, marker.marker_id.clone());
             fresh_start_markers.insert(partition_id, marker);
+          } else if newly_owned {
+            self.fresh_start_markers.remove(&partition_id);
           } else if let Some(committed_cursor) = lease.committed_cursor {
             recovered_cursors.insert(
               partition_id,
@@ -994,10 +997,12 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       match outcome {
         ConsumerGroupReleaseOutcome::Released => {
           self.owned.remove(partition_id);
+          self.fresh_start_markers.remove(partition_id);
           released.push(*partition_id);
         },
         ConsumerGroupReleaseOutcome::HeldByOther(_) | ConsumerGroupReleaseOutcome::Expired => {
           self.owned.remove(partition_id);
+          self.fresh_start_markers.remove(partition_id);
         },
       }
     }

@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "./admin_test.rs"]
+mod tests;
+
 use crate::ConsumerDiagnostics;
 use crate::diagnostics::ConsumerArmFreshStartResult;
 use axum::http::StatusCode;
@@ -8,6 +12,7 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct ArmFreshStartRequest {
+  #[serde(default)]
   confirm_loss: bool,
   #[serde(default)]
   dry_run: bool,

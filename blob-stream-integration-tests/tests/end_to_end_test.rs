@@ -2783,6 +2783,26 @@ async fn consumer_restart_fresh_start_marker_replaces_poisoned_cursor() -> Resul
     recovery_id,
   )
   .await?;
+  consumer_time.advance(TimeDuration::seconds(WINDOW_SIZE_SECONDS));
+  let intermediate_id = "fresh-start-intermediate";
+  let intermediate_ack = produce_message_at_manual_time(
+    &cluster,
+    &producer,
+    consumer_time.as_ref(),
+    b"fresh-start-key".to_vec(),
+    intermediate_id,
+  )
+  .await?;
+  consumer_time.advance(TimeDuration::seconds(WINDOW_SIZE_SECONDS));
+  let live_id = "fresh-start-live";
+  let live_ack = produce_message_at_manual_time(
+    &cluster,
+    &producer,
+    consumer_time.as_ref(),
+    b"fresh-start-key".to_vec(),
+    live_id,
+  )
+  .await?;
 
   let hooks = cluster.lifecycle_hooks();
   let mut replacement_rebalance = hooks
@@ -2807,7 +2827,9 @@ async fn consumer_restart_fresh_start_marker_replaces_poisoned_cursor() -> Resul
   .map_err(|_| anyhow!("fresh-start replacement did not reach rebalance"))??;
   replacement_rebalance.release()?;
 
+  let expected_recovery_ids = HashSet::from([recovery_id, intermediate_id, live_id]);
   let mut recovery_counts = HashMap::new();
+  let mut highest_recovery_offset: Option<u64> = None;
   let recovery_offset = timeout(Duration::from_secs(5), async {
     loop {
       match timeout(Duration::from_millis(250), consumer_b.next()).await {
@@ -2822,7 +2844,7 @@ async fn consumer_restart_fresh_start_marker_replaces_poisoned_cursor() -> Resul
           if id == checkpoint_id {
             return Err(anyhow!("fresh-start replacement replayed checkpoint"));
           }
-          if id != recovery_id {
+          if !expected_recovery_ids.contains(id.as_str()) {
             return Err(anyhow!(
               "fresh-start replacement delivered unexpected record: {id}"
             ));
@@ -2834,16 +2856,39 @@ async fn consumer_restart_fresh_start_marker_replaces_poisoned_cursor() -> Resul
           );
           consumer_b.store_offset(record.virtual_partition_id, record.offset)?;
           consumer_b.commit().await?;
-          return Ok::<_, anyhow::Error>(record.offset);
+          highest_recovery_offset =
+            Some(highest_recovery_offset.map_or(record.offset, |offset| offset.max(record.offset)));
+          if recovery_counts.len() == expected_recovery_ids.len() {
+            return highest_recovery_offset
+              .ok_or_else(|| anyhow!("fresh-start replacement did not record recovery offsets"));
+          }
         },
       }
     }
   })
   .await
   .map_err(|_| anyhow!("fresh-start replacement did not deliver recovery record"))??;
-  assert_eq!(recovery_counts.get(recovery_id), Some(&1));
+  assert!(
+    recovery_counts.values().all(|count| *count == 1),
+    "fresh-start recovery delivered duplicate records: {recovery_counts:?}"
+  );
+  assert_eq!(
+    recovery_counts.keys().cloned().collect::<HashSet<_>>(),
+    expected_recovery_ids
+      .into_iter()
+      .map(str::to_string)
+      .collect()
+  );
   assert_eq!(
     recovery_ack.virtual_partition_id,
+    checkpoint_ack.virtual_partition_id
+  );
+  assert_eq!(
+    intermediate_ack.virtual_partition_id,
+    checkpoint_ack.virtual_partition_id
+  );
+  assert_eq!(
+    live_ack.virtual_partition_id,
     checkpoint_ack.virtual_partition_id
   );
 

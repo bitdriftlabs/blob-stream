@@ -828,8 +828,10 @@ An operator can arm a next-window fresh-start marker for a retained partition wh
 known to be unusable, such as after an externally corrected producer sequence regression. Arming
 derives the target from the committed source checkpoint; callers cannot provide an arbitrary offset
 or timestamp. The marker remains inert in its current process and is applied only after a restart
-or reassignment. Marker arming races normal cursor commits with a conditional checkpoint comparison;
-the caller must retry after inspecting the new lease state if that comparison changes.
+or reassignment. A replacement first scans the target window cursor-free, then recovers every
+retained window through its current cutover before joining the fast path. Marker arming races normal
+cursor commits with a conditional checkpoint comparison; the caller must retry after inspecting the
+new lease state if that comparison changes.
 
 An orderly release writes a durable `graceful_release_ts` marker while expiring the lease. The next
 successful claim removes that marker and classifies its predecessor as either a graceful handoff or

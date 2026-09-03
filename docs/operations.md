@@ -173,8 +173,10 @@ reassigned owner consumes on its first new cursor commit.
 
 4. Verify every response is `armed` or already `already_armed`, then perform a rolling restart of
    the affected consumers. Do not expect the current owner to reset during the same process.
-5. Watch `GET /state`: a new owner first reports the `fresh` reader mode at the target window. Once
-   it commits newly processed data, the marker disappears and the lease's committed cursor advances.
+5. Watch `GET /state`: a new owner first reports the `fresh` reader mode at the target window, then
+   recovers every retained window through its current cutover before switching to `fast`. Restart
+   promptly to minimize this bounded recovery. Once it commits newly processed data, the marker
+   disappears and the lease's committed cursor advances.
 
 `missing_source_checkpoint` means the lease cannot derive a safe next-window target. Investigate or
 rebuild that group instead of deleting the cursor. `missing_lease` means no retained row exists.

@@ -484,15 +484,15 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       AttributeValue::N(ttl_epoch_seconds.to_string()),
     );
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+    if let Some(marker_id) = consumed_fresh_start_marker_id.as_deref() {
+      values.insert(
+        ":marker_id".to_string(),
+        AttributeValue::S(marker_id.to_string()),
+      );
+    }
 
     let update = if let Some(cursor) = committed_cursor {
       values.insert(":cursor".to_string(), Self::cursor_value(&cursor)?);
-      if let Some(marker_id) = consumed_fresh_start_marker_id.as_deref() {
-        values.insert(
-          ":marker_id".to_string(),
-          AttributeValue::S(marker_id.to_string()),
-        );
-      }
       if consumed_fresh_start_marker_id.is_some() {
         format!(
           "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl, \

@@ -570,6 +570,19 @@ impl ConsumerDiagnostics {
     dry_run: bool,
   ) -> Result<Vec<ConsumerArmFreshStartResult>, anyhow::Error> {
     let now = OffsetDateTime::now_utc();
+    let existing_leases = if dry_run {
+      Some(
+        self
+          .lease_store
+          .list_group_leases(&self.group_config.topic, &self.group_config.group_id)
+          .await?
+          .into_iter()
+          .map(|lease| (lease.key.virtual_partition_id, lease))
+          .collect::<HashMap<_, _>>(),
+      )
+    } else {
+      None
+    };
     let mut results = Vec::with_capacity(virtual_partition_ids.len());
     for virtual_partition_id in virtual_partition_ids {
       let key = blob_stream_metadata_store::ConsumerGroupLeaseKey {
@@ -578,15 +591,11 @@ impl ConsumerDiagnostics {
         virtual_partition_id,
       };
       if dry_run {
-        let outcome = self
-          .lease_store
-          .list_group_leases(&key.topic, &key.group_id)
-          .await?
-          .into_iter()
-          .find(|lease| lease.key.virtual_partition_id == virtual_partition_id);
         results.push(ConsumerArmFreshStartResult::from_existing_lease(
           virtual_partition_id,
-          outcome,
+          existing_leases
+            .as_ref()
+            .and_then(|leases| leases.get(&virtual_partition_id).cloned()),
           self.metadata_window_size,
         )?);
         continue;
