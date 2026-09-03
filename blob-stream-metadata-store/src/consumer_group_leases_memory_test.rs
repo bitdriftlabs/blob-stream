@@ -1,4 +1,5 @@
 use crate::{
+  ConsumerGroupArmFreshStartOutcome,
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupCommitOutcome,
   ConsumerGroupHeartbeatOutcome,
@@ -8,7 +9,11 @@ use crate::{
   ConsumerGroupReleaseOutcome,
   InMemoryConsumerGroupLeaseStore,
 };
-use blob_stream_types::{CommittedCursor, offset_datetime_from_unix_millis};
+use blob_stream_types::{
+  CommittedCursor,
+  CommittedSourceCheckpoint,
+  offset_datetime_from_unix_millis,
+};
 use time::Duration;
 
 fn lease_key() -> ConsumerGroupLeaseKey {
@@ -228,6 +233,118 @@ async fn heartbeats_and_commits() {
     lease.committed_cursor,
     Some(cursor(key.virtual_partition_id, 12))
   );
+}
+
+#[tokio::test]
+async fn fresh_start_marker_survives_normal_commit_and_requires_matching_consumption() {
+  let store = InMemoryConsumerGroupLeaseStore::new();
+  let key = lease_key();
+  let committed_cursor = CommittedCursor {
+    virtual_partition_id: key.virtual_partition_id,
+    seq_end: 10,
+    source_checkpoint: Some(CommittedSourceCheckpoint {
+      window_start_unix_seconds: 1_200,
+      snowflake_id: 42,
+    }),
+  };
+
+  store
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      Duration::milliseconds(100),
+    )
+    .await
+    .expect("assign lease");
+  store
+    .commit_cursor(
+      &key,
+      "member-a",
+      1,
+      offset_datetime_from_unix_millis(1_010),
+      committed_cursor,
+    )
+    .await
+    .expect("commit source checkpoint");
+
+  let outcome = store
+    .arm_next_window_fresh_start(
+      &key,
+      Duration::seconds(300),
+      "marker-a".to_string(),
+      offset_datetime_from_unix_millis(1_020),
+    )
+    .await
+    .expect("arm fresh start");
+  let ConsumerGroupArmFreshStartOutcome::Armed(lease) = outcome else {
+    panic!("expected armed marker");
+  };
+  assert!(matches!(
+    lease.fresh_start_marker,
+    Some(ref marker) if marker.marker_id == "marker-a"
+      && marker.target_window_start_unix_seconds == 1_500
+  ));
+
+  let error = store
+    .heartbeat_partition_consuming_fresh_start_marker(
+      &key,
+      "member-a",
+      1,
+      offset_datetime_from_unix_millis(1_025),
+      Duration::milliseconds(100),
+      Some(cursor(key.virtual_partition_id, 11)),
+      Some("marker-b".to_string()),
+    )
+    .await
+    .expect_err("mismatched marker must reject the heartbeat atomically");
+  assert!(error.to_string().contains("fresh start marker changed"));
+  let lease = store
+    .list_group_leases("topic-a", "group-a")
+    .await
+    .expect("list retained lease")
+    .into_iter()
+    .next()
+    .expect("retained lease");
+  assert_eq!(lease.lease_expiration_ts_ms, 1_100);
+  assert_eq!(lease.last_heartbeat_ts_ms, 1_000);
+  assert!(lease.fresh_start_marker.is_some());
+
+  let normal_commit = store
+    .commit_cursor(
+      &key,
+      "member-a",
+      1,
+      offset_datetime_from_unix_millis(1_030),
+      cursor(key.virtual_partition_id, 11),
+    )
+    .await
+    .expect("normal owner commit");
+  let ConsumerGroupCommitOutcome::Committed(lease) = normal_commit else {
+    panic!("expected committed cursor");
+  };
+  assert!(lease.fresh_start_marker.is_some());
+
+  let reset_commit = store
+    .commit_cursor_consuming_fresh_start_marker(
+      &key,
+      "member-a",
+      1,
+      offset_datetime_from_unix_millis(1_040),
+      cursor(key.virtual_partition_id, 1),
+      Some("marker-a".to_string()),
+    )
+    .await
+    .expect("consume fresh-start marker");
+  let ConsumerGroupCommitOutcome::Committed(lease) = reset_commit else {
+    panic!("expected committed cursor");
+  };
+  assert_eq!(
+    lease.committed_cursor,
+    Some(cursor(key.virtual_partition_id, 1))
+  );
+  assert!(lease.fresh_start_marker.is_none());
 }
 
 #[tokio::test]

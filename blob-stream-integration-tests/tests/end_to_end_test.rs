@@ -20,6 +20,7 @@ use blob_stream_consumer::{
 };
 use blob_stream_integration_tests::test_framework::{self as framework, TestConsumerReader};
 use blob_stream_metadata_store::{
+  ConsumerGroupArmFreshStartOutcome,
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupCommitOutcome,
   ConsumerGroupHeartbeatOutcome,
@@ -2628,6 +2629,281 @@ async fn live_group_restart_recovers_retained_history_before_fast_path() -> Resu
     "replacement member did not durably checkpoint retained history",
   )
   .await?;
+
+  consumer_b.shutdown().await?;
+  cluster.shutdown().await;
+  Ok(())
+}
+
+// High-level: verifies a restart consumes a durable fresh-start marker instead of skipping a
+// newly published sequence range below a poisoned cursor.
+#[tokio::test]
+async fn consumer_restart_fresh_start_marker_replaces_poisoned_cursor() -> Result<()> {
+  let consumer_time = Arc::new(framework::ManualTimeProvider::new(
+    OffsetDateTime::from_unix_timestamp(1_700_200_000)?,
+  ));
+  let mut cluster = ClusterHarness::in_memory(1)
+    .partition_count(1)
+    .broker_flush_max_delay(Duration::from_mins(1))
+    .broker_time_provider(consumer_time.clone())
+    .consumer_time_provider(consumer_time.clone())
+    .start()
+    .await?;
+  let producer = Arc::new(
+    cluster
+      .create_producer(
+        producer_config(),
+        vec![producer_topic_named_with_partition_count(TOPIC, 1, 1)],
+      )
+      .await?,
+  );
+  let mut runtime_a = consumer_runtime_config("fresh-start-owner");
+  let mut runtime_b = consumer_runtime_config("fresh-start-replacement");
+  for runtime in [&mut runtime_a, &mut runtime_b] {
+    runtime
+      .read
+      .as_mut()
+      .ok_or_else(|| anyhow!("fresh-start consumer read config missing"))?
+      .strongly_consistent_metadata_reads = Some(true);
+  }
+  let group = runtime_a
+    .group
+    .as_ref()
+    .ok_or_else(|| anyhow!("fresh-start group config missing"))?;
+  let group_topic = group.topic.to_string();
+  let group_id = group.group_id.to_string();
+
+  let checkpoint_id = "fresh-start-checkpoint";
+  let checkpoint_ack = produce_message_at_manual_time(
+    &cluster,
+    &producer,
+    consumer_time.as_ref(),
+    b"fresh-start-key".to_vec(),
+    checkpoint_id,
+  )
+  .await?;
+  let mut consumer_a = ControlledConsumer::new(
+    "fresh-start-owner",
+    cluster.create_consumer(&runtime_a).await?,
+  );
+  consumer_a.start()?;
+  let checkpoint_offset = timeout(Duration::from_secs(5), async {
+    loop {
+      match timeout(Duration::from_millis(250), consumer_a.next()).await {
+        Err(_) => {
+          consumer_time.wait_until_sleeping(1).await;
+          consumer_time.advance(TimeDuration::seconds(1));
+          tokio::task::yield_now().await;
+        },
+        Ok(Err(error)) => return Err(anyhow!("fresh-start owner next failed: {error}")),
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          assert_eq!(
+            String::from_utf8(record.record.payload.to_vec())?,
+            checkpoint_id
+          );
+          consumer_a.store_offset(record.virtual_partition_id, record.offset)?;
+          consumer_a.commit().await?;
+          return Ok::<_, anyhow::Error>(record.offset);
+        },
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("fresh-start owner did not commit checkpoint"))??;
+
+  let lease_store = cluster.consumer_lease_store();
+  let checkpoint_lease = lease_store
+    .list_group_leases(&group_topic, &group_id)
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == checkpoint_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing fresh-start checkpoint lease"))?;
+  let source_checkpoint = checkpoint_lease
+    .committed_cursor
+    .as_ref()
+    .and_then(|cursor| cursor.source_checkpoint.clone())
+    .ok_or_else(|| anyhow!("fresh-start checkpoint is missing source state"))?;
+  assert_eq!(
+    checkpoint_lease
+      .committed_cursor
+      .as_ref()
+      .map(|cursor| cursor.seq_end),
+    Some(checkpoint_offset)
+  );
+
+  let poisoned_cursor = CommittedCursor {
+    virtual_partition_id: checkpoint_ack.virtual_partition_id,
+    seq_end: checkpoint_offset.saturating_add(10_000),
+    source_checkpoint: Some(source_checkpoint),
+  };
+  let ConsumerGroupCommitOutcome::Committed(poisoned_lease) = lease_store
+    .commit_cursor(
+      &checkpoint_lease.key,
+      "fresh-start-owner",
+      checkpoint_lease.generation,
+      consumer_time.now(),
+      poisoned_cursor.clone(),
+    )
+    .await?
+  else {
+    panic!("expected poisoned cursor commit");
+  };
+  assert_eq!(
+    poisoned_lease.committed_cursor,
+    Some(poisoned_cursor.clone())
+  );
+
+  let ConsumerGroupArmFreshStartOutcome::Armed(armed_lease) = lease_store
+    .arm_next_window_fresh_start(
+      &checkpoint_lease.key,
+      TimeDuration::seconds(WINDOW_SIZE_SECONDS),
+      "fresh-start-marker".to_string(),
+      consumer_time.now(),
+    )
+    .await?
+  else {
+    panic!("expected fresh-start marker to be armed");
+  };
+  let marker = armed_lease
+    .fresh_start_marker
+    .ok_or_else(|| anyhow!("fresh-start marker was not persisted"))?;
+
+  consumer_a.shutdown().await?;
+  let seconds_to_target = marker
+    .target_window_start_unix_seconds
+    .saturating_sub(consumer_time.now().unix_timestamp())
+    .saturating_add(1);
+  consumer_time.advance(TimeDuration::seconds(seconds_to_target));
+  let recovery_id = "fresh-start-recovered";
+  let recovery_ack = produce_message_at_manual_time(
+    &cluster,
+    &producer,
+    consumer_time.as_ref(),
+    b"fresh-start-key".to_vec(),
+    recovery_id,
+  )
+  .await?;
+  consumer_time.advance(TimeDuration::seconds(WINDOW_SIZE_SECONDS));
+  let intermediate_id = "fresh-start-intermediate";
+  let intermediate_ack = produce_message_at_manual_time(
+    &cluster,
+    &producer,
+    consumer_time.as_ref(),
+    b"fresh-start-key".to_vec(),
+    intermediate_id,
+  )
+  .await?;
+  consumer_time.advance(TimeDuration::seconds(WINDOW_SIZE_SECONDS));
+  let live_id = "fresh-start-live";
+  let live_ack = produce_message_at_manual_time(
+    &cluster,
+    &producer,
+    consumer_time.as_ref(),
+    b"fresh-start-key".to_vec(),
+    live_id,
+  )
+  .await?;
+
+  let hooks = cluster.lifecycle_hooks();
+  let mut replacement_rebalance = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "fresh-start-replacement",
+      None,
+      None,
+    )
+    .await?;
+  let mut consumer_b = ControlledConsumer::new(
+    "fresh-start-replacement",
+    cluster.create_consumer(&runtime_b).await?,
+  );
+  consumer_b.start()?;
+  consumer_time.advance(TimeDuration::milliseconds(200));
+  timeout(
+    Duration::from_secs(5),
+    replacement_rebalance.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("fresh-start replacement did not reach rebalance"))??;
+  replacement_rebalance.release()?;
+
+  let expected_recovery_ids = HashSet::from([recovery_id, intermediate_id, live_id]);
+  let mut recovery_counts = HashMap::new();
+  let mut highest_recovery_offset: Option<u64> = None;
+  let recovery_offset = timeout(Duration::from_secs(5), async {
+    loop {
+      match timeout(Duration::from_millis(250), consumer_b.next()).await {
+        Err(_) => {
+          consumer_time.wait_until_sleeping(1).await;
+          consumer_time.advance(TimeDuration::seconds(1));
+          tokio::task::yield_now().await;
+        },
+        Ok(Err(error)) => return Err(anyhow!("fresh-start replacement next failed: {error}")),
+        Ok(Ok(NextResult::Revoked(revoked))) => revoked.complete().await,
+        Ok(Ok(NextResult::Record(record))) => {
+          let id = String::from_utf8(record.record.payload.to_vec())?;
+          if id == checkpoint_id {
+            return Err(anyhow!("fresh-start replacement replayed checkpoint"));
+          }
+          if !expected_recovery_ids.contains(id.as_str()) {
+            return Err(anyhow!(
+              "fresh-start replacement delivered unexpected record: {id}"
+            ));
+          }
+          *recovery_counts.entry(id).or_insert(0_usize) += 1;
+          assert!(
+            record.offset < poisoned_cursor.seq_end,
+            "marker recovery must deliver sequence below poisoned cursor"
+          );
+          consumer_b.store_offset(record.virtual_partition_id, record.offset)?;
+          consumer_b.commit().await?;
+          highest_recovery_offset =
+            Some(highest_recovery_offset.map_or(record.offset, |offset| offset.max(record.offset)));
+          if recovery_counts.len() == expected_recovery_ids.len() {
+            return highest_recovery_offset
+              .ok_or_else(|| anyhow!("fresh-start replacement did not record recovery offsets"));
+          }
+        },
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("fresh-start replacement did not deliver recovery record"))??;
+  assert!(
+    recovery_counts.values().all(|count| *count == 1),
+    "fresh-start recovery delivered duplicate records: {recovery_counts:?}"
+  );
+  assert_eq!(
+    recovery_counts.keys().cloned().collect::<HashSet<_>>(),
+    expected_recovery_ids
+      .into_iter()
+      .map(str::to_string)
+      .collect()
+  );
+  assert_eq!(
+    recovery_ack.virtual_partition_id,
+    checkpoint_ack.virtual_partition_id
+  );
+  assert_eq!(
+    intermediate_ack.virtual_partition_id,
+    checkpoint_ack.virtual_partition_id
+  );
+  assert_eq!(
+    live_ack.virtual_partition_id,
+    checkpoint_ack.virtual_partition_id
+  );
+
+  let final_lease = lease_store
+    .list_group_leases(&group_topic, &group_id)
+    .await?
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == checkpoint_ack.virtual_partition_id)
+    .ok_or_else(|| anyhow!("missing fresh-start replacement lease"))?;
+  assert!(final_lease.fresh_start_marker.is_none());
+  assert!(final_lease.committed_cursor.as_ref().is_some_and(|cursor| {
+    cursor.seq_end == recovery_offset && cursor.source_checkpoint.is_some()
+  }));
 
   consumer_b.shutdown().await?;
   cluster.shutdown().await;

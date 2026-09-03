@@ -371,6 +371,15 @@ expiration plus the configured lease TTL buffer. Producer leases and consumer me
 the same expiry-plus-buffer model. DynamoDB TTL cleanup is asynchronous, so expiry checks in the
 store also use the stored lease timestamp.
 
+A consumer lease can additionally retain one `fresh_start_marker`. The marker records the source
+checkpoint, the next aligned metadata-window start, its creation time, and an opaque marker ID. It
+is an operator-armed recovery instruction, not a live cursor mutation: the current owner continues
+normal commits and heartbeats without clearing it. When a later process first acquires that
+partition, it discards the retained cursor and scans exactly the marker's target window cursor-free
+before entering the normal Fast path. Its first durable cursor write conditionally requires the
+matching marker ID, replaces the old cursor, and removes the marker atomically. A different marker
+or a stale owner cannot consume the instruction.
+
 The assignment plan and planner lease use the existing `consumer_group_membership` table under the
 separate reserved partition key
 `__blob_stream_assignment_control_v1__#<topic>#<group_id>`, with reserved sort keys
@@ -815,6 +824,15 @@ conditional cursor operation: it does not renew unrelated partition leases, exte
 heartbeat membership. This keeps frequent application checkpointing from amplifying steady-state
 lease traffic while retaining generation fencing on every durable cursor advance.
 
+An operator can arm a next-window fresh-start marker for a retained partition when its cursor is
+known to be unusable, such as after an externally corrected producer sequence regression. Arming
+derives the target from the committed source checkpoint; callers cannot provide an arbitrary offset
+or timestamp. The marker remains inert in its current process and is applied only after a restart
+or reassignment. A replacement first scans the target window cursor-free, then recovers every
+retained window through its current cutover before joining the fast path. Marker arming races normal
+cursor commits with a conditional checkpoint comparison; the caller must retry after inspecting the
+new lease state if that comparison changes.
+
 An orderly release writes a durable `graceful_release_ts` marker while expiring the lease. The next
 successful claim removes that marker and classifies its predecessor as either a graceful handoff or
 an expiry takeover. Initial claims and same-owner generation advances are classified separately.
@@ -856,6 +874,8 @@ coordinator, so it includes planned but currently unleased partitions as well as
 owner, generation, heartbeat, and committed cursor information. The inline query never enters the
 driver control flow and is bounded to one second. A query error or timeout is represented as
 `lookup_failed`; the local state remains available in that response.
+Each observed lease also includes any pending fresh-start marker with its source checkpoint, target
+window, and armed time.
 
 ## Correctness and Failure Behavior
 

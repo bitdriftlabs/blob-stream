@@ -4,6 +4,7 @@ mod tests;
 
 use crate::dynamo::duration_seconds_ceil;
 use crate::{
+  ConsumerGroupArmFreshStartOutcome,
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupCommitOutcome,
   ConsumerGroupHeartbeatOutcome,
@@ -13,6 +14,7 @@ use crate::{
   ConsumerGroupLeaseStore,
   ConsumerGroupReleaseOutcome,
   DynamoCapacityMetrics,
+  FreshStartMarker,
   consumer_group_lease_transition,
 };
 use anyhow::{Result, anyhow};
@@ -35,6 +37,7 @@ const ATTR_LAST_HEARTBEAT: &str = "last_heartbeat_ts";
 const ATTR_COMMITTED_CURSOR: &str = "committed_cursor";
 const ATTR_COMMITTED_TS: &str = "committed_ts";
 const ATTR_GRACEFUL_RELEASE_TS: &str = "graceful_release_ts";
+const ATTR_FRESH_START_MARKER: &str = "fresh_start_marker";
 const ATTR_TTL: &str = "ttl_epoch_seconds";
 
 //
@@ -100,6 +103,28 @@ impl DynamoConsumerGroupLeaseStore {
       return Ok(None);
     };
 
+    let entry: DynamoLeaseItem = serde_dynamo::from_item(item)?;
+    Ok(Some(entry.into_lease(key.clone())))
+  }
+
+  async fn get_lease_strong(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+  ) -> Result<Option<ConsumerGroupLease>> {
+    let response = self
+      .client
+      .get_item()
+      .table_name(&self.table_name)
+      .key(ATTR_PK, AttributeValue::S(key.partition_key()))
+      .key(ATTR_SK, AttributeValue::S(key.sort_key()))
+      .consistent_read(true)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
+      .send()
+      .await?;
+    self.record_read_capacity(response.consumed_capacity.as_ref());
+    let Some(item) = response.item else {
+      return Ok(None);
+    };
     let entry: DynamoLeaseItem = serde_dynamo::from_item(item)?;
     Ok(Some(entry.into_lease(key.clone())))
   }
@@ -258,6 +283,9 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
           committed_ts_ms: previous_lease
             .as_ref()
             .and_then(|previous| previous.committed_ts_ms),
+          fresh_start_marker: previous_lease
+            .as_ref()
+            .and_then(|previous| previous.fresh_start_marker.clone()),
         };
         if let Some(previous) = previous_entry.as_ref()
           && previous.owner_id != lease.owner_id
@@ -297,6 +325,99 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     }
   }
 
+  async fn arm_next_window_fresh_start(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    metadata_window_size: Duration,
+    marker_id: String,
+    now: OffsetDateTime,
+  ) -> Result<ConsumerGroupArmFreshStartOutcome> {
+    let metadata_window_seconds = metadata_window_size.whole_seconds();
+    if metadata_window_seconds <= 0 {
+      return Err(anyhow!("metadata window size must be positive"));
+    }
+    let Some(lease) = self.get_lease_strong(key).await? else {
+      return Ok(ConsumerGroupArmFreshStartOutcome::MissingLease);
+    };
+    if lease.fresh_start_marker.is_some() {
+      return Ok(ConsumerGroupArmFreshStartOutcome::AlreadyArmed(lease));
+    }
+    let Some(source_checkpoint) = lease
+      .committed_cursor
+      .as_ref()
+      .and_then(|cursor| cursor.source_checkpoint.clone())
+    else {
+      return Ok(ConsumerGroupArmFreshStartOutcome::MissingSourceCheckpoint(
+        lease,
+      ));
+    };
+    let target_window_start_unix_seconds = source_checkpoint
+      .window_start_unix_seconds
+      .checked_add(metadata_window_seconds)
+      .ok_or_else(|| anyhow!("fresh start target window overflow"))?;
+    let armed_at_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+    let marker = FreshStartMarker {
+      marker_id,
+      source_checkpoint,
+      target_window_start_unix_seconds,
+      armed_at_ts_ms,
+    };
+    let mut values = HashMap::new();
+    values.insert(
+      ":marker".to_string(),
+      AttributeValue::M(serde_dynamo::to_item(&marker)?),
+    );
+    values.insert(
+      ":cursor".to_string(),
+      Self::cursor_value(lease.committed_cursor.as_ref().expect("checked above"))?,
+    );
+    let response = self
+      .client
+      .update_item()
+      .table_name(&self.table_name)
+      .key(ATTR_PK, AttributeValue::S(key.partition_key()))
+      .key(ATTR_SK, AttributeValue::S(key.sort_key()))
+      .update_expression(format!("SET {ATTR_FRESH_START_MARKER} = :marker"))
+      .condition_expression(format!(
+        "attribute_not_exists({ATTR_FRESH_START_MARKER}) AND {ATTR_COMMITTED_CURSOR} = :cursor"
+      ))
+      .set_expression_attribute_values(Some(values))
+      .return_values(ReturnValue::AllNew)
+      .return_consumed_capacity(ReturnConsumedCapacity::Total)
+      .send()
+      .await;
+    match response {
+      Ok(output) => {
+        self.record_write_capacity(output.consumed_capacity.as_ref());
+        let attributes = output
+          .attributes
+          .ok_or_else(|| anyhow!("lease attributes missing"))?;
+        Ok(ConsumerGroupArmFreshStartOutcome::Armed(
+          Self::lease_from_item(attributes, key.clone())?,
+        ))
+      },
+      Err(SdkError::ServiceError(service_error))
+        if service_error.err().is_conditional_check_failed_exception() =>
+      {
+        let lease = self
+          .get_lease_strong(key)
+          .await?
+          .ok_or_else(|| anyhow!("lease missing after conditional failure"))?;
+        if lease.fresh_start_marker.is_some() {
+          Ok(ConsumerGroupArmFreshStartOutcome::AlreadyArmed(lease))
+        } else if lease.committed_cursor.is_none() {
+          Ok(ConsumerGroupArmFreshStartOutcome::MissingSourceCheckpoint(
+            lease,
+          ))
+        } else {
+          Err(anyhow!("consumer cursor changed while arming fresh start"))
+        }
+      },
+      Err(error) => Err(error.into()),
+    }
+  }
+
   async fn heartbeat_partition(
     &self,
     key: &ConsumerGroupLeaseKey,
@@ -305,6 +426,29 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     now: OffsetDateTime,
     lease_duration: Duration,
     committed_cursor: Option<CommittedCursor>,
+  ) -> Result<ConsumerGroupHeartbeatOutcome> {
+    self
+      .heartbeat_partition_consuming_fresh_start_marker(
+        key,
+        owner_id,
+        generation,
+        now,
+        lease_duration,
+        committed_cursor,
+        None,
+      )
+      .await
+  }
+
+  async fn heartbeat_partition_consuming_fresh_start_marker(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now: OffsetDateTime,
+    lease_duration: Duration,
+    committed_cursor: Option<CommittedCursor>,
+    consumed_fresh_start_marker_id: Option<String>,
   ) -> Result<ConsumerGroupHeartbeatOutcome> {
     trace!(
       "consumer lease(dynamo) heartbeat: table={}, topic={}, group_id={}, partition={}, \
@@ -340,21 +484,38 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       AttributeValue::N(ttl_epoch_seconds.to_string()),
     );
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+    if let Some(marker_id) = consumed_fresh_start_marker_id.as_deref() {
+      values.insert(
+        ":marker_id".to_string(),
+        AttributeValue::S(marker_id.to_string()),
+      );
+    }
 
     let update = if let Some(cursor) = committed_cursor {
       values.insert(":cursor".to_string(), Self::cursor_value(&cursor)?);
-      format!(
-        "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl, \
-         {ATTR_COMMITTED_CURSOR} = :cursor, {ATTR_COMMITTED_TS} = :now"
-      )
+      if consumed_fresh_start_marker_id.is_some() {
+        format!(
+          "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl, \
+           {ATTR_COMMITTED_CURSOR} = :cursor, {ATTR_COMMITTED_TS} = :now REMOVE \
+           {ATTR_FRESH_START_MARKER}"
+        )
+      } else {
+        format!(
+          "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl, \
+           {ATTR_COMMITTED_CURSOR} = :cursor, {ATTR_COMMITTED_TS} = :now"
+        )
+      }
     } else {
       format!(
         "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl"
       )
     };
-    let condition = format!(
+    let mut condition = format!(
       "{ATTR_OWNER} = :owner AND {ATTR_GENERATION} = :generation AND {ATTR_LEASE_EXPIRES} > :now"
     );
+    if consumed_fresh_start_marker_id.is_some() {
+      condition.push_str(" AND fresh_start_marker.marker_id = :marker_id");
+    }
 
     let response = self
       .client
@@ -407,6 +568,27 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     now: OffsetDateTime,
     committed_cursor: CommittedCursor,
   ) -> Result<ConsumerGroupCommitOutcome> {
+    self
+      .commit_cursor_consuming_fresh_start_marker(
+        key,
+        owner_id,
+        generation,
+        now,
+        committed_cursor,
+        None,
+      )
+      .await
+  }
+
+  async fn commit_cursor_consuming_fresh_start_marker(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now: OffsetDateTime,
+    committed_cursor: CommittedCursor,
+    consumed_fresh_start_marker_id: Option<String>,
+  ) -> Result<ConsumerGroupCommitOutcome> {
     trace!(
       "consumer lease(dynamo) commit: table={}, topic={}, group_id={}, partition={}, owner_id={}, \
        generation={}, seq_end={}",
@@ -436,11 +618,26 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
       ":cursor".to_string(),
       Self::cursor_value(&committed_cursor)?,
     );
-
-    let update = format!("SET {ATTR_COMMITTED_CURSOR} = :cursor, {ATTR_COMMITTED_TS} = :now");
-    let condition = format!(
+    if let Some(marker_id) = consumed_fresh_start_marker_id.as_deref() {
+      values.insert(
+        ":marker_id".to_string(),
+        AttributeValue::S(marker_id.to_string()),
+      );
+    }
+    let update = if consumed_fresh_start_marker_id.is_some() {
+      format!(
+        "SET {ATTR_COMMITTED_CURSOR} = :cursor, {ATTR_COMMITTED_TS} = :now REMOVE \
+         {ATTR_FRESH_START_MARKER}"
+      )
+    } else {
+      format!("SET {ATTR_COMMITTED_CURSOR} = :cursor, {ATTR_COMMITTED_TS} = :now")
+    };
+    let mut condition = format!(
       "{ATTR_OWNER} = :owner AND {ATTR_GENERATION} = :generation AND {ATTR_LEASE_EXPIRES} > :now"
     );
+    if consumed_fresh_start_marker_id.is_some() {
+      condition.push_str(" AND fresh_start_marker.marker_id = :marker_id");
+    }
 
     let response = self
       .client
@@ -577,6 +774,7 @@ struct DynamoLeaseItem {
   last_heartbeat_ts_ms: i64,
   committed_cursor: Option<CommittedCursor>,
   committed_ts: Option<i64>,
+  fresh_start_marker: Option<FreshStartMarker>,
   graceful_release_ts: Option<i64>,
 }
 
@@ -590,6 +788,7 @@ impl DynamoLeaseItem {
       last_heartbeat_ts_ms: self.last_heartbeat_ts_ms,
       committed_cursor: self.committed_cursor,
       committed_ts_ms: self.committed_ts,
+      fresh_start_marker: self.fresh_start_marker,
     }
   }
 }

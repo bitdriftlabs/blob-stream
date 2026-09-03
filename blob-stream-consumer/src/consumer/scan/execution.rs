@@ -35,6 +35,7 @@ use crate::consumer::{
   BrokerBlobRangeQuery,
   BrokerBlobRangeRead,
   ConsumerReadOutcome,
+  RecoveryState,
   decode_blob_range_response_for_ranges,
 };
 use bd_log_util::warn_every;
@@ -50,6 +51,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   TailMetadataCoverage,
   read_metadata_window_request,
 };
+use blob_stream_types::Window;
 use time::OffsetDateTime;
 use time::ext::NumericalDuration;
 use tokio::sync::Semaphore;
@@ -576,10 +578,38 @@ impl ConsumerReaderImpl {
           && !capacity_deferred_fresh_window_starts.contains(initial_window_start_unix_seconds) =>
         {
           initial_scans_completed.push((*partition_id, *initial_window_start_unix_seconds));
-          next_state = Some(VirtualPartitionState::Fast {
-            cursor: *cursor,
-            last_scan: None,
-          });
+          let next_window_start = initial_window_start_unix_seconds
+            .checked_add(self.metadata_window_size.whole_seconds())
+            .ok_or_else(|| anyhow::anyhow!("fresh-start recovery window overflow"))?;
+          let cutover_window_start = Window::for_timestamp(now, self.metadata_window_size)
+            .start
+            .unix_timestamp();
+          let retention_floor_window_start = Window::for_timestamp(
+            now.saturating_sub(self.retention),
+            self.metadata_window_size,
+          )
+          .start
+          .unix_timestamp();
+          next_state = Some(
+            if next_window_start <= cutover_window_start {
+              VirtualPartitionState::Recovering {
+                cursor: *cursor,
+                recovery_state: RecoveryState {
+                  next_window_start_unix_seconds: next_window_start
+                    .max(retention_floor_window_start),
+                  cutover_window_start_unix_seconds: cutover_window_start,
+                  first_window_start_unix_seconds: None,
+                  first_window_min_snowflake: None,
+                },
+                last_scan: None,
+              }
+            } else {
+              VirtualPartitionState::Fast {
+                cursor: *cursor,
+                last_scan: None,
+              }
+            },
+          );
         },
         VirtualPartitionState::Recovering {
           cursor,

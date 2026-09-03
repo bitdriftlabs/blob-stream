@@ -233,6 +233,30 @@ impl ConsumerReaderImpl {
       .retain(|(partition_id, _), _| *partition_id != virtual_partition_id);
   }
 
+  /// Discard a durable cursor and scan exactly the marker-selected metadata window.
+  pub fn mark_fresh_at_window(
+    &mut self,
+    virtual_partition_id: VirtualPartitionId,
+    target_window_start_unix_seconds: i64,
+  ) {
+    self.clear_recovery_metadata_cache(virtual_partition_id);
+    self.virtual_partition_states.insert(
+      virtual_partition_id,
+      VirtualPartitionState::Fresh {
+        cursor: None,
+        initial_window_start_unix_seconds: target_window_start_unix_seconds,
+        last_scan: None,
+      },
+    );
+    self
+      .fast_frontiers
+      .retain(|(partition_id, _), _| *partition_id != virtual_partition_id);
+    info!(
+      "consumer partition marked fresh: topic={}, partition={}, target_window={}",
+      self.config.topic, virtual_partition_id, target_window_start_unix_seconds
+    );
+  }
+
   fn clear_recovery_metadata_cache(&mut self, virtual_partition_id: VirtualPartitionId) {
     let cached_entry_count = self.recovery_metadata_cache.len();
     self

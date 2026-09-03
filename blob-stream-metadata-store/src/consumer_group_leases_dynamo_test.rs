@@ -1,4 +1,5 @@
 use crate::{
+  ConsumerGroupArmFreshStartOutcome,
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupCommitOutcome,
   ConsumerGroupHeartbeatOutcome,
@@ -347,6 +348,125 @@ async fn heartbeats_and_commits() -> Result<()> {
 
   client.delete_table().table_name(table_name).send().await?;
 
+  Ok(())
+}
+
+#[tokio::test]
+async fn fresh_start_marker_persists_until_matching_cursor_commit() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
+  create_leases_table(&client, &table_name).await?;
+
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
+  let key = lease_key();
+  store
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      1,
+      offset_datetime_from_unix_millis(1_000),
+      TimeDuration::milliseconds(100),
+    )
+    .await?;
+  store
+    .commit_cursor(
+      &key,
+      "member-a",
+      1,
+      offset_datetime_from_unix_millis(1_010),
+      cursor_with_source(key.virtual_partition_id, 10),
+    )
+    .await?;
+
+  let arm = store
+    .arm_next_window_fresh_start(
+      &key,
+      TimeDuration::seconds(300),
+      "marker-a".to_string(),
+      offset_datetime_from_unix_millis(1_020),
+    )
+    .await?;
+  let ConsumerGroupArmFreshStartOutcome::Armed(lease) = arm else {
+    panic!("expected fresh-start marker to be armed");
+  };
+  assert!(matches!(
+    lease.fresh_start_marker,
+    Some(ref marker) if marker.marker_id == "marker-a"
+      && marker.target_window_start_unix_seconds == 1_500
+  ));
+
+  let repeated_arm = store
+    .arm_next_window_fresh_start(
+      &key,
+      TimeDuration::seconds(300),
+      "marker-b".to_string(),
+      offset_datetime_from_unix_millis(1_030),
+    )
+    .await?;
+  assert!(matches!(
+    repeated_arm,
+    ConsumerGroupArmFreshStartOutcome::AlreadyArmed(lease)
+      if lease
+        .fresh_start_marker
+        .as_ref()
+        .is_some_and(|marker| marker.marker_id == "marker-a")
+  ));
+
+  let normal_commit = store
+    .commit_cursor(
+      &key,
+      "member-a",
+      1,
+      offset_datetime_from_unix_millis(1_040),
+      cursor_with_source(key.virtual_partition_id, 11),
+    )
+    .await?;
+  let ConsumerGroupCommitOutcome::Committed(lease) = normal_commit else {
+    panic!("expected ordinary cursor commit");
+  };
+  assert!(lease.fresh_start_marker.is_some());
+
+  let idle_heartbeat = store
+    .heartbeat_partition_consuming_fresh_start_marker(
+      &key,
+      "member-a",
+      1,
+      offset_datetime_from_unix_millis(1_045),
+      TimeDuration::milliseconds(100),
+      None,
+      Some("marker-a".to_string()),
+    )
+    .await?;
+  let ConsumerGroupHeartbeatOutcome::Renewed(lease) = idle_heartbeat else {
+    panic!("expected marker-bearing idle heartbeat to renew");
+  };
+  assert!(lease.fresh_start_marker.is_some());
+
+  let reset_commit = store
+    .commit_cursor_consuming_fresh_start_marker(
+      &key,
+      "member-a",
+      1,
+      offset_datetime_from_unix_millis(1_050),
+      cursor_with_source(key.virtual_partition_id, 1),
+      Some("marker-a".to_string()),
+    )
+    .await?;
+  let ConsumerGroupCommitOutcome::Committed(lease) = reset_commit else {
+    panic!("expected marker-consuming cursor commit");
+  };
+  assert_eq!(
+    lease.committed_cursor,
+    Some(cursor_with_source(key.virtual_partition_id, 1))
+  );
+  assert!(lease.fresh_start_marker.is_none());
+
+  client.delete_table().table_name(table_name).send().await?;
   Ok(())
 }
 

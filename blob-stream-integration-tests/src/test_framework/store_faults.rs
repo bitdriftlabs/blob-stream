@@ -10,6 +10,7 @@ use blob_stream_blob_store::{
   ByteRange,
 };
 use blob_stream_metadata_store::{
+  ConsumerGroupArmFreshStartOutcome,
   ConsumerGroupAssignmentOutcome,
   ConsumerGroupAssignmentPlan,
   ConsumerGroupCommitOutcome,
@@ -1470,6 +1471,19 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
     result
   }
 
+  async fn arm_next_window_fresh_start(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    metadata_window_size: TimeDuration,
+    marker_id: String,
+    now: OffsetDateTime,
+  ) -> Result<ConsumerGroupArmFreshStartOutcome> {
+    self
+      .inner
+      .arm_next_window_fresh_start(key, metadata_window_size, marker_id, now)
+      .await
+  }
+
   async fn heartbeat_partition(
     &self,
     key: &ConsumerGroupLeaseKey,
@@ -1478,6 +1492,29 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
     now: OffsetDateTime,
     lease_duration: TimeDuration,
     committed_cursor: Option<CommittedCursor>,
+  ) -> Result<ConsumerGroupHeartbeatOutcome> {
+    self
+      .heartbeat_partition_consuming_fresh_start_marker(
+        key,
+        owner_id,
+        generation,
+        now,
+        lease_duration,
+        committed_cursor,
+        None,
+      )
+      .await
+  }
+
+  async fn heartbeat_partition_consuming_fresh_start_marker(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now: OffsetDateTime,
+    lease_duration: TimeDuration,
+    committed_cursor: Option<CommittedCursor>,
+    consumed_fresh_start_marker_id: Option<String>,
   ) -> Result<ConsumerGroupHeartbeatOutcome> {
     let key_str = format!("{}#{}", key.partition_key(), key.sort_key());
     let effects = self
@@ -1506,13 +1543,14 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
 
     let result = self
       .inner
-      .heartbeat_partition(
+      .heartbeat_partition_consuming_fresh_start_marker(
         key,
         owner_id,
         generation,
         now,
         lease_duration,
         committed_cursor,
+        consumed_fresh_start_marker_id,
       )
       .await;
     self
@@ -1538,6 +1576,27 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
     generation: u64,
     now: OffsetDateTime,
     committed_cursor: CommittedCursor,
+  ) -> Result<ConsumerGroupCommitOutcome> {
+    self
+      .commit_cursor_consuming_fresh_start_marker(
+        key,
+        owner_id,
+        generation,
+        now,
+        committed_cursor,
+        None,
+      )
+      .await
+  }
+
+  async fn commit_cursor_consuming_fresh_start_marker(
+    &self,
+    key: &ConsumerGroupLeaseKey,
+    owner_id: &str,
+    generation: u64,
+    now: OffsetDateTime,
+    committed_cursor: CommittedCursor,
+    consumed_fresh_start_marker_id: Option<String>,
   ) -> Result<ConsumerGroupCommitOutcome> {
     let key_str = format!("{}#{}", key.partition_key(), key.sort_key());
     let effects = self
@@ -1566,7 +1625,14 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
 
     let result = self
       .inner
-      .commit_cursor(key, owner_id, generation, now, committed_cursor)
+      .commit_cursor_consuming_fresh_start_marker(
+        key,
+        owner_id,
+        generation,
+        now,
+        committed_cursor,
+        consumed_fresh_start_marker_id,
+      )
       .await;
     self
       .controller
