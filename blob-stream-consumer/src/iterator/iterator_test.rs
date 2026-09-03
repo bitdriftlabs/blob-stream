@@ -430,7 +430,6 @@ impl ConsumerGroupLeaseStore for PartiallyFailingLeaseStore {
             last_heartbeat_ts_ms: unix_millis_from_offset_datetime(now).unwrap(),
             committed_cursor: None,
             committed_ts_ms: None,
-            fresh_start_marker: None,
           },
         ));
       }
@@ -1765,7 +1764,6 @@ fn group_lease_observation_includes_unleased_plan_partitions() {
       last_heartbeat_ts_ms: 10_000,
       committed_cursor: None,
       committed_ts_ms: None,
-      fresh_start_marker: None,
     }],
   );
   let ConsumerGroupLeaseObservation::Fresh { partitions } = observation else {

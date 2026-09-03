@@ -30,7 +30,6 @@ use blob_stream_metadata_store::{
   ConsumerGroupMembershipStore,
   ConsumerGroupPlannerLeaseOutcome,
   ConsumerGroupReleaseOutcome,
-  FreshStartMarker,
 };
 use blob_stream_types::{CommittedCursor, VirtualPartitionId, offset_datetime_from_unix_millis};
 use futures::{StreamExt, stream};
@@ -157,8 +156,6 @@ pub struct RebalanceReport {
   pub active_partition_lease_expiration_deadline_ms: Option<i64>,
   /// Last committed cursor state per owned partition, when present in lease store.
   pub recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
-  /// Fresh-start markers that supersede recovered cursors for newly acquired partitions.
-  pub fresh_start_markers: HashMap<VirtualPartitionId, FreshStartMarker>,
   /// Valid persisted assignment plan accepted during this rebalance.
   pub accepted_assignment_plan: Option<ConsumerGroupAssignmentPlan>,
   /// Version of the valid persisted assignment plan accepted during this rebalance.
@@ -278,7 +275,6 @@ pub struct ConsumerGroupCoordinatorImpl {
   planner_session_id: String,
   generation: u64,
   owned: HashMap<VirtualPartitionId, ConsumerGroupLease>,
-  fresh_start_markers: HashMap<VirtualPartitionId, String>,
 }
 
 impl ConsumerGroupCoordinatorImpl {
@@ -298,7 +294,6 @@ impl ConsumerGroupCoordinatorImpl {
       planner_session_id: Uuid::new_v4().to_string(),
       generation: 0,
       owned: HashMap::new(),
-      fresh_start_markers: HashMap::new(),
     })
   }
 
@@ -556,7 +551,6 @@ impl ConsumerGroupCoordinatorImpl {
     let group_id = self.config.group_id.to_string();
     let member_id = self.config.member_id.to_string();
     let lease_duration = consumer_lease_duration(&self.config);
-    let fresh_start_markers = self.fresh_start_markers.clone();
     let outcomes = stream::iter(partitions.into_iter().map(|(partition_id, generation)| {
       let lease_store = Arc::clone(&self.lease_store);
       let key = ConsumerGroupLeaseKey {
@@ -566,20 +560,16 @@ impl ConsumerGroupCoordinatorImpl {
       };
       let member_id = member_id.clone();
       let committed_cursor = cursors.get(&partition_id).cloned();
-      let consumed_fresh_start_marker_id = committed_cursor
-        .as_ref()
-        .and_then(|_| fresh_start_markers.get(&partition_id).cloned());
       async move {
         let outcome = match operation {
           LeaseMaintenanceOperation::Heartbeat => match lease_store
-            .heartbeat_partition_consuming_fresh_start_marker(
+            .heartbeat_partition(
               &key,
               &member_id,
               generation,
               now,
               lease_duration,
               committed_cursor,
-              consumed_fresh_start_marker_id,
             )
             .await?
           {
@@ -592,13 +582,12 @@ impl ConsumerGroupCoordinatorImpl {
             ConsumerGroupHeartbeatOutcome::Expired => LeaseMaintenanceOutcome::Expired,
           },
           LeaseMaintenanceOperation::CommitCursor => match lease_store
-            .commit_cursor_consuming_fresh_start_marker(
+            .commit_cursor(
               &key,
               &member_id,
               generation,
               now,
               committed_cursor.expect("cursor commits only target staged partitions"),
-              consumed_fresh_start_marker_id,
             )
             .await?
           {
@@ -629,9 +618,6 @@ impl ConsumerGroupCoordinatorImpl {
       };
       match outcome {
         LeaseMaintenanceOutcome::Renewed(lease) => {
-          if lease.fresh_start_marker.is_none() {
-            self.fresh_start_markers.remove(&partition_id);
-          }
           self.owned.insert(partition_id, lease);
           renewed.push(partition_id);
         },
@@ -655,7 +641,6 @@ impl ConsumerGroupCoordinatorImpl {
         },
         LeaseMaintenanceOutcome::Expired => {
           self.owned.remove(&partition_id);
-          self.fresh_start_markers.remove(&partition_id);
           fenced.push(partition_id);
           info!(
             "consumer lease expired before heartbeat: topic={}, group_id={}, partition={}, \
@@ -802,7 +787,6 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       .await;
 
     let mut recovered_cursors = HashMap::new();
-    let mut fresh_start_markers = HashMap::new();
     let mut assignment_error = None;
     let mut lease_claim_counts = LeaseClaimCounts::default();
     for result in outcomes {
@@ -820,7 +804,6 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
         ConsumerGroupAssignmentOutcome::Assigned {
           lease, transition, ..
         } => {
-          let newly_owned = !self.owned.contains_key(&partition_id);
           match transition {
             ConsumerGroupLeaseTransition::Initial => lease_claim_counts.initial += 1,
             ConsumerGroupLeaseTransition::Retained => lease_claim_counts.retained += 1,
@@ -850,17 +833,7 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
           }
           assignment_changed |= owned_partitions.insert(partition_id);
           self.owned.insert(partition_id, lease.clone());
-          if newly_owned && let Some(marker) = lease.fresh_start_marker.clone() {
-            self
-              .fresh_start_markers
-              .insert(partition_id, marker.marker_id.clone());
-            fresh_start_markers.insert(partition_id, marker);
-          } else if newly_owned {
-            self.fresh_start_markers.remove(&partition_id);
-          }
-          if lease.fresh_start_marker.is_none()
-            && let Some(committed_cursor) = lease.committed_cursor
-          {
+          if let Some(committed_cursor) = lease.committed_cursor {
             recovered_cursors.insert(
               partition_id,
               RecoveredCursor {
@@ -873,7 +846,6 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
         ConsumerGroupAssignmentOutcome::HeldByOther(lease) => {
           assignment_changed |= owned_partitions.remove(&partition_id);
           self.owned.remove(&partition_id);
-          self.fresh_start_markers.remove(&partition_id);
           debug!(
             "consumer assignment held by another member: topic={}, group_id={}, partition={}, \
              member_id={}, generation={}, owner_id={}, owner_generation={}, lease_expires_at={}, \
@@ -930,7 +902,6 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       owned_partitions: owned,
       active_partition_lease_expiration_deadline_ms,
       recovered_cursors,
-      fresh_start_markers,
       accepted_assignment_plan: shared_plan,
       accepted_assignment_plan_version,
       rejected_assignment_plan_version,
@@ -1000,12 +971,10 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
       match outcome {
         ConsumerGroupReleaseOutcome::Released => {
           self.owned.remove(partition_id);
-          self.fresh_start_markers.remove(partition_id);
           released.push(*partition_id);
         },
         ConsumerGroupReleaseOutcome::HeldByOther(_) | ConsumerGroupReleaseOutcome::Expired => {
           self.owned.remove(partition_id);
-          self.fresh_start_markers.remove(partition_id);
         },
       }
     }

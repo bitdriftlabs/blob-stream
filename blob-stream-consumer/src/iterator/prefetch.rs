@@ -102,9 +102,6 @@ pub(super) enum ConsumerReaderCommand {
     recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
     now: OffsetDateTime,
   },
-  MarkFreshAtWindows {
-    target_window_starts: HashMap<VirtualPartitionId, i64>,
-  },
   SetAssignment {
     assignment: Vec<VirtualPartitionId>,
     now: OffsetDateTime,
@@ -912,14 +909,6 @@ fn process_reader_commands(
             recovered_cursor.committed_ts_ms,
             now,
           );
-        }
-        None
-      },
-      ConsumerReaderCommand::MarkFreshAtWindows {
-        target_window_starts,
-      } => {
-        for (partition_id, target_window_start) in target_window_starts {
-          reader.mark_fresh_at_window(partition_id, target_window_start);
         }
         None
       },
