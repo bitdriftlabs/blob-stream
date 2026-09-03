@@ -22,6 +22,7 @@ use crate::config::{
   consumer_max_clock_skew,
 };
 use crate::consumer::{BrokerBlobRangeQuery, BrokerMetadataQuery};
+use crate::coordination::RecoveredCursor;
 use crate::diagnostics::{
   ConsumerAssignmentPlanSnapshot,
   ConsumerAssignmentPolicy,
@@ -825,7 +826,124 @@ fn delivered_record_after_a_gap_records_the_missing_sequences() {
 }
 
 #[tokio::test]
+async fn cursor_hydration_keeps_last_delivered_offset_for_retained_partition() {
+  let now = OffsetDateTime::UNIX_EPOCH;
+  let time_provider = Arc::new(ManualTimeProvider::new(now));
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![3],
+    }));
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )
+  .time_provider(time_provider)
+  .build()
+  .await
+  .unwrap();
+
+  iterator
+    .shared_state
+    .lock()
+    .active_partitions
+    .get_mut(&3)
+    .unwrap()
+    .delivery_gap_baseline = Some(7);
+  iterator
+    .driver
+    .as_mut()
+    .unwrap()
+    .hydrate_cursors(
+      HashMap::from([(
+        3,
+        RecoveredCursor {
+          committed_cursor: CommittedCursor {
+            virtual_partition_id: 3,
+            seq_end: 5,
+            source_checkpoint: None,
+          },
+          committed_ts_ms: None,
+        },
+      )]),
+      now,
+    )
+    .unwrap();
+
+  assert_eq!(
+    iterator
+      .shared_state
+      .lock()
+      .active_partitions
+      .get(&3)
+      .unwrap()
+      .delivery_gap_baseline,
+    Some(7)
+  );
+}
+
+#[tokio::test]
 async fn recovered_cursor_records_gap_after_consumer_restart() {
+  let mut iterator =
+    build_iterator_with_recovered_cursor_record(2, b"restarted-gap".to_vec()).await;
+
+  iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[3]).await;
+  let NextResult::Record(record) = timeout(Duration::from_secs(2), iterator.next())
+    .await
+    .unwrap()
+    .unwrap()
+  else {
+    panic!("expected recovered record");
+  };
+  assert_eq!(record.offset, 2);
+  assert_eq!(record.record.payload.as_ref(), b"restarted-gap");
+  assert_eq!(iterator.metrics.delivery_gap_events.get(), 1);
+
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn recovered_cursor_contiguous_delivery_does_not_record_gap_after_consumer_restart() {
+  let mut iterator =
+    build_iterator_with_recovered_cursor_record(1, b"restarted-contiguous".to_vec()).await;
+
+  iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[3]).await;
+  let NextResult::Record(record) = timeout(Duration::from_secs(2), iterator.next())
+    .await
+    .unwrap()
+    .unwrap()
+  else {
+    panic!("expected recovered record");
+  };
+  assert_eq!(record.offset, 1);
+  assert_eq!(record.record.payload.as_ref(), b"restarted-contiguous");
+  assert_eq!(iterator.metrics.delivery_gap_events.get(), 0);
+
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+async fn build_iterator_with_recovered_cursor_record(
+  record_offset: u64,
+  record_payload: Vec<u8>,
+) -> ConsumerIteratorImpl {
   let now = OffsetDateTime::UNIX_EPOCH + TimeDuration::seconds(902);
   let time_provider = Arc::new(ManualTimeProvider::new(now));
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
@@ -878,8 +996,11 @@ async fn recovered_cursor_records_gap_after_consumer_restart() {
     900,
     2,
     3,
-    SeqRange { start: 2, end: 2 },
-    vec![new_record(b"restarted-gap".to_vec(), 902_000)],
+    SeqRange {
+      start: record_offset,
+      end: record_offset,
+    },
+    vec![new_record(record_payload, 902_000)],
   )
   .await;
 
@@ -889,7 +1010,7 @@ async fn recovered_cursor_records_gap_after_consumer_restart() {
     .as_mut()
     .unwrap()
     .strongly_consistent_metadata_reads = Some(true);
-  let mut iterator = ConsumerIteratorBuilder::new(
+  ConsumerIteratorBuilder::new(
     &runtime,
     blob_store,
     metadata_store,
@@ -906,22 +1027,7 @@ async fn recovered_cursor_records_gap_after_consumer_restart() {
   .time_provider(time_provider)
   .build()
   .await
-  .unwrap();
-
-  iterator.start().unwrap();
-  wait_for_active_assignment(&iterator, &[3]).await;
-  let NextResult::Record(record) = timeout(Duration::from_secs(2), iterator.next())
-    .await
-    .unwrap()
-    .unwrap()
-  else {
-    panic!("expected recovered record");
-  };
-  assert_eq!(record.offset, 2);
-  assert_eq!(record.record.payload.as_ref(), b"restarted-gap");
-  assert_eq!(iterator.metrics.delivery_gap_events.get(), 1);
-
-  Box::new(iterator).shutdown().await.unwrap();
+  .unwrap()
 }
 
 async fn write_segment(

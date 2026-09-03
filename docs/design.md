@@ -213,12 +213,13 @@ lease.
 
 Consumer iterator metrics report application-visible discontinuities with `delivery_gap_events`.
 The baseline comes from the partition's recovered durable committed cursor and advances only when
-`next()` returns a record. A restarted consumer or a new owner after a rebalance recovers that
-cursor and therefore reports a gap before its first post-recovery delivery. "Fresh" means this
-consumer group has no durable committed cursor for the partition, not merely that this iterator was
-newly assigned the partition. A seek resets the baseline to the requested offset, so intentionally
-skipped records before a forward seek and replay after a backward seek do not produce false gap
-reports. A truly fresh group partition has no baseline until its first delivered record.
+`next()` returns a record. A restarted consumer or a new owner after a rebalance reports a
+discontinuity only when its first post-recovery delivery exceeds the recovered committed cursor
+plus one; normal contiguous recovery reports none. "Fresh" means this consumer group has no
+durable committed cursor for the partition, not merely that this iterator was newly assigned the
+partition. A seek resets the baseline to the requested offset, so intentionally skipped records
+before a forward seek and replay after a backward seek do not produce false gap reports. A truly
+fresh group partition has no baseline until its first delivered record.
 
 The optional `fenced_metadata_writes` mode supplies a durable cross-process publication fence. Each
 write engine creates a unique process session ID; acquisition by a new or expired session increments
