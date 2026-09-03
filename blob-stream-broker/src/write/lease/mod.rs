@@ -8,6 +8,7 @@ use blob_stream_metadata_store::{
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
+  ProducerSequenceProgress,
   SequenceReservationOutcome,
 };
 use blob_stream_types::{SeqRange, VirtualPartitionId};
@@ -46,6 +47,7 @@ pub(super) async fn acquire_lease_and_reserve_sequences(
   now: OffsetDateTime,
   lease_duration: Duration,
   reservation_size: Option<u64>,
+  sequence_progress: ProducerSequenceProgress,
   metrics: &WriteMetrics,
 ) -> Result<LeaseAcquireAndReserveOutcome> {
   let reservation_started = reservation_size.map(|_| Instant::now());
@@ -57,6 +59,7 @@ pub(super) async fn acquire_lease_and_reserve_sequences(
       now,
       lease_duration,
       reservation_size,
+      sequence_progress,
     )
     .await
     .context("acquire producer partition lease and reserve sequences");
@@ -94,6 +97,7 @@ impl WriteEngineImpl {
     topic: &str,
     virtual_partition_id: VirtualPartitionId,
     now: OffsetDateTime,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<blob_stream_metadata_store::ProducerPartitionLease, WriteError> {
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string().into(),
@@ -108,6 +112,7 @@ impl WriteEngineImpl {
         self.lease_session_id.clone(),
         now,
         self.config.lease_duration,
+        sequence_progress,
       )
       .await
       .context("acquire producer partition lease")?
@@ -126,6 +131,7 @@ impl WriteEngineImpl {
     virtual_partition_id: VirtualPartitionId,
     now: OffsetDateTime,
     reservation_size: u64,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<SeqRange, WriteError> {
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string().into(),
@@ -140,6 +146,7 @@ impl WriteEngineImpl {
         &self.lease_session_id,
         now,
         reservation_size,
+        sequence_progress,
       )
       .await
       .context("reserve sequences");
@@ -178,6 +185,7 @@ impl WriteEngineImpl {
     virtual_partition_id: VirtualPartitionId,
     now: OffsetDateTime,
     reservation_size: u64,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<(blob_stream_metadata_store::ProducerPartitionLease, SeqRange), WriteError> {
     let key = ProducerPartitionLeaseKey {
       topic: topic.to_string().into(),
@@ -191,6 +199,7 @@ impl WriteEngineImpl {
       now,
       self.config.lease_duration,
       Some(reservation_size),
+      sequence_progress,
       &self.metrics,
     )
     .await;

@@ -109,6 +109,62 @@ async fn list_group_leases_returns_retained_rows_in_partition_order() {
 }
 
 #[tokio::test]
+async fn list_active_leases_filters_expired_rows_and_sorts_groups() {
+  let store = InMemoryConsumerGroupLeaseStore::new();
+  let active_a = lease_key_for("topic-a", "group-a", 2);
+  let active_b = lease_key_for("topic-a", "group-b", 1);
+  let expired = lease_key_for("topic-b", "group-a", 3);
+
+  for (key, owner_id) in [
+    (active_b.clone(), "member-b"),
+    (expired.clone(), "member-c"),
+    (active_a.clone(), "member-a"),
+  ] {
+    store
+      .assign_partition(
+        key,
+        owner_id.to_string(),
+        1,
+        offset_datetime_from_unix_millis(1_000),
+        Duration::milliseconds(100),
+      )
+      .await
+      .unwrap();
+  }
+  store
+    .release_partition(
+      &expired,
+      "member-c",
+      1,
+      offset_datetime_from_unix_millis(1_050),
+    )
+    .await
+    .unwrap();
+
+  let leases = store
+    .list_active_leases(
+      &["topic-a".to_string(), "topic-b".to_string()],
+      offset_datetime_from_unix_millis(1_050),
+    )
+    .await
+    .unwrap();
+
+  assert_eq!(
+    leases
+      .iter()
+      .map(|lease| {
+        (
+          lease.key.topic.as_str(),
+          lease.key.group_id.as_str(),
+          lease.key.virtual_partition_id,
+        )
+      })
+      .collect::<Vec<_>>(),
+    vec![("topic-a", "group-a", 2), ("topic-a", "group-b", 1)]
+  );
+}
+
+#[tokio::test]
 async fn fences_assignment() {
   let store = InMemoryConsumerGroupLeaseStore::new();
   let key = lease_key();

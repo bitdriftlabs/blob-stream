@@ -53,13 +53,19 @@ The broker listener serves gRPC plus these HTTP endpoints:
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /metrics` | Prometheus text format (`text/plain; version=0.0.4`) |
-| `GET /admin/state` | JSON snapshot of broker configuration, discovery, ownership, and local buffers |
+| `GET /admin/state` | JSON snapshot of broker configuration, discovery, local buffers, and durable lease state |
 | `GET /admin/metadata-cache` | Aggregate bounded metadata-cache capacity, age, refill, waiter, and failure state |
 | `GET /admin/blob-cache` | Aggregate raw blob-cache retention, active fetch, memory headroom, and failure state; never exposes object keys or bytes |
 | `POST /admin/log?rust_log=<filter>` | Replaces the active Rust log filter without restarting the broker |
 
 Protect the admin listener according to the deployment's network policy. `/admin/log` accepts a log
 filter such as `blob_stream=debug,bd=debug`; use trace only for targeted investigations.
+
+Consumer state responses include `suspected_lagging_partitions` when the group-lease lookup
+succeeds. Each entry is the complete observed lease snapshot for a partition whose committed source
+checkpoint is not in the current topic-configured metadata window, including entries with no source
+checkpoint. This is a quick signal for stalled, high-write partitions rather than a delivery
+guarantee; correlate it with the owner, heartbeat, and committed checkpoint before acting.
 
 ## Reading Broker State
 
@@ -82,6 +88,19 @@ sequence. Persistent growth in buffered bytes or an old `first_buffered_at` with
 usually points to blob-store, DynamoDB, or publication-latency problems. An unexpected local
 assignment without `local_active` is expected briefly during discovery or lease convergence; pair it
 with lease status and error metrics before treating it as an incident.
+
+`durable_topics` is a read-only, deployment-wide complement to the local state: it lists every
+configured virtual partition, its producer lease fence, expiry, and allocation high-water mark, and
+the active leases for every consumer group. `durable_consumer_lease_scan` describes the single
+consumer-table scan. A `missing` producer lease or an empty consumer list is meaningful only when
+the corresponding lookup completed; `unavailable`, `lookup_failed`, and `timed_out` mean the view
+is partial and should not be used to infer inactivity.
+
+Producer lease diagnostics include `reservation_start`, `max_allocated_seq`,
+`last_handed_out_seq`, and `sequence_progress_updated_at`. The first two bound the last observed
+local reservation; `last_handed_out_seq` is null until the current broker process has allocated a
+sequence. These informational fields are refreshed with successful lease mutations, never used as
+inputs to fencing, allocation, replay, or recovery.
 
 ### Metadata Cache State
 

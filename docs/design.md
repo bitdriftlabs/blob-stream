@@ -136,10 +136,12 @@ maintenance, plus the assignment-set generation that authorized it.
 
 Broker admin state reports its configured writer ID, local membership as `{node_id, address}`,
 and one ownership row per local writer-scoped virtual partition. Each row distinguishes the
-deterministic planned owner from the observed lease holder. Producer state reports the same local
-membership shape and one route per logical partition for its configured writer ID. Neither state
-surface claims knowledge of another writer/AZ. State snapshots use RFC 3339 UTC strings for
-absolute timestamps; elapsed durations remain numeric milliseconds.
+deterministic planned owner from the observed lease holder. Its additive `durable_topics` view
+enumerates every configured virtual partition across all writers, including the durable producer
+lease and all active consumer-group leases. Producer reads are bounded and the consumer lease table
+is scanned once. `missing`, `unavailable`, `lookup_failed`, and `timed_out` observations are
+explicitly distinct from a successful empty lease list. State snapshots use RFC 3339 UTC strings
+for absolute timestamps; elapsed durations remain numeric milliseconds.
 
 ### Sequence Numbers and Cursors
 
@@ -150,6 +152,12 @@ number, with both endpoints included. If a batch contains $R$ records, then $E =
 first record has sequence $S$, its last record has sequence $E$, and each intervening record has
 the next sequence number. The batch metadata persists that range once; the records themselves do
 not each carry a separate durable sequence-allocation record.
+
+Producer leases also retain diagnostics-only allocator progress. `reservation_start` with
+`max_allocated_seq` bounds the last observed local reservation range, and `last_handed_out_seq`
+is null until the owning broker process allocates its first sequence. The broker updates these
+values and `sequence_progress_updated_at` on every successful lease mutation, but never uses them
+for fencing, allocation, recovery, replay, or sequence reclamation.
 
 Sequence allocation uses a Hi-Lo allocator to avoid a metadata-store operation for every record
 or every producer batch. The durable producer-partition lease stores a high-water mark. While it
@@ -206,6 +214,16 @@ for each partition in epoch order, so a later sequence range cannot become consu
 During a graceful membership handoff or orderly shutdown, the broker stops accepting new batches for
 the partition, drains its already accepted work, and only then voluntarily releases the producer
 lease.
+
+Consumer iterator metrics report application-visible discontinuities with `delivery_gap_events`.
+The baseline comes from the partition's recovered durable committed cursor and advances only when
+`next()` returns a record. A restarted consumer or a new owner after a rebalance reports a
+discontinuity only when its first post-recovery delivery exceeds the recovered committed cursor
+plus one; normal contiguous recovery reports none. "Fresh" means this consumer group has no
+durable committed cursor for the partition, not merely that this iterator was newly assigned the
+partition. A seek resets the baseline to the requested offset, so intentionally skipped records
+before a forward seek and replay after a backward seek do not produce false gap reports. A truly
+fresh group partition has no baseline until its first delivered record.
 
 The optional `fenced_metadata_writes` mode supplies a durable cross-process publication fence. Each
 write engine creates a unique process session ID; acquisition by a new or expired session increments

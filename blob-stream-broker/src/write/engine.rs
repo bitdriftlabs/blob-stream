@@ -8,6 +8,14 @@ use super::api::{
   BrokerPartitionStateSnapshot,
   BrokerStateSnapshot,
   BrokerTopicStateSnapshot,
+  DurableCommittedSourceCheckpointSnapshot,
+  DurableConsumerLeaseScanSnapshot,
+  DurableConsumerLeaseSnapshot,
+  DurablePartitionStateSnapshot,
+  DurableProducerLeaseObservation,
+  DurableProducerLeaseSnapshot,
+  DurableStateLookupStatus,
+  DurableTopicStateSnapshot,
   SequenceReservationSnapshot,
   WriteEngine,
   WriteError,
@@ -30,11 +38,15 @@ use blob_stream_broker_discovery::{balanced_assignment, writer_virtual_partition
 use blob_stream_metadata_store::ProducerPartitionLeaseKey;
 use blob_stream_types::RecordBatch;
 pub use core::{WriteEngineBuilder, WriteEngineImpl};
+use futures::{StreamExt, stream};
 use log::trace;
 use std::collections::HashMap;
 use std::time::Duration as StdDuration;
 use time::ext::NumericalDuration;
 use tokio::sync::oneshot;
+
+const MAX_CONCURRENT_DURABLE_STATE_LOOKUPS: usize = 8;
+const DURABLE_STATE_LOOKUP_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
 #[async_trait]
 impl WriteEngine for WriteEngineImpl {
@@ -177,7 +189,13 @@ impl WriteEngine for WriteEngineImpl {
           let mut reservation = None;
           match (work.needs_lease, work.reservation) {
             (true, Some(request)) => match self
-              .acquire_lease_and_reserve_sequences(&topic, virtual_partition_id, now, request.size)
+              .acquire_lease_and_reserve_sequences(
+                &topic,
+                virtual_partition_id,
+                now,
+                request.size,
+                work.sequence_progress,
+              )
               .await
             {
               Ok((lease, range)) => {
@@ -191,7 +209,10 @@ impl WriteEngine for WriteEngineImpl {
                 return Err(error);
               },
             },
-            (true, None) => match self.ensure_lease(&topic, virtual_partition_id, now).await {
+            (true, None) => match self
+              .ensure_lease(&topic, virtual_partition_id, now, work.sequence_progress)
+              .await
+            {
               Ok(lease) => acquired_lease = Some(lease),
               Err(error) => {
                 let _ = work
@@ -201,7 +222,13 @@ impl WriteEngine for WriteEngineImpl {
               },
             },
             (false, Some(request)) => match self
-              .reserve_sequences(&topic, virtual_partition_id, now, request.size)
+              .reserve_sequences(
+                &topic,
+                virtual_partition_id,
+                now,
+                request.size,
+                work.sequence_progress,
+              )
               .await
             {
               Ok(range) => reservation = Some(range),
@@ -437,6 +464,187 @@ impl WriteEngine for WriteEngineImpl {
       (&left.topic, left.virtual_partition_id).cmp(&(&right.topic, right.virtual_partition_id))
     });
 
+    // The durable view intentionally reads after local state is copied so slow Dynamo calls do
+    // not block producers. Each observation reports failure separately from an absent lease.
+    let configured_topics = self
+      .topics
+      .values()
+      .map(|topic| topic.name.to_string())
+      .collect::<Vec<_>>();
+    let (durable_consumer_lease_scan, consumer_leases_by_partition) =
+      if let Some(consumer_lease_store) = &self.consumer_lease_store {
+        match tokio::time::timeout(
+          DURABLE_STATE_LOOKUP_TIMEOUT,
+          consumer_lease_store.list_active_leases(&configured_topics, generated_at),
+        )
+        .await
+        {
+          Ok(Ok(leases)) => {
+            let mut consumer_leases_by_partition = HashMap::new();
+            for lease in leases {
+              let committed_source_checkpoint =
+                lease.committed_cursor.as_ref().and_then(|cursor| {
+                  cursor.source_checkpoint.as_ref().map(|checkpoint| {
+                    DurableCommittedSourceCheckpointSnapshot {
+                      window_start_unix_seconds: checkpoint.window_start_unix_seconds,
+                      snowflake_id: checkpoint.snowflake_id,
+                    }
+                  })
+                });
+              let consumer_lease = DurableConsumerLeaseSnapshot {
+                group_id: lease.key.group_id,
+                owner_id: lease.owner_id,
+                generation: lease.generation,
+                lease_expiration_ts_ms: lease.lease_expiration_ts_ms,
+                last_heartbeat_ts_ms: lease.last_heartbeat_ts_ms,
+                committed_seq_end: lease.committed_cursor.as_ref().map(|cursor| cursor.seq_end),
+                committed_ts_ms: lease.committed_ts_ms,
+                committed_source_checkpoint,
+              };
+              consumer_leases_by_partition
+                .entry((lease.key.topic, lease.key.virtual_partition_id))
+                .or_insert_with(Vec::new)
+                .push(consumer_lease);
+            }
+            (
+              DurableConsumerLeaseScanSnapshot {
+                status: DurableStateLookupStatus::Present,
+                error: None,
+              },
+              consumer_leases_by_partition,
+            )
+          },
+          Ok(Err(error)) => {
+            warn_every!(
+              15.seconds(),
+              "broker durable consumer lease scan failed: error={error}",
+            );
+            (
+              DurableConsumerLeaseScanSnapshot {
+                status: DurableStateLookupStatus::LookupFailed,
+                error: Some(error.to_string()),
+              },
+              HashMap::new(),
+            )
+          },
+          Err(_) => (
+            DurableConsumerLeaseScanSnapshot {
+              status: DurableStateLookupStatus::TimedOut,
+              error: Some(format!("lookup exceeded {DURABLE_STATE_LOOKUP_TIMEOUT:?}")),
+            },
+            HashMap::new(),
+          ),
+        }
+      } else {
+        (
+          DurableConsumerLeaseScanSnapshot {
+            status: DurableStateLookupStatus::Unavailable,
+            error: None,
+          },
+          HashMap::new(),
+        )
+      };
+
+    let durable_partition_keys = self
+      .topics
+      .values()
+      .flat_map(|topic| {
+        (0 .. topic.partition_count.saturating_mul(topic.num_writers)).map(|virtual_partition_id| {
+          ProducerPartitionLeaseKey {
+            topic: topic.name.clone(),
+            virtual_partition_id,
+          }
+        })
+      })
+      .collect::<Vec<_>>();
+    let durable_producer_leases =
+      stream::iter(durable_partition_keys.into_iter().map(|key| async {
+        let observation = match tokio::time::timeout(
+          DURABLE_STATE_LOOKUP_TIMEOUT,
+          self.lease_store.get_lease(&key),
+        )
+        .await
+        {
+          Ok(Ok(Some(lease))) => DurableProducerLeaseObservation {
+            status: DurableStateLookupStatus::Present,
+            lease: Some(DurableProducerLeaseSnapshot {
+              holder_id: lease.fence.holder_id,
+              lease_epoch: lease.fence.lease_epoch,
+              lease_session_id: lease.fence.lease_session_id,
+              expires_at: lease.lease_expiration_at,
+              is_active: lease.lease_expiration_at > generated_at,
+              reservation_start: lease.reservation_start,
+              last_handed_out_seq: lease.last_handed_out_seq,
+              sequence_progress_updated_at: lease.sequence_progress_updated_at,
+              max_allocated_seq: lease.max_allocated_seq,
+            }),
+            error: None,
+          },
+          Ok(Ok(None)) => DurableProducerLeaseObservation {
+            status: DurableStateLookupStatus::Missing,
+            lease: None,
+            error: None,
+          },
+          Ok(Err(error)) => {
+            warn_every!(
+              15.seconds(),
+              "broker durable producer lease lookup failed: topic={}, virtual_partition_id={}, \
+               error={error}",
+              key.topic,
+              key.virtual_partition_id,
+            );
+            DurableProducerLeaseObservation {
+              status: DurableStateLookupStatus::LookupFailed,
+              lease: None,
+              error: Some(error.to_string()),
+            }
+          },
+          Err(_) => DurableProducerLeaseObservation {
+            status: DurableStateLookupStatus::TimedOut,
+            lease: None,
+            error: Some(format!("lookup exceeded {DURABLE_STATE_LOOKUP_TIMEOUT:?}")),
+          },
+        };
+        (key, observation)
+      }))
+      .buffer_unordered(MAX_CONCURRENT_DURABLE_STATE_LOOKUPS)
+      .collect::<HashMap<_, _>>()
+      .await;
+
+    let mut durable_topics = self
+      .topics
+      .values()
+      .map(|topic| {
+        let mut partitions = (0 .. topic.partition_count.saturating_mul(topic.num_writers))
+          .map(|virtual_partition_id| {
+            let mut consumer_leases = consumer_leases_by_partition
+              .get(&(topic.name.to_string(), virtual_partition_id))
+              .cloned()
+              .unwrap_or_default();
+            consumer_leases.sort_by(|left, right| left.group_id.cmp(&right.group_id));
+            let producer_lease = durable_producer_leases
+              .get(&ProducerPartitionLeaseKey {
+                topic: topic.name.clone(),
+                virtual_partition_id,
+              })
+              .expect("durable producer lookup must exist for every configured partition")
+              .clone();
+            DurablePartitionStateSnapshot {
+              virtual_partition_id,
+              producer_lease,
+              consumer_leases,
+            }
+          })
+          .collect::<Vec<_>>();
+        partitions.sort_by_key(|partition| partition.virtual_partition_id);
+        DurableTopicStateSnapshot {
+          name: topic.name.clone(),
+          partitions,
+        }
+      })
+      .collect::<Vec<_>>();
+    durable_topics.sort_by(|left, right| left.name.cmp(&right.name));
+
     let effective_flush_config = *self.effective_flush_config.read();
     BrokerStateSnapshot {
       generated_at,
@@ -453,6 +661,8 @@ impl WriteEngine for WriteEngineImpl {
       membership: membership_snapshot,
       ownership,
       topics,
+      durable_consumer_lease_scan,
+      durable_topics,
     }
   }
 }

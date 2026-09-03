@@ -55,6 +55,36 @@ impl ConsumerGroupLeaseStore for InMemoryConsumerGroupLeaseStore {
     Ok(leases)
   }
 
+  async fn list_active_leases(
+    &self,
+    topics: &[String],
+    now: OffsetDateTime,
+  ) -> Result<Vec<ConsumerGroupLease>> {
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds in-memory millisecond range"))?;
+    let guard = self.leases.read();
+    let mut leases = guard
+      .iter()
+      .filter(|(key, state)| {
+        topics.iter().any(|topic| topic == &key.topic) && state.lease_expiration_ts_ms > now_ts_ms
+      })
+      .map(|(key, state)| state.to_lease(key.clone()))
+      .collect::<Vec<_>>();
+    leases.sort_by(|left, right| {
+      (
+        &left.key.topic,
+        &left.key.group_id,
+        left.key.virtual_partition_id,
+      )
+        .cmp(&(
+          &right.key.topic,
+          &right.key.group_id,
+          right.key.virtual_partition_id,
+        ))
+    });
+    Ok(leases)
+  }
+
   async fn assign_partition(
     &self,
     key: ConsumerGroupLeaseKey,

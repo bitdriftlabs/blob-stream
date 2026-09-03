@@ -8,6 +8,7 @@ use blob_stream_metadata_store::{
 use blob_stream_types::{
   CommittedSourceCheckpoint,
   VirtualPartitionId,
+  Window,
   now_unix_millis,
   offset_datetime_from_unix_millis,
   offset_datetime_from_unix_seconds,
@@ -18,7 +19,7 @@ use serde::{Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use time::OffsetDateTime;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tracing::Span;
 
 //
@@ -30,6 +31,7 @@ pub struct ConsumerStateResponse {
   #[serde(flatten)]
   pub state: ConsumerStateSnapshot,
   pub group_lease_observation: ConsumerGroupLeaseObservation,
+  pub suspected_lagging_partitions: Vec<ConsumerGroupPartitionLeaseSnapshot>,
 }
 
 //
@@ -213,7 +215,7 @@ pub struct ConsumerCommittedCursorSnapshot {
   pub committed_at_ms: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 /// Desired and observed lease state for one consumer-group virtual partition.
 pub struct ConsumerGroupPartitionLeaseSnapshot {
   pub virtual_partition_id: VirtualPartitionId,
@@ -336,6 +338,7 @@ pub struct ConsumerDiagnostics {
   group_config: ConsumerGroupConfig,
   shared_state: Arc<Mutex<ConsumerSharedState>>,
   prefetch_max_bytes: u64,
+  metadata_window_size: TimeDuration,
   lease_store: Arc<dyn ConsumerGroupLeaseStore>,
 }
 
@@ -344,12 +347,14 @@ impl ConsumerDiagnostics {
     group_config: ConsumerGroupConfig,
     shared_state: Arc<Mutex<ConsumerSharedState>>,
     prefetch_max_bytes: u64,
+    metadata_window_size: TimeDuration,
     lease_store: Arc<dyn ConsumerGroupLeaseStore>,
   ) -> Self {
     Self {
       group_config,
       shared_state,
       prefetch_max_bytes,
+      metadata_window_size,
       lease_store,
     }
   }
@@ -534,9 +539,16 @@ impl ConsumerDiagnostics {
     };
 
     state.generated_at = offset_datetime_from_unix_millis(now_unix_millis());
+    let suspected_lagging_partitions = match &group_lease_observation {
+      ConsumerGroupLeaseObservation::Fresh { partitions } => {
+        suspected_lagging_partitions(partitions, state.generated_at, self.metadata_window_size)
+      },
+      ConsumerGroupLeaseObservation::LookupFailed { .. } => Vec::new(),
+    };
     ConsumerStateResponse {
       state,
       group_lease_observation,
+      suspected_lagging_partitions,
     }
   }
 
@@ -652,6 +664,24 @@ pub fn group_lease_observation(
   }
   partitions.sort_by_key(|partition| partition.virtual_partition_id);
   ConsumerGroupLeaseObservation::Fresh { partitions }
+}
+
+pub fn suspected_lagging_partitions(
+  partitions: &[ConsumerGroupPartitionLeaseSnapshot],
+  now: OffsetDateTime,
+  metadata_window_size: TimeDuration,
+) -> Vec<ConsumerGroupPartitionLeaseSnapshot> {
+  let current_window_start = Window::for_timestamp(now, metadata_window_size).start;
+  partitions
+    .iter()
+    .filter(|partition| {
+      partition
+        .committed_source_checkpoint
+        .as_ref()
+        .is_none_or(|checkpoint| checkpoint.window_start != current_window_start)
+    })
+    .cloned()
+    .collect()
 }
 
 fn group_partition_lease_snapshot(

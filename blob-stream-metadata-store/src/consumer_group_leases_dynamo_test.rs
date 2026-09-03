@@ -209,6 +209,87 @@ async fn list_group_leases_returns_retained_rows_in_partition_order() -> Result<
 }
 
 #[tokio::test]
+async fn list_active_leases_filters_expired_and_unconfigured_rows() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());
+  create_leases_table(&client, &table_name).await?;
+
+  let store = DynamoConsumerGroupLeaseStore::new(
+    client.clone(),
+    table_name.clone(),
+    TimeDuration::hours(1),
+    None,
+  );
+  let active_a = lease_key_for("topic-a", "group-a", 2);
+  let active_b = lease_key_for("topic-a", "group-b", 1);
+  let expired = lease_key_for("topic-b", "group-a", 3);
+  let unconfigured = lease_key_for("topic-c", "group-a", 4);
+
+  for (key, owner_id) in [
+    (active_b.clone(), "member-b"),
+    (expired.clone(), "member-c"),
+    (unconfigured, "member-d"),
+    (active_a.clone(), "member-a"),
+  ] {
+    store
+      .assign_partition(
+        key,
+        owner_id.to_string(),
+        1,
+        offset_datetime_from_unix_millis(1_000),
+        TimeDuration::milliseconds(100),
+      )
+      .await?;
+  }
+  store
+    .heartbeat_partition(
+      &active_a,
+      "member-a",
+      1,
+      offset_datetime_from_unix_millis(1_010),
+      TimeDuration::milliseconds(100),
+      Some(cursor_with_source(2, 42)),
+    )
+    .await?;
+  assert_eq!(
+    store
+      .release_partition(
+        &expired,
+        "member-c",
+        1,
+        offset_datetime_from_unix_millis(1_050),
+      )
+      .await?,
+    ConsumerGroupReleaseOutcome::Released
+  );
+
+  let leases = store
+    .list_active_leases(
+      &["topic-a".to_string(), "topic-b".to_string()],
+      offset_datetime_from_unix_millis(1_050),
+    )
+    .await?;
+
+  assert_eq!(
+    leases
+      .iter()
+      .map(|lease| {
+        (
+          lease.key.topic.as_str(),
+          lease.key.group_id.as_str(),
+          lease.key.virtual_partition_id,
+        )
+      })
+      .collect::<Vec<_>>(),
+    vec![("topic-a", "group-a", 2), ("topic-a", "group-b", 1)]
+  );
+  assert_eq!(leases[0].committed_cursor, Some(cursor_with_source(2, 42)));
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[tokio::test]
 async fn fences_assignment() -> Result<()> {
   let client = dynamo_client().await?;
   let table_name = format!("consumer_leases_test_{}", Uuid::new_v4());

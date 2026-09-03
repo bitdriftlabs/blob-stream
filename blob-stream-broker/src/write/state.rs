@@ -1,6 +1,6 @@
 use super::buffer::{BufferState, FlushPublicationDependency};
 use blob_stream_broker_discovery::BrokerMembership;
-use blob_stream_metadata_store::ProducerLeaseFence;
+use blob_stream_metadata_store::{ProducerLeaseFence, ProducerSequenceProgress};
 use blob_stream_types::{SeqRange, VirtualPartitionId};
 use log::debug;
 use protobuf::Chars;
@@ -267,6 +267,7 @@ impl PartitionState {
 pub(super) struct SeqAllocator {
   pub(super) reservation: Option<SeqRange>,
   pub(super) next_seq: u64,
+  pub(super) last_handed_out_seq: Option<u64>,
 }
 
 impl SeqAllocator {
@@ -302,7 +303,27 @@ impl SeqAllocator {
     let start = self.next_seq;
     let end = start.checked_add(count.saturating_sub(1))?;
     self.next_seq = end.saturating_add(1);
+    self.last_handed_out_seq = Some(end);
     Some(SeqRange { start, end })
+  }
+
+  pub(super) fn sequence_progress(&self) -> ProducerSequenceProgress {
+    ProducerSequenceProgress {
+      reservation_start: self
+        .reservation
+        .as_ref()
+        .map(|reservation| reservation.start),
+      last_handed_out_seq: self.last_handed_out_seq,
+    }
+  }
+
+  pub(super) fn sequence_progress_for_new_reservation(&self) -> ProducerSequenceProgress {
+    // The range start is allocated by the conditional lease-store mutation. `None` directs that
+    // mutation to derive and persist the new start from its durable high watermark atomically.
+    ProducerSequenceProgress {
+      reservation_start: None,
+      last_handed_out_seq: self.last_handed_out_seq,
+    }
   }
 
   pub(super) fn install_or_extend_reservation(&mut self, range: SeqRange) {

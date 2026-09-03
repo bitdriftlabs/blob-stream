@@ -22,6 +22,7 @@ use crate::{
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
+  ProducerSequenceProgress,
   SequenceReservation,
   SequenceReservationOutcome,
 };
@@ -39,9 +40,13 @@ use blob_stream_types::{
 use log::{debug, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use time::{Duration, OffsetDateTime};
 
 const ATTR_MAX_SEQ: &str = "max_allocated_seq";
+const ATTR_RESERVATION_START: &str = "reservation_start";
+const ATTR_LAST_HANDED_OUT_SEQ: &str = "last_handed_out_seq";
+const ATTR_SEQUENCE_PROGRESS_UPDATED_TS_MS: &str = "sequence_progress_updated_ts_ms";
 
 //
 // DynamoProducerPartitionLeaseStore
@@ -155,6 +160,8 @@ impl DynamoProducerPartitionLeaseStore {
     pk: String,
     mut values: HashMap<String, AttributeValue>,
     reservation_size: Option<u64>,
+    sequence_progress: ProducerSequenceProgress,
+    now_ts_ms: i64,
   ) -> Result<Option<UpdateItemOutput>> {
     values.insert(
       ":epoch_zero".to_string(),
@@ -176,6 +183,13 @@ impl DynamoProducerPartitionLeaseStore {
          :epoch_increment"
       ),
     };
+    let claim_update = sequence_progress_update(
+      claim_update,
+      &mut values,
+      sequence_progress,
+      reservation_size.is_some(),
+      now_ts_ms,
+    );
     let claim_condition = format!("attribute_not_exists({ATTR_PK}) OR {ATTR_EXPIRES} <= :now");
     let claim_condition = match reservation_size {
       Some(_) => format!(
@@ -231,6 +245,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     lease_session_id: String,
     now: OffsetDateTime,
     lease_duration: Duration,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseAcquireOutcome> {
     match self
       .acquire_lease_and_reserve_sequences(
@@ -240,6 +255,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
         now,
         lease_duration,
         None,
+        sequence_progress,
       )
       .await?
     {
@@ -267,6 +283,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     now: OffsetDateTime,
     lease_duration: Duration,
     reservation_size: Option<u64>,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseAcquireAndReserveOutcome> {
     trace!(
       "producer lease(dynamo) acquire/reserve: table={}, topic={}, partition={}, holder_id={}, \
@@ -318,6 +335,13 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       ),
       None => format!("SET {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl"),
     };
+    let renewal_update = sequence_progress_update(
+      renewal_update,
+      &mut values,
+      sequence_progress,
+      reservation_size.is_some(),
+      now_ts_ms,
+    );
     let renewal_condition =
       format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EXPIRES} > :now");
     let renewal_condition = match reservation_size {
@@ -352,7 +376,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
         if service_error.err().is_conditional_check_failed_exception() =>
       {
         if let Some(output) = self
-          .claim_after_failed_renewal(pk, values, reservation_size)
+          .claim_after_failed_renewal(pk, values, reservation_size, sequence_progress, now_ts_ms)
           .await?
         {
           self.complete_acquire(output, key, reservation_size, "acquired takeover")
@@ -385,6 +409,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     lease_session_id: &str,
     now: OffsetDateTime,
     lease_duration: Duration,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseHeartbeatOutcome> {
     trace!(
       "producer lease(dynamo) heartbeat: table={}, topic={}, partition={}, holder_id={}",
@@ -416,7 +441,13 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     );
     values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
 
-    let update = format!("SET {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl");
+    let update = sequence_progress_update(
+      format!("SET {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl"),
+      &mut values,
+      sequence_progress,
+      false,
+      now_ts_ms,
+    );
     let condition =
       format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EXPIRES} > :now");
 
@@ -475,6 +506,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     lease_session_id: &str,
     now: OffsetDateTime,
     reservation_size: u64,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<SequenceReservationOutcome> {
     trace!(
       "producer lease(dynamo) reserve: table={}, topic={}, partition={}, holder_id={}, size={}",
@@ -506,7 +538,13 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       AttributeValue::N((u64::MAX - reservation_size).to_string()),
     );
 
-    let update = format!("SET {ATTR_MAX_SEQ} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta");
+    let update = sequence_progress_update(
+      format!("SET {ATTR_MAX_SEQ} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta"),
+      &mut values,
+      sequence_progress,
+      true,
+      now_ts_ms,
+    );
     let condition = format!(
       "{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EXPIRES} > :now AND \
        (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= :max_reservable)"
@@ -590,6 +628,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     holder_id: &str,
     lease_session_id: &str,
     now: OffsetDateTime,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseReleaseOutcome> {
     trace!(
       "producer lease(dynamo) release: table={}, topic={}, partition={}, holder_id={}",
@@ -615,7 +654,13 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
       AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer)?.to_string()),
     );
 
-    let update = format!("SET {ATTR_EXPIRES} = :expired, {ATTR_TTL} = :ttl");
+    let update = sequence_progress_update(
+      format!("SET {ATTR_EXPIRES} = :expired, {ATTR_TTL} = :ttl"),
+      &mut values,
+      sequence_progress,
+      false,
+      now_ts_ms,
+    );
     let condition = format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session");
     let response = retry_dynamo_transaction_conflicts(
       "producer_lease_release",
@@ -663,6 +708,60 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
 }
 
 //
+// Sequence Progress Updates
+//
+
+fn sequence_progress_update(
+  mut update: String,
+  values: &mut HashMap<String, AttributeValue>,
+  sequence_progress: ProducerSequenceProgress,
+  reserves_sequences: bool,
+  updated_ts_ms: i64,
+) -> String {
+  values.insert(
+    ":sequence_progress_updated_ts_ms".to_string(),
+    AttributeValue::N(updated_ts_ms.to_string()),
+  );
+  let _ = write!(
+    update,
+    ", {ATTR_SEQUENCE_PROGRESS_UPDATED_TS_MS} = :sequence_progress_updated_ts_ms"
+  );
+  let mut remove = Vec::new();
+  if let Some(reservation_start) = sequence_progress.reservation_start {
+    values.insert(
+      ":reservation_start".to_string(),
+      AttributeValue::N(reservation_start.to_string()),
+    );
+    let _ = write!(update, ", {ATTR_RESERVATION_START} = :reservation_start");
+  } else if reserves_sequences {
+    values.insert(":one".to_string(), AttributeValue::N("1".to_string()));
+    let _ = write!(
+      update,
+      ", {ATTR_RESERVATION_START} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :one"
+    );
+  } else {
+    remove.push(ATTR_RESERVATION_START);
+  }
+  if let Some(last_handed_out_seq) = sequence_progress.last_handed_out_seq {
+    values.insert(
+      ":last_handed_out_seq".to_string(),
+      AttributeValue::N(last_handed_out_seq.to_string()),
+    );
+    let _ = write!(
+      update,
+      ", {ATTR_LAST_HANDED_OUT_SEQ} = :last_handed_out_seq"
+    );
+  } else {
+    remove.push(ATTR_LAST_HANDED_OUT_SEQ);
+  }
+  if !remove.is_empty() {
+    update.push_str(" REMOVE ");
+    update.push_str(&remove.join(", "));
+  }
+  update
+}
+
+//
 // DynamoLeaseItem
 //
 
@@ -673,6 +772,9 @@ struct DynamoLeaseItem {
   lease_session_id: String,
   lease_expiration_ts_ms: i64,
   max_allocated_seq: Option<u64>,
+  reservation_start: Option<u64>,
+  last_handed_out_seq: Option<u64>,
+  sequence_progress_updated_ts_ms: Option<i64>,
 }
 
 impl DynamoLeaseItem {
@@ -686,6 +788,11 @@ impl DynamoLeaseItem {
       },
       lease_expiration_at: offset_datetime_from_unix_millis(self.lease_expiration_ts_ms),
       max_allocated_seq: self.max_allocated_seq,
+      reservation_start: self.reservation_start,
+      last_handed_out_seq: self.last_handed_out_seq,
+      sequence_progress_updated_at: self
+        .sequence_progress_updated_ts_ms
+        .map(offset_datetime_from_unix_millis),
     }
   }
 }

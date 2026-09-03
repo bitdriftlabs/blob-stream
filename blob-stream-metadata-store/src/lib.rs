@@ -33,7 +33,12 @@ mod memory;
 mod producer_partition_leases_dynamo;
 mod producer_partition_leases_memory;
 
-pub use aws::{aws_retry_config, aws_timeout_config};
+pub use aws::{
+  aws_retry_config,
+  aws_timeout_config,
+  build_dynamo_client,
+  build_dynamo_consumer_group_lease_store,
+};
 pub use codec::{decode_segment_metadata_v1, encode_segment_metadata_v1};
 pub use consumer_group_leases_dynamo::DynamoConsumerGroupLeaseStore;
 pub use consumer_group_leases_memory::InMemoryConsumerGroupLeaseStore;
@@ -202,6 +207,28 @@ pub struct ProducerPartitionLease {
   pub lease_expiration_at: OffsetDateTime,
   /// High watermark for allocated sequence numbers.
   pub max_allocated_seq: Option<u64>,
+  /// First sequence in the broker's current local reservation range.
+  pub reservation_start: Option<u64>,
+  /// Most recent sequence handed out by the broker's current process.
+  pub last_handed_out_seq: Option<u64>,
+  /// Time at which the sequence progress was last observed.
+  pub sequence_progress_updated_at: Option<OffsetDateTime>,
+}
+
+//
+// ProducerSequenceProgress
+//
+
+/// Diagnostics-only local allocator state persisted with a producer lease mutation.
+///
+/// This is not used for lease fencing, sequence allocation, or recovery. A reservation mutation
+/// derives its start from the durable high watermark when `reservation_start` is `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProducerSequenceProgress {
+  /// First sequence in the current local reservation range, when one exists.
+  pub reservation_start: Option<u64>,
+  /// Most recent sequence handed out by this broker process, when one exists.
+  pub last_handed_out_seq: Option<u64>,
 }
 
 //
@@ -310,7 +337,7 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     key: &ProducerPartitionLeaseKey,
   ) -> Result<Option<ProducerPartitionLease>>;
 
-  /// Acquire or renew a producer partition lease.
+  /// Acquire or renew a producer partition lease and persist a diagnostics-only progress sample.
   async fn acquire_lease(
     &self,
     key: ProducerPartitionLeaseKey,
@@ -318,9 +345,10 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     lease_session_id: String,
     now: OffsetDateTime,
     lease_duration: Duration,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseAcquireOutcome>;
 
-  /// Atomically acquire or renew a lease and optionally reserve a Hi-Lo sequence block.
+  /// Atomically acquire or renew a lease, optionally reserve sequences, and persist progress.
   async fn acquire_lease_and_reserve_sequences(
     &self,
     key: ProducerPartitionLeaseKey,
@@ -329,9 +357,10 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     now: OffsetDateTime,
     lease_duration: Duration,
     reservation_size: Option<u64>,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseAcquireAndReserveOutcome>;
 
-  /// Heartbeat a lease to keep ownership.
+  /// Heartbeat a lease to keep ownership and persist a diagnostics-only progress sample.
   async fn heartbeat_lease(
     &self,
     key: &ProducerPartitionLeaseKey,
@@ -339,9 +368,10 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     lease_session_id: &str,
     now: OffsetDateTime,
     lease_duration: Duration,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseHeartbeatOutcome>;
 
-  /// Reserve a sequence block for a virtual partition using Hi-Lo semantics.
+  /// Reserve a sequence block for a virtual partition and persist a diagnostics-only sample.
   async fn reserve_sequences(
     &self,
     key: &ProducerPartitionLeaseKey,
@@ -349,15 +379,17 @@ pub trait ProducerPartitionLeaseStore: Send + Sync {
     lease_session_id: &str,
     now: OffsetDateTime,
     reservation_size: u64,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<SequenceReservationOutcome>;
 
-  /// Release a lease held by the caller to speed up ownership convergence.
+  /// Release a lease held by the caller and persist a diagnostics-only progress sample.
   async fn release_lease(
     &self,
     key: &ProducerPartitionLeaseKey,
     holder_id: &str,
     lease_session_id: &str,
     now: OffsetDateTime,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseReleaseOutcome>;
 }
 
@@ -552,6 +584,13 @@ pub trait ConsumerGroupLeaseStore: Send + Sync {
   /// cleanup.
   async fn list_group_leases(&self, topic: &str, group_id: &str)
   -> Result<Vec<ConsumerGroupLease>>;
+
+  /// List unexpired lease rows for the configured topics across all consumer groups.
+  async fn list_active_leases(
+    &self,
+    topics: &[String],
+    now: OffsetDateTime,
+  ) -> Result<Vec<ConsumerGroupLease>>;
 
   /// Assign ownership of a virtual partition lease.
   async fn assign_partition(

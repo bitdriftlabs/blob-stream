@@ -37,6 +37,7 @@ use blob_stream_metadata_store::{
   ProducerPartitionFence,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
+  ProducerSequenceProgress,
   SegmentMetadata,
   SequenceReservationOutcome,
 };
@@ -182,6 +183,7 @@ async fn acquire_producer_fence(
       lease_session_id.to_string(),
       offset_datetime_from_unix_millis(now_ts_ms),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   let LeaseAcquireOutcome::Acquired(lease) = outcome else {
@@ -391,6 +393,7 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
       "session-1".to_string(),
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   let LeaseAcquireOutcome::Acquired(first) = first else {
@@ -405,6 +408,7 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
       "session-1".to_string(),
       offset_datetime_from_unix_millis(1_050),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   let LeaseAcquireOutcome::Acquired(renewal) = renewal else {
@@ -419,6 +423,7 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
       "session-2".to_string(),
       offset_datetime_from_unix_millis(1_100),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   assert!(matches!(live_takeover, LeaseAcquireOutcome::HeldByOther(_)));
@@ -430,6 +435,7 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
       "session-2".to_string(),
       offset_datetime_from_unix_millis(1_150),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   let LeaseAcquireOutcome::Acquired(takeover) = takeover else {
@@ -444,6 +450,7 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
       "session-1",
       offset_datetime_from_unix_millis(1_150),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   assert!(matches!(heartbeat, LeaseHeartbeatOutcome::HeldByOther(_)));
@@ -454,6 +461,7 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
       "session-1",
       offset_datetime_from_unix_millis(1_150),
       1,
+      ProducerSequenceProgress::default(),
     )
     .await?;
   assert!(matches!(
@@ -466,6 +474,7 @@ async fn dynamo_producer_leases_fence_stale_broker_sessions() -> Result<()> {
       "broker-a",
       "session-1",
       offset_datetime_from_unix_millis(1_150),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   assert!(matches!(release, LeaseReleaseOutcome::HeldByOther(_)));
@@ -492,6 +501,7 @@ async fn dynamo_sequence_reservation_rejects_stale_same_holder_session_before_ov
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
       Some(u64::MAX),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   assert!(matches!(
@@ -506,6 +516,7 @@ async fn dynamo_sequence_reservation_rejects_stale_same_holder_session_before_ov
       "session-2".to_string(),
       offset_datetime_from_unix_millis(1_100),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   assert!(matches!(takeover, LeaseAcquireOutcome::Acquired(_)));
@@ -517,6 +528,7 @@ async fn dynamo_sequence_reservation_rejects_stale_same_holder_session_before_ov
       "session-1",
       offset_datetime_from_unix_millis(1_100),
       2,
+      ProducerSequenceProgress::default(),
     )
     .await?;
   assert!(matches!(

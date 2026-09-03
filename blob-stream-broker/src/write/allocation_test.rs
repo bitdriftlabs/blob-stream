@@ -6,7 +6,7 @@ use super::{
   begin_allocation_transition,
 };
 use crate::write::buffer::{BufferedBatch, FlushCompletionError};
-use crate::write::state::WriteState;
+use crate::write::state::{SeqAllocator, WriteState};
 use blob_stream_metadata_store::{
   ProducerLeaseFence,
   ProducerPartitionLease,
@@ -74,6 +74,9 @@ fn fence_change_discards_buffered_batches_and_completes_them() {
       fence: fence(2),
       lease_expiration_at: offset_datetime_from_unix_millis(1_100),
       max_allocated_seq: Some(0),
+      reservation_start: None,
+      last_handed_out_seq: None,
+      sequence_progress_updated_at: None,
     }),
     None,
   );
@@ -150,6 +153,34 @@ fn allocation_rejects_unassigned_partition_without_creating_state() {
 }
 
 #[test]
+fn allocator_sequence_progress_tracks_last_handout() {
+  let mut allocator = SeqAllocator::default();
+  assert_eq!(allocator.sequence_progress().reservation_start, None);
+  assert_eq!(allocator.sequence_progress().last_handed_out_seq, None);
+
+  allocator.install_or_extend_reservation(SeqRange { start: 10, end: 19 });
+  assert_eq!(allocator.sequence_progress().reservation_start, Some(10));
+  assert_eq!(allocator.sequence_progress().last_handed_out_seq, None);
+  assert_eq!(allocator.allocate(3), Some(SeqRange { start: 10, end: 12 }));
+  assert_eq!(allocator.sequence_progress().last_handed_out_seq, Some(12));
+
+  allocator.install_or_extend_reservation(SeqRange { start: 20, end: 29 });
+  assert_eq!(allocator.sequence_progress().reservation_start, Some(10));
+  assert_eq!(
+    allocator
+      .sequence_progress_for_new_reservation()
+      .reservation_start,
+    None
+  );
+  assert_eq!(
+    allocator
+      .sequence_progress_for_new_reservation()
+      .last_handed_out_seq,
+    Some(12)
+  );
+}
+
+#[test]
 fn stale_assignment_completion_discards_lease_and_reservation() {
   let state = state_with_local_telemetry_assignment();
   let now = offset_datetime_from_unix_millis(1_000);
@@ -172,6 +203,9 @@ fn stale_assignment_completion_discards_lease_and_reservation() {
       fence: fence(1),
       lease_expiration_at: now + time::Duration::seconds(60),
       max_allocated_seq: Some(9),
+      reservation_start: None,
+      last_handed_out_seq: None,
+      sequence_progress_updated_at: None,
     }),
     Some(SeqRange { start: 0, end: 9 }),
   );

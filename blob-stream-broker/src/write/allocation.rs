@@ -4,7 +4,7 @@ mod tests;
 
 use super::state::WriteState;
 use crate::write::buffer::FlushCompletionError;
-use blob_stream_metadata_store::ProducerPartitionLease;
+use blob_stream_metadata_store::{ProducerPartitionLease, ProducerSequenceProgress};
 use blob_stream_types::{SeqRange, VirtualPartitionId};
 use log::trace;
 use parking_lot::Mutex;
@@ -189,6 +189,7 @@ pub(super) struct AllocationTransitionWork {
   pub(super) needs_lease: bool,
   pub(super) lease_was_expired: bool,
   pub(super) reservation: Option<ReservationRequest>,
+  pub(super) sequence_progress: ProducerSequenceProgress,
   pub(super) records_allocated_since_last_maintenance: Option<u64>,
 }
 
@@ -327,6 +328,18 @@ pub(super) fn begin_allocation_transition(
     return AllocationTransitionDecision::Ready;
   }
 
+  let sequence_progress = if lease_was_expired {
+    ProducerSequenceProgress::default()
+  } else if reservation.is_some() && remaining_capacity == 0 {
+    // A reservation request for an exhausted range obtains its start only when the conditional
+    // store mutation succeeds. Have the store derive and persist that start in the same mutation.
+    partition_state
+      .seq_allocator
+      .sequence_progress_for_new_reservation()
+  } else {
+    partition_state.seq_allocator.sequence_progress()
+  };
+
   partition_state.allocation_in_flight = true;
   partition_state.allocation_started_at = Some(now);
   trace!(
@@ -347,6 +360,7 @@ pub(super) fn begin_allocation_transition(
     needs_lease,
     lease_was_expired,
     reservation,
+    sequence_progress,
     records_allocated_since_last_maintenance: renew_lease
       .then_some(records_allocated_since_last_maintenance),
   })

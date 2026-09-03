@@ -55,6 +55,123 @@ pub struct BrokerStateSnapshot {
   pub membership: Vec<BrokerNodeSnapshot>,
   pub ownership: Vec<BrokerPartitionOwnershipSnapshot>,
   pub topics: Vec<BrokerTopicStateSnapshot>,
+  pub durable_consumer_lease_scan: DurableConsumerLeaseScanSnapshot,
+  pub durable_topics: Vec<DurableTopicStateSnapshot>,
+}
+
+//
+// DurableConsumerLeaseScanSnapshot
+//
+
+/// Outcome of reading active consumer leases for the durable state view.
+#[derive(Clone, Debug, Serialize)]
+pub struct DurableConsumerLeaseScanSnapshot {
+  pub status: DurableStateLookupStatus,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub error: Option<String>,
+}
+
+//
+// DurableStateLookupStatus
+//
+
+/// Result of one read-only durable state lookup.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableStateLookupStatus {
+  Present,
+  Missing,
+  Unavailable,
+  LookupFailed,
+  TimedOut,
+}
+
+//
+// DurableTopicStateSnapshot
+//
+
+/// Durable producer and consumer lease observations for one configured topic.
+#[derive(Clone, Debug, Serialize)]
+pub struct DurableTopicStateSnapshot {
+  #[serde(serialize_with = "serialize_as_string")]
+  pub name: Chars,
+  pub partitions: Vec<DurablePartitionStateSnapshot>,
+}
+
+//
+// DurablePartitionStateSnapshot
+//
+
+/// Durable producer and consumer state for one configured virtual partition.
+#[derive(Clone, Debug, Serialize)]
+pub struct DurablePartitionStateSnapshot {
+  pub virtual_partition_id: VirtualPartitionId,
+  pub producer_lease: DurableProducerLeaseObservation,
+  pub consumer_leases: Vec<DurableConsumerLeaseSnapshot>,
+}
+
+//
+// DurableProducerLeaseObservation
+//
+
+/// Result of looking up the durable producer lease for one virtual partition.
+#[derive(Clone, Debug, Serialize)]
+pub struct DurableProducerLeaseObservation {
+  pub status: DurableStateLookupStatus,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub lease: Option<DurableProducerLeaseSnapshot>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub error: Option<String>,
+}
+
+//
+// DurableProducerLeaseSnapshot
+//
+
+/// Durable producer lease row fields that are relevant to diagnosis.
+#[derive(Clone, Debug, Serialize)]
+pub struct DurableProducerLeaseSnapshot {
+  pub holder_id: String,
+  pub lease_epoch: u64,
+  pub lease_session_id: String,
+  #[serde(with = "time::serde::rfc3339")]
+  pub expires_at: OffsetDateTime,
+  pub is_active: bool,
+  /// First sequence in the current locally reserved range, when observed.
+  pub reservation_start: Option<u64>,
+  /// Most recent sequence handed out by the current broker process, when observed.
+  pub last_handed_out_seq: Option<u64>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub sequence_progress_updated_at: Option<OffsetDateTime>,
+  pub max_allocated_seq: Option<u64>,
+}
+
+//
+// DurableConsumerLeaseSnapshot
+//
+
+/// Active consumer-group lease row fields for one virtual partition.
+#[derive(Clone, Debug, Serialize)]
+pub struct DurableConsumerLeaseSnapshot {
+  pub group_id: String,
+  pub owner_id: String,
+  pub generation: u64,
+  pub lease_expiration_ts_ms: i64,
+  pub last_heartbeat_ts_ms: i64,
+  pub committed_seq_end: Option<u64>,
+  pub committed_ts_ms: Option<i64>,
+  pub committed_source_checkpoint: Option<DurableCommittedSourceCheckpointSnapshot>,
+}
+
+//
+// DurableCommittedSourceCheckpointSnapshot
+//
+
+/// Source checkpoint paired with an active consumer group's committed cursor.
+#[derive(Clone, Debug, Serialize)]
+pub struct DurableCommittedSourceCheckpointSnapshot {
+  pub window_start_unix_seconds: i64,
+  pub snowflake_id: u64,
 }
 
 //
@@ -218,6 +335,6 @@ pub trait WriteEngine: Send + Sync {
   /// Returns the maximum time an incoming produce RPC may wait for this engine.
   fn produce_request_timeout(&self) -> Duration;
 
-  /// Returns a best-effort snapshot of state held by this broker process.
+  /// Returns a best-effort snapshot of local and durable broker state.
   async fn state_snapshot(&self) -> BrokerStateSnapshot;
 }

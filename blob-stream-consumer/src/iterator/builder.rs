@@ -259,6 +259,7 @@ impl ConsumerIteratorBuilder<'_> {
       group_config.clone(),
       Arc::clone(&shared_state),
       prefetch_max_bytes,
+      metadata_window_size,
       Arc::clone(&lease_store),
     );
     {

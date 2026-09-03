@@ -1,8 +1,5 @@
 use crate::write::{AdmissionController, DEFAULT_ZSTD_LEVEL, WriteEngine, WriteEngineBuilder};
 use anyhow::{Context, Result, anyhow, ensure};
-use aws_config::BehaviorVersion;
-use aws_config::meta::region::RegionProviderChain;
-use aws_types::region::Region;
 use bd_log_util::warn_every;
 use bd_pgv::proto_validate;
 use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
@@ -13,14 +10,15 @@ use blob_stream_broker_discovery::k8s::K8sServiceBrokerDiscovery;
 use blob_stream_broker_discovery::r#static::StaticBrokerDiscovery;
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode};
 use blob_stream_metadata_store::{
+  ConsumerGroupLeaseStore,
   DynamoCapacityMetrics,
   DynamoProducerPartitionLeaseStore,
   InMemoryMetadataStore,
   InMemoryProducerPartitionLeaseStore,
   MetadataStore,
   ProducerPartitionLeaseStore,
-  aws_retry_config,
-  aws_timeout_config,
+  build_dynamo_client,
+  build_dynamo_consumer_group_lease_store,
 };
 use blob_stream_proto::protos::blobstream::v1::config::{
   BrokerConfig,
@@ -70,6 +68,7 @@ mod tests;
 enum DynamoTablePurpose {
   SegmentMetadata,
   ProducerPartitionLeases,
+  ConsumerGroupLeases,
 }
 
 //
@@ -391,11 +390,14 @@ impl<'a> RuntimeWriteEngineBuilder<'a> {
       .context("runtime config missing metadata_store config")?;
 
     let lease_store =
-      build_producer_partition_lease_store(metadata_store_config, dynamo_capacity_metrics).await?;
+      build_producer_partition_lease_store(metadata_store_config, dynamo_capacity_metrics.clone())
+        .await?;
+    let consumer_lease_store =
+      build_consumer_group_lease_store(metadata_store_config, dynamo_capacity_metrics).await?;
     let topics_count = topics.len();
     let holder_id_for_log = holder_id.clone();
     let writer_id = write_config.writer_id;
-    let mut builder = WriteEngineBuilder::new(
+    let builder = WriteEngineBuilder::new(
       write_config,
       topics,
       blob_store,
@@ -407,6 +409,11 @@ impl<'a> RuntimeWriteEngineBuilder<'a> {
     )
     .membership_rx(membership_rx)
     .feature_flags(feature_flags);
+    let mut builder = if let Some(consumer_lease_store) = consumer_lease_store {
+      builder.consumer_lease_store(consumer_lease_store)
+    } else {
+      builder
+    };
     if let Some(admission) = admission {
       builder = builder.admission(admission);
     }
@@ -451,19 +458,7 @@ async fn build_producer_partition_lease_store(
     let dynamo = config.dynamo();
     let table_name =
       dynamo_table_name(dynamo, DynamoTablePurpose::ProducerPartitionLeases).to_string();
-    let region = dynamo.region.to_string();
-
-    let region_provider = RegionProviderChain::first_try(Some(Region::new(region)));
-    let mut loader = aws_config::defaults(BehaviorVersion::latest())
-      .region(region_provider)
-      .retry_config(aws_retry_config())
-      .timeout_config(aws_timeout_config());
-    if !dynamo.endpoint.is_empty() {
-      loader = loader.endpoint_url(dynamo.endpoint.to_string());
-    }
-
-    let shared = loader.load().await;
-    let client = aws_sdk_dynamodb::Client::new(&shared);
+    let client = build_dynamo_client(dynamo.region.as_str(), dynamo.endpoint.as_str()).await;
     let ttl_buffer = dynamo
       .lease_ttl_buffer
       .as_ref()
@@ -476,6 +471,35 @@ async fn build_producer_partition_lease_store(
         Some(capacity_metrics),
       ));
     return Ok(store);
+  }
+
+  Err(anyhow!("metadata_store backend not configured"))
+}
+
+async fn build_consumer_group_lease_store(
+  config: &MetadataStoreConfig,
+  capacity_metrics: DynamoCapacityMetrics,
+) -> Result<Option<Arc<dyn ConsumerGroupLeaseStore>>> {
+  if config.has_in_memory() {
+    return Ok(None);
+  }
+
+  if config.has_dynamo() {
+    debug!("using dynamo consumer group lease store backend for broker diagnostics");
+    let dynamo = config.dynamo();
+    let table_name = dynamo_table_name(dynamo, DynamoTablePurpose::ConsumerGroupLeases).to_string();
+    let client = build_dynamo_client(dynamo.region.as_str(), dynamo.endpoint.as_str()).await;
+    let ttl_buffer = dynamo
+      .lease_ttl_buffer
+      .as_ref()
+      .map_or(DEFAULT_LEASE_TTL_BUFFER, ProtoDurationExt::to_time_duration);
+    let store = build_dynamo_consumer_group_lease_store(
+      client,
+      table_name,
+      ttl_buffer,
+      Some(capacity_metrics),
+    );
+    return Ok(Some(store));
   }
 
   Err(anyhow!("metadata_store backend not configured"))
@@ -592,19 +616,7 @@ async fn build_metadata_store(
     let table_name = dynamo_table_name(dynamo, DynamoTablePurpose::SegmentMetadata).to_string();
     let producer_partition_lease_table_name =
       dynamo_table_name(dynamo, DynamoTablePurpose::ProducerPartitionLeases).to_string();
-    let region = dynamo.region.to_string();
-
-    let region_provider = RegionProviderChain::first_try(Some(Region::new(region)));
-    let mut loader = aws_config::defaults(BehaviorVersion::latest())
-      .region(region_provider)
-      .retry_config(aws_retry_config())
-      .timeout_config(aws_timeout_config());
-    if !dynamo.endpoint.is_empty() {
-      loader = loader.endpoint_url(dynamo.endpoint.to_string());
-    }
-
-    let shared = loader.load().await;
-    let client = aws_sdk_dynamodb::Client::new(&shared);
+    let client = build_dynamo_client(dynamo.region.as_str(), dynamo.endpoint.as_str()).await;
 
     let retention_by_topic = topics
       .iter()
@@ -636,5 +648,6 @@ fn dynamo_table_name(config: &DynamoMetadataStoreConfig, purpose: DynamoTablePur
     DynamoTablePurpose::ProducerPartitionLeases => {
       config.producer_partition_lease_table_name.as_str()
     },
+    DynamoTablePurpose::ConsumerGroupLeases => config.consumer_group_lease_table_name.as_str(),
   }
 }

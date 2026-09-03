@@ -2,13 +2,18 @@
 #[path = "./aws_test.rs"]
 mod tests;
 
+use crate::{ConsumerGroupLeaseStore, DynamoCapacityMetrics, DynamoConsumerGroupLeaseStore};
+use aws_config::meta::region::RegionProviderChain;
 use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
+use aws_config::{BehaviorVersion, Region};
+use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use bd_backoff::{ExponentialBackoffBuilder, Finite, FiniteBackoff as _, SystemClock};
 use log::trace;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 use time::Duration as TimeDuration;
 use tokio::time::sleep;
@@ -31,6 +36,35 @@ pub fn aws_timeout_config() -> TimeoutConfig {
     .operation_timeout(OPERATION_TIMEOUT)
     .operation_attempt_timeout(OPERATION_ATTEMPT_TIMEOUT)
     .build()
+}
+
+/// Build a `DynamoDB` client with Blob Stream's standard retry and timeout policy.
+pub async fn build_dynamo_client(region: &str, endpoint: &str) -> Client {
+  let region_provider = RegionProviderChain::first_try(Some(Region::new(region.to_string())));
+  let mut loader = aws_config::defaults(BehaviorVersion::latest())
+    .region(region_provider)
+    .retry_config(aws_retry_config())
+    .timeout_config(aws_timeout_config());
+  if !endpoint.trim().is_empty() {
+    loader = loader.endpoint_url(endpoint.to_string());
+  }
+  Client::new(&loader.load().await)
+}
+
+/// Build the consumer-group lease store from a client shared with the other Dynamo stores.
+#[must_use]
+pub fn build_dynamo_consumer_group_lease_store(
+  client: Client,
+  table_name: impl Into<String>,
+  ttl_buffer: TimeDuration,
+  capacity_metrics: Option<DynamoCapacityMetrics>,
+) -> Arc<dyn ConsumerGroupLeaseStore> {
+  Arc::new(DynamoConsumerGroupLeaseStore::new(
+    client,
+    table_name,
+    ttl_buffer,
+    capacity_metrics,
+  ))
 }
 
 /// Returns whether a `DynamoDB` operation failed with a direct transaction conflict.

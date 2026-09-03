@@ -181,6 +181,66 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     Ok(leases)
   }
 
+  async fn list_active_leases(
+    &self,
+    topics: &[String],
+    now: OffsetDateTime,
+  ) -> Result<Vec<ConsumerGroupLease>> {
+    if topics.is_empty() {
+      return Ok(Vec::new());
+    }
+    let now_ts_ms = unix_millis_from_offset_datetime(now)
+      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+    let mut leases = Vec::new();
+    let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+
+    loop {
+      let mut values = HashMap::new();
+      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+      let mut scan = self
+        .client
+        .scan()
+        .table_name(&self.table_name)
+        .consistent_read(true)
+        .filter_expression(format!("{ATTR_LEASE_EXPIRES} > :now"))
+        .set_expression_attribute_values(Some(values));
+      if let Some(key) = start_key.take() {
+        scan = scan.set_exclusive_start_key(Some(key));
+      }
+
+      let response = scan
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .await?;
+      self.record_read_capacity(response.consumed_capacity.as_ref());
+      for item in response.items() {
+        if let Some(key) = consumer_group_lease_key_from_scan_item(item, topics)? {
+          leases.push(Self::lease_from_item(item.clone(), key)?);
+        }
+      }
+
+      if let Some(key) = response.last_evaluated_key {
+        start_key = Some(key);
+      } else {
+        break;
+      }
+    }
+
+    leases.sort_by(|left, right| {
+      (
+        &left.key.topic,
+        &left.key.group_id,
+        left.key.virtual_partition_id,
+      )
+        .cmp(&(
+          &right.key.topic,
+          &right.key.group_id,
+          right.key.virtual_partition_id,
+        ))
+    });
+    Ok(leases)
+  }
+
   async fn assign_partition(
     &self,
     key: ConsumerGroupLeaseKey,
@@ -592,6 +652,44 @@ impl DynamoLeaseItem {
       committed_ts_ms: self.committed_ts,
     }
   }
+}
+
+fn consumer_group_lease_key_from_scan_item(
+  item: &HashMap<String, AttributeValue>,
+  topics: &[String],
+) -> Result<Option<ConsumerGroupLeaseKey>> {
+  let partition_key = item
+    .get(ATTR_PK)
+    .ok_or_else(|| anyhow!("consumer lease scan returned row without partition key"))?
+    .as_s()
+    .map_err(|_| anyhow!("consumer lease scan returned row without string partition key"))?;
+  let topic = topics
+    .iter()
+    .filter(|topic| {
+      partition_key
+        .strip_prefix(&format!("{topic}#"))
+        .is_some_and(|group_id| !group_id.is_empty())
+    })
+    .max_by_key(|topic| topic.len());
+  let Some(topic) = topic else {
+    return Ok(None);
+  };
+  let group_id = partition_key
+    .strip_prefix(&format!("{topic}#"))
+    .ok_or_else(|| anyhow!("consumer lease scan key no longer matched configured topic"))?
+    .to_string();
+  let virtual_partition_id = item
+    .get(ATTR_SK)
+    .ok_or_else(|| anyhow!("consumer lease scan returned row without partition sort key"))?
+    .as_s()
+    .map_err(|_| anyhow!("consumer lease scan returned row without string partition sort key"))?
+    .parse()
+    .map_err(|error| anyhow!("consumer lease scan returned invalid partition id: {error}"))?;
+  Ok(Some(ConsumerGroupLeaseKey {
+    topic: topic.clone(),
+    group_id,
+    virtual_partition_id,
+  }))
 }
 
 fn validate_cursor(key: &ConsumerGroupLeaseKey, cursor: &CommittedCursor) -> Result<()> {

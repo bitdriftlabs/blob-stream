@@ -20,6 +20,7 @@ use blob_stream_metadata_store::{
   MetadataWriteResult,
   ProducerPartitionFence,
   ProducerPartitionLeaseStore,
+  ProducerSequenceProgress,
   SegmentMetadata,
 };
 use blob_stream_producer::test::ProducerClientTestExt;
@@ -108,6 +109,7 @@ impl MetadataStore for FenceInvalidatingMetadataStore {
         &fence.fence.holder_id,
         &fence.fence.lease_session_id,
         offset_datetime_from_unix_millis(now_ts_ms),
+        ProducerSequenceProgress::default(),
       )
       .await?;
     if release != LeaseReleaseOutcome::Released {
