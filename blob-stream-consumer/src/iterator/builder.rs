@@ -260,7 +260,6 @@ impl ConsumerIteratorBuilder<'_> {
       Arc::clone(&shared_state),
       prefetch_max_bytes,
       Arc::clone(&lease_store),
-      metadata_window_size,
     );
     {
       let mut state = shared_state.lock();

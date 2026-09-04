@@ -76,14 +76,13 @@ impl ConsumerDriver {
     let RebalanceReport {
       owned_partitions,
       recovered_cursors,
-      fresh_start_markers,
       accepted_assignment_plan,
       ..
     } = report;
     self.record_accepted_assignment_plan(accepted_assignment_plan);
-    // Restore or reset state before exposing the reader assignment to delivery.
+    // Hydrate before exposing the reader assignment so the first scan starts from the durable
+    // cursor claimed with this generation.
     self.hydrate_cursors(recovered_cursors, self.time_provider.now())?;
-    self.mark_fresh_at_windows(fresh_start_markers)?;
 
     self.apply_assignment(&owned_partitions)?;
     Ok(owned_partitions)
@@ -457,7 +456,6 @@ impl ConsumerDriver {
       owned_partitions: next_assignment,
       active_partition_lease_expiration_deadline_ms,
       recovered_cursors,
-      fresh_start_markers,
       accepted_assignment_plan,
       retry_error,
       ..
@@ -475,7 +473,6 @@ impl ConsumerDriver {
         offset_datetime_from_unix_millis(active_partition_lease_expiration_deadline_ms);
     }
     self.hydrate_cursors(recovered_cursors, now)?;
-    self.mark_fresh_at_windows(fresh_start_markers)?;
 
     if !assignment_changed {
       // Ownership is unchanged, but retain plan and retry diagnostics so an incomplete rebalance

@@ -144,47 +144,6 @@ changing capacity or routing.
 3. Use [Cost analysis](cost-analysis.md) with observed page and range-read rates before changing
    strong-read or transactional-publication modes.
 
-### Recover A Consumer Cursor After Sequence Regression
-
-Use a next-window fresh start only after confirming that a consumer cursor is ahead of producer
-sequences and that skipping the selected checkpoint-to-target range is acceptable. The operation
-does not repair or rewind a cursor in place; it records a durable marker that a restarted or
-reassigned owner consumes on its first new cursor commit.
-
-1. Read the consumer admin router's `GET /state` and record the affected virtual partition IDs,
-   committed source checkpoints, and any existing `fresh_start_marker` values.
-2. Preview the target window for all affected rows. The path is relative to the consumer admin
-   router, commonly `/admin` in an embedding service:
-
-   ```sh
-   curl -sS -X POST "$CONSUMER_ADMIN/partitions/arm-next-window-fresh-start" \
-     -H 'content-type: application/json' \
-     --data '{"dry_run":true,"virtual_partition_ids":[126]}'
-   ```
-
-3. Confirm the intentional loss and arm the markers. The target is always the next metadata window
-   after the durable checkpoint; the request cannot accept a caller-selected timestamp or offset:
-
-   ```sh
-   curl -sS -X POST "$CONSUMER_ADMIN/partitions/arm-next-window-fresh-start" \
-     -H 'content-type: application/json' \
-     --data '{"confirm_loss":true,"virtual_partition_ids":[126]}'
-   ```
-
-4. Verify every response is `armed` or already `already_armed`, then perform a rolling restart of
-   the affected consumers. A per-partition `failed` result includes its storage error; re-run the
-   preview and resolve that row before restarting. Do not expect the current owner to reset during
-   the same process.
-5. Watch `GET /state`: a new owner first reports the `fresh` reader mode at the target window, then
-   recovers every retained window through its current cutover before switching to `fast`. Restart
-   promptly to minimize this bounded recovery. Once it commits newly processed data, the marker
-   disappears and the lease's committed cursor advances.
-
-`missing_source_checkpoint` means the lease cannot derive a safe next-window target. Investigate or
-rebuild that group instead of deleting the cursor. `missing_lease` means no retained row exists.
-Arm requests are idempotent while a marker is present; use `dry_run` again after a conditional
-arming failure because the normal owner may have committed a newer checkpoint.
-
 ### Broker Blob Delivery Falls Back
 
 1. Compare `broker_blob_range_requests` with the sum of `broker_blob_range_successes`,

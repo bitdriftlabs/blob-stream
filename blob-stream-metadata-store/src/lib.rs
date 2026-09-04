@@ -10,7 +10,6 @@ use blob_stream_blob_store::BlobKey;
 use blob_stream_types::{
   BatchMetadata,
   CommittedCursor,
-  CommittedSourceCheckpoint,
   Compression,
   SeqRange,
   SnowflakeId,
@@ -18,7 +17,6 @@ use blob_stream_types::{
   VirtualPartitionId,
 };
 use protobuf::Chars;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
 
@@ -413,25 +411,6 @@ pub struct ConsumerGroupLease {
   pub committed_cursor: Option<CommittedCursor>,
   /// Timestamp for committed cursor in milliseconds.
   pub committed_ts_ms: Option<i64>,
-  /// Pending instruction for a new owner to ignore the committed cursor and start fresh.
-  pub fresh_start_marker: Option<FreshStartMarker>,
-}
-
-//
-// FreshStartMarker
-//
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-/// Durable operator instruction to start a partition at the next metadata window.
-pub struct FreshStartMarker {
-  /// Unique marker identity carried until a replacement cursor commit consumes it.
-  pub marker_id: String,
-  /// Source checkpoint used to derive the target window.
-  pub source_checkpoint: CommittedSourceCheckpoint,
-  /// Aligned metadata window scanned cursor-free by the next consumer owner.
-  pub target_window_start_unix_seconds: i64,
-  /// Timestamp at which the marker was armed, in milliseconds.
-  pub armed_at_ts_ms: i64,
 }
 
 //
@@ -554,29 +533,11 @@ pub enum ConsumerGroupCommitOutcome {
 //
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)]
 /// Result of releasing a consumer partition lease.
 pub enum ConsumerGroupReleaseOutcome {
   Released,
   HeldByOther(ConsumerGroupLease),
   Expired,
-}
-
-//
-// ConsumerGroupArmFreshStartOutcome
-//
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-/// Result of requesting a next-window fresh start for a consumer partition lease.
-pub enum ConsumerGroupArmFreshStartOutcome {
-  /// A new marker was durably installed.
-  Armed(ConsumerGroupLease),
-  /// An existing marker already protects this partition.
-  AlreadyArmed(ConsumerGroupLease),
-  /// The retained lease has no cursor checkpoint from which to derive a target window.
-  MissingSourceCheckpoint(ConsumerGroupLease),
-  /// The lease row does not exist.
-  MissingLease,
 }
 
 //
@@ -602,20 +563,6 @@ pub trait ConsumerGroupLeaseStore: Send + Sync {
     lease_duration: Duration,
   ) -> Result<ConsumerGroupAssignmentOutcome>;
 
-  /// Persist an instruction for the next owner to begin at the next metadata window.
-  async fn arm_next_window_fresh_start(
-    &self,
-    key: &ConsumerGroupLeaseKey,
-    metadata_window_size: Duration,
-    marker_id: String,
-    now: OffsetDateTime,
-  ) -> Result<ConsumerGroupArmFreshStartOutcome> {
-    let _ = (key, metadata_window_size, marker_id, now);
-    Err(anyhow::anyhow!(
-      "fresh-start marker arming is not supported by this lease store"
-    ))
-  }
-
   /// Heartbeat a partition lease and optionally commit a cursor.
   async fn heartbeat_partition(
     &self,
@@ -627,34 +574,6 @@ pub trait ConsumerGroupLeaseStore: Send + Sync {
     committed_cursor: Option<CommittedCursor>,
   ) -> Result<ConsumerGroupHeartbeatOutcome>;
 
-  /// Heartbeat a partition lease and atomically consume the matching fresh-start marker.
-  async fn heartbeat_partition_consuming_fresh_start_marker(
-    &self,
-    key: &ConsumerGroupLeaseKey,
-    owner_id: &str,
-    generation: u64,
-    now: OffsetDateTime,
-    lease_duration: Duration,
-    committed_cursor: Option<CommittedCursor>,
-    consumed_fresh_start_marker_id: Option<String>,
-  ) -> Result<ConsumerGroupHeartbeatOutcome> {
-    if consumed_fresh_start_marker_id.is_some() {
-      return Err(anyhow::anyhow!(
-        "fresh-start marker consumption is not supported by this lease store"
-      ));
-    }
-    self
-      .heartbeat_partition(
-        key,
-        owner_id,
-        generation,
-        now,
-        lease_duration,
-        committed_cursor,
-      )
-      .await
-  }
-
   /// Commit a cursor for a partition lease.
   async fn commit_cursor(
     &self,
@@ -664,26 +583,6 @@ pub trait ConsumerGroupLeaseStore: Send + Sync {
     now: OffsetDateTime,
     committed_cursor: CommittedCursor,
   ) -> Result<ConsumerGroupCommitOutcome>;
-
-  /// Commit a cursor and atomically consume the matching fresh-start marker.
-  async fn commit_cursor_consuming_fresh_start_marker(
-    &self,
-    key: &ConsumerGroupLeaseKey,
-    owner_id: &str,
-    generation: u64,
-    now: OffsetDateTime,
-    committed_cursor: CommittedCursor,
-    consumed_fresh_start_marker_id: Option<String>,
-  ) -> Result<ConsumerGroupCommitOutcome> {
-    if consumed_fresh_start_marker_id.is_some() {
-      return Err(anyhow::anyhow!(
-        "fresh-start marker consumption is not supported by this lease store"
-      ));
-    }
-    self
-      .commit_cursor(key, owner_id, generation, now, committed_cursor)
-      .await
-  }
 
   /// Release a partition lease held by this owner/generation.
   async fn release_partition(
