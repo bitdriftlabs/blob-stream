@@ -137,8 +137,8 @@ pub struct DurableProducerLeaseSnapshot {
   #[serde(with = "time::serde::rfc3339")]
   pub expires_at: OffsetDateTime,
   pub is_active: bool,
-  /// First sequence in the current locally reserved range, when observed.
-  pub reservation_start: Option<u64>,
+  /// First sequence reserved by the active broker lease session, when observed.
+  pub lease_sequence_start: Option<u64>,
   /// Most recent sequence handed out by the current broker process, when observed.
   pub last_handed_out_seq: Option<u64>,
   #[serde(with = "time::serde::rfc3339::option")]

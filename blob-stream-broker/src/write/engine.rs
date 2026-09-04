@@ -573,7 +573,7 @@ impl WriteEngine for WriteEngineImpl {
               lease_session_id: lease.fence.lease_session_id,
               expires_at: lease.lease_expiration_at,
               is_active: lease.lease_expiration_at > generated_at,
-              reservation_start: lease.reservation_start,
+              lease_sequence_start: lease.lease_sequence_start,
               last_handed_out_seq: lease.last_handed_out_seq,
               sequence_progress_updated_at: lease.sequence_progress_updated_at,
               max_allocated_seq: lease.max_allocated_seq,

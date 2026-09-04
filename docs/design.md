@@ -153,11 +153,11 @@ first record has sequence $S$, its last record has sequence $E$, and each interv
 the next sequence number. The batch metadata persists that range once; the records themselves do
 not each carry a separate durable sequence-allocation record.
 
-Producer leases also retain diagnostics-only allocator progress. `reservation_start` with
-`max_allocated_seq` bounds the last observed local reservation range, and `last_handed_out_seq`
-is null until the owning broker process allocates its first sequence. The broker updates these
-values and `sequence_progress_updated_at` on every successful lease mutation, but never uses them
-for fencing, allocation, recovery, replay, or sequence reclamation.
+Producer leases also retain diagnostics-only allocator progress. `lease_sequence_start` and
+`max_allocated_seq` bound the sequences reserved by the active lease session, and
+`last_handed_out_seq` is null until the owning broker process allocates its first sequence. The
+broker updates these values and `sequence_progress_updated_at` on every successful lease mutation,
+but never uses them for fencing, allocation, recovery, replay, or sequence reclamation.
 
 Sequence allocation uses a Hi-Lo allocator to avoid a metadata-store operation for every record
 or every producer batch. The durable producer-partition lease stores a high-water mark. While it

@@ -74,7 +74,7 @@ fn fence_change_discards_buffered_batches_and_completes_them() {
       fence: fence(2),
       lease_expiration_at: offset_datetime_from_unix_millis(1_100),
       max_allocated_seq: Some(0),
-      reservation_start: None,
+      lease_sequence_start: None,
       last_handed_out_seq: None,
       sequence_progress_updated_at: None,
     }),
@@ -153,31 +153,55 @@ fn allocation_rejects_unassigned_partition_without_creating_state() {
 }
 
 #[test]
-fn allocator_sequence_progress_tracks_last_handout() {
+fn allocator_sequence_progress_tracks_lease_session_start_and_last_handout() {
   let mut allocator = SeqAllocator::default();
-  assert_eq!(allocator.sequence_progress().reservation_start, None);
+  assert_eq!(allocator.sequence_progress().lease_sequence_start, None);
   assert_eq!(allocator.sequence_progress().last_handed_out_seq, None);
 
   allocator.install_or_extend_reservation(SeqRange { start: 10, end: 19 });
-  assert_eq!(allocator.sequence_progress().reservation_start, Some(10));
+  assert_eq!(allocator.sequence_progress().lease_sequence_start, Some(10));
   assert_eq!(allocator.sequence_progress().last_handed_out_seq, None);
   assert_eq!(allocator.allocate(3), Some(SeqRange { start: 10, end: 12 }));
   assert_eq!(allocator.sequence_progress().last_handed_out_seq, Some(12));
 
   allocator.install_or_extend_reservation(SeqRange { start: 20, end: 29 });
-  assert_eq!(allocator.sequence_progress().reservation_start, Some(10));
+  assert_eq!(allocator.sequence_progress().lease_sequence_start, Some(10));
   assert_eq!(
-    allocator
-      .sequence_progress_for_new_reservation()
-      .reservation_start,
-    None
+    allocator.allocate(17),
+    Some(SeqRange { start: 13, end: 29 })
   );
-  assert_eq!(
-    allocator
-      .sequence_progress_for_new_reservation()
-      .last_handed_out_seq,
-    Some(12)
-  );
+  assert_eq!(allocator.remaining_capacity(), 0);
+
+  allocator.install_or_extend_reservation(SeqRange { start: 30, end: 39 });
+  assert_eq!(allocator.reservation, Some(SeqRange { start: 10, end: 39 }));
+  assert_eq!(allocator.sequence_progress().lease_sequence_start, Some(10));
+  assert_eq!(allocator.sequence_progress().last_handed_out_seq, Some(29));
+}
+
+#[test]
+fn exhausted_reservation_keeps_lease_session_start() {
+  let state = state_with_local_telemetry_assignment();
+  let now = offset_datetime_from_unix_millis(1_000);
+  {
+    let mut state = state.lock();
+    let partition = state.partition_state_mut("telemetry", 0);
+    partition.lease_expiration_at = Some(now + time::Duration::seconds(60));
+    partition
+      .seq_allocator
+      .install_or_extend_reservation(SeqRange { start: 0, end: 9 });
+    assert_eq!(
+      partition.seq_allocator.allocate(10),
+      Some(SeqRange { start: 0, end: 9 })
+    );
+  }
+
+  let AllocationTransitionDecision::Claimed(work) =
+    begin_allocation_transition(&state, "telemetry", 0, 1, now, false, 10)
+  else {
+    panic!("exhausted reservation must request the next range");
+  };
+  assert!(work.reservation.is_some());
+  assert_eq!(work.sequence_progress.lease_sequence_start, Some(0));
 }
 
 #[test]
@@ -203,7 +227,7 @@ fn stale_assignment_completion_discards_lease_and_reservation() {
       fence: fence(1),
       lease_expiration_at: now + time::Duration::seconds(60),
       max_allocated_seq: Some(9),
-      reservation_start: None,
+      lease_sequence_start: None,
       last_handed_out_seq: None,
       sequence_progress_updated_at: None,
     }),

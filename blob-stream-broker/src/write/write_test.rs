@@ -2481,7 +2481,7 @@ async fn state_snapshot_reports_durable_leases_for_every_configured_partition() 
       .lease
       .as_ref()
       .unwrap()
-      .reservation_start,
+      .lease_sequence_start,
     Some(0)
   );
   assert_eq!(

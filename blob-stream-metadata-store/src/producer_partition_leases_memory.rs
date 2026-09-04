@@ -113,7 +113,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
       lease_session_id: lease_session_id.clone(),
       lease_expiration_at: expires_at,
       max_allocated_seq: None,
-      reservation_start: None,
+      lease_sequence_start: None,
       last_handed_out_seq: None,
       sequence_progress_updated_at: None,
     });
@@ -151,8 +151,8 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     } else {
       None
     };
-    state.reservation_start = sequence_progress
-      .reservation_start
+    state.lease_sequence_start = sequence_progress
+      .lease_sequence_start
       .or_else(|| reservation.as_ref().map(|range| range.start));
     state.last_handed_out_seq = sequence_progress.last_handed_out_seq;
     state.sequence_progress_updated_at = Some(now);
@@ -190,7 +190,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     }
 
     state.lease_expiration_at = expires_at(now, lease_duration)?;
-    state.reservation_start = sequence_progress.reservation_start;
+    state.lease_sequence_start = sequence_progress.lease_sequence_start;
     state.last_handed_out_seq = sequence_progress.last_handed_out_seq;
     state.sequence_progress_updated_at = Some(now);
     Ok(LeaseHeartbeatOutcome::Renewed(state.to_lease(key.clone())))
@@ -230,7 +230,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
 
     let (range, updated) = reserve_range(state.max_allocated_seq, reservation_size)?;
     state.max_allocated_seq = Some(updated);
-    state.reservation_start = sequence_progress.reservation_start.or(Some(range.start));
+    state.lease_sequence_start = sequence_progress.lease_sequence_start.or(Some(range.start));
     state.last_handed_out_seq = sequence_progress.last_handed_out_seq;
     state.sequence_progress_updated_at = Some(now);
 
@@ -268,7 +268,7 @@ impl ProducerPartitionLeaseStore for InMemoryProducerPartitionLeaseStore {
     }
 
     state.lease_expiration_at = now;
-    state.reservation_start = sequence_progress.reservation_start;
+    state.lease_sequence_start = sequence_progress.lease_sequence_start;
     state.last_handed_out_seq = sequence_progress.last_handed_out_seq;
     state.sequence_progress_updated_at = Some(now);
     guard.insert(key.clone(), state);
@@ -287,7 +287,7 @@ struct LeaseState {
   lease_session_id: String,
   lease_expiration_at: OffsetDateTime,
   max_allocated_seq: Option<u64>,
-  reservation_start: Option<u64>,
+  lease_sequence_start: Option<u64>,
   last_handed_out_seq: Option<u64>,
   sequence_progress_updated_at: Option<OffsetDateTime>,
 }
@@ -307,7 +307,7 @@ impl LeaseState {
       },
       lease_expiration_at: self.lease_expiration_at,
       max_allocated_seq: self.max_allocated_seq,
-      reservation_start: self.reservation_start,
+      lease_sequence_start: self.lease_sequence_start,
       last_handed_out_seq: self.last_handed_out_seq,
       sequence_progress_updated_at: self.sequence_progress_updated_at,
     }

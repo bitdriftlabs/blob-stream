@@ -96,11 +96,11 @@ consumer-table scan. A `missing` producer lease or an empty consumer list is mea
 the corresponding lookup completed; `unavailable`, `lookup_failed`, and `timed_out` mean the view
 is partial and should not be used to infer inactivity.
 
-Producer lease diagnostics include `reservation_start`, `max_allocated_seq`,
-`last_handed_out_seq`, and `sequence_progress_updated_at`. The first two bound the last observed
-local reservation; `last_handed_out_seq` is null until the current broker process has allocated a
-sequence. These informational fields are refreshed with successful lease mutations, never used as
-inputs to fencing, allocation, replay, or recovery.
+Producer lease diagnostics include `lease_sequence_start`, `max_allocated_seq`,
+`last_handed_out_seq`, and `sequence_progress_updated_at`. The first two bound the sequences
+reserved by the active lease session; `last_handed_out_seq` is null until the current broker
+process has allocated a sequence. These informational fields are refreshed with successful lease
+mutations, never used as inputs to fencing, allocation, replay, or recovery.
 
 ### Metadata Cache State
 

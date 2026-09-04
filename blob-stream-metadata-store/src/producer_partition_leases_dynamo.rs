@@ -44,7 +44,7 @@ use std::fmt::Write as _;
 use time::{Duration, OffsetDateTime};
 
 const ATTR_MAX_SEQ: &str = "max_allocated_seq";
-const ATTR_RESERVATION_START: &str = "reservation_start";
+const ATTR_LEASE_SEQUENCE_START: &str = "lease_sequence_start";
 const ATTR_LAST_HANDED_OUT_SEQ: &str = "last_handed_out_seq";
 const ATTR_SEQUENCE_PROGRESS_UPDATED_TS_MS: &str = "sequence_progress_updated_ts_ms";
 
@@ -727,20 +727,23 @@ fn sequence_progress_update(
     ", {ATTR_SEQUENCE_PROGRESS_UPDATED_TS_MS} = :sequence_progress_updated_ts_ms"
   );
   let mut remove = Vec::new();
-  if let Some(reservation_start) = sequence_progress.reservation_start {
+  if let Some(lease_sequence_start) = sequence_progress.lease_sequence_start {
     values.insert(
-      ":reservation_start".to_string(),
-      AttributeValue::N(reservation_start.to_string()),
+      ":lease_sequence_start".to_string(),
+      AttributeValue::N(lease_sequence_start.to_string()),
     );
-    let _ = write!(update, ", {ATTR_RESERVATION_START} = :reservation_start");
+    let _ = write!(
+      update,
+      ", {ATTR_LEASE_SEQUENCE_START} = :lease_sequence_start"
+    );
   } else if reserves_sequences {
     values.insert(":one".to_string(), AttributeValue::N("1".to_string()));
     let _ = write!(
       update,
-      ", {ATTR_RESERVATION_START} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :one"
+      ", {ATTR_LEASE_SEQUENCE_START} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :one"
     );
   } else {
-    remove.push(ATTR_RESERVATION_START);
+    remove.push(ATTR_LEASE_SEQUENCE_START);
   }
   if let Some(last_handed_out_seq) = sequence_progress.last_handed_out_seq {
     values.insert(
@@ -772,7 +775,7 @@ struct DynamoLeaseItem {
   lease_session_id: String,
   lease_expiration_ts_ms: i64,
   max_allocated_seq: Option<u64>,
-  reservation_start: Option<u64>,
+  lease_sequence_start: Option<u64>,
   last_handed_out_seq: Option<u64>,
   sequence_progress_updated_ts_ms: Option<i64>,
 }
@@ -788,7 +791,7 @@ impl DynamoLeaseItem {
       },
       lease_expiration_at: offset_datetime_from_unix_millis(self.lease_expiration_ts_ms),
       max_allocated_seq: self.max_allocated_seq,
-      reservation_start: self.reservation_start,
+      lease_sequence_start: self.lease_sequence_start,
       last_handed_out_seq: self.last_handed_out_seq,
       sequence_progress_updated_at: self
         .sequence_progress_updated_ts_ms

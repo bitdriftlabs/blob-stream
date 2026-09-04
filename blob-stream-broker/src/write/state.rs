@@ -309,19 +309,10 @@ impl SeqAllocator {
 
   pub(super) fn sequence_progress(&self) -> ProducerSequenceProgress {
     ProducerSequenceProgress {
-      reservation_start: self
+      lease_sequence_start: self
         .reservation
         .as_ref()
         .map(|reservation| reservation.start),
-      last_handed_out_seq: self.last_handed_out_seq,
-    }
-  }
-
-  pub(super) fn sequence_progress_for_new_reservation(&self) -> ProducerSequenceProgress {
-    // The range start is allocated by the conditional lease-store mutation. `None` directs that
-    // mutation to derive and persist the new start from its durable high watermark atomically.
-    ProducerSequenceProgress {
-      reservation_start: None,
       last_handed_out_seq: self.last_handed_out_seq,
     }
   }
@@ -333,27 +324,24 @@ impl SeqAllocator {
       return;
     }
 
-    if self.remaining_capacity() > 0 {
-      let reservation = self
-        .reservation
-        .as_mut()
-        .expect("remaining capacity requires a reservation");
-      if reservation
-        .end
-        .checked_add(1)
-        .is_some_and(|next_start| range.start == next_start)
-      {
-        reservation.end = range.end;
-        return;
-      }
-
-      debug!(
-        "broker sequence reservation replaced nonadjacent local range: previous_start={}, \
-         previous_end={}, replacement_start={}, replacement_end={}",
-        reservation.start, reservation.end, range.start, range.end
-      );
+    let reservation = self
+      .reservation
+      .as_mut()
+      .expect("existing reservation was checked immediately before mutable access");
+    if reservation
+      .end
+      .checked_add(1)
+      .is_some_and(|next_start| range.start == next_start)
+    {
+      reservation.end = range.end;
+      return;
     }
 
+    debug!(
+      "broker sequence reservation replaced nonadjacent local range: previous_start={}, \
+       previous_end={}, replacement_start={}, replacement_end={}",
+      reservation.start, reservation.end, range.start, range.end
+    );
     self.next_seq = range.start;
     self.reservation = Some(range);
   }

@@ -207,8 +207,8 @@ pub struct ProducerPartitionLease {
   pub lease_expiration_at: OffsetDateTime,
   /// High watermark for allocated sequence numbers.
   pub max_allocated_seq: Option<u64>,
-  /// First sequence in the broker's current local reservation range.
-  pub reservation_start: Option<u64>,
+  /// First sequence reserved by the active broker lease session.
+  pub lease_sequence_start: Option<u64>,
   /// Most recent sequence handed out by the broker's current process.
   pub last_handed_out_seq: Option<u64>,
   /// Time at which the sequence progress was last observed.
@@ -222,11 +222,11 @@ pub struct ProducerPartitionLease {
 /// Diagnostics-only local allocator state persisted with a producer lease mutation.
 ///
 /// This is not used for lease fencing, sequence allocation, or recovery. A reservation mutation
-/// derives its start from the durable high watermark when `reservation_start` is `None`.
+/// derives its start from the durable high watermark when `lease_sequence_start` is `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProducerSequenceProgress {
-  /// First sequence in the current local reservation range, when one exists.
-  pub reservation_start: Option<u64>,
+  /// First sequence reserved by the active broker lease session, when one exists.
+  pub lease_sequence_start: Option<u64>,
   /// Most recent sequence handed out by this broker process, when one exists.
   pub last_handed_out_seq: Option<u64>,
 }

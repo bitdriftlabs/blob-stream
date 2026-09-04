@@ -320,7 +320,7 @@ async fn persists_sequence_progress_with_each_successful_mutation() {
   assert!(matches!(first, SequenceReservationOutcome::Reserved(_)));
 
   let progress = ProducerSequenceProgress {
-    reservation_start: Some(0),
+    lease_sequence_start: Some(0),
     last_handed_out_seq: Some(2),
   };
   store
@@ -345,7 +345,7 @@ async fn persists_sequence_progress_with_each_successful_mutation() {
     .await
     .expect("read lease")
     .expect("lease exists");
-  assert_eq!(lease.reservation_start, Some(0));
+  assert_eq!(lease.lease_sequence_start, Some(0));
   assert_eq!(lease.max_allocated_seq, Some(7));
   assert_eq!(lease.last_handed_out_seq, Some(2));
   assert_eq!(lease.sequence_progress_updated_at, Some(now));
@@ -371,7 +371,7 @@ async fn persists_sequence_progress_with_each_successful_mutation() {
     .await
     .expect("read replacement lease")
     .expect("replacement lease exists");
-  assert_eq!(lease.reservation_start, None);
+  assert_eq!(lease.lease_sequence_start, None);
   assert_eq!(lease.last_handed_out_seq, None);
 }
 

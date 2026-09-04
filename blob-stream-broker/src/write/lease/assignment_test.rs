@@ -727,7 +727,7 @@ async fn terminal_release_outcomes_retire_unassigned_partition_state() {
     },
     lease_expiration_at: now + Duration::seconds(60),
     max_allocated_seq: None,
-    reservation_start: None,
+    lease_sequence_start: None,
     last_handed_out_seq: None,
     sequence_progress_updated_at: None,
   };

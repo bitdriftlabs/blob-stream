@@ -137,7 +137,7 @@ and session-fenced planner lease; no fifth table is needed. Producer lease rows 
 holder ID, lease epoch, and lease session ID, even when transactional fenced metadata publication is
 disabled.
 
-Producer lease rows may also include optional `reservation_start`, `last_handed_out_seq`, and
+Producer lease rows may also include optional `lease_sequence_start`, `last_handed_out_seq`, and
 `sequence_progress_updated_ts_ms` diagnostic attributes. They require no schema, index, TTL, or
 IAM change.
 

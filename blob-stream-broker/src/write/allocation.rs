@@ -330,12 +330,6 @@ pub(super) fn begin_allocation_transition(
 
   let sequence_progress = if lease_was_expired {
     ProducerSequenceProgress::default()
-  } else if reservation.is_some() && remaining_capacity == 0 {
-    // A reservation request for an exhausted range obtains its start only when the conditional
-    // store mutation succeeds. Have the store derive and persist that start in the same mutation.
-    partition_state
-      .seq_allocator
-      .sequence_progress_for_new_reservation()
   } else {
     partition_state.seq_allocator.sequence_progress()
   };

@@ -331,7 +331,7 @@ async fn persists_sequence_progress_with_each_successful_mutation() -> Result<()
     )
     .await?;
   let progress = ProducerSequenceProgress {
-    reservation_start: Some(0),
+    lease_sequence_start: Some(0),
     last_handed_out_seq: Some(2),
   };
   store
@@ -352,7 +352,7 @@ async fn persists_sequence_progress_with_each_successful_mutation() -> Result<()
     .get_lease(&key)
     .await?
     .ok_or_else(|| anyhow!("expected active lease"))?;
-  assert_eq!(lease.reservation_start, Some(0));
+  assert_eq!(lease.lease_sequence_start, Some(0));
   assert_eq!(lease.max_allocated_seq, Some(7));
   assert_eq!(lease.last_handed_out_seq, Some(2));
   assert_eq!(lease.sequence_progress_updated_at, Some(now));
@@ -372,7 +372,7 @@ async fn persists_sequence_progress_with_each_successful_mutation() -> Result<()
     .get_lease(&key)
     .await?
     .ok_or_else(|| anyhow!("expected active lease"))?;
-  assert_eq!(lease.reservation_start, Some(0));
+  assert_eq!(lease.lease_sequence_start, Some(0));
   assert_eq!(lease.last_handed_out_seq, Some(2));
 
   let cleared_at = now + TimeDuration::milliseconds(1);
@@ -384,7 +384,7 @@ async fn persists_sequence_progress_with_each_successful_mutation() -> Result<()
       cleared_at,
       TimeDuration::milliseconds(100),
       ProducerSequenceProgress {
-        reservation_start: Some(0),
+        lease_sequence_start: Some(0),
         last_handed_out_seq: None,
       },
     )
@@ -393,7 +393,7 @@ async fn persists_sequence_progress_with_each_successful_mutation() -> Result<()
     .get_lease(&key)
     .await?
     .ok_or_else(|| anyhow!("expected active lease"))?;
-  assert_eq!(lease.reservation_start, Some(0));
+  assert_eq!(lease.lease_sequence_start, Some(0));
   assert_eq!(lease.last_handed_out_seq, None);
   assert_eq!(lease.sequence_progress_updated_at, Some(cleared_at));
 
@@ -405,7 +405,7 @@ async fn persists_sequence_progress_with_each_successful_mutation() -> Result<()
     .get_lease(&key)
     .await?
     .ok_or_else(|| anyhow!("expected released lease row"))?;
-  assert_eq!(lease.reservation_start, Some(0));
+  assert_eq!(lease.lease_sequence_start, Some(0));
   assert_eq!(lease.last_handed_out_seq, Some(2));
   assert_eq!(lease.sequence_progress_updated_at, Some(released_at));
 
@@ -428,7 +428,7 @@ async fn persists_sequence_progress_with_each_successful_mutation() -> Result<()
     .get_lease(&atomic_key)
     .await?
     .ok_or_else(|| anyhow!("expected atomic lease"))?;
-  assert_eq!(lease.reservation_start, Some(0));
+  assert_eq!(lease.lease_sequence_start, Some(0));
   assert_eq!(lease.last_handed_out_seq, None);
   assert_eq!(lease.sequence_progress_updated_at, Some(now));
 
