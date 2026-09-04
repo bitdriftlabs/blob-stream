@@ -2,6 +2,7 @@ use super::buffer::{FlushPlan, FlushTrigger};
 use super::{WriteError, WriteResponse};
 use bd_server_stats::stats::Scope;
 use blob_stream_types::SeqRange;
+use time::Duration;
 
 const UPLOADED_OBJECT_SIZE_BUCKETS_BYTES: &[f64] = &[
   64.0 * 1024.0,
@@ -32,8 +33,8 @@ pub(super) struct WriteMetrics {
   pub(super) flush_batches_max_bytes_total: prometheus::IntCounter,
   pub(super) flush_batches_max_delay_total: prometheus::IntCounter,
   pub(super) flush_batches_lease_drain_total: prometheus::IntCounter,
-  pub(super) flush_partitions_total: prometheus::IntCounter,
   pub(super) flush_max_segment_size_splits_total: prometheus::IntCounter,
+  pub(super) adaptive_flush_max_delay_ms: prometheus::IntGauge,
   pub(super) active_flush_plans: prometheus::IntGauge,
   pub(super) flush_failures_total: prometheus::IntCounter,
   pub(super) flush_latency_seconds: prometheus::Histogram,
@@ -61,8 +62,8 @@ impl WriteMetrics {
       flush_batches_max_bytes_total: scope.counter("flush_batches_max_bytes_total"),
       flush_batches_max_delay_total: scope.counter("flush_batches_max_delay_total"),
       flush_batches_lease_drain_total: scope.counter("flush_batches_lease_drain_total"),
-      flush_partitions_total: scope.counter("flush_partitions_total"),
       flush_max_segment_size_splits_total: scope.counter("flush_max_segment_size_splits_total"),
+      adaptive_flush_max_delay_ms: scope.gauge("adaptive_flush_max_delay_ms"),
       active_flush_plans: scope.gauge("active_flush_plans"),
       flush_failures_total: scope.counter("flush_failures_total"),
       flush_latency_seconds: scope.histogram("flush_latency_seconds"),
@@ -86,9 +87,6 @@ impl WriteMetrics {
   pub(super) fn record_flush_plan_summary(&self, plans: &[FlushPlan]) {
     for plan in plans {
       for topic_plan in &plan.topics {
-        self
-          .flush_partitions_total
-          .inc_by(topic_plan.partitions.len() as u64);
         for partition in &topic_plan.partitions {
           match partition.trigger {
             FlushTrigger::MaxBytes => self
@@ -104,6 +102,12 @@ impl WriteMetrics {
         }
       }
     }
+  }
+
+  pub(super) fn set_adaptive_flush_max_delay(&self, delay: Duration) {
+    self
+      .adaptive_flush_max_delay_ms
+      .set(i64::try_from(delay.whole_milliseconds()).unwrap_or(i64::MAX));
   }
 }
 

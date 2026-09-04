@@ -1,4 +1,6 @@
 use super::{
+  ADAPTIVE_FLUSH_MAX_DELAY_ENABLED_FEATURE_FLAG,
+  ADAPTIVE_FLUSH_MAX_DELAY_FLOOR_FEATURE_FLAG,
   DynamoTablePurpose,
   FLUSH_MAX_BYTES_FEATURE_FLAG,
   FLUSH_MAX_DELAY_FEATURE_FLAG,
@@ -70,6 +72,8 @@ fn defaults_segment_compression_to_zstd() {
   assert_eq!(config.reservation_size, 10_000);
   assert_eq!(config.max_segment_bytes, 64 * 1024 * 1024);
   assert!(!config.fenced_metadata_writes);
+  assert!(config.adaptive_flush_max_delay_enabled);
+  assert_eq!(config.adaptive_flush_max_delay_floor, None);
 }
 
 #[test]
@@ -81,6 +85,52 @@ fn respects_explicit_max_segment_bytes() {
   let config = WriteConfig::from_broker_config(&broker_config).unwrap();
 
   assert_eq!(config.max_segment_bytes, 8 * 1024 * 1024);
+}
+
+#[test]
+fn rejects_submillisecond_flush_max_delay() {
+  let mut broker_config = BrokerConfig::new();
+  broker_config.writer_id = Some(0);
+  broker_config.flush_max_delay = Duration::microseconds(999).into_proto();
+
+  let error = WriteConfig::from_broker_config(&broker_config).unwrap_err();
+
+  assert_eq!(
+    error.to_string(),
+    "broker flush_max_delay must be at least one millisecond"
+  );
+}
+
+#[test]
+fn respects_explicit_adaptive_flush_delay_disablement() {
+  let mut broker_config = BrokerConfig::new();
+  broker_config.writer_id = Some(0);
+  broker_config.flush_max_delay = Duration::milliseconds(250).into_proto();
+  broker_config.adaptive_flush_max_delay_enabled = Some(false);
+  broker_config.adaptive_flush_max_delay_floor = Duration::milliseconds(100).into_proto();
+
+  let config = WriteConfig::from_broker_config(&broker_config).unwrap();
+
+  assert!(!config.adaptive_flush_max_delay_enabled);
+  assert_eq!(
+    config.adaptive_flush_max_delay_floor,
+    Some(Duration::milliseconds(100))
+  );
+}
+
+#[test]
+fn rejects_adaptive_flush_delay_floor_above_static_maximum() {
+  let mut broker_config = BrokerConfig::new();
+  broker_config.writer_id = Some(0);
+  broker_config.flush_max_delay = Duration::milliseconds(250).into_proto();
+  broker_config.adaptive_flush_max_delay_floor = Duration::milliseconds(251).into_proto();
+
+  let error = WriteConfig::from_broker_config(&broker_config).unwrap_err();
+
+  assert_eq!(
+    error.to_string(),
+    "broker adaptive_flush_max_delay_floor must not exceed flush_max_delay"
+  );
 }
 
 #[test]
@@ -161,6 +211,70 @@ fn invalid_flush_runtime_overrides_use_configured_values() {
 
   let flush_config = config.effective_flush_config(Some(&over_limit_delay.snapshot_watch()));
   assert_eq!(flush_config.max_delay, config.flush_max_delay);
+}
+
+#[test]
+fn adaptive_flush_delay_defaults_to_enabled_with_half_the_effective_maximum_as_its_floor() {
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_delay = Duration::milliseconds(250);
+  let defaults = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
+
+  let flush_config = config.effective_flush_config(None);
+
+  assert!(flush_config.adaptive_flush_delay.enabled);
+  assert_eq!(
+    flush_config.adaptive_flush_delay.floor,
+    Duration::milliseconds(125)
+  );
+  assert_eq!(
+    flush_config.adaptive_flush_delay.max_delay,
+    Duration::milliseconds(250)
+  );
+
+  let flush_config = config.effective_flush_config(Some(&defaults.snapshot_watch()));
+  assert!(flush_config.adaptive_flush_delay.enabled);
+}
+
+#[test]
+fn adaptive_flush_delay_runtime_overrides_use_the_live_delay_ceiling() {
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_delay = Duration::milliseconds(1_000);
+  config.adaptive_flush_max_delay_floor = Some(Duration::milliseconds(600));
+  let overrides = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag(FLUSH_MAX_DELAY_FEATURE_FLAG, 400)
+      .with_bool_flag(ADAPTIVE_FLUSH_MAX_DELAY_ENABLED_FEATURE_FLAG, false),
+  ));
+
+  let flush_config = config.effective_flush_config(Some(&overrides.snapshot_watch()));
+
+  assert!(!flush_config.adaptive_flush_delay.enabled);
+  assert_eq!(
+    flush_config.adaptive_flush_delay.max_delay,
+    Duration::milliseconds(400)
+  );
+  assert_eq!(
+    flush_config.adaptive_flush_delay.floor,
+    Duration::milliseconds(400)
+  );
+}
+
+#[test]
+fn invalid_adaptive_flush_delay_floor_runtime_override_uses_the_configured_floor() {
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_delay = Duration::milliseconds(1_000);
+  config.adaptive_flush_max_delay_floor = Some(Duration::milliseconds(300));
+  let overrides = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag(ADAPTIVE_FLUSH_MAX_DELAY_FLOOR_FEATURE_FLAG, 1_001),
+  ));
+
+  let flush_config = config.effective_flush_config(Some(&overrides.snapshot_watch()));
+
+  assert_eq!(
+    flush_config.adaptive_flush_delay.floor,
+    Duration::milliseconds(300)
+  );
 }
 
 #[test]

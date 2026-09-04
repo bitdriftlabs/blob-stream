@@ -2,6 +2,7 @@
 #[path = "./write_test.rs"]
 mod tests;
 
+mod adaptive_flush_delay;
 mod allocation;
 mod api;
 mod buffer;

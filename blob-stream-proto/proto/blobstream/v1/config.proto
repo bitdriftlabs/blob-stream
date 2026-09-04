@@ -18,8 +18,8 @@ message BrokerConfig {
   // Default when unset/zero: 67,108,864 bytes (64 MiB).
   uint32 flush_max_bytes = 1;
 
-  // Maximum time to wait before flushing buffered records, even if size is low.
-  // Default when unset: 1 second.
+  // Maximum time to wait before flushing buffered records, even if size is low. Must be at least
+  // 1 millisecond when configured. Default when unset: 1 second.
   google.protobuf.Duration flush_max_delay = 2 [(validate.rules).duration.gt = {}];
 
   // Address to bind the broker listener (e.g. "0.0.0.0:8080").
@@ -77,6 +77,13 @@ message BrokerConfig {
   // Deadline for one blob-cache RPC, including blob storage, slicing, and encoding. Default when
   // unset: 30 seconds.
   google.protobuf.Duration blob_cache_request_timeout = 17 [(validate.rules).duration.gt = {}];
+
+  // Adapt the broker-wide flush maximum delay after segment-cap splits. Default when unset: true.
+  optional bool adaptive_flush_max_delay_enabled = 18;
+
+  // Lower bound for the adaptive flush delay. Default when unset: half the current effective
+  // flush_max_delay. Runtime max-delay overrides remain the upper bound.
+  google.protobuf.Duration adaptive_flush_max_delay_floor = 19 [(validate.rules).duration.gt = {}];
 }
 
 // Filesystem paths used to reload broker feature flags.

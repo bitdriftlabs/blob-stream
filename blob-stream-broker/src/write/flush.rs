@@ -310,6 +310,15 @@ struct TargetFillGroup<T> {
   remaining: Vec<T>,
 }
 
+//
+// FlushPlanCompletion
+//
+
+pub(super) struct FlushPlanCompletion {
+  pub(super) partition_results: Vec<FlushPartitionResult>,
+  pub(super) split_count: u64,
+}
+
 /// Return contiguous target-filled groups while retaining each partition's scheduler order. The
 /// cap is positive because static config validation and runtime feature-flag fallback enforce that
 /// invariant before scheduling.
@@ -618,7 +627,7 @@ impl FlushContext {
     &self,
     plan: &mut FlushPlan,
     metrics: &WriteMetrics,
-  ) -> Result<(Vec<PersistedObject>, Vec<FlushPartitionResult>)> {
+  ) -> Result<(Vec<PersistedObject>, Vec<FlushPartitionResult>, u64)> {
     let topic_plans = std::mem::take(&mut plan.topics);
     let mut encoded_partitions = Vec::new();
     let mut failed_partitions = Vec::new();
@@ -670,7 +679,8 @@ impl FlushContext {
       }
       objects.push(builder.finish(self, plan.max_segment_bytes).await?);
     }
-    Ok((objects, failed_partitions))
+    let split_count = u64::try_from(objects.len().saturating_sub(1)).unwrap_or(u64::MAX);
+    Ok((objects, failed_partitions, split_count))
   }
 
   async fn persist_topic_metadata(
@@ -852,9 +862,9 @@ impl FlushContext {
     blob_upload_permits: &Arc<Semaphore>,
     metadata_write_permits: &Arc<Semaphore>,
     flush_notifier: &Arc<tokio::sync::Notify>,
-  ) -> Result<Vec<FlushPartitionResult>, WriteError> {
+  ) -> Result<FlushPlanCompletion, WriteError> {
     let publication_started_at = Instant::now();
-    let (objects, mut results) = match self.build_objects(plan, metrics).await {
+    let (objects, mut results, split_count) = match self.build_objects(plan, metrics).await {
       Ok(objects) => objects,
       Err(error) => {
         mark_publication_complete(
@@ -992,7 +1002,10 @@ impl FlushContext {
         .then_with(|| left.virtual_partition_id.cmp(&right.virtual_partition_id))
     });
     debug!("flush completed {} partition results", results.len());
-    Ok(results)
+    Ok(FlushPlanCompletion {
+      partition_results: results,
+      split_count,
+    })
   }
 
   #[must_use]

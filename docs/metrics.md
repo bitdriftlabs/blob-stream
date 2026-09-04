@@ -154,9 +154,9 @@ only when whole-object overfetch and broker resource use remain acceptable.
 | `produce_not_lease_holder_total`, `produce_overloaded_total`, `produce_unknown_topic_total` | Counters | Rejections classified as ownership/fence loss, overload or internal transient failure, and unknown topic. |
 | `admission_rejections_total` | Counter | Batches rejected by broker admission control before normal write processing. |
 | `sequence_reservations_total`, `sequence_reservation_records_total`, `sequence_reservation_failures_total`, `sequence_reservation_latency_seconds` | Counters, histogram | Durable Hi-Lo range reservations, sequence capacity obtained, reservation failures, and reservation latency. |
-| `flush_partitions_total` | Counter | Partition plans included in flushes. |
 | `flush_batches_max_bytes_total`, `flush_batches_max_delay_total`, `flush_batches_lease_drain_total` | Counters | Flushed batches classified by size, delay, or lease-drain trigger. |
 | `flush_max_segment_size_splits_total` | Counter | Additional objects created while packing encoded partitions under `max_segment_bytes`. |
+| `adaptive_flush_max_delay_ms` | Gauge | Actual broker-wide maximum delay in milliseconds for future scheduler cycles. It equals the effective configured maximum while adaptive delay is disabled, decreases after segment-cap object splits, and recovers after successful unsplit plans. |
 | `flush_failures_total`, `flush_latency_seconds` | Counter, histogram | Failed flushes and complete flush latency. |
 | `metadata_publication_deadline_exhausted_before_persistence_total`, `metadata_publication_deadline_exhausted_while_persisting_total` | Counters | Publication deadlines exhausted before metadata persistence begins or while it is in progress. Both fail the flush. |
 | `flush_uploaded_objects_total`, `flush_oversized_single_partition_objects_total` | Counters | Uploaded immutable objects and objects containing one partition that exceeded `max_segment_bytes` and could not be split. |
