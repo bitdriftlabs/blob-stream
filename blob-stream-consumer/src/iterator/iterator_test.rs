@@ -22,6 +22,7 @@ use crate::config::{
   consumer_max_clock_skew,
 };
 use crate::consumer::{BrokerBlobRangeQuery, BrokerMetadataQuery};
+use crate::coordination::RecoveredCursor;
 use crate::diagnostics::{
   ConsumerAssignmentPlanSnapshot,
   ConsumerAssignmentPolicy,
@@ -319,6 +320,17 @@ impl ConsumerGroupLeaseStore for FailingLeaseStore {
     ))
   }
 
+  async fn list_active_leases(
+    &self,
+    topics: &[String],
+    now: OffsetDateTime,
+  ) -> anyhow::Result<Vec<ConsumerGroupLease>> {
+    Err(anyhow::anyhow!(
+      "injected active lease lookup failure for {} at {now}",
+      topics.join(","),
+    ))
+  }
+
   async fn assign_partition(
     &self,
     key: ConsumerGroupLeaseKey,
@@ -391,6 +403,14 @@ impl ConsumerGroupLeaseStore for PartiallyFailingLeaseStore {
     group_id: &str,
   ) -> anyhow::Result<Vec<ConsumerGroupLease>> {
     self.inner.list_group_leases(topic, group_id).await
+  }
+
+  async fn list_active_leases(
+    &self,
+    topics: &[String],
+    now: OffsetDateTime,
+  ) -> anyhow::Result<Vec<ConsumerGroupLease>> {
+    self.inner.list_active_leases(topics, now).await
   }
 
   async fn assign_partition(
@@ -787,6 +807,246 @@ fn current_batch_remaining_bytes_decrease_as_records_are_delivered() {
     Some(NextResult::Record(_))
   ));
   assert_eq!(delivery_state.retained_bytes(), 0);
+}
+
+#[test]
+fn delivered_record_after_a_gap_records_the_missing_sequences() {
+  let mut delivery_state = DeliveryState {
+    current_batch: Some(BufferedBatch {
+      virtual_partition_id: 7,
+      next_offset: 3,
+      source_checkpoint: CommittedSourceCheckpoint {
+        window_start_unix_seconds: 0,
+        snowflake_id: 1,
+      },
+      remaining_payload_bytes: 1,
+      records: vec![new_record(vec![1], 0)].into_iter(),
+    }),
+    ..Default::default()
+  };
+  let mut active_partitions = HashMap::from([(
+    7,
+    ActivePartitionState {
+      delivery_gap_baseline: Some(1),
+      ..Default::default()
+    },
+  )]);
+  let metrics = ConsumerIteratorMetrics::new(&metrics_scope());
+
+  assert!(matches!(
+    delivery_state.try_take_next(&mut active_partitions, &metrics),
+    Some(NextResult::Record(_))
+  ));
+  assert_eq!(metrics.delivery_gap_events.get(), 1);
+  assert_eq!(
+    active_partitions.get(&7).unwrap().delivery_gap_baseline,
+    Some(3)
+  );
+}
+
+#[tokio::test]
+async fn cursor_hydration_keeps_last_delivered_offset_for_retained_partition() {
+  let now = OffsetDateTime::UNIX_EPOCH;
+  let time_provider = Arc::new(ManualTimeProvider::new(now));
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
+    Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![3],
+    }));
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )
+  .time_provider(time_provider)
+  .build()
+  .await
+  .unwrap();
+
+  iterator
+    .shared_state
+    .lock()
+    .active_partitions
+    .get_mut(&3)
+    .unwrap()
+    .delivery_gap_baseline = Some(7);
+  iterator
+    .driver
+    .as_mut()
+    .unwrap()
+    .hydrate_cursors(
+      HashMap::from([(
+        3,
+        RecoveredCursor {
+          committed_cursor: CommittedCursor {
+            virtual_partition_id: 3,
+            seq_end: 5,
+            source_checkpoint: None,
+          },
+          committed_ts_ms: None,
+        },
+      )]),
+      now,
+    )
+    .unwrap();
+
+  assert_eq!(
+    iterator
+      .shared_state
+      .lock()
+      .active_partitions
+      .get(&3)
+      .unwrap()
+      .delivery_gap_baseline,
+    Some(7)
+  );
+}
+
+#[tokio::test]
+async fn recovered_cursor_records_gap_after_consumer_restart() {
+  let mut iterator =
+    build_iterator_with_recovered_cursor_record(2, b"restarted-gap".to_vec()).await;
+
+  iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[3]).await;
+  let NextResult::Record(record) = timeout(Duration::from_secs(2), iterator.next())
+    .await
+    .unwrap()
+    .unwrap()
+  else {
+    panic!("expected recovered record");
+  };
+  assert_eq!(record.offset, 2);
+  assert_eq!(record.record.payload.as_ref(), b"restarted-gap");
+  assert_eq!(iterator.metrics.delivery_gap_events.get(), 1);
+
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn recovered_cursor_contiguous_delivery_does_not_record_gap_after_consumer_restart() {
+  let mut iterator =
+    build_iterator_with_recovered_cursor_record(1, b"restarted-contiguous".to_vec()).await;
+
+  iterator.start().unwrap();
+  wait_for_active_assignment(&iterator, &[3]).await;
+  let NextResult::Record(record) = timeout(Duration::from_secs(2), iterator.next())
+    .await
+    .unwrap()
+    .unwrap()
+  else {
+    panic!("expected recovered record");
+  };
+  assert_eq!(record.offset, 1);
+  assert_eq!(record.record.payload.as_ref(), b"restarted-contiguous");
+  assert_eq!(iterator.metrics.delivery_gap_events.get(), 0);
+
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+async fn build_iterator_with_recovered_cursor_record(
+  record_offset: u64,
+  record_payload: Vec<u8>,
+) -> ConsumerIteratorImpl {
+  let now = OffsetDateTime::UNIX_EPOCH + TimeDuration::seconds(902);
+  let time_provider = Arc::new(ManualTimeProvider::new(now));
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let concrete_lease_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let lease_store: Arc<dyn ConsumerGroupLeaseStore> = concrete_lease_store.clone();
+  let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+    Arc::new(InMemoryConsumerGroupMembershipStore::new());
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![3],
+  }));
+  let key = ConsumerGroupLeaseKey {
+    topic: "telemetry".to_string(),
+    group_id: "group-a".to_string(),
+    virtual_partition_id: 3,
+  };
+  concrete_lease_store
+    .assign_partition(
+      key.clone(),
+      "member-a".to_string(),
+      1,
+      now,
+      TimeDuration::seconds(60),
+    )
+    .await
+    .unwrap();
+  concrete_lease_store
+    .heartbeat_partition(
+      &key,
+      "member-a",
+      1,
+      now,
+      TimeDuration::seconds(60),
+      Some(CommittedCursor {
+        virtual_partition_id: 3,
+        seq_end: 0,
+        source_checkpoint: Some(CommittedSourceCheckpoint {
+          window_start_unix_seconds: 900,
+          snowflake_id: 1,
+        }),
+      }),
+    )
+    .await
+    .unwrap();
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    2,
+    3,
+    SeqRange {
+      start: record_offset,
+      end: record_offset,
+    },
+    vec![new_record(record_payload, 902_000)],
+  )
+  .await;
+
+  let mut runtime = runtime_config();
+  runtime
+    .read
+    .as_mut()
+    .unwrap()
+    .strongly_consistent_metadata_reads = Some(true);
+  ConsumerIteratorBuilder::new(
+    &runtime,
+    blob_store,
+    metadata_store,
+    lease_store,
+    membership_store,
+    source,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )
+  .time_provider(time_provider)
+  .build()
+  .await
+  .unwrap()
 }
 
 async fn write_segment(
@@ -1773,6 +2033,108 @@ fn group_lease_observation_includes_unleased_plan_partitions() {
   assert_eq!(partitions[0].virtual_partition_id, 0);
   assert_eq!(partitions[0].desired_owner_id.as_deref(), Some("member-a"));
   assert!(partitions[0].owner_id.is_none());
+}
+
+#[test]
+fn suspected_lagging_partitions_uses_configured_metadata_window() {
+  let observation = crate::diagnostics::group_lease_observation(
+    None,
+    vec![
+      ConsumerGroupLease {
+        key: ConsumerGroupLeaseKey {
+          topic: "telemetry".to_string(),
+          group_id: "group-a".to_string(),
+          virtual_partition_id: 0,
+        },
+        owner_id: "member-a".to_string(),
+        generation: 1,
+        lease_expiration_ts_ms: 0,
+        last_heartbeat_ts_ms: 0,
+        committed_cursor: Some(CommittedCursor {
+          virtual_partition_id: 0,
+          seq_end: 10,
+          source_checkpoint: Some(CommittedSourceCheckpoint {
+            window_start_unix_seconds: 1_788_477_600,
+            snowflake_id: 1,
+          }),
+        }),
+        committed_ts_ms: Some(0),
+      },
+      ConsumerGroupLease {
+        key: ConsumerGroupLeaseKey {
+          topic: "telemetry".to_string(),
+          group_id: "group-a".to_string(),
+          virtual_partition_id: 1,
+        },
+        owner_id: "member-b".to_string(),
+        generation: 2,
+        lease_expiration_ts_ms: 0,
+        last_heartbeat_ts_ms: 0,
+        committed_cursor: Some(CommittedCursor {
+          virtual_partition_id: 1,
+          seq_end: 20,
+          source_checkpoint: Some(CommittedSourceCheckpoint {
+            window_start_unix_seconds: 1_788_477_000,
+            snowflake_id: 2,
+          }),
+        }),
+        committed_ts_ms: Some(0),
+      },
+      ConsumerGroupLease {
+        key: ConsumerGroupLeaseKey {
+          topic: "telemetry".to_string(),
+          group_id: "group-a".to_string(),
+          virtual_partition_id: 2,
+        },
+        owner_id: "member-c".to_string(),
+        generation: 3,
+        lease_expiration_ts_ms: 0,
+        last_heartbeat_ts_ms: 0,
+        committed_cursor: None,
+        committed_ts_ms: None,
+      },
+      ConsumerGroupLease {
+        key: ConsumerGroupLeaseKey {
+          topic: "telemetry".to_string(),
+          group_id: "group-a".to_string(),
+          virtual_partition_id: 3,
+        },
+        owner_id: "member-d".to_string(),
+        generation: 4,
+        lease_expiration_ts_ms: 0,
+        last_heartbeat_ts_ms: 0,
+        committed_cursor: Some(CommittedCursor {
+          virtual_partition_id: 3,
+          seq_end: 30,
+          source_checkpoint: Some(CommittedSourceCheckpoint {
+            window_start_unix_seconds: 1_788_478_200,
+            snowflake_id: 3,
+          }),
+        }),
+        committed_ts_ms: Some(0),
+      },
+    ],
+  );
+  let ConsumerGroupLeaseObservation::Fresh { partitions } = observation else {
+    panic!("expected fresh group lease observation");
+  };
+
+  let suspected = crate::diagnostics::suspected_lagging_partitions(
+    &partitions,
+    datetime!(2026-09-03 23:27 UTC),
+    TimeDuration::minutes(10),
+  );
+
+  assert_eq!(
+    suspected
+      .iter()
+      .map(|partition| partition.virtual_partition_id)
+      .collect::<Vec<_>>(),
+    vec![1, 2, 3]
+  );
+  assert_eq!(suspected[0].virtual_partition_id, 1);
+  assert_eq!(suspected[0].owner_id.as_deref(), Some("member-b"));
+  assert_eq!(suspected[0].committed_offset, Some(20));
 }
 
 #[tokio::test]
@@ -2894,6 +3256,7 @@ async fn seek_discards_prefetched_records_slices_the_resume_batch_and_rewinds_fa
     };
     assert_eq!(record.offset, expected_offset);
   }
+  assert_eq!(iterator.metrics.delivery_gap_events.get(), 0);
   wait_for_reader_mode(&iterator, 7, ConsumerPartitionReadMode::Fast).await;
   let recovered_snapshot = iterator
     .diagnostics()

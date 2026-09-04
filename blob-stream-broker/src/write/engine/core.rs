@@ -23,7 +23,11 @@ use bd_shutdown::ComponentShutdownTriggerHandle;
 use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::BlobStore;
 use blob_stream_broker_discovery::{BrokerMembership, BrokerNode};
-use blob_stream_metadata_store::{MetadataStore, ProducerPartitionLeaseStore};
+use blob_stream_metadata_store::{
+  ConsumerGroupLeaseStore,
+  MetadataStore,
+  ProducerPartitionLeaseStore,
+};
 use parking_lot::{Mutex, RwLock};
 use protobuf::Chars;
 use std::collections::HashMap;
@@ -43,6 +47,7 @@ pub struct WriteEngineImpl {
   pub(in crate::write) topics: HashMap<Chars, TopicInfo>,
   pub(in crate::write) flush_context: FlushContext,
   pub(in crate::write) lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+  pub(in crate::write) consumer_lease_store: Option<Arc<dyn ConsumerGroupLeaseStore>>,
   pub(in crate::write) holder_id: String,
   pub(in crate::write) lease_session_id: String,
   pub(in crate::write) time_provider: Arc<dyn TimeProvider>,
@@ -66,6 +71,7 @@ pub struct WriteEngineBuilder<'a> {
   blob_store: Arc<dyn BlobStore>,
   metadata_store: Arc<dyn MetadataStore>,
   lease_store: Arc<dyn ProducerPartitionLeaseStore>,
+  consumer_lease_store: Option<Arc<dyn ConsumerGroupLeaseStore>>,
   holder_id: String,
   lease_session_id: Option<String>,
   shutdown_trigger_handle: ComponentShutdownTriggerHandle,
@@ -95,6 +101,7 @@ impl<'a> WriteEngineBuilder<'a> {
       blob_store,
       metadata_store,
       lease_store,
+      consumer_lease_store: None,
       holder_id,
       lease_session_id: None,
       shutdown_trigger_handle,
@@ -123,6 +130,15 @@ impl<'a> WriteEngineBuilder<'a> {
   #[must_use]
   pub fn admission(mut self, admission: Arc<dyn AdmissionController>) -> Self {
     self.admission = Some(admission);
+    self
+  }
+
+  #[must_use]
+  pub fn consumer_lease_store(
+    mut self,
+    consumer_lease_store: Arc<dyn ConsumerGroupLeaseStore>,
+  ) -> Self {
+    self.consumer_lease_store = Some(consumer_lease_store);
     self
   }
 
@@ -157,6 +173,7 @@ impl<'a> WriteEngineBuilder<'a> {
       blob_store,
       metadata_store,
       lease_store,
+      consumer_lease_store,
       holder_id,
       lease_session_id,
       shutdown_trigger_handle,
@@ -218,6 +235,7 @@ impl<'a> WriteEngineBuilder<'a> {
       topics,
       flush_context,
       lease_store,
+      consumer_lease_store,
       holder_id,
       lease_session_id: lease_session_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
       time_provider,

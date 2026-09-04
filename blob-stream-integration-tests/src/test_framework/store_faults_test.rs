@@ -20,6 +20,7 @@ use blob_stream_metadata_store::{
   InMemoryProducerPartitionLeaseStore,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
+  ProducerSequenceProgress,
 };
 use blob_stream_types::offset_datetime_from_unix_millis;
 use std::sync::Arc;
@@ -89,6 +90,7 @@ async fn coalesced_reservation_honors_sequence_reservation_faults() {
       offset_datetime_from_unix_millis(1_000),
       Duration::milliseconds(100),
       Some(1),
+      ProducerSequenceProgress::default(),
     )
     .await
     .expect_err("coalesced reservation should honor the reservation fault");

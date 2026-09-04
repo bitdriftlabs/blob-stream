@@ -75,6 +75,14 @@ impl ConsumerGroupLeaseStore for PartialHeartbeatFailureLeaseStore {
     self.inner.list_group_leases(topic, group_id).await
   }
 
+  async fn list_active_leases(
+    &self,
+    topics: &[String],
+    now: OffsetDateTime,
+  ) -> anyhow::Result<Vec<ConsumerGroupLease>> {
+    self.inner.list_active_leases(topics, now).await
+  }
+
   async fn assign_partition(
     &self,
     key: ConsumerGroupLeaseKey,
@@ -153,6 +161,14 @@ impl ConsumerGroupLeaseStore for BlockingAssignmentLeaseStore {
     group_id: &str,
   ) -> anyhow::Result<Vec<ConsumerGroupLease>> {
     self.inner.list_group_leases(topic, group_id).await
+  }
+
+  async fn list_active_leases(
+    &self,
+    topics: &[String],
+    now: OffsetDateTime,
+  ) -> anyhow::Result<Vec<ConsumerGroupLease>> {
+    self.inner.list_active_leases(topics, now).await
   }
 
   async fn assign_partition(

@@ -19,6 +19,7 @@ use blob_stream_metadata_store::{
   ProducerPartitionLease,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
+  ProducerSequenceProgress,
   SequenceReservationOutcome,
 };
 use blob_stream_test_utils::ManualTimeProvider;
@@ -104,7 +105,9 @@ impl ProducerPartitionLeaseStore for TerminalReleaseLeaseStore {
     _lease_session_id: String,
     _now: OffsetDateTime,
     _lease_duration: Duration,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseAcquireOutcome> {
+    let _ = sequence_progress;
     panic!("terminal release test does not acquire leases")
   }
 
@@ -116,7 +119,9 @@ impl ProducerPartitionLeaseStore for TerminalReleaseLeaseStore {
     _now: OffsetDateTime,
     _lease_duration: Duration,
     _reservation_size: Option<u64>,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseAcquireAndReserveOutcome> {
+    let _ = sequence_progress;
     panic!("terminal release test does not acquire leases")
   }
 
@@ -127,7 +132,9 @@ impl ProducerPartitionLeaseStore for TerminalReleaseLeaseStore {
     _lease_session_id: &str,
     _now: OffsetDateTime,
     _lease_duration: Duration,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseHeartbeatOutcome> {
+    let _ = sequence_progress;
     panic!("terminal release test does not heartbeat leases")
   }
 
@@ -138,7 +145,9 @@ impl ProducerPartitionLeaseStore for TerminalReleaseLeaseStore {
     _lease_session_id: &str,
     _now: OffsetDateTime,
     _reservation_size: u64,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<SequenceReservationOutcome> {
+    let _ = sequence_progress;
     panic!("terminal release test does not reserve sequences")
   }
 
@@ -148,7 +157,9 @@ impl ProducerPartitionLeaseStore for TerminalReleaseLeaseStore {
     _holder_id: &str,
     _lease_session_id: &str,
     _now: OffsetDateTime,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseReleaseOutcome> {
+    let _ = sequence_progress;
     self.release_calls.fetch_add(1, Ordering::AcqRel);
     Ok(self.outcome.clone())
   }
@@ -170,10 +181,18 @@ impl ProducerPartitionLeaseStore for TransientHeartbeatLeaseStore {
     lease_session_id: String,
     now: OffsetDateTime,
     lease_duration: Duration,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseAcquireOutcome> {
     self
       .inner
-      .acquire_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .acquire_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now,
+        lease_duration,
+        sequence_progress,
+      )
       .await
   }
 
@@ -185,6 +204,7 @@ impl ProducerPartitionLeaseStore for TransientHeartbeatLeaseStore {
     now: OffsetDateTime,
     lease_duration: Duration,
     reservation_size: Option<u64>,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseAcquireAndReserveOutcome> {
     self
       .inner
@@ -195,6 +215,7 @@ impl ProducerPartitionLeaseStore for TransientHeartbeatLeaseStore {
         now,
         lease_duration,
         reservation_size,
+        sequence_progress,
       )
       .await
   }
@@ -206,6 +227,7 @@ impl ProducerPartitionLeaseStore for TransientHeartbeatLeaseStore {
     lease_session_id: &str,
     now: OffsetDateTime,
     lease_duration: Duration,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseHeartbeatOutcome> {
     if self
       .heartbeat_failures_remaining
@@ -218,7 +240,14 @@ impl ProducerPartitionLeaseStore for TransientHeartbeatLeaseStore {
     }
     self
       .inner
-      .heartbeat_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .heartbeat_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now,
+        lease_duration,
+        sequence_progress,
+      )
       .await
   }
 
@@ -229,10 +258,18 @@ impl ProducerPartitionLeaseStore for TransientHeartbeatLeaseStore {
     lease_session_id: &str,
     now: OffsetDateTime,
     reservation_size: u64,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<SequenceReservationOutcome> {
     self
       .inner
-      .reserve_sequences(key, holder_id, lease_session_id, now, reservation_size)
+      .reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now,
+        reservation_size,
+        sequence_progress,
+      )
       .await
   }
 
@@ -242,10 +279,11 @@ impl ProducerPartitionLeaseStore for TransientHeartbeatLeaseStore {
     holder_id: &str,
     lease_session_id: &str,
     now: OffsetDateTime,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<blob_stream_metadata_store::LeaseReleaseOutcome> {
     self
       .inner
-      .release_lease(key, holder_id, lease_session_id, now)
+      .release_lease(key, holder_id, lease_session_id, now, sequence_progress)
       .await
   }
 }
@@ -266,10 +304,18 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     lease_session_id: String,
     now: OffsetDateTime,
     lease_duration: Duration,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseAcquireOutcome> {
     self
       .inner
-      .acquire_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .acquire_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now,
+        lease_duration,
+        sequence_progress,
+      )
       .await
   }
 
@@ -281,6 +327,7 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     now: OffsetDateTime,
     lease_duration: Duration,
     reservation_size: Option<u64>,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseAcquireAndReserveOutcome> {
     self
       .inner
@@ -291,6 +338,7 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
         now,
         lease_duration,
         reservation_size,
+        sequence_progress,
       )
       .await
   }
@@ -302,10 +350,18 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     lease_session_id: &str,
     now: OffsetDateTime,
     lease_duration: Duration,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseHeartbeatOutcome> {
     self
       .inner
-      .heartbeat_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .heartbeat_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now,
+        lease_duration,
+        sequence_progress,
+      )
       .await
   }
 
@@ -316,10 +372,18 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     lease_session_id: &str,
     now: OffsetDateTime,
     reservation_size: u64,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<SequenceReservationOutcome> {
     self
       .inner
-      .reserve_sequences(key, holder_id, lease_session_id, now, reservation_size)
+      .reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now,
+        reservation_size,
+        sequence_progress,
+      )
       .await
   }
 
@@ -329,6 +393,7 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
     holder_id: &str,
     lease_session_id: &str,
     now: OffsetDateTime,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<blob_stream_metadata_store::LeaseReleaseOutcome> {
     self
       .started_tx
@@ -342,7 +407,7 @@ impl ProducerPartitionLeaseStore for BlockingReleaseLeaseStore {
       .forget();
     self
       .inner
-      .release_lease(key, holder_id, lease_session_id, now)
+      .release_lease(key, holder_id, lease_session_id, now, sequence_progress)
       .await
   }
 }
@@ -488,6 +553,7 @@ async fn all_partitions_acquired(
         holder_id.to_string(),
         offset_datetime_from_unix_millis(1_000),
         Duration::seconds(60),
+        ProducerSequenceProgress::default(),
       )
       .await
       .expect("acquire lease");
@@ -661,6 +727,9 @@ async fn terminal_release_outcomes_retire_unassigned_partition_state() {
     },
     lease_expiration_at: now + Duration::seconds(60),
     max_allocated_seq: None,
+    lease_sequence_start: None,
+    last_handed_out_seq: None,
+    sequence_progress_updated_at: None,
   };
 
   for outcome in [
@@ -725,6 +794,7 @@ async fn transient_drain_heartbeat_failure_retries_before_lease_expiry() -> Resu
       "session-a".to_string(),
       initial_time,
       Duration::seconds(10),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   let state = Arc::new(parking_lot::Mutex::new(
@@ -775,6 +845,7 @@ async fn transient_drain_heartbeat_failure_retries_before_lease_expiry() -> Resu
       "session-b".to_string(),
       time_provider.now(),
       Duration::seconds(10),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   assert!(matches!(takeover, LeaseAcquireOutcome::HeldByOther(_)));
@@ -972,6 +1043,7 @@ async fn lease_assignment_retries_held_partition_before_heartbeat() -> Result<()
       "old-session".to_string(),
       initial_time,
       Duration::seconds(60),
+      ProducerSequenceProgress::default(),
     )
     .await?;
 
@@ -1001,7 +1073,13 @@ async fn lease_assignment_retries_held_partition_before_heartbeat() -> Result<()
 
   time_provider.wait_until_sleeping(2).await;
   lease_store
-    .release_lease(&key, "old-node", "old-session", initial_time)
+    .release_lease(
+      &key,
+      "old-node",
+      "old-session",
+      initial_time,
+      ProducerSequenceProgress::default(),
+    )
     .await?;
   time_provider.advance(Duration::milliseconds(250));
 
@@ -1040,6 +1118,7 @@ async fn lease_assignment_does_not_retry_held_partition_on_early_heartbeat() -> 
       "old-session".to_string(),
       initial_time,
       Duration::seconds(60),
+      ProducerSequenceProgress::default(),
     )
     .await?;
 
@@ -1069,7 +1148,13 @@ async fn lease_assignment_does_not_retry_held_partition_on_early_heartbeat() -> 
 
   time_provider.wait_until_sleeping(2).await;
   lease_store
-    .release_lease(&key, "old-node", "old-session", initial_time)
+    .release_lease(
+      &key,
+      "old-node",
+      "old-session",
+      initial_time,
+      ProducerSequenceProgress::default(),
+    )
     .await?;
 
   tokio::time::advance(StdDuration::from_millis(10)).await;
@@ -1273,6 +1358,7 @@ async fn reconciliation_releases_a_tracked_legacy_lease_outside_the_assignment()
       "session-a".to_string(),
       now,
       Duration::seconds(60),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   {
@@ -1292,6 +1378,7 @@ async fn reconciliation_releases_a_tracked_legacy_lease_outside_the_assignment()
             "session-b".to_string(),
             now,
             Duration::seconds(60),
+            ProducerSequenceProgress::default(),
           )
           .await,
         Ok(LeaseAcquireOutcome::Acquired(_))

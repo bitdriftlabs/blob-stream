@@ -31,6 +31,7 @@ use blob_stream_metadata_store::{
   MetadataWriteResult,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
+  ProducerSequenceProgress,
   SegmentMetadata,
   SequenceReservationOutcome,
 };
@@ -78,6 +79,7 @@ pub enum StoreFaultOperation {
   ConsumerCommitCursor,
   ConsumerReleasePartition,
   ConsumerListGroupLeases,
+  ConsumerListActiveLeases,
   ConsumerMembershipHeartbeat,
   ConsumerDeregisterMember,
   ConsumerGetAssignmentPlan,
@@ -452,6 +454,7 @@ fn describe_store_operation(operation: StoreFaultOperation) -> &'static str {
     StoreFaultOperation::ConsumerCommitCursor => "consumer_commit_cursor",
     StoreFaultOperation::ConsumerReleasePartition => "consumer_release_partition",
     StoreFaultOperation::ConsumerListGroupLeases => "consumer_list_group_leases",
+    StoreFaultOperation::ConsumerListActiveLeases => "consumer_list_active_leases",
     StoreFaultOperation::ConsumerMembershipHeartbeat => "consumer_membership_heartbeat",
     StoreFaultOperation::ConsumerDeregisterMember => "consumer_deregister_member",
     StoreFaultOperation::ConsumerGetAssignmentPlan => "consumer_get_assignment_plan",
@@ -800,6 +803,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     lease_session_id: String,
     now: OffsetDateTime,
     lease_duration: TimeDuration,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseAcquireOutcome> {
     let effects = self
       .controller
@@ -829,7 +833,14 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .acquire_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .acquire_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now,
+        lease_duration,
+        sequence_progress,
+      )
       .await;
     self
       .controller
@@ -861,6 +872,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     now: OffsetDateTime,
     lease_duration: TimeDuration,
     reservation_size: Option<u64>,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseAcquireAndReserveOutcome> {
     let key_format = key.format();
     let effects = self
@@ -922,6 +934,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
         now,
         lease_duration,
         reservation_size,
+        sequence_progress,
       )
       .await;
     self
@@ -946,6 +959,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     lease_session_id: &str,
     now: OffsetDateTime,
     lease_duration: TimeDuration,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseHeartbeatOutcome> {
     let effects = self
       .controller
@@ -975,7 +989,14 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .heartbeat_lease(key, holder_id, lease_session_id, now, lease_duration)
+      .heartbeat_lease(
+        key,
+        holder_id,
+        lease_session_id,
+        now,
+        lease_duration,
+        sequence_progress,
+      )
       .await;
     self
       .controller
@@ -1000,6 +1021,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     lease_session_id: &str,
     now: OffsetDateTime,
     reservation_size: u64,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<SequenceReservationOutcome> {
     let effects = self
       .controller
@@ -1029,7 +1051,14 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .reserve_sequences(key, holder_id, lease_session_id, now, reservation_size)
+      .reserve_sequences(
+        key,
+        holder_id,
+        lease_session_id,
+        now,
+        reservation_size,
+        sequence_progress,
+      )
       .await;
     self
       .controller
@@ -1053,6 +1082,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
     holder_id: &str,
     lease_session_id: &str,
     now: OffsetDateTime,
+    sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseReleaseOutcome> {
     let effects = self
       .controller
@@ -1082,7 +1112,7 @@ impl ProducerPartitionLeaseStore for FaultInjectedProducerPartitionLeaseStore {
 
     let result = self
       .inner
-      .release_lease(key, holder_id, lease_session_id, now)
+      .release_lease(key, holder_id, lease_session_id, now, sequence_progress)
       .await;
     self
       .controller
@@ -1410,6 +1440,47 @@ impl ConsumerGroupLeaseStore for FaultInjectedConsumerGroupLeaseStore {
       .controller
       .record_operation_outcome(
         StoreFaultOperation::ConsumerListGroupLeases,
+        key,
+        if result.is_ok() { "ok" } else { "error" },
+        result.as_ref().ok().map(|leases| leases.len().to_string()),
+      )
+      .await;
+    result
+  }
+
+  async fn list_active_leases(
+    &self,
+    topics: &[String],
+    now: OffsetDateTime,
+  ) -> Result<Vec<ConsumerGroupLease>> {
+    let key = topics.join("#");
+    let effects = self
+      .controller
+      .effects_for_call(
+        StoreFaultDomain::ConsumerLease,
+        StoreFaultOperation::ConsumerListActiveLeases,
+        &key,
+      )
+      .await;
+    if let Some(delay) = effects.delay {
+      sleep(delay).await;
+    }
+    if let Some(timeout) = effects.timeout {
+      sleep(timeout).await;
+      return Err(anyhow!(
+        "consumer list_active_leases timed out for key {key}"
+      ));
+    }
+    if let Some(message) = effects.fail_message {
+      return Err(anyhow!(
+        "consumer list_active_leases fault for key {key}: {message}"
+      ));
+    }
+    let result = self.inner.list_active_leases(topics, now).await;
+    self
+      .controller
+      .record_operation_outcome(
+        StoreFaultOperation::ConsumerListActiveLeases,
         key,
         if result.is_ok() { "ok" } else { "error" },
         result.as_ref().ok().map(|leases| leases.len().to_string()),

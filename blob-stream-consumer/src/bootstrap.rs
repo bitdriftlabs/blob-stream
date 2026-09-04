@@ -33,7 +33,6 @@ use blob_stream_metadata_store::{
   ConsumerGroupMember,
   ConsumerGroupMembershipStore,
   DynamoCapacityMetrics,
-  DynamoConsumerGroupLeaseStore,
   DynamoConsumerGroupMembershipStore,
   DynamoMetadataStore,
   InMemoryConsumerGroupLeaseStore,
@@ -42,6 +41,8 @@ use blob_stream_metadata_store::{
   MetadataStore,
   aws_retry_config,
   aws_timeout_config,
+  build_dynamo_client,
+  build_dynamo_consumer_group_lease_store,
 };
 use blob_stream_proto::protos::blobstream::v1::config::{
   BlobStoreConfig,
@@ -400,22 +401,12 @@ async fn build_metadata_and_coordination_stores(
 
   if config.has_dynamo() {
     let dynamo = config.dynamo();
-    let region = dynamo.region.to_string();
     let metadata_table = dynamo.segment_metadata_table_name.to_string();
     let producer_partition_lease_table = dynamo.producer_partition_lease_table_name.to_string();
     let consumer_lease_table = dynamo.consumer_group_lease_table_name.to_string();
     let consumer_membership_table = dynamo.consumer_group_membership_table_name.to_string();
 
-    let region_provider = RegionProviderChain::first_try(Some(Region::new(region)));
-    let mut loader = aws_config::defaults(BehaviorVersion::latest())
-      .region(region_provider)
-      .retry_config(aws_retry_config())
-      .timeout_config(aws_timeout_config());
-    if !dynamo.endpoint.trim().is_empty() {
-      loader = loader.endpoint_url(dynamo.endpoint.to_string());
-    }
-    let shared = loader.load().await;
-    let client = aws_sdk_dynamodb::Client::new(&shared);
+    let client = build_dynamo_client(dynamo.region.as_str(), dynamo.endpoint.as_str()).await;
 
     let metadata_store: Arc<dyn MetadataStore> = Arc::new(DynamoMetadataStore::new(
       client.clone(),
@@ -430,13 +421,12 @@ async fn build_metadata_and_coordination_stores(
       ProtoDurationExt::to_time_duration,
     );
     let consumer_lease_ttl_buffer = consumer_group_lease_ttl_buffer(retention)?;
-    let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
-      Arc::new(DynamoConsumerGroupLeaseStore::new(
-        client.clone(),
-        consumer_lease_table,
-        consumer_lease_ttl_buffer,
-        Some(capacity_metrics.clone()),
-      ));
+    let lease_store = build_dynamo_consumer_group_lease_store(
+      client.clone(),
+      consumer_lease_table,
+      consumer_lease_ttl_buffer,
+      Some(capacity_metrics.clone()),
+    );
     let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
       Arc::new(DynamoConsumerGroupMembershipStore::new(
         client,

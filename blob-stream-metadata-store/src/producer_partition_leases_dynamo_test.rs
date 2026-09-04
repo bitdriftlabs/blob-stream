@@ -7,6 +7,7 @@ use crate::{
   LeaseReleaseOutcome,
   ProducerPartitionLeaseKey,
   ProducerPartitionLeaseStore,
+  ProducerSequenceProgress,
   SequenceReservationOutcome,
 };
 use anyhow::{Context, Result, anyhow};
@@ -129,6 +130,7 @@ async fn fences_lease_holders() -> Result<()> {
       "session-a".to_string(),
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
 
@@ -141,6 +143,7 @@ async fn fences_lease_holders() -> Result<()> {
       "session-b".to_string(),
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
 
@@ -153,6 +156,7 @@ async fn fences_lease_holders() -> Result<()> {
       "session-b",
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
 
@@ -165,6 +169,7 @@ async fn fences_lease_holders() -> Result<()> {
       "session-b".to_string(),
       offset_datetime_from_unix_millis(1_100),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
 
@@ -191,6 +196,7 @@ async fn reserves_sequences_in_order() -> Result<()> {
       "session-a".to_string(),
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
 
@@ -201,6 +207,7 @@ async fn reserves_sequences_in_order() -> Result<()> {
       "session-a",
       offset_datetime_from_unix_millis(1_000),
       5,
+      ProducerSequenceProgress::default(),
     )
     .await?;
 
@@ -218,6 +225,7 @@ async fn reserves_sequences_in_order() -> Result<()> {
       "session-a",
       offset_datetime_from_unix_millis(1_000),
       3,
+      ProducerSequenceProgress::default(),
     )
     .await?;
 
@@ -249,6 +257,7 @@ async fn acquires_and_reserves_sequences_in_one_operation() -> Result<()> {
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
       Some(5),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = first else {
@@ -272,6 +281,7 @@ async fn acquires_and_reserves_sequences_in_one_operation() -> Result<()> {
       offset_datetime_from_unix_millis(1_050),
       TimeDuration::milliseconds(100),
       Some(3),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   let LeaseAcquireAndReserveOutcome::Acquired { lease, reservation } = second else {
@@ -286,6 +296,141 @@ async fn acquires_and_reserves_sequences_in_one_operation() -> Result<()> {
     reservation,
     Some(blob_stream_types::SeqRange { start: 5, end: 7 })
   );
+
+  client.delete_table().table_name(table_name).send().await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn persists_sequence_progress_with_each_successful_mutation() -> Result<()> {
+  let client = dynamo_client().await?;
+  let table_name = format!("producer_leases_test_{}", Uuid::new_v4());
+  create_leases_table(&client, &table_name).await?;
+
+  let store = default_lease_store(client.clone(), table_name.clone());
+  let key = lease_key();
+  let now = offset_datetime_from_unix_millis(1_000);
+  store
+    .acquire_lease(
+      key.clone(),
+      "broker-a".to_string(),
+      "session-a".to_string(),
+      now,
+      TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
+    )
+    .await?;
+  store
+    .reserve_sequences(
+      &key,
+      "broker-a",
+      "session-a",
+      now,
+      5,
+      ProducerSequenceProgress::default(),
+    )
+    .await?;
+  let progress = ProducerSequenceProgress {
+    lease_sequence_start: Some(0),
+    last_handed_out_seq: Some(2),
+  };
+  store
+    .heartbeat_lease(
+      &key,
+      "broker-a",
+      "session-a",
+      now,
+      TimeDuration::milliseconds(100),
+      progress,
+    )
+    .await?;
+  store
+    .reserve_sequences(&key, "broker-a", "session-a", now, 3, progress)
+    .await?;
+
+  let lease = store
+    .get_lease(&key)
+    .await?
+    .ok_or_else(|| anyhow!("expected active lease"))?;
+  assert_eq!(lease.lease_sequence_start, Some(0));
+  assert_eq!(lease.max_allocated_seq, Some(7));
+  assert_eq!(lease.last_handed_out_seq, Some(2));
+  assert_eq!(lease.sequence_progress_updated_at, Some(now));
+
+  let stale = store
+    .heartbeat_lease(
+      &key,
+      "broker-a",
+      "session-b",
+      now,
+      TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
+    )
+    .await?;
+  assert!(matches!(stale, LeaseHeartbeatOutcome::HeldByOther(_)));
+  let lease = store
+    .get_lease(&key)
+    .await?
+    .ok_or_else(|| anyhow!("expected active lease"))?;
+  assert_eq!(lease.lease_sequence_start, Some(0));
+  assert_eq!(lease.last_handed_out_seq, Some(2));
+
+  let cleared_at = now + TimeDuration::milliseconds(1);
+  store
+    .heartbeat_lease(
+      &key,
+      "broker-a",
+      "session-a",
+      cleared_at,
+      TimeDuration::milliseconds(100),
+      ProducerSequenceProgress {
+        lease_sequence_start: Some(0),
+        last_handed_out_seq: None,
+      },
+    )
+    .await?;
+  let lease = store
+    .get_lease(&key)
+    .await?
+    .ok_or_else(|| anyhow!("expected active lease"))?;
+  assert_eq!(lease.lease_sequence_start, Some(0));
+  assert_eq!(lease.last_handed_out_seq, None);
+  assert_eq!(lease.sequence_progress_updated_at, Some(cleared_at));
+
+  let released_at = cleared_at + TimeDuration::milliseconds(1);
+  store
+    .release_lease(&key, "broker-a", "session-a", released_at, progress)
+    .await?;
+  let lease = store
+    .get_lease(&key)
+    .await?
+    .ok_or_else(|| anyhow!("expected released lease row"))?;
+  assert_eq!(lease.lease_sequence_start, Some(0));
+  assert_eq!(lease.last_handed_out_seq, Some(2));
+  assert_eq!(lease.sequence_progress_updated_at, Some(released_at));
+
+  let atomic_key = ProducerPartitionLeaseKey {
+    topic: "topic-a".into(),
+    virtual_partition_id: 43,
+  };
+  store
+    .acquire_lease_and_reserve_sequences(
+      atomic_key.clone(),
+      "broker-b".to_string(),
+      "session-b".to_string(),
+      now,
+      TimeDuration::milliseconds(100),
+      Some(5),
+      ProducerSequenceProgress::default(),
+    )
+    .await?;
+  let lease = store
+    .get_lease(&atomic_key)
+    .await?
+    .ok_or_else(|| anyhow!("expected atomic lease"))?;
+  assert_eq!(lease.lease_sequence_start, Some(0));
+  assert_eq!(lease.last_handed_out_seq, None);
+  assert_eq!(lease.sequence_progress_updated_at, Some(now));
 
   client.delete_table().table_name(table_name).send().await?;
   Ok(())
@@ -307,6 +452,7 @@ async fn rejects_overflowing_atomic_sequence_reservation() -> Result<()> {
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
       Some(u64::MAX),
+      ProducerSequenceProgress::default(),
     )
     .await?;
 
@@ -318,6 +464,7 @@ async fn rejects_overflowing_atomic_sequence_reservation() -> Result<()> {
       offset_datetime_from_unix_millis(1_050),
       TimeDuration::milliseconds(100),
       Some(2),
+      ProducerSequenceProgress::default(),
     )
     .await
     .expect_err("overflowing reservation must fail");
@@ -330,6 +477,7 @@ async fn rejects_overflowing_atomic_sequence_reservation() -> Result<()> {
       "session-a",
       offset_datetime_from_unix_millis(1_050),
       2,
+      ProducerSequenceProgress::default(),
     )
     .await
     .expect_err("overflowing standalone reservation must fail");
@@ -361,6 +509,7 @@ async fn releases_lease_for_current_holder() -> Result<()> {
       "session-a".to_string(),
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
 
@@ -371,6 +520,7 @@ async fn releases_lease_for_current_holder() -> Result<()> {
       "session-a",
       offset_datetime_from_unix_millis(1_000),
       5,
+      ProducerSequenceProgress::default(),
     )
     .await?;
   assert!(matches!(
@@ -384,6 +534,7 @@ async fn releases_lease_for_current_holder() -> Result<()> {
       "broker-a",
       "session-a",
       offset_datetime_from_unix_millis(1_000),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   assert!(matches!(release, LeaseReleaseOutcome::Released));
@@ -405,6 +556,7 @@ async fn releases_lease_for_current_holder() -> Result<()> {
       "session-b".to_string(),
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
   assert!(matches!(reacquire, LeaseAcquireOutcome::Acquired(_)));
@@ -416,6 +568,7 @@ async fn releases_lease_for_current_holder() -> Result<()> {
       "session-b",
       offset_datetime_from_unix_millis(1_000),
       2,
+      ProducerSequenceProgress::default(),
     )
     .await?;
   let SequenceReservationOutcome::Reserved(reservation) = reservation else {
@@ -445,6 +598,7 @@ async fn lookup_reports_absent_and_active_leases() -> Result<()> {
       "session-a".to_string(),
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
+      ProducerSequenceProgress::default(),
     )
     .await?;
 
@@ -483,6 +637,7 @@ async fn writes_ttl_attribute_for_lease_rows() -> Result<()> {
       "session-a".to_string(),
       offset_datetime_from_unix_millis(2_000),
       TimeDuration::milliseconds(1_000),
+      ProducerSequenceProgress::default(),
     )
     .await?;
 

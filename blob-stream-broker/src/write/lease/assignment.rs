@@ -572,6 +572,7 @@ impl WriteEngineImpl {
                 time_provider.now(),
                 lease_duration,
                 transition.reservation.map(|request| request.size),
+                transition.sequence_progress,
                 &metrics,
               )
               .await;
@@ -743,8 +744,19 @@ impl WriteEngineImpl {
     // same conditional operation until the store reports Released, Expired, or HeldByOther.
     let mut release_retry = LeaseRetrySchedule::new(time_provider.now());
     loop {
+      let sequence_progress = state
+        .lock()
+        .partition_state(key.topic.as_str(), key.virtual_partition_id)
+        .map(|partition_state| partition_state.seq_allocator.sequence_progress())
+        .unwrap_or_default();
       match lease_store
-        .release_lease(&key, holder_id, lease_session_id, time_provider.now())
+        .release_lease(
+          &key,
+          holder_id,
+          lease_session_id,
+          time_provider.now(),
+          sequence_progress,
+        )
         .await
       {
         Ok(
@@ -852,6 +864,11 @@ impl WriteEngineImpl {
             );
           },
           () = time_provider.sleep(heartbeat_delay) => {
+            let sequence_progress = state
+              .lock()
+              .partition_state(key.topic.as_str(), key.virtual_partition_id)
+              .map(|partition_state| partition_state.seq_allocator.sequence_progress())
+              .unwrap_or_default();
             match lease_store
               .heartbeat_lease(
                 key,
@@ -859,6 +876,7 @@ impl WriteEngineImpl {
                 lease_session_id,
                 time_provider.now(),
                 lease_duration,
+                sequence_progress,
               )
               .await
             {
