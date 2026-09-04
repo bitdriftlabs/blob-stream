@@ -2516,6 +2516,18 @@ async fn state_snapshot_reports_durable_leases_for_every_configured_partition() 
   );
   assert_eq!(partitions[2].consumer_leases[0].committed_seq_end, Some(42));
   assert_eq!(
+    partitions[2].consumer_leases[0].lease_expires_at,
+    offset_datetime_from_unix_millis(31_050)
+  );
+  assert_eq!(
+    partitions[2].consumer_leases[0].last_heartbeat_at,
+    offset_datetime_from_unix_millis(1_050)
+  );
+  assert_eq!(
+    partitions[2].consumer_leases[0].committed_at,
+    Some(offset_datetime_from_unix_millis(1_050))
+  );
+  assert_eq!(
     partitions[2].consumer_leases[0]
       .committed_source_checkpoint
       .as_ref()
@@ -2524,6 +2536,19 @@ async fn state_snapshot_reports_durable_leases_for_every_configured_partition() 
     9
   );
   assert!(partitions[0].consumer_leases.is_empty());
+  let state_dump = to_value(&snapshot)?;
+  assert_eq!(
+    state_dump["durable_topics"][0]["partitions"][2]["consumer_leases"][0]["lease_expires_at"],
+    "1970-01-01T00:00:31.05Z"
+  );
+  assert_eq!(
+    state_dump["durable_topics"][0]["partitions"][2]["consumer_leases"][0]["last_heartbeat_at"],
+    "1970-01-01T00:00:01.05Z"
+  );
+  assert_eq!(
+    state_dump["durable_topics"][0]["partitions"][2]["consumer_leases"][0]["committed_at"],
+    "1970-01-01T00:00:01.05Z"
+  );
 
   Ok(())
 }

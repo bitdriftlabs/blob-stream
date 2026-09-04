@@ -156,10 +156,13 @@ pub struct DurableConsumerLeaseSnapshot {
   pub group_id: String,
   pub owner_id: String,
   pub generation: u64,
-  pub lease_expiration_ts_ms: i64,
-  pub last_heartbeat_ts_ms: i64,
+  #[serde(with = "time::serde::rfc3339")]
+  pub lease_expires_at: OffsetDateTime,
+  #[serde(with = "time::serde::rfc3339")]
+  pub last_heartbeat_at: OffsetDateTime,
   pub committed_seq_end: Option<u64>,
-  pub committed_ts_ms: Option<i64>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub committed_at: Option<OffsetDateTime>,
   pub committed_source_checkpoint: Option<DurableCommittedSourceCheckpointSnapshot>,
 }
 

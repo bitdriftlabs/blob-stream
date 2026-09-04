@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use bd_log_util::warn_every;
 use blob_stream_broker_discovery::{balanced_assignment, writer_virtual_partitions};
 use blob_stream_metadata_store::ProducerPartitionLeaseKey;
-use blob_stream_types::RecordBatch;
+use blob_stream_types::{RecordBatch, offset_datetime_from_unix_millis};
 pub use core::{WriteEngineBuilder, WriteEngineImpl};
 use futures::{StreamExt, stream};
 use log::trace;
@@ -495,10 +495,10 @@ impl WriteEngine for WriteEngineImpl {
                 group_id: lease.key.group_id,
                 owner_id: lease.owner_id,
                 generation: lease.generation,
-                lease_expiration_ts_ms: lease.lease_expiration_ts_ms,
-                last_heartbeat_ts_ms: lease.last_heartbeat_ts_ms,
+                lease_expires_at: offset_datetime_from_unix_millis(lease.lease_expiration_ts_ms),
+                last_heartbeat_at: offset_datetime_from_unix_millis(lease.last_heartbeat_ts_ms),
                 committed_seq_end: lease.committed_cursor.as_ref().map(|cursor| cursor.seq_end),
-                committed_ts_ms: lease.committed_ts_ms,
+                committed_at: lease.committed_ts_ms.map(offset_datetime_from_unix_millis),
                 committed_source_checkpoint,
               };
               consumer_leases_by_partition

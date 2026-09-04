@@ -201,7 +201,7 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
         .client
         .scan()
         .table_name(&self.table_name)
-        .consistent_read(true)
+        .consistent_read(false)
         .filter_expression(format!("{ATTR_LEASE_EXPIRES} > :now"))
         .set_expression_attribute_values(Some(values));
       if let Some(key) = start_key.take() {
