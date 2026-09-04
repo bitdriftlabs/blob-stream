@@ -153,7 +153,12 @@ impl WriteConfig {
     }
 
     if let Some(flush_max_delay) = broker.flush_max_delay.as_ref() {
-      config.flush_max_delay = flush_max_delay.to_time_duration();
+      let flush_max_delay = flush_max_delay.to_time_duration();
+      ensure!(
+        flush_max_delay >= Duration::milliseconds(1),
+        "broker flush_max_delay must be at least one millisecond"
+      );
+      config.flush_max_delay = flush_max_delay;
     }
     config.adaptive_flush_max_delay_enabled =
       broker.adaptive_flush_max_delay_enabled.unwrap_or(true);

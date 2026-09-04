@@ -385,9 +385,6 @@ impl WriteEngineImpl {
                   flush_config.max_delay = adaptive_flush_delay.current_delay();
                   *effective_flush_config.write() = flush_config;
                   metrics.set_adaptive_flush_max_delay(flush_config.max_delay);
-                  flush_tick = Box::pin(time_provider.sleep(
-                    flush_config.max_delay.max(TimeDuration::milliseconds(1)),
-                  ));
                   debug!(
                     "broker adaptive flush max delay adjusted: delay_ms={}, split_count={}, \
                      successful={}",

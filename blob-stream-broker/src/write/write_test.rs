@@ -4670,8 +4670,14 @@ async fn adaptive_flush_delay_requires_consecutive_split_and_unsplit_plans() -> 
         .sum::<usize>(),
       1
     );
-    time_provider.advance(adaptive_delay);
-    tokio::time::advance(std_duration(adaptive_delay)).await;
+    // The split adjustment retains the timer that was scheduled before its plan completed.
+    let timer_delay = if sequence == 0 {
+      config.flush_max_delay
+    } else {
+      adaptive_delay
+    };
+    time_provider.advance(timer_delay);
+    tokio::time::advance(std_duration(timer_delay)).await;
     recovery_write.await??;
   }
   for _ in 0 .. 100 {

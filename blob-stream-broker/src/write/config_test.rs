@@ -88,6 +88,20 @@ fn respects_explicit_max_segment_bytes() {
 }
 
 #[test]
+fn rejects_submillisecond_flush_max_delay() {
+  let mut broker_config = BrokerConfig::new();
+  broker_config.writer_id = Some(0);
+  broker_config.flush_max_delay = Duration::microseconds(999).into_proto();
+
+  let error = WriteConfig::from_broker_config(&broker_config).unwrap_err();
+
+  assert_eq!(
+    error.to_string(),
+    "broker flush_max_delay must be at least one millisecond"
+  );
+}
+
+#[test]
 fn respects_explicit_adaptive_flush_delay_disablement() {
   let mut broker_config = BrokerConfig::new();
   broker_config.writer_id = Some(0);
