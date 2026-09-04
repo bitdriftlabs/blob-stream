@@ -557,15 +557,10 @@ impl WriteEngine for WriteEngineImpl {
         })
       })
       .collect::<Vec<_>>();
-    let durable_producer_leases =
-      stream::iter(durable_partition_keys.into_iter().map(|key| async {
-        let observation = match tokio::time::timeout(
-          DURABLE_STATE_LOOKUP_TIMEOUT,
-          self.lease_store.get_lease(&key),
-        )
-        .await
-        {
-          Ok(Ok(Some(lease))) => DurableProducerLeaseObservation {
+    let mut durable_producer_lease_lookups =
+      stream::iter(durable_partition_keys.clone().into_iter().map(|key| async {
+        let observation = match self.lease_store.get_lease(&key).await {
+          Ok(Some(lease)) => DurableProducerLeaseObservation {
             status: DurableStateLookupStatus::Present,
             lease: Some(DurableProducerLeaseSnapshot {
               holder_id: lease.fence.holder_id,
@@ -580,12 +575,12 @@ impl WriteEngine for WriteEngineImpl {
             }),
             error: None,
           },
-          Ok(Ok(None)) => DurableProducerLeaseObservation {
+          Ok(None) => DurableProducerLeaseObservation {
             status: DurableStateLookupStatus::Missing,
             lease: None,
             error: None,
           },
-          Ok(Err(error)) => {
+          Err(error) => {
             warn_every!(
               15.seconds(),
               "broker durable producer lease lookup failed: topic={}, virtual_partition_id={}, \
@@ -599,17 +594,26 @@ impl WriteEngine for WriteEngineImpl {
               error: Some(error.to_string()),
             }
           },
-          Err(_) => DurableProducerLeaseObservation {
-            status: DurableStateLookupStatus::TimedOut,
-            lease: None,
-            error: Some(format!("lookup exceeded {DURABLE_STATE_LOOKUP_TIMEOUT:?}")),
-          },
         };
         (key, observation)
       }))
-      .buffer_unordered(MAX_CONCURRENT_DURABLE_STATE_LOOKUPS)
-      .collect::<HashMap<_, _>>()
-      .await;
+      .buffer_unordered(MAX_CONCURRENT_DURABLE_STATE_LOOKUPS);
+    let deadline = tokio::time::Instant::now() + DURABLE_STATE_LOOKUP_TIMEOUT;
+    let mut durable_producer_leases = HashMap::new();
+    while let Ok(Some((key, observation))) =
+      tokio::time::timeout_at(deadline, durable_producer_lease_lookups.next()).await
+    {
+      durable_producer_leases.insert(key, observation);
+    }
+    for key in durable_partition_keys {
+      durable_producer_leases
+        .entry(key)
+        .or_insert_with(|| DurableProducerLeaseObservation {
+          status: DurableStateLookupStatus::TimedOut,
+          lease: None,
+          error: Some(format!("lookup exceeded {DURABLE_STATE_LOOKUP_TIMEOUT:?}")),
+        });
+    }
 
     let mut durable_topics = self
       .topics

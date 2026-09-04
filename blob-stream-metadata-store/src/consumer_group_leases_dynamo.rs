@@ -658,6 +658,8 @@ fn consumer_group_lease_key_from_scan_item(
   item: &HashMap<String, AttributeValue>,
   topics: &[String],
 ) -> Result<Option<ConsumerGroupLeaseKey>> {
+  // Known limitation: this unescaped composite key is ambiguous when configured topic names
+  // contain '#'. Current deployments do not use that character in topic names.
   let partition_key = item
     .get(ATTR_PK)
     .ok_or_else(|| anyhow!("consumer lease scan returned row without partition key"))?

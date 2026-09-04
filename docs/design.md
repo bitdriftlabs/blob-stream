@@ -138,10 +138,10 @@ Broker admin state reports its configured writer ID, local membership as `{node_
 and one ownership row per local writer-scoped virtual partition. Each row distinguishes the
 deterministic planned owner from the observed lease holder. Its additive `durable_topics` view
 enumerates every configured virtual partition across all writers, including the durable producer
-lease and all active consumer-group leases. Producer reads are bounded and the consumer lease table
-is scanned once. `missing`, `unavailable`, `lookup_failed`, and `timed_out` observations are
-explicitly distinct from a successful empty lease list. State snapshots use RFC 3339 UTC strings
-for absolute timestamps; elapsed durations remain numeric milliseconds.
+lease and all active consumer-group leases. Producer reads share one bounded deadline, and the
+consumer lease table is scanned once. `missing`, `unavailable`, `lookup_failed`, and `timed_out`
+observations are explicitly distinct from a successful empty lease list. State snapshots use RFC
+3339 UTC strings for absolute timestamps; elapsed durations remain numeric milliseconds.
 
 ### Sequence Numbers and Cursors
 
