@@ -11,6 +11,7 @@
 use super::ConsumerReaderPartitionScanState;
 use blob_stream_types::{SnowflakeId, VirtualPartitionId};
 use std::sync::Arc;
+use time::OffsetDateTime;
 
 //
 // RecoveryState
@@ -63,6 +64,8 @@ pub enum VirtualPartitionState {
   /// A partition scanning the bounded live publication horizon.
   Fast {
     cursor: Option<u64>,
+    /// Oldest Fast time floor whose metadata coverage must be retained after an incomplete pass.
+    coverage_floor: Option<OffsetDateTime>,
     last_scan: Option<Arc<ConsumerReaderPartitionScanState>>,
   },
 }
@@ -142,6 +145,7 @@ impl VirtualPartitionState {
       },
       Self::PendingFast { cursor, last_scan } => Self::Fast {
         cursor: Some(cursor),
+        coverage_floor: None,
         last_scan,
       },
       state @ (Self::Fresh { .. } | Self::Recovering { .. } | Self::Fast { .. }) => state,
@@ -212,6 +216,29 @@ impl VirtualPartitionState {
     }
   }
 
+  /// Return the earliest Fast time floor that has not been superseded by a complete scan.
+  pub(super) fn fast_coverage_floor(&self) -> Option<OffsetDateTime> {
+    match self {
+      Self::Fast { coverage_floor, .. } => *coverage_floor,
+      Self::PendingCursor { .. }
+      | Self::PendingRecovering { .. }
+      | Self::PendingFast { .. }
+      | Self::Fresh { .. }
+      | Self::Recovering { .. } => None,
+    }
+  }
+
+  /// Replace the retained Fast coverage floor after a complete Fast scan.
+  pub(super) fn set_fast_coverage_floor(&mut self, coverage_floor: OffsetDateTime) {
+    if let Self::Fast {
+      coverage_floor: retained_coverage_floor,
+      ..
+    } = self
+    {
+      *retained_coverage_floor = Some(coverage_floor);
+    }
+  }
+
   /// Return the diagnostic read mode; a pending cursor has no active reader mode yet.
   pub(super) fn reader_mode(&self) -> Option<ConsumerReaderPartitionMode> {
     match self {
@@ -259,4 +286,5 @@ pub enum ConsumerReaderPartitionMode {
 pub struct ConsumerReaderPartitionState {
   pub virtual_partition_id: VirtualPartitionId,
   pub mode: ConsumerReaderPartitionMode,
+  pub fast_coverage_floor: Option<OffsetDateTime>,
 }

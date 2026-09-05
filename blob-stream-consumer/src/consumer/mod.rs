@@ -14,7 +14,7 @@ mod state;
 mod time;
 
 pub(crate) use api::ConsumerReadOutcome;
-pub use api::{ConsumerBatch, ConsumerReader, ReadCapacity};
+pub use api::{ConsumerBatch, ConsumerBatchSource, ConsumerReader, ReadCapacity};
 pub(crate) use blob_query::decode_blob_range_response_for_ranges;
 pub use blob_query::{
   BrokerBlobRangeQuery,

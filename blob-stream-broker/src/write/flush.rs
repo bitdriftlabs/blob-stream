@@ -502,6 +502,7 @@ impl FlushContext {
 
     BlobKey::new(key)
   }
+
   fn encode_batch(virtual_partition_id: VirtualPartitionId, records: Vec<Record>) -> Result<Bytes> {
     let proto_batch = StoredRecordBatch {
       virtual_partition_id,

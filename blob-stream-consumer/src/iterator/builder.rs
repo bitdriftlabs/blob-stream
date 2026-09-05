@@ -60,6 +60,7 @@ pub struct ConsumerIteratorBuilder<'a> {
   broker_metadata_query: Arc<dyn BrokerMetadataQuery>,
   broker_blob_range_query: Arc<dyn BrokerBlobRangeQuery>,
   time_provider: Arc<dyn TimeProvider>,
+  driver_time_provider: Arc<dyn TimeProvider>,
   lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
 }
 
@@ -99,13 +100,22 @@ impl<'a> ConsumerIteratorBuilder<'a> {
       broker_metadata_query,
       broker_blob_range_query,
       time_provider: Arc::new(SystemTimeProvider),
+      driver_time_provider: Arc::new(SystemTimeProvider),
       lifecycle_hooks: None,
     }
   }
 
   #[must_use]
   pub fn time_provider(mut self, time_provider: Arc<dyn TimeProvider>) -> Self {
-    self.time_provider = time_provider;
+    self.time_provider = Arc::clone(&time_provider);
+    self.driver_time_provider = time_provider;
+    self
+  }
+
+  /// Supply a clock for consumer-group coordination independently from reader scan time.
+  #[must_use]
+  pub fn driver_time_provider(mut self, driver_time_provider: Arc<dyn TimeProvider>) -> Self {
+    self.driver_time_provider = driver_time_provider;
     self
   }
 
@@ -193,6 +203,7 @@ impl ConsumerIteratorBuilder<'_> {
       broker_metadata_query,
       broker_blob_range_query,
       time_provider,
+      driver_time_provider,
       lifecycle_hooks,
     } = self;
     validate_runtime_config(runtime)?;
@@ -246,7 +257,7 @@ impl ConsumerIteratorBuilder<'_> {
       Arc::clone(&lease_store),
       Arc::clone(&membership_store),
     )?;
-    let now = time_provider.now();
+    let now = driver_time_provider.now();
     let now_ts_ms = now.unix_timestamp_ms();
     let membership_lease_duration = consumer_lease_duration(&group_config);
     let membership_lease_expires_at = persisted_lease_expires_at(now, membership_lease_duration)?;
@@ -294,7 +305,8 @@ impl ConsumerIteratorBuilder<'_> {
       pending_revocation_span: None,
       revocation_notify,
       lifecycle_hooks,
-      time_provider,
+      time_provider: driver_time_provider,
+      prefetch_time_provider: time_provider,
       membership_lease_expires_at,
       active_partition_lease_expiration_deadline: membership_lease_expires_at,
       next_heartbeat_at: now,

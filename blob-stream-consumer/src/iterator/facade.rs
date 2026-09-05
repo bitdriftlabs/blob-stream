@@ -1,6 +1,6 @@
-use super::delivery::{update_total_prefetch_bytes, update_worker_prefetch_metrics};
+use super::delivery::{DeliveryGap, update_total_prefetch_bytes, update_worker_prefetch_metrics};
 use super::driver::{ConsumerDriver, ConsumerDriverCommand};
-use super::shared::{ConsumerIteratorMetrics, PendingCommit};
+use super::shared::{ConsumerIteratorMetrics, DeliveredSource, PendingCommit};
 use super::{
   AssignmentCallback,
   ConsumerIterator,
@@ -12,12 +12,16 @@ use crate::coordination::HeartbeatReport;
 use crate::diagnostics::ConsumerDiagnostics;
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
+use bd_log_util::WarnTracker;
 use blob_stream_types::VirtualPartitionId;
-use log::trace;
+use log::{trace, warn};
 use parking_lot::Mutex;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use time::ext::NumericalDuration;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
+
+static DELIVERY_GAP_WARN_TRACKER: OnceLock<WarnTracker> = OnceLock::new();
 
 //
 // ConsumerIteratorImpl
@@ -123,7 +127,7 @@ impl ConsumerIterator for ConsumerIteratorImpl {
       let notified = self.delivery_notify.notified();
       tokio::pin!(notified);
       notified.as_mut().enable();
-      let (next_result, terminal_error) = {
+      let (delivery_result, terminal_error) = {
         let mut shared_state = self.shared_state.lock();
         let pending_bytes = shared_state.diagnostics.prefetch_pending_bytes;
         let ConsumerSharedState {
@@ -132,19 +136,32 @@ impl ConsumerIterator for ConsumerIteratorImpl {
           terminal_error,
           ..
         } = &mut *shared_state;
-        let next_result = delivery_state.try_take_next(active_partitions, &self.metrics);
+        let delivery_result = delivery_state.try_take_next(active_partitions, &self.metrics);
         update_worker_prefetch_metrics(&self.metrics, delivery_state);
         update_total_prefetch_bytes(&self.metrics, delivery_state, pending_bytes);
-        (next_result, terminal_error.clone())
+        (delivery_result, terminal_error.clone())
       };
       #[cfg(test)]
       if let Some(hook) = self.next_after_delivery_state_check_hook.take() {
         let _ = hook.state_checked.send(());
         let _ = hook.release.await;
       }
-      if let Some(next_result) = next_result {
+      if let Some(delivery_result) = delivery_result {
+        if let Some(gap) = delivery_result.gap
+          && should_log_delivery_gap()
+        {
+          let partition_state_json = self
+            .diagnostics
+            .state_snapshot()
+            .local
+            .partitions
+            .into_iter()
+            .find(|partition| partition.virtual_partition_id == gap.virtual_partition_id)
+            .and_then(|partition| serde_json::to_string(&partition).ok());
+          log_delivery_gap(&gap, partition_state_json.as_deref());
+        }
         self.prefetch_space_notify.notify_waiters();
-        return Ok(next_result);
+        return Ok(delivery_result.next_result);
       }
 
       if let Some(error) = terminal_error {
@@ -163,12 +180,15 @@ impl ConsumerIterator for ConsumerIteratorImpl {
       .ok_or_else(|| {
         anyhow!("cannot store cursor for unassigned virtual partition {virtual_partition_id}")
       })?;
-    let source_checkpoint = partition_state
+    let stored_source = partition_state
       .delivered_source_ranges
       .iter()
       .find_map(|range| {
-        (range.start_offset <= offset && offset <= range.end_offset)
-          .then(|| range.source_checkpoint.clone())
+        (range.start_offset <= offset && offset <= range.end_offset).then(|| DeliveredSource {
+          offset,
+          source_checkpoint: range.source_checkpoint.clone(),
+          source: range.source.clone(),
+        })
       })
       .ok_or_else(|| {
         anyhow!(
@@ -176,6 +196,7 @@ impl ConsumerIterator for ConsumerIteratorImpl {
            delivered"
         )
       })?;
+    let source_checkpoint = stored_source.source_checkpoint.clone();
     if let Some(staged) = &partition_state.pending_commit {
       ensure!(
         offset >= staged.offset,
@@ -187,6 +208,7 @@ impl ConsumerIterator for ConsumerIteratorImpl {
       offset,
       source_checkpoint,
     });
+    partition_state.last_stored_source = Some(stored_source);
     trace!("consumer stored offset: partition={virtual_partition_id}, offset={offset}");
     Ok(())
   }
@@ -277,4 +299,57 @@ impl ConsumerIterator for ConsumerIteratorImpl {
   fn diagnostics(&self) -> Option<ConsumerDiagnostics> {
     Some(self.diagnostics.clone())
   }
+}
+
+/// Decide whether the next gap receives full forensic serialization and a warning.
+fn should_log_delivery_gap() -> bool {
+  DELIVERY_GAP_WARN_TRACKER
+    .get_or_init(WarnTracker::default)
+    .should_warn(15.seconds())
+}
+
+/// Emit source identifiers needed to inspect both sides of a delivery discontinuity.
+fn log_delivery_gap(gap: &DeliveryGap, partition_state_json: Option<&str>) {
+  let admission_scan_json = gap
+    .admission_scan
+    .as_ref()
+    .and_then(|scan| serde_json::to_string(scan).ok())
+    .unwrap_or_else(|| "null".to_string());
+  let previous_offset = gap.previous_source.as_ref().map(|source| source.offset);
+  let previous_checkpoint = gap
+    .previous_source
+    .as_ref()
+    .map(|source| &source.source_checkpoint);
+  let previous_blob_key = gap
+    .previous_source
+    .as_ref()
+    .map(|source| source.source.blob_key.as_str());
+  let last_stored_offset = gap.last_stored_source.as_ref().map(|source| source.offset);
+  let last_stored_checkpoint = gap
+    .last_stored_source
+    .as_ref()
+    .map(|source| &source.source_checkpoint);
+  let last_stored_blob_key = gap
+    .last_stored_source
+    .as_ref()
+    .map(|source| source.source.blob_key.as_str());
+  warn!(
+    "consumer delivery gap: partition={}, expected_offset={}, received_offset={}, \
+     missing_sequences={}, previous_delivered_offset={previous_offset:?}, \
+     previous_source_checkpoint={previous_checkpoint:?}, previous_blob_key={previous_blob_key:?}, \
+     last_stored_offset={last_stored_offset:?}, \
+     last_stored_source_checkpoint={last_stored_checkpoint:?}, \
+     last_stored_blob_key={last_stored_blob_key:?}, current_batch_range={}..={}, \
+     current_source_checkpoint={:?}, current_blob_key={}, current_metadata_published_at={}, \
+     admission_scan_json={admission_scan_json}, partition_state_json={partition_state_json:?}",
+    gap.virtual_partition_id,
+    gap.expected_offset,
+    gap.received_offset,
+    gap.missing_sequences,
+    gap.current_batch_start_offset,
+    gap.current_batch_end_offset,
+    gap.current_source_checkpoint,
+    gap.current_source.blob_key.as_str(),
+    gap.current_source.metadata_published_at,
+  );
 }

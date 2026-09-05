@@ -62,6 +62,12 @@ pub struct DynamoMetadataStore {
 }
 
 impl DynamoMetadataStore {
+  /// Build a metadata store used only for read-only inspection.
+  #[must_use]
+  pub fn new_read_only(client: Client, table_name: impl Into<String>) -> Self {
+    Self::new(client, table_name, "", HashMap::new(), Duration::ZERO, None)
+  }
+
   #[must_use]
   pub fn new(
     client: Client,

@@ -102,6 +102,7 @@ use framework::{
   poll_consumer_once,
   produce_message,
   produce_message_at_manual_time,
+  produce_message_at_manual_time_with_flush_advance,
   produce_message_for_topic,
   producer_config,
   producer_config_with_writer_id,
@@ -2767,6 +2768,16 @@ async fn live_group_recovery_waits_for_historical_metadata_visibility_delay() ->
   )
   .await?;
   consumer_time.advance(TimeDuration::seconds(WINDOW_SIZE_SECONDS + 1));
+  produce_message_at_manual_time(
+    &cluster,
+    &producer,
+    consumer_time.as_ref(),
+    b"deferred-history-key".to_vec(),
+    deferred_id,
+  )
+  .await?;
+  // The broker selects the metadata window when it flushes, which may be after the producer
+  // record was queued. Bind the wrapper to that actual window before the replacement scans it.
   deferred_window_start.store(
     Window::for_timestamp(
       consumer_time.now(),
@@ -2776,14 +2787,6 @@ async fn live_group_recovery_waits_for_historical_metadata_visibility_delay() ->
     .unix_timestamp(),
     Ordering::Release,
   );
-  produce_message_at_manual_time(
-    &cluster,
-    &producer,
-    consumer_time.as_ref(),
-    b"deferred-history-key".to_vec(),
-    deferred_id,
-  )
-  .await?;
   consumer_time.advance(TimeDuration::seconds(WINDOW_SIZE_SECONDS + 1));
   produce_message_at_manual_time(
     &cluster,
@@ -4788,6 +4791,568 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
   assert!(duplicate_scan.is_empty());
 
   // Step 4: Clean up all resources.
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
+// High-level: verifies retained Fast coverage recovers an older source after a prefetch stall
+// exceeds the default metadata-publication lag during a partial rebalance.
+#[tokio::test]
+async fn broker_backed_fast_coverage_survives_prefetch_stall_and_partial_rebalance() -> Result<()> {
+  let clock_origin = OffsetDateTime::now_utc();
+  let broker_time = Arc::new(ManualTimeProvider::new(clock_origin));
+  let reader_time = Arc::new(ManualTimeProvider::new(clock_origin));
+  let coordination_time = Arc::new(ManualTimeProvider::new(clock_origin));
+  let resources = IntegrationResources::create().await?;
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .broker_flush_max_delay(Duration::from_secs(1))
+    .broker_time_provider(broker_time.clone())
+    .consumer_time_provider(reader_time.clone())
+    .consumer_coordination_time_provider(coordination_time.clone())
+    .start()
+    .await?;
+  let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
+  let producer = Arc::new(
+    new_producer(
+      producer_config(),
+      vec![producer_topic()],
+      Arc::clone(&discovery),
+      metrics_scope("blob_stream_producer_it"),
+    )
+    .await?,
+  );
+
+  let mut owner_runtime = consumer_runtime_config("fast-coverage-owner");
+  let mut replacement_runtime = consumer_runtime_config("fast-coverage-replacement");
+  for runtime in [&mut owner_runtime, &mut replacement_runtime] {
+    let read = runtime
+      .read
+      .as_mut()
+      .ok_or_else(|| anyhow!("Fast coverage test read config missing"))?;
+    read.strongly_consistent_metadata_reads = Some(true);
+    read.prefetch_max_bytes = Some(1);
+  }
+
+  let filler_key = b"fast-coverage-filler-key".to_vec();
+  let filler_partition = virtual_partition_for_logical(
+    logical_partition_for_key(&filler_key, PARTITION_COUNT),
+    PARTITION_COUNT,
+    0,
+  );
+  let hooks = cluster.lifecycle_hooks();
+  let mut initial_fast_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerInitialFastPathActive,
+      "fast-coverage-owner",
+      Some(filler_partition),
+      None,
+    )
+    .await?;
+  let mut capacity_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerPrefetchCapacityExhausted,
+      "fast-coverage-owner",
+      Some(filler_partition),
+      None,
+    )
+    .await?;
+  let mut owner = cluster.create_consumer(&owner_runtime).await?;
+  owner.start()?;
+  timeout(
+    Duration::from_secs(5),
+    initial_fast_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("owner did not activate the initial Fast path"))??;
+  initial_fast_gate.release()?;
+
+  produce_message_at_manual_time_with_flush_advance(
+    &cluster,
+    &producer,
+    &broker_time,
+    filler_key,
+    "fast-coverage-filler",
+    TimeDuration::seconds(1),
+  )
+  .await?;
+  timeout(Duration::from_secs(5), reader_time.wait_until_sleeping(1))
+    .await
+    .map_err(|_| anyhow!("owner did not register a logical sleep after filler publication"))?;
+  reader_time.advance(TimeDuration::seconds(1));
+  framework::advance_manual_time_until_lifecycle_gate(
+    &reader_time,
+    &mut capacity_gate,
+    "owner did not reach prefetch capacity before the rebalance",
+  )
+  .await?;
+
+  let mut plan_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerRebalancePlanReady,
+      "fast-coverage-owner",
+      None,
+      None,
+    )
+    .await?;
+  let mut revocation_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerRevocationEmitted,
+      "fast-coverage-owner",
+      None,
+      None,
+    )
+    .await?;
+  let mut rebalance_applied_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerRebalanceApplied,
+      "fast-coverage-owner",
+      None,
+      None,
+    )
+    .await?;
+  let mut replacement = cluster.create_consumer(&replacement_runtime).await?;
+  replacement.start()?;
+  framework::advance_manual_time_until_lifecycle_gate(
+    &coordination_time,
+    &mut plan_gate,
+    "owner did not compute the partial rebalance plan",
+  )
+  .await?;
+  let plan = hooks
+    .rebalance_plan("fast-coverage-owner")
+    .await
+    .ok_or_else(|| anyhow!("rebalance plan hook did not record the owner plan"))?;
+  let survivor_partition = plan
+    .current_assignment
+    .iter()
+    .copied()
+    .find(|partition| plan.next_assignment.contains(partition))
+    .ok_or_else(|| anyhow!("partial rebalance did not leave an owner partition assigned"))?;
+  let revoked_partition = plan
+    .current_assignment
+    .iter()
+    .copied()
+    .find(|partition| !plan.next_assignment.contains(partition))
+    .ok_or_else(|| anyhow!("partial rebalance did not move an owner partition"))?;
+
+  let survivor_key = (0 .. 1_024)
+    .find_map(|key_index| {
+      let key = format!("fast-coverage-survivor-key-{key_index}").into_bytes();
+      let partition = virtual_partition_for_logical(
+        logical_partition_for_key(&key, PARTITION_COUNT),
+        PARTITION_COUNT,
+        0,
+      );
+      (partition == survivor_partition).then_some(key)
+    })
+    .ok_or_else(|| anyhow!("could not construct a key for the surviving partition"))?;
+  let missing_id = "fast-coverage-missing";
+  let missing_ack = produce_message_at_manual_time_with_flush_advance(
+    &cluster,
+    &producer,
+    &broker_time,
+    survivor_key.clone(),
+    missing_id,
+    TimeDuration::seconds(1),
+  )
+  .await?;
+  assert_eq!(missing_ack.virtual_partition_id, survivor_partition);
+  let missing_source_time = broker_time.now().saturating_sub(TimeDuration::seconds(1));
+
+  plan_gate.release()?;
+  timeout(Duration::from_secs(5), revocation_gate.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("owner did not emit the planned partial revocation"))??;
+  let revoked = timeout(Duration::from_secs(5), owner.next())
+    .await
+    .map_err(|_| anyhow!("owner did not surface its partial revocation"))??;
+  let NextResult::Revoked(revoked) = revoked else {
+    return Err(anyhow!(
+      "owner delivered a record before its partial revocation"
+    ));
+  };
+  assert!(revoked.partitions().contains(&revoked_partition));
+  assert!(!revoked.partitions().contains(&survivor_partition));
+  revocation_gate.release()?;
+  assert!(
+    timeout(Duration::from_millis(50), owner.next())
+      .await
+      .is_err(),
+    "the global delivery fence must hold until revocation completion"
+  );
+
+  let later_id = "fast-coverage-later";
+  // The prior one-second flush advance makes this source newer than the missing source. At t=17,
+  // Fast excludes the former at t=1 and retains this one at t=2.
+  produce_message_at_manual_time_with_flush_advance(
+    &cluster,
+    &producer,
+    &broker_time,
+    survivor_key,
+    later_id,
+    TimeDuration::seconds(1),
+  )
+  .await?;
+  reader_time.advance(TimeDuration::seconds(16));
+  assert!(
+    reader_time.now() - missing_source_time > DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    "the stalled source must be older than the default metadata-publication lag"
+  );
+
+  revoked.complete().await;
+  framework::advance_manual_time_until_lifecycle_gate(
+    &coordination_time,
+    &mut rebalance_applied_gate,
+    "owner did not apply its post-revocation assignment",
+  )
+  .await?;
+  rebalance_applied_gate.release()?;
+  capacity_gate.release()?;
+
+  let mut received_ids = HashMap::new();
+  timeout(Duration::from_secs(10), async {
+    while received_ids.len() < 2 {
+      let next_result = timeout(Duration::from_millis(250), owner.next()).await;
+      let next = if let Ok(next) = next_result {
+        next?
+      } else {
+        reader_time.advance(TimeDuration::seconds(1));
+        tokio::task::yield_now().await;
+        continue;
+      };
+      let NextResult::Record(record) = next else {
+        return Err(anyhow!("owner received an unexpected second revocation"));
+      };
+      let id = String::from_utf8(record.record.payload.to_vec())?;
+      if id == missing_id || id == later_id {
+        *received_ids.entry(id).or_insert(0_usize) += 1;
+      }
+      owner.store_offset(record.virtual_partition_id, record.offset)?;
+      owner.commit().await?;
+    }
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| {
+    anyhow!("owner did not drain retained Fast coverage after the rebalance: {received_ids:?}")
+  })??;
+  assert_eq!(
+    received_ids,
+    HashMap::from([
+      (missing_id.to_string(), 1_usize),
+      (later_id.to_string(), 1_usize),
+    ])
+  );
+
+  Box::new(replacement).shutdown().await?;
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
+// High-level: verifies a stalled Fast reader recovers an unscanned pre-rollover gap with the
+// snowflake floor retained from its last delivered segment, then delivers post-rollover data.
+#[tokio::test]
+async fn broker_backed_fast_stall_enters_recovery_without_overscanning_prior_window() -> Result<()>
+{
+  let window_anchor = OffsetDateTime::from_unix_timestamp(1_700_000_001)?;
+  let previous_window_start =
+    Window::for_timestamp(window_anchor, TimeDuration::seconds(WINDOW_SIZE_SECONDS))
+      .start
+      .unix_timestamp();
+  let initial_segment_time = OffsetDateTime::from_unix_timestamp(
+    previous_window_start.saturating_add(WINDOW_SIZE_SECONDS - 120),
+  )?;
+  let broker_time = Arc::new(ManualTimeProvider::new(initial_segment_time));
+  let reader_time = Arc::new(ManualTimeProvider::new(initial_segment_time));
+  let coordination_time = Arc::new(ManualTimeProvider::new(initial_segment_time));
+  let resources = IntegrationResources::create().await?;
+  let metadata_store = Arc::new(CountingWindowMetadataStore::new(
+    resources.metadata_store(),
+    previous_window_start,
+  ));
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .partition_count(1)
+    .metadata_store(metadata_store.clone())
+    .broker_flush_max_delay(Duration::from_secs(1))
+    .broker_time_provider(broker_time.clone())
+    .consumer_time_provider(reader_time.clone())
+    .consumer_coordination_time_provider(coordination_time.clone())
+    .start()
+    .await?;
+  let discovery: Arc<dyn BrokerDiscovery> = Arc::new(cluster.producer_discovery());
+  let producer = Arc::new(
+    new_producer(
+      producer_config(),
+      vec![producer_topic_named_with_partition_count(TOPIC, 1, 1)],
+      discovery,
+      metrics_scope("blob_stream_producer_it"),
+    )
+    .await?,
+  );
+
+  let key = b"fast-recovery-key".to_vec();
+  let initial_id = "fast-recovery-initial";
+  let initial_ack = produce_message_at_manual_time_with_flush_advance(
+    &cluster,
+    &producer,
+    &broker_time,
+    key.clone(),
+    initial_id,
+    TimeDuration::seconds(1),
+  )
+  .await?;
+  assert_eq!(initial_ack.virtual_partition_id, 0);
+
+  let mut runtime = consumer_runtime_config("fast-recovery-owner");
+  let read = runtime
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow!("Fast recovery test read config missing"))?;
+  read.strongly_consistent_metadata_reads = Some(true);
+  read.prefetch_max_bytes = Some(1);
+
+  let hooks = cluster.lifecycle_hooks();
+  let mut initial_fast_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerInitialFastPathActive,
+      "fast-recovery-owner",
+      Some(0),
+      None,
+    )
+    .await?;
+  let mut owner = cluster.create_consumer(&runtime).await?;
+  owner.start()?;
+  timeout(
+    Duration::from_secs(5),
+    initial_fast_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("owner did not activate the initial Fast path"))??;
+  initial_fast_gate.release()?;
+
+  let initial = timeout(Duration::from_secs(5), owner.next())
+    .await
+    .map_err(|_| anyhow!("owner did not deliver the initial segment"))??;
+  let NextResult::Record(initial) = initial else {
+    return Err(anyhow!(
+      "owner was revoked before delivering the initial segment"
+    ));
+  };
+  assert_eq!(
+    String::from_utf8(initial.record.payload.to_vec())?,
+    initial_id
+  );
+  let last_delivered_checkpoint = initial.source_checkpoint;
+  assert_eq!(
+    last_delivered_checkpoint.window_start_unix_seconds,
+    previous_window_start
+  );
+  let fast_snapshot = owner
+    .diagnostics()
+    .ok_or_else(|| anyhow!("concrete consumer did not provide diagnostics"))?
+    .state_snapshot();
+  let retained_fast_floor = fast_snapshot
+    .local
+    .partitions
+    .iter()
+    .find(|partition| partition.virtual_partition_id == 0)
+    .and_then(|partition| partition.reader.as_ref())
+    .and_then(|reader| reader.fast_coverage_floor)
+    .ok_or_else(|| anyhow!("Fast diagnostics must retain coverage after initial delivery"))?;
+
+  let mut blocker_capacity_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerPrefetchCapacityExhausted,
+      "fast-recovery-owner",
+      Some(0),
+      None,
+    )
+    .await?;
+  let blocker_id = "fast-recovery-blocker";
+  let blocker_ack = produce_message_at_manual_time_with_flush_advance(
+    &cluster,
+    &producer,
+    &broker_time,
+    key.clone(),
+    blocker_id,
+    TimeDuration::seconds(1),
+  )
+  .await?;
+  assert_eq!(blocker_ack.virtual_partition_id, 0);
+  let (blocker, ()) = tokio::try_join!(
+    async {
+      timeout(Duration::from_secs(5), owner.next())
+        .await
+        .map_err(|_| anyhow!("owner did not deliver the prefetch blocker"))?
+    },
+    async {
+      timeout(
+        Duration::from_secs(5),
+        blocker_capacity_gate.wait_until_reached(),
+      )
+      .await
+      .map_err(|_| anyhow!("blocker did not exhaust prefetch capacity"))?
+    },
+  )?;
+  let NextResult::Record(blocker) = blocker else {
+    return Err(anyhow!(
+      "owner was revoked before delivering the prefetch blocker"
+    ));
+  };
+  assert_eq!(
+    String::from_utf8(blocker.record.payload.to_vec())?,
+    blocker_id
+  );
+
+  let pre_rollover_gap_time = OffsetDateTime::from_unix_timestamp(
+    previous_window_start.saturating_add(WINDOW_SIZE_SECONDS - 1),
+  )?;
+  broker_time.advance(pre_rollover_gap_time - broker_time.now());
+  let gap_id = "fast-recovery-pre-rollover-gap";
+  let gap_ack = produce_message_at_manual_time_with_flush_advance(
+    &cluster,
+    &producer,
+    &broker_time,
+    key.clone(),
+    gap_id,
+    TimeDuration::seconds(1),
+  )
+  .await?;
+  assert_eq!(gap_ack.virtual_partition_id, 0);
+
+  let post_rollover_time = OffsetDateTime::from_unix_timestamp(
+    previous_window_start.saturating_add(WINDOW_SIZE_SECONDS + 1),
+  )?;
+  broker_time.advance(post_rollover_time - broker_time.now());
+  let post_rollover_id = "fast-recovery-post-rollover";
+  let post_rollover_ack = produce_message_at_manual_time_with_flush_advance(
+    &cluster,
+    &producer,
+    &broker_time,
+    key.clone(),
+    post_rollover_id,
+    TimeDuration::seconds(1),
+  )
+  .await?;
+  assert_eq!(post_rollover_ack.virtual_partition_id, 0);
+
+  let previous_window_scan_count = metadata_store.scan_count();
+  let mut recovery_capacity_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerPrefetchCapacityExhausted,
+      "fast-recovery-owner",
+      Some(0),
+      None,
+    )
+    .await?;
+  let recovery_time = OffsetDateTime::from_unix_timestamp(
+    previous_window_start
+      .saturating_add(WINDOW_SIZE_SECONDS)
+      .saturating_add(DEFAULT_MAX_METADATA_PUBLICATION_LAG.whole_seconds())
+      .saturating_add(1),
+  )?;
+  let stall_duration = recovery_time - reader_time.now();
+  assert!(
+    stall_duration > DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    "the prefetch stall must exceed the default metadata-publication lag"
+  );
+  reader_time.advance(stall_duration);
+
+  blocker_capacity_gate.release()?;
+
+  timeout(
+    Duration::from_secs(5),
+    recovery_capacity_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("Fast coverage recovery did not reach prefetch capacity"))??;
+  let recovery_snapshot = owner
+    .diagnostics()
+    .ok_or_else(|| anyhow!("concrete consumer did not provide diagnostics"))?
+    .state_snapshot();
+  let recovery_partition = recovery_snapshot
+    .local
+    .partitions
+    .iter()
+    .find(|partition| partition.virtual_partition_id == 0)
+    .ok_or_else(|| anyhow!("missing recovery diagnostics partition"))?;
+  assert_eq!(
+    recovery_partition
+      .reader
+      .as_ref()
+      .map(|reader| &reader.mode),
+    Some(&ConsumerPartitionReadMode::Recovering),
+    "expired Fast coverage must enter recovery: {recovery_snapshot:?}"
+  );
+  assert_eq!(
+    metadata_store.scan_count(),
+    previous_window_scan_count + 1,
+    "recovery must scan its prior metadata window once before the next capacity cycle"
+  );
+  let recovery_floor = metadata_store
+    .scan_floors()
+    .await
+    .get(previous_window_scan_count)
+    .copied()
+    .flatten()
+    .ok_or_else(|| anyhow!("recovery scan must use a snowflake floor"))?;
+  assert!(
+    recovery_floor == SnowflakeId::minimum_for_timestamp(retained_fast_floor),
+    "recovery floor must match the retained Fast coverage from the last delivered segment: \
+     floor={recovery_floor:?}, retained_fast_floor={retained_fast_floor:?}, \
+     last_delivered_checkpoint={last_delivered_checkpoint:?}"
+  );
+  assert!(
+    recovery_floor <= SnowflakeId::minimum_for_timestamp(pre_rollover_gap_time),
+    "recovery floor must include the pre-rollover gap: floor={recovery_floor:?}, \
+     pre_rollover_gap_time={pre_rollover_gap_time:?}"
+  );
+  assert!(
+    recovery_floor
+      > SnowflakeId::minimum_for_timestamp(OffsetDateTime::from_unix_timestamp(
+        previous_window_start
+      )?,),
+    "recovery floor must avoid scanning the full previous window: floor={recovery_floor:?}"
+  );
+  recovery_capacity_gate.release()?;
+
+  let mut received_ids = HashMap::from([
+    (initial_id.to_string(), 1_usize),
+    (blocker_id.to_string(), 1_usize),
+  ]);
+  timeout(Duration::from_secs(10), async {
+    while received_ids.len() < 4 {
+      let next = owner.next().await?;
+      let NextResult::Record(record) = next else {
+        return Err(anyhow!(
+          "owner received an unexpected revocation during recovery"
+        ));
+      };
+      let id = String::from_utf8(record.record.payload.to_vec())?;
+      *received_ids.entry(id).or_insert(0) += 1;
+    }
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| anyhow!("owner did not drain all recovered prior-window segments"))??;
+  assert_eq!(
+    received_ids,
+    HashMap::from([
+      (initial_id.to_string(), 1_usize),
+      (blocker_id.to_string(), 1_usize),
+      (gap_id.to_string(), 1_usize),
+      (post_rollover_id.to_string(), 1_usize),
+    ])
+  );
+  assert_eq!(
+    metadata_store.scan_count(),
+    previous_window_scan_count + 1,
+    "recovery metadata cache must prevent an overscan of the prior window"
+  );
+
+  Box::new(owner).shutdown().await?;
   cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())

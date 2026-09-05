@@ -1,4 +1,9 @@
 use crate::config::ConsumerGroupConfig;
+use crate::consumer::{
+  ConsumerReaderFastFrontierState,
+  ConsumerReaderFastScanBoundState,
+  ConsumerReaderPartitionScanState,
+};
 use crate::iterator::{ConsumerDeliveryState, ConsumerSharedState};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentPlan,
@@ -7,6 +12,8 @@ use blob_stream_metadata_store::{
 };
 use blob_stream_types::{
   CommittedSourceCheckpoint,
+  SeqRange,
+  SnowflakeId,
   VirtualPartitionId,
   Window,
   now_unix_millis,
@@ -21,6 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tracing::Span;
+
+const MAX_SCAN_DETAIL_ENTRIES: usize = 64;
 
 //
 // ConsumerStateResponse
@@ -114,6 +123,8 @@ pub struct ConsumerReaderStateSnapshot {
   pub recovery_next_window_start: Option<OffsetDateTime>,
   #[serde(with = "time::serde::rfc3339::option")]
   pub recovery_cutover_window_start: Option<OffsetDateTime>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub fast_coverage_floor: Option<OffsetDateTime>,
 }
 
 //
@@ -121,6 +132,7 @@ pub struct ConsumerReaderStateSnapshot {
 //
 
 /// Most recent successful scan outcome for one local reader partition.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConsumerReaderScanSnapshot {
   #[serde(with = "time::serde::rfc3339")]
@@ -136,6 +148,8 @@ pub struct ConsumerReaderScanSnapshot {
   pub cursor_after: Option<u64>,
   pub metadata_segments_seen: usize,
   pub metadata_segments_without_partition_batches: usize,
+  pub metadata_sources: Vec<ConsumerReaderMetadataSourceSnapshot>,
+  pub metadata_sources_truncated: bool,
   pub metadata_batches_seen: usize,
   pub metadata_batches_skipped_by_cursor: usize,
   pub metadata_segments_skipped_by_frontier: usize,
@@ -148,6 +162,103 @@ pub struct ConsumerReaderScanSnapshot {
   pub metadata_batches_deferred_by_capacity: usize,
   pub batches_accepted: usize,
   pub records_accepted: usize,
+}
+
+//
+// ConsumerReaderMetadataSourceSnapshot
+//
+
+/// A bounded record of a metadata row returned for one partition during the latest reader scan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ConsumerReaderMetadataSourceSnapshot {
+  #[serde(with = "time::serde::rfc3339")]
+  pub window_start: OffsetDateTime,
+  pub snowflake_id: u64,
+  pub blob_key: String,
+  #[serde(with = "time::serde::rfc3339")]
+  pub metadata_published_at: OffsetDateTime,
+  pub batch_ranges: Vec<SeqRange>,
+}
+
+/// Convert a reader scan into the bounded representation emitted with consumer diagnostics.
+pub fn reader_partition_scan_snapshot(
+  state: &ConsumerReaderPartitionScanState,
+) -> ConsumerReaderScanSnapshot {
+  ConsumerReaderScanSnapshot {
+    completed_at: offset_datetime_from_unix_seconds(state.completed_at_unix_seconds),
+    scanned_window_starts: state
+      .scanned_window_starts
+      .iter()
+      .take(MAX_SCAN_DETAIL_ENTRIES)
+      .map(|window_start| offset_datetime_from_unix_seconds(*window_start))
+      .collect(),
+    scanned_window_starts_truncated: state.scanned_window_starts.len() > MAX_SCAN_DETAIL_ENTRIES,
+    fast_scan_bounds: state
+      .fast_scan_bounds
+      .iter()
+      .take(MAX_SCAN_DETAIL_ENTRIES)
+      .map(reader_fast_scan_bound_snapshot)
+      .collect(),
+    fast_scan_bounds_truncated: state.fast_scan_bounds.len() > MAX_SCAN_DETAIL_ENTRIES,
+    fast_frontiers: state
+      .fast_frontiers
+      .iter()
+      .take(MAX_SCAN_DETAIL_ENTRIES)
+      .map(reader_fast_frontier_snapshot)
+      .collect(),
+    fast_frontiers_truncated: state.fast_frontiers.len() > MAX_SCAN_DETAIL_ENTRIES,
+    cursor_before: state.cursor_before,
+    cursor_after: state.cursor_after,
+    metadata_segments_seen: state.metadata_segments_seen,
+    metadata_segments_without_partition_batches: state.metadata_segments_without_partition_batches,
+    metadata_sources: state
+      .metadata_sources
+      .iter()
+      .map(|source| ConsumerReaderMetadataSourceSnapshot {
+        window_start: offset_datetime_from_unix_seconds(source.window_start_unix_seconds),
+        snowflake_id: source.snowflake_id,
+        blob_key: source.blob_key.clone(),
+        metadata_published_at: source.metadata_published_at,
+        batch_ranges: source.batch_ranges.clone(),
+      })
+      .collect(),
+    metadata_sources_truncated: state.metadata_sources_truncated,
+    metadata_batches_seen: state.metadata_batches_seen,
+    metadata_batches_skipped_by_cursor: state.metadata_batches_skipped_by_cursor,
+    metadata_segments_skipped_by_frontier: state.metadata_segments_skipped_by_frontier,
+    metadata_segments_deferred_by_visibility: state.metadata_segments_deferred_by_visibility,
+    metadata_segments_blocked_by_visibility: state.metadata_segments_blocked_by_visibility,
+    recovery_segments_handed_to_fast_by_visibility: state
+      .recovery_segments_handed_to_fast_by_visibility,
+    recovery_segments_blocked_by_visibility: state.recovery_segments_blocked_by_visibility,
+    recovery_metadata_cache_hits: state.recovery_metadata_cache_hits,
+    recovery_metadata_cache_misses: state.recovery_metadata_cache_misses,
+    metadata_batches_deferred_by_capacity: state.metadata_batches_deferred_by_capacity,
+    batches_accepted: state.batches_accepted,
+    records_accepted: state.records_accepted,
+  }
+}
+
+fn reader_fast_scan_bound_snapshot(
+  state: &ConsumerReaderFastScanBoundState,
+) -> ConsumerReaderFastScanBoundSnapshot {
+  ConsumerReaderFastScanBoundSnapshot {
+    window_start: offset_datetime_from_unix_seconds(state.window_start_unix_seconds),
+    floor_timestamp: state.floor_timestamp,
+    time_floor_snowflake_id: state.time_floor.as_u64(),
+    observed_frontier_snowflake_id: state.observed_frontier.map(SnowflakeId::as_u64),
+    partition_lower_bound_snowflake_id: state.partition_lower_bound.as_u64(),
+    query_lower_bound_snowflake_id: state.query_lower_bound.map(SnowflakeId::as_u64),
+  }
+}
+
+fn reader_fast_frontier_snapshot(
+  state: &ConsumerReaderFastFrontierState,
+) -> ConsumerReaderFastFrontierSnapshot {
+  ConsumerReaderFastFrontierSnapshot {
+    window_start: offset_datetime_from_unix_seconds(state.window_start_unix_seconds),
+    snowflake_id: state.snowflake_id.as_u64(),
+  }
 }
 
 //
@@ -309,6 +420,8 @@ pub struct ConsumerReaderPartitionSnapshot {
   pub recovery_next_window_start: Option<OffsetDateTime>,
   #[serde(with = "time::serde::rfc3339::option")]
   pub recovery_cutover_window_start: Option<OffsetDateTime>,
+  #[serde(with = "time::serde::rfc3339::option")]
+  pub fast_coverage_floor: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Default)]
@@ -441,12 +554,14 @@ impl ConsumerDiagnostics {
         mode,
         recovery_next_window_start,
         recovery_cutover_window_start,
+        fast_coverage_floor,
       } = reader_partition;
       local_partition_snapshot(&mut local_partitions, virtual_partition_id).reader =
         Some(ConsumerReaderStateSnapshot {
           mode,
           recovery_next_window_start,
           recovery_cutover_window_start,
+          fast_coverage_floor,
         });
     }
     for (partition_id, scan) in runtime_state.reader_partition_scans {

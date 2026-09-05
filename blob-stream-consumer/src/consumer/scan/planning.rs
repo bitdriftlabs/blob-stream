@@ -15,11 +15,13 @@ use super::{
   VirtualPartitionId,
   VirtualPartitionState,
   Window,
+  info,
   offset_datetime_from_unix_seconds,
   trace,
 };
 use crate::config::consumer_candidate_window_count_with_availability_horizon;
 use crate::consumer::reader::RecoveryMetadataCacheKey;
+use crate::consumer::state::RecoveryState;
 
 impl ConsumerReaderImpl {
   /// Return the cache identity for an immutable, recovery-only metadata request.
@@ -143,16 +145,43 @@ impl ConsumerReaderImpl {
     &self,
     assigned_partition_ids: &[VirtualPartitionId],
     window_start_unix_seconds: i64,
-    safe_floor: SnowflakeId,
+    now: time::OffsetDateTime,
+    runtime_settings: ConsumerReadRuntimeSettings,
   ) -> BTreeMap<VirtualPartitionId, SnowflakeId> {
     assigned_partition_ids
       .iter()
       .filter_map(|&partition_id| {
+        let (_, time_floor) = self.fast_scan_partition_time_floor(
+          partition_id,
+          window_start_unix_seconds,
+          now,
+          runtime_settings,
+        )?;
         self
-          .fast_scan_partition_lower_bound(partition_id, window_start_unix_seconds, safe_floor)
+          .fast_scan_partition_lower_bound(partition_id, window_start_unix_seconds, time_floor)
           .map(|(_, partition_lower_bound)| (partition_id, partition_lower_bound))
       })
       .collect()
+  }
+
+  /// Return the timestamp and Snowflake floor whose Fast metadata coverage is still required.
+  fn fast_scan_partition_time_floor(
+    &self,
+    partition_id: VirtualPartitionId,
+    window_start_unix_seconds: i64,
+    now: time::OffsetDateTime,
+    runtime_settings: ConsumerReadRuntimeSettings,
+  ) -> Option<(time::OffsetDateTime, SnowflakeId)> {
+    let state = self.virtual_partition_states.get(&partition_id)?;
+    if !matches!(state, VirtualPartitionState::Fast { .. }) {
+      return None;
+    }
+    let safe_timestamp = self.fast_scan_safe_timestamp(now, runtime_settings);
+    let coverage_floor = state.fast_coverage_floor().unwrap_or(safe_timestamp);
+    let window_start = time::OffsetDateTime::from_unix_timestamp(window_start_unix_seconds)
+      .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let floor_timestamp = window_start.max(safe_timestamp.min(coverage_floor));
+    Some((floor_timestamp, Self::snowflake_floor(floor_timestamp)))
   }
 
   /// Return the observed and effective lower bounds for one Fast partition/window pair.
@@ -186,17 +215,19 @@ impl ConsumerReaderImpl {
     runtime_settings: ConsumerReadRuntimeSettings,
     scan_states: &mut HashMap<VirtualPartitionId, ConsumerReaderPartitionScanState>,
   ) {
-    let safe_timestamp = self.fast_scan_safe_timestamp(now, runtime_settings);
     for request in scan_requests {
       if !request.eligibility.fast {
         continue;
       }
-      let window_start =
-        time::OffsetDateTime::from_unix_timestamp(request.window.window_start_unix_seconds)
-          .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-      let floor_timestamp = window_start.max(safe_timestamp);
-      let time_floor = Self::snowflake_floor(floor_timestamp);
       for &partition_id in assigned_partition_ids {
+        let Some((floor_timestamp, time_floor)) = self.fast_scan_partition_time_floor(
+          partition_id,
+          request.window.window_start_unix_seconds,
+          now,
+          runtime_settings,
+        ) else {
+          continue;
+        };
         let Some((observed_frontier, partition_lower_bound)) = self
           .fast_scan_partition_lower_bound(
             partition_id,
@@ -301,6 +332,62 @@ impl ConsumerReaderImpl {
     })
   }
 
+  /// Convert Fast coverage debt that escaped the live horizon into bounded chronological recovery.
+  fn start_fast_coverage_recoveries(
+    &mut self,
+    now: time::OffsetDateTime,
+    runtime_settings: ConsumerReadRuntimeSettings,
+  ) -> Result<()> {
+    let Some((first_fast_window, _)) = self
+      .eligible_fast_scan_windows(now, runtime_settings)?
+      .into_iter()
+      .next()
+    else {
+      return Ok(());
+    };
+    let cutover_window_start = Window::for_timestamp(now, self.metadata_window_size)
+      .start
+      .unix_timestamp();
+    let recoveries = self
+      .virtual_partition_states
+      .iter()
+      .filter_map(|(partition_id, state)| {
+        let coverage_floor = state.fast_coverage_floor()?;
+        let recovery_start_window =
+          Window::for_timestamp(coverage_floor, self.metadata_window_size)
+            .start
+            .unix_timestamp();
+        (recovery_start_window < first_fast_window.window_start_unix_seconds).then_some((
+          *partition_id,
+          coverage_floor,
+          recovery_start_window,
+        ))
+      })
+      .collect::<Vec<_>>();
+    for (partition_id, coverage_floor, recovery_start_window) in recoveries {
+      let first_window_min_snowflake = Some(Self::snowflake_floor(coverage_floor));
+      let Some(state) = self.virtual_partition_states.get_mut(&partition_id) else {
+        continue;
+      };
+      state.start_recovery(RecoveryState {
+        next_window_start_unix_seconds: recovery_start_window,
+        cutover_window_start_unix_seconds: cutover_window_start,
+        first_window_start_unix_seconds: Some(recovery_start_window),
+        first_window_min_snowflake,
+      });
+      info!(
+        "consumer fast coverage catch-up started: topic={}, partition={}, coverage_floor={}, \
+         recovery_start_window={}, cutover_window={}",
+        self.config.topic,
+        partition_id,
+        coverage_floor,
+        offset_datetime_from_unix_seconds(recovery_start_window),
+        offset_datetime_from_unix_seconds(cutover_window_start),
+      );
+    }
+    Ok(())
+  }
+
   /// Build a scan pass that prioritizes bounded recovery before using the fast path.
   pub(in crate::consumer) fn scan_requests(
     &mut self,
@@ -310,6 +397,8 @@ impl ConsumerReaderImpl {
   ) -> Result<(Vec<ScanRequest>, bool)> {
     let mut scan_requests = BTreeMap::new();
     let mut recovery_scan = false;
+
+    self.start_fast_coverage_recoveries(now, runtime_settings)?;
 
     // Rotate recovery slices between partitions so a dense historical partition cannot consume
     // every prefetch cycle and starve a later partition's independent recovery.
@@ -433,11 +522,12 @@ impl ConsumerReaderImpl {
       .values()
       .any(|state| state.is_assigned() && matches!(state, VirtualPartitionState::Fast { .. }))
     {
-      for (window, safe_floor) in self.eligible_fast_scan_windows(now, runtime_settings)? {
+      for (window, _) in self.eligible_fast_scan_windows(now, runtime_settings)? {
         let fast_partition_bounds = self.fast_scan_partition_bounds(
           assigned_partition_ids,
           window.window_start_unix_seconds,
-          safe_floor,
+          now,
+          runtime_settings,
         );
         Self::insert_scan_request(
           &mut scan_requests,

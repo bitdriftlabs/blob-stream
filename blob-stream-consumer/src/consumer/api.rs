@@ -1,8 +1,24 @@
+use crate::diagnostics::ConsumerReaderScanSnapshot;
 use anyhow::Result;
 use async_trait::async_trait;
+use blob_stream_blob_store::BlobKey;
 use blob_stream_types::{CommittedSourceCheckpoint, Record, SeqRange, VirtualPartitionId};
 use std::collections::HashMap;
+use std::sync::Arc;
 use time::OffsetDateTime;
+
+//
+// ConsumerBatchSource
+//
+
+/// Immutable metadata and blob provenance for a decoded batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerBatchSource {
+  /// Blob object containing the batch payload.
+  pub blob_key: BlobKey,
+  /// Instant immediately before the metadata index row was written.
+  pub metadata_published_at: OffsetDateTime,
+}
 
 //
 // ConsumerBatch
@@ -17,6 +33,10 @@ pub struct ConsumerBatch {
   pub seq_range: SeqRange,
   /// Metadata source used to recover this batch after a consumer restart.
   pub source_checkpoint: CommittedSourceCheckpoint,
+  /// Immutable source details for delivery-gap investigation.
+  pub source: ConsumerBatchSource,
+  /// Finalized scan evidence that admitted this batch, shared by every batch in the scan pass.
+  pub(crate) admission_scan: Option<Arc<ConsumerReaderScanSnapshot>>,
   /// Decoded records for the batch.
   pub records: Vec<Record>,
 }

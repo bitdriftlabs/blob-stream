@@ -137,6 +137,14 @@ pub trait ConsumerLifecycleHooks: Send + Sync {
   ) {
   }
 
+  /// Runs when a full prefetch queue prevents the reader from beginning another scan.
+  async fn prefetch_capacity_exhausted(
+    &self,
+    _member_id: &str,
+    _buffered_partitions: &[VirtualPartitionId],
+  ) {
+  }
+
   /// Runs after the prefetch worker observes a partition leave recovery for the Fast path.
   async fn recovery_fast_path_active(
     &self,
@@ -160,6 +168,16 @@ pub trait ConsumerLifecycleHooks: Send + Sync {
 
   /// Runs immediately before the driver begins a consumer-group rebalance.
   async fn before_rebalance(&self, _member_id: &str, _generation: u64) {}
+
+  /// Runs after a changed group assignment is computed but before its revocations are published.
+  async fn rebalance_plan_ready(
+    &self,
+    _member_id: &str,
+    _generation: u64,
+    _current_assignment: &[VirtualPartitionId],
+    _next_assignment: &[VirtualPartitionId],
+  ) {
+  }
 
   /// Runs after a rebalance fails and before the driver schedules its retry.
   async fn rebalance_failed(&self, _member_id: &str, _generation: u64) {}

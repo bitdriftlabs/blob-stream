@@ -68,7 +68,7 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `batches_delivered`, `records_delivered` | Counters | Batches and records yielded to application code. |
+| `batches_delivered`, `records_delivered`, `delivery_gap_events` | Counters | Batches and records yielded to application code, and application-visible sequence discontinuities. A gap is an observation, not a root-cause classification; its rate-limited warning includes `admission_scan_json`, the immutable reader scan that admitted the batch, plus live supplemental partition state. |
 | `next_latency_seconds`, `commit_latency_seconds` | Histograms | Application-visible `next()` and explicit `commit()` operation latency. |
 | `retries`, `failures`, `seeks`, `revocations` | Counters | Iterator retry attempts, terminal failures, explicit cursor seeks, and revocation events surfaced to the application. |
 | `rebalances_total`, `rebalance_failures_total` | Counters | Rebalance attempts and attempts that failed before an assignment applied. |

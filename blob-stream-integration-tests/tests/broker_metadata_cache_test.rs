@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use bd_time::TimeProvider;
 use blob_stream_consumer::iterator::{ConsumerIterator, NextResult};
 use blob_stream_integration_tests::test_framework::{
   self as framework,
@@ -159,12 +160,16 @@ async fn broker_metadata_cache_real_transport_uses_equal_fast_frontier() -> Resu
   .await?;
 
   assert_eq!(reader.read_available(now).await?.len(), 1);
-  assert!(
-    metadata_store
-      .scan_requests()
-      .await
-      .contains(&(window, Some(initial_floor))),
-    "equal Fast frontiers must issue a Tail query at their shared inclusive bound"
+  let matching_window_bounds = metadata_store
+    .scan_requests()
+    .await
+    .into_iter()
+    .filter_map(|(scanned_window, bound)| (scanned_window == window).then_some(bound))
+    .collect::<Vec<_>>();
+  assert_eq!(
+    matching_window_bounds,
+    vec![Some(initial_floor)],
+    "equal Fast frontiers must issue exactly one Tail query at their shared inclusive bound"
   );
 
   cluster.shutdown().await;
@@ -237,12 +242,16 @@ async fn broker_metadata_cache_real_transport_uses_lowest_mixed_fast_frontier() 
   .await?;
 
   assert_eq!(reader.read_available(now).await?.len(), 1);
-  assert!(
-    metadata_store
-      .scan_requests()
-      .await
-      .contains(&(window, Some(initial_floor))),
-    "mixed Fast frontiers must collapse to the lowest inclusive Tail bound"
+  let matching_window_bounds = metadata_store
+    .scan_requests()
+    .await
+    .into_iter()
+    .filter_map(|(scanned_window, bound)| (scanned_window == window).then_some(bound))
+    .collect::<Vec<_>>();
+  assert_eq!(
+    matching_window_bounds,
+    vec![Some(initial_floor)],
+    "mixed Fast frontiers must issue exactly one Tail query at the lowest inclusive bound"
   );
 
   cluster.shutdown().await;
@@ -319,6 +328,117 @@ async fn broker_metadata_cache_real_transport_defers_late_eventual_metadata() ->
     metadata_store.scan_requests().await,
   );
 
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn broker_metadata_cache_default_timing_preserves_visibility_boundary() -> Result<()> {
+  let initial_time = OffsetDateTime::from_unix_timestamp(1_700_200_000)?;
+  let cache_clock = Arc::new(framework::ManualTimeProvider::new(initial_time));
+  let consumer_clock = Arc::new(framework::ManualTimeProvider::new(initial_time));
+  let resources = IntegrationResources::create().await?;
+  let metadata_store = Arc::new(GatedMetadataStore::recording(resources.metadata_store()));
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .partition_count(1)
+    .metadata_store(metadata_store.clone())
+    .consumer_time_provider(consumer_clock.clone())
+    .metadata_cache_time_provider(cache_clock.clone())
+    .start()
+    .await?;
+  let window_start = initial_time
+    .unix_timestamp()
+    .div_euclid(WINDOW_SIZE_SECONDS)
+    .saturating_mul(WINDOW_SIZE_SECONDS);
+  write_recovery_segment(
+    resources.blob_store().as_ref(),
+    metadata_store.as_ref(),
+    0,
+    window_start,
+    u64::MAX,
+    1,
+    "default-cache-visibility",
+    initial_time.unix_timestamp().saturating_mul(1_000),
+  )
+  .await?;
+
+  let hooks = cluster.lifecycle_hooks();
+  let mut batch_buffered = hooks.arm_prefetch_for_partition(0).await?;
+  let mut runtime_a = consumer_runtime_config("default-cache-member-a");
+  runtime_a
+    .group
+    .as_mut()
+    .ok_or_else(|| anyhow!("default-cache consumer A group config missing"))?
+    .group_id = "default-cache-group-a".into();
+  let mut consumer_a = cluster
+    .create_broker_metadata_cache_consumer(&runtime_a)
+    .await?;
+  consumer_a.start()?;
+  let mut initial_cache_sleep_count = cache_clock.sleep_registration_count();
+  timeout(Duration::from_secs(5), async {
+    loop {
+      tokio::select! {
+        () = consumer_clock.wait_until_sleeping(2) => return,
+        sleep_count = cache_clock.wait_for_sleep_registration_after(initial_cache_sleep_count) => {
+          initial_cache_sleep_count = sleep_count;
+          cache_clock.advance(TimeDuration::milliseconds(250));
+        },
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("consumer did not defer the initial eventual observation"))?;
+  let initial_scan_count = metadata_store.scan_count();
+  assert!(
+    initial_scan_count > 0,
+    "the initial eventual observation must query metadata before visibility maturity"
+  );
+  assert!(
+    cache_clock.now() < initial_time + TimeDuration::seconds(2),
+    "the initial eventual observations must complete before their two-second visibility boundary"
+  );
+  cache_clock.set_time(initial_time + TimeDuration::seconds(2));
+  consumer_clock.set_time(initial_time + TimeDuration::seconds(2));
+  {
+    let mut mature_cache_sleep_count = cache_clock.sleep_registration_count();
+    let batch_wait = batch_buffered.wait_until_reached();
+    tokio::pin!(batch_wait);
+    timeout(Duration::from_secs(5), async {
+      loop {
+        tokio::select! {
+          result = &mut batch_wait => return result,
+          sleep_count = cache_clock.wait_for_sleep_registration_after(mature_cache_sleep_count) => {
+            assert_eq!(
+              metadata_store.scan_count(),
+              initial_scan_count,
+              "an expired cache entry must not query storage until its fresh coalescing wait completes"
+            );
+            mature_cache_sleep_count = sleep_count;
+            cache_clock.advance(TimeDuration::milliseconds(250));
+          },
+        }
+      }
+    })
+    .await
+    .map_err(|_| anyhow!("mature metadata was not delivered after fresh eventual observations"))??;
+    assert!(
+      metadata_store.scan_count() > initial_scan_count,
+      "expired cache entries must issue fresh eventual queries before delivery"
+    );
+    assert!(
+      cache_clock.now() >= initial_time + TimeDuration::milliseconds(2_250),
+      "the fresh eventual observation must occur after the two-second visibility delay and \
+       coalescing wait"
+    );
+  }
+  batch_buffered.release()?;
+  assert_eq!(
+    consume_next_record(&mut consumer_a).await?,
+    "default-cache-visibility"
+  );
+
+  Box::new(consumer_a).shutdown().await?;
   cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())

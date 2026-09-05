@@ -1,6 +1,9 @@
-use blob_stream_types::{SnowflakeId, VirtualPartitionId};
+use blob_stream_types::{SeqRange, SnowflakeId, VirtualPartitionId};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use time::OffsetDateTime;
+
+pub const MAX_METADATA_SOURCE_DETAILS: usize = 64;
 
 //
 // ConsumerReaderPartitionScanState
@@ -18,6 +21,8 @@ pub struct ConsumerReaderPartitionScanState {
   pub(crate) cursor_after: Option<u64>,
   pub(crate) metadata_segments_seen: usize,
   pub(crate) metadata_segments_without_partition_batches: usize,
+  pub(crate) metadata_sources: VecDeque<ConsumerReaderMetadataSource>,
+  pub(crate) metadata_sources_truncated: bool,
   pub(crate) metadata_batches_seen: usize,
   pub(crate) metadata_batches_skipped_by_cursor: usize,
   pub(crate) metadata_segments_skipped_by_frontier: usize,
@@ -76,6 +81,8 @@ impl ConsumerReaderPartitionScanState {
       cursor_after: cursor_before,
       metadata_segments_seen: 0,
       metadata_segments_without_partition_batches: 0,
+      metadata_sources: VecDeque::with_capacity(MAX_METADATA_SOURCE_DETAILS),
+      metadata_sources_truncated: false,
       metadata_batches_seen: 0,
       metadata_batches_skipped_by_cursor: 0,
       metadata_segments_skipped_by_frontier: 0,
@@ -90,4 +97,18 @@ impl ConsumerReaderPartitionScanState {
       records_accepted: 0,
     }
   }
+}
+
+//
+// ConsumerReaderMetadataSource
+//
+
+/// A metadata row observed for one partition during a reader scan, retained in Snowflake order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerReaderMetadataSource {
+  pub(crate) window_start_unix_seconds: i64,
+  pub(crate) snowflake_id: u64,
+  pub(crate) blob_key: String,
+  pub(crate) metadata_published_at: OffsetDateTime,
+  pub(crate) batch_ranges: Vec<SeqRange>,
 }

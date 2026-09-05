@@ -204,6 +204,11 @@ impl ConsumerReaderImpl {
         window_start_unix_seconds: metadata.window.window_start_unix_seconds,
         snowflake_id: metadata.snowflake_id.as_u64(),
       },
+      source: super::ConsumerBatchSource {
+        blob_key: metadata.blob_key.clone(),
+        metadata_published_at: metadata.metadata_published_at,
+      },
+      admission_scan: None,
       records: record_batch.records,
     })
   }

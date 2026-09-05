@@ -225,6 +225,15 @@ partition. A seek resets the baseline to the requested offset, so intentionally 
 before a forward seek and replay after a backward seek do not produce false gap reports. A truly
 fresh group partition has no baseline until its first delivered record.
 
+The rate-limited delivery-gap warning records the preceding delivered source, the last
+application-stored source when one exists, and the current source. Each source contains its
+sequence position, metadata window, snowflake ID, and blob key. `admission_scan_json` is the exact
+finalized bounded scan that admitted the current batch: query windows and lower bounds, returned
+metadata rows with partition batch ranges, scan counters, and truncation indicators. When the row
+list is truncated, it retains the newest Snowflake-ordered rows nearest the admitted batches. The
+warning's `partition_state_json` is a live, supplemental snapshot that may have advanced past that
+admission scan. Neither evidence source assigns a root cause to the discontinuity.
+
 The optional `fenced_metadata_writes` mode supplies a durable cross-process publication fence. Each
 write engine creates a unique process session ID; acquisition by a new or expired session increments
 the durable lease epoch, while a live renewal by the same session preserves it. Metadata publication

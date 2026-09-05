@@ -1,4 +1,5 @@
 use super::delivery::{DeliveredSourceRange, DeliveryState};
+use crate::consumer::ConsumerBatchSource;
 use crate::diagnostics::ConsumerDiagnosticsRuntimeState;
 use bd_server_stats::stats::{ContributionGauge, Scope};
 use blob_stream_types::{CommittedSourceCheckpoint, VirtualPartitionId};
@@ -117,6 +118,18 @@ pub struct PendingCommit {
 }
 
 //
+// DeliveredSource
+//
+
+/// Provenance for the most recently delivered record in a partition.
+#[derive(Clone, Debug)]
+pub(super) struct DeliveredSource {
+  pub(super) offset: u64,
+  pub(super) source_checkpoint: CommittedSourceCheckpoint,
+  pub(super) source: ConsumerBatchSource,
+}
+
+//
 // ActivePartitionState
 //
 
@@ -126,6 +139,8 @@ pub struct ActivePartitionState {
   pub(crate) pending_commit: Option<PendingCommit>,
   pub(crate) delivered_source_ranges: Vec<DeliveredSourceRange>,
   pub(crate) delivery_gap_baseline: Option<u64>,
+  pub(super) last_delivered_source: Option<DeliveredSource>,
+  pub(super) last_stored_source: Option<DeliveredSource>,
 }
 
 //

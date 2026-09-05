@@ -6,6 +6,7 @@
 
 use super::{
   ConsumerBatch,
+  ConsumerBatchSource,
   ConsumerReaderFastFrontierState,
   ConsumerReaderFastScanBoundState,
   ConsumerReaderImpl,

@@ -178,7 +178,7 @@ impl ConsumerDriver {
     let diagnostics = self.diagnostics.clone();
     let base_idle_delay = self.prefetch_idle_base_delay;
     let max_idle_delay = self.prefetch_idle_max_delay;
-    let time_provider = Arc::clone(&self.time_provider);
+    let time_provider = Arc::clone(&self.prefetch_time_provider);
     let lifecycle_hooks = self.lifecycle_hooks.clone();
     let member_id = self.group_config.member_id.to_string();
 
