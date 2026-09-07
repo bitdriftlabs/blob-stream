@@ -875,7 +875,7 @@ impl ConsumerReaderImpl {
     let fast_horizon_windows = self
       .eligible_fast_scan_windows(now, runtime_settings)?
       .into_iter()
-      .map(|(window, _)| window.window_start_unix_seconds)
+      .map(|window| window.window_start_unix_seconds)
       .collect::<HashSet<_>>();
     let fast_horizon_floor =
       Self::snowflake_floor(self.fast_scan_safe_timestamp(now, runtime_settings));

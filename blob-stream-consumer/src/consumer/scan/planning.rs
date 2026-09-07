@@ -278,12 +278,12 @@ impl ConsumerReaderImpl {
     SnowflakeId::minimum_for_timestamp(timestamp)
   }
 
-  /// Return Fast windows that can still contain unpublished or invisible metadata and their floors.
+  /// Return Fast windows that can still contain unpublished or invisible metadata.
   pub(in crate::consumer) fn eligible_fast_scan_windows(
     &self,
     now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
-  ) -> Result<Vec<(TopicWindowKey, SnowflakeId)>> {
+  ) -> Result<Vec<TopicWindowKey>> {
     let safe_timestamp = self.fast_scan_safe_timestamp(now, runtime_settings);
     let window_size_seconds = self.metadata_window_size.whole_seconds();
     let windows = self
@@ -296,15 +296,6 @@ impl ConsumerReaderImpl {
             .saturating_add(window_size_seconds),
         )
         .is_ok_and(|window_end| window_end > safe_timestamp)
-      })
-      .map(|window| {
-        let window_start =
-          time::OffsetDateTime::from_unix_timestamp(window.window_start_unix_seconds)
-            .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-        (
-          window,
-          Self::snowflake_floor(window_start.max(safe_timestamp)),
-        )
       })
       .collect();
     Ok(windows)
@@ -338,7 +329,7 @@ impl ConsumerReaderImpl {
     now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<()> {
-    let Some((first_fast_window, _)) = self
+    let Some(first_fast_window) = self
       .eligible_fast_scan_windows(now, runtime_settings)?
       .into_iter()
       .next()
@@ -522,7 +513,7 @@ impl ConsumerReaderImpl {
       .values()
       .any(|state| state.is_assigned() && matches!(state, VirtualPartitionState::Fast { .. }))
     {
-      for (window, _) in self.eligible_fast_scan_windows(now, runtime_settings)? {
+      for window in self.eligible_fast_scan_windows(now, runtime_settings)? {
         let fast_partition_bounds = self.fast_scan_partition_bounds(
           assigned_partition_ids,
           window.window_start_unix_seconds,
@@ -558,7 +549,7 @@ impl ConsumerReaderImpl {
     let eligible_window_starts = self
       .eligible_fast_scan_windows(now, runtime_settings)?
       .into_iter()
-      .map(|(window, _)| window.window_start_unix_seconds)
+      .map(|window| window.window_start_unix_seconds)
       .collect::<HashSet<_>>();
     self
       .fast_frontiers
