@@ -2,7 +2,7 @@ use super::{ClusterHarness, IntegrationResources, LifecycleEvent, ManualTimeProv
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use bd_server_stats::stats::Collector;
-use bd_time::{OffsetDateTimeExt, TimeProvider};
+use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobKey, BlobStore};
 use blob_stream_consumer::consumer::{
   BrokerBlobRangeQuery,
@@ -612,29 +612,10 @@ pub async fn produce_message_at_manual_time_with_flush_advance(
   timeout(Duration::from_secs(5), manual_time.wait_until_sleeping(1))
     .await
     .map_err(|_| anyhow!("broker did not register a logical flush sleep"))?;
-  let flush_reached = {
-    let flush_wait = flush_gate.wait_until_reached();
-    tokio::pin!(flush_wait);
-    let mut flush_reached = false;
-    for _ in 0 .. 25 {
-      manual_time.advance(flush_advance);
-      tokio::select! {
-        biased;
-        result = &mut flush_wait => {
-          result?;
-          flush_reached = true;
-          break;
-        },
-        () = tokio::task::yield_now() => {},
-      }
-    }
-    flush_reached
-  };
-  if !flush_reached {
-    return Err(anyhow!(
-      "broker flush did not reach its pre-persist boundary"
-    ));
-  }
+  manual_time.advance(flush_advance);
+  timeout(Duration::from_secs(5), flush_gate.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("broker flush did not reach its pre-persist boundary"))??;
   flush_gate.release()?;
   produce_task
     .await
@@ -775,6 +756,7 @@ pub async fn broker_metadata_cache_reader(
   let discovery = Arc::new(cluster.producer_discovery());
   let broker_metadata_query = Arc::new(GrpcBrokerMetadataQuery::new(discovery).await?);
   ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(strongly_consistent),

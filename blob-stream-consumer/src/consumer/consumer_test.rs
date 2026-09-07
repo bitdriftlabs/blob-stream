@@ -26,6 +26,7 @@ use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
 use bd_server_stats::test::util::stats::Helper;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
+use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::{
   BlobCacheAdmission,
   BlobKey,
@@ -60,6 +61,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   read_metadata_window_request,
   read_metadata_window_response,
 };
+use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::{
   BatchMetadata,
   CommittedCursor,
@@ -232,6 +234,7 @@ enum BrokerMetadataResponse {
   Valid,
   TransportFailure,
   Malformed,
+  StaleAtReceipt,
 }
 
 #[async_trait]
@@ -662,6 +665,7 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
       .with_integer_flag("blob_stream_consumer_max_in_flight_batch_reads", 2),
   ));
   let reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       prefetch_max_bytes: Some(8),
@@ -710,6 +714,7 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
 #[test]
 fn eventual_broker_reads_include_cache_age_in_availability_horizon() {
   let reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -742,6 +747,7 @@ fn eventual_broker_reads_include_cache_age_in_availability_horizon() {
 #[test]
 fn reader_rejects_negative_publication_lag() {
   let result = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -900,6 +906,7 @@ async fn seek_slices_a_multi_record_batch_and_suppresses_a_fully_consumed_batch(
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -971,6 +978,7 @@ async fn reader_rejects_decoded_batch_with_mismatched_record_count() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -1163,6 +1171,7 @@ async fn metadata_source_diagnostics_retain_the_newest_snowflake_rows() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -1228,6 +1237,7 @@ async fn visibility_delay_defers_newly_published_metadata() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
@@ -1328,6 +1338,7 @@ async fn strong_metadata_reads_accept_future_metadata_publication_timestamps() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
@@ -1392,6 +1403,7 @@ async fn runtime_strong_metadata_reads_apply_on_the_next_scan() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
@@ -1451,6 +1463,7 @@ async fn runtime_strong_metadata_reads_apply_on_the_next_scan() {
 #[test]
 fn strong_metadata_reads_use_clock_skew_without_a_visibility_delay() {
   let reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       metadata_visibility_delay: TimeDuration::milliseconds(2_000).into_proto(),
@@ -1514,6 +1527,7 @@ async fn derived_horizon_retries_visibility_deferred_metadata_across_window_boun
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       metadata_visibility_delay: TimeDuration::milliseconds(300_000).into_proto(),
@@ -1570,6 +1584,7 @@ async fn retention_recovery_scans_from_checkpoint_before_fast_path() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -1663,6 +1678,7 @@ async fn recovery_scans_single_checkpoint_window_with_overlap_bound() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
@@ -1722,6 +1738,7 @@ fn recovery_only_bounds_its_checkpoint_window() {
       .saturating_add(time::Duration::milliseconds(990)),
   );
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -1793,6 +1810,7 @@ async fn broker_recovery_uses_tail_for_checkpoint_and_full_recovery_afterward() 
       .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
   ));
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -1933,6 +1951,7 @@ async fn broker_recovery_delivery_preserves_batches_and_cursor() {
       .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
   ));
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -1983,6 +2002,7 @@ async fn assignment_activates_hydrated_state_and_removes_revoked_state() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -2041,6 +2061,7 @@ async fn retention_recovery_clamps_legacy_cursor_to_retention_floor() {
   let metadata_store = Arc::new(RecordingMetadataStore::new());
   let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -2077,6 +2098,48 @@ async fn retention_recovery_clamps_legacy_cursor_to_retention_floor() {
   assert_eq!(scans.len(), 32);
 }
 
+#[test]
+fn fast_coverage_recovery_clamps_a_stale_floor_to_retention() {
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )
+  .unwrap();
+  reader.virtual_partition_states.insert(
+    7,
+    VirtualPartitionState::Fast {
+      cursor: Some(4),
+      coverage_floor: Some(timestamp(1_000)),
+      last_scan: None,
+    },
+  );
+
+  let (requests, recovery_scan) = reader
+    .scan_requests(timestamp(90_000), &[7], reader.runtime_settings())
+    .unwrap();
+
+  assert!(recovery_scan);
+  assert_eq!(requests[0].window.window_start_unix_seconds, 3_600);
+  assert!(matches!(
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::Recovering { recovery_state, .. })
+      if recovery_state.next_window_start_unix_seconds == 3_600
+  ));
+}
+
 #[tokio::test]
 async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
@@ -2107,6 +2170,7 @@ async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -2195,6 +2259,7 @@ async fn recovery_waits_for_visibility_deferred_window_before_advancing() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
@@ -2306,6 +2371,7 @@ async fn recovery_does_not_advance_cursor_past_visibility_deferred_window() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
@@ -2382,6 +2448,7 @@ async fn recovery_hands_active_window_visibility_deferral_to_fast() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
@@ -2453,6 +2520,7 @@ async fn advances_cursor_and_dedupes_on_rescan() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -2511,6 +2579,7 @@ async fn failed_scan_restores_cursor_before_retrying_undelivered_batches() {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -2577,6 +2646,7 @@ async fn missing_blob_range_is_counted_and_skipped() {
 
   let collector = Collector::default();
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -2611,6 +2681,7 @@ async fn metadata_scan_error_preserves_aws_source_chain() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(FailingMetadataStore);
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -2664,6 +2735,7 @@ async fn byte_capacity_defers_later_batches_until_the_next_scan() {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -2734,6 +2806,7 @@ async fn recovery_capacity_resumes_at_the_first_deferred_window() {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -2832,6 +2905,7 @@ async fn recovery_capacity_deferral_keeps_unprocessed_cutover_partitions_recover
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -2928,6 +3002,7 @@ async fn fresh_capacity_deferral_retries_the_initial_window_before_fast_path() {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -3011,6 +3086,7 @@ async fn mature_recovery_metadata_is_scanned_once_across_capacity_cycles() {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -3127,6 +3203,7 @@ async fn mature_recovery_metadata_caches_after_visibility_deferral() {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
@@ -3241,6 +3318,7 @@ async fn mature_recovery_metadata_survives_blob_read_failure() {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -3326,6 +3404,7 @@ async fn mature_recovery_metadata_survives_blob_read_failure() {
 #[test]
 fn recovery_metadata_cache_is_invalidated_by_lifecycle_resets() {
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -3380,6 +3459,7 @@ fn recovery_metadata_cache_is_invalidated_by_lifecycle_resets() {
 #[test]
 fn recovery_planning_rotates_between_partitions() {
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -3470,6 +3550,7 @@ async fn coalesces_owned_ranges_from_one_segment() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -3545,6 +3626,7 @@ async fn broker_blob_cache_reads_ranges_without_object_store_access() {
     payloads,
   )));
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -3604,6 +3686,7 @@ async fn broker_blob_cache_groups_same_key_plans_and_decodes_validated_ranges() 
   )));
   let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -3707,6 +3790,7 @@ async fn broker_blob_cache_handles_many_ranges_from_one_blob_key() {
   )));
   let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -3771,6 +3855,7 @@ async fn corrupt_broker_blob_payload_retries_the_complete_group_directly() {
   ])));
   let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -3857,6 +3942,7 @@ async fn overloaded_broker_blob_response_retries_the_complete_group_directly() {
   )));
   let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -3930,6 +4016,7 @@ async fn broker_blob_failure_preserves_direct_range_concurrency() {
   )));
   let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       max_in_flight_batch_reads: Some(2),
@@ -3995,6 +4082,7 @@ async fn distinct_blob_keys_use_distinct_broker_requests() {
   let query = Arc::new(FixedBrokerBlobRangeQuery::with_responses(Vec::new()));
   let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -4077,6 +4165,7 @@ async fn broker_blob_cache_accepts_mixed_key_outcomes_without_direct_retry() {
   ]));
   let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -4135,6 +4224,7 @@ async fn authoritative_broker_blob_not_found_skips_direct_retry() {
   }));
   let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -4183,6 +4273,7 @@ async fn authoritative_broker_blob_not_found_skips_direct_retry() {
 #[test]
 fn recovery_planning_batches_active_cutover_partitions() {
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -4258,6 +4349,7 @@ async fn capacity_limited_segment_read_excludes_deferred_batches() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -4344,6 +4436,7 @@ async fn failed_slice_in_segment_read_does_not_advance_cursor() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -4392,6 +4485,7 @@ async fn bounded_parallel_reads_respect_configured_limit() {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       max_in_flight_batch_reads: Some(2),
@@ -4447,6 +4541,7 @@ async fn catches_late_metadata_with_derived_candidate_horizon() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -4506,6 +4601,7 @@ async fn decodes_zstd_compressed_batches() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -4550,6 +4646,7 @@ async fn fast_scan_uses_per_partition_inclusive_frontier() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -4592,6 +4689,7 @@ async fn fast_scan_retains_coverage_after_capacity_stall() {
   let second_source_at = scan_started_at.saturating_add(3);
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -4682,6 +4780,7 @@ async fn fast_scan_catches_up_coverage_across_window_stall() {
   let second_source_at = second_window_start.saturating_add(190);
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -4771,6 +4870,7 @@ async fn fast_recovery_retains_visibility_deferred_rows_below_the_fast_floor() {
   let deferred_source_at = cutover_window_start.saturating_add(1);
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       metadata_visibility_delay: TimeDuration::seconds(1).into_proto(),
@@ -4878,6 +4978,7 @@ async fn fast_scan_uses_lowest_partition_frontier_for_cross_partition_ordering()
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -4962,6 +5063,7 @@ async fn broker_tail_request_keeps_each_fast_partition_frontier() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -5064,17 +5166,26 @@ async fn broker_offload_read(
   }
   let broker_query = Arc::new(FixedBrokerMetadataQuery {
     responses: match broker_response {
-      BrokerMetadataResponse::Valid | BrokerMetadataResponse::Malformed => {
+      BrokerMetadataResponse::Valid
+      | BrokerMetadataResponse::Malformed
+      | BrokerMetadataResponse::StaleAtReceipt => {
         HashMap::from([(600, empty_response), (900, segments_response)])
       },
       BrokerMetadataResponse::TransportFailure => HashMap::new(),
     },
   });
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
-  ));
-  let mut reader = ConsumerReaderImpl::new(
+  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default().with_bool_flag(
+    "blob_stream_consumer_strong_metadata_reads",
+    !matches!(broker_response, BrokerMetadataResponse::StaleAtReceipt),
+  )));
+  let time_provider: Arc<dyn TimeProvider> =
+    if matches!(broker_response, BrokerMetadataResponse::StaleAtReceipt) {
+      Arc::new(ManualTimeProvider::new(timestamp(902)))
+    } else {
+      Arc::new(SystemTimeProvider)
+    };
+  let reader = ConsumerReaderImpl::new(
+    time_provider,
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -5090,7 +5201,9 @@ async fn broker_offload_read(
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     Some(feature_flags.snapshot_watch()),
   )
-  .unwrap();
+  .unwrap()
+  .metadata_cache_max_age(TimeDuration::milliseconds(250));
+  let mut reader = reader;
   let batches = reader.read_available(901).await.unwrap();
   (batches, reader.cursor(7), metrics)
 }
@@ -5128,6 +5241,23 @@ async fn broker_offload_metrics_distinguish_delivery_from_direct_fallback() {
     &labels!(),
   );
   fallback_metrics.assert_counter_eq(
+    2,
+    &format!("{metric}:broker_metadata_offload_fallbacks"),
+    &labels!(),
+  );
+
+  let (_, _, stale_metrics) = broker_offload_read(BrokerMetadataResponse::StaleAtReceipt).await;
+  stale_metrics.assert_counter_eq(
+    2,
+    &format!("{metric}:broker_metadata_offload_requests"),
+    &labels!(),
+  );
+  stale_metrics.assert_counter_eq(
+    0,
+    &format!("{metric}:broker_metadata_offload_deliveries"),
+    &labels!(),
+  );
+  stale_metrics.assert_counter_eq(
     2,
     &format!("{metric}:broker_metadata_offload_fallbacks"),
     &labels!(),
@@ -5179,6 +5309,7 @@ async fn seek_resets_partition_fast_frontier() {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -5241,6 +5372,7 @@ async fn source_directed_seek_normalizes_target_window_and_handles_future_window
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -5388,6 +5520,7 @@ async fn source_directed_seek_uses_the_checkpoint_snowflake_lower_bound() {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
@@ -5460,6 +5593,7 @@ async fn fast_scan_uses_per_window_frontiers_across_candidate_window_boundary() 
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -5534,6 +5668,7 @@ async fn fast_scan_omits_windows_before_the_safe_publication_floor() {
   let safe_floor = SnowflakeId::minimum_for_timestamp(safe_timestamp);
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()
@@ -5594,6 +5729,7 @@ async fn fast_scan_prunes_frontiers_for_windows_before_the_safe_publication_floo
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -5789,6 +5925,7 @@ async fn fast_scan_bounds_sparse_partitions_with_the_safe_publication_floor() {
   .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
       ..Default::default()

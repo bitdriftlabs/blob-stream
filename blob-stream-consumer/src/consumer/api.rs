@@ -36,7 +36,7 @@ pub struct ConsumerBatch {
   /// Immutable source details for delivery-gap investigation.
   pub source: ConsumerBatchSource,
   /// Finalized scan evidence that admitted this batch, shared by every batch in the scan pass.
-  pub(crate) admission_scan: Option<Arc<ConsumerReaderScanSnapshot>>,
+  pub admission_scan: Option<Arc<ConsumerReaderScanSnapshot>>,
   /// Decoded records for the batch.
   pub records: Vec<Record>,
 }

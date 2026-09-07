@@ -27,12 +27,14 @@ use super::{
 use crate::config::{ConsumerReadRuntimeSettings, consumer_max_clock_skew};
 use crate::consumer::AvailabilityHorizon;
 use crate::iterator::ConsumerSeekTarget;
+use bd_time::TimeProvider;
 use blob_stream_types::offset_datetime_from_unix_millis;
 use time::{Duration, OffsetDateTime};
 
 impl ConsumerReaderImpl {
   /// Create a reader with finite retention recovery and an explicit metadata publication bound.
   pub fn new(
+    time_provider: Arc<dyn TimeProvider>,
     config: ConsumerReadConfig,
     assigned_virtual_partitions: Vec<VirtualPartitionId>,
     initial_cursors: HashMap<VirtualPartitionId, u64>,
@@ -98,6 +100,7 @@ impl ConsumerReaderImpl {
       metadata_window_size: blob_stream_types::DEFAULT_METADATA_WINDOW_SIZE,
       maximum_clock_skew: consumer_max_clock_skew(&config),
       metadata_cache_max_age: Duration::ZERO,
+      time_provider,
       fast_frontiers: HashMap::new(),
       recovery_scan_last_partition: None,
       recovery_metadata_cache: HashMap::new(),
@@ -156,7 +159,10 @@ impl ConsumerReaderImpl {
     Window::for_timestamp(timestamp, self.metadata_window_size).start
   }
 
-  fn retention_floor_window_start(&self, cutover_window_start: OffsetDateTime) -> OffsetDateTime {
+  pub(in crate::consumer) fn retention_floor_window_start(
+    &self,
+    cutover_window_start: OffsetDateTime,
+  ) -> OffsetDateTime {
     self.window_start(cutover_window_start.saturating_sub(self.retention))
   }
 

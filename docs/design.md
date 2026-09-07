@@ -487,8 +487,11 @@ query still apply their own frontier filters after the result is returned.
   and becomes Fast only after its cutover window is fully scanned. When the checkpoint window is
   the cutover window, recovery is a single-window pass.
 3. **Fast:** A partition that has completed Fresh or Recovery scans only the bounded recent horizon
-   where metadata can still be unpublished or invisible. Fast is an optimization; it is never used
-   to replace retained recovery for a resumed partition.
+  where metadata can still be unpublished or invisible. It retains the earliest unconfirmed
+  coverage floor from incomplete Fast passes. When that floor leaves the live horizon, the
+  partition returns to bounded chronological Recovery from the retention-clamped floor through
+  the captured current-window cutover before resuming Fast. Fast is an optimization; it is never
+  used to replace retained recovery for a resumed partition.
 
 For a usable source checkpoint that was not clamped to retention, recovery uses an inclusive lower
 bound only for its first window. Let $D$ be the broker's publication deadline plus the consumer's

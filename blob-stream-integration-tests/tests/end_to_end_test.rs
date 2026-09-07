@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use bd_server_stats::stats::{Collector, Scope};
-use bd_time::{OffsetDateTimeExt, TimeProvider};
+use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::BlobKey;
 use blob_stream_broker::write::{BrokerLeaseStatus, WriteRequest};
 use blob_stream_broker_discovery::BrokerDiscovery;
@@ -605,6 +605,7 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
 
   // Step 4: Read from the exact virtual partition and assert the record is visible.
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -846,6 +847,7 @@ async fn broker_coalesces_same_partition_requests_into_one_consumer_batch() -> R
   );
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -1214,6 +1216,7 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
 
   // Step 3: Read the produced data and validate dedupe/cursor monotonicity on repeated scans.
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -3884,6 +3887,7 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
   .await?;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -4023,6 +4027,7 @@ async fn multi_topic_isolation() -> Result<()> {
   .await?;
 
   let mut topic_a_reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -4041,6 +4046,7 @@ async fn multi_topic_isolation() -> Result<()> {
   )?;
 
   let mut topic_b_reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: SECOND_TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -4293,6 +4299,7 @@ async fn shared_cross_topic_blob_pulls_forward_a_fresh_topic() -> Result<()> {
   assert!(first_segments[0].blob_key.as_str().starts_with("shared/"));
 
   let mut first_reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -4310,6 +4317,7 @@ async fn shared_cross_topic_blob_pulls_forward_a_fresh_topic() -> Result<()> {
     None,
   )?;
   let mut second_reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: SECOND_TOPIC.into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -4516,6 +4524,7 @@ async fn shared_object_metadata_failure_is_isolated_and_retries() -> Result<()> 
   assert_ne!(first_segments[0].blob_key, second_segments[0].blob_key);
 
   let mut second_reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: SECOND_TOPIC.into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -4584,6 +4593,7 @@ async fn payload_boundary_and_batching_behavior() -> Result<()> {
   );
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       ..Default::default()
@@ -4734,6 +4744,7 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
   .await?;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       ..Default::default()
@@ -6550,6 +6561,7 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
 
   let virtual_partition_ids: Vec<u32> = (0 .. (PARTITION_COUNT * 2)).collect();
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       ..Default::default()

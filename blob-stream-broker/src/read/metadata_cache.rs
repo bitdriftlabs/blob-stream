@@ -674,10 +674,8 @@ impl MetadataCache {
         && let Some(entry) = entries.get(&specification.key).await
       {
         let covers_request = entry.covers(&specification);
-        let fresh = entry.is_fresh(
-          specification.topic.metadata_cache_max_age,
-          self.time_provider.now(),
-        );
+        let now = self.time_provider.now();
+        let fresh = entry.is_fresh(specification.topic.metadata_cache_max_age, now);
         if covers_request && fresh {
           debug!(
             "broker metadata cache retained hit: topic={}, window_start={}, coverage={:?}, \
@@ -692,11 +690,10 @@ impl MetadataCache {
             ReadCoverage::Tail => self.metrics.tail_hits.inc(),
             ReadCoverage::FullRecovery => self.metrics.recovery_hits.inc(),
           }
-          self.metrics.observation_age_seconds.observe(
-            (OffsetDateTime::now_utc() - entry.observed_at)
-              .as_seconds_f64()
-              .max(0.0),
-          );
+          self
+            .metrics
+            .observation_age_seconds
+            .observe((now - entry.observed_at).as_seconds_f64().max(0.0));
           return Ok(LoadedCacheEntry {
             entry,
             retained_coverage: true,

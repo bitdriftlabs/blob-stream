@@ -339,18 +339,21 @@ impl ConsumerReaderImpl {
     let cutover_window_start = Window::for_timestamp(now, self.metadata_window_size)
       .start
       .unix_timestamp();
+    let retention_floor =
+      self.retention_floor_window_start(offset_datetime_from_unix_seconds(cutover_window_start));
     let recoveries = self
       .virtual_partition_states
       .iter()
       .filter_map(|(partition_id, state)| {
         let coverage_floor = state.fast_coverage_floor()?;
+        let recovery_floor = coverage_floor.max(retention_floor);
         let recovery_start_window =
-          Window::for_timestamp(coverage_floor, self.metadata_window_size)
+          Window::for_timestamp(recovery_floor, self.metadata_window_size)
             .start
             .unix_timestamp();
         (recovery_start_window < first_fast_window.window_start_unix_seconds).then_some((
           *partition_id,
-          coverage_floor,
+          recovery_floor,
           recovery_start_window,
         ))
       })

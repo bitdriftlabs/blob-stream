@@ -237,6 +237,7 @@ impl ConsumerIteratorBuilder<'_> {
     let assignment_callback = Arc::new(Mutex::new(None));
     let shared_state = Arc::new(Mutex::new(ConsumerSharedState::default()));
     let reader = ConsumerReaderImpl::new(
+      Arc::clone(&time_provider),
       read_config,
       Vec::new(),
       HashMap::new(),

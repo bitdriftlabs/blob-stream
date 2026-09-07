@@ -134,6 +134,7 @@ impl ConsumerReaderImpl {
       let metrics = self.metrics.clone();
       let metadata_read_consistency = runtime_settings.metadata_read_consistency;
       let metadata_cache_max_age = self.metadata_cache_max_age;
+      let time_provider = Arc::clone(&self.time_provider);
       let broker_request = broker_request_for_scan(&request, metadata_read_consistency);
       scan_futures.push(async move {
         if !request.recovery_scan && request.eligibility.fast && request.min_snowflake.is_none() {
@@ -148,8 +149,13 @@ impl ConsumerReaderImpl {
             .await
           {
             Ok(response) => {
-              match decode_metadata_response(&broker_request, response, now, metadata_cache_max_age)
-              {
+              let received_at = time_provider.now();
+              match decode_metadata_response(
+                &broker_request,
+                response,
+                received_at,
+                metadata_cache_max_age,
+              ) {
                 Ok(result) => Some(result),
                 Err(error) => {
                   trace!(
