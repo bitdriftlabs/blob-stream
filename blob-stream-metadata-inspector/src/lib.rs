@@ -11,6 +11,8 @@ use serde::Serialize;
 use std::ops::Range;
 use time::{Duration, OffsetDateTime};
 
+pub const MAX_WINDOW_RADIUS: u32 = 10;
+
 //
 // InspectorRequest
 //
@@ -129,6 +131,9 @@ pub async fn inspect_metadata(
 pub fn queried_window_starts(request: &InspectorRequest) -> Result<Vec<i64>> {
   if request.metadata_window_seconds <= 0 {
     bail!("metadata window seconds must be positive");
+  }
+  if request.window_radius > MAX_WINDOW_RADIUS {
+    bail!("metadata window radius must not exceed {MAX_WINDOW_RADIUS}");
   }
   let window_size = Duration::seconds(request.metadata_window_seconds);
   let focal_window_start = Window::for_timestamp(request.target_time, window_size)
@@ -275,15 +280,23 @@ fn row_for_batch(
 
 fn continuity_issues(suspect_cursor: u64, rows: &[MetadataBatchRow]) -> Vec<ContinuityIssue> {
   let mut next_expected = suspect_cursor.saturating_add(1);
+  let mut highest_range_start = next_expected;
   let mut issues = Vec::new();
   for row in rows {
     if row.sequence_end < next_expected {
       if row.sequence_end > suspect_cursor {
-        issues.push(ContinuityIssue::OutOfOrder {
-          sequence_start: row.sequence_start,
-          sequence_end: row.sequence_end,
-          expected_at_least: next_expected,
-        });
+        if row.sequence_start >= highest_range_start {
+          issues.push(ContinuityIssue::Overlap {
+            start: row.sequence_start,
+            end: row.sequence_end,
+          });
+        } else {
+          issues.push(ContinuityIssue::OutOfOrder {
+            sequence_start: row.sequence_start,
+            sequence_end: row.sequence_end,
+            expected_at_least: next_expected,
+          });
+        }
       }
       continue;
     }
@@ -301,7 +314,10 @@ fn continuity_issues(suspect_cursor: u64, rows: &[MetadataBatchRow]) -> Vec<Cont
         });
       }
     }
-    next_expected = next_expected.max(row.sequence_end.saturating_add(1));
+    if row.sequence_end.saturating_add(1) > next_expected {
+      next_expected = row.sequence_end.saturating_add(1);
+      highest_range_start = row.sequence_start;
+    }
   }
   issues
 }

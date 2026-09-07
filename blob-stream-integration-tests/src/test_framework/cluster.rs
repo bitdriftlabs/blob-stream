@@ -779,9 +779,24 @@ impl ClusterHarness {
     runtime: &ConsumerRuntimeConfig,
   ) -> Result<ConsumerIteratorImpl> {
     self
-      .create_broker_metadata_cache_consumer_with_discovery(
+      .create_broker_metadata_cache_consumer_with_metadata_store(
+        runtime,
+        Arc::clone(&self.metadata_store),
+      )
+      .await
+  }
+
+  /// Build a cache consumer with a distinct direct metadata store for fallback assertions.
+  pub async fn create_broker_metadata_cache_consumer_with_metadata_store(
+    &self,
+    runtime: &ConsumerRuntimeConfig,
+    metadata_store: Arc<dyn MetadataStore>,
+  ) -> Result<ConsumerIteratorImpl> {
+    self
+      .create_broker_metadata_cache_consumer_with_discovery_and_metadata_store(
         runtime,
         Arc::new(self.producer_discovery()),
+        metadata_store,
       )
       .await
   }
@@ -791,6 +806,21 @@ impl ClusterHarness {
     &self,
     runtime: &ConsumerRuntimeConfig,
     discovery: Arc<dyn BrokerDiscovery>,
+  ) -> Result<ConsumerIteratorImpl> {
+    self
+      .create_broker_metadata_cache_consumer_with_discovery_and_metadata_store(
+        runtime,
+        discovery,
+        Arc::clone(&self.metadata_store),
+      )
+      .await
+  }
+
+  async fn create_broker_metadata_cache_consumer_with_discovery_and_metadata_store(
+    &self,
+    runtime: &ConsumerRuntimeConfig,
+    discovery: Arc<dyn BrokerDiscovery>,
+    metadata_store: Arc<dyn MetadataStore>,
   ) -> Result<ConsumerIteratorImpl> {
     let group = runtime
       .group
@@ -813,7 +843,7 @@ impl ClusterHarness {
     ConsumerIteratorBuilder::new(
       runtime,
       Arc::clone(&self.blob_store),
-      Arc::clone(&self.metadata_store),
+      metadata_store,
       Arc::clone(&self.consumer_lease_store),
       Arc::clone(&self.consumer_membership_store),
       coordination_source,

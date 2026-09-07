@@ -52,7 +52,6 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   TailMetadataCoverage,
   read_metadata_window_request,
 };
-use time::OffsetDateTime;
 use time::ext::NumericalDuration;
 use tokio::sync::Semaphore;
 
@@ -149,12 +148,8 @@ impl ConsumerReaderImpl {
             .await
           {
             Ok(response) => {
-              match decode_metadata_response(
-                &broker_request,
-                response,
-                OffsetDateTime::now_utc(),
-                metadata_cache_max_age,
-              ) {
+              match decode_metadata_response(&broker_request, response, now, metadata_cache_max_age)
+              {
                 Ok(result) => Some(result),
                 Err(error) => {
                   trace!(

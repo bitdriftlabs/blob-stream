@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use blob_stream_metadata_inspector::{
   InspectionReport,
   InspectorRequest,
+  MAX_WINDOW_RADIUS,
   MetadataBatchRow,
   cursor_context_range,
   inspect_metadata,
@@ -58,6 +59,9 @@ async fn main() -> Result<()> {
   let cli = Cli::parse();
   if cli.metadata_window_seconds <= 0 {
     bail!("--metadata-window-seconds must be positive");
+  }
+  if cli.window_radius > MAX_WINDOW_RADIUS {
+    bail!("--window-radius must not exceed {MAX_WINDOW_RADIUS}");
   }
   let request = InspectorRequest {
     topic: cli.topic,
@@ -128,7 +132,7 @@ fn print_rows_around_cursor(
   }
   for row in &rows[context.clone()] {
     println!(
-      "  window={} snowflake={} range={}..={} bytes={}..={} payload_bytes={} created_at={} \
+      "  window={} snowflake={} range={}..={} bytes={}..{} payload_bytes={} created_at={} \
        published_at={} relation={:?} blob={}",
       row.window_start_unix_seconds,
       row.snowflake_id,

@@ -340,6 +340,7 @@ async fn broker_metadata_cache_default_timing_preserves_visibility_boundary() ->
   let consumer_clock = Arc::new(framework::ManualTimeProvider::new(initial_time));
   let resources = IntegrationResources::create().await?;
   let metadata_store = Arc::new(GatedMetadataStore::recording(resources.metadata_store()));
+  let fallback_metadata_store = Arc::new(GatedMetadataStore::recording(resources.metadata_store()));
   let mut cluster = ClusterHarness::builder(&resources, 1)
     .partition_count(1)
     .metadata_store(metadata_store.clone())
@@ -372,7 +373,10 @@ async fn broker_metadata_cache_default_timing_preserves_visibility_boundary() ->
     .ok_or_else(|| anyhow!("default-cache consumer A group config missing"))?
     .group_id = "default-cache-group-a".into();
   let mut consumer_a = cluster
-    .create_broker_metadata_cache_consumer(&runtime_a)
+    .create_broker_metadata_cache_consumer_with_metadata_store(
+      &runtime_a,
+      fallback_metadata_store.clone(),
+    )
     .await?;
   consumer_a.start()?;
   let mut initial_cache_sleep_count = cache_clock.sleep_registration_count();
@@ -393,6 +397,11 @@ async fn broker_metadata_cache_default_timing_preserves_visibility_boundary() ->
   assert!(
     initial_scan_count > 0,
     "the initial eventual observation must query metadata before visibility maturity"
+  );
+  assert_eq!(
+    fallback_metadata_store.scan_count(),
+    0,
+    "accepted broker metadata responses must not fall back to direct metadata scans"
   );
   assert!(
     cache_clock.now() < initial_time + TimeDuration::seconds(2),
@@ -432,6 +441,11 @@ async fn broker_metadata_cache_default_timing_preserves_visibility_boundary() ->
        coalescing wait"
     );
   }
+  assert_eq!(
+    fallback_metadata_store.scan_count(),
+    0,
+    "cache refills must not trigger consumer direct metadata fallbacks"
+  );
   batch_buffered.release()?;
   assert_eq!(
     consume_next_record(&mut consumer_a).await?,

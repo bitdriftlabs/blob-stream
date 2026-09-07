@@ -157,8 +157,9 @@ impl ConsumerIterator for ConsumerIteratorImpl {
             .partitions
             .into_iter()
             .find(|partition| partition.virtual_partition_id == gap.virtual_partition_id)
-            .and_then(|partition| serde_json::to_string(&partition).ok());
-          log_delivery_gap(&gap, partition_state_json.as_deref());
+            .and_then(|partition| serde_json::to_string(&partition).ok())
+            .unwrap_or_else(|| "null".to_string());
+          log_delivery_gap(&gap, &partition_state_json);
         }
         self.prefetch_space_notify.notify_waiters();
         return Ok(delivery_result.next_result);
@@ -309,7 +310,7 @@ fn should_log_delivery_gap() -> bool {
 }
 
 /// Emit source identifiers needed to inspect both sides of a delivery discontinuity.
-fn log_delivery_gap(gap: &DeliveryGap, partition_state_json: Option<&str>) {
+fn log_delivery_gap(gap: &DeliveryGap, partition_state_json: &str) {
   let admission_scan_json = gap
     .admission_scan
     .as_ref()
@@ -341,7 +342,7 @@ fn log_delivery_gap(gap: &DeliveryGap, partition_state_json: Option<&str>) {
      last_stored_source_checkpoint={last_stored_checkpoint:?}, \
      last_stored_blob_key={last_stored_blob_key:?}, current_batch_range={}..={}, \
      current_source_checkpoint={:?}, current_blob_key={}, current_metadata_published_at={}, \
-     admission_scan_json={admission_scan_json}, partition_state_json={partition_state_json:?}",
+     admission_scan_json={admission_scan_json}, partition_state_json={partition_state_json}",
     gap.virtual_partition_id,
     gap.expected_offset,
     gap.received_offset,

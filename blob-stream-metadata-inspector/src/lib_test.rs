@@ -2,6 +2,7 @@ use super::{
   ContinuityIssue,
   CursorRelation,
   InspectorRequest,
+  MAX_WINDOW_RADIUS,
   build_report,
   cursor_context_range,
   queried_window_starts,
@@ -75,6 +76,15 @@ fn queried_windows_reject_an_overflowing_window_offset() {
 }
 
 #[test]
+fn queried_windows_reject_an_excessive_radius() {
+  let mut request = request(0);
+  request.window_radius = MAX_WINDOW_RADIUS.saturating_add(1);
+
+  let error = queried_window_starts(&request).expect_err("excessive radius must be rejected");
+  assert!(error.to_string().contains("radius"));
+}
+
+#[test]
 fn report_sorts_unordered_sources_and_finds_the_uncovered_range() {
   let request = request(11_480_895_592);
   let report = build_report(
@@ -141,6 +151,20 @@ fn report_clamps_a_true_overlap_to_the_inspected_interval() {
   assert_eq!(
     report.continuity_issues,
     vec![ContinuityIssue::Overlap { start: 11, end: 20 }]
+  );
+}
+
+#[test]
+fn report_identifies_a_contained_range_as_an_overlap() {
+  let report = build_report(
+    &request(10),
+    vec![1_788_612_500],
+    vec![segment(1, 11, 30), segment(2, 12, 20)],
+  );
+
+  assert_eq!(
+    report.continuity_issues,
+    vec![ContinuityIssue::Overlap { start: 12, end: 20 }]
   );
 }
 
