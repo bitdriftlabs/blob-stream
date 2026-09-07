@@ -239,6 +239,17 @@ impl VirtualPartitionState {
     }
   }
 
+  /// Establish Fast coverage before a pass that may stop before scanning every partition.
+  pub(super) fn seed_fast_coverage_floor(&mut self, coverage_floor: OffsetDateTime) {
+    if let Self::Fast {
+      coverage_floor: retained_coverage_floor,
+      ..
+    } = self
+    {
+      retained_coverage_floor.get_or_insert(coverage_floor);
+    }
+  }
+
   /// Return the diagnostic read mode; a pending cursor has no active reader mode yet.
   pub(super) fn reader_mode(&self) -> Option<ConsumerReaderPartitionMode> {
     match self {

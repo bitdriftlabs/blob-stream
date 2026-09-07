@@ -697,6 +697,7 @@ impl ConsumerReaderImpl {
          metadata_segments_without_partition_batches={}, metadata_batches_seen={}, \
          metadata_batches_skipped_by_cursor={}, metadata_segments_skipped_by_frontier={}, \
          metadata_segments_deferred_by_visibility={}, metadata_segments_blocked_by_visibility={}, \
+         metadata_sources_incomplete_by_capacity={}, \
          recovery_segments_handed_to_fast_by_visibility={}, \
          recovery_segments_blocked_by_visibility={}, recovery_metadata_cache_hits={}, \
          recovery_metadata_cache_misses={}, metadata_batches_deferred_by_capacity={}, \
@@ -713,6 +714,7 @@ impl ConsumerReaderImpl {
         scan_state.metadata_segments_skipped_by_frontier,
         scan_state.metadata_segments_deferred_by_visibility,
         scan_state.metadata_segments_blocked_by_visibility,
+        scan_state.metadata_sources_incomplete_by_capacity,
         scan_state.recovery_segments_handed_to_fast_by_visibility,
         scan_state.recovery_segments_blocked_by_visibility,
         scan_state.recovery_metadata_cache_hits,
@@ -781,6 +783,12 @@ impl ConsumerReaderImpl {
         )
       })
       .collect::<Vec<_>>();
+    let fast_scan_start_floor = self.fast_scan_safe_timestamp(now, runtime_settings);
+    for &partition_id in &initial_fast_partitions {
+      if let Some(state) = self.virtual_partition_states.get_mut(&partition_id) {
+        state.seed_fast_coverage_floor(fast_scan_start_floor);
+      }
+    }
     let visibility_cutoff = now.saturating_sub(runtime_settings.metadata_visibility_delay);
     // A pass can defer several sources. The worker needs only the first safe retry, not a
     // per-source timer, because rescanning then will reconsider every deferred source.
@@ -1174,6 +1182,9 @@ impl ConsumerReaderImpl {
           // A capacity stop leaves the current request only partially observed and prevents every
           // later request from being processed. Keep all affected modes at their first incomplete
           // window so a later pass cannot skip unread batches by advancing to Fast.
+          for scan_state in scan_states.values_mut() {
+            scan_state.metadata_sources_incomplete_by_capacity = true;
+          }
           for deferred_request in scan_requests.iter().skip(request_index) {
             for &partition_id in &deferred_request.eligibility.recovering_partitions {
               let partition_finalization = partition_finalizations.entry(partition_id).or_default();
@@ -1229,14 +1240,13 @@ impl ConsumerReaderImpl {
       &mut scan_states,
     )?;
     if !capacity_exhausted {
-      let fast_coverage_floor = self.fast_scan_safe_timestamp(now, runtime_settings);
       for partition_id in initial_fast_partitions {
         if !blocked_fast_sources
           .iter()
           .any(|(blocked_partition_id, _)| *blocked_partition_id == partition_id)
           && let Some(state) = self.virtual_partition_states.get_mut(&partition_id)
         {
-          state.set_fast_coverage_floor(fast_coverage_floor);
+          state.set_fast_coverage_floor(fast_scan_start_floor);
         }
       }
     }

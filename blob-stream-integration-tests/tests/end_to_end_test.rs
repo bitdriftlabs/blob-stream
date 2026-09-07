@@ -117,8 +117,10 @@ use framework::{
   write_recovery_segment,
 };
 use std::collections::{HashMap, HashSet};
+use std::future::{Future, poll_fn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::{Barrier, mpsc, watch};
@@ -4975,12 +4977,17 @@ async fn broker_backed_fast_coverage_survives_prefetch_stall_and_partial_rebalan
   assert!(revoked.partitions().contains(&revoked_partition));
   assert!(!revoked.partitions().contains(&survivor_partition));
   revocation_gate.release()?;
-  assert!(
-    timeout(Duration::from_millis(50), owner.next())
-      .await
-      .is_err(),
-    "the global delivery fence must hold until revocation completion"
-  );
+  {
+    let next = owner.next();
+    tokio::pin!(next);
+    assert!(
+      matches!(
+        poll_fn(|context| Poll::Ready(next.as_mut().poll(context))).await,
+        Poll::Pending
+      ),
+      "the global delivery fence must hold until revocation completion"
+    );
+  }
 
   let later_id = "fast-coverage-later";
   // The prior one-second flush advance makes this source newer than the missing source. At t=17,

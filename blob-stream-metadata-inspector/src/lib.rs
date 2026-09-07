@@ -148,8 +148,12 @@ pub fn queried_window_starts(request: &InspectorRequest) -> Result<Vec<i64>> {
     .ok_or_else(|| anyhow::anyhow!("metadata window count overflow"))?;
   (0 .. window_count)
     .map(|index| {
+      let window_offset = request
+        .metadata_window_seconds
+        .checked_mul(i64::from(index))
+        .ok_or_else(|| anyhow::anyhow!("metadata window offset overflow"))?;
       first_window_start
-        .checked_add(request.metadata_window_seconds * i64::from(index))
+        .checked_add(window_offset)
         .ok_or_else(|| anyhow::anyhow!("metadata window end overflow"))
     })
     .collect()
@@ -288,11 +292,14 @@ fn continuity_issues(suspect_cursor: u64, rows: &[MetadataBatchRow]) -> Vec<Cont
         start: next_expected,
         end: row.sequence_start - 1,
       });
-    } else if row.sequence_start < next_expected {
-      issues.push(ContinuityIssue::Overlap {
-        start: row.sequence_start,
-        end: next_expected - 1,
-      });
+    } else {
+      let overlap_start = row.sequence_start.max(suspect_cursor.saturating_add(1));
+      if overlap_start < next_expected {
+        issues.push(ContinuityIssue::Overlap {
+          start: overlap_start,
+          end: next_expected - 1,
+        });
+      }
     }
     next_expected = next_expected.max(row.sequence_end.saturating_add(1));
   }

@@ -150,6 +150,7 @@ pub struct ConsumerReaderScanSnapshot {
   pub metadata_segments_without_partition_batches: usize,
   pub metadata_sources: Vec<ConsumerReaderMetadataSourceSnapshot>,
   pub metadata_sources_truncated: bool,
+  pub metadata_sources_incomplete_by_capacity: bool,
   pub metadata_batches_seen: usize,
   pub metadata_batches_skipped_by_cursor: usize,
   pub metadata_segments_skipped_by_frontier: usize,
@@ -223,6 +224,7 @@ pub fn reader_partition_scan_snapshot(
       })
       .collect(),
     metadata_sources_truncated: state.metadata_sources_truncated,
+    metadata_sources_incomplete_by_capacity: state.metadata_sources_incomplete_by_capacity,
     metadata_batches_seen: state.metadata_batches_seen,
     metadata_batches_skipped_by_cursor: state.metadata_batches_skipped_by_cursor,
     metadata_segments_skipped_by_frontier: state.metadata_segments_skipped_by_frontier,

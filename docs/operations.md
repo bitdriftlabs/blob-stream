@@ -31,9 +31,10 @@ For a delivery gap, its warning's `admission_scan_json` is the exact finalized r
 admitted the gapped batch; compare its rows and partition batch ranges with the inspector output,
 then inspect the listed S3 blob keys. `partition_state_json` is a later live snapshot and is
 supplemental only. A row present now but absent from `admission_scan_json` supports an
-eventual-consistency or query-response hypothesis; a row observed but skipped at or below the
-cursor supports consumer accounting investigation; no row spanning the interval points to producer
-allocation or publication.
+eventual-consistency or query-response hypothesis only when both
+`metadata_sources_truncated` and `metadata_sources_incomplete_by_capacity` are false. A row
+observed but skipped at or below the cursor supports consumer accounting investigation; no row
+spanning the interval points to producer allocation or publication.
 
 ## Consistency Controls
 

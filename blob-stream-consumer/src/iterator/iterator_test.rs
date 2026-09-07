@@ -3267,6 +3267,9 @@ async fn seek_discards_prefetched_records_slices_the_resume_batch_and_rewinds_fa
   };
   assert_eq!(first_record.virtual_partition_id, 7);
   assert_eq!(first_record.offset, 1);
+  iterator
+    .store_offset(first_record.virtual_partition_id, first_record.offset)
+    .unwrap();
 
   let in_flight_snapshot = iterator
     .diagnostics()
@@ -3292,6 +3295,15 @@ async fn seek_discards_prefetched_records_slices_the_resume_batch_and_rewinds_fa
   .unwrap()
   .unwrap();
   assert_eq!(iterator.metrics.seeks.get(), 1);
+  {
+    let shared_state = iterator.shared_state.lock();
+    let partition_state = shared_state
+      .active_partitions
+      .get(&7)
+      .expect("seek retains the active partition");
+    assert!(partition_state.last_delivered_source.is_none());
+    assert!(partition_state.last_stored_source.is_none());
+  }
   let rewound = timeout(Duration::from_secs(2), iterator.next())
     .await
     .unwrap()

@@ -65,6 +65,16 @@ fn queried_windows_include_the_target_window_and_neighbors() {
 }
 
 #[test]
+fn queried_windows_reject_an_overflowing_window_offset() {
+  let mut request = request(0);
+  request.metadata_window_seconds = i64::MAX;
+  request.window_radius = 1;
+
+  let error = queried_window_starts(&request).expect_err("overflowing offset must be rejected");
+  assert!(error.to_string().contains("overflow"));
+}
+
+#[test]
 fn report_sorts_unordered_sources_and_finds_the_uncovered_range() {
   let request = request(11_480_895_592);
   let report = build_report(
@@ -111,6 +121,27 @@ fn report_flags_source_order_that_differs_from_sequence_order() {
     ]
   );
   assert!(report.continuity_issues.is_empty());
+}
+
+#[test]
+fn report_does_not_flag_the_consumed_prefix_of_a_cursor_crossing_batch() {
+  let report = build_report(&request(10), vec![1_788_612_500], vec![segment(1, 1, 100)]);
+
+  assert!(report.continuity_issues.is_empty());
+}
+
+#[test]
+fn report_clamps_a_true_overlap_to_the_inspected_interval() {
+  let report = build_report(
+    &request(10),
+    vec![1_788_612_500],
+    vec![segment(1, 1, 20), segment(2, 5, 30)],
+  );
+
+  assert_eq!(
+    report.continuity_issues,
+    vec![ContinuityIssue::Overlap { start: 11, end: 20 }]
+  );
 }
 
 #[test]

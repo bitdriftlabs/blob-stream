@@ -125,6 +125,25 @@ fn batch_for_slicing_test(seq_range: SeqRange) -> ConsumerBatch {
   }
 }
 
+#[test]
+fn fast_coverage_floor_seeds_only_an_uninitialized_fast_partition() {
+  let initial_floor = timestamp(100);
+  let completed_scan_floor = timestamp(200);
+  let later_attempt_floor = timestamp(300);
+  let mut state = VirtualPartitionState::Fast {
+    cursor: Some(1),
+    coverage_floor: None,
+    last_scan: None,
+  };
+
+  state.seed_fast_coverage_floor(initial_floor);
+  assert_eq!(state.fast_coverage_floor(), Some(initial_floor));
+
+  state.set_fast_coverage_floor(completed_scan_floor);
+  state.seed_fast_coverage_floor(later_attempt_floor);
+  assert_eq!(state.fast_coverage_floor(), Some(completed_scan_floor));
+}
+
 struct RecordingMetadataStore {
   inner: InMemoryMetadataStore,
   scans: Mutex<Vec<(i64, Option<SnowflakeId>)>>,
@@ -4268,6 +4287,13 @@ async fn capacity_limited_segment_read_excludes_deferred_batches() {
       .map(|batch| batch.virtual_partition_id)
       .collect::<Vec<_>>(),
     vec![7]
+  );
+  assert!(
+    first.batches[0]
+      .admission_scan
+      .as_ref()
+      .expect("capacity-limited batch retains admission evidence")
+      .metadata_sources_incomplete_by_capacity
   );
   let first_range = blob_store.ranges().pop().unwrap();
   assert_eq!(first_range.start, 0);
