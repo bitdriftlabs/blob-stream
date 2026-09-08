@@ -71,7 +71,7 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 | `batches_delivered`, `records_delivered`, `delivery_gap_events` | Counters | Batches and records yielded to application code, and application-visible sequence discontinuities. A gap is an observation, not a root-cause classification; its rate-limited warning includes `admission_scan_json`, the immutable reader scan that admitted the batch, plus live supplemental partition state. |
 | `next_latency_seconds`, `commit_latency_seconds` | Histograms | Application-visible `next()` and explicit `commit()` operation latency. |
 | `retries`, `failures`, `seeks`, `revocations` | Counters | Iterator retry attempts, terminal failures, explicit cursor seeks, and revocation events surfaced to the application. |
-| `rebalances_total`, `rebalance_failures_total` | Counters | Rebalance attempts and attempts that failed before an assignment applied. |
+| `rebalance_failures_total` | Counters | Rebalance attempts that failed before an assignment applied. |
 | `assignment_plans_applied_total`, `assignment_plan_rejections_total`, `assignment_applications_total` | Counters | Accepted assignment plans, rejected plan versions, and local assignment changes that reached the reader. |
 | `lease_claims_initial`, `lease_claims_retained`, `lease_claims_graceful_handoff`, `lease_claims_expiry_takeover` | Counters | Partition claims classified by initial ownership, retention, cooperative handoff, or takeover after owner expiry. |
 | `desired_partitions`, `owned_partitions`, `active_partitions` | Gauges | Partitions assigned by the plan, currently leased by this member, and currently active for reading. |

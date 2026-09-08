@@ -32,16 +32,3 @@ impl AvailabilityHorizon {
     self.0
   }
 }
-
-#[must_use]
-/// Return the effective metadata maturity duration for the resolved consistency mode.
-pub fn metadata_visibility_delay(
-  configured_visibility_delay: Duration,
-  strongly_consistent: bool,
-) -> Duration {
-  if strongly_consistent {
-    Duration::ZERO
-  } else {
-    configured_visibility_delay
-  }
-}

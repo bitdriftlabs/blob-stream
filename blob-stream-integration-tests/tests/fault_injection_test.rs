@@ -329,7 +329,6 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -434,12 +433,7 @@ async fn network_response_loss_after_persistence_retries_with_duplicate_batch() 
     ack.attempts
   );
 
-  let mut runtime = consumer_runtime_config("fit-response-loss-member");
-  runtime
-    .read
-    .as_mut()
-    .ok_or_else(|| anyhow::anyhow!("response-loss consumer read config missing"))?
-    .strongly_consistent_metadata_reads = Some(true);
+  let runtime = consumer_runtime_config("fit-response-loss-member");
   let group = runtime
     .group
     .as_ref()
@@ -660,12 +654,7 @@ async fn response_loss_retry_during_broker_handoff_preserves_group_delivery_cont
   );
   assert_eq!(ack.virtual_partition_id, virtual_partition_id);
 
-  let mut runtime = consumer_runtime_config("fit-response-loss-handoff-member");
-  runtime
-    .read
-    .as_mut()
-    .ok_or_else(|| anyhow::anyhow!("handoff consumer read config missing"))?
-    .strongly_consistent_metadata_reads = Some(true);
+  let runtime = consumer_runtime_config("fit-response-loss-handoff-member");
   let group = runtime
     .group
     .as_ref()
@@ -1055,7 +1044,6 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -1350,7 +1338,6 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -1432,7 +1419,6 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -1545,7 +1531,6 @@ async fn s3_get_not_found_consumer_skips_lost_data() -> Result<()> {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     produced_partitions.into_iter().collect(),
@@ -1715,12 +1700,7 @@ async fn metadata_write_fail_then_retry_ack_semantics() -> Result<()> {
     "same-key recovery marker must remain on the failed request partition"
   );
 
-  let mut runtime = consumer_runtime_config("fit-007-member");
-  runtime
-    .read
-    .as_mut()
-    .ok_or_else(|| anyhow::anyhow!("metadata retry consumer read config missing"))?
-    .strongly_consistent_metadata_reads = Some(true);
+  let runtime = consumer_runtime_config("fit-007-member");
   let group = runtime
     .group
     .as_ref()
@@ -1836,7 +1816,6 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     (0 .. framework::PARTITION_COUNT).collect(),
@@ -2129,15 +2108,8 @@ async fn consumer_lease_store_heartbeat_failover() -> Result<()> {
     .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
-  let mut runtime_a = consumer_runtime_config("fit-010-a");
-  let mut runtime_b = consumer_runtime_config("fit-010-b");
-  for runtime in [&mut runtime_a, &mut runtime_b] {
-    runtime
-      .read
-      .as_mut()
-      .ok_or_else(|| anyhow::anyhow!("fit-010 consumer read config missing"))?
-      .strongly_consistent_metadata_reads = Some(true);
-  }
+  let runtime_a = consumer_runtime_config("fit-010-a");
+  let runtime_b = consumer_runtime_config("fit-010-b");
   let group = runtime_a
     .group
     .as_ref()
@@ -3603,12 +3575,7 @@ async fn run_scripted_transport_fault_scenario() -> Result<Fit012Outcome> {
     expected_ids.insert(id);
   }
 
-  let mut runtime = consumer_runtime_config("fit-012-member");
-  runtime
-    .read
-    .as_mut()
-    .ok_or_else(|| anyhow::anyhow!("scripted trace consumer read config missing"))?
-    .strongly_consistent_metadata_reads = Some(true);
+  let runtime = consumer_runtime_config("fit-012-member");
   let group = runtime
     .group
     .as_ref()

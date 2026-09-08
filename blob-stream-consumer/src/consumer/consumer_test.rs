@@ -13,6 +13,7 @@ use super::{
   ConsumerReaderImpl,
   ReadCapacity,
 };
+use crate::EventualMetadataReadsConfig;
 use crate::config::{
   ConsumerReadConfig,
   ConsumerReadRuntimeSettings,
@@ -81,16 +82,27 @@ use blob_stream_types::{
 use bytes::Bytes;
 use parking_lot::Mutex;
 use prometheus::labels;
-use protobuf::Message;
+use protobuf::{Message, MessageField};
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use time::ext::NumericalDuration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::{Duration, timeout};
 
 const TEST_READ_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
+
+fn eventual_metadata_reads(
+  visibility_delay: TimeDuration,
+) -> MessageField<EventualMetadataReadsConfig> {
+  Some(EventualMetadataReadsConfig {
+    visibility_delay: visibility_delay.into_proto(),
+    ..Default::default()
+  })
+  .into()
+}
 
 fn timestamp(unix_seconds: i64) -> OffsetDateTime {
   OffsetDateTime::from_unix_timestamp(unix_seconds).expect("test timestamp is in range")
@@ -786,16 +798,15 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
     ConsumerReadRuntimeSettings {
       prefetch_max_bytes: 16,
       max_in_flight_batch_reads: 2,
-      metadata_read_consistency: MetadataReadConsistency::Eventual,
-      metadata_visibility_delay: time::Duration::milliseconds(2_000),
+      metadata_read_consistency: MetadataReadConsistency::Strong,
+      metadata_visibility_delay: time::Duration::ZERO,
     }
   );
 
   feature_flags.update(Arc::new(
     DefaultFeatureFlags::default()
       .with_integer_flag("blob_stream_consumer_prefetch_max_bytes", 32)
-      .with_integer_flag("blob_stream_consumer_max_in_flight_batch_reads", 4)
-      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
+      .with_integer_flag("blob_stream_consumer_max_in_flight_batch_reads", 4),
   ));
   assert_eq!(
     reader.runtime_settings(),
@@ -814,6 +825,7 @@ fn eventual_broker_reads_include_cache_age_in_availability_horizon() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
+      eventual_metadata_reads: Some(EventualMetadataReadsConfig::new()).into(),
       ..Default::default()
     },
     Vec::new(),
@@ -1006,7 +1018,6 @@ async fn seek_slices_a_multi_record_batch_and_suppresses_a_fully_consumed_batch(
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -1078,7 +1089,6 @@ async fn reader_rejects_decoded_batch_with_mismatched_record_count() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -1337,7 +1347,7 @@ async fn visibility_delay_defers_newly_published_metadata() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
+      eventual_metadata_reads: eventual_metadata_reads(1.seconds()),
       ..Default::default()
     },
     vec![7],
@@ -1438,8 +1448,6 @@ async fn strong_metadata_reads_accept_future_metadata_publication_timestamps() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -1478,93 +1486,12 @@ async fn strong_metadata_reads_accept_future_metadata_publication_timestamps() {
   assert_eq!(scan_state[0].metadata_segments_deferred_by_visibility, 0);
 }
 
-#[tokio::test]
-async fn runtime_strong_metadata_reads_apply_on_the_next_scan() {
-  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
-  let recording_metadata_store = Arc::new(RecordingMetadataStore::new());
-  let metadata_store: Arc<dyn MetadataStore> = recording_metadata_store.clone();
-  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
-
-  write_segment_with_publication_time(
-    blob_store.as_ref(),
-    metadata_store.as_ref(),
-    "telemetry",
-    900,
-    1,
-    7,
-    SeqRange { start: 1, end: 1 },
-    vec![new_record(vec![1], 902_000)],
-    Compression::none(),
-    902_000,
-  )
-  .await;
-
-  let mut reader = ConsumerReaderImpl::new(
-    Arc::new(SystemTimeProvider),
-    ConsumerReadConfig {
-      topic: "telemetry".to_string().into(),
-      metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
-      ..Default::default()
-    },
-    vec![7],
-    HashMap::new(),
-    blob_store,
-    metadata_store,
-    rejecting_broker_metadata_query(),
-    rejecting_broker_blob_range_query(),
-    &metrics_scope(),
-    TimeDuration::days(1),
-    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-    Some(feature_flags.snapshot_watch()),
-  )
-  .unwrap();
-
-  let eventual = reader
-    .read_available_with_capacity_and_settings(
-      timestamp(902),
-      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
-      reader.runtime_settings(),
-    )
-    .await
-    .unwrap();
-  assert!(eventual.batches.is_empty());
-  assert_eq!(reader.cursor(7), None);
-
-  feature_flags.update(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
-  ));
-  let strong = reader
-    .read_available_with_capacity_and_settings(
-      timestamp(902),
-      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
-      reader.runtime_settings(),
-    )
-    .await
-    .unwrap();
-
-  assert_eq!(strong.batches.len(), 1);
-  assert_eq!(strong.next_metadata_eligible_at, None);
-  assert_eq!(reader.cursor(7), Some(1));
-  assert!(
-    recording_metadata_store
-      .consistencies
-      .lock()
-      .iter()
-      .rev()
-      .take(2)
-      .all(|consistency| *consistency == MetadataReadConsistency::Strong)
-  );
-}
-
 #[test]
 fn strong_metadata_reads_use_clock_skew_without_a_visibility_delay() {
   let reader = ConsumerReaderImpl::new(
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      metadata_visibility_delay: TimeDuration::milliseconds(2_000).into_proto(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     Vec::new(),
@@ -1627,7 +1554,7 @@ async fn derived_horizon_retries_visibility_deferred_metadata_across_window_boun
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      metadata_visibility_delay: TimeDuration::milliseconds(300_000).into_proto(),
+      eventual_metadata_reads: eventual_metadata_reads(300.seconds()),
       ..Default::default()
     },
     vec![7],
@@ -1778,8 +1705,6 @@ async fn recovery_scans_single_checkpoint_window_with_overlap_bound() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     Vec::new(),
@@ -1838,7 +1763,6 @@ fn recovery_only_bounds_its_checkpoint_window() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     Vec::new(),
@@ -1902,10 +1826,6 @@ async fn broker_recovery_uses_tail_for_checkpoint_and_full_recovery_afterward() 
   let broker_query = Arc::new(RecordingBrokerMetadataQuery {
     requests: Mutex::new(Vec::new()),
   });
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
-  ));
   let mut reader = ConsumerReaderImpl::new(
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
@@ -1921,7 +1841,7 @@ async fn broker_recovery_uses_tail_for_checkpoint_and_full_recovery_afterward() 
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-    Some(feature_flags.snapshot_watch()),
+    None,
   )
   .unwrap();
   reader.hydrate_cursor_with_source(
@@ -2043,10 +1963,6 @@ async fn broker_recovery_delivery_preserves_batches_and_cursor() {
       (window_start + 300, recovery_response),
     ]),
   });
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
-  ));
   let mut reader = ConsumerReaderImpl::new(
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
@@ -2062,7 +1978,7 @@ async fn broker_recovery_delivery_preserves_batches_and_cursor() {
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-    Some(feature_flags.snapshot_watch()),
+    None,
   )
   .unwrap();
   reader.hydrate_cursor_with_source(
@@ -2244,7 +2160,6 @@ fn fast_coverage_tail_stays_on_the_fast_path_at_window_rollover() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -2299,7 +2214,6 @@ fn fast_coverage_tail_clamps_a_stale_floor_to_the_retained_window() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -2355,7 +2269,6 @@ async fn fast_scan_bound_diagnostics_exclude_partitions_outside_a_targeted_tail(
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7, 8],
@@ -2444,7 +2357,6 @@ async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7, 8],
@@ -2535,7 +2447,6 @@ async fn merged_fast_coverage_tail_partial_cache_hit_requeries_and_refreshes_ent
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7, 8],
@@ -2687,7 +2598,6 @@ async fn fast_gap_probe_preserves_late_predecessor_and_all_later_window_frontier
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -2837,7 +2747,6 @@ async fn fast_gap_hold_reschedules_after_an_empty_intermediate_probe() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -2930,7 +2839,6 @@ async fn fast_gap_retry_survives_capacity_exhaustion_by_a_held_candidate() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -3003,7 +2911,6 @@ async fn fast_gap_retry_does_not_delay_capacity_deferred_work_for_another_partit
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7, 8],
@@ -3060,7 +2967,6 @@ fn fast_gap_probes_every_half_second_without_exceeding_maturity_deadline() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -3149,7 +3055,6 @@ async fn fast_gap_guard_does_not_hold_contiguous_cross_window_batches() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -3218,7 +3123,6 @@ async fn fast_gap_guard_releases_a_genuine_gap_after_predecessor_matures() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -3334,7 +3238,6 @@ async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     Vec::new(),
@@ -3423,7 +3326,7 @@ async fn recovery_waits_for_visibility_deferred_window_before_advancing() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
+      eventual_metadata_reads: eventual_metadata_reads(1.seconds()),
       ..Default::default()
     },
     Vec::new(),
@@ -3535,7 +3438,7 @@ async fn recovery_does_not_advance_cursor_past_visibility_deferred_window() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
+      eventual_metadata_reads: eventual_metadata_reads(1.seconds()),
       ..Default::default()
     },
     Vec::new(),
@@ -3612,7 +3515,7 @@ async fn recovery_hands_active_window_visibility_deferral_to_fast() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
+      eventual_metadata_reads: eventual_metadata_reads(1.seconds()),
       ..Default::default()
     },
     Vec::new(),
@@ -3970,7 +3873,6 @@ async fn recovery_capacity_resumes_at_the_first_deferred_window() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     Vec::new(),
@@ -4069,7 +3971,6 @@ async fn recovery_capacity_deferral_keeps_unprocessed_cutover_partitions_recover
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     Vec::new(),
@@ -4166,7 +4067,6 @@ async fn fresh_capacity_deferral_retries_the_initial_window_before_fast_path() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     Vec::new(),
@@ -4250,7 +4150,6 @@ async fn mature_recovery_metadata_is_scanned_once_across_capacity_cycles() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     Vec::new(),
@@ -4367,7 +4266,7 @@ async fn mature_recovery_metadata_caches_after_visibility_deferral() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
+      eventual_metadata_reads: eventual_metadata_reads(1.seconds()),
       ..Default::default()
     },
     Vec::new(),
@@ -4482,7 +4381,6 @@ async fn mature_recovery_metadata_survives_blob_read_failure() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     Vec::new(),
@@ -5810,7 +5708,6 @@ async fn fast_scan_uses_per_partition_inclusive_frontier() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -5853,7 +5750,6 @@ async fn fast_scan_retains_coverage_after_capacity_stall() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -5944,7 +5840,6 @@ async fn fast_scan_catches_up_coverage_across_window_stall() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -6034,7 +5929,7 @@ async fn fast_coverage_tail_retains_visibility_deferred_rows_below_the_fast_floo
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      metadata_visibility_delay: TimeDuration::seconds(1).into_proto(),
+      eventual_metadata_reads: eventual_metadata_reads(1.seconds()),
       ..Default::default()
     },
     vec![7],
@@ -6142,7 +6037,6 @@ async fn fast_scan_uses_lowest_partition_frontier_for_cross_partition_ordering()
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7, 8],
@@ -6230,7 +6124,6 @@ async fn direct_fast_scan_reapplies_each_partition_effective_lower_bound() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7, 8],
@@ -6292,11 +6185,6 @@ async fn broker_tail_request_keeps_each_fast_partition_frontier() {
   let broker_query = Arc::new(RecordingBrokerMetadataQuery {
     requests: Mutex::new(Vec::new()),
   });
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", true),
-  ));
-
   write_segment(
     blob_store.as_ref(),
     metadata_store.as_ref(),
@@ -6337,7 +6225,7 @@ async fn broker_tail_request_keeps_each_fast_partition_frontier() {
     &metrics_scope(),
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-    Some(feature_flags.snapshot_watch()),
+    None,
   )
   .unwrap();
 
@@ -6434,22 +6322,22 @@ async fn broker_offload_read(
       BrokerMetadataResponse::TransportFailure => HashMap::new(),
     },
   });
-  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default().with_bool_flag(
-    "blob_stream_consumer_strong_metadata_reads",
-    !matches!(broker_response, BrokerMetadataResponse::StaleAtReceipt),
-  )));
   let time_provider: Arc<dyn TimeProvider> =
     if matches!(broker_response, BrokerMetadataResponse::StaleAtReceipt) {
       Arc::new(ManualTimeProvider::new(timestamp(902)))
     } else {
       Arc::new(SystemTimeProvider)
     };
+  let mut consumer_config = ConsumerReadConfig {
+    topic: "telemetry".to_string().into(),
+    ..Default::default()
+  };
+  if matches!(broker_response, BrokerMetadataResponse::StaleAtReceipt) {
+    consumer_config.eventual_metadata_reads = eventual_metadata_reads(2.seconds());
+  }
   let reader = ConsumerReaderImpl::new(
     time_provider,
-    ConsumerReadConfig {
-      topic: "telemetry".to_string().into(),
-      ..Default::default()
-    },
+    consumer_config,
     vec![7],
     HashMap::new(),
     blob_store,
@@ -6459,7 +6347,7 @@ async fn broker_offload_read(
     &metrics_scope,
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-    Some(feature_flags.snapshot_watch()),
+    None,
   )
   .unwrap()
   .metadata_cache_max_age(TimeDuration::milliseconds(250));
@@ -6572,7 +6460,6 @@ async fn seek_resets_partition_fast_frontier() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -6647,7 +6534,6 @@ async fn source_directed_seek_normalizes_target_window_and_handles_future_window
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -6795,8 +6681,6 @@ async fn source_directed_seek_uses_the_checkpoint_snowflake_lower_bound() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      metadata_visibility_delay: TimeDuration::milliseconds(1_000).into_proto(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -6868,7 +6752,6 @@ async fn fast_scan_uses_per_window_frontiers_across_candidate_window_boundary() 
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7, 8],
@@ -6943,6 +6826,7 @@ async fn fast_scan_omits_windows_before_the_safe_publication_floor() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
+      eventual_metadata_reads: eventual_metadata_reads(2.seconds()),
       ..Default::default()
     },
     vec![7],
@@ -7004,7 +6888,6 @@ async fn fast_scan_prunes_frontiers_for_windows_before_the_safe_publication_floo
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![7],
@@ -7200,6 +7083,7 @@ async fn fast_scan_bounds_sparse_partitions_with_the_safe_publication_floor() {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: "telemetry".to_string().into(),
+      eventual_metadata_reads: eventual_metadata_reads(2.seconds()),
       ..Default::default()
     },
     vec![7, 8],

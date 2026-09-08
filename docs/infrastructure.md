@@ -82,17 +82,17 @@ Feature flags affect local process behavior. Broker controls include
 `blob_stream_broker_flush_max_bytes`, and `blob_stream_broker_flush_max_delay_ms`. The segment and
 flush threshold overrides accept positive integers; invalid values retain the configured fallback.
 The flush settings are sampled for the next timer cycle, while the segment cap applies to newly
-selected flushes. Consumer reader flags `blob_stream_consumer_strong_metadata_reads`,
-`blob_stream_consumer_prefetch_max_bytes`, and `blob_stream_consumer_max_in_flight_batch_reads` are
-live. `ConsumerIteratorBootstrapConfig.broker_discovery` is required. Consumers use the broker
-metadata and blob caches for every read, retrying direct storage only after a broker transport,
-validation, overload, or stale-observation failure. Blob-cache idle retention is configured when a
-broker starts through `blob_stream_broker_blob_cache_idle_ttl_ms`; it defaults to 10 seconds and
-must be positive. The broker admits each complete object from its reported content length and
-current cgroup headroom before reading its body. Consumer polling and group scheduling flags are
-sampled when a consumer is constructed. Producer batching, retry, timeout, concurrency, and
-compression flags are sampled when a producer is constructed. See [Operations](operations.md) for
-the complete inventory and rollout behavior.
+selected flushes. Consumer reader flags `blob_stream_consumer_prefetch_max_bytes` and
+`blob_stream_consumer_max_in_flight_batch_reads` are live. Metadata consistency is configured
+statically through `eventual_metadata_reads`. `ConsumerIteratorBootstrapConfig.broker_discovery` is
+required. Consumers use the broker metadata and blob caches for every read, retrying direct storage
+only after a broker transport, validation, overload, or stale-observation failure. Blob-cache idle
+retention is configured when a broker starts through `blob_stream_broker_blob_cache_idle_ttl_ms`; it
+defaults to 10 seconds and must be positive. The broker admits each complete object from its
+reported content length and current cgroup headroom before reading its body. Consumer polling and
+group scheduling flags are sampled when a consumer is constructed. Producer batching, retry,
+timeout, concurrency, and compression flags are sampled when a producer is constructed. See
+[Operations](operations.md) for the complete inventory and rollout behavior.
 
 ## S3
 

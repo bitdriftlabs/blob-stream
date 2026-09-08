@@ -350,6 +350,14 @@ message ProducerRuntimeConfig {
   repeated TopicConfig topics = 3 [(validate.rules).repeated.min_items = 1];
 }
 
+// Eventual-consistency settings for consumer metadata reads.
+message EventualMetadataReadsConfig {
+  // Delay accepting recently published metadata rows. Default when unset: 2,000 ms. This is a
+  // best-effort staleness margin, not a consistency guarantee because the metadata store has no
+  // bounded replication delay.
+  google.protobuf.Duration visibility_delay = 1 [(validate.rules).duration.gte = {}];
+}
+
 // Consumer read path settings.
 message ConsumerReadConfig {
   // Topic to scan for segment metadata.
@@ -375,10 +383,9 @@ message ConsumerReadConfig {
   // - Decrease to reduce process memory footprint when running many consumers per host.
   optional uint64 prefetch_max_bytes = 6 [(validate.rules).uint64.gt = 0];
 
-  // Delay accepting recently published metadata rows while using eventually consistent reads.
-  // Default when unset: 2,000 ms. This is a best-effort staleness margin, not a
-  // consistency guarantee because the metadata store has no bounded replication delay.
-  google.protobuf.Duration metadata_visibility_delay = 9 [(validate.rules).duration.gte = {}];
+  // Optional settings for eventually consistent metadata reads. When unset, metadata reads use
+  // DynamoDB strong consistency. When set, visibility_delay defaults to 2,000 ms when unset.
+  optional EventualMetadataReadsConfig eventual_metadata_reads = 9;
 
   // Maximum number of batch byte-range reads and decodes that may run concurrently.
   // Default when unset: 32.
@@ -387,10 +394,6 @@ message ConsumerReadConfig {
   // total consumer-owned payload capacity. Increase only after confirming object-store and host
   // capacity can sustain the additional concurrent work.
   optional uint64 max_in_flight_batch_reads = 10 [(validate.rules).uint64.gt = 0];
-
-  // Read metadata from DynamoDB with strong consistency. Default when unset: false.
-  // Strong reads remove read-replica staleness but do not fence stale producer publication.
-  optional bool strongly_consistent_metadata_reads = 11;
 
   // Maximum pairwise amount by which this consumer clock may lead a broker clock. This must cover
   // time-source uncertainty and is included in the metadata availability horizon.

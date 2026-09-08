@@ -330,7 +330,6 @@ impl ConsumerIteratorBuilder<'_> {
       .await?;
     let snapshot = driver.coordination_source.snapshot().await?;
     driver.record_coordination_snapshot(&snapshot);
-    driver.metrics.rebalances_total.inc();
     let report = driver
       .coordinator
       .rebalance(snapshot.members, snapshot.virtual_partitions, now)

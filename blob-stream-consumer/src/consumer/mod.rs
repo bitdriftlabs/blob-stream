@@ -37,5 +37,4 @@ pub(crate) use state::{
   RecoveryState,
   VirtualPartitionState,
 };
-pub(crate) use time::metadata_visibility_delay;
 use time::{AvailabilityHorizon, offset_datetime_from_unix_seconds};

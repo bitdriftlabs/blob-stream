@@ -437,7 +437,6 @@ impl ConsumerDriver {
     }
     let snapshot = self.coordination_source.snapshot().await?;
     self.record_coordination_snapshot(&snapshot);
-    self.metrics.rebalances_total.inc();
     // The coordinator validates the shared plan, claims the resulting leases, and returns both
     // the owned set and any durable cursors that must be recovered before delivery resumes.
     let report = match self
