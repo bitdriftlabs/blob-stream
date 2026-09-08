@@ -52,6 +52,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   TailMetadataCoverage,
   read_metadata_window_request,
 };
+use blob_stream_types::Window;
 use time::ext::NumericalDuration;
 use tokio::sync::Semaphore;
 
@@ -83,8 +84,10 @@ struct ScanPassFinalization {
 impl ConsumerReaderImpl {
   /// Load metadata for every planned window, preserving plan order across cache hits and queries.
   ///
-  /// Mature recovery entries are narrowed to their sole partition before caching; a window with a
-  /// visibility-deferred segment remains uncached so the next scan observes the full result.
+  /// Only mature per-partition Recovery results and Fast rollover-tail entries are cached. They
+  /// are immutable by the time they become eligible for this cache, while a visibility-deferred
+  /// result must be queried again so a later pass can observe rows that were not yet safe to
+  /// consume.
   async fn materialize_window_results(
     &mut self,
     scan_requests: &[ScanRequest],
@@ -97,32 +100,52 @@ impl ConsumerReaderImpl {
     let mut cached_window_results = Vec::new();
     let mut scan_futures = Vec::new();
     for (request_index, request) in scan_requests.iter().cloned().enumerate() {
-      let cache_key = self.mature_recovery_metadata_cache_key(&request, now, runtime_settings);
-      if let Some(cache_key) = cache_key
-        && let Some(segments) = self.recovery_metadata_cache.get(&cache_key)
+      let cache_keys = self.mature_metadata_cache_keys(&request, now, runtime_settings);
+      // A merged Fast-tail query is stored as independently filtered entries because later scan
+      // passes might need a subset of its partitions. Reuse is deliberately all-or-nothing:
+      // returning only the entries that happen to be present would mark the request complete
+      // while silently skipping uncached partitions. On a partial hit, query once and refresh
+      // every participating entry together below.
+      if !cache_keys.is_empty()
+        && let Some(cached_segments) = cache_keys
+          .iter()
+          .map(|cache_key| self.recovery_metadata_cache.get(cache_key).cloned())
+          .collect::<Option<Vec<_>>>()
       {
-        self.metrics.record_recovery_metadata_cache_hit();
-        if let Some(scan_state) = scan_states.get_mut(&cache_key.0) {
-          scan_state.recovery_metadata_cache_hits =
-            scan_state.recovery_metadata_cache_hits.saturating_add(1);
+        // Cached entries no longer retain the other partitions from their original request.
+        // Rebuild that response shape here so the normal filtering, frontier, and capacity code
+        // cannot distinguish a cache hit from a direct metadata-store result.
+        let mut merged_segments = cached_segments
+          .into_iter()
+          .flat_map(|segments| segments.iter().cloned().collect::<Vec<_>>())
+          .collect::<Vec<_>>();
+        merged_segments.sort_by_key(|metadata| metadata.snowflake_id);
+        for cache_key in &cache_keys {
+          self.metrics.record_recovery_metadata_cache_hit();
+          if let Some(scan_state) = scan_states.get_mut(&cache_key.0) {
+            scan_state.recovery_metadata_cache_hits =
+              scan_state.recovery_metadata_cache_hits.saturating_add(1);
+          }
         }
         trace!(
-          "consumer reused cached recovery metadata: topic={}, partition={}, window_start={}, \
+          "consumer reused cached mature metadata: topic={}, partitions={:?}, window_start={}, \
            segments={}",
           self.config.topic,
-          cache_key.0,
+          cache_keys.iter().map(|key| key.0).collect::<Vec<_>>(),
           offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
-          segments.len()
+          merged_segments.len()
         );
         cached_window_results.push((
           request_index,
           request,
-          Arc::clone(segments),
+          merged_segments.into(),
           visibility_cutoff,
         ));
         continue;
       }
-      if let Some(cache_key) = cache_key {
+      // Metrics are per cache identity, including a partial hit. A direct query after a partial
+      // hit is still necessary to restore a complete immutable response for this request.
+      for cache_key in &cache_keys {
         self.metrics.record_recovery_metadata_cache_miss();
         if let Some(scan_state) = scan_states.get_mut(&cache_key.0) {
           scan_state.recovery_metadata_cache_misses =
@@ -149,6 +172,8 @@ impl ConsumerReaderImpl {
             .await
           {
             Ok(response) => {
+              // The cache-age contract is measured at receipt, not at scan start. A broker RPC
+              // can itself consume the allowed age, particularly when tests use a manual clock.
               let received_at = time_provider.now();
               match decode_metadata_response(
                 &broker_request,
@@ -195,7 +220,7 @@ impl ConsumerReaderImpl {
           request_index,
           request,
           segments,
-          cache_key,
+          cache_keys,
           result_visibility_cutoff,
         ))
       });
@@ -211,24 +236,32 @@ impl ConsumerReaderImpl {
         return Err(error);
       },
     };
-    for (request_index, request, segments, cache_key, result_visibility_cutoff) in
+    for (request_index, request, segments, cache_keys, result_visibility_cutoff) in
       queried_window_results
     {
-      let segments = if let Some(cache_key) = cache_key {
-        let partition_id = cache_key.0;
-        let has_visibility_deferred_segment = runtime_settings.metadata_read_consistency
-          == MetadataReadConsistency::Eventual
-          && segments.iter().any(|segment| {
-            segment.segment_index.contains_key(&partition_id)
+      // Eventual-consistency results that contain rows newer than the cutoff are incomplete by
+      // definition. Do not cache them: a later retry must query again to observe the rows that
+      // were not yet safe to consume. Cached mature windows, in contrast, are immutable.
+      let has_visibility_deferred_segment = runtime_settings.metadata_read_consistency
+        == MetadataReadConsistency::Eventual
+        && cache_keys.iter().any(|cache_key| {
+          segments.iter().any(|segment| {
+            segment.segment_index.contains_key(&cache_key.0)
               && segment.metadata_published_at > result_visibility_cutoff
-          });
-        if has_visibility_deferred_segment {
-          let mut segments = segments;
-          segments.sort_by_key(|metadata| metadata.snowflake_id);
-          segments.into()
-        } else {
-          let mut cached_segments = segments
-            .into_iter()
+          })
+        });
+      let mut segments = segments;
+      segments.sort_by_key(|metadata| metadata.snowflake_id);
+      if !cache_keys.is_empty() && !has_visibility_deferred_segment {
+        // Preserve the full response for this pass, but cache a copy containing only one
+        // partition's batches for each identity. The later cache-hit path merges those copies
+        // back into a response in Snowflake order. Clearing the original index avoids retaining
+        // unrelated partition batches in an entry that may be reused on its own.
+        for cache_key in cache_keys {
+          let partition_id = cache_key.0;
+          let cached_segments = segments
+            .iter()
+            .cloned()
             .filter_map(|mut segment| {
               let partition_batches = segment.segment_index.remove(&partition_id)?;
               segment.segment_index.clear();
@@ -238,11 +271,9 @@ impl ConsumerReaderImpl {
               Some(segment)
             })
             .collect::<Vec<_>>();
-          cached_segments.sort_by_key(|metadata| metadata.snowflake_id);
           let cached_segments: Arc<[SegmentMetadata]> = cached_segments.into();
           trace!(
-            "consumer cached mature recovery metadata: topic={}, partition={}, window_start={}, \
-             segments={}",
+            "consumer cached mature metadata: topic={}, partition={}, window_start={}, segments={}",
             self.config.topic,
             partition_id,
             offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
@@ -250,16 +281,16 @@ impl ConsumerReaderImpl {
           );
           self
             .recovery_metadata_cache
-            .insert(cache_key, Arc::clone(&cached_segments));
+            .insert(cache_key, cached_segments);
           self.metrics.record_recovery_metadata_cache_insert();
-          cached_segments
         }
-      } else {
-        let mut segments = segments;
-        segments.sort_by_key(|metadata| metadata.snowflake_id);
-        segments.into()
-      };
-      cached_window_results.push((request_index, request, segments, result_visibility_cutoff));
+      }
+      cached_window_results.push((
+        request_index,
+        request,
+        segments.into(),
+        result_visibility_cutoff,
+      ));
     }
     self.record_recovery_metadata_cache_state();
     cached_window_results.sort_by_key(|(request_index, ..)| *request_index);
@@ -565,6 +596,9 @@ impl ConsumerReaderImpl {
     } = finalization;
     let mut initial_scans_completed = Vec::new();
     let mut recoveries_completed = Vec::new();
+    // A Fresh scan covers its assigned current window. Once complete, Fast starts at this pass's
+    // safety floor; any part of the preceding window that ages safe on the next pass is handled by
+    // the planner's one-window Fast tail rather than by a transient Recovery transition.
     let fast_coverage_floor = self.fast_scan_safe_timestamp(now, runtime_settings);
     for (partition_id, state) in &mut self.virtual_partition_states {
       let mut next_state = None;
@@ -600,12 +634,16 @@ impl ConsumerReaderImpl {
           let recovery_window_end = partition_finalization
             .visibility_deferred_recovery_window
             .map_or(recovery_window_end, |deferred_window| {
+              // The deferred window is not complete. Resume at its predecessor so the next pass
+              // advances into it normally instead of moving the recovery cursor past unread rows.
               recovery_window_end
                 .min(deferred_window.saturating_sub(self.metadata_window_size.whole_seconds()))
             });
           let recovery_window_end = partition_finalization
             .capacity_deferred_recovery_window
             .map_or(recovery_window_end, |deferred_window| {
+              // Capacity stops this window and every later planned request. The same predecessor
+              // rule preserves chronological recovery and prevents a later cursor from skipping it.
               recovery_window_end
                 .min(deferred_window.saturating_sub(self.metadata_window_size.whole_seconds()))
             });
@@ -659,6 +697,8 @@ impl ConsumerReaderImpl {
       );
     }
 
+    let retention_floor = self
+      .retention_floor_window_start(Window::for_timestamp(now, self.metadata_window_size).start);
     self
       .recovery_metadata_cache
       .retain(|(partition_id, window_start, _), _| {
@@ -666,6 +706,18 @@ impl ConsumerReaderImpl {
           self.virtual_partition_states.get(partition_id),
           Some(VirtualPartitionState::Recovering { recovery_state, .. })
             if recovery_state.next_window_start_unix_seconds <= *window_start
+        ) || matches!(
+          self.virtual_partition_states.get(partition_id),
+          Some(VirtualPartitionState::Fast {
+            coverage_floor: Some(coverage_floor),
+            ..
+          }) if Window::for_timestamp(
+            (*coverage_floor).max(retention_floor),
+            self.metadata_window_size,
+          )
+            .start
+            .unix_timestamp()
+            == *window_start
         )
       });
     self.record_recovery_metadata_cache_state();
@@ -787,6 +839,8 @@ impl ConsumerReaderImpl {
     let fast_scan_start_floor = self.fast_scan_safe_timestamp(now, runtime_settings);
     for &partition_id in &initial_fast_partitions {
       if let Some(state) = self.virtual_partition_states.get_mut(&partition_id) {
+        // Retain the pass-start floor until all Fast sources complete. If capacity interrupts this
+        // pass, the next pass must still cover everything at or after this exact timestamp.
         state.seed_fast_coverage_floor(fast_scan_start_floor);
       }
     }
@@ -795,9 +849,10 @@ impl ConsumerReaderImpl {
     // per-source timer, because rescanning then will reconsider every deferred source.
     let mut next_visibility_eligible_at = None::<time::OffsetDateTime>;
 
-    // Requests merge partitions sharing a metadata window. Recovery scans catch late
-    // lower-snowflake rows, while fast scans avoid rereading metadata outside its visibility
-    // horizon; per-partition filtering is reapplied after each shared query.
+    // Requests merge partitions sharing a metadata window. The DynamoDB query uses the lowest
+    // needed Snowflake bound, then execution reapplies each partition's stricter Fast frontier.
+    // Recovery catches debt that escaped the live horizon; Fast covers the normal live range and
+    // its one-window rollover tail.
     let (scan_requests, recovery_scan) =
       self.scan_requests(now, &assigned_partition_ids, runtime_settings)?;
     for request in &scan_requests {
@@ -836,13 +891,7 @@ impl ConsumerReaderImpl {
           })
       })
       .collect::<HashMap<_, _>>();
-    self.record_fast_scan_bounds(
-      &scan_requests,
-      &assigned_partition_ids,
-      now,
-      runtime_settings,
-      &mut scan_states,
-    );
+    self.record_fast_scan_bounds(&scan_requests, now, runtime_settings, &mut scan_states);
     let mut partition_finalizations =
       HashMap::<VirtualPartitionId, PartitionScanFinalization>::new();
     for request in &scan_requests {
@@ -879,8 +928,8 @@ impl ConsumerReaderImpl {
     // later sequence could advance the cursor and make the deferred batch permanently ineligible.
     let mut blocked_recovering_partitions = HashSet::new();
     let mut capacity_deferred_fresh_window_starts = HashSet::new();
-    // Recovery can hand an active publication-horizon window to Fast. Fast retains the same
-    // visibility safety check and replays its inclusive time floor once the row becomes eligible.
+    // Recovery can hand an active publication-horizon window to Fast. A handoff is safe only when
+    // Fast's own inclusive lower bound will still include the deferred segment on its next pass.
     let fast_horizon_windows = self
       .eligible_fast_scan_windows(now, runtime_settings)?
       .into_iter()
@@ -923,7 +972,12 @@ impl ConsumerReaderImpl {
                 && window.window_start_unix_seconds
                   <= recovery_state.cutover_window_start_unix_seconds
             },
-            Some(VirtualPartitionState::Fast { .. }) => request.eligibility.fast,
+            Some(VirtualPartitionState::Fast { .. }) => {
+              // Rollover-tail requests deliberately include only partitions with retained debt in
+              // that old window. Ordinary Fast partitions must not turn this narrow repair into a
+              // full reread of the previous DynamoDB partition.
+              request.eligibility.fast && request.fast_partition_bounds.contains_key(&partition_id)
+            },
             Some(
               VirtualPartitionState::PendingCursor { .. }
               | VirtualPartitionState::PendingRecovering { .. }
@@ -980,8 +1034,8 @@ impl ConsumerReaderImpl {
             });
           if fast_partition {
             // The shared DynamoDB lower bound is the least restrictive partition bound. Reapply
-            // each partition's inclusive frontier here so a sparse partition cannot be skipped
-            // because another partition in the same query is further ahead.
+            // each partition's inclusive bound here so a sparse partition cannot be skipped
+            // because another partition in the same query requires an earlier floor.
             if blocked_fast_sources.contains(&frontier_key) {
               trace!(
                 "consumer metadata segment blocked by earlier visibility delay: topic={}, \
@@ -993,6 +1047,25 @@ impl ConsumerReaderImpl {
               );
               scan_state.metadata_segments_blocked_by_visibility = scan_state
                 .metadata_segments_blocked_by_visibility
+                .saturating_add(1);
+              continue;
+            }
+            let partition_lower_bound = request
+              .fast_partition_bounds
+              .get(&partition_id)
+              .expect("eligible Fast partition has a planned lower bound");
+            if segment.snowflake_id < *partition_lower_bound {
+              trace!(
+                "consumer metadata segment skipped by fast lower bound: topic={}, partition={}, \
+                 window_start={}, snowflake_id={}, lower_bound={}",
+                self.config.topic,
+                partition_id,
+                offset_datetime_from_unix_seconds(window.window_start_unix_seconds),
+                segment.snowflake_id.as_u64(),
+                partition_lower_bound.as_u64()
+              );
+              scan_state.metadata_segments_skipped_by_frontier = scan_state
+                .metadata_segments_skipped_by_frontier
                 .saturating_add(1);
               continue;
             }
@@ -1022,6 +1095,9 @@ impl ConsumerReaderImpl {
           if runtime_settings.metadata_read_consistency == MetadataReadConsistency::Eventual
             && published_at > visibility_cutoff
           {
+            // The cutoff is `now - visibility_delay`: newer metadata may not be present on every
+            // eventual-consistency replica. Fast blocks its frontier; Fresh retries its sole
+            // initial window; Recovery either hands the row to Fast or holds its cursor behind it.
             self
               .metrics
               .metadata_segments_deferred_by_visibility_delay
@@ -1164,9 +1240,9 @@ impl ConsumerReaderImpl {
           }
 
           if fast_partition {
-            // Advance only after the segment passed visibility and processing checks. The
-            // inclusive value replays the boundary row on the next scan, while max prevents an
-            // unordered metadata result from regressing the observed frontier.
+            // Advance only after visibility and capacity checks. The value remains inclusive, so
+            // the boundary row is replayed next pass; `max` prevents unordered results from
+            // regressing the per-window frontier.
             next_fast_frontiers
               .entry(frontier_key)
               .and_modify(|frontier| *frontier = (*frontier).max(segment.snowflake_id))

@@ -2140,6 +2140,264 @@ fn fast_coverage_recovery_clamps_a_stale_floor_to_retention() {
   ));
 }
 
+#[test]
+fn fast_coverage_tail_stays_on_the_fast_path_at_window_rollover() {
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  reader.virtual_partition_states.insert(
+    7,
+    VirtualPartitionState::Fast {
+      cursor: Some(4),
+      coverage_floor: Some(timestamp(1_199)),
+      last_scan: None,
+    },
+  );
+
+  let (requests, recovery_scan) = reader
+    .scan_requests(timestamp(1_215), &[7], reader.runtime_settings())
+    .unwrap();
+
+  assert!(!recovery_scan);
+  assert_eq!(
+    requests
+      .iter()
+      .map(|request| request.window.window_start_unix_seconds)
+      .collect::<Vec<_>>(),
+    vec![900, 1_200]
+  );
+  assert_eq!(
+    requests[0].fast_partition_bounds.get(&7),
+    Some(&SnowflakeId::minimum_for_timestamp(timestamp(1_199)))
+  );
+  assert!(matches!(
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::Fast { .. })
+  ));
+}
+
+#[test]
+fn fast_coverage_tail_clamps_a_stale_floor_to_the_retained_window() {
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::seconds(200),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  reader.virtual_partition_states.insert(
+    7,
+    VirtualPartitionState::Fast {
+      cursor: Some(4),
+      coverage_floor: Some(timestamp(600)),
+      last_scan: None,
+    },
+  );
+
+  let (requests, recovery_scan) = reader
+    .scan_requests(timestamp(1_320), &[7], reader.runtime_settings())
+    .unwrap();
+
+  assert!(!recovery_scan);
+  assert_eq!(
+    requests
+      .iter()
+      .map(|request| request.window.window_start_unix_seconds)
+      .collect::<Vec<_>>(),
+    vec![900, 1_200]
+  );
+  assert_eq!(
+    requests[0].fast_partition_bounds.get(&7),
+    Some(&SnowflakeId::minimum_for_timestamp(timestamp(900)))
+  );
+  assert!(matches!(
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::Fast { .. })
+  ));
+}
+
+#[tokio::test]
+async fn fast_scan_bound_diagnostics_exclude_partitions_outside_a_targeted_tail() {
+  let metadata_store = Arc::new(RecordingMetadataStore::new());
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  reader.virtual_partition_states.insert(
+    7,
+    VirtualPartitionState::Fast {
+      cursor: Some(4),
+      coverage_floor: Some(timestamp(1_199)),
+      last_scan: None,
+    },
+  );
+
+  assert!(reader.read_available(1_215).await.unwrap().is_empty());
+  let scan_states = reader.partition_scan_states();
+  let tail_partition = scan_states
+    .iter()
+    .find(|state| state.virtual_partition_id == 7)
+    .unwrap();
+  let current_only_partition = scan_states
+    .iter()
+    .find(|state| state.virtual_partition_id == 8)
+    .unwrap();
+  assert_eq!(
+    tail_partition
+      .fast_scan_bounds
+      .iter()
+      .map(|bound| bound.window_start_unix_seconds)
+      .collect::<Vec<_>>(),
+    vec![900, 1_200]
+  );
+  assert_eq!(
+    current_only_partition
+      .fast_scan_bounds
+      .iter()
+      .map(|bound| bound.window_start_unix_seconds)
+      .collect::<Vec<_>>(),
+    vec![1_200]
+  );
+}
+
+#[tokio::test]
+async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
+  let tail_floor = SnowflakeId::minimum_for_timestamp(timestamp(1_199));
+  for (partition_id, snowflake_id, sequence) in [
+    (7, tail_floor.as_u64(), 1),
+    (8, tail_floor.as_u64().saturating_add(1 << 25), 1),
+  ] {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store_dyn.as_ref(),
+      "telemetry",
+      900,
+      snowflake_id,
+      partition_id,
+      SeqRange {
+        start: sequence,
+        end: sequence,
+      },
+      vec![new_record(
+        vec![u8::try_from(partition_id).unwrap()],
+        900_000,
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    blob_store,
+    metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  for partition_id in [7, 8] {
+    reader.virtual_partition_states.insert(
+      partition_id,
+      VirtualPartitionState::Fast {
+        cursor: Some(0),
+        coverage_floor: Some(timestamp(1_199)),
+        last_scan: None,
+      },
+    );
+  }
+
+  for expected_partition_id in [7, 8] {
+    let outcome = reader
+      .read_available_with_capacity_and_settings(
+        timestamp(1_215),
+        ReadCapacity::new(1),
+        reader.runtime_settings(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(outcome.batches.len(), 1);
+    assert_eq!(
+      outcome.batches[0].virtual_partition_id,
+      expected_partition_id
+    );
+    assert_eq!(
+      metadata_store
+        .scans
+        .lock()
+        .iter()
+        .filter(|(window_start, _)| *window_start == 900)
+        .count(),
+      1,
+      "every capacity refill must reuse the complete merged rollover-tail cache"
+    );
+  }
+}
+
 #[tokio::test]
 async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
@@ -4856,7 +5114,7 @@ async fn fast_scan_catches_up_coverage_across_window_stall() {
 }
 
 #[tokio::test]
-async fn fast_recovery_retains_visibility_deferred_rows_below_the_fast_floor() {
+async fn fast_coverage_tail_retains_visibility_deferred_rows_below_the_fast_floor() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
   let first_window_start =
@@ -4937,7 +5195,7 @@ async fn fast_recovery_retains_visibility_deferred_rows_below_the_fast_floor() {
   assert_eq!(recovered[0].seq_range, SeqRange { start: 1, end: 1 });
   assert!(matches!(
     reader.virtual_partition_states.get(&7),
-    Some(VirtualPartitionState::Recovering { .. })
+    Some(VirtualPartitionState::Fast { .. })
   ));
 
   let deferred = reader.read_available(recovery_scan_at + 1).await.unwrap();
@@ -5022,6 +5280,103 @@ async fn fast_scan_uses_lowest_partition_frontier_for_cross_partition_ordering()
       .lock()
       .contains(&(900, Some(SnowflakeId(1))))
   );
+}
+
+#[tokio::test]
+async fn direct_fast_scan_reapplies_each_partition_effective_lower_bound() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let recording_metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = recording_metadata_store.clone();
+  let window_start = 1_700_001_000;
+
+  let _ = write_multi_partition_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    window_start,
+    SnowflakeId::minimum_for_timestamp(timestamp(window_start + 10)).as_u64(),
+    Compression::none(),
+    vec![
+      (
+        7,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![7], (window_start + 10) * 1_000)],
+      ),
+      (
+        8,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![8], (window_start + 10) * 1_000)],
+      ),
+    ],
+  )
+  .await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    window_start,
+    SnowflakeId::minimum_for_timestamp(timestamp(window_start + 35)).as_u64(),
+    8,
+    SeqRange { start: 2, end: 2 },
+    vec![new_record(vec![9], (window_start + 35) * 1_000)],
+    Compression::none(),
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  reader.virtual_partition_states.insert(
+    7,
+    VirtualPartitionState::Fast {
+      cursor: None,
+      coverage_floor: Some(timestamp(window_start)),
+      last_scan: None,
+    },
+  );
+  reader.virtual_partition_states.insert(
+    8,
+    VirtualPartitionState::Fast {
+      cursor: None,
+      coverage_floor: None,
+      last_scan: None,
+    },
+  );
+
+  let batches = reader.read_available(window_start + 50).await.unwrap();
+  assert_eq!(
+    batches
+      .iter()
+      .map(|batch| (batch.virtual_partition_id, batch.seq_range.clone()))
+      .collect::<Vec<_>>(),
+    vec![
+      (7, SeqRange { start: 1, end: 1 }),
+      (8, SeqRange { start: 2, end: 2 })
+    ]
+  );
+  assert_eq!(reader.cursor(8), Some(2));
+  assert!(recording_metadata_store.scans.lock().contains(&(
+    window_start,
+    Some(SnowflakeId::minimum_for_timestamp(timestamp(window_start)))
+  )));
 }
 
 #[tokio::test]

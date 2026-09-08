@@ -5069,11 +5069,19 @@ async fn broker_backed_fast_coverage_survives_prefetch_stall_and_partial_rebalan
   Ok(())
 }
 
-// High-level: verifies a stalled Fast reader recovers an unscanned pre-rollover gap with the
-// snowflake floor retained from its last delivered segment, then delivers post-rollover data.
 #[tokio::test]
-async fn broker_backed_fast_stall_enters_recovery_without_overscanning_prior_window() -> Result<()>
-{
+async fn broker_backed_fast_stall_scans_one_window_rollover_tail_without_recovery() -> Result<()> {
+  Box::pin(run_broker_backed_fast_stall_rollover_boundary(false)).await
+}
+
+#[tokio::test]
+async fn broker_backed_fast_stall_enters_recovery_after_two_retired_windows() -> Result<()> {
+  Box::pin(run_broker_backed_fast_stall_rollover_boundary(true)).await
+}
+
+// Exercises the state boundary for capacity-interrupted Fast coverage using the production broker
+// transport. One retired coverage window is an eligible Fast tail; two require Recovery.
+async fn run_broker_backed_fast_stall_rollover_boundary(expect_recovery: bool) -> Result<()> {
   let window_anchor = OffsetDateTime::from_unix_timestamp(1_700_000_001)?;
   let previous_window_start =
     Window::for_timestamp(window_anchor, TimeDuration::seconds(WINDOW_SIZE_SECONDS))
@@ -5162,23 +5170,10 @@ async fn broker_backed_fast_stall_enters_recovery_without_overscanning_prior_win
     String::from_utf8(initial.record.payload.to_vec())?,
     initial_id
   );
-  let last_delivered_checkpoint = initial.source_checkpoint;
   assert_eq!(
-    last_delivered_checkpoint.window_start_unix_seconds,
+    initial.source_checkpoint.window_start_unix_seconds,
     previous_window_start
   );
-  let fast_snapshot = owner
-    .diagnostics()
-    .ok_or_else(|| anyhow!("concrete consumer did not provide diagnostics"))?
-    .state_snapshot();
-  let retained_fast_floor = fast_snapshot
-    .local
-    .partitions
-    .iter()
-    .find(|partition| partition.virtual_partition_id == 0)
-    .and_then(|partition| partition.reader.as_ref())
-    .and_then(|reader| reader.fast_coverage_floor)
-    .ok_or_else(|| anyhow!("Fast diagnostics must retain coverage after initial delivery"))?;
 
   let mut blocker_capacity_gate = hooks
     .arm_consumer(
@@ -5223,6 +5218,19 @@ async fn broker_backed_fast_stall_enters_recovery_without_overscanning_prior_win
     String::from_utf8(blocker.record.payload.to_vec())?,
     blocker_id
   );
+  let last_delivered_checkpoint = blocker.source_checkpoint;
+  let stalled_fast_snapshot = owner
+    .diagnostics()
+    .ok_or_else(|| anyhow!("concrete consumer did not provide diagnostics"))?
+    .state_snapshot();
+  let retained_fast_floor = stalled_fast_snapshot
+    .local
+    .partitions
+    .iter()
+    .find(|partition| partition.virtual_partition_id == 0)
+    .and_then(|partition| partition.reader.as_ref())
+    .and_then(|reader| reader.fast_coverage_floor)
+    .ok_or_else(|| anyhow!("Fast diagnostics must retain coverage at the capacity boundary"))?;
 
   let pre_rollover_gap_time = OffsetDateTime::from_unix_timestamp(
     previous_window_start.saturating_add(WINDOW_SIZE_SECONDS - 1),
@@ -5265,13 +5273,13 @@ async fn broker_backed_fast_stall_enters_recovery_without_overscanning_prior_win
       None,
     )
     .await?;
-  let recovery_time = OffsetDateTime::from_unix_timestamp(
+  let scan_time = OffsetDateTime::from_unix_timestamp(
     previous_window_start
-      .saturating_add(WINDOW_SIZE_SECONDS)
+      .saturating_add(WINDOW_SIZE_SECONDS.saturating_mul(if expect_recovery { 2 } else { 1 }))
       .saturating_add(DEFAULT_MAX_METADATA_PUBLICATION_LAG.whole_seconds())
       .saturating_add(1),
   )?;
-  let stall_duration = recovery_time - reader_time.now();
+  let stall_duration = scan_time - reader_time.now();
   assert!(
     stall_duration > DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     "the prefetch stall must exceed the default metadata-publication lag"
@@ -5285,54 +5293,63 @@ async fn broker_backed_fast_stall_enters_recovery_without_overscanning_prior_win
     recovery_capacity_gate.wait_until_reached(),
   )
   .await
-  .map_err(|_| anyhow!("Fast coverage recovery did not reach prefetch capacity"))??;
-  let recovery_snapshot = owner
+  .map_err(|_| anyhow!("Fast coverage scan did not reach prefetch capacity"))??;
+  let scan_snapshot = owner
     .diagnostics()
     .ok_or_else(|| anyhow!("concrete consumer did not provide diagnostics"))?
     .state_snapshot();
-  let recovery_partition = recovery_snapshot
+  let scan_partition = scan_snapshot
     .local
     .partitions
     .iter()
     .find(|partition| partition.virtual_partition_id == 0)
-    .ok_or_else(|| anyhow!("missing recovery diagnostics partition"))?;
+    .ok_or_else(|| anyhow!("missing Fast coverage diagnostics partition"))?;
+  let expected_mode = if expect_recovery {
+    ConsumerPartitionReadMode::Recovering
+  } else {
+    ConsumerPartitionReadMode::Fast
+  };
   assert_eq!(
-    recovery_partition
-      .reader
-      .as_ref()
-      .map(|reader| &reader.mode),
-    Some(&ConsumerPartitionReadMode::Recovering),
-    "expired Fast coverage must enter recovery: {recovery_snapshot:?}"
+    scan_partition.reader.as_ref().map(|reader| &reader.mode),
+    Some(&expected_mode),
+    "Fast coverage chose the wrong rollover mode: expect_recovery={expect_recovery}, \
+     snapshot={scan_snapshot:?}"
   );
   assert_eq!(
     metadata_store.scan_count(),
     previous_window_scan_count + 1,
-    "recovery must scan its prior metadata window once before the next capacity cycle"
+    "the retained prior-window coverage must be scanned once before the next capacity cycle"
   );
-  let recovery_floor = metadata_store
+  let retained_floor = metadata_store
     .scan_floors()
     .await
     .get(previous_window_scan_count)
     .copied()
     .flatten()
-    .ok_or_else(|| anyhow!("recovery scan must use a snowflake floor"))?;
+    .ok_or_else(|| anyhow!("retained Fast coverage scan must use a snowflake floor"))?;
+  let expected_floor = if expect_recovery {
+    SnowflakeId::minimum_for_timestamp(retained_fast_floor)
+  } else {
+    SnowflakeId(last_delivered_checkpoint.snowflake_id)
+  };
   assert!(
-    recovery_floor == SnowflakeId::minimum_for_timestamp(retained_fast_floor),
-    "recovery floor must match the retained Fast coverage from the last delivered segment: \
-     floor={recovery_floor:?}, retained_fast_floor={retained_fast_floor:?}, \
+    retained_floor == expected_floor,
+    "retained floor must match the Fast coverage from the last delivered segment: \
+     expect_recovery={expect_recovery}, floor={retained_floor:?}, \
+     retained_fast_floor={retained_fast_floor:?}, \
      last_delivered_checkpoint={last_delivered_checkpoint:?}"
   );
   assert!(
-    recovery_floor <= SnowflakeId::minimum_for_timestamp(pre_rollover_gap_time),
-    "recovery floor must include the pre-rollover gap: floor={recovery_floor:?}, \
+    retained_floor <= SnowflakeId::minimum_for_timestamp(pre_rollover_gap_time),
+    "retained floor must include the pre-rollover gap: floor={retained_floor:?}, \
      pre_rollover_gap_time={pre_rollover_gap_time:?}"
   );
   assert!(
-    recovery_floor
+    retained_floor
       > SnowflakeId::minimum_for_timestamp(OffsetDateTime::from_unix_timestamp(
         previous_window_start
       )?,),
-    "recovery floor must avoid scanning the full previous window: floor={recovery_floor:?}"
+    "retained floor must avoid scanning the full previous window: floor={retained_floor:?}"
   );
   recovery_capacity_gate.release()?;
 
@@ -5345,7 +5362,7 @@ async fn broker_backed_fast_stall_enters_recovery_without_overscanning_prior_win
       let next = owner.next().await?;
       let NextResult::Record(record) = next else {
         return Err(anyhow!(
-          "owner received an unexpected revocation during recovery"
+          "owner received an unexpected revocation during Fast coverage completion"
         ));
       };
       let id = String::from_utf8(record.record.payload.to_vec())?;
@@ -5367,7 +5384,7 @@ async fn broker_backed_fast_stall_enters_recovery_without_overscanning_prior_win
   assert_eq!(
     metadata_store.scan_count(),
     previous_window_scan_count + 1,
-    "recovery metadata cache must prevent an overscan of the prior window"
+    "the mature rollover tail must remain cached across later capacity refills"
   );
 
   Box::new(owner).shutdown().await?;

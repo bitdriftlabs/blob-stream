@@ -486,12 +486,16 @@ query still apply their own frontier filters after the result is returned.
   the retention floor. Recovery scans up to 32 consecutive windows per pass, from oldest to newest,
   and becomes Fast only after its cutover window is fully scanned. When the checkpoint window is
   the cutover window, recovery is a single-window pass.
-3. **Fast:** A partition that has completed Fresh or Recovery scans only the bounded recent horizon
+3. **Fast:** A partition that has completed Fresh or Recovery scans the bounded recent horizon
   where metadata can still be unpublished or invisible. It retains the earliest unconfirmed
-  coverage floor from incomplete Fast passes. When that floor leaves the live horizon, the
-  partition returns to bounded chronological Recovery from the retention-clamped floor through
-  the captured current-window cutover before resuming Fast. Fast is an optimization; it is never
-  used to replace retained recovery for a resumed partition.
+  coverage floor from incomplete Fast passes. When that floor is in the immediately preceding
+  metadata window, Fast performs a targeted, retention-clamped rollover-tail scan for that
+  partition before the normal live-horizon queries. The tail uses the partition's normal Fast
+  lower bound and may use a mature per-partition metadata cache across prefetch-capacity refills.
+  When the retention-clamped floor is at least two windows older than the first Fast window, the
+  partition enters bounded chronological Recovery through the captured current-window cutover
+  before resuming Fast. Fast is an optimization; it is never used to replace retained recovery
+  for a resumed partition.
 
 For a usable source checkpoint that was not clamped to retention, recovery uses an inclusive lower
 bound only for its first window. Let $D$ be the broker's publication deadline plus the consumer's
@@ -594,7 +598,11 @@ partitions share a window, the DynamoDB query uses the lowest effective bound, t
 filters rows below its own frontier. This protects a sparse partition whose last observed
 snowflake is lower than another partition's. Frontiers are updated only after visibility-eligible
 metadata is selected, are inclusive so the boundary row is safely replayed, and are cleared on
-assignment loss or explicit seek and pruned when their window leaves the Fast horizon.
+assignment loss or explicit seek. An incomplete Fast pass also retains its immediately preceding,
+retention-clamped coverage window as a targeted Fast tail; this single mature window is still
+eligible after it leaves the normal horizon. Older retained debt enters Recovery instead. Ordinary
+frontiers are pruned when their windows leave the Fast horizon, while a mature tail is retained
+only until the interrupted pass completes or the partition loses assignment.
 
 After the metadata query, the reader sorts segment rows by snowflake ID, filters each row to
 eligible assigned partitions, and sorts batches within that row's partition index by `seq_start`.
@@ -779,9 +787,10 @@ normally observe `A` and `B` together and deliver them in sequence order.
 
 Fast does not continuously scan backward from the last observed snowflake. Its frontier is an
 observed lower bound, retained per partition and metadata window, and is pruned once that window
-leaves the bounded availability horizon. The visibility delay reduces the chance that a query
-advances this bound during ordinary replica lag; it does not turn the frontier into a completeness
-watermark or establish a DynamoDB visibility guarantee.
+leaves the bounded availability horizon, except for the single targeted rollover tail retained by
+an interrupted pass. The visibility delay reduces the chance that a query advances this bound
+during ordinary replica lag; it does not turn the frontier into a completeness watermark or
+establish a DynamoDB visibility guarantee.
 
 A Fast or checkpoint-overlap recovery scan can miss a row that becomes visible outside its bounded
 availability horizon. Strong metadata reads remove the read-replica component, but do not make a
