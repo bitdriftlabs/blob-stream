@@ -1006,8 +1006,8 @@ impl ConsumerReaderImpl {
             });
           if fast_partition {
             // The shared DynamoDB lower bound is the least restrictive partition bound. Reapply
-            // each partition's inclusive frontier here so a sparse partition cannot be skipped
-            // because another partition in the same query is further ahead.
+            // each partition's inclusive bound here so a sparse partition cannot be skipped
+            // because another partition in the same query requires an earlier floor.
             if blocked_fast_sources.contains(&frontier_key) {
               trace!(
                 "consumer metadata segment blocked by earlier visibility delay: topic={}, \
@@ -1019,6 +1019,25 @@ impl ConsumerReaderImpl {
               );
               scan_state.metadata_segments_blocked_by_visibility = scan_state
                 .metadata_segments_blocked_by_visibility
+                .saturating_add(1);
+              continue;
+            }
+            let partition_lower_bound = request
+              .fast_partition_bounds
+              .get(&partition_id)
+              .expect("eligible Fast partition has a planned lower bound");
+            if segment.snowflake_id < *partition_lower_bound {
+              trace!(
+                "consumer metadata segment skipped by fast lower bound: topic={}, partition={}, \
+                 window_start={}, snowflake_id={}, lower_bound={}",
+                self.config.topic,
+                partition_id,
+                offset_datetime_from_unix_seconds(window.window_start_unix_seconds),
+                segment.snowflake_id.as_u64(),
+                partition_lower_bound.as_u64()
+              );
+              scan_state.metadata_segments_skipped_by_frontier = scan_state
+                .metadata_segments_skipped_by_frontier
                 .saturating_add(1);
               continue;
             }
