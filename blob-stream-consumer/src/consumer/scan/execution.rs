@@ -1416,11 +1416,11 @@ impl ConsumerReaderImpl {
           // A held gap can suppress all requests until the next probe. Those empty passes must
           // keep the older coverage floor, or the later query would start after the sequence that
           // caused the hold.
-          && !self
+          && self
             .virtual_partition_states
             .get(&partition_id)
             .and_then(VirtualPartitionState::fast_gap_retry_at)
-            .is_some()
+            .is_none()
           && let Some(state) = self.virtual_partition_states.get_mut(&partition_id)
         {
           state.set_fast_coverage_floor(fast_scan_start_floor);
