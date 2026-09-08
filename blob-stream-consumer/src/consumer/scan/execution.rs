@@ -85,10 +85,11 @@ struct ScanPassFinalization {
 // BatchAcceptance
 //
 
-/// Batches admitted to delivery plus the earliest metadata maturity retry for held Fast ranges.
+/// Batches admitted to delivery plus state that must remain incomplete for held Fast ranges.
 struct BatchAcceptance {
   batches: Vec<ConsumerBatch>,
   next_metadata_eligible_at: Option<time::OffsetDateTime>,
+  held_fast_sources: HashSet<(VirtualPartitionId, i64)>,
 }
 
 impl ConsumerReaderImpl {
@@ -495,14 +496,17 @@ impl ConsumerReaderImpl {
     // publication-open window could fill on its maturity retry.
     let mut output = Vec::new();
     let mut next_metadata_eligible_at = None::<time::OffsetDateTime>;
-    let mut held_fast_partitions = HashSet::new();
+    let mut held_fast_sources = HashSet::new();
     for result in batch_read_results {
       let candidate = match &result {
         BatchReadResult::Decoded { candidate, .. } | BatchReadResult::Missing { candidate, .. } => {
           candidate
         },
       };
-      if held_fast_partitions.contains(&candidate.virtual_partition_id) {
+      if held_fast_sources
+        .iter()
+        .any(|(partition_id, _)| *partition_id == candidate.virtual_partition_id)
+      {
         continue;
       }
       let current_cursor = self
@@ -534,7 +538,10 @@ impl ConsumerReaderImpl {
         {
           state.set_fast_gap_retry_at(retry_at);
         }
-        held_fast_partitions.insert(candidate.virtual_partition_id);
+        held_fast_sources.insert((
+          candidate.virtual_partition_id,
+          candidate.window_start_unix_seconds,
+        ));
         next_metadata_eligible_at =
           Some(next_metadata_eligible_at.map_or(retry_at, |current| current.min(retry_at)));
         trace!(
@@ -620,6 +627,7 @@ impl ConsumerReaderImpl {
     BatchAcceptance {
       batches: output,
       next_metadata_eligible_at,
+      held_fast_sources,
     }
   }
 
@@ -1338,6 +1346,7 @@ impl ConsumerReaderImpl {
     let BatchAcceptance {
       batches: mut output,
       next_metadata_eligible_at: fast_gap_retry_at,
+      held_fast_sources,
     } = self.accept_batch_read_results(
       batch_read_results,
       &mut scan_states,
@@ -1345,6 +1354,17 @@ impl ConsumerReaderImpl {
       now,
       runtime_settings,
     );
+    // Planning advances a per-window Fast frontier while it selects candidates. A held candidate
+    // is deliberately not admitted, so its source is incomplete even when later segments in the
+    // same window were selected. Restore the pre-pass frontier: otherwise the retry could begin
+    // at a later segment and permanently exclude the first held sequence.
+    for frontier_key in &held_fast_sources {
+      if let Some(previous_frontier) = self.fast_frontiers.get(frontier_key) {
+        next_fast_frontiers.insert(*frontier_key, *previous_frontier);
+      } else {
+        next_fast_frontiers.remove(frontier_key);
+      }
+    }
     if let Some(fast_gap_retry_at) = fast_gap_retry_at {
       next_metadata_eligible_at = Some(
         next_metadata_eligible_at
@@ -1393,6 +1413,14 @@ impl ConsumerReaderImpl {
         if !blocked_fast_sources
           .iter()
           .any(|(blocked_partition_id, _)| *blocked_partition_id == partition_id)
+          // A held gap can suppress all requests until the next probe. Those empty passes must
+          // keep the older coverage floor, or the later query would start after the sequence that
+          // caused the hold.
+          && !self
+            .virtual_partition_states
+            .get(&partition_id)
+            .and_then(VirtualPartitionState::fast_gap_retry_at)
+            .is_some()
           && let Some(state) = self.virtual_partition_states.get_mut(&partition_id)
         {
           state.set_fast_coverage_floor(fast_scan_start_floor);

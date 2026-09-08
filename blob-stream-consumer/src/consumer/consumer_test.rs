@@ -2490,7 +2490,7 @@ async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
 }
 
 #[tokio::test]
-async fn fast_gap_holds_newer_window_until_late_predecessor_matures() {
+async fn fast_gap_probe_preserves_late_predecessor_and_newer_window_frontier() {
   let old_window_start = 900;
   let new_window_start = 1_200;
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
@@ -2506,6 +2506,18 @@ async fn fast_gap_holds_newer_window_until_late_predecessor_matures() {
     7,
     SeqRange { start: 3, end: 3 },
     vec![new_record(vec![3], 1_205_000)],
+    Compression::none(),
+  )
+  .await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store_dyn.as_ref(),
+    "telemetry",
+    new_window_start,
+    SnowflakeId::minimum_for_timestamp(timestamp(1_206)).as_u64(),
+    7,
+    SeqRange { start: 4, end: 4 },
+    vec![new_record(vec![4], 1_206_000)],
     Compression::none(),
   )
   .await;
@@ -2535,14 +2547,16 @@ async fn fast_gap_holds_newer_window_until_late_predecessor_matures() {
     7,
     VirtualPartitionState::Fast {
       cursor: Some(1),
-      coverage_floor: Some(timestamp(1_195)),
+      coverage_floor: Some(timestamp(1_194)),
       gap_retry_at: None,
       last_scan: None,
     },
   );
 
   // The old query has already taken its empty snapshot when range 2 is published. The newer
-  // query in the same read pass can observe range 3, reproducing the production interleaving.
+  // query in the same read pass can observe ranges 3 and 4. The late predecessor is below the
+  // normal Fast safe floor, so the hold must preserve both its older coverage floor and the
+  // newer window's pre-pass frontier for the prompt probe to recover all three ranges.
   let read_task = tokio::spawn(async move {
     let runtime_settings = reader.runtime_settings();
     let outcome = reader
@@ -2560,10 +2574,10 @@ async fn fast_gap_holds_newer_window_until_late_predecessor_matures() {
     metadata_store.as_ref(),
     "telemetry",
     old_window_start,
-    SnowflakeId::minimum_for_timestamp(timestamp(1_195)).as_u64(),
+    SnowflakeId::minimum_for_timestamp(timestamp(1_194)).as_u64(),
     7,
     SeqRange { start: 2, end: 2 },
-    vec![new_record(vec![2], 1_195_000)],
+    vec![new_record(vec![2], 1_194_000)],
     Compression::none(),
   )
   .await;
@@ -2585,6 +2599,18 @@ async fn fast_gap_holds_newer_window_until_late_predecessor_matures() {
       .and_then(VirtualPartitionState::fast_gap_retry_at),
     Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500)))
   );
+  assert_eq!(
+    reader
+      .virtual_partition_states
+      .get(&7)
+      .and_then(VirtualPartitionState::fast_coverage_floor),
+    Some(timestamp(1_194)),
+    "the held predecessor remains below the normal Fast safe floor"
+  );
+  assert!(
+    !reader.fast_frontiers.contains_key(&(7, new_window_start)),
+    "a held newer-window segment must not advance its Fast frontier"
+  );
 
   let scans_before_retry = metadata_store.scan_count();
   let before_probe = reader
@@ -2601,6 +2627,14 @@ async fn fast_gap_holds_newer_window_until_late_predecessor_matures() {
     Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500)))
   );
   assert_eq!(metadata_store.scan_count(), scans_before_retry);
+  assert_eq!(
+    reader
+      .virtual_partition_states
+      .get(&7)
+      .and_then(VirtualPartitionState::fast_coverage_floor),
+    Some(timestamp(1_194)),
+    "an intentionally suppressed pass must not advance the held coverage floor"
+  );
 
   let after_probe = reader
     .read_available_with_capacity_and_settings(
@@ -2616,9 +2650,13 @@ async fn fast_gap_holds_newer_window_until_late_predecessor_matures() {
       .iter()
       .map(|batch| batch.seq_range.clone())
       .collect::<Vec<_>>(),
-    vec![SeqRange { start: 2, end: 2 }, SeqRange { start: 3, end: 3 }]
+    vec![
+      SeqRange { start: 2, end: 2 },
+      SeqRange { start: 3, end: 3 },
+      SeqRange { start: 4, end: 4 },
+    ]
   );
-  assert_eq!(reader.cursor(7), Some(3));
+  assert_eq!(reader.cursor(7), Some(4));
 }
 
 #[test]

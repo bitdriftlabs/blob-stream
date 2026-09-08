@@ -500,10 +500,12 @@ query still apply their own frontier filters after the result is returned.
 Fast metadata-window queries may execute concurrently and their results are processed in window
 order, but separate DynamoDB partition keys do not form one atomic snapshot. If a newer Fast batch
 would skip the next sequence after a partition cursor while an older Fast window remains inside the
-availability horizon, the reader holds that partition without advancing its cursor. It retries when
-the newest relevant predecessor window has ended plus $D$, then reads the retained Fast tail before
-admitting the newer range. This delay applies only to an actual sequence discontinuity; contiguous
-cross-window batches continue immediately, and other partitions continue independently.
+availability horizon, the reader holds that partition without advancing its cursor. The hold starts
+probing again after 500 ms to recover the common late-publication case promptly.
+It repeats at that interval only until the newest relevant predecessor window has ended plus $D$;
+at that $W + D$ maturity boundary, a remaining discontinuity is admitted normally. This delay
+applies only to an actual sequence discontinuity; contiguous cross-window batches continue
+immediately, and other partitions continue independently.
 
 For a usable source checkpoint that was not clamped to retention, recovery uses an inclusive lower
 bound only for its first window. Let $D$ be the broker's publication deadline plus the consumer's

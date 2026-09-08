@@ -66,7 +66,7 @@ pub enum VirtualPartitionState {
     cursor: Option<u64>,
     /// Oldest Fast time floor whose metadata coverage must be retained after an incomplete pass.
     coverage_floor: Option<OffsetDateTime>,
-    /// Earliest retry after a newer range exposed a possible gap in an open prior Fast window.
+    /// Next probe after a newer range exposed a possible gap in an open prior Fast window.
     gap_retry_at: Option<OffsetDateTime>,
     last_scan: Option<Arc<ConsumerReaderPartitionScanState>>,
   },
@@ -265,7 +265,7 @@ impl VirtualPartitionState {
     }
   }
 
-  /// Retain the earliest safe retry when a newer Fast range cannot yet cross an open prior window.
+  /// Retain the earliest scheduled probe for a newer Fast range held behind an open prior window.
   pub(super) fn set_fast_gap_retry_at(&mut self, retry_at: OffsetDateTime) {
     if let Self::Fast { gap_retry_at, .. } = self {
       *gap_retry_at = Some(gap_retry_at.map_or(retry_at, |current| current.min(retry_at)));
