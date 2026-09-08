@@ -2310,6 +2310,95 @@ async fn fast_scan_bound_diagnostics_exclude_partitions_outside_a_targeted_tail(
 }
 
 #[tokio::test]
+async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
+  let tail_floor = SnowflakeId::minimum_for_timestamp(timestamp(1_199));
+  for (partition_id, snowflake_id, sequence) in [
+    (7, tail_floor.as_u64(), 1),
+    (8, tail_floor.as_u64().saturating_add(1 << 25), 1),
+  ] {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store_dyn.as_ref(),
+      "telemetry",
+      900,
+      snowflake_id,
+      partition_id,
+      SeqRange {
+        start: sequence,
+        end: sequence,
+      },
+      vec![new_record(
+        vec![u8::try_from(partition_id).unwrap()],
+        900_000,
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    blob_store,
+    metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  for partition_id in [7, 8] {
+    reader.virtual_partition_states.insert(
+      partition_id,
+      VirtualPartitionState::Fast {
+        cursor: Some(0),
+        coverage_floor: Some(timestamp(1_199)),
+        last_scan: None,
+      },
+    );
+  }
+
+  for expected_partition_id in [7, 8] {
+    let outcome = reader
+      .read_available_with_capacity_and_settings(
+        timestamp(1_215),
+        ReadCapacity::new(1),
+        reader.runtime_settings(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(outcome.batches.len(), 1);
+    assert_eq!(
+      outcome.batches[0].virtual_partition_id,
+      expected_partition_id
+    );
+    assert_eq!(
+      metadata_store
+        .scans
+        .lock()
+        .iter()
+        .filter(|(window_start, _)| *window_start == 900)
+        .count(),
+      1,
+      "every capacity refill must reuse the complete merged rollover-tail cache"
+    );
+  }
+}
+
+#[tokio::test]
 async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());

@@ -84,9 +84,10 @@ struct ScanPassFinalization {
 impl ConsumerReaderImpl {
   /// Load metadata for every planned window, preserving plan order across cache hits and queries.
   ///
-  /// Only a mature, single-partition Recovery result or Fast rollover tail is cached. It is
-  /// immutable by the time it becomes eligible for this cache, while a visibility-deferred result
-  /// must be queried again so a later pass can observe rows that were not yet safe to consume.
+  /// Only mature per-partition Recovery results and Fast rollover-tail entries are cached. They
+  /// are immutable by the time they become eligible for this cache, while a visibility-deferred
+  /// result must be queried again so a later pass can observe rows that were not yet safe to
+  /// consume.
   async fn materialize_window_results(
     &mut self,
     scan_requests: &[ScanRequest],
@@ -99,32 +100,52 @@ impl ConsumerReaderImpl {
     let mut cached_window_results = Vec::new();
     let mut scan_futures = Vec::new();
     for (request_index, request) in scan_requests.iter().cloned().enumerate() {
-      let cache_key = self.mature_recovery_metadata_cache_key(&request, now, runtime_settings);
-      if let Some(cache_key) = cache_key
-        && let Some(segments) = self.recovery_metadata_cache.get(&cache_key)
+      let cache_keys = self.mature_metadata_cache_keys(&request, now, runtime_settings);
+      // A merged Fast-tail query is stored as independently filtered entries because later scan
+      // passes might need a subset of its partitions. Reuse is deliberately all-or-nothing:
+      // returning only the entries that happen to be present would mark the request complete
+      // while silently skipping uncached partitions. On a partial hit, query once and refresh
+      // every participating entry together below.
+      if !cache_keys.is_empty()
+        && let Some(cached_segments) = cache_keys
+          .iter()
+          .map(|cache_key| self.recovery_metadata_cache.get(cache_key).cloned())
+          .collect::<Option<Vec<_>>>()
       {
-        self.metrics.record_recovery_metadata_cache_hit();
-        if let Some(scan_state) = scan_states.get_mut(&cache_key.0) {
-          scan_state.recovery_metadata_cache_hits =
-            scan_state.recovery_metadata_cache_hits.saturating_add(1);
+        // Cached entries no longer retain the other partitions from their original request.
+        // Rebuild that response shape here so the normal filtering, frontier, and capacity code
+        // cannot distinguish a cache hit from a direct metadata-store result.
+        let mut merged_segments = cached_segments
+          .into_iter()
+          .flat_map(|segments| segments.iter().cloned().collect::<Vec<_>>())
+          .collect::<Vec<_>>();
+        merged_segments.sort_by_key(|metadata| metadata.snowflake_id);
+        for cache_key in &cache_keys {
+          self.metrics.record_recovery_metadata_cache_hit();
+          if let Some(scan_state) = scan_states.get_mut(&cache_key.0) {
+            scan_state.recovery_metadata_cache_hits =
+              scan_state.recovery_metadata_cache_hits.saturating_add(1);
+          }
         }
         trace!(
-          "consumer reused cached mature metadata: topic={}, partition={}, window_start={}, \
+          "consumer reused cached mature metadata: topic={}, partitions={:?}, window_start={}, \
            segments={}",
           self.config.topic,
-          cache_key.0,
+          cache_keys.iter().map(|key| key.0).collect::<Vec<_>>(),
           offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
-          segments.len()
+          merged_segments.len()
         );
         cached_window_results.push((
           request_index,
           request,
-          Arc::clone(segments),
+          merged_segments.into(),
           visibility_cutoff,
         ));
         continue;
       }
-      if let Some(cache_key) = cache_key {
+      // Metrics are per cache identity, including a partial hit. A direct query after a partial
+      // hit is still necessary to restore a complete immutable response for this request.
+      for cache_key in &cache_keys {
         self.metrics.record_recovery_metadata_cache_miss();
         if let Some(scan_state) = scan_states.get_mut(&cache_key.0) {
           scan_state.recovery_metadata_cache_misses =
@@ -199,7 +220,7 @@ impl ConsumerReaderImpl {
           request_index,
           request,
           segments,
-          cache_key,
+          cache_keys,
           result_visibility_cutoff,
         ))
       });
@@ -215,24 +236,32 @@ impl ConsumerReaderImpl {
         return Err(error);
       },
     };
-    for (request_index, request, segments, cache_key, result_visibility_cutoff) in
+    for (request_index, request, segments, cache_keys, result_visibility_cutoff) in
       queried_window_results
     {
-      let segments = if let Some(cache_key) = cache_key {
-        let partition_id = cache_key.0;
-        let has_visibility_deferred_segment = runtime_settings.metadata_read_consistency
-          == MetadataReadConsistency::Eventual
-          && segments.iter().any(|segment| {
-            segment.segment_index.contains_key(&partition_id)
+      // Eventual-consistency results that contain rows newer than the cutoff are incomplete by
+      // definition. Do not cache them: a later retry must query again to observe the rows that
+      // were not yet safe to consume. Cached mature windows, in contrast, are immutable.
+      let has_visibility_deferred_segment = runtime_settings.metadata_read_consistency
+        == MetadataReadConsistency::Eventual
+        && cache_keys.iter().any(|cache_key| {
+          segments.iter().any(|segment| {
+            segment.segment_index.contains_key(&cache_key.0)
               && segment.metadata_published_at > result_visibility_cutoff
-          });
-        if has_visibility_deferred_segment {
-          let mut segments = segments;
-          segments.sort_by_key(|metadata| metadata.snowflake_id);
-          segments.into()
-        } else {
-          let mut cached_segments = segments
-            .into_iter()
+          })
+        });
+      let mut segments = segments;
+      segments.sort_by_key(|metadata| metadata.snowflake_id);
+      if !cache_keys.is_empty() && !has_visibility_deferred_segment {
+        // Preserve the full response for this pass, but cache a copy containing only one
+        // partition's batches for each identity. The later cache-hit path merges those copies
+        // back into a response in Snowflake order. Clearing the original index avoids retaining
+        // unrelated partition batches in an entry that may be reused on its own.
+        for cache_key in cache_keys {
+          let partition_id = cache_key.0;
+          let cached_segments = segments
+            .iter()
+            .cloned()
             .filter_map(|mut segment| {
               let partition_batches = segment.segment_index.remove(&partition_id)?;
               segment.segment_index.clear();
@@ -242,7 +271,6 @@ impl ConsumerReaderImpl {
               Some(segment)
             })
             .collect::<Vec<_>>();
-          cached_segments.sort_by_key(|metadata| metadata.snowflake_id);
           let cached_segments: Arc<[SegmentMetadata]> = cached_segments.into();
           trace!(
             "consumer cached mature metadata: topic={}, partition={}, window_start={}, segments={}",
@@ -253,16 +281,16 @@ impl ConsumerReaderImpl {
           );
           self
             .recovery_metadata_cache
-            .insert(cache_key, Arc::clone(&cached_segments));
+            .insert(cache_key, cached_segments);
           self.metrics.record_recovery_metadata_cache_insert();
-          cached_segments
         }
-      } else {
-        let mut segments = segments;
-        segments.sort_by_key(|metadata| metadata.snowflake_id);
-        segments.into()
-      };
-      cached_window_results.push((request_index, request, segments, result_visibility_cutoff));
+      }
+      cached_window_results.push((
+        request_index,
+        request,
+        segments.into(),
+        result_visibility_cutoff,
+      ));
     }
     self.record_recovery_metadata_cache_state();
     cached_window_results.sort_by_key(|(request_index, ..)| *request_index);
