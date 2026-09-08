@@ -135,6 +135,7 @@ pub(in crate::iterator) struct ConsumerDriver {
   pub(in crate::iterator) revocation_notify: Arc<Notify>,
   pub(in crate::iterator) lifecycle_hooks: Option<Arc<dyn ConsumerLifecycleHooks>>,
   pub(in crate::iterator) time_provider: Arc<dyn TimeProvider>,
+  pub(in crate::iterator) prefetch_time_provider: Arc<dyn TimeProvider>,
   pub(in crate::iterator) membership_lease_expires_at: OffsetDateTime,
   /// Earliest expiration among this driver's active partition leases.
   ///

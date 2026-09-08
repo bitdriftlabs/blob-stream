@@ -21,30 +21,25 @@ use crate::consumer::{
   ConsumerBatch,
   ConsumerReadOutcome,
   ConsumerReader,
-  ConsumerReaderFastFrontierState,
-  ConsumerReaderFastScanBoundState,
   ConsumerReaderImpl,
   ConsumerReaderPartitionMode,
-  ConsumerReaderPartitionScanState,
   ReadCapacity,
 };
 use crate::coordination::RecoveredCursor;
 use crate::diagnostics::{
   ConsumerDiagnostics,
   ConsumerPartitionReadMode,
-  ConsumerReaderFastFrontierSnapshot,
-  ConsumerReaderFastScanBoundSnapshot,
   ConsumerReaderPartitionSnapshot,
-  ConsumerReaderScanSnapshot,
   emit_partition_handoff_snapshots,
   handoff_cursor_key,
   offsets_from_map,
+  reader_partition_scan_snapshot,
 };
 use anyhow::Result;
 use bd_backoff::{ExponentialBackoff, ExponentialBackoffBuilder, InfiniteBackoff as _};
 use bd_log_util::warn_every;
 use bd_time::TimeProvider;
-use blob_stream_types::{SnowflakeId, VirtualPartitionId, offset_datetime_from_unix_seconds};
+use blob_stream_types::{VirtualPartitionId, offset_datetime_from_unix_seconds};
 use log::debug;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -55,8 +50,6 @@ use time::OffsetDateTime;
 use time::ext::NumericalDuration;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{Span, field};
-
-const MAX_SCAN_DETAIL_ENTRIES: usize = 64;
 
 //
 // IdlePollBackoff
@@ -281,6 +274,11 @@ impl PrefetchWorker {
       let Some(capacity) = self.read_capacity(pending_bytes, runtime_settings.prefetch_max_bytes)
       else {
         self.metrics.prefetch_paused_budget.inc();
+        if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+          lifecycle_hooks
+            .prefetch_capacity_exhausted(&self.member_id, &self.buffered_partition_ids())
+            .await;
+        }
         let _ = tokio::time::timeout(
           std::time::Duration::from_millis(250),
           self.prefetch_space_notify.notified(),
@@ -622,6 +620,27 @@ impl PrefetchWorker {
     })
   }
 
+  fn buffered_partition_ids(&self) -> Vec<VirtualPartitionId> {
+    let shared_state = self.shared_state.lock();
+    let mut partition_ids = shared_state
+      .delivery_state
+      .current_batch
+      .as_ref()
+      .map(|batch| batch.virtual_partition_id)
+      .into_iter()
+      .chain(
+        shared_state
+          .delivery_state
+          .batches
+          .iter()
+          .map(|batch| batch.virtual_partition_id),
+      )
+      .collect::<Vec<_>>();
+    partition_ids.sort_unstable();
+    partition_ids.dedup();
+    partition_ids
+  }
+
   fn record_pending_diagnostics(
     &self,
     pending: &VecDeque<ConsumerBatch>,
@@ -795,7 +814,13 @@ pub(super) fn record_reader_diagnostics(
   shared_state.diagnostics.reader_partitions = reader
     .partition_read_states()
     .into_iter()
-    .map(|state| reader_partition_snapshot(state.virtual_partition_id, state.mode))
+    .map(|state| {
+      reader_partition_snapshot(
+        state.virtual_partition_id,
+        state.mode,
+        state.fast_coverage_floor,
+      )
+    })
     .collect();
   shared_state.diagnostics.reader_partition_scans = reader
     .partition_scan_states()
@@ -807,74 +832,6 @@ pub(super) fn record_reader_diagnostics(
       )
     })
     .collect();
-}
-
-fn reader_partition_scan_snapshot(
-  state: &ConsumerReaderPartitionScanState,
-) -> ConsumerReaderScanSnapshot {
-  ConsumerReaderScanSnapshot {
-    completed_at: offset_datetime_from_unix_seconds(state.completed_at_unix_seconds),
-    scanned_window_starts: state
-      .scanned_window_starts
-      .iter()
-      .take(MAX_SCAN_DETAIL_ENTRIES)
-      .map(|window_start| offset_datetime_from_unix_seconds(*window_start))
-      .collect(),
-    scanned_window_starts_truncated: state.scanned_window_starts.len() > MAX_SCAN_DETAIL_ENTRIES,
-    fast_scan_bounds: state
-      .fast_scan_bounds
-      .iter()
-      .take(MAX_SCAN_DETAIL_ENTRIES)
-      .map(reader_fast_scan_bound_snapshot)
-      .collect(),
-    fast_scan_bounds_truncated: state.fast_scan_bounds.len() > MAX_SCAN_DETAIL_ENTRIES,
-    fast_frontiers: state
-      .fast_frontiers
-      .iter()
-      .take(MAX_SCAN_DETAIL_ENTRIES)
-      .map(reader_fast_frontier_snapshot)
-      .collect(),
-    fast_frontiers_truncated: state.fast_frontiers.len() > MAX_SCAN_DETAIL_ENTRIES,
-    cursor_before: state.cursor_before,
-    cursor_after: state.cursor_after,
-    metadata_segments_seen: state.metadata_segments_seen,
-    metadata_segments_without_partition_batches: state.metadata_segments_without_partition_batches,
-    metadata_batches_seen: state.metadata_batches_seen,
-    metadata_batches_skipped_by_cursor: state.metadata_batches_skipped_by_cursor,
-    metadata_segments_skipped_by_frontier: state.metadata_segments_skipped_by_frontier,
-    metadata_segments_deferred_by_visibility: state.metadata_segments_deferred_by_visibility,
-    metadata_segments_blocked_by_visibility: state.metadata_segments_blocked_by_visibility,
-    recovery_segments_handed_to_fast_by_visibility: state
-      .recovery_segments_handed_to_fast_by_visibility,
-    recovery_segments_blocked_by_visibility: state.recovery_segments_blocked_by_visibility,
-    recovery_metadata_cache_hits: state.recovery_metadata_cache_hits,
-    recovery_metadata_cache_misses: state.recovery_metadata_cache_misses,
-    metadata_batches_deferred_by_capacity: state.metadata_batches_deferred_by_capacity,
-    batches_accepted: state.batches_accepted,
-    records_accepted: state.records_accepted,
-  }
-}
-
-fn reader_fast_scan_bound_snapshot(
-  state: &ConsumerReaderFastScanBoundState,
-) -> ConsumerReaderFastScanBoundSnapshot {
-  ConsumerReaderFastScanBoundSnapshot {
-    window_start: offset_datetime_from_unix_seconds(state.window_start_unix_seconds),
-    floor_timestamp: state.floor_timestamp,
-    time_floor_snowflake_id: state.time_floor.as_u64(),
-    observed_frontier_snowflake_id: state.observed_frontier.map(SnowflakeId::as_u64),
-    partition_lower_bound_snowflake_id: state.partition_lower_bound.as_u64(),
-    query_lower_bound_snowflake_id: state.query_lower_bound.map(SnowflakeId::as_u64),
-  }
-}
-
-fn reader_fast_frontier_snapshot(
-  state: &ConsumerReaderFastFrontierState,
-) -> ConsumerReaderFastFrontierSnapshot {
-  ConsumerReaderFastFrontierSnapshot {
-    window_start: offset_datetime_from_unix_seconds(state.window_start_unix_seconds),
-    snowflake_id: state.snowflake_id.as_u64(),
-  }
 }
 
 /// Apply every queued reader mutation before starting another asynchronous reader scan.
@@ -1039,6 +996,7 @@ fn finish_unassigned_recovery_traces(
 fn reader_partition_snapshot(
   virtual_partition_id: VirtualPartitionId,
   mode: ConsumerReaderPartitionMode,
+  fast_coverage_floor: Option<OffsetDateTime>,
 ) -> ConsumerReaderPartitionSnapshot {
   match mode {
     ConsumerReaderPartitionMode::Fresh {
@@ -1050,6 +1008,7 @@ fn reader_partition_snapshot(
         initial_window_start_unix_seconds,
       )),
       recovery_cutover_window_start: None,
+      fast_coverage_floor,
     },
     ConsumerReaderPartitionMode::Recovering {
       next_window_start_unix_seconds,
@@ -1063,12 +1022,14 @@ fn reader_partition_snapshot(
       recovery_cutover_window_start: Some(offset_datetime_from_unix_seconds(
         cutover_window_start_unix_seconds,
       )),
+      fast_coverage_floor,
     },
     ConsumerReaderPartitionMode::Fast => ConsumerReaderPartitionSnapshot {
       virtual_partition_id,
       mode: ConsumerPartitionReadMode::Fast,
       recovery_next_window_start: None,
       recovery_cutover_window_start: None,
+      fast_coverage_floor,
     },
   }
 }

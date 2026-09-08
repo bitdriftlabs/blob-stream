@@ -1,6 +1,6 @@
 use anyhow::Result;
 use bd_server_stats::stats::Collector;
-use bd_time::TimeProvider;
+use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_broker::write::BrokerLeaseStatus;
 use blob_stream_consumer::consumer::ConsumerReaderImpl;
 use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, NextResult};
@@ -326,6 +326,7 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -811,6 +812,7 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       ..Default::default()
@@ -1050,6 +1052,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -1211,6 +1214,7 @@ async fn producer_retry_deadline_respected_after_transport_failures() -> Result<
   );
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       ..Default::default()
@@ -1343,6 +1347,7 @@ async fn s3_put_transient_failures_recover_without_loss() -> Result<()> {
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -1424,6 +1429,7 @@ async fn s3_get_failures_consumer_rescan_recovers() -> Result<()> {
     .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -1536,6 +1542,7 @@ async fn s3_get_not_found_consumer_skips_lost_data() -> Result<()> {
     .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -1826,6 +1833,7 @@ async fn metadata_scan_stale_visibility_no_duplicate_progress() -> Result<()> {
     .await;
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(true),
@@ -2067,6 +2075,7 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       ..Default::default()
@@ -3445,6 +3454,7 @@ async fn combined_network_and_metadata_faults_preserve_producer_publication() ->
   }
 
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       ..Default::default()

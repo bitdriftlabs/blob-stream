@@ -481,6 +481,19 @@ impl ConsumerDriver {
       return retry_error.map_or_else(|| Ok(()), |error| Err(anyhow::Error::msg(error)));
     }
 
+    if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
+      let mut current_assignment = self.active_assignment.iter().copied().collect::<Vec<_>>();
+      current_assignment.sort_unstable();
+      lifecycle_hooks
+        .rebalance_plan_ready(
+          &self.group_config.member_id,
+          self.coordinator.generation(),
+          &current_assignment,
+          &next_assignment,
+        )
+        .await;
+    }
+
     let revoked = self
       .active_assignment
       .difference(&next_assignment_set)

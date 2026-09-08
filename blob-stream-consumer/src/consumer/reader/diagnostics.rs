@@ -17,6 +17,7 @@ impl ConsumerReaderImpl {
           .map(|mode| ConsumerReaderPartitionState {
             virtual_partition_id: *virtual_partition_id,
             mode,
+            fast_coverage_floor: state.fast_coverage_floor(),
           })
       })
       .collect::<Vec<_>>();

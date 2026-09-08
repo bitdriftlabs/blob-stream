@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow, ensure};
 use bd_log_util::warn_every;
 use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
 use bd_shutdown::ComponentShutdownTriggerHandle;
+use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_metadata_store::{
   MetadataReadConsistency as StoreConsistency,
   MetadataStore,
@@ -270,6 +271,7 @@ impl TopicCacheContract {
 /// scans from the lowest pending Tail bound, then each caller receives only its own projection.
 pub struct MetadataCache {
   metadata_store: Arc<dyn MetadataStore>,
+  time_provider: Arc<dyn TimeProvider>,
   config: MetadataCacheConfig,
   eventual_tail_entries: Cache<CacheKey, Arc<CacheEntry>>,
   eventual_recovery_entries: Cache<CacheKey, Arc<CacheEntry>>,
@@ -443,6 +445,13 @@ impl MetadataCache {
   }
 
   #[must_use]
+  /// Override the clock used for cache entry age and coalescing waits.
+  pub fn time_provider(mut self, time_provider: Arc<dyn TimeProvider>) -> Self {
+    self.time_provider = time_provider;
+    self
+  }
+
+  #[must_use]
   pub fn new_with_metrics(
     metadata_store: Arc<dyn MetadataStore>,
     config: MetadataCacheConfig,
@@ -497,6 +506,7 @@ impl MetadataCache {
       .build();
     Self {
       metadata_store,
+      time_provider: Arc::new(SystemTimeProvider),
       config,
       eventual_tail_entries,
       eventual_recovery_entries,
@@ -543,8 +553,14 @@ impl MetadataCache {
       recovery_entry_count: self.eventual_recovery_entries.entry_count(),
       recovery_retained_bytes: self.eventual_recovery_entries.weighted_size(),
       recovery_byte_budget: self.config.recovery_max_bytes,
-      tail_oldest_entry_age_seconds: oldest_entry_age_seconds(&self.eventual_tail_entries),
-      recovery_oldest_entry_age_seconds: oldest_entry_age_seconds(&self.eventual_recovery_entries),
+      tail_oldest_entry_age_seconds: oldest_entry_age_seconds(
+        &self.eventual_tail_entries,
+        self.time_provider.now(),
+      ),
+      recovery_oldest_entry_age_seconds: oldest_entry_age_seconds(
+        &self.eventual_recovery_entries,
+        self.time_provider.now(),
+      ),
       in_flight_refills: self.in_flight.lock().len(),
       active_waiters: self.active_waiters.load(Ordering::Relaxed),
       available_refill_permits: self.refill_permits.available_permits(),
@@ -658,7 +674,8 @@ impl MetadataCache {
         && let Some(entry) = entries.get(&specification.key).await
       {
         let covers_request = entry.covers(&specification);
-        let fresh = entry.is_fresh(specification.topic.metadata_cache_max_age);
+        let now = self.time_provider.now();
+        let fresh = entry.is_fresh(specification.topic.metadata_cache_max_age, now);
         if covers_request && fresh {
           debug!(
             "broker metadata cache retained hit: topic={}, window_start={}, coverage={:?}, \
@@ -673,11 +690,10 @@ impl MetadataCache {
             ReadCoverage::Tail => self.metrics.tail_hits.inc(),
             ReadCoverage::FullRecovery => self.metrics.recovery_hits.inc(),
           }
-          self.metrics.observation_age_seconds.observe(
-            (OffsetDateTime::now_utc() - entry.observed_at)
-              .as_seconds_f64()
-              .max(0.0),
-          );
+          self
+            .metrics
+            .observation_age_seconds
+            .observe((now - entry.observed_at).as_seconds_f64().max(0.0));
           return Ok(LoadedCacheEntry {
             entry,
             retained_coverage: true,
@@ -765,10 +781,32 @@ impl MetadataCache {
     );
     let cache = Arc::clone(self);
     let key = specification.key.clone();
+    let window = specification.window.clone();
     let worker = Arc::clone(&pending);
     tokio::spawn(async move {
       // Delay the storage read so compatible requests can widen the shared Tail scan.
-      tokio::time::sleep(cache.config.coalescing_window).await;
+      let Ok(coalescing_window) = Duration::try_from(cache.config.coalescing_window) else {
+        worker.complete(Err(anyhow::Error::msg(
+          "metadata cache coalescing window exceeds supported range",
+        )));
+        cache.remove_pending_refill(&key, &worker);
+        return;
+      };
+      debug!(
+        "broker metadata cache coalescing wait started: topic={}, window_start={}, \
+         duration_ms={}, now={}",
+        window.topic,
+        window.window_start_unix_seconds,
+        coalescing_window.whole_milliseconds(),
+        cache.time_provider.now(),
+      );
+      cache.time_provider.sleep(coalescing_window).await;
+      debug!(
+        "broker metadata cache coalescing wait completed: topic={}, window_start={}, now={}",
+        window.topic,
+        window.window_start_unix_seconds,
+        cache.time_provider.now(),
+      );
       let (request, coalescing_window_requests) = worker.begin();
       let result = match cache.refill_permits.clone().try_acquire_owned() {
         Ok(permit) => {
@@ -829,7 +867,7 @@ impl MetadataCache {
     );
     let entry = Arc::new(CacheEntry {
       refill_floor: min_snowflake,
-      observed_at: OffsetDateTime::now_utc(),
+      observed_at: self.time_provider.now(),
       retained_bytes: estimate_retained_bytes(&segments),
       generation: self
         .generation
@@ -1057,8 +1095,10 @@ struct CacheEntry {
   segments: Arc<[SegmentMetadata]>,
 }
 
-fn oldest_entry_age_seconds(entries: &Cache<CacheKey, Arc<CacheEntry>>) -> Option<u64> {
-  let now = OffsetDateTime::now_utc();
+fn oldest_entry_age_seconds(
+  entries: &Cache<CacheKey, Arc<CacheEntry>>,
+  now: OffsetDateTime,
+) -> Option<u64> {
   entries
     .iter()
     .map(|(_, entry)| {
@@ -1088,8 +1128,8 @@ impl CacheEntry {
     }
   }
 
-  fn is_fresh(&self, maximum_age: Duration) -> bool {
-    maximum_age > Duration::ZERO && OffsetDateTime::now_utc() - self.observed_at <= maximum_age
+  fn is_fresh(&self, maximum_age: Duration, now: OffsetDateTime) -> bool {
+    maximum_age > Duration::ZERO && now - self.observed_at <= maximum_age
   }
 }
 

@@ -1,8 +1,8 @@
-use super::{ClusterHarness, IntegrationResources, ManualTimeProvider, TOPIC};
+use super::{ClusterHarness, IntegrationResources, LifecycleEvent, ManualTimeProvider, TOPIC};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use bd_server_stats::stats::Collector;
-use bd_time::{OffsetDateTimeExt, TimeProvider};
+use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::{BlobKey, BlobStore};
 use blob_stream_consumer::consumer::{
   BrokerBlobRangeQuery,
@@ -245,6 +245,7 @@ pub struct CountingWindowMetadataStore {
   inner: Arc<dyn MetadataStore>,
   counted_window_start: i64,
   scan_count: AtomicUsize,
+  scan_floors: Mutex<Vec<Option<SnowflakeId>>>,
 }
 
 impl CountingWindowMetadataStore {
@@ -254,12 +255,17 @@ impl CountingWindowMetadataStore {
       inner,
       counted_window_start,
       scan_count: AtomicUsize::new(0),
+      scan_floors: Mutex::new(Vec::new()),
     }
   }
 
   #[must_use]
   pub fn scan_count(&self) -> usize {
     self.scan_count.load(Ordering::Acquire)
+  }
+
+  pub async fn scan_floors(&self) -> Vec<Option<SnowflakeId>> {
+    self.scan_floors.lock().await.clone()
   }
 }
 
@@ -282,6 +288,7 @@ impl MetadataStore for CountingWindowMetadataStore {
   ) -> Result<Vec<SegmentMetadata>> {
     if window.window_start_unix_seconds == self.counted_window_start {
       self.scan_count.fetch_add(1, Ordering::AcqRel);
+      self.scan_floors.lock().await.push(min_snowflake);
     }
     self
       .inner
@@ -543,7 +550,30 @@ pub async fn produce_message_at_manual_time(
   key: Vec<u8>,
   id: &str,
 ) -> Result<blob_stream_producer::ProducerAck> {
+  produce_message_at_manual_time_with_flush_advance(
+    cluster,
+    producer,
+    manual_time,
+    key,
+    id,
+    TimeDuration::seconds(60),
+  )
+  .await
+}
+
+pub async fn produce_message_at_manual_time_with_flush_advance(
+  cluster: &ClusterHarness,
+  producer: &Arc<ProducerClientImpl>,
+  manual_time: &ManualTimeProvider,
+  key: Vec<u8>,
+  id: &str,
+  flush_advance: TimeDuration,
+) -> Result<blob_stream_producer::ProducerAck> {
   let event_timestamp_ms = manual_time.now().unix_timestamp_ms();
+  let lifecycle_hooks = cluster.lifecycle_hooks();
+  let mut flush_gate = lifecycle_hooks
+    .arm(LifecycleEvent::BrokerBeforeFlushPersist)
+    .await?;
   let payload = id.as_bytes().to_vec();
   let producer = Arc::clone(producer);
   let produce_task = tokio::spawn(async move {
@@ -579,8 +609,14 @@ pub async fn produce_message_at_manual_time(
   })
   .await
   .map_err(|_| anyhow!("producer request did not enter the broker buffer"))??;
-  manual_time.advance(TimeDuration::seconds(60));
-
+  timeout(Duration::from_secs(5), manual_time.wait_until_sleeping(1))
+    .await
+    .map_err(|_| anyhow!("broker did not register a logical flush sleep"))?;
+  manual_time.advance(flush_advance);
+  timeout(Duration::from_secs(5), flush_gate.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("broker flush did not reach its pre-persist boundary"))??;
+  flush_gate.release()?;
   produce_task
     .await
     .map_err(|error| anyhow!("manual-time producer task join error: {error}"))?
@@ -720,6 +756,7 @@ pub async fn broker_metadata_cache_reader(
   let discovery = Arc::new(cluster.producer_discovery());
   let broker_metadata_query = Arc::new(GrpcBrokerMetadataQuery::new(discovery).await?);
   ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       strongly_consistent_metadata_reads: Some(strongly_consistent),

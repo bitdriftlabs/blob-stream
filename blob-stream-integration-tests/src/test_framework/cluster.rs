@@ -190,6 +190,8 @@ pub struct ClusterHarness {
   lifecycle_hooks: TestLifecycleHooks,
   broker_time_provider: Arc<dyn TimeProvider>,
   consumer_time_provider: Arc<dyn TimeProvider>,
+  consumer_coordination_time_provider: Arc<dyn TimeProvider>,
+  metadata_cache_time_provider: Arc<dyn TimeProvider>,
   metadata_cache_settings: TestMetadataCacheSettings,
   store_fault_controller: Option<StoreFaultController>,
 }
@@ -210,6 +212,7 @@ pub struct InMemoryClusterHarnessBuilder {
   start_with_all_nodes: bool,
   broker_time_provider: Arc<dyn TimeProvider>,
   consumer_time_provider: Arc<dyn TimeProvider>,
+  consumer_coordination_time_provider: Arc<dyn TimeProvider>,
 }
 
 impl InMemoryClusterHarnessBuilder {
@@ -258,7 +261,18 @@ impl InMemoryClusterHarnessBuilder {
 
   #[must_use]
   pub fn consumer_time_provider(mut self, consumer_time_provider: Arc<dyn TimeProvider>) -> Self {
-    self.consumer_time_provider = consumer_time_provider;
+    self.consumer_time_provider = Arc::clone(&consumer_time_provider);
+    self.consumer_coordination_time_provider = consumer_time_provider;
+    self
+  }
+
+  /// Override the consumer-group clock independently from reader scan time.
+  #[must_use]
+  pub fn consumer_coordination_time_provider(
+    mut self,
+    consumer_coordination_time_provider: Arc<dyn TimeProvider>,
+  ) -> Self {
+    self.consumer_coordination_time_provider = consumer_coordination_time_provider;
     self
   }
 
@@ -308,6 +322,8 @@ impl InMemoryClusterHarnessBuilder {
       Arc::new(InMemoryTestTransport::new()),
       self.broker_time_provider,
       self.consumer_time_provider,
+      self.consumer_coordination_time_provider,
+      Arc::new(SystemTimeProvider),
       TestMetadataCacheSettings::default(),
     )
     .await
@@ -333,6 +349,8 @@ pub struct ClusterHarnessBuilder<'a> {
   transport: Arc<dyn BrokerTransport>,
   broker_time_provider: Arc<dyn TimeProvider>,
   consumer_time_provider: Arc<dyn TimeProvider>,
+  consumer_coordination_time_provider: Arc<dyn TimeProvider>,
+  metadata_cache_time_provider: Arc<dyn TimeProvider>,
   metadata_cache_settings: TestMetadataCacheSettings,
 }
 
@@ -400,7 +418,28 @@ impl ClusterHarnessBuilder<'_> {
 
   #[must_use]
   pub fn consumer_time_provider(mut self, consumer_time_provider: Arc<dyn TimeProvider>) -> Self {
-    self.consumer_time_provider = consumer_time_provider;
+    self.consumer_time_provider = Arc::clone(&consumer_time_provider);
+    self.consumer_coordination_time_provider = consumer_time_provider;
+    self
+  }
+
+  /// Override the consumer-group clock independently from reader scan time.
+  #[must_use]
+  pub fn consumer_coordination_time_provider(
+    mut self,
+    consumer_coordination_time_provider: Arc<dyn TimeProvider>,
+  ) -> Self {
+    self.consumer_coordination_time_provider = consumer_coordination_time_provider;
+    self
+  }
+
+  /// Override the broker metadata-cache clock for deterministic timing assertions.
+  #[must_use]
+  pub fn metadata_cache_time_provider(
+    mut self,
+    metadata_cache_time_provider: Arc<dyn TimeProvider>,
+  ) -> Self {
+    self.metadata_cache_time_provider = metadata_cache_time_provider;
     self
   }
 
@@ -464,6 +503,8 @@ impl ClusterHarnessBuilder<'_> {
       self.transport,
       self.broker_time_provider,
       self.consumer_time_provider,
+      self.consumer_coordination_time_provider,
+      self.metadata_cache_time_provider,
       self.metadata_cache_settings,
     )
     .await
@@ -490,6 +531,8 @@ impl ClusterHarness {
       transport: Arc::new(GrpcTcpTransport),
       broker_time_provider: Arc::new(SystemTimeProvider),
       consumer_time_provider: Arc::new(SystemTimeProvider),
+      consumer_coordination_time_provider: Arc::new(SystemTimeProvider),
+      metadata_cache_time_provider: Arc::new(SystemTimeProvider),
       metadata_cache_settings: TestMetadataCacheSettings::default(),
     }
   }
@@ -507,6 +550,7 @@ impl ClusterHarness {
       start_with_all_nodes: false,
       broker_time_provider: Arc::new(SystemTimeProvider),
       consumer_time_provider: Arc::new(SystemTimeProvider),
+      consumer_coordination_time_provider: Arc::new(SystemTimeProvider),
     }
   }
 
@@ -528,6 +572,8 @@ impl ClusterHarness {
     transport: Arc<dyn BrokerTransport>,
     broker_time_provider: Arc<dyn TimeProvider>,
     consumer_time_provider: Arc<dyn TimeProvider>,
+    consumer_coordination_time_provider: Arc<dyn TimeProvider>,
+    metadata_cache_time_provider: Arc<dyn TimeProvider>,
     metadata_cache_settings: TestMetadataCacheSettings,
   ) -> Result<Self> {
     if partition_count == 0 {
@@ -612,6 +658,8 @@ impl ClusterHarness {
       lifecycle_hooks,
       broker_time_provider,
       consumer_time_provider,
+      consumer_coordination_time_provider,
+      metadata_cache_time_provider,
       metadata_cache_settings,
       store_fault_controller,
     };
@@ -698,7 +746,7 @@ impl ClusterHarness {
         (0 .. self.partition_count).collect(),
         Arc::clone(&self.consumer_membership_store),
       )
-      .time_provider(Arc::clone(&self.consumer_time_provider)),
+      .time_provider(Arc::clone(&self.consumer_coordination_time_provider)),
     );
     let broker_metadata_query =
       Arc::new(GrpcBrokerMetadataQuery::new(Arc::clone(&discovery)).await?);
@@ -720,6 +768,7 @@ impl ClusterHarness {
     .metadata_cache_max_age(self.metadata_cache_settings.effective_max_age())
     .lifecycle_hooks(Arc::new(self.lifecycle_hooks.clone()))
     .time_provider(Arc::clone(&self.consumer_time_provider))
+    .driver_time_provider(Arc::clone(&self.consumer_coordination_time_provider))
     .build()
     .await
   }
@@ -730,9 +779,24 @@ impl ClusterHarness {
     runtime: &ConsumerRuntimeConfig,
   ) -> Result<ConsumerIteratorImpl> {
     self
-      .create_broker_metadata_cache_consumer_with_discovery(
+      .create_broker_metadata_cache_consumer_with_metadata_store(
+        runtime,
+        Arc::clone(&self.metadata_store),
+      )
+      .await
+  }
+
+  /// Build a cache consumer with a distinct direct metadata store for fallback assertions.
+  pub async fn create_broker_metadata_cache_consumer_with_metadata_store(
+    &self,
+    runtime: &ConsumerRuntimeConfig,
+    metadata_store: Arc<dyn MetadataStore>,
+  ) -> Result<ConsumerIteratorImpl> {
+    self
+      .create_broker_metadata_cache_consumer_with_discovery_and_metadata_store(
         runtime,
         Arc::new(self.producer_discovery()),
+        metadata_store,
       )
       .await
   }
@@ -742,6 +806,21 @@ impl ClusterHarness {
     &self,
     runtime: &ConsumerRuntimeConfig,
     discovery: Arc<dyn BrokerDiscovery>,
+  ) -> Result<ConsumerIteratorImpl> {
+    self
+      .create_broker_metadata_cache_consumer_with_discovery_and_metadata_store(
+        runtime,
+        discovery,
+        Arc::clone(&self.metadata_store),
+      )
+      .await
+  }
+
+  async fn create_broker_metadata_cache_consumer_with_discovery_and_metadata_store(
+    &self,
+    runtime: &ConsumerRuntimeConfig,
+    discovery: Arc<dyn BrokerDiscovery>,
+    metadata_store: Arc<dyn MetadataStore>,
   ) -> Result<ConsumerIteratorImpl> {
     let group = runtime
       .group
@@ -755,7 +834,7 @@ impl ClusterHarness {
         (0 .. self.partition_count).collect(),
         Arc::clone(&self.consumer_membership_store),
       )
-      .time_provider(Arc::clone(&self.consumer_time_provider)),
+      .time_provider(Arc::clone(&self.consumer_coordination_time_provider)),
     );
     let broker_metadata_query =
       Arc::new(GrpcBrokerMetadataQuery::new(Arc::clone(&discovery)).await?);
@@ -764,7 +843,7 @@ impl ClusterHarness {
     ConsumerIteratorBuilder::new(
       runtime,
       Arc::clone(&self.blob_store),
-      Arc::clone(&self.metadata_store),
+      metadata_store,
       Arc::clone(&self.consumer_lease_store),
       Arc::clone(&self.consumer_membership_store),
       coordination_source,
@@ -778,6 +857,7 @@ impl ClusterHarness {
     .metadata_cache_max_age(time::Duration::milliseconds(250))
     .lifecycle_hooks(Arc::new(self.lifecycle_hooks.clone()))
     .time_provider(Arc::clone(&self.consumer_time_provider))
+    .driver_time_provider(Arc::clone(&self.consumer_coordination_time_provider))
     .build()
     .await
   }
@@ -929,14 +1009,16 @@ impl ClusterHarness {
       ),
       &metrics.scope(),
     ));
-    let metadata_cache = Arc::new(MetadataCache::new(
+    let metadata_cache = MetadataCache::new(
       Arc::clone(&self.metadata_store),
       test_metadata_cache_config(
         partition_count,
         topic_num_writers,
         self.metadata_cache_settings,
       )?,
-    ));
+    )
+    .time_provider(Arc::clone(&self.metadata_cache_time_provider));
+    let metadata_cache = Arc::new(metadata_cache);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     // TCP bindings run the real axum server; in-memory bindings only wait for shutdown.
     let serve_task = match endpoint.binding {

@@ -30,6 +30,7 @@ use super::{
   trace,
   try_join_all,
 };
+use crate::consumer::diagnostics::{ConsumerReaderMetadataSource, MAX_METADATA_SOURCE_DETAILS};
 use crate::consumer::metadata_query::decode_metadata_response;
 use crate::consumer::{
   BrokerBlobRangeQuery,
@@ -37,6 +38,7 @@ use crate::consumer::{
   ConsumerReadOutcome,
   decode_blob_range_response_for_ranges,
 };
+use crate::diagnostics::reader_partition_scan_snapshot;
 use bd_log_util::warn_every;
 use blob_stream_blob_store::BlobKey;
 use blob_stream_metadata_store::MetadataReadConsistency;
@@ -50,7 +52,6 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   TailMetadataCoverage,
   read_metadata_window_request,
 };
-use time::OffsetDateTime;
 use time::ext::NumericalDuration;
 use tokio::sync::Semaphore;
 
@@ -133,6 +134,7 @@ impl ConsumerReaderImpl {
       let metrics = self.metrics.clone();
       let metadata_read_consistency = runtime_settings.metadata_read_consistency;
       let metadata_cache_max_age = self.metadata_cache_max_age;
+      let time_provider = Arc::clone(&self.time_provider);
       let broker_request = broker_request_for_scan(&request, metadata_read_consistency);
       scan_futures.push(async move {
         if !request.recovery_scan && request.eligibility.fast && request.min_snowflake.is_none() {
@@ -147,10 +149,11 @@ impl ConsumerReaderImpl {
             .await
           {
             Ok(response) => {
+              let received_at = time_provider.now();
               match decode_metadata_response(
                 &broker_request,
                 response,
-                OffsetDateTime::now_utc(),
+                received_at,
                 metadata_cache_max_age,
               ) {
                 Ok(result) => Some(result),
@@ -562,6 +565,7 @@ impl ConsumerReaderImpl {
     } = finalization;
     let mut initial_scans_completed = Vec::new();
     let mut recoveries_completed = Vec::new();
+    let fast_coverage_floor = self.fast_scan_safe_timestamp(now, runtime_settings);
     for (partition_id, state) in &mut self.virtual_partition_states {
       let mut next_state = None;
       match state {
@@ -578,6 +582,7 @@ impl ConsumerReaderImpl {
           initial_scans_completed.push((*partition_id, *initial_window_start_unix_seconds));
           next_state = Some(VirtualPartitionState::Fast {
             cursor: *cursor,
+            coverage_floor: Some(fast_coverage_floor),
             last_scan: None,
           });
         },
@@ -612,12 +617,15 @@ impl ConsumerReaderImpl {
           if recovery_state.next_window_start_unix_seconds
             > recovery_state.cutover_window_start_unix_seconds
           {
+            let coverage_floor =
+              offset_datetime_from_unix_seconds(recovery_state.cutover_window_start_unix_seconds);
             recoveries_completed.push((
               *partition_id,
               recovery_state.cutover_window_start_unix_seconds,
             ));
             next_state = Some(VirtualPartitionState::Fast {
               cursor: *cursor,
+              coverage_floor: Some(coverage_floor),
               last_scan: None,
             });
           }
@@ -690,6 +698,7 @@ impl ConsumerReaderImpl {
          metadata_segments_without_partition_batches={}, metadata_batches_seen={}, \
          metadata_batches_skipped_by_cursor={}, metadata_segments_skipped_by_frontier={}, \
          metadata_segments_deferred_by_visibility={}, metadata_segments_blocked_by_visibility={}, \
+         metadata_sources_incomplete_by_capacity={}, \
          recovery_segments_handed_to_fast_by_visibility={}, \
          recovery_segments_blocked_by_visibility={}, recovery_metadata_cache_hits={}, \
          recovery_metadata_cache_misses={}, metadata_batches_deferred_by_capacity={}, \
@@ -706,6 +715,7 @@ impl ConsumerReaderImpl {
         scan_state.metadata_segments_skipped_by_frontier,
         scan_state.metadata_segments_deferred_by_visibility,
         scan_state.metadata_segments_blocked_by_visibility,
+        scan_state.metadata_sources_incomplete_by_capacity,
         scan_state.recovery_segments_handed_to_fast_by_visibility,
         scan_state.recovery_segments_blocked_by_visibility,
         scan_state.recovery_metadata_cache_hits,
@@ -764,6 +774,22 @@ impl ConsumerReaderImpl {
     let mut metadata_batches_scanned = 0_usize;
     let mut metadata_batches_skipped_by_cursor = 0_usize;
     let now_unix_seconds = now.unix_timestamp();
+    let initial_fast_partitions = assigned_partition_ids
+      .iter()
+      .copied()
+      .filter(|partition_id| {
+        matches!(
+          self.virtual_partition_states.get(partition_id),
+          Some(VirtualPartitionState::Fast { .. })
+        )
+      })
+      .collect::<Vec<_>>();
+    let fast_scan_start_floor = self.fast_scan_safe_timestamp(now, runtime_settings);
+    for &partition_id in &initial_fast_partitions {
+      if let Some(state) = self.virtual_partition_states.get_mut(&partition_id) {
+        state.seed_fast_coverage_floor(fast_scan_start_floor);
+      }
+    }
     let visibility_cutoff = now.saturating_sub(runtime_settings.metadata_visibility_delay);
     // A pass can defer several sources. The worker needs only the first safe retry, not a
     // per-source timer, because rescanning then will reconsider every deferred source.
@@ -858,8 +884,10 @@ impl ConsumerReaderImpl {
     let fast_horizon_windows = self
       .eligible_fast_scan_windows(now, runtime_settings)?
       .into_iter()
-      .map(|(window, _)| window.window_start_unix_seconds)
+      .map(|window| window.window_start_unix_seconds)
       .collect::<HashSet<_>>();
+    let fast_horizon_floor =
+      Self::snowflake_floor(self.fast_scan_safe_timestamp(now, runtime_settings));
     let mut segment_read_plans = Vec::new();
     let mut capacity_exhausted = false;
     'windows: for (request_index, (request, segments, visibility_cutoff)) in
@@ -933,6 +961,23 @@ impl ConsumerReaderImpl {
           };
           let frontier_key = (partition_id, window.window_start_unix_seconds);
           let fast_partition = matches!(partition_state, Some(VirtualPartitionState::Fast { .. }));
+          // Sources are Snowflake ordered, so keep the newest rows nearest accepted batches.
+          if scan_state.metadata_sources.len() == MAX_METADATA_SOURCE_DETAILS {
+            scan_state.metadata_sources.pop_front();
+            scan_state.metadata_sources_truncated = true;
+          }
+          scan_state
+            .metadata_sources
+            .push_back(ConsumerReaderMetadataSource {
+              window_start_unix_seconds: window.window_start_unix_seconds,
+              snowflake_id: segment.snowflake_id.as_u64(),
+              blob_key: segment.blob_key.as_str().to_string(),
+              metadata_published_at: segment.metadata_published_at,
+              batch_ranges: partition_batches
+                .iter()
+                .map(|batch| batch.seq_range.clone())
+                .collect(),
+            });
           if fast_partition {
             // The shared DynamoDB lower bound is the least restrictive partition bound. Reapply
             // each partition's inclusive frontier here so a sparse partition cannot be skipped
@@ -1008,23 +1053,36 @@ impl ConsumerReaderImpl {
                 .entry(partition_id)
                 .or_default()
                 .fresh_deferred_by_visibility = true;
-            } else if fast_horizon_windows.contains(&window.window_start_unix_seconds) {
-              scan_state.recovery_segments_handed_to_fast_by_visibility = scan_state
-                .recovery_segments_handed_to_fast_by_visibility
-                .saturating_add(1);
             } else {
-              scan_state.recovery_segments_blocked_by_visibility = scan_state
-                .recovery_segments_blocked_by_visibility
-                .saturating_add(1);
-              let partition_finalization = partition_finalizations.entry(partition_id).or_default();
-              partition_finalization.visibility_deferred_recovery_window = Some(
-                partition_finalization
-                  .visibility_deferred_recovery_window
-                  .map_or(window.window_start_unix_seconds, |deferred_window| {
-                    deferred_window.min(window.window_start_unix_seconds)
-                  }),
-              );
-              blocked_recovering_partitions.insert(partition_id);
+              // Recovery may complete only when Fast can revisit this source. A retained Fast
+              // frontier can be stricter than the time floor after a stalled Fast scan.
+              let fast_handoff_floor = next_fast_frontiers
+                .get(&frontier_key)
+                .copied()
+                .map_or(fast_horizon_floor, |frontier| {
+                  frontier.max(fast_horizon_floor)
+                });
+              if fast_horizon_windows.contains(&window.window_start_unix_seconds)
+                && segment.snowflake_id >= fast_handoff_floor
+              {
+                scan_state.recovery_segments_handed_to_fast_by_visibility = scan_state
+                  .recovery_segments_handed_to_fast_by_visibility
+                  .saturating_add(1);
+              } else {
+                scan_state.recovery_segments_blocked_by_visibility = scan_state
+                  .recovery_segments_blocked_by_visibility
+                  .saturating_add(1);
+                let partition_finalization =
+                  partition_finalizations.entry(partition_id).or_default();
+                partition_finalization.visibility_deferred_recovery_window = Some(
+                  partition_finalization
+                    .visibility_deferred_recovery_window
+                    .map_or(window.window_start_unix_seconds, |deferred_window| {
+                      deferred_window.min(window.window_start_unix_seconds)
+                    }),
+                );
+                blocked_recovering_partitions.insert(partition_id);
+              }
             }
             continue;
           }
@@ -1125,6 +1183,9 @@ impl ConsumerReaderImpl {
           // A capacity stop leaves the current request only partially observed and prevents every
           // later request from being processed. Keep all affected modes at their first incomplete
           // window so a later pass cannot skip unread batches by advancing to Fast.
+          for scan_state in scan_states.values_mut() {
+            scan_state.metadata_sources_incomplete_by_capacity = true;
+          }
           for deferred_request in scan_requests.iter().skip(request_index) {
             for &partition_id in &deferred_request.eligibility.recovering_partitions {
               let partition_finalization = partition_finalizations.entry(partition_id).or_default();
@@ -1153,7 +1214,7 @@ impl ConsumerReaderImpl {
       .execute_segment_reads(segment_read_plans, runtime_settings)
       .await?;
 
-    let output = self.accept_batch_read_results(
+    let mut output = self.accept_batch_read_results(
       batch_read_results,
       &mut scan_states,
       &mut metadata_batches_skipped_by_cursor,
@@ -1179,6 +1240,18 @@ impl ConsumerReaderImpl {
       runtime_settings,
       &mut scan_states,
     )?;
+    if !capacity_exhausted {
+      for partition_id in initial_fast_partitions {
+        if !blocked_fast_sources
+          .iter()
+          .any(|(blocked_partition_id, _)| *blocked_partition_id == partition_id)
+          && let Some(state) = self.virtual_partition_states.get_mut(&partition_id)
+        {
+          state.set_fast_coverage_floor(fast_scan_start_floor);
+        }
+      }
+    }
+    self.attach_admission_scan_contexts(&mut output);
 
     self.metrics.record_read_available(
       read_started_at,
@@ -1199,6 +1272,22 @@ impl ConsumerReaderImpl {
         .filter(|deadline| !capacity_exhausted && *deadline > now),
       batches: output,
     })
+  }
+
+  fn attach_admission_scan_contexts(&self, batches: &mut [ConsumerBatch]) {
+    let mut contexts = HashMap::new();
+    for batch in batches {
+      let context = contexts
+        .entry(batch.virtual_partition_id)
+        .or_insert_with(|| {
+          self
+            .virtual_partition_states
+            .get(&batch.virtual_partition_id)
+            .and_then(VirtualPartitionState::last_scan_handle)
+            .map(|scan| Arc::new(reader_partition_scan_snapshot(&scan)))
+        });
+      batch.admission_scan.clone_from(context);
+    }
   }
 }
 

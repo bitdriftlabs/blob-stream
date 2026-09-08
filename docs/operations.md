@@ -4,6 +4,38 @@ This guide covers live `blob-stream` operation, observability, and consistency c
 [Infrastructure setup](infrastructure.md) for configuration, access, and resource provisioning, and
 [Design](design.md) for the underlying delivery guarantees.
 
+## Investigating A Consumer Delivery Gap
+
+Use `blob-stream-metadata-inspector` to strongly read the current DynamoDB metadata rows around a
+gap. It uses standard AWS credential resolution; supply `AWS_REGION` and, when inspecting a local
+table, `DYNAMODB_ENDPOINT`. The default 300-second metadata window must be changed with
+`--metadata-window-seconds` for a topic configured with a different fixed window size.
+
+```sh
+AWS_REGION=us-east-1 ./bazelw run //blob-stream/blob-stream-metadata-inspector:blob-stream-metadata-inspector-bin -- \
+   --segment-dynamo-table <table> \
+   --topic <topic> \
+   --target-time 2026-09-05T13:16:17.556509Z \
+   --suspect-cursor 11480895592 \
+   --partition 1
+```
+
+The report includes the target window and one adjacent window on each side. Its table output shows
+three source rows before and after the cursor boundary by default, including blob keys, timestamps,
+byte ranges, and payload sizes; it summarizes the omitted rows. Use `--context-rows <count>` to
+widen that focused view, or `--format json` to attach every queried row to an incident. It flags
+uncovered sequence intervals, overlaps, and when source order differs from sequence order.
+
+Strong reads show the table's current state, not what an earlier eventual consumer query returned.
+For a delivery gap, its warning's `admission_scan_json` is the exact finalized reader scan that
+admitted the gapped batch; compare its rows and partition batch ranges with the inspector output,
+then inspect the listed S3 blob keys. `partition_state_json` is a later live snapshot and is
+supplemental only. A row present now but absent from `admission_scan_json` supports an
+eventual-consistency or query-response hypothesis only when both
+`metadata_sources_truncated` and `metadata_sources_incomplete_by_capacity` are false. A row
+observed but skipped at or below the cursor supports consumer accounting investigation; no row
+spanning the interval points to producer allocation or publication.
+
 ## Consistency Controls
 
 Consumer metadata reads are eventually consistent by default. The controls below address different

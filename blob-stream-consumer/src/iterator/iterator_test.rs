@@ -2,7 +2,7 @@
 
 use super::delivery::{BufferedBatch, DeliveryState};
 use super::prefetch::{IdlePollBackoff, SeekTrace};
-use super::shared::{ActivePartitionState, ConsumerIteratorMetrics};
+use super::shared::{ActivePartitionState, ConsumerIteratorMetrics, DeliveredSource};
 use super::{
   ConsumerCoordinationSource,
   ConsumerDeliveryState,
@@ -21,7 +21,7 @@ use crate::config::{
   DEFAULT_MAX_METADATA_PUBLICATION_LAG,
   consumer_max_clock_skew,
 };
-use crate::consumer::{BrokerBlobRangeQuery, BrokerMetadataQuery};
+use crate::consumer::{BrokerBlobRangeQuery, BrokerMetadataQuery, ConsumerBatchSource};
 use crate::coordination::RecoveredCursor;
 use crate::diagnostics::{
   ConsumerAssignmentPlanSnapshot,
@@ -760,11 +760,17 @@ fn current_batch_for_fenced_partition_is_not_delivered() {
   let mut delivery_state = DeliveryState {
     current_batch: Some(BufferedBatch {
       virtual_partition_id: 7,
+      end_offset: 1,
       next_offset: 1,
       source_checkpoint: CommittedSourceCheckpoint {
         window_start_unix_seconds: 0,
         snowflake_id: 1,
       },
+      source: ConsumerBatchSource {
+        blob_key: BlobKey::new("telemetry/0/1.bin"),
+        metadata_published_at: OffsetDateTime::UNIX_EPOCH,
+      },
+      admission_scan: None,
       remaining_payload_bytes: 1,
       records: vec![new_record(vec![1], 0)].into_iter(),
     }),
@@ -787,11 +793,17 @@ fn current_batch_remaining_bytes_decrease_as_records_are_delivered() {
   let mut delivery_state = DeliveryState {
     current_batch: Some(BufferedBatch {
       virtual_partition_id: 7,
+      end_offset: 1,
       next_offset: 1,
       source_checkpoint: CommittedSourceCheckpoint {
         window_start_unix_seconds: 0,
         snowflake_id: 1,
       },
+      source: ConsumerBatchSource {
+        blob_key: BlobKey::new("telemetry/0/1.bin"),
+        metadata_published_at: OffsetDateTime::UNIX_EPOCH,
+      },
+      admission_scan: None,
       remaining_payload_bytes: 3,
       records: vec![new_record(vec![1, 2, 3], 0)].into_iter(),
     }),
@@ -800,10 +812,12 @@ fn current_batch_remaining_bytes_decrease_as_records_are_delivered() {
 
   let mut active_partitions = HashMap::from([(7, ActivePartitionState::default())]);
   assert!(matches!(
-    delivery_state.try_take_next(
-      &mut active_partitions,
-      &ConsumerIteratorMetrics::new(&metrics_scope())
-    ),
+    delivery_state
+      .try_take_next(
+        &mut active_partitions,
+        &ConsumerIteratorMetrics::new(&metrics_scope())
+      )
+      .map(|result| result.next_result),
     Some(NextResult::Record(_))
   ));
   assert_eq!(delivery_state.retained_bytes(), 0);
@@ -814,11 +828,17 @@ fn delivered_record_after_a_gap_records_the_missing_sequences() {
   let mut delivery_state = DeliveryState {
     current_batch: Some(BufferedBatch {
       virtual_partition_id: 7,
+      end_offset: 3,
       next_offset: 3,
       source_checkpoint: CommittedSourceCheckpoint {
         window_start_unix_seconds: 0,
         snowflake_id: 1,
       },
+      source: ConsumerBatchSource {
+        blob_key: BlobKey::new("telemetry/0/1.bin"),
+        metadata_published_at: OffsetDateTime::UNIX_EPOCH,
+      },
+      admission_scan: None,
       remaining_payload_bytes: 1,
       records: vec![new_record(vec![1], 0)].into_iter(),
     }),
@@ -828,15 +848,51 @@ fn delivered_record_after_a_gap_records_the_missing_sequences() {
     7,
     ActivePartitionState {
       delivery_gap_baseline: Some(1),
+      last_delivered_source: Some(DeliveredSource {
+        offset: 1,
+        source_checkpoint: CommittedSourceCheckpoint {
+          window_start_unix_seconds: 0,
+          snowflake_id: 0,
+        },
+        source: ConsumerBatchSource {
+          blob_key: BlobKey::new("telemetry/0/0.bin"),
+          metadata_published_at: OffsetDateTime::UNIX_EPOCH,
+        },
+      }),
+      last_stored_source: Some(DeliveredSource {
+        offset: 1,
+        source_checkpoint: CommittedSourceCheckpoint {
+          window_start_unix_seconds: 0,
+          snowflake_id: 0,
+        },
+        source: ConsumerBatchSource {
+          blob_key: BlobKey::new("telemetry/0/0.bin"),
+          metadata_published_at: OffsetDateTime::UNIX_EPOCH,
+        },
+      }),
       ..Default::default()
     },
   )]);
   let metrics = ConsumerIteratorMetrics::new(&metrics_scope());
 
-  assert!(matches!(
-    delivery_state.try_take_next(&mut active_partitions, &metrics),
-    Some(NextResult::Record(_))
-  ));
+  let delivery_result = delivery_state
+    .try_take_next(&mut active_partitions, &metrics)
+    .expect("expected a delivered record");
+  assert!(matches!(delivery_result.next_result, NextResult::Record(_)));
+  let gap = delivery_result.gap.expect("expected delivery gap context");
+  assert_eq!(gap.expected_offset, 2);
+  assert_eq!(gap.received_offset, 3);
+  assert_eq!(gap.missing_sequences, 1);
+  assert_eq!(
+    gap.previous_source.unwrap().source.blob_key.as_str(),
+    "telemetry/0/0.bin"
+  );
+  assert_eq!(
+    gap.last_stored_source.unwrap().source.blob_key.as_str(),
+    "telemetry/0/0.bin"
+  );
+  assert_eq!(gap.current_source_checkpoint.snowflake_id, 1);
+  assert_eq!(gap.current_source.blob_key.as_str(), "telemetry/0/1.bin");
   assert_eq!(metrics.delivery_gap_events.get(), 1);
   assert_eq!(
     active_partitions.get(&7).unwrap().delivery_gap_baseline,
@@ -1448,7 +1504,7 @@ async fn iterator_builder_applies_configured_clock_skew_to_reader_scan_horizon()
   let mut scanned_windows = metadata_store.scanned_windows.lock().clone();
   scanned_windows.sort_unstable();
   scanned_windows.dedup();
-  assert_eq!(scanned_windows, vec![2, 3]);
+  assert_eq!(scanned_windows, vec![1, 2, 3]);
 
   Box::new(iterator).shutdown().await.unwrap();
 }
@@ -3211,6 +3267,9 @@ async fn seek_discards_prefetched_records_slices_the_resume_batch_and_rewinds_fa
   };
   assert_eq!(first_record.virtual_partition_id, 7);
   assert_eq!(first_record.offset, 1);
+  iterator
+    .store_offset(first_record.virtual_partition_id, first_record.offset)
+    .unwrap();
 
   let in_flight_snapshot = iterator
     .diagnostics()
@@ -3236,6 +3295,15 @@ async fn seek_discards_prefetched_records_slices_the_resume_batch_and_rewinds_fa
   .unwrap()
   .unwrap();
   assert_eq!(iterator.metrics.seeks.get(), 1);
+  {
+    let shared_state = iterator.shared_state.lock();
+    let partition_state = shared_state
+      .active_partitions
+      .get(&7)
+      .expect("seek retains the active partition");
+    assert!(partition_state.last_delivered_source.is_none());
+    assert!(partition_state.last_stored_source.is_none());
+  }
   let rewound = timeout(Duration::from_secs(2), iterator.next())
     .await
     .unwrap()

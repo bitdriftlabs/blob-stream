@@ -309,6 +309,8 @@ impl ConsumerDriver {
         partition_state.pending_commit = None;
         partition_state.delivered_source_ranges.clear();
         partition_state.delivery_gap_baseline = Some(target.offset);
+        partition_state.last_delivered_source = None;
+        partition_state.last_stored_source = None;
       }
       update_worker_prefetch_metrics(&self.metrics, &shared_state.delivery_state);
       update_total_prefetch_bytes(

@@ -10,9 +10,9 @@ use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::VirtualPartitionId;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use time::Duration as TimeDuration;
-use tokio::sync::{Mutex, oneshot};
-
+use tokio::sync::{Mutex, Notify, oneshot};
 //
 // LifecycleEvent
 //
@@ -29,10 +29,12 @@ pub enum LifecycleEvent {
   BrokerLeaseReleased,
   ConsumerRevocationEmitted,
   ConsumerPrefetchBatchBuffered,
+  ConsumerPrefetchCapacityExhausted,
   ConsumerRecoveryFastPathActive,
   ConsumerInitialFastPathActive,
   ConsumerBeforeScheduledHeartbeat,
   ConsumerBeforeRebalance,
+  ConsumerRebalancePlanReady,
   ConsumerRebalanceFailed,
   ConsumerRebalanceApplied,
   ConsumerBeforeCommit,
@@ -122,6 +124,16 @@ pub async fn advance_manual_time_until_lifecycle_gate(
 #[derive(Clone, Default)]
 pub struct TestLifecycleHooks {
   gates: Arc<Mutex<HashMap<LifecycleGateKey, ArmedLifecycleGate>>>,
+  rebalance_plans: Arc<Mutex<HashMap<String, TestRebalancePlan>>>,
+  broker_flush_persist_count: Arc<AtomicUsize>,
+  broker_flush_persisted: Arc<Notify>,
+}
+
+/// Assignment transition observed after group coordination chooses a changed plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestRebalancePlan {
+  pub current_assignment: Vec<VirtualPartitionId>,
+  pub next_assignment: Vec<VirtualPartitionId>,
 }
 
 struct ArmedLifecycleGate {
@@ -197,6 +209,28 @@ impl TestLifecycleHooks {
       entered: Some(entered_rx),
       release: Some(release_tx),
     })
+  }
+
+  /// Return the latest changed plan observed for `member_id`.
+  pub async fn rebalance_plan(&self, member_id: &str) -> Option<TestRebalancePlan> {
+    self.rebalance_plans.lock().await.get(member_id).cloned()
+  }
+
+  #[must_use]
+  pub fn broker_flush_persist_count(&self) -> usize {
+    self.broker_flush_persist_count.load(Ordering::Acquire)
+  }
+
+  pub async fn wait_for_broker_flush_persist_after(&self, previous_count: usize) {
+    loop {
+      let notified = self.broker_flush_persisted.notified();
+      tokio::pin!(notified);
+      notified.as_mut().enable();
+      if self.broker_flush_persist_count() > previous_count {
+        return;
+      }
+      notified.await;
+    }
   }
 
   async fn reach_prefetch(&self, member_id: &str, virtual_partition_id: VirtualPartitionId) {
@@ -306,6 +340,10 @@ impl TestLifecycleHooks {
 #[async_trait]
 impl BrokerLifecycleHooks for TestLifecycleHooks {
   async fn before_flush_persist(&self, _topic: &str, partitions: &[VirtualPartitionId]) {
+    self
+      .broker_flush_persist_count
+      .fetch_add(1, Ordering::Release);
+    self.broker_flush_persisted.notify_waiters();
     for virtual_partition_id in partitions {
       self
         .reach_broker_partition(
@@ -392,6 +430,21 @@ impl ConsumerLifecycleHooks for TestLifecycleHooks {
     self.reach_prefetch(member_id, virtual_partition_id).await;
   }
 
+  async fn prefetch_capacity_exhausted(
+    &self,
+    member_id: &str,
+    buffered_partitions: &[VirtualPartitionId],
+  ) {
+    self
+      .reach_consumer(
+        LifecycleEvent::ConsumerPrefetchCapacityExhausted,
+        member_id,
+        0,
+        buffered_partitions,
+      )
+      .await;
+  }
+
   async fn recovery_fast_path_active(
     &self,
     member_id: &str,
@@ -442,6 +495,30 @@ impl ConsumerLifecycleHooks for TestLifecycleHooks {
         member_id,
         generation,
         &[],
+      )
+      .await;
+  }
+
+  async fn rebalance_plan_ready(
+    &self,
+    member_id: &str,
+    generation: u64,
+    current_assignment: &[VirtualPartitionId],
+    next_assignment: &[VirtualPartitionId],
+  ) {
+    self.rebalance_plans.lock().await.insert(
+      member_id.to_string(),
+      TestRebalancePlan {
+        current_assignment: current_assignment.to_vec(),
+        next_assignment: next_assignment.to_vec(),
+      },
+    );
+    self
+      .reach_consumer(
+        LifecycleEvent::ConsumerRebalancePlanReady,
+        member_id,
+        generation,
+        next_assignment,
       )
       .await;
   }

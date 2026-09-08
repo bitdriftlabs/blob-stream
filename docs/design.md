@@ -225,6 +225,15 @@ partition. A seek resets the baseline to the requested offset, so intentionally 
 before a forward seek and replay after a backward seek do not produce false gap reports. A truly
 fresh group partition has no baseline until its first delivered record.
 
+The rate-limited delivery-gap warning records the preceding delivered source, the last
+application-stored source when one exists, and the current source. Each source contains its
+sequence position, metadata window, snowflake ID, and blob key. `admission_scan_json` is the exact
+finalized bounded scan that admitted the current batch: query windows and lower bounds, returned
+metadata rows with partition batch ranges, scan counters, and truncation indicators. When the row
+list is truncated, it retains the newest Snowflake-ordered rows nearest the admitted batches. The
+warning's `partition_state_json` is a live, supplemental snapshot that may have advanced past that
+admission scan. Neither evidence source assigns a root cause to the discontinuity.
+
 The optional `fenced_metadata_writes` mode supplies a durable cross-process publication fence. Each
 write engine creates a unique process session ID; acquisition by a new or expired session increments
 the durable lease epoch, while a live renewal by the same session preserves it. Metadata publication
@@ -478,8 +487,11 @@ query still apply their own frontier filters after the result is returned.
   and becomes Fast only after its cutover window is fully scanned. When the checkpoint window is
   the cutover window, recovery is a single-window pass.
 3. **Fast:** A partition that has completed Fresh or Recovery scans only the bounded recent horizon
-   where metadata can still be unpublished or invisible. Fast is an optimization; it is never used
-   to replace retained recovery for a resumed partition.
+  where metadata can still be unpublished or invisible. It retains the earliest unconfirmed
+  coverage floor from incomplete Fast passes. When that floor leaves the live horizon, the
+  partition returns to bounded chronological Recovery from the retention-clamped floor through
+  the captured current-window cutover before resuming Fast. Fast is an optimization; it is never
+  used to replace retained recovery for a resumed partition.
 
 For a usable source checkpoint that was not clamped to retention, recovery uses an inclusive lower
 bound only for its first window. Let $D$ be the broker's publication deadline plus the consumer's

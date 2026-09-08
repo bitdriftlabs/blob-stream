@@ -11,6 +11,7 @@ use crate::test_framework::{
 };
 use anyhow::{Result, anyhow};
 use bd_server_stats::stats::Collector;
+use bd_time::SystemTimeProvider;
 use blob_stream_broker::write::BrokerLeaseStatus;
 use blob_stream_consumer::consumer::{ConsumerReader, ConsumerReaderImpl, ReadCapacity};
 use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, NextResult};
@@ -1064,6 +1065,7 @@ async fn verify_all_records(
   progress: &StressProgress,
 ) -> Result<()> {
   let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       ..Default::default()
