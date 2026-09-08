@@ -61,8 +61,9 @@ impl ConsumerReaderImpl {
     now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<Vec<TopicWindowKey>> {
-    // Anchor scans to the current window and cover the enforced publication deadline plus the
-    // effective visibility delay. Oldest -> newest ordering keeps traversal deterministic.
+    // Include the current window plus ceil(availability_horizon / window_size) preceding windows.
+    // A row can be published or remain invisible anywhere in that interval, so omitting a partial
+    // leading window would create a gap. Oldest -> newest ordering keeps traversal deterministic.
     let now_unix_seconds = now.unix_timestamp();
     let current_window = Window::for_timestamp(now, self.metadata_window_size)
       .start
@@ -107,6 +108,8 @@ impl ConsumerReaderImpl {
     scan_requests
       .entry(window_start_unix_seconds)
       .and_modify(|request| {
+        // One DynamoDB query serves every mode and partition in this window. Its lower bound must
+        // therefore be the least restrictive bound; per-partition bounds are reapplied later.
         request.min_snowflake = request.min_snowflake.min(min_snowflake);
         request
           .fast_partition_bounds
@@ -180,6 +183,10 @@ impl ConsumerReaderImpl {
     let coverage_floor = state.fast_coverage_floor().unwrap_or(safe_timestamp);
     let window_start = time::OffsetDateTime::from_unix_timestamp(window_start_unix_seconds)
       .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    // `coverage_floor` is retained when a prior Fast pass may have stopped early. `safe_timestamp`
+    // is the newest point that must be revisited for publication/visibility safety. Use their
+    // earlier value so an incomplete pass is never skipped, then clamp to this window's start: a
+    // window-specific DynamoDB query cannot observe rows before its partition key.
     let floor_timestamp = window_start.max(safe_timestamp.min(coverage_floor));
     Some((floor_timestamp, Self::snowflake_floor(floor_timestamp)))
   }
@@ -201,6 +208,9 @@ impl ConsumerReaderImpl {
       .fast_frontiers
       .get(&(partition_id, window_start_unix_seconds))
       .copied();
+    // Frontiers are inclusive replay points. The higher lower bound preserves an already observed
+    // per-window frontier while also discarding rows that are definitely outside the live horizon.
+    // The shared query can be lower than this; execution reapplies this bound per partition.
     let partition_lower_bound =
       observed_frontier.map_or(safe_floor, |frontier| frontier.max(safe_floor));
     Some((observed_frontier, partition_lower_bound))
@@ -351,11 +361,13 @@ impl ConsumerReaderImpl {
           Window::for_timestamp(recovery_floor, self.metadata_window_size)
             .start
             .unix_timestamp();
-        (recovery_start_window < first_fast_window.window_start_unix_seconds).then_some((
-          *partition_id,
-          recovery_floor,
-          recovery_start_window,
-        ))
+        // The immediately preceding window is the ordinary rollover tail: its last unsafe rows
+        // become eligible just after the safe timestamp enters the next window, and Fast scans it
+        // below. Start bounded Recovery only when the debt is at least two windows behind the live
+        // horizon. This avoids a Recovery round-trip for every partition at every window boundary.
+        (recovery_start_window.saturating_add(self.metadata_window_size.whole_seconds())
+          < first_fast_window.window_start_unix_seconds)
+          .then_some((*partition_id, recovery_floor, recovery_start_window))
       })
       .collect::<Vec<_>>();
     for (partition_id, coverage_floor, recovery_start_window) in recoveries {
@@ -421,8 +433,9 @@ impl ConsumerReaderImpl {
         recovery_start_window == recovery_cutover_window
       },
     ) {
-      // All partitions need only their active cutover window. They can share one query without
-      // allowing a dense historical recovery to monopolize subsequent capacity-limited passes.
+      // All partitions need only their active cutover window. They can share one query because no
+      // partition has earlier recovery work that could monopolize capacity; per-partition bounds
+      // still ensure the shared DynamoDB lower bound is filtered correctly after the query.
       for (partition_id, recovery_start_window, _) in &recovering_partitions {
         Self::insert_scan_request(
           &mut scan_requests,
@@ -516,7 +529,57 @@ impl ConsumerReaderImpl {
       .values()
       .any(|state| state.is_assigned() && matches!(state, VirtualPartitionState::Fast { .. }))
     {
-      for window in self.eligible_fast_scan_windows(now, runtime_settings)? {
+      let fast_windows = self.eligible_fast_scan_windows(now, runtime_settings)?;
+      if let Some(first_fast_window) = fast_windows.first() {
+        // The first normal Fast window begins at or after `safe_timestamp`. Retain exactly the
+        // preceding window as a Fast tail for partitions whose last complete coverage ended there.
+        // It contains the small interval that became safe since the previous pass. Older debt is
+        // handled above by Recovery; querying more than this one tail would widen every Fast pass.
+        let coverage_tail_window_start = first_fast_window
+          .window_start_unix_seconds
+          .saturating_sub(self.metadata_window_size.whole_seconds());
+        let coverage_tail_partition_bounds: BTreeMap<VirtualPartitionId, SnowflakeId> = self
+          .fast_scan_partition_bounds(
+            assigned_partition_ids,
+            coverage_tail_window_start,
+            now,
+            runtime_settings,
+          )
+          .into_iter()
+          .filter(|(partition_id, _)| {
+            // Tail membership is per partition. A Fast frontier in the current window says
+            // nothing about the previous window, so only the retained coverage-floor window can
+            // certify that this partition still needs the tail query.
+            self
+              .virtual_partition_states
+              .get(partition_id)
+              .and_then(VirtualPartitionState::fast_coverage_floor)
+              .is_some_and(|coverage_floor| {
+                Window::for_timestamp(coverage_floor, self.metadata_window_size)
+                  .start
+                  .unix_timestamp()
+                  == coverage_tail_window_start
+              })
+          })
+          .collect();
+        if !coverage_tail_partition_bounds.is_empty() {
+          Self::insert_scan_request(
+            &mut scan_requests,
+            self.config.topic.as_str(),
+            coverage_tail_window_start,
+            coverage_tail_partition_bounds.values().copied().min(),
+            coverage_tail_partition_bounds,
+            BTreeMap::new(),
+            false,
+            ScanEligibility {
+              recovering_partitions: Vec::new(),
+              fast: true,
+              fresh: false,
+            },
+          );
+        }
+      }
+      for window in fast_windows {
         let fast_partition_bounds = self.fast_scan_partition_bounds(
           assigned_partition_ids,
           window.window_start_unix_seconds,
