@@ -24,34 +24,50 @@ use crate::consumer::reader::RecoveryMetadataCacheKey;
 use crate::consumer::state::RecoveryState;
 
 impl ConsumerReaderImpl {
-  /// Return the cache identity for an immutable, recovery-only metadata request.
+  /// Return the cache identity for an immutable, single-partition metadata request.
   ///
-  /// The key intentionally excludes consistency: runtime changes do not invalidate a completed
-  /// recovery observation or replay it with stronger reads.
+  /// Mature Recovery windows and the single Fast rollover tail are immutable. The key
+  /// intentionally excludes consistency: runtime changes do not invalidate a completed
+  /// observation or replay it with stronger reads.
   pub(in crate::consumer) fn mature_recovery_metadata_cache_key(
     &self,
     request: &ScanRequest,
     now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Option<RecoveryMetadataCacheKey> {
-    let &[partition_id] = request.eligibility.recovering_partitions.as_slice() else {
-      return None;
-    };
+    let partition_id =
+      if request.recovery_scan && !request.eligibility.fast && !request.eligibility.fresh {
+        let &[partition_id] = request.eligibility.recovering_partitions.as_slice() else {
+          return None;
+        };
+        partition_id
+      } else if !request.recovery_scan && request.eligibility.fast && !request.eligibility.fresh {
+        let (&partition_id, _) = request.fast_partition_bounds.first_key_value()?;
+        if request.fast_partition_bounds.len() != 1 {
+          return None;
+        }
+        partition_id
+      } else {
+        return None;
+      };
     let window_end_unix_seconds = request
       .window
       .window_start_unix_seconds
       .saturating_add(self.metadata_window_size.whole_seconds());
-    if !request.recovery_scan
-      || request.eligibility.fast
-      || request.eligibility.fresh
-      || window_end_unix_seconds > self.fast_scan_safe_timestamp_unix_seconds(now, runtime_settings)
-    {
+    if window_end_unix_seconds > self.fast_scan_safe_timestamp_unix_seconds(now, runtime_settings) {
       return None;
     }
+    // Recovery's first-window bound identifies its durable resume point. A Fast-tail frontier
+    // only advances as batches are accepted, so its first mature response is a safe superset for
+    // later capacity refills and must keep the same cache key as that frontier narrows.
+    let min_snowflake = request
+      .recovery_scan
+      .then(|| request.min_snowflake.map(SnowflakeId::as_u64))
+      .flatten();
     Some((
       partition_id,
       request.window.window_start_unix_seconds,
-      request.min_snowflake.map(SnowflakeId::as_u64),
+      min_snowflake,
     ))
   }
 
@@ -220,7 +236,6 @@ impl ConsumerReaderImpl {
   pub(in crate::consumer) fn record_fast_scan_bounds(
     &self,
     scan_requests: &[ScanRequest],
-    assigned_partition_ids: &[VirtualPartitionId],
     now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
     scan_states: &mut HashMap<VirtualPartitionId, ConsumerReaderPartitionScanState>,
@@ -229,7 +244,9 @@ impl ConsumerReaderImpl {
       if !request.eligibility.fast {
         continue;
       }
-      for &partition_id in assigned_partition_ids {
+      // A rollover tail can be targeted to a subset of Fast partitions. Record only the bounds
+      // that actually contributed to this request so diagnostics match query execution.
+      for &partition_id in request.fast_partition_bounds.keys() {
         let Some((floor_timestamp, time_floor)) = self.fast_scan_partition_time_floor(
           partition_id,
           request.window.window_start_unix_seconds,
@@ -538,6 +555,11 @@ impl ConsumerReaderImpl {
         let coverage_tail_window_start = first_fast_window
           .window_start_unix_seconds
           .saturating_sub(self.metadata_window_size.whole_seconds());
+        let retention_floor = self.retention_floor_window_start(offset_datetime_from_unix_seconds(
+          Window::for_timestamp(now, self.metadata_window_size)
+            .start
+            .unix_timestamp(),
+        ));
         let coverage_tail_partition_bounds: BTreeMap<VirtualPartitionId, SnowflakeId> = self
           .fast_scan_partition_bounds(
             assigned_partition_ids,
@@ -555,9 +577,14 @@ impl ConsumerReaderImpl {
               .get(partition_id)
               .and_then(VirtualPartitionState::fast_coverage_floor)
               .is_some_and(|coverage_floor| {
-                Window::for_timestamp(coverage_floor, self.metadata_window_size)
-                  .start
-                  .unix_timestamp()
+                // Use the same retention clamp as Recovery selection. A stale floor can still
+                // require the retained tail even when its original window has expired.
+                Window::for_timestamp(
+                  coverage_floor.max(retention_floor),
+                  self.metadata_window_size,
+                )
+                .start
+                .unix_timestamp()
                   == coverage_tail_window_start
               })
           })

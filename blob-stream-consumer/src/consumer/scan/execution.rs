@@ -52,6 +52,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   TailMetadataCoverage,
   read_metadata_window_request,
 };
+use blob_stream_types::Window;
 use time::ext::NumericalDuration;
 use tokio::sync::Semaphore;
 
@@ -83,9 +84,9 @@ struct ScanPassFinalization {
 impl ConsumerReaderImpl {
   /// Load metadata for every planned window, preserving plan order across cache hits and queries.
   ///
-  /// Only a mature, recovery-only, single-partition result is cached. It is immutable by the time
-  /// it becomes eligible for this cache, while a visibility-deferred result must be queried again
-  /// so a later pass can observe rows that were not yet safe to consume.
+  /// Only a mature, single-partition Recovery result or Fast rollover tail is cached. It is
+  /// immutable by the time it becomes eligible for this cache, while a visibility-deferred result
+  /// must be queried again so a later pass can observe rows that were not yet safe to consume.
   async fn materialize_window_results(
     &mut self,
     scan_requests: &[ScanRequest],
@@ -108,7 +109,7 @@ impl ConsumerReaderImpl {
             scan_state.recovery_metadata_cache_hits.saturating_add(1);
         }
         trace!(
-          "consumer reused cached recovery metadata: topic={}, partition={}, window_start={}, \
+          "consumer reused cached mature metadata: topic={}, partition={}, window_start={}, \
            segments={}",
           self.config.topic,
           cache_key.0,
@@ -244,8 +245,7 @@ impl ConsumerReaderImpl {
           cached_segments.sort_by_key(|metadata| metadata.snowflake_id);
           let cached_segments: Arc<[SegmentMetadata]> = cached_segments.into();
           trace!(
-            "consumer cached mature recovery metadata: topic={}, partition={}, window_start={}, \
-             segments={}",
+            "consumer cached mature metadata: topic={}, partition={}, window_start={}, segments={}",
             self.config.topic,
             partition_id,
             offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
@@ -669,6 +669,8 @@ impl ConsumerReaderImpl {
       );
     }
 
+    let retention_floor = self
+      .retention_floor_window_start(Window::for_timestamp(now, self.metadata_window_size).start);
     self
       .recovery_metadata_cache
       .retain(|(partition_id, window_start, _), _| {
@@ -676,6 +678,18 @@ impl ConsumerReaderImpl {
           self.virtual_partition_states.get(partition_id),
           Some(VirtualPartitionState::Recovering { recovery_state, .. })
             if recovery_state.next_window_start_unix_seconds <= *window_start
+        ) || matches!(
+          self.virtual_partition_states.get(partition_id),
+          Some(VirtualPartitionState::Fast {
+            coverage_floor: Some(coverage_floor),
+            ..
+          }) if Window::for_timestamp(
+            (*coverage_floor).max(retention_floor),
+            self.metadata_window_size,
+          )
+            .start
+            .unix_timestamp()
+            == *window_start
         )
       });
     self.record_recovery_metadata_cache_state();
@@ -849,13 +863,7 @@ impl ConsumerReaderImpl {
           })
       })
       .collect::<HashMap<_, _>>();
-    self.record_fast_scan_bounds(
-      &scan_requests,
-      &assigned_partition_ids,
-      now,
-      runtime_settings,
-      &mut scan_states,
-    );
+    self.record_fast_scan_bounds(&scan_requests, now, runtime_settings, &mut scan_states);
     let mut partition_finalizations =
       HashMap::<VirtualPartitionId, PartitionScanFinalization>::new();
     for request in &scan_requests {

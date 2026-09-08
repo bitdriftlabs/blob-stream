@@ -5381,6 +5381,11 @@ async fn run_broker_backed_fast_stall_rollover_boundary(expect_recovery: bool) -
       (post_rollover_id.to_string(), 1_usize),
     ])
   );
+  assert_eq!(
+    metadata_store.scan_count(),
+    previous_window_scan_count + 1,
+    "the mature rollover tail must remain cached across later capacity refills"
+  );
 
   Box::new(owner).shutdown().await?;
   cluster.shutdown().await;

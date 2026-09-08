@@ -2194,6 +2194,121 @@ fn fast_coverage_tail_stays_on_the_fast_path_at_window_rollover() {
   ));
 }
 
+#[test]
+fn fast_coverage_tail_clamps_a_stale_floor_to_the_retained_window() {
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::seconds(200),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  reader.virtual_partition_states.insert(
+    7,
+    VirtualPartitionState::Fast {
+      cursor: Some(4),
+      coverage_floor: Some(timestamp(600)),
+      last_scan: None,
+    },
+  );
+
+  let (requests, recovery_scan) = reader
+    .scan_requests(timestamp(1_320), &[7], reader.runtime_settings())
+    .unwrap();
+
+  assert!(!recovery_scan);
+  assert_eq!(
+    requests
+      .iter()
+      .map(|request| request.window.window_start_unix_seconds)
+      .collect::<Vec<_>>(),
+    vec![900, 1_200]
+  );
+  assert_eq!(
+    requests[0].fast_partition_bounds.get(&7),
+    Some(&SnowflakeId::minimum_for_timestamp(timestamp(900)))
+  );
+  assert!(matches!(
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::Fast { .. })
+  ));
+}
+
+#[tokio::test]
+async fn fast_scan_bound_diagnostics_exclude_partitions_outside_a_targeted_tail() {
+  let metadata_store = Arc::new(RecordingMetadataStore::new());
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  reader.virtual_partition_states.insert(
+    7,
+    VirtualPartitionState::Fast {
+      cursor: Some(4),
+      coverage_floor: Some(timestamp(1_199)),
+      last_scan: None,
+    },
+  );
+
+  assert!(reader.read_available(1_215).await.unwrap().is_empty());
+  let scan_states = reader.partition_scan_states();
+  let tail_partition = scan_states
+    .iter()
+    .find(|state| state.virtual_partition_id == 7)
+    .unwrap();
+  let current_only_partition = scan_states
+    .iter()
+    .find(|state| state.virtual_partition_id == 8)
+    .unwrap();
+  assert_eq!(
+    tail_partition
+      .fast_scan_bounds
+      .iter()
+      .map(|bound| bound.window_start_unix_seconds)
+      .collect::<Vec<_>>(),
+    vec![900, 1_200]
+  );
+  assert_eq!(
+    current_only_partition
+      .fast_scan_bounds
+      .iter()
+      .map(|bound| bound.window_start_unix_seconds)
+      .collect::<Vec<_>>(),
+    vec![1_200]
+  );
+}
+
 #[tokio::test]
 async fn retention_recovery_crosses_multiple_scan_slices_before_fast_path() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
