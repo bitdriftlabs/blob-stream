@@ -66,6 +66,8 @@ pub enum VirtualPartitionState {
     cursor: Option<u64>,
     /// Oldest Fast time floor whose metadata coverage must be retained after an incomplete pass.
     coverage_floor: Option<OffsetDateTime>,
+    /// Earliest retry after a newer range exposed a possible gap in an open prior Fast window.
+    gap_retry_at: Option<OffsetDateTime>,
     last_scan: Option<Arc<ConsumerReaderPartitionScanState>>,
   },
 }
@@ -146,6 +148,7 @@ impl VirtualPartitionState {
       Self::PendingFast { cursor, last_scan } => Self::Fast {
         cursor: Some(cursor),
         coverage_floor: None,
+        gap_retry_at: None,
         last_scan,
       },
       state @ (Self::Fresh { .. } | Self::Recovering { .. } | Self::Fast { .. }) => state,
@@ -247,6 +250,34 @@ impl VirtualPartitionState {
     } = self
     {
       retained_coverage_floor.get_or_insert(coverage_floor);
+    }
+  }
+
+  /// Return the deadline for a targeted Fast sequence-safety retry, if one is pending.
+  pub(super) fn fast_gap_retry_at(&self) -> Option<OffsetDateTime> {
+    match self {
+      Self::Fast { gap_retry_at, .. } => *gap_retry_at,
+      Self::PendingCursor { .. }
+      | Self::PendingRecovering { .. }
+      | Self::PendingFast { .. }
+      | Self::Fresh { .. }
+      | Self::Recovering { .. } => None,
+    }
+  }
+
+  /// Retain the earliest safe retry when a newer Fast range cannot yet cross an open prior window.
+  pub(super) fn set_fast_gap_retry_at(&mut self, retry_at: OffsetDateTime) {
+    if let Self::Fast { gap_retry_at, .. } = self {
+      *gap_retry_at = Some(gap_retry_at.map_or(retry_at, |current| current.min(retry_at)));
+    }
+  }
+
+  /// Clear a Fast sequence-safety hold once its metadata window can be trusted as mature.
+  pub(super) fn clear_fast_gap_retry_at_if_due(&mut self, now: OffsetDateTime) {
+    if let Self::Fast { gap_retry_at, .. } = self
+      && gap_retry_at.is_some_and(|retry_at| retry_at <= now)
+    {
+      *gap_retry_at = None;
     }
   }
 

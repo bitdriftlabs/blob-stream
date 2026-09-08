@@ -305,12 +305,13 @@ impl PrefetchWorker {
         .observe(read_started_at.elapsed().as_secs_f64());
 
       if read_outcome.batches.is_empty() {
-        // A deferred row supplies a precise earliest retry instead of speculative exponential
-        // polling. Re-read the clock after scanning because a slow scan can reduce the remaining
-        // delay. If the deadline has arrived, retain the fallback rather than tight-looping.
+        // A visibility deferral or Fast sequence hold supplies a precise metadata-maturity retry
+        // instead of speculative exponential polling. Re-read the clock after scanning because a
+        // slow scan can reduce the remaining delay. If the deadline has arrived, retain the
+        // fallback rather than tight-looping.
         let now = self.time_provider.now();
         let idle_delay = read_outcome
-          .next_visibility_eligible_at
+          .next_metadata_eligible_at
           .map(|deadline| deadline - now)
           .filter(|delay| delay.is_positive())
           .and_then(|delay| time::Duration::try_from(delay.unsigned_abs()).ok())
@@ -318,7 +319,7 @@ impl PrefetchWorker {
         tokio::select! {
           () = self.time_provider.sleep(idle_delay) => {},
           // Configuration, assignment, hydration, and seek commands must not wait for metadata
-          // visibility. They wake the worker at this safe boundary and supersede the old hint.
+          // maturity. They wake the worker at this safe boundary and supersede the old hint.
           () = self.reader_command_notify.notified() => {},
         }
         continue;

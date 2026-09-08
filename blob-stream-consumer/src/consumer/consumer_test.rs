@@ -85,9 +85,9 @@ use protobuf::Message;
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::{Duration, timeout};
 
 const TEST_READ_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
@@ -135,6 +135,7 @@ fn fast_coverage_floor_seeds_only_an_uninitialized_fast_partition() {
   let mut state = VirtualPartitionState::Fast {
     cursor: Some(1),
     coverage_floor: None,
+    gap_retry_at: None,
     last_scan: None,
   };
 
@@ -188,6 +189,91 @@ impl MetadataStore for RecordingMetadataStore {
       .inner
       .scan_window_from_snowflake(window, min_snowflake, consistency)
       .await
+  }
+}
+
+//
+// SnapshotGatedWindowMetadataStore
+//
+
+/// Returns a captured response for one window after the test admits a late metadata write.
+struct SnapshotGatedWindowMetadataStore {
+  inner: InMemoryMetadataStore,
+  gated_window_start_unix_seconds: i64,
+  gate_armed: AtomicBool,
+  snapshot_taken: AtomicBool,
+  scan_count: AtomicUsize,
+  snapshot_taken_notify: Notify,
+  release_snapshot: Notify,
+}
+
+impl SnapshotGatedWindowMetadataStore {
+  fn new(gated_window_start_unix_seconds: i64) -> Self {
+    Self {
+      inner: InMemoryMetadataStore::new(),
+      gated_window_start_unix_seconds,
+      gate_armed: AtomicBool::new(true),
+      snapshot_taken: AtomicBool::new(false),
+      scan_count: AtomicUsize::new(0),
+      snapshot_taken_notify: Notify::new(),
+      release_snapshot: Notify::new(),
+    }
+  }
+
+  async fn wait_for_snapshot(&self) {
+    loop {
+      let notified = self.snapshot_taken_notify.notified();
+      tokio::pin!(notified);
+      notified.as_mut().enable();
+      if self.snapshot_taken.load(Ordering::Acquire) {
+        return;
+      }
+      notified.await;
+    }
+  }
+
+  fn release(&self) {
+    self.release_snapshot.notify_waiters();
+  }
+
+  fn scan_count(&self) -> usize {
+    self.scan_count.load(Ordering::Acquire)
+  }
+}
+
+#[async_trait]
+impl MetadataStore for SnapshotGatedWindowMetadataStore {
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[blob_stream_metadata_store::ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> MetadataWriteResult {
+    self.inner.write_segment(metadata, fences, now_ts_ms).await
+  }
+
+  async fn scan_window_from_snowflake(
+    &self,
+    window: &TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
+    consistency: MetadataReadConsistency,
+  ) -> Result<Vec<SegmentMetadata>> {
+    self.scan_count.fetch_add(1, Ordering::AcqRel);
+    let segments = self
+      .inner
+      .scan_window_from_snowflake(window, min_snowflake, consistency)
+      .await?;
+    if window.window_start_unix_seconds == self.gated_window_start_unix_seconds
+      && self.gate_armed.swap(false, Ordering::AcqRel)
+    {
+      let release = self.release_snapshot.notified();
+      tokio::pin!(release);
+      release.as_mut().enable();
+      self.snapshot_taken.store(true, Ordering::Release);
+      self.snapshot_taken_notify.notify_waiters();
+      release.await;
+    }
+    Ok(segments)
   }
 }
 
@@ -1269,7 +1355,7 @@ async fn visibility_delay_defers_newly_published_metadata() {
     .unwrap();
   assert!(outcome.batches.is_empty());
   assert_eq!(
-    outcome.next_visibility_eligible_at,
+    outcome.next_metadata_eligible_at,
     Some(OffsetDateTime::from_unix_timestamp(903).unwrap())
   );
   let scan_state = reader.partition_scan_states();
@@ -1368,7 +1454,7 @@ async fn strong_metadata_reads_accept_future_metadata_publication_timestamps() {
     .unwrap();
 
   assert_eq!(outcome.batches.len(), 1);
-  assert_eq!(outcome.next_visibility_eligible_at, None);
+  assert_eq!(outcome.next_metadata_eligible_at, None);
   assert_eq!(reader.cursor(7), Some(1));
   assert!(
     recording_metadata_store
@@ -1447,7 +1533,7 @@ async fn runtime_strong_metadata_reads_apply_on_the_next_scan() {
     .unwrap();
 
   assert_eq!(strong.batches.len(), 1);
-  assert_eq!(strong.next_visibility_eligible_at, None);
+  assert_eq!(strong.next_metadata_eligible_at, None);
   assert_eq!(reader.cursor(7), Some(1));
   assert!(
     recording_metadata_store
@@ -2123,6 +2209,7 @@ fn fast_coverage_recovery_clamps_a_stale_floor_to_retention() {
     VirtualPartitionState::Fast {
       cursor: Some(4),
       coverage_floor: Some(timestamp(1_000)),
+      gap_retry_at: None,
       last_scan: None,
     },
   );
@@ -2168,6 +2255,7 @@ fn fast_coverage_tail_stays_on_the_fast_path_at_window_rollover() {
     VirtualPartitionState::Fast {
       cursor: Some(4),
       coverage_floor: Some(timestamp(1_199)),
+      gap_retry_at: None,
       last_scan: None,
     },
   );
@@ -2222,6 +2310,7 @@ fn fast_coverage_tail_clamps_a_stale_floor_to_the_retained_window() {
     VirtualPartitionState::Fast {
       cursor: Some(4),
       coverage_floor: Some(timestamp(600)),
+      gap_retry_at: None,
       last_scan: None,
     },
   );
@@ -2277,6 +2366,7 @@ async fn fast_scan_bound_diagnostics_exclude_partitions_outside_a_targeted_tail(
     VirtualPartitionState::Fast {
       cursor: Some(4),
       coverage_floor: Some(timestamp(1_199)),
+      gap_retry_at: None,
       last_scan: None,
     },
   );
@@ -2366,6 +2456,7 @@ async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
       VirtualPartitionState::Fast {
         cursor: Some(0),
         coverage_floor: Some(timestamp(1_199)),
+        gap_retry_at: None,
         last_scan: None,
       },
     );
@@ -2396,6 +2487,339 @@ async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
       "every capacity refill must reuse the complete merged rollover-tail cache"
     );
   }
+}
+
+#[tokio::test]
+async fn fast_gap_holds_newer_window_until_late_predecessor_matures() {
+  let old_window_start = 900;
+  let new_window_start = 1_200;
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(SnapshotGatedWindowMetadataStore::new(old_window_start));
+  let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
+
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store_dyn.as_ref(),
+    "telemetry",
+    new_window_start,
+    SnowflakeId::minimum_for_timestamp(timestamp(1_205)).as_u64(),
+    7,
+    SeqRange { start: 3, end: 3 },
+    vec![new_record(vec![3], 1_205_000)],
+    Compression::none(),
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    Arc::clone(&blob_store),
+    metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  reader.virtual_partition_states.insert(
+    7,
+    VirtualPartitionState::Fast {
+      cursor: Some(1),
+      coverage_floor: Some(timestamp(1_195)),
+      gap_retry_at: None,
+      last_scan: None,
+    },
+  );
+
+  // The old query has already taken its empty snapshot when range 2 is published. The newer
+  // query in the same read pass can observe range 3, reproducing the production interleaving.
+  let read_task = tokio::spawn(async move {
+    let runtime_settings = reader.runtime_settings();
+    let outcome = reader
+      .read_available_with_capacity_and_settings(
+        timestamp(1_210),
+        ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+        runtime_settings,
+      )
+      .await;
+    (reader, outcome)
+  });
+  metadata_store.wait_for_snapshot().await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    old_window_start,
+    SnowflakeId::minimum_for_timestamp(timestamp(1_195)).as_u64(),
+    7,
+    SeqRange { start: 2, end: 2 },
+    vec![new_record(vec![2], 1_195_000)],
+    Compression::none(),
+  )
+  .await;
+  metadata_store.release();
+
+  let (mut reader, first) = read_task.await.unwrap();
+  let first = first.unwrap();
+  assert!(first.batches.is_empty());
+  assert_eq!(reader.cursor(7), Some(1));
+  assert_eq!(
+    first.next_metadata_eligible_at,
+    Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500))),
+    "a held Fast gap must promptly probe for a row published after the stale old-window snapshot"
+  );
+  assert_eq!(
+    reader
+      .virtual_partition_states
+      .get(&7)
+      .and_then(VirtualPartitionState::fast_gap_retry_at),
+    Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500)))
+  );
+
+  let scans_before_retry = metadata_store.scan_count();
+  let before_probe = reader
+    .read_available_with_capacity_and_settings(
+      timestamp(1_210).saturating_add(TimeDuration::milliseconds(499)),
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert!(before_probe.batches.is_empty());
+  assert_eq!(
+    before_probe.next_metadata_eligible_at,
+    Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500)))
+  );
+  assert_eq!(metadata_store.scan_count(), scans_before_retry);
+
+  let after_probe = reader
+    .read_available_with_capacity_and_settings(
+      timestamp(1_210).saturating_add(TimeDuration::milliseconds(500)),
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(
+    after_probe
+      .batches
+      .iter()
+      .map(|batch| batch.seq_range.clone())
+      .collect::<Vec<_>>(),
+    vec![SeqRange { start: 2, end: 2 }, SeqRange { start: 3, end: 3 }]
+  );
+  assert_eq!(reader.cursor(7), Some(3));
+}
+
+#[test]
+fn fast_gap_probes_every_half_second_without_exceeding_maturity_deadline() {
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  reader.virtual_partition_states.insert(
+    7,
+    VirtualPartitionState::Fast {
+      cursor: Some(1),
+      coverage_floor: Some(timestamp(1_195)),
+      gap_retry_at: None,
+      last_scan: None,
+    },
+  );
+
+  let runtime_settings = reader.runtime_settings();
+  assert_eq!(
+    reader.fast_gap_retry_at(7, 1_200, Some(1), 3, timestamp(1_210), runtime_settings),
+    Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500)))
+  );
+  assert_eq!(
+    reader.fast_gap_retry_at(
+      7,
+      1_200,
+      Some(1),
+      3,
+      timestamp(1_214).saturating_add(TimeDuration::milliseconds(750)),
+      runtime_settings,
+    ),
+    Some(timestamp(1_215)),
+    "the final short probe must stop at the original predecessor maturity deadline"
+  );
+  assert_eq!(
+    reader.fast_gap_retry_at(7, 1_200, Some(1), 3, timestamp(1_215), runtime_settings),
+    None,
+    "a remaining mature discontinuity is a genuine delivery gap, not a Fast hold"
+  );
+}
+
+#[tokio::test]
+async fn fast_gap_guard_does_not_hold_contiguous_cross_window_batches() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  for (window_start, snowflake_timestamp, sequence) in [(900, 1_195, 2), (1_200, 1_205, 3)] {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      window_start,
+      SnowflakeId::minimum_for_timestamp(timestamp(snowflake_timestamp)).as_u64(),
+      7,
+      SeqRange {
+        start: sequence,
+        end: sequence,
+      },
+      vec![new_record(
+        vec![u8::try_from(sequence).unwrap()],
+        snowflake_timestamp * 1_000,
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  reader.virtual_partition_states.insert(
+    7,
+    VirtualPartitionState::Fast {
+      cursor: Some(1),
+      coverage_floor: Some(timestamp(1_195)),
+      gap_retry_at: None,
+      last_scan: None,
+    },
+  );
+
+  let outcome = reader
+    .read_available_with_capacity_and_settings(
+      timestamp(1_210),
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(
+    outcome
+      .batches
+      .iter()
+      .map(|batch| batch.seq_range.clone())
+      .collect::<Vec<_>>(),
+    vec![SeqRange { start: 2, end: 2 }, SeqRange { start: 3, end: 3 }]
+  );
+  assert_eq!(outcome.next_metadata_eligible_at, None);
+  assert_eq!(reader.cursor(7), Some(3));
+}
+
+#[tokio::test]
+async fn fast_gap_guard_releases_a_genuine_gap_after_predecessor_matures() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    1_200,
+    SnowflakeId::minimum_for_timestamp(timestamp(1_205)).as_u64(),
+    7,
+    SeqRange { start: 3, end: 3 },
+    vec![new_record(vec![3], 1_205_000)],
+    Compression::none(),
+  )
+  .await;
+
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  reader.virtual_partition_states.insert(
+    7,
+    VirtualPartitionState::Fast {
+      cursor: Some(1),
+      coverage_floor: Some(timestamp(1_195)),
+      gap_retry_at: None,
+      last_scan: None,
+    },
+  );
+
+  let outcome = reader
+    .read_available_with_capacity_and_settings(
+      timestamp(1_220),
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(
+    outcome
+      .batches
+      .iter()
+      .map(|batch| batch.seq_range.clone())
+      .collect::<Vec<_>>(),
+    vec![SeqRange { start: 3, end: 3 }]
+  );
+  assert_eq!(outcome.next_metadata_eligible_at, None);
+  assert_eq!(reader.cursor(7), Some(3));
 }
 
 #[tokio::test]
@@ -5349,6 +5773,7 @@ async fn direct_fast_scan_reapplies_each_partition_effective_lower_bound() {
     VirtualPartitionState::Fast {
       cursor: None,
       coverage_floor: Some(timestamp(window_start)),
+      gap_retry_at: None,
       last_scan: None,
     },
   );
@@ -5357,6 +5782,7 @@ async fn direct_fast_scan_reapplies_each_partition_effective_lower_bound() {
     VirtualPartitionState::Fast {
       cursor: None,
       coverage_floor: None,
+      gap_retry_at: None,
       last_scan: None,
     },
   );

@@ -53,7 +53,7 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 | `metadata_recovery_scan_requests`, `metadata_recovery_scan_segments`, `metadata_recovery_scan_failures` | Counters | Metadata work and failures while replaying retained history. |
 | `metadata_recovery_scan_hits`, `metadata_recovery_scan_batches_read` | Counters | Recovery scans that returned any batch and the batches returned by them. |
 | `broker_metadata_offload_requests`, `broker_metadata_offload_deliveries`, `broker_metadata_offload_fallbacks` | Counters | Broker metadata RPCs attempted, validated broker responses delivered, and original direct queries retried after an unusable broker response. Requests equal deliveries plus fallbacks. |
-| `recovery_metadata_cache_hits`, `recovery_metadata_cache_misses`, `recovery_metadata_cache_inserts`, `recovery_metadata_cache_invalidations` | Counters | Recovery metadata-cache effectiveness and maintenance. |
+| `mature_metadata_cache_reuses` | Counter | Per-partition mature metadata responses reused without a metadata query. |
 | `recovery_metadata_cache_entries`, `recovery_metadata_cache_retained_bytes` | Gauges | Current retained recovery cache entry count and bytes. |
 | `metadata_fast_scan_without_lower_bound` | Counter | Fast scans that could not use a derived metadata lower bound. |
 | `metadata_segments_deferred_by_visibility_delay` | Counter | Segment rows deferred by the eventual-read visibility maturity delay. Strong reads accept every validated row and do not increment this counter. |

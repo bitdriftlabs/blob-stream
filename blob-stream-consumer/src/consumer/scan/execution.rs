@@ -81,6 +81,16 @@ struct ScanPassFinalization {
   next_fast_frontiers: HashMap<(VirtualPartitionId, i64), SnowflakeId>,
 }
 
+//
+// BatchAcceptance
+//
+
+/// Batches admitted to delivery plus the earliest metadata maturity retry for held Fast ranges.
+struct BatchAcceptance {
+  batches: Vec<ConsumerBatch>,
+  next_metadata_eligible_at: Option<time::OffsetDateTime>,
+}
+
 impl ConsumerReaderImpl {
   /// Load metadata for every planned window, preserving plan order across cache hits and queries.
   ///
@@ -121,10 +131,10 @@ impl ConsumerReaderImpl {
           .collect::<Vec<_>>();
         merged_segments.sort_by_key(|metadata| metadata.snowflake_id);
         for cache_key in &cache_keys {
-          self.metrics.record_recovery_metadata_cache_hit();
+          self.metrics.record_mature_metadata_cache_reuse();
           if let Some(scan_state) = scan_states.get_mut(&cache_key.0) {
-            scan_state.recovery_metadata_cache_hits =
-              scan_state.recovery_metadata_cache_hits.saturating_add(1);
+            scan_state.mature_metadata_cache_reuses =
+              scan_state.mature_metadata_cache_reuses.saturating_add(1);
           }
         }
         trace!(
@@ -142,15 +152,6 @@ impl ConsumerReaderImpl {
           visibility_cutoff,
         ));
         continue;
-      }
-      // Metrics are per cache identity, including a partial hit. A direct query after a partial
-      // hit is still necessary to restore a complete immutable response for this request.
-      for cache_key in &cache_keys {
-        self.metrics.record_recovery_metadata_cache_miss();
-        if let Some(scan_state) = scan_states.get_mut(&cache_key.0) {
-          scan_state.recovery_metadata_cache_misses =
-            scan_state.recovery_metadata_cache_misses.saturating_add(1);
-        }
       }
       let metadata_store = Arc::clone(&self.metadata_store);
       let broker_metadata_query = Arc::clone(&self.broker_metadata_query);
@@ -282,7 +283,6 @@ impl ConsumerReaderImpl {
           self
             .recovery_metadata_cache
             .insert(cache_key, cached_segments);
-          self.metrics.record_recovery_metadata_cache_insert();
         }
       }
       cached_window_results.push((
@@ -487,16 +487,24 @@ impl ConsumerReaderImpl {
     batch_read_results: Vec<BatchReadResult>,
     scan_states: &mut HashMap<VirtualPartitionId, ConsumerReaderPartitionScanState>,
     metadata_batches_skipped_by_cursor: &mut usize,
-  ) -> Vec<ConsumerBatch> {
-    // Results are already normalized by partition sequence, so each cursor update makes later
-    // duplicate checks deterministic even when metadata windows completed concurrently.
+    now: time::OffsetDateTime,
+    runtime_settings: ConsumerReadRuntimeSettings,
+  ) -> BatchAcceptance {
+    // Results are normalized by partition sequence, but ordered responses are not a cross-window
+    // snapshot. Never let a newer Fast result advance a cursor over a gap that an older, still
+    // publication-open window could fill on its maturity retry.
     let mut output = Vec::new();
+    let mut next_metadata_eligible_at = None::<time::OffsetDateTime>;
+    let mut held_fast_partitions = HashSet::new();
     for result in batch_read_results {
       let candidate = match &result {
         BatchReadResult::Decoded { candidate, .. } | BatchReadResult::Missing { candidate, .. } => {
           candidate
         },
       };
+      if held_fast_partitions.contains(&candidate.virtual_partition_id) {
+        continue;
+      }
       let current_cursor = self
         .virtual_partition_states
         .get(&candidate.virtual_partition_id)
@@ -508,6 +516,38 @@ impl ConsumerReaderImpl {
             .metadata_batches_skipped_by_cursor
             .saturating_add(1);
         }
+        continue;
+      }
+      if let Some(retry_at) = self.fast_gap_retry_at(
+        candidate.virtual_partition_id,
+        candidate.window_start_unix_seconds,
+        current_cursor,
+        candidate.batch_metadata.seq_range.start,
+        now,
+        runtime_settings,
+      ) {
+        // Discard this decoded result intentionally: accepting it would make a late predecessor
+        // permanently ineligible. The targeted Fast retry re-reads the retained tail at `retry_at`.
+        if let Some(state) = self
+          .virtual_partition_states
+          .get_mut(&candidate.virtual_partition_id)
+        {
+          state.set_fast_gap_retry_at(retry_at);
+        }
+        held_fast_partitions.insert(candidate.virtual_partition_id);
+        next_metadata_eligible_at =
+          Some(next_metadata_eligible_at.map_or(retry_at, |current| current.min(retry_at)));
+        trace!(
+          "consumer held Fast batch behind open prior window: topic={}, partition={}, \
+           window_start={}, seq_start={}, seq_end={}, cursor={:?}, retry_at={}",
+          self.config.topic,
+          candidate.virtual_partition_id,
+          offset_datetime_from_unix_seconds(candidate.window_start_unix_seconds),
+          candidate.batch_metadata.seq_range.start,
+          candidate.batch_metadata.seq_range.end,
+          current_cursor,
+          retry_at
+        );
         continue;
       }
 
@@ -577,7 +617,10 @@ impl ConsumerReaderImpl {
         },
       }
     }
-    output
+    BatchAcceptance {
+      batches: output,
+      next_metadata_eligible_at,
+    }
   }
 
   /// Complete lifecycle transitions and persist the diagnostics for a successful scan pass.
@@ -617,6 +660,7 @@ impl ConsumerReaderImpl {
           next_state = Some(VirtualPartitionState::Fast {
             cursor: *cursor,
             coverage_floor: Some(fast_coverage_floor),
+            gap_retry_at: None,
             last_scan: None,
           });
         },
@@ -664,6 +708,7 @@ impl ConsumerReaderImpl {
             next_state = Some(VirtualPartitionState::Fast {
               cursor: *cursor,
               coverage_floor: Some(coverage_floor),
+              gap_retry_at: None,
               last_scan: None,
             });
           }
@@ -752,9 +797,9 @@ impl ConsumerReaderImpl {
          metadata_segments_deferred_by_visibility={}, metadata_segments_blocked_by_visibility={}, \
          metadata_sources_incomplete_by_capacity={}, \
          recovery_segments_handed_to_fast_by_visibility={}, \
-         recovery_segments_blocked_by_visibility={}, recovery_metadata_cache_hits={}, \
-         recovery_metadata_cache_misses={}, metadata_batches_deferred_by_capacity={}, \
-         batches_accepted={}, records_accepted={}, fast_scan_bounds={:?}, fast_frontiers={:?}",
+         recovery_segments_blocked_by_visibility={}, mature_metadata_cache_reuses={}, \
+         metadata_batches_deferred_by_capacity={}, batches_accepted={}, records_accepted={}, \
+         fast_scan_bounds={:?}, fast_frontiers={:?}",
         self.config.topic,
         partition_id,
         scan_state.scanned_window_starts,
@@ -770,8 +815,7 @@ impl ConsumerReaderImpl {
         scan_state.metadata_sources_incomplete_by_capacity,
         scan_state.recovery_segments_handed_to_fast_by_visibility,
         scan_state.recovery_segments_blocked_by_visibility,
-        scan_state.recovery_metadata_cache_hits,
-        scan_state.recovery_metadata_cache_misses,
+        scan_state.mature_metadata_cache_reuses,
         scan_state.metadata_batches_deferred_by_capacity,
         scan_state.batches_accepted,
         scan_state.records_accepted,
@@ -847,7 +891,7 @@ impl ConsumerReaderImpl {
     let visibility_cutoff = now.saturating_sub(runtime_settings.metadata_visibility_delay);
     // A pass can defer several sources. The worker needs only the first safe retry, not a
     // per-source timer, because rescanning then will reconsider every deferred source.
-    let mut next_visibility_eligible_at = None::<time::OffsetDateTime>;
+    let mut next_metadata_eligible_at = None::<time::OffsetDateTime>;
 
     // Requests merge partitions sharing a metadata window. The DynamoDB query uses the lowest
     // needed Snowflake bound, then execution reapplies each partition's stricter Fast frontier.
@@ -1107,8 +1151,8 @@ impl ConsumerReaderImpl {
               .saturating_add(1);
             let visibility_eligible_at =
               published_at.saturating_add(runtime_settings.metadata_visibility_delay);
-            next_visibility_eligible_at = Some(
-              next_visibility_eligible_at.map_or(visibility_eligible_at, |current| {
+            next_metadata_eligible_at = Some(
+              next_metadata_eligible_at.map_or(visibility_eligible_at, |current| {
                 current.min(visibility_eligible_at)
               }),
             );
@@ -1232,6 +1276,7 @@ impl ConsumerReaderImpl {
             segment_read_candidates.push(BatchReadCandidate {
               batch_metadata: batch_metadata.clone(),
               virtual_partition_id: partition_id,
+              window_start_unix_seconds: window.window_start_unix_seconds,
             });
           }
 
@@ -1290,11 +1335,38 @@ impl ConsumerReaderImpl {
       .execute_segment_reads(segment_read_plans, runtime_settings)
       .await?;
 
-    let mut output = self.accept_batch_read_results(
+    let BatchAcceptance {
+      batches: mut output,
+      next_metadata_eligible_at: fast_gap_retry_at,
+    } = self.accept_batch_read_results(
       batch_read_results,
       &mut scan_states,
       &mut metadata_batches_skipped_by_cursor,
+      now,
+      runtime_settings,
     );
+    if let Some(fast_gap_retry_at) = fast_gap_retry_at {
+      next_metadata_eligible_at = Some(
+        next_metadata_eligible_at
+          .map_or(fast_gap_retry_at, |current| current.min(fast_gap_retry_at)),
+      );
+    }
+    // A prior pass can emit a contiguous prefix before it finds the held range. Preserve that
+    // partition's stored deadline on the following empty pass so prefetch sleeps until maturity
+    // instead of polling while planning intentionally excludes the held partition.
+    if let Some(pending_fast_gap_retry_at) = self
+      .virtual_partition_states
+      .values()
+      .filter_map(VirtualPartitionState::fast_gap_retry_at)
+      .filter(|retry_at| *retry_at > now)
+      .min()
+    {
+      next_metadata_eligible_at = Some(
+        next_metadata_eligible_at.map_or(pending_fast_gap_retry_at, |current| {
+          current.min(pending_fast_gap_retry_at)
+        }),
+      );
+    }
 
     trace!(
       "consumer read_available complete: topic={}, output_batches={}, \
@@ -1337,13 +1409,13 @@ impl ConsumerReaderImpl {
       recovery_scan,
     );
 
-    // A visibility deadline is useful only when it is the sole reason this successful pass has
-    // no work. Ready output must keep the refill loop hot, and a capacity stop means unscanned
+    // A metadata maturity deadline is useful only when it is the sole reason this successful pass
+    // has no work. Ready output must keep the refill loop hot, and a capacity stop means unscanned
     // metadata could be ready now, so either case falls back to normal worker behavior.
     Ok(ConsumerReadOutcome {
-      next_visibility_eligible_at: output
+      next_metadata_eligible_at: output
         .is_empty()
-        .then_some(next_visibility_eligible_at)
+        .then_some(next_metadata_eligible_at)
         .flatten()
         .filter(|deadline| !capacity_exhausted && *deadline > now),
       batches: output,

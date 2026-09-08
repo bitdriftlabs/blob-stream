@@ -87,6 +87,8 @@ pub(in crate::consumer) struct ScanEligibility {
 pub(in crate::consumer) struct BatchReadCandidate {
   pub(in crate::consumer) batch_metadata: BatchMetadata,
   pub(in crate::consumer) virtual_partition_id: VirtualPartitionId,
+  /// Metadata window that supplied this batch; required to protect cross-window cursor ordering.
+  pub(in crate::consumer) window_start_unix_seconds: i64,
 }
 
 //
