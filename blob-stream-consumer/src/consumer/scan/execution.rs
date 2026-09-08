@@ -507,6 +507,12 @@ impl ConsumerReaderImpl {
         .iter()
         .any(|(partition_id, _)| *partition_id == candidate.virtual_partition_id)
       {
+        // Planning may already have advanced this later source's frontier. Retain it so the
+        // retry restores every dropped window, not only the source that first exposed the gap.
+        held_fast_sources.insert((
+          candidate.virtual_partition_id,
+          candidate.window_start_unix_seconds,
+        ));
         continue;
       }
       let current_cursor = self

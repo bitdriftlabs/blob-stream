@@ -2490,9 +2490,10 @@ async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
 }
 
 #[tokio::test]
-async fn fast_gap_probe_preserves_late_predecessor_and_newer_window_frontier() {
+async fn fast_gap_probe_preserves_late_predecessor_and_all_later_window_frontiers() {
   let old_window_start = 900;
-  let new_window_start = 1_200;
+  let held_window_start = 1_200;
+  let later_window_start = 1_500;
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
   let metadata_store = Arc::new(SnapshotGatedWindowMetadataStore::new(old_window_start));
   let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
@@ -2501,7 +2502,7 @@ async fn fast_gap_probe_preserves_late_predecessor_and_newer_window_frontier() {
     blob_store.as_ref(),
     metadata_store_dyn.as_ref(),
     "telemetry",
-    new_window_start,
+    held_window_start,
     SnowflakeId::minimum_for_timestamp(timestamp(1_205)).as_u64(),
     7,
     SeqRange { start: 3, end: 3 },
@@ -2513,11 +2514,35 @@ async fn fast_gap_probe_preserves_late_predecessor_and_newer_window_frontier() {
     blob_store.as_ref(),
     metadata_store_dyn.as_ref(),
     "telemetry",
-    new_window_start,
+    held_window_start,
     SnowflakeId::minimum_for_timestamp(timestamp(1_206)).as_u64(),
     7,
     SeqRange { start: 4, end: 4 },
     vec![new_record(vec![4], 1_206_000)],
+    Compression::none(),
+  )
+  .await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store_dyn.as_ref(),
+    "telemetry",
+    later_window_start,
+    SnowflakeId::minimum_for_timestamp(timestamp(1_505)).as_u64(),
+    7,
+    SeqRange { start: 5, end: 5 },
+    vec![new_record(vec![5], 1_505_000)],
+    Compression::none(),
+  )
+  .await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store_dyn.as_ref(),
+    "telemetry",
+    later_window_start,
+    SnowflakeId::minimum_for_timestamp(timestamp(1_506)).as_u64(),
+    7,
+    SeqRange { start: 6, end: 6 },
+    vec![new_record(vec![6], 1_506_000)],
     Compression::none(),
   )
   .await;
@@ -2537,7 +2562,7 @@ async fn fast_gap_probe_preserves_late_predecessor_and_newer_window_frontier() {
     rejecting_broker_blob_range_query(),
     &metrics_scope(),
     TimeDuration::days(1),
-    TimeDuration::seconds(15),
+    TimeDuration::seconds(315),
     None,
   )
   .unwrap()
@@ -2553,15 +2578,16 @@ async fn fast_gap_probe_preserves_late_predecessor_and_newer_window_frontier() {
     },
   );
 
-  // The old query has already taken its empty snapshot when range 2 is published. The newer
-  // query in the same read pass can observe ranges 3 and 4. The late predecessor is below the
-  // normal Fast safe floor, so the hold must preserve both its older coverage floor and the
-  // newer window's pre-pass frontier for the prompt probe to recover all three ranges.
+  // The old query has already taken its empty snapshot when range 2 is published. The held
+  // window can observe ranges 3 and 4 while the later Fast window observes ranges 5 and 6. The
+  // late predecessor is below the normal Fast safe floor, so the hold must preserve its older
+  // coverage floor and reset every held and later window's pre-pass frontier for the prompt
+  // probe.
   let read_task = tokio::spawn(async move {
     let runtime_settings = reader.runtime_settings();
     let outcome = reader
       .read_available_with_capacity_and_settings(
-        timestamp(1_210),
+        timestamp(1_510),
         ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
         runtime_settings,
       )
@@ -2589,7 +2615,7 @@ async fn fast_gap_probe_preserves_late_predecessor_and_newer_window_frontier() {
   assert_eq!(reader.cursor(7), Some(1));
   assert_eq!(
     first.next_metadata_eligible_at,
-    Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500))),
+    Some(timestamp(1_510).saturating_add(TimeDuration::milliseconds(500))),
     "a held Fast gap must promptly probe for a row published after the stale old-window snapshot"
   );
   assert_eq!(
@@ -2597,7 +2623,7 @@ async fn fast_gap_probe_preserves_late_predecessor_and_newer_window_frontier() {
       .virtual_partition_states
       .get(&7)
       .and_then(VirtualPartitionState::fast_gap_retry_at),
-    Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500)))
+    Some(timestamp(1_510).saturating_add(TimeDuration::milliseconds(500)))
   );
   assert_eq!(
     reader
@@ -2608,14 +2634,15 @@ async fn fast_gap_probe_preserves_late_predecessor_and_newer_window_frontier() {
     "the held predecessor remains below the normal Fast safe floor"
   );
   assert!(
-    !reader.fast_frontiers.contains_key(&(7, new_window_start)),
-    "a held newer-window segment must not advance its Fast frontier"
+    !reader.fast_frontiers.contains_key(&(7, held_window_start))
+      && !reader.fast_frontiers.contains_key(&(7, later_window_start)),
+    "a held Fast gap must not retain any later window's advanced frontier"
   );
 
   let scans_before_retry = metadata_store.scan_count();
   let before_probe = reader
     .read_available_with_capacity_and_settings(
-      timestamp(1_210).saturating_add(TimeDuration::milliseconds(499)),
+      timestamp(1_510).saturating_add(TimeDuration::milliseconds(499)),
       ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
       reader.runtime_settings(),
     )
@@ -2624,7 +2651,7 @@ async fn fast_gap_probe_preserves_late_predecessor_and_newer_window_frontier() {
   assert!(before_probe.batches.is_empty());
   assert_eq!(
     before_probe.next_metadata_eligible_at,
-    Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500)))
+    Some(timestamp(1_510).saturating_add(TimeDuration::milliseconds(500)))
   );
   assert_eq!(metadata_store.scan_count(), scans_before_retry);
   assert_eq!(
@@ -2638,7 +2665,7 @@ async fn fast_gap_probe_preserves_late_predecessor_and_newer_window_frontier() {
 
   let after_probe = reader
     .read_available_with_capacity_and_settings(
-      timestamp(1_210).saturating_add(TimeDuration::milliseconds(500)),
+      timestamp(1_510).saturating_add(TimeDuration::milliseconds(500)),
       ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
       reader.runtime_settings(),
     )
@@ -2654,9 +2681,11 @@ async fn fast_gap_probe_preserves_late_predecessor_and_newer_window_frontier() {
       SeqRange { start: 2, end: 2 },
       SeqRange { start: 3, end: 3 },
       SeqRange { start: 4, end: 4 },
+      SeqRange { start: 5, end: 5 },
+      SeqRange { start: 6, end: 6 },
     ]
   );
-  assert_eq!(reader.cursor(7), Some(4));
+  assert_eq!(reader.cursor(7), Some(6));
 }
 
 #[test]
