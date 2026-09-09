@@ -38,8 +38,8 @@ broker is conservative but increases availability latency.
 # How do partitions relate to virtual partitions?
 
 Blob-stream was designed for zero cross-AZ traffic. Every AZ is assigned a "writer domain." Within
-that domain every topic has N partitions. In aggregate across all AZs, if there are N writer domains
-and M topics, there are N * M virtual partitions in total.
+that domain, every topic has P logical partitions. A topic configured with W writer domains therefore
+has P * W virtual partitions; across multiple topics, sum that product for each topic.
 
 From the consumer perspective, *all* virtual partitions are balanced across all AZs. This is subtly
 different from Kafka. In Kafka, when using a producer controlled partition hash, the same hash is
