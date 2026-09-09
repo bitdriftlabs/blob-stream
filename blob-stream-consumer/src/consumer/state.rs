@@ -27,7 +27,7 @@ pub struct RecoveryState {
 }
 
 //
-// VirtualPartitionState
+// FastGapState
 //
 
 /// Pending Fast sequence gap and the bounded retry state that protects it.
@@ -37,6 +37,10 @@ pub struct FastGapState {
   maturity_at: OffsetDateTime,
   expected_sequence: u64,
 }
+
+//
+// VirtualPartitionState
+//
 
 /// Lifecycle, read mode, cursor, and latest scan diagnostic for one virtual partition.
 #[derive(Clone, Debug)]
