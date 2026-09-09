@@ -125,14 +125,14 @@ perform the final commit and release membership and leases during controlled ter
 
 | Surface | Responsibility |
 | --- | --- |
-| `runtime.read` | Idle polling, visibility delay, clock-skew horizon, prefetch memory, batch-read concurrency, and strong-read setting. |
+| `runtime.read` | Idle polling, optional eventual-read visibility delay, clock-skew horizon, prefetch memory, and batch-read concurrency. Unset `eventual_metadata_reads` uses strong reads. |
 | `runtime.group` | Topic, consumer-group ID, stable member ID, optional pod ID, lease duration, heartbeat interval, and rebalance interval. |
 | `topic` | The shared partition and durable metadata-window contract used to derive the complete virtual partition space. |
 | `blob_store` and `metadata_store` | S3/DynamoDB production stores or in-memory local/test stores. |
 
-Feature flags are optional at construction time. Strong metadata reads, prefetch capacity, and
-batch-read concurrency update live. Idle polling, lease duration, heartbeat interval, and rebalance
-interval are sampled at construction and require rebuilding the iterator to adopt a new value. See
+Feature flags are optional at construction time. Prefetch capacity and batch-read concurrency update
+live. Metadata consistency, idle polling, lease duration, heartbeat interval, and rebalance interval
+are sampled at construction and require rebuilding the iterator to adopt a new value. See
 [Infrastructure setup](infrastructure.md) and [Operations](operations.md) for deployment and
 consistency effects.
 

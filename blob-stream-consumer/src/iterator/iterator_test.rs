@@ -14,6 +14,7 @@ use super::{
   CoordinationSnapshot,
   NextResult,
 };
+use crate::EventualMetadataReadsConfig;
 use crate::config::{
   ConsumerGroupConfig,
   ConsumerReadConfig,
@@ -1079,12 +1080,7 @@ async fn build_iterator_with_recovered_cursor_record(
   )
   .await;
 
-  let mut runtime = runtime_config();
-  runtime
-    .read
-    .as_mut()
-    .unwrap()
-    .strongly_consistent_metadata_reads = Some(true);
+  let runtime = runtime_config();
   ConsumerIteratorBuilder::new(
     &runtime,
     blob_store,
@@ -1359,7 +1355,11 @@ async fn visibility_deferred_empty_scan_waits_until_metadata_is_eligible() {
       virtual_partitions: vec![3],
     }));
   let mut runtime = runtime_config();
-  runtime.read.as_mut().unwrap().metadata_visibility_delay = TimeDuration::seconds(1).into_proto();
+  runtime.read.as_mut().unwrap().eventual_metadata_reads = Some(EventualMetadataReadsConfig {
+    visibility_delay: TimeDuration::seconds(1).into_proto(),
+    ..Default::default()
+  })
+  .into();
   write_segment_with_publication_time(
     blob_store.as_ref(),
     metadata_store.as_ref(),
@@ -1456,7 +1456,6 @@ async fn iterator_builder_applies_configured_clock_skew_to_reader_scan_horizon()
   let mut runtime = runtime_config();
   let read = runtime.read.as_mut().unwrap();
   read.max_clock_skew = TimeDuration::milliseconds(1_001).into_proto();
-  read.strongly_consistent_metadata_reads = Some(true);
   let maximum_clock_skew = consumer_max_clock_skew(read);
 
   let mut iterator = ConsumerIteratorBuilder::new(

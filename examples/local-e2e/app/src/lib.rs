@@ -105,7 +105,6 @@ pub fn consumer_bootstrap_config(
         topic: TOPIC.to_string().into(),
         idle_poll_delay: Duration::milliseconds(100).into_proto(),
         max_idle_poll_delay: Duration::milliseconds(500).into_proto(),
-        metadata_visibility_delay: Duration::ZERO.into_proto(),
         ..Default::default()
       })
       .into(),

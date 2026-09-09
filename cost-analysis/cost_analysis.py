@@ -55,7 +55,7 @@ class Inputs:
   # Fresh/Recovering scans are assignment-driven, not steady Fast work. This is the observed
   # aggregate window-query rate across all readers, before pagination.
   recovery_window_queries_per_hour: float
-  metadata_strong_reads: bool
+  metadata_eventual_reads: bool
   transactional_metadata_writes: bool
   avg_partitions_per_segment: float
 
@@ -218,7 +218,7 @@ def compute(i: Inputs) -> dict[str, float]:
   )
   rru_hour = (
     req_ddb_r_scan * strong_read_units(i.kb_scanned_per_metadata_query_page)
-    * (1.0 if i.metadata_strong_reads else 0.5)
+    * (0.5 if i.metadata_eventual_reads else 1.0)
     + req_ddb_r_coordination * strong_read_units(i.kb_coordination_read)
     + transactional_fence_rru
     + assignment_plan_rru
@@ -263,7 +263,7 @@ def print_report(i: Inputs, result: dict[str, float]) -> None:
   """Pretty-print an hourly cost breakdown."""
   print("blob-stream hourly request-cost estimate (DynamoDB + S3)")
   print("=" * 68)
-  print(f"Metadata read consistency:              {'strong' if i.metadata_strong_reads else 'eventual'}")
+  print(f"Metadata read consistency:              {'eventual' if i.metadata_eventual_reads else 'strong'}")
   print(f"Metadata write mode:                    {'transactional fence' if i.transactional_metadata_writes else 'plain PutItem'}")
   print(f"Segments/hour (publication rate):       {result['s_seg_per_hour']:,.2f}")
   print(f"S3 range GETs/hour:                     {result['s_range_read_per_hour']:,.2f}")
@@ -305,7 +305,7 @@ DEFAULTS = Inputs(
   polls_per_s=2.0,
   fast_window_queries_per_poll=1.0,
   recovery_window_queries_per_hour=0.0,
-  metadata_strong_reads=False,
+  metadata_eventual_reads=False,
   transactional_metadata_writes=False,
   avg_partitions_per_segment=8.0,
   pages_per_metadata_query=1.2,
@@ -350,13 +350,13 @@ def parse_override(specification: str) -> tuple[str, float | bool]:
 def parse_inputs() -> Inputs:
   """Apply CLI consistency switches and explicit overrides to DEFAULTS."""
   parser = ArgumentParser(description=__doc__)
-  parser.add_argument("--strong-metadata-reads", action="store_true")
+  parser.add_argument("--eventual-metadata-reads", action="store_true")
   parser.add_argument("--transactional-metadata-writes", action="store_true")
   parser.add_argument("--set", action="append", default=[], metavar="NAME=VALUE")
   arguments = parser.parse_args()
   overrides = dict(parse_override(specification) for specification in arguments.set)
-  if arguments.strong_metadata_reads:
-    overrides["metadata_strong_reads"] = True
+  if arguments.eventual_metadata_reads:
+    overrides["metadata_eventual_reads"] = True
   if arguments.transactional_metadata_writes:
     overrides["transactional_metadata_writes"] = True
   return replace(DEFAULTS, **overrides)

@@ -87,6 +87,7 @@ mod coordination;
 mod diagnostics;
 pub mod iterator;
 
+pub use blob_stream_proto::protos::blobstream::v1::config::EventualMetadataReadsConfig;
 pub use bootstrap::{
   ConsumerBootstrapConfig,
   ConsumerBootstrapIteratorBuilder,

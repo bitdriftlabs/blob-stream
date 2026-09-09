@@ -38,16 +38,16 @@ spanning the interval points to producer allocation or publication.
 
 ## Consistency Controls
 
-Consumer metadata reads are eventually consistent by default. The controls below address different
-failure modes and can be enabled independently.
+Consumer metadata reads are strongly consistent by default. The controls below address different
+failure modes and can be selected independently.
 
 | Control | Default | Protects | Cost and limits |
 | --- | --- | --- | --- |
-| `strongly_consistent_metadata_reads` or `blob_stream_consumer_strong_metadata_reads` | `false` | DynamoDB read-replica staleness | Strong metadata reads approximately double query RRUs. They ignore the configured visibility delay, but do not make paginated scans atomic or stop stale producer publication. |
+| `eventual_metadata_reads` | Unset (strong reads) | Reduce DynamoDB metadata-query RRUs | Opts into eventual metadata reads. Its `visibility_delay` defaults to two seconds when unset; this best-effort margin does not make paginated scans atomic or stop stale producer publication. |
 | `fenced_metadata_writes` or `blob_stream_broker_fenced_metadata_writes` | `false` | A former producer-lease holder publishing after replacement | Each publication becomes a DynamoDB transaction. It conditions metadata publication on every current lease, requires additional IAM actions, and is limited to 99 producer-lease checks per plan. |
 | `blob_stream_broker_max_segment_bytes` | `max_segment_bytes` config, 64 MiB by default | Oversized time-triggered objects | Positive integer override for newly selected objects. A partition batch larger after serialization and compression is emitted alone. |
 
-Strong reads remove the eventual-read visibility margin; the broker's metadata publication deadline
+Strong reads have no eventual-read visibility margin; the broker's metadata publication deadline
 and the consumer's configured `max_clock_skew` still apply to the Fast and checkpoint horizon.
 Fenced writes retain a durable holder ID, lease epoch, and session ID in every producer lease row
 regardless of whether the mode is enabled.
@@ -64,7 +64,7 @@ blob ranges from broker caches, retrying direct storage only after a retryable b
 
 | Scope | Flags | Adoption | Operational effect |
 | --- | --- | --- | --- |
-| Consumer reader | `blob_stream_consumer_strong_metadata_reads`, `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads` | Live | Configures metadata consistency, prefetch capacity, and range-read concurrency. Non-`NOT_FOUND` broker blob failures retry the full affected group directly. |
+| Consumer reader | `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads` | Live | Configures prefetch capacity and range-read concurrency. Metadata consistency is static `runtime.read` configuration. Non-`NOT_FOUND` broker blob failures retry the full affected group directly. |
 | Broker metadata-cache startup | `blob_stream_broker_metadata_recovery_cache_max_bytes`, `blob_stream_broker_metadata_cache_max_waiters_per_key`, `blob_stream_broker_metadata_cache_max_waiters`, `blob_stream_broker_metadata_cache_max_refills`, `blob_stream_broker_metadata_cache_max_request_partitions`, `blob_stream_broker_metadata_cache_max_response_items`, `blob_stream_broker_metadata_cache_max_response_bytes`, `blob_stream_broker_metadata_cache_max_entry_items` | Restart the broker | Overrides the internal cache defaults when a feature-flag loader is configured. Values must be positive; the per-key waiter limit cannot exceed the global waiter limit, and the response-byte limit is capped at the gRPC request maximum. |
 | Broker blob-cache startup | `blob_stream_broker_blob_cache_idle_ttl_ms` | Restart the broker | Sets positive idle retention for complete immutable blobs; absent means 10 seconds. Blob requests remain limited to 16 MiB; broker responses allow the effective `max_segment_bytes` amount of requested compressed bytes, covering normal segment objects. The broker admits each object from its reported content length and current cgroup headroom before reading its body. Cgroup-aware memory admission can flush entries or disable cache admission without disabling direct consumer reads. |
 | Broker write path | `blob_stream_broker_flush_max_bytes`, `blob_stream_broker_flush_max_delay_ms`, `blob_stream_broker_max_segment_bytes`, `blob_stream_broker_adaptive_flush_max_delay_enabled`, `blob_stream_broker_adaptive_flush_max_delay_floor_ms` | Live | A time-due local partition always pulls every available buffered non-draining local topic section into bounded shared objects. Positive byte overrides and positive delay overrides no greater than `flush_max_delay` apply at the next scheduler timer cycle; invalid values retain static configuration. Adaptive delay defaults on and may be disabled statically with `adaptive_flush_max_delay_enabled: false` or live with its watched flag. Its static or watched floor defaults to half the live maximum delay and must be positive and no greater than that maximum. Three consecutive split plans derive a proportional target from their extra objects, then reduce the delay by one quarter of the distance to it; three consecutive successful unsplit plans recover half the remaining headroom. Every adjustment requires a new three-plan streak, and failures or opposite outcomes reset the streak. Positive segment-cap overrides apply to future flush plans. Independently byte-triggered and lease-drain work remain local. |
@@ -176,9 +176,9 @@ capacity or routing.
 1. Check publication deadline-exhaustion and flush-failure counters.
 2. Inspect partition buffer age and queued bytes in `/admin/state`.
 3. Verify S3 and DynamoDB latency, throttling, IAM, and lifecycle policy.
-4. For eventual-read consumers, decide whether the configured visibility margin is adequate; enable
-   strong metadata reads only when replica staleness is the relevant risk and the RRU increase is
-   acceptable.
+4. For eventual-read consumers, decide whether the configured visibility margin is adequate;
+   remove `eventual_metadata_reads` to return to strong reads when replica staleness is the
+   relevant risk and the RRU increase is acceptable.
 5. Verify that broker and consumer clocks remain within the consumer's `max_clock_skew` bound;
    investigate time-source or clock-health alerts before widening the availability horizon.
 
@@ -196,8 +196,8 @@ capacity or routing.
    `bd-server-stats` registry.
 2. Compare recovery work with topic retention and the availability horizon: publication lag,
    the consumer's `max_clock_skew`, and the effective visibility delay.
-3. Use [Cost analysis](cost-analysis.md) with observed page and range-read rates before changing
-   strong-read or transactional-publication modes.
+3. Use [Cost analysis](cost-analysis.md) with observed page and range-read rates before selecting
+   eventual-read or transactional-publication modes.
 
 ### Broker Blob Delivery Falls Back
 

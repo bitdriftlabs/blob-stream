@@ -16,6 +16,7 @@ use blob_stream_consumer::{
   ConsumerPartitionReadMode,
   ConsumerReadConfig,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+  EventualMetadataReadsConfig,
   MembershipCoordinationSource,
 };
 use blob_stream_integration_tests::test_framework::{self as framework, TestConsumerReader};
@@ -125,6 +126,13 @@ use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::{Barrier, mpsc, watch};
 use tokio::time::{Instant, timeout};
+
+fn eventual_metadata_reads(visibility_delay: TimeDuration) -> EventualMetadataReadsConfig {
+  EventualMetadataReadsConfig {
+    visibility_delay: visibility_delay.into_proto(),
+    ..Default::default()
+  }
+}
 
 fn member_ids(members: &[ConsumerGroupMember]) -> Vec<String> {
   members
@@ -608,7 +616,6 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![ack.virtual_partition_id],
@@ -850,7 +857,6 @@ async fn broker_coalesces_same_partition_requests_into_one_consumer_batch() -> R
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![virtual_partition_id],
@@ -988,16 +994,9 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
     );
   }
 
-  let mut runtime_0 = consumer_runtime_config("consumer-0");
-  let mut runtime_1 = consumer_runtime_config("consumer-1");
-  let mut runtime_2 = consumer_runtime_config("consumer-2");
-  for runtime in [&mut runtime_0, &mut runtime_1, &mut runtime_2] {
-    runtime
-      .read
-      .as_mut()
-      .ok_or_else(|| anyhow!("consumer read config missing"))?
-      .strongly_consistent_metadata_reads = Some(true);
-  }
+  let runtime_0 = consumer_runtime_config("consumer-0");
+  let runtime_1 = consumer_runtime_config("consumer-1");
+  let runtime_2 = consumer_runtime_config("consumer-2");
 
   let (event_tx, mut event_rx) = mpsc::unbounded_channel();
   let (stop_tx_0, stop_rx_0) = watch::channel(false);
@@ -1219,7 +1218,6 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -1583,15 +1581,8 @@ async fn graceful_shutdown_final_checkpoint_commits_staged_record_before_release
     )
     .await?;
 
-  let mut runtime_a = consumer_runtime_config("shutdown-final-commit-a");
-  let mut runtime_b = consumer_runtime_config("shutdown-final-commit-b");
-  for runtime in [&mut runtime_a, &mut runtime_b] {
-    runtime
-      .read
-      .as_mut()
-      .ok_or_else(|| anyhow!("shutdown final-commit read config missing"))?
-      .strongly_consistent_metadata_reads = Some(true);
-  }
+  let runtime_a = consumer_runtime_config("shutdown-final-commit-a");
+  let runtime_b = consumer_runtime_config("shutdown-final-commit-b");
   let group = runtime_a
     .group
     .as_ref()
@@ -1975,7 +1966,6 @@ async fn iterator_reuses_mature_recovery_metadata_across_prefetch_capacity_cycle
     .read
     .as_mut()
     .ok_or_else(|| anyhow!("recovery reader config missing"))?;
-  read.strongly_consistent_metadata_reads = Some(true);
   read.prefetch_max_bytes = Some(1);
   let runtime_group = runtime
     .group
@@ -2251,7 +2241,6 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
     .read
     .as_mut()
     .ok_or_else(|| anyhow!("recovery reader config missing"))?;
-  read.strongly_consistent_metadata_reads = Some(true);
   read.prefetch_max_bytes = Some(1);
   let runtime_group = runtime
     .group
@@ -2402,15 +2391,8 @@ async fn live_group_restart_recovers_retained_history_before_fast_path() -> Resu
       .await?,
   );
 
-  let mut runtime_a = consumer_runtime_config("retained-history-a");
-  let mut runtime_b = consumer_runtime_config("retained-history-b");
-  for runtime in [&mut runtime_a, &mut runtime_b] {
-    runtime
-      .read
-      .as_mut()
-      .ok_or_else(|| anyhow!("retained-history read config missing"))?
-      .strongly_consistent_metadata_reads = Some(true);
-  }
+  let runtime_a = consumer_runtime_config("retained-history-a");
+  let runtime_b = consumer_runtime_config("retained-history-b");
   let group = runtime_a
     .group
     .as_ref()
@@ -2690,7 +2672,8 @@ async fn live_group_recovery_waits_for_historical_metadata_visibility_delay() ->
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("deferred-history read config missing"))?
-      .metadata_visibility_delay = TimeDuration::milliseconds(1_000).into_proto();
+      .eventual_metadata_reads =
+      Some(eventual_metadata_reads(TimeDuration::milliseconds(1_000))).into();
   }
   let group = runtime_a
     .group
@@ -3011,20 +2994,9 @@ async fn group_rebalance_continuous_traffic_no_loss() -> Result<()> {
 
   // Step 2: Start two iterators, scale out to three, then scale in to one.
 
-  let mut runtime_0 = consumer_runtime_config("consumer-0");
-  let mut runtime_1 = consumer_runtime_config("consumer-1");
-  let mut runtime_2 = consumer_runtime_config("consumer-2");
-  for (member_id, runtime) in [
-    ("consumer-0", &mut runtime_0),
-    ("consumer-1", &mut runtime_1),
-    ("consumer-2", &mut runtime_2),
-  ] {
-    runtime
-      .read
-      .as_mut()
-      .ok_or_else(|| anyhow!("{member_id} read config missing"))?
-      .strongly_consistent_metadata_reads = Some(true);
-  }
+  let runtime_0 = consumer_runtime_config("consumer-0");
+  let runtime_1 = consumer_runtime_config("consumer-1");
+  let runtime_2 = consumer_runtime_config("consumer-2");
 
   let consumer_lease_store = resources.consumer_lease_store();
   let hooks = cluster.lifecycle_hooks();
@@ -3403,16 +3375,9 @@ async fn active_broker_restart_continuity() -> Result<()> {
   )
   .await?;
 
-  let mut runtime_0 = consumer_runtime_config("restart-consumer-0");
-  let mut runtime_1 = consumer_runtime_config("restart-consumer-1");
-  let mut runtime_2 = consumer_runtime_config("restart-consumer-2");
-  for runtime in [&mut runtime_0, &mut runtime_1, &mut runtime_2] {
-    runtime
-      .read
-      .as_mut()
-      .ok_or_else(|| anyhow!("restart consumer read config missing"))?
-      .strongly_consistent_metadata_reads = Some(true);
-  }
+  let runtime_0 = consumer_runtime_config("restart-consumer-0");
+  let runtime_1 = consumer_runtime_config("restart-consumer-1");
+  let runtime_2 = consumer_runtime_config("restart-consumer-2");
   let (event_tx, mut event_rx) = mpsc::unbounded_channel();
   let (stop_tx_0, stop_rx_0) = watch::channel(false);
   let (stop_tx_1, stop_rx_1) = watch::channel(false);
@@ -3684,12 +3649,7 @@ async fn graceful_broker_restart_waits_for_partition_drain_before_lease_release(
     .into_iter()
     .next()
     .ok_or_else(|| anyhow!("expected a broker node"))?;
-  let mut runtime = consumer_runtime_config("restart-drain-consumer");
-  runtime
-    .read
-    .as_mut()
-    .ok_or_else(|| anyhow!("restart drain consumer read config missing"))?
-    .strongly_consistent_metadata_reads = Some(true);
+  let runtime = consumer_runtime_config("restart-drain-consumer");
   let group = runtime
     .group
     .as_ref()
@@ -3890,7 +3850,6 @@ async fn per_partition_sequence_monotonicity() -> Result<()> {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -4030,7 +3989,6 @@ async fn multi_topic_isolation() -> Result<()> {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -4049,7 +4007,6 @@ async fn multi_topic_isolation() -> Result<()> {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: SECOND_TOPIC.to_string().into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     (0 .. PARTITION_COUNT).collect(),
@@ -4302,7 +4259,6 @@ async fn shared_cross_topic_blob_pulls_forward_a_fresh_topic() -> Result<()> {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![0],
@@ -4320,7 +4276,6 @@ async fn shared_cross_topic_blob_pulls_forward_a_fresh_topic() -> Result<()> {
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: SECOND_TOPIC.into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![0],
@@ -4527,7 +4482,6 @@ async fn shared_object_metadata_failure_is_isolated_and_retries() -> Result<()> 
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: SECOND_TOPIC.into(),
-      strongly_consistent_metadata_reads: Some(true),
       ..Default::default()
     },
     vec![0],
@@ -4843,7 +4797,6 @@ async fn broker_backed_fast_coverage_survives_prefetch_stall_and_partial_rebalan
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("Fast coverage test read config missing"))?;
-    read.strongly_consistent_metadata_reads = Some(true);
     read.prefetch_max_bytes = Some(1);
   }
 
@@ -5136,7 +5089,6 @@ async fn run_broker_backed_fast_stall_rollover_boundary(expect_recovery: bool) -
     .read
     .as_mut()
     .ok_or_else(|| anyhow!("Fast recovery test read config missing"))?;
-  read.strongly_consistent_metadata_reads = Some(true);
   read.prefetch_max_bytes = Some(1);
 
   let hooks = cluster.lifecycle_hooks();
@@ -5644,7 +5596,6 @@ async fn graceful_shutdown_recovers_prefetched_undelivered_record() -> Result<()
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("prefetch-shutdown read config missing"))?;
-    read.strongly_consistent_metadata_reads = Some(true);
     read.prefetch_max_bytes = Some(1_024);
   }
   let group = runtime_a
@@ -5855,7 +5806,6 @@ async fn prefetch_rebalance_revocation_fences_buffered_record() -> Result<()> {
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("prefetch fence read config missing"))?;
-    read.strongly_consistent_metadata_reads = Some(true);
     read.prefetch_max_bytes = Some(1_024);
   }
   let group = runtime_a
@@ -6350,15 +6300,8 @@ async fn live_consumer_commit_race_is_fenced_and_redelivered() -> Result<()> {
     .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
-  let mut runtime_a = consumer_runtime_config("commit-race-owner");
-  let mut runtime_b = consumer_runtime_config("commit-race-replacement");
-  for runtime in [&mut runtime_a, &mut runtime_b] {
-    runtime
-      .read
-      .as_mut()
-      .ok_or_else(|| anyhow!("commit-race consumer read config missing"))?
-      .strongly_consistent_metadata_reads = Some(true);
-  }
+  let runtime_a = consumer_runtime_config("commit-race-owner");
+  let runtime_b = consumer_runtime_config("commit-race-replacement");
   let group = runtime_a
     .group
     .as_ref()
@@ -6723,15 +6666,8 @@ async fn lease_expiry_takeover_preserves_progress() -> Result<()> {
     .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
-  let mut runtime_a = consumer_runtime_config("expiry-owner");
-  let mut runtime_b = consumer_runtime_config("expiry-replacement");
-  for runtime in [&mut runtime_a, &mut runtime_b] {
-    runtime
-      .read
-      .as_mut()
-      .ok_or_else(|| anyhow!("lease-expiry consumer read config missing"))?
-      .strongly_consistent_metadata_reads = Some(true);
-  }
+  let runtime_a = consumer_runtime_config("expiry-owner");
+  let runtime_b = consumer_runtime_config("expiry-replacement");
   let group = runtime_a
     .group
     .as_ref()
@@ -6946,15 +6882,8 @@ async fn consumer_crash_recovery_redelivers_only_uncommitted_record() -> Result<
     .create_producer(producer_config(), vec![producer_topic()])
     .await?;
 
-  let mut runtime_a = consumer_runtime_config("crash-owner");
-  let mut runtime_b = consumer_runtime_config("replacement-owner");
-  for runtime in [&mut runtime_a, &mut runtime_b] {
-    runtime
-      .read
-      .as_mut()
-      .ok_or_else(|| anyhow!("crash recovery consumer read config missing"))?
-      .strongly_consistent_metadata_reads = Some(true);
-  }
+  let runtime_a = consumer_runtime_config("crash-owner");
+  let runtime_b = consumer_runtime_config("replacement-owner");
 
   let committed_id = "crash-recovery-committed";
   let staged_id = "crash-recovery-staged";
@@ -7138,7 +7067,8 @@ async fn consumer_restart_hands_active_window_visibility_deferral_to_fast() -> R
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("visibility recovery read config missing"))?
-      .metadata_visibility_delay = TimeDuration::milliseconds(5_000).into_proto();
+      .eventual_metadata_reads =
+      Some(eventual_metadata_reads(TimeDuration::milliseconds(5_000))).into();
     runtime
       .group
       .as_mut()

@@ -13,14 +13,14 @@ name = "blob-stream-metadata-inspector"
 path = "src/main.rs"
 
 [dependencies]
-anyhow.workspace                  = true
-blob-stream-metadata-store.path  = "../blob-stream-metadata-store"
-blob-stream-types.path           = "../blob-stream-types"
-clap.workspace                    = true
-serde.workspace                   = true
-serde_json.workspace              = true
-time.workspace                    = true
-tokio.workspace                   = true
+anyhow.workspace                = true
+blob-stream-metadata-store.path = "../blob-stream-metadata-store"
+blob-stream-types.path          = "../blob-stream-types"
+clap.workspace                  = true
+serde.workspace                 = true
+serde_json.workspace            = true
+time.workspace                  = true
+tokio.workspace                 = true
 
 [dev-dependencies]
 blob-stream-blob-store.path = "../blob-stream-blob-store"

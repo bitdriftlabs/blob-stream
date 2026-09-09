@@ -8,10 +8,10 @@ use super::{
   consumer_max_clock_skew,
   consumer_max_idle_poll_delay,
   consumer_max_in_flight_batch_reads,
+  consumer_metadata_read_consistency,
   consumer_metadata_visibility_delay,
   consumer_prefetch_max_bytes,
   consumer_read_runtime_settings,
-  consumer_strongly_consistent_metadata_reads,
   validate_group_config,
   validate_read_config,
 };
@@ -19,6 +19,7 @@ use crate::config::ConsumerGroupConfig;
 use bd_runtime_config::loader::Loader;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_metadata_store::MetadataReadConsistency;
+use blob_stream_proto::protos::blobstream::v1::config::EventualMetadataReadsConfig;
 use blob_stream_types::{
   DEFAULT_MAX_METADATA_PUBLICATION_LAG as SHARED_PUBLICATION_LAG,
   DEFAULT_METADATA_WINDOW_SIZE,
@@ -166,18 +167,22 @@ fn read_defaults_derive_two_candidate_windows_and_two_second_idle_cap() {
   assert_eq!(consumer_idle_poll_delay(&read), Duration::milliseconds(250));
   assert_eq!(consumer_max_idle_poll_delay(&read), Duration::seconds(2));
   assert_eq!(consumer_prefetch_max_bytes(&read), 64 * 1024 * 1024);
+  assert_eq!(consumer_metadata_visibility_delay(&read), Duration::ZERO);
   assert_eq!(
-    consumer_metadata_visibility_delay(&read),
-    Duration::milliseconds(2_000)
+    consumer_metadata_read_consistency(&read),
+    MetadataReadConsistency::Strong
   );
-  assert!(!consumer_strongly_consistent_metadata_reads(&read));
   assert_eq!(consumer_max_in_flight_batch_reads(&read), 32);
 }
 
 #[test]
 fn candidate_windows_cover_publication_and_visibility_delay() {
   let mut read = read_config();
-  read.metadata_visibility_delay = Duration::seconds(300).into_proto();
+  read.eventual_metadata_reads = Some(EventualMetadataReadsConfig {
+    visibility_delay: Duration::seconds(300).into_proto(),
+    ..Default::default()
+  })
+  .into();
 
   assert_eq!(
     consumer_candidate_window_count(&read, Duration::seconds(30), DEFAULT_METADATA_WINDOW_SIZE,)
@@ -189,7 +194,11 @@ fn candidate_windows_cover_publication_and_visibility_delay() {
 #[test]
 fn candidate_windows_round_sub_millisecond_horizons_up() {
   let mut read = read_config();
-  read.metadata_visibility_delay = (Duration::seconds(300) + Duration::nanoseconds(1)).into_proto();
+  read.eventual_metadata_reads = Some(EventualMetadataReadsConfig {
+    visibility_delay: (Duration::seconds(300) + Duration::nanoseconds(1)).into_proto(),
+    ..Default::default()
+  })
+  .into();
 
   assert_eq!(
     consumer_candidate_window_count(&read, Duration::ZERO, DEFAULT_METADATA_WINDOW_SIZE).unwrap(),
@@ -200,7 +209,11 @@ fn candidate_windows_round_sub_millisecond_horizons_up() {
 #[test]
 fn candidate_windows_rejects_unbounded_scan_horizon() {
   let mut read = read_config();
-  read.metadata_visibility_delay = Duration::minutes(160).into_proto();
+  read.eventual_metadata_reads = Some(EventualMetadataReadsConfig {
+    visibility_delay: Duration::minutes(160).into_proto(),
+    ..Default::default()
+  })
+  .into();
 
   let error =
     consumer_candidate_window_count(&read, Duration::seconds(300), DEFAULT_METADATA_WINDOW_SIZE)
@@ -213,9 +226,28 @@ fn candidate_windows_rejects_unbounded_scan_horizon() {
 }
 
 #[test]
-fn metadata_visibility_delay_uses_explicit_value() {
+fn eventual_metadata_reads_default_visibility_delay_to_two_seconds() {
   let mut read = read_config();
-  read.metadata_visibility_delay = Duration::milliseconds(1_500).into_proto();
+  read.eventual_metadata_reads = Some(EventualMetadataReadsConfig::new()).into();
+
+  assert_eq!(
+    consumer_metadata_read_consistency(&read),
+    MetadataReadConsistency::Eventual
+  );
+  assert_eq!(
+    consumer_metadata_visibility_delay(&read),
+    Duration::milliseconds(2_000)
+  );
+}
+
+#[test]
+fn eventual_metadata_reads_use_explicit_visibility_delay() {
+  let mut read = read_config();
+  read.eventual_metadata_reads = Some(EventualMetadataReadsConfig {
+    visibility_delay: Duration::milliseconds(1_500).into_proto(),
+    ..Default::default()
+  })
+  .into();
 
   assert_eq!(
     consumer_metadata_visibility_delay(&read),
@@ -224,9 +256,13 @@ fn metadata_visibility_delay_uses_explicit_value() {
 }
 
 #[test]
-fn validate_read_config_accepts_zero_metadata_visibility_delay() {
+fn validate_read_config_accepts_zero_eventual_metadata_visibility_delay() {
   let mut read = read_config();
-  read.metadata_visibility_delay = Duration::ZERO.into_proto();
+  read.eventual_metadata_reads = Some(EventualMetadataReadsConfig {
+    visibility_delay: Duration::ZERO.into_proto(),
+    ..Default::default()
+  })
+  .into();
 
   validate_read_config(&read).unwrap();
 }
@@ -282,21 +318,19 @@ fn runtime_feature_flags_override_configured_reader_settings() {
     super::ConsumerReadRuntimeSettings {
       prefetch_max_bytes: 32,
       max_in_flight_batch_reads: 4,
-      metadata_read_consistency: MetadataReadConsistency::Eventual,
-      metadata_visibility_delay: Duration::milliseconds(2_000),
+      metadata_read_consistency: MetadataReadConsistency::Strong,
+      metadata_visibility_delay: Duration::ZERO,
     }
   );
 }
 
 #[test]
-fn strong_metadata_reads_ignore_the_configured_visibility_delay() {
+fn default_strong_metadata_reads_use_no_visibility_delay() {
   let mut read = read_config();
-  read.metadata_visibility_delay = Duration::milliseconds(1_500).into_proto();
-  read.strongly_consistent_metadata_reads = Some(true);
+  read.eventual_metadata_reads.clear();
 
   let runtime_settings = consumer_read_runtime_settings(&read, None);
 
-  assert!(consumer_strongly_consistent_metadata_reads(&read));
   assert_eq!(
     runtime_settings.metadata_read_consistency,
     MetadataReadConsistency::Strong
@@ -305,16 +339,11 @@ fn strong_metadata_reads_ignore_the_configured_visibility_delay() {
 }
 
 #[test]
-fn runtime_feature_flag_overrides_configured_metadata_read_consistency() {
+fn eventual_metadata_reads_enable_eventual_consistency() {
   let mut read = read_config();
-  read.strongly_consistent_metadata_reads = Some(true);
-  let feature_flags = FakeLoader::new(Arc::new(
-    DefaultFeatureFlags::default()
-      .with_bool_flag("blob_stream_consumer_strong_metadata_reads", false),
-  ));
+  read.eventual_metadata_reads = Some(EventualMetadataReadsConfig::new()).into();
 
-  let runtime_settings =
-    consumer_read_runtime_settings(&read, Some(&feature_flags.snapshot_watch()));
+  let runtime_settings = consumer_read_runtime_settings(&read, None);
 
   assert_eq!(
     runtime_settings.metadata_read_consistency,

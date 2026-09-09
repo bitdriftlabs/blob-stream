@@ -6,8 +6,8 @@ from cost_analysis import DEFAULTS, compute
 
 class CostAnalysisTest(unittest.TestCase):
   def test_strong_metadata_reads_double_only_metadata_scan_capacity(self) -> None:
-    eventual = compute(replace(DEFAULTS, metadata_strong_reads=False))
-    strong = compute(replace(DEFAULTS, metadata_strong_reads=True))
+    eventual = compute(replace(DEFAULTS, metadata_eventual_reads=True))
+    strong = compute(replace(DEFAULTS, metadata_eventual_reads=False))
 
     expected_increase = (
       eventual["req_ddb_r_scan_fast"] + eventual["req_ddb_r_scan_recovery"]

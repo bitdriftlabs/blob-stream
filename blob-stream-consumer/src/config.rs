@@ -35,7 +35,6 @@ const RESERVED_MEMBER_ID_PREFIX: &str = "__blob_stream_";
 const PREFETCH_MAX_BYTES_FEATURE_FLAG: &str = "blob_stream_consumer_prefetch_max_bytes";
 const MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG: &str =
   "blob_stream_consumer_max_in_flight_batch_reads";
-const STRONG_METADATA_READS_FEATURE_FLAG: &str = "blob_stream_consumer_strong_metadata_reads";
 const IDLE_POLL_DELAY_FEATURE_FLAG: &str = "blob_stream_consumer_idle_poll_delay_ms";
 const MAX_IDLE_POLL_DELAY_FEATURE_FLAG: &str = "blob_stream_consumer_max_idle_poll_delay_ms";
 const LEASE_DURATION_FEATURE_FLAG: &str = "blob_stream_consumer_lease_duration_ms";
@@ -125,12 +124,17 @@ pub fn consumer_prefetch_max_bytes(config: &ConsumerReadConfig) -> u64 {
 }
 
 #[must_use]
-/// Return the delay before newly published metadata ranges become eligible for consumption.
+/// Return the effective metadata visibility delay for the configured consistency mode.
 pub fn consumer_metadata_visibility_delay(config: &ConsumerReadConfig) -> Duration {
-  config.metadata_visibility_delay.as_ref().map_or(
-    DEFAULT_METADATA_VISIBILITY_DELAY,
-    ProtoDurationExt::to_time_duration,
-  )
+  config
+    .eventual_metadata_reads
+    .as_ref()
+    .map_or(Duration::ZERO, |settings| {
+      settings.visibility_delay.as_ref().map_or(
+        DEFAULT_METADATA_VISIBILITY_DELAY,
+        ProtoDurationExt::to_time_duration,
+      )
+    })
 }
 
 #[must_use]
@@ -161,9 +165,13 @@ pub fn consumer_max_clock_skew(config: &ConsumerReadConfig) -> Duration {
 }
 
 #[must_use]
-/// Return whether metadata queries are strongly consistent, applying the eventual default.
-pub fn consumer_strongly_consistent_metadata_reads(config: &ConsumerReadConfig) -> bool {
-  config.strongly_consistent_metadata_reads.unwrap_or(false)
+/// Return the metadata consistency selected by the presence of eventual-read settings.
+pub fn consumer_metadata_read_consistency(config: &ConsumerReadConfig) -> MetadataReadConsistency {
+  if config.eventual_metadata_reads.is_some() {
+    MetadataReadConsistency::Eventual
+  } else {
+    MetadataReadConsistency::Strong
+  }
 }
 
 #[must_use]
@@ -217,22 +225,8 @@ pub fn consumer_read_runtime_settings(
     },
   };
 
-  let configured_strong_metadata_reads = consumer_strongly_consistent_metadata_reads(config);
-  let strong_metadata_reads = feature_flags.map_or(configured_strong_metadata_reads, |flags| {
-    flags.get_bool(
-      STRONG_METADATA_READS_FEATURE_FLAG,
-      configured_strong_metadata_reads,
-    )
-  });
-  let metadata_read_consistency = if strong_metadata_reads {
-    MetadataReadConsistency::Strong
-  } else {
-    MetadataReadConsistency::Eventual
-  };
-  let metadata_visibility_delay = crate::consumer::metadata_visibility_delay(
-    consumer_metadata_visibility_delay(config),
-    strong_metadata_reads,
-  );
+  let metadata_read_consistency = consumer_metadata_read_consistency(config);
+  let metadata_visibility_delay = consumer_metadata_visibility_delay(config);
 
   ConsumerReadRuntimeSettings {
     prefetch_max_bytes,
@@ -249,13 +243,9 @@ pub fn consumer_candidate_window_count(
   maximum_metadata_publication_lag: Duration,
   metadata_window_size: Duration,
 ) -> Result<usize> {
-  let metadata_visibility_delay = crate::consumer::metadata_visibility_delay(
-    consumer_metadata_visibility_delay(config),
-    consumer_strongly_consistent_metadata_reads(config),
-  );
   consumer_candidate_window_count_with_availability_horizon(
     metadata_window_size,
-    maximum_metadata_publication_lag.saturating_add(metadata_visibility_delay),
+    maximum_metadata_publication_lag.saturating_add(consumer_metadata_visibility_delay(config)),
   )
 }
 

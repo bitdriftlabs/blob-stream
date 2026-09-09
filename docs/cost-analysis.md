@@ -29,21 +29,21 @@ python3 ../cost-analysis/cost_analysis.py \
 	--set n_cons=12
 ```
 
-The current data path uses eventual segment-metadata queries and plain `PutItem` publication. Price
-the two proposed stronger modes separately:
+The current data path uses strongly consistent segment-metadata queries and plain `PutItem`
+publication. Price eventual reads and transactionally fenced publication separately:
 
 ```bash
-# Strongly consistent segment-metadata queries. Consumer coordination reads are already strong.
-python3 ../cost-analysis/cost_analysis.py --strong-metadata-reads
+# Eventually consistent segment-metadata queries. Consumer coordination reads are already strong.
+python3 ../cost-analysis/cost_analysis.py --eventual-metadata-reads
 
 # Transactionally fence metadata publication against the producing lease rows.
 python3 ../cost-analysis/cost_analysis.py \
 	--transactional-metadata-writes \
 	--set avg_partitions_per_segment=6
 
-# Price both stronger modes for the same workload.
+# Price eventual reads with transactionally fenced publication for the same workload.
 python3 ../cost-analysis/cost_analysis.py \
-	--strong-metadata-reads \
+	--eventual-metadata-reads \
 	--transactional-metadata-writes \
 	--set avg_partitions_per_segment=6
 ```
@@ -52,17 +52,17 @@ Every `Inputs` field can also be set with `--set NAME=VALUE`. Boolean values are
 
 ```bash
 python3 ../cost-analysis/cost_analysis.py \
-	--set metadata_strong_reads=true \
+	--set metadata_eventual_reads=true \
 	--set transactional_metadata_writes=true \
 	--set pages_per_metadata_query=1.4
 ```
 
-`--strong-metadata-reads` and `metadata_strong_reads` model the resolved
-`ConsumerReadConfig.strongly_consistent_metadata_reads` setting, including its
-`blob_stream_consumer_strong_metadata_reads` runtime override. `--transactional-metadata-writes`
-and `transactional_metadata_writes` model broker `fenced_metadata_writes`, including its
-`blob_stream_broker_fenced_metadata_writes` runtime override. The fence mode is optional, but its
-holder ID, lease epoch, and session ID remain required in every producer lease row.
+`--eventual-metadata-reads` and `metadata_eventual_reads` model
+`ConsumerReadConfig.eventual_metadata_reads`; omitting that config uses strong reads.
+`--transactional-metadata-writes` and `transactional_metadata_writes` model broker
+`fenced_metadata_writes`, including its `blob_stream_broker_fenced_metadata_writes` runtime
+override. The fence mode is optional, but its holder ID, lease epoch, and session ID remain required
+in every producer lease row.
 
 The model's metadata-read cost is unaffected by the fact that strong reads have no visibility delay
 or by the configured consumer clock-skew horizon. The clock-skew bound can increase the scanned time
@@ -104,9 +104,9 @@ values for a decision.
 
 ## Consistency Costs
 
-With eventual metadata reads, each 4 KiB metadata-query page costs $0.5$ RRU. The
-`--strong-metadata-reads` switch changes only those metadata-query pages to 1 RRU. Consumer-group
-coordination is already strongly consistent, so it is unaffected by the switch.
+With the default strong metadata reads, each 4 KiB metadata-query page costs 1 RRU. The
+`--eventual-metadata-reads` switch changes only those metadata-query pages to $0.5$ RRU.
+Consumer-group coordination is already strongly consistent, so it is unaffected by the switch.
 
 `--transactional-metadata-writes` models enabled broker fenced metadata publication: a transactional
 metadata `Put` plus one transactional producer-lease `ConditionCheck` per contributing virtual

@@ -1,22 +1,24 @@
-# This thing uses eventual consistency, isn't it broken?
+# What data loss conditions are tolerated?
 
-By default, consumer metadata reads are eventually consistent. See [Design](design.md) and
-[Operations](operations.md) for details. This is an intentional cost/consistency tradeoff: the
-default two-second visibility delay is a best-effort margin for ordinary replica lag, not a DynamoDB
-correctness guarantee. It is part of a broader bounded availability horizon that also includes the
-broker's metadata-publication deadline.
+By default, consumer metadata reads are strongly consistent. See [Design](design.md) and
+[Operations](operations.md) for details. To opt into eventually consistent reads in order to reduce
+cost, set `eventual_metadata_reads`; its optional `visibility_delay` defaults to two seconds. This
+delay is a best-effort margin for ordinary replica lag, not a DynamoDB correctness guarantee, and is
+part of a broader bounded availability horizon that also includes the broker's metadata-publication
+deadline. As of this writing, metadata reads are coalesced via the brokers and in practice the
+marginal cost increase of strongly consistent reads is low. We do not recommend changing this
+setting and might even remove the eventually consistent option in the future as it makes the code
+substantially more complicated in various places.
 
-Set `strongly_consistent_metadata_reads` or the runtime flag
-`blob_stream_consumer_strong_metadata_reads` to use strongly consistent metadata queries. This
-removes read-replica staleness, ignores the configured visibility delay, and approximately doubles
-metadata-query RRUs. It does not make paginated scans atomic. Enable broker
-`fenced_metadata_writes` as well when stale producer publication must be rejected: it conditions
-metadata publication on the active lease session and epoch, requires transactional DynamoDB IAM
-permissions, and defaults off. The durable holder ID, lease epoch, and session ID are required in
-every producer lease row regardless of this setting. Fenced publication has a significant write-cost
-impact: each metadata publication becomes a DynamoDB transaction containing the segment metadata
-write plus a lease condition check for every partition in the flush, and DynamoDB charges
-transactional writes and reads at twice the normal capacity-unit rate.
+Strong reads remove read-replica staleness and approximately double metadata-query RRUs. They do not
+make paginated scans atomic. Enable broker `fenced_metadata_writes` as well when stale producer
+publication must be rejected: it conditions metadata publication on the active lease session and
+epoch, requires transactional DynamoDB IAM permissions, and defaults off. Fenced publication has a
+significant write-cost impact: each metadata publication becomes a DynamoDB transaction containing
+the segment metadata write plus a lease condition check for every partition in the flush, and
+DynamoDB charges transactional writes and reads at twice the normal capacity-unit rate. The default
+configuration accepts the stalled broker write loss condition because the mitigation cost is very
+high compared to the potential data loss it prevents in real world usage.
 
 # What time source is required to operate blob-stream correctly?
 
@@ -32,6 +34,29 @@ and consumers in the same bounded-time domain. When the measured envelope exceed
 value, raise the consumer setting before operating the deployment. A consumer clock that leads a
 broker beyond this bound can omit a segment from the Fast or checkpoint-recovery floor; a leading
 broker is conservative but increases availability latency.
+
+# How do partitions relate to virtual partitions?
+
+Blob-stream was designed for zero cross-AZ traffic. Every AZ is assigned a "writer domain." Within
+that domain, every topic has P logical partitions. A topic configured with W writer domains therefore
+has P * W virtual partitions; across multiple topics, sum that product for each topic.
+
+From the consumer perspective, *all* virtual partitions are balanced across all AZs. This is subtly
+different from Kafka. In Kafka, when using a producer controlled partition hash, the same hash is
+going to wind up in the same global partition regardless of which AZ it is written from. With
+blob-stream, the same hash across 3 AZs is going to wind up in 3 different virtual partitions which
+may or may not get assigned to the same consumer.
+
+Use cases that require strict ordering across AZs for a single partition hash cannot currently be
+satisfied by blob-stream. In the future we may consider two possible improvements to satisfy this:
+
+1. Add a consumer assignment mode which will force all virtual partitions for a given partition to
+   be assigned to the same consumer. This would send all same-hashed data to the same consumer, but
+   there would not be strict ordering guarantees. This is still likely good enough for many
+   workflows.
+2. It is technically possible to create a meta-iterator that merges all virtual partitions for a
+   partition and defines a strict global order based on (snowflake ID, [per partition sequence
+   range]). This is more complicated but we can consider this in the future if there is demand.
 
 # Why haven't you implemented compaction?
 
@@ -57,7 +82,7 @@ contributions.
 
 No.
 
-# Are you going to add other Kafka like features such as transactions?
+# Are you going to add other Kafka like features such as transactions, authn/authz, and whatever else?
 
 There are no plans at the current time but there is nothing in the current system that would
 outright prevent this if the need arises.
@@ -67,7 +92,7 @@ outright prevent this if the need arises.
 We have no plans currently but it should be relatively easy to do this if there is interest. The
 main requirement is that both the metadata and blob store must support out of band TTL for records
 and blobs. Doing internal cleanup adds a lot of complexity (and cost) and we would prefer to avoid
-that.
+that. The metadata store must also support efficient range key scans.
 
 # Will configuration become centrally managed?
 

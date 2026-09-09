@@ -548,20 +548,20 @@ Visibility-deferred, Fresh, Fast, shared, and active-horizon responses are not c
 intentionally reader-local and is discarded on restart, revocation, seek, or replacement recovery
 hydration.
 
-The effective visibility delay applies only to eventual reads. In the default eventual-read mode it
-is `metadata_visibility_delay_ms`; when an eligible metadata row is newer than
-`now - effective_visibility_delay`, the reader defers it. Strong reads accept every validated row
-returned by storage. Clock skew is accounted for by the Fast and checkpoint availability horizon,
-not added to the eventual-read per-row maturity test. In Recovery, deferring a window blocks later
-recovery windows for that partition in the same pass, so the cursor cannot advance past a missing
-earlier sequence range. The recovery pointer remains at the deferred window for the next pass when
-that window is outside Fast's bounded scan horizon. A deferred window inside that horizon instead
-completes recovery and is handed to Fast: Fast retains the same visibility check, blocks later
-snowflakes in that partition/window during the pass, and retries from its inclusive time floor and
-frontier. This prevents recovery from tail-chasing a busy active window while preserving the
-historical recovery barrier that protects cursor order. A failed metadata or blob read, except a
-classified missing blob, restores the pass's cursor and frontier state so an undelivered batch is
-retried.
+The effective visibility delay applies only when `eventual_metadata_reads` is configured. Its
+`visibility_delay` defaults to two seconds when unset; when an eligible metadata row is newer than
+`now - effective_visibility_delay`, the reader defers it. The default strong reads accept every
+validated row returned by storage. Clock skew is accounted for by the Fast and checkpoint
+availability horizon, not added to the eventual-read per-row maturity test. In Recovery, deferring a
+window blocks later recovery windows for that partition in the same pass, so the cursor cannot
+advance past a missing earlier sequence range. The recovery pointer remains at the deferred window
+for the next pass when that window is outside Fast's bounded scan horizon. A deferred window inside
+that horizon instead completes recovery and is handed to Fast: Fast retains the same visibility
+check, blocks later snowflakes in that partition/window during the pass, and retries from its
+inclusive time floor and frontier. This prevents recovery from tail-chasing a busy active window
+while preserving the historical recovery barrier that protects cursor order. A failed metadata or
+blob read, except a classified missing blob, restores the pass's cursor and frontier state so an
+undelivered batch is retried.
 
 A classified blob `NotFound` is a retention or storage durability violation: metadata is published
 only after its blob upload, and S3 retention must outlive the referencing metadata. The reader
@@ -592,14 +592,14 @@ Let $D$ be the broker's enforced maximum metadata-publication lag plus the consu
 $T_{safe} = now - D$. The reader considers the current window plus enough preceding windows to
 cover $D$, then omits every window whose end is at or before $T_{safe}$.
 
-For a configured skew bound $S$, eventual reads use $D = 15s + S + 2s$ by default, and strong
-reads use $D = 15s + S$. The unset `max_clock_skew` default is $S = 10ms$, yielding 17.010s and
-15.010s respectively. This is Fast's metadata-query lower-bound horizon, not a wait of that
-duration applied to every returned row: the publication deadline and clock-skew bound account for
-metadata that might not yet be safely queryable, while the visibility delay separately decides
-whether an existing returned row is old enough to use. A higher observed frontier can narrow an
-individual steady-state query beyond the time floor, but it does not reduce the required horizon
-before that frontier exists.
+For a configured skew bound $S$, the default strong reads use $D = 15s + S$. Explicit eventual reads
+with an unset `visibility_delay` use $D = 15s + S + 2s$. The unset `max_clock_skew` default is $S =
+10ms$, yielding 15.010s and 17.010s respectively. This is Fast's metadata-query lower-bound horizon,
+not a wait of that duration applied to every returned row: the publication deadline and clock-skew
+bound account for metadata that might not yet be safely queryable, while the visibility delay
+separately decides whether an existing returned row is old enough to use. A higher observed frontier
+can narrow an individual steady-state query beyond the time floor, but it does not reduce the
+required horizon before that frontier exists.
 
 For each remaining window, the time floor is the smallest Sonyflake for
 $max(window_start, T_{safe})$. A Fast partition's effective lower bound is the greater of this
@@ -662,17 +662,16 @@ the same window, recovery completes in one scan and the partition enters Fast. T
 `recovery_scans_single_checkpoint_window_with_overlap_bound` and is the expected shape during a
 consumer recovery or reassignment that overlaps a broker rolling restart.
 
-**Later recovery window.** Assume topic `telemetry` uses 300-second windows, the default
-15-second publication deadline, default `max_clock_skew = 10ms`, and default 2-second
-visibility delay, making $D = 17.010s$. At
-`now = 1,350`, the cutover window is `[1,200, 1,500)`. Partition 7 restores a usable source
-checkpoint from timestamp 1,020 in the earlier `[900, 1,200)` window. Its source-window query is
-`pk = telemetry#900` with a Sonyflake lower bound for $1,020 - 17.010 = 1,002.990$. Its later
-cutover-window query is `pk = telemetry#1200` with no snowflake lower bound. Only the source window uses the
-checkpoint overlap; every later recovery window remains a full-window query. Partition 7 enters
-Fast only after it has fully scanned the `[1,200, 1,500)` cutover window in a recovery pass. If a
-visibility deferral or prefetch-capacity limit blocks that window, it remains Recovering and retries
-that window on a later pass.
+**Later recovery window.** Assume topic `telemetry` uses 300-second windows, the default 15-second
+publication deadline, default `max_clock_skew = 10ms`, and explicit eventual reads with the default
+2-second visibility delay, making $D = 17.010s$. At `now = 1,350`, the cutover window is `[1,200,
+1,500)`. Partition 7 restores a usable source checkpoint from timestamp 1,020 in the earlier `[900,
+1,200)` window. Its source-window query is `pk = telemetry#900` with a Sonyflake lower bound for
+$1,020 - 17.010 = 1,002.990$. Its later cutover-window query is `pk = telemetry#1200` with no
+snowflake lower bound. Only the source window uses the checkpoint overlap; every later recovery
+window remains a full-window query. Partition 7 enters Fast only after it has fully scanned the
+`[1,200, 1,500)` cutover window in a recovery pass. If a visibility deferral or prefetch-capacity
+limit blocks that window, it remains Recovering and retries that window on a later pass.
 
 **Sparse partition after downtime.** Assume topic `telemetry` has seven-day retention and
 300-second windows. Partition 7 last delivered sequence 10 from window `W0`, then remains idle
@@ -684,17 +683,16 @@ has never delivered a record has no durable cursor or source checkpoint. On reas
 Fresh and scans only the new current window, just as a newly created group does; it has no durable
 origin from which to recover earlier retained windows.
 
-**Recovery waits for a visibility gap.** Assume topic `telemetry` uses 300-second windows and a
-2-second visibility delay. At `now = 1,230`, a partition with cursor 1 performs legacy recovery
-from window `[900, 1,200)` through its cutover window `[1,200, 1,500)`; legacy recovery has no
-checkpoint lower bound. The `[2, 2]` row in the first window has
-`metadata_published_ts_ms = 1,229,000`, so it is deferred because it is newer than
-`1,230,000 - 2,000`. The `[3, 3]` row in the cutover window has
-`metadata_published_ts_ms = 1,200,000` and is already visible. The pass delivers neither range
-and retains cursor 1, because the deferred earlier window blocks recovery progress. At
-`now = 1,232`, the `[2, 2]` row becomes eligible; the next pass delivers `[2, 2]` followed by
-`[3, 3]`. This prevents cursor 3 from hiding sequence 2 and is covered by
-`recovery_does_not_advance_cursor_past_visibility_deferred_window`.
+**Recovery waits for a visibility gap.** Assume topic `telemetry` uses 300-second windows and
+explicit eventual reads with a 2-second visibility delay. At `now = 1,230`, a partition with cursor
+1 performs legacy recovery from window `[900, 1,200)` through its cutover window `[1,200, 1,500)`;
+legacy recovery has no checkpoint lower bound. The `[2, 2]` row in the first window has
+`metadata_published_ts_ms = 1,229,000`, so it is deferred because it is newer than `1,230,000 -
+2,000`. The `[3, 3]` row in the cutover window has `metadata_published_ts_ms = 1,200,000` and is
+already visible. The pass delivers neither range and retains cursor 1, because the deferred earlier
+window blocks recovery progress. At `now = 1,232`, the `[2, 2]` row becomes eligible; the next pass
+delivers `[2, 2]` followed by `[3, 3]`. This prevents cursor 3 from hiding sequence 2 and is covered
+by `recovery_does_not_advance_cursor_past_visibility_deferred_window`.
 
 **Active-window visibility handoff.** Assume a graceful replacement starts in the same 300-second
 window as its committed source checkpoint. A newer row in that window is still inside the reader's
@@ -705,29 +703,27 @@ to close while preserving the normal visibility and cursor protections; it is co
 `consumer_restart_hands_active_window_visibility_deferral_to_fast`.
 
 **Constantly producing Fast partition.** Assume one Fast partition in topic `telemetry` produces
-segments continuously in the `[900, 1,200)` window. With the default 15-second publication
-deadline, default `max_clock_skew = 10ms`, and 2-second visibility delay, at `now = 1,020`
-$D = 17.010s$ and $T_{safe} = 1,002.990$.
-Suppose an earlier scan already observed a visibility-eligible segment at Sonyflake timestamp
-1,015, so its inclusive frontier is 1,015. The next query uses
-$max(1,002.990, 1,015) = 1,015$: it replays the boundary row and does not rescan the interval from
-1,002.990 through 1,014. If that query returns a later segment whose metadata was published at
-1,019, Fast defers that segment at `now = 1,020` because it is newer than the 2-second visibility
-cutoff of 1,018. Its frontier remains 1,015 and the segment becomes eligible at `now = 1,021`.
-The 17.010-second floor still matters before a higher frontier exists: a segment with Sonyflake
-timestamp 1,004 can be selected by that floor but, if its metadata was published at 1,019, is
-separately deferred until 1,021. Thus 17.010 seconds controls how far back Fast queries; 2 seconds
-controls whether a returned metadata row is accepted on that pass.
+segments continuously in the `[900, 1,200)` window. With the default 15-second publication deadline,
+default `max_clock_skew = 10ms`, and explicit eventual reads with a 2-second visibility delay, at
+`now = 1,020` $D = 17.010s$ and $T_{safe} = 1,002.990$. Suppose an earlier scan already observed a
+visibility-eligible segment at Sonyflake timestamp 1,015, so its inclusive frontier is 1,015. The
+next query uses $max(1,002.990, 1,015) = 1,015$: it replays the boundary row and does not rescan the
+interval from 1,002.990 through 1,014. If that query returns a later segment whose metadata was
+published at 1,019, Fast defers that segment at `now = 1,020` because it is newer than the 2-second
+visibility cutoff of 1,018. Its frontier remains 1,015 and the segment becomes eligible at `now =
+1,021`. The 17.010-second floor still matters before a higher frontier exists: a segment with
+Sonyflake timestamp 1,004 can be selected by that floor but, if its metadata was published at 1,019,
+is separately deferred until 1,021. Thus 17.010 seconds controls how far back Fast queries; 2
+seconds controls whether a returned metadata row is accepted on that pass.
 
 **Fast time floor and frontiers.** Assume topic `telemetry` uses 300-second windows, the default
-15-second publication deadline, default `max_clock_skew = 10ms`, and default 2-second
-visibility delay. At `now = 1,020`, the current window is `[900, 1,200)` and $D = 17.010s$, so
-$T_{safe} = 1,002.990$. The preceding window
-`[600, 900)` ended before $T_{safe}$ and is omitted. In the current window, partition 7 has an
-inclusive frontier at Sonyflake timestamp 1,005, while partition 8 has an inclusive frontier at
-timestamp 1,001. Their shared query uses the lower effective bound, timestamp 1,001; partition 7
-filters rows below its own 1,005 frontier locally, while partition 8 can still receive rows at or
-after 1,001.
+15-second publication deadline, default `max_clock_skew = 10ms`, and explicit eventual reads with a
+2-second visibility delay. At `now = 1,020`, the current window is `[900, 1,200)` and $D = 17.010s$,
+so $T_{safe} = 1,002.990$. The preceding window `[600, 900)` ended before $T_{safe}$ and is omitted.
+In the current window, partition 7 has an inclusive frontier at Sonyflake timestamp 1,005, while
+partition 8 has an inclusive frontier at timestamp 1,001. Their shared query uses the lower
+effective bound, timestamp 1,001; partition 7 filters rows below its own 1,005 frontier locally,
+while partition 8 can still receive rows at or after 1,001.
 
 **One range read for several selected batches.** Assume a selected segment from topic `telemetry`
 contains three independently compressed batches: batches for owned partitions 7 and 9 occupy
@@ -741,10 +737,9 @@ trades data transfer for one fewer object-store request.
 
 The broker starts `max_metadata_publication_lag_ms` before segment construction and requires both
 blob upload and metadata persistence to finish within the remaining budget. The unset topic default
-is 15 seconds. Consumers add their configured `max_clock_skew` bound (10 ms only when unset)
-and their effective visibility delay to form $D$. Eventual reads use
-`metadata_visibility_delay_ms` (two seconds by default); strong reads use zero delay even when
-that setting is nonzero.
+is 15 seconds. Consumers add their configured `max_clock_skew` bound (10 ms only when unset) and
+their effective visibility delay to form $D$. The default strong reads use zero delay. When
+`eventual_metadata_reads` is present, its `visibility_delay` defaults to two seconds.
 
 The Fast safe timestamp is $T_{safe} = now - D$; it omits older windows and uses the Sonyflake
 minimum for $max(window\_start, T_{safe})$ in the remaining windows. Checkpoint recovery uses the
@@ -765,24 +760,14 @@ investigate deadline exhaustion and flush failures rather than silently widening
 
 ### Read Consistency and Delivery Tradeoffs
 
-Metadata queries are eventually consistent by default. A broker returns `OK` only after it uploads
-the segment blob and writes its metadata row, but an eventually consistent reader replica may not
-observe that row immediately. `metadata_visibility_delay_ms` can defer accepting metadata whose
-publication timestamp is too recent. It defaults to two seconds and is a best-effort staleness
+Metadata queries are strongly consistent by default. A broker returns `OK` only after it uploads the
+segment blob and writes its metadata row. To use eventually consistent DynamoDB metadata queries,
+set `ConsumerReadConfig.eventual_metadata_reads`; its optional `visibility_delay` defaults to two
+seconds. The delay defers accepting recently published metadata rows as a best-effort staleness
 margin, not a correctness guarantee: DynamoDB supplies no bounded replication-delay contract, and
-the delay does not solve stale-writer publication.
-
-Set `ConsumerReadConfig.strongly_consistent_metadata_reads` to enable DynamoDB `ConsistentRead` for
-every metadata-query page. It defaults to false. The runtime feature flag
-`blob_stream_consumer_strong_metadata_reads` overrides that setting, using the configuration value
-as its fallback. The reader snapshots the resolved value at the beginning of each scan pass; a flag
-change therefore affects the next pass without invalidating metadata caches, clearing Fast
-frontiers, replaying cursors, or retroactively changing a hydrated recovery source-window overlap.
-Operational flag changes are expected to be infrequent: a strong-to-eventual change after hydration
-retains the shorter strong-mode overlap for that recovery. Strong mode ignores a configured nonzero
-`metadata_visibility_delay_ms` and accepts a row at its publication timestamp. The broker
-publication deadline and configured `max_clock_skew` remain part of Fast and checkpoint-recovery
-overlap calculations in both modes.
+the delay does not solve stale-writer publication. Strong reads accept every validated row at its
+publication timestamp. The broker publication deadline and configured `max_clock_skew` remain part
+of Fast and checkpoint-recovery overlap calculations in both modes.
 
 The delay is needed even though Fast retains a per-partition observed snowflake frontier. That
 frontier records only metadata returned by a prior query; it is not evidence that the query returned
@@ -818,10 +803,9 @@ component. They do not by themselves prevent stale publication; fenced broker me
 provide that publication fence when enabled.
 
 Use `cost-analysis/cost_analysis.py` with real page sizes, poll rates, consumer counts, and
-regional pricing before enabling strong reads. Its `--strong-metadata-reads` mode models the
-resolved `strongly_consistent_metadata_reads` configuration or runtime-flag value; it doubles
-metadata scan RRUs but leaves already strongly consistent coordination reads unchanged. Its
-`--transactional-metadata-writes` mode separately models fenced metadata publication.
+regional pricing before selecting eventual reads. Its `--eventual-metadata-reads` mode halves the
+metadata scan RRU component while leaving already strongly consistent coordination reads unchanged.
+Its `--transactional-metadata-writes` mode separately models fenced metadata publication.
 
 ## Consumer Group Coordination
 
@@ -960,8 +944,8 @@ defaults are:
 | Topic metadata window | 300 seconds; fixed broker/consumer metadata-key layout contract |
 | Broker metadata publication deadline | 15 seconds |
 | Consumer `max_clock_skew` | 10 ms when unset |
-| Consumer metadata visibility delay | 2 seconds |
-| Consumer strong metadata reads | Disabled |
+| Consumer metadata reads | Strongly consistent |
+| Consumer eventual metadata visibility delay | 2 seconds when `eventual_metadata_reads` is configured and `visibility_delay` is unset |
 | Consumer recovery slice | Up to 32 metadata windows per scan pass |
 | Consumer prefetch target | 64 MiB |
 | Consumer lease duration | 30 seconds |
@@ -1005,16 +989,16 @@ Event timestamps do not participate in this calculation.
 
 ### Eventually Consistent Metadata Reads
 
-Consumers use eventually consistent DynamoDB metadata queries. The visibility delay is a
-best-effort operational margin intended for ordinary replica lag; DynamoDB does not provide a
-bounded replication-delay guarantee. Fast and checkpoint-overlap scans can miss metadata that
-becomes visible outside their bounded availability horizon.
+Consumers use strongly consistent DynamoDB metadata queries unless
+`eventual_metadata_reads` is configured. In eventual mode, the visibility delay is a best-effort
+operational margin intended for ordinary replica lag; DynamoDB does not provide a bounded
+replication-delay guarantee. Fast and checkpoint-overlap scans can miss metadata that becomes
+visible outside their bounded availability horizon.
 
-This tradeoff is appropriate only when occasional delayed or missed discovery under an extreme
-replica-lag event is acceptable. Increasing the visibility delay reduces the risk at the cost of
-more scan work and latency. Strongly consistent metadata reads can be configured and will remove the
-read-replica component (at the cost of approximately doubling the metadata-query RRU component), but
-do not by themselves fence stale producer publication.
+Use eventual mode only when occasional delayed or missed discovery under an extreme replica-lag
+event is acceptable. Increasing its visibility delay reduces the risk at the cost of more scan work
+and latency. Strong reads approximately double the metadata-query RRU component, but do not by
+themselves fence stale producer publication.
 
 ### Unfenced Stale-Writer Publication
 

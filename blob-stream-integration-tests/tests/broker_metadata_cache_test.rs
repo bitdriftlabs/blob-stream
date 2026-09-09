@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use bd_time::TimeProvider;
+use blob_stream_consumer::EventualMetadataReadsConfig;
 use blob_stream_consumer::iterator::{ConsumerIterator, NextResult};
 use blob_stream_integration_tests::test_framework::{
   self as framework,
@@ -30,6 +31,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::time::timeout;
+
+fn eventual_metadata_reads(visibility_delay: TimeDuration) -> EventualMetadataReadsConfig {
+  EventualMetadataReadsConfig {
+    visibility_delay: visibility_delay.into_proto(),
+    ..Default::default()
+  }
+}
 
 #[tokio::test]
 async fn broker_metadata_cache_delivers_real_broker_multi_group_initial_recovery() -> Result<()> {
@@ -372,6 +380,11 @@ async fn broker_metadata_cache_default_timing_preserves_visibility_boundary() ->
     .as_mut()
     .ok_or_else(|| anyhow!("default-cache consumer A group config missing"))?
     .group_id = "default-cache-group-a".into();
+  runtime_a
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow!("default-cache consumer A read config missing"))?
+    .eventual_metadata_reads = Some(EventualMetadataReadsConfig::new()).into();
   let mut consumer_a = cluster
     .create_broker_metadata_cache_consumer_with_metadata_store(
       &runtime_a,
@@ -495,8 +508,9 @@ async fn assert_broker_metadata_cache_collapses_multi_group_fast_tail(
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("cache Fast consumer read config missing"))?;
-    read.metadata_visibility_delay = TimeDuration::ZERO.into_proto();
-    read.strongly_consistent_metadata_reads = Some(strongly_consistent);
+    read.eventual_metadata_reads = (!strongly_consistent)
+      .then(|| eventual_metadata_reads(TimeDuration::ZERO))
+      .into();
   }
 
   let mut initial_fast_a = hooks
@@ -603,7 +617,7 @@ async fn broker_metadata_cache_unavailable_owner_falls_back_to_direct_metadata()
     .read
     .as_mut()
     .ok_or_else(|| anyhow!("owner-loss consumer read config missing"))?
-    .metadata_visibility_delay = TimeDuration::ZERO.into_proto();
+    .eventual_metadata_reads = Some(eventual_metadata_reads(TimeDuration::ZERO)).into();
 
   let mut consumer = cluster
     .create_broker_metadata_cache_consumer_with_discovery(
@@ -668,7 +682,7 @@ async fn broker_metadata_cache_owner_churn_falls_back_to_direct_metadata() -> Re
     .read
     .as_mut()
     .ok_or_else(|| anyhow!("owner churn consumer read config missing"))?
-    .metadata_visibility_delay = TimeDuration::ZERO.into_proto();
+    .eventual_metadata_reads = Some(eventual_metadata_reads(TimeDuration::ZERO)).into();
 
   let mut initial_fast = hooks
     .arm_consumer(
@@ -750,7 +764,7 @@ async fn broker_metadata_cache_deadline_falls_back_to_direct_metadata() -> Resul
     .read
     .as_mut()
     .ok_or_else(|| anyhow!("cache-deadline consumer read config missing"))?
-    .metadata_visibility_delay = TimeDuration::ZERO.into_proto();
+    .eventual_metadata_reads = Some(eventual_metadata_reads(TimeDuration::ZERO)).into();
 
   let mut initial_fast = hooks
     .arm_consumer(
@@ -820,7 +834,7 @@ async fn broker_metadata_cache_pressure_reloads_evicted_tail_entry() -> Result<(
     .read
     .as_mut()
     .ok_or_else(|| anyhow!("cache-pressure consumer read config missing"))?
-    .metadata_visibility_delay = TimeDuration::ZERO.into_proto();
+    .eventual_metadata_reads = Some(eventual_metadata_reads(TimeDuration::ZERO)).into();
 
   let mut initial_fast = hooks
     .arm_consumer(
@@ -919,7 +933,7 @@ async fn broker_metadata_cache_delivers_active_recovery_after_restart() -> Resul
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("cache recovery consumer read config missing"))?
-      .metadata_visibility_delay = TimeDuration::ZERO.into_proto();
+      .eventual_metadata_reads = Some(eventual_metadata_reads(TimeDuration::ZERO)).into();
   }
 
   produce_message(
@@ -1003,7 +1017,7 @@ async fn broker_metadata_cache_recovers_retained_historical_windows() -> Result<
       .read
       .as_mut()
       .ok_or_else(|| anyhow!("cache history consumer read config missing"))?
-      .metadata_visibility_delay = TimeDuration::ZERO.into_proto();
+      .eventual_metadata_reads = Some(eventual_metadata_reads(TimeDuration::ZERO)).into();
   }
 
   produce_message_at_manual_time(

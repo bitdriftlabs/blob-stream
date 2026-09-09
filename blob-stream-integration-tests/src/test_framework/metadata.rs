@@ -11,7 +11,11 @@ use blob_stream_consumer::consumer::{
   GrpcBrokerMetadataQuery,
 };
 use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, NextResult};
-use blob_stream_consumer::{ConsumerReadConfig, DEFAULT_MAX_METADATA_PUBLICATION_LAG};
+use blob_stream_consumer::{
+  ConsumerReadConfig,
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+  EventualMetadataReadsConfig,
+};
 use blob_stream_metadata_store::{
   LeaseReleaseOutcome,
   MetadataReadConsistency,
@@ -759,8 +763,12 @@ pub async fn broker_metadata_cache_reader(
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
-      strongly_consistent_metadata_reads: Some(strongly_consistent),
-      metadata_visibility_delay: metadata_visibility_delay.into_proto(),
+      eventual_metadata_reads: (!strongly_consistent)
+        .then(|| EventualMetadataReadsConfig {
+          visibility_delay: metadata_visibility_delay.into_proto(),
+          ..Default::default()
+        })
+        .into(),
       ..Default::default()
     },
     vec![0, 1],
