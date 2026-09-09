@@ -88,6 +88,7 @@ impl ConsumerReaderImpl {
         VirtualPartitionState::Fast {
           cursor,
           coverage_floor: None,
+          gap: None,
           last_scan: None,
         },
       );
@@ -182,13 +183,9 @@ impl ConsumerReaderImpl {
         .fast_frontiers
         .retain(|(partition_id, _), _| assigned.contains(partition_id));
     }
-    let cached_entry_count = self.recovery_metadata_cache.len();
     self
       .recovery_metadata_cache
       .retain(|(partition_id, ..), _| assigned.contains(partition_id));
-    self.metrics.record_recovery_metadata_cache_invalidation(
-      cached_entry_count.saturating_sub(self.recovery_metadata_cache.len()),
-    );
     self.record_recovery_metadata_cache_state();
     // A revoked partition has no reader-local work left after the iterator drains it. Its durable
     // cursor belongs in the consumer-group lease and is hydrated again if this reader reacquires
@@ -241,13 +238,9 @@ impl ConsumerReaderImpl {
   }
 
   fn clear_recovery_metadata_cache(&mut self, virtual_partition_id: VirtualPartitionId) {
-    let cached_entry_count = self.recovery_metadata_cache.len();
     self
       .recovery_metadata_cache
       .retain(|(partition_id, ..), _| *partition_id != virtual_partition_id);
-    self.metrics.record_recovery_metadata_cache_invalidation(
-      cached_entry_count.saturating_sub(self.recovery_metadata_cache.len()),
-    );
     self.record_recovery_metadata_cache_state();
   }
 

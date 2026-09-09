@@ -497,6 +497,16 @@ query still apply their own frontier filters after the result is returned.
   before resuming Fast. Fast is an optimization; it is never used to replace retained recovery
   for a resumed partition.
 
+Fast metadata-window queries may execute concurrently and their results are processed in window
+order, but separate DynamoDB partition keys do not form one atomic snapshot. If a newer Fast batch
+would skip the next sequence after a partition cursor while an older Fast window remains inside the
+availability horizon, the reader holds that partition without advancing its cursor. The hold starts
+probing again after 500 ms to recover the common late-publication case promptly.
+It repeats at that interval only until the newest relevant predecessor window has ended plus $D$;
+at that $W + D$ maturity boundary, a remaining discontinuity is admitted normally. This delay
+applies only to an actual sequence discontinuity; contiguous cross-window batches continue
+immediately, and other partitions continue independently.
+
 For a usable source checkpoint that was not clamped to retention, recovery uses an inclusive lower
 bound only for its first window. Let $D$ be the broker's publication deadline plus the consumer's
 configured `max_clock_skew` bound and the reader's effective visibility delay. The lower bound is
@@ -569,11 +579,11 @@ window from its mature cached metadata when available, rather than querying eith
 the completed prefix of the slice again. This preserves the same cursor ordering guarantee as
 visibility deferral while avoiding repeated metadata scans during a long backlog.
 
-After a successful pass that produces no batches solely because eligible metadata was deferred,
-the prefetch worker waits until the earliest deferred row reaches its precise eligibility instant.
-This replaces only the normal empty-result idle backoff for that pass; a pass that produces batches
-continues immediately, and reader commands interrupt the wait so assignment, hydration, and seek
-changes remain prompt.
+After a successful pass that produces no batches solely because eligible metadata was deferred or a
+Fast sequence hold awaits predecessor maturity, the prefetch worker waits until the earliest precise
+retry instant. This replaces only the normal empty-result idle backoff for that pass; a pass that
+produces batches continues immediately, and reader commands interrupt the wait so assignment,
+hydration, and seek changes remain prompt.
 
 ### Fast Query Bounds
 

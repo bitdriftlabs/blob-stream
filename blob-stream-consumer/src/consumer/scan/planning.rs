@@ -23,6 +23,11 @@ use crate::config::consumer_candidate_window_count_with_availability_horizon;
 use crate::consumer::reader::RecoveryMetadataCacheKey;
 use crate::consumer::state::RecoveryState;
 
+// A cross-window sequence hold is exceptional and partition-scoped. Recheck soon enough to
+// recover the common "published just after the prior query" case without turning normal Fast
+// scans into high-frequency polling.
+pub(super) const FAST_GAP_PROBE_INTERVAL: time::Duration = time::Duration::milliseconds(500);
+
 impl ConsumerReaderImpl {
   /// Return cache identities for every partition in an immutable metadata request.
   ///
@@ -201,6 +206,12 @@ impl ConsumerReaderImpl {
     if !matches!(state, VirtualPartitionState::Fast { .. }) {
       return None;
     }
+    if state
+      .fast_gap_next_probe_at()
+      .is_some_and(|retry_at| retry_at > now)
+    {
+      return None;
+    }
     let safe_timestamp = self.fast_scan_safe_timestamp(now, runtime_settings);
     let coverage_floor = state.fast_coverage_floor().unwrap_or(safe_timestamp);
     let window_start = time::OffsetDateTime::from_unix_timestamp(window_start_unix_seconds)
@@ -304,6 +315,49 @@ impl ConsumerReaderImpl {
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> time::OffsetDateTime {
     now.saturating_sub(self.availability_horizon(runtime_settings).duration())
+  }
+
+  /// Return the maturity deadline for a Fast sequence hold, if the predecessor remains open.
+  ///
+  /// Metadata scans can complete in request order without observing a snapshot across window
+  /// keys. A newer range that skips the cursor's next sequence may be missing a row published
+  /// immediately after the prior window's query. The caller probes at `FAST_GAP_PROBE_INTERVAL`
+  /// rather than waiting for the full availability horizon.
+  ///
+  /// The full horizon remains the correctness boundary. If the candidate window starts at `W`
+  /// and the horizon is `D`, `W + D` is when every earlier window is mature. For example, with
+  /// `W = 12:00:00`, `D = 15s`, and a gap observed at `12:00:10`, probes run at `12:00:10.500`,
+  /// `12:00:11.000`, and so on; the last possible probe deadline is `12:00:15`. At that point
+  /// this function returns `None`, allowing a remaining discontinuity to be reported normally.
+  pub(in crate::consumer) fn fast_gap_maturity_at(
+    &self,
+    partition_id: VirtualPartitionId,
+    candidate_window_start_unix_seconds: i64,
+    current_cursor: Option<u64>,
+    candidate_sequence_start: u64,
+    now: time::OffsetDateTime,
+    runtime_settings: ConsumerReadRuntimeSettings,
+  ) -> Option<time::OffsetDateTime> {
+    if !matches!(
+      self.virtual_partition_states.get(&partition_id),
+      Some(VirtualPartitionState::Fast { .. })
+    ) {
+      return None;
+    }
+    let next_sequence = current_cursor?.saturating_add(1);
+    if candidate_sequence_start <= next_sequence {
+      return None;
+    }
+    let candidate_window_start =
+      offset_datetime_from_unix_seconds(candidate_window_start_unix_seconds);
+    // The candidate's window start is also the latest predecessor's end. If it is after the
+    // safe timestamp, at least one prior Fast window may still receive a missing sequence.
+    if candidate_window_start <= self.fast_scan_safe_timestamp(now, runtime_settings) {
+      return None;
+    }
+    let maturity_deadline =
+      candidate_window_start.saturating_add(self.availability_horizon(runtime_settings).duration());
+    Some(maturity_deadline)
   }
 
   /// Return the lowest possible segment ID for a timestamp, preserving safety for invalid input.
@@ -426,6 +480,12 @@ impl ConsumerReaderImpl {
   ) -> Result<(Vec<ScanRequest>, bool)> {
     let mut scan_requests = BTreeMap::new();
     let mut recovery_scan = false;
+
+    // A sequence hold is local to one Fast partition. Once its predecessor becomes mature, clear
+    // it before planning so the normal retained-tail path performs the validating reread.
+    for state in self.virtual_partition_states.values_mut() {
+      state.clear_fast_gap_hold_if_mature(now);
+    }
 
     self.start_fast_coverage_recoveries(now, runtime_settings)?;
 
@@ -619,6 +679,9 @@ impl ConsumerReaderImpl {
           now,
           runtime_settings,
         );
+        if fast_partition_bounds.is_empty() {
+          continue;
+        }
         Self::insert_scan_request(
           &mut scan_requests,
           self.config.topic.as_str(),

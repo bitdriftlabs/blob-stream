@@ -62,14 +62,18 @@ impl ConsumerBatch {
 // ConsumerReadOutcome
 //
 
-/// Internal reader outcome used to schedule a visibility-aware empty-result retry.
+/// Internal reader outcome used to schedule a metadata-maturity-aware empty-result retry.
 pub struct ConsumerReadOutcome {
   /// Batches ready for the prefetch worker to admit to delivery.
   pub batches: Vec<ConsumerBatch>,
-  /// Earliest instant at which a deferred metadata row can be safely retried.
+  /// Earliest instant at which deferred metadata can be safely retried.
   ///
-  /// This is present only when the pass has no ready batches and was not stopped by capacity.
-  pub next_visibility_eligible_at: Option<OffsetDateTime>,
+  /// This covers eventual-consistency visibility delays and Fast cross-window sequence holds.
+  ///
+  /// This is present only when the pass has no ready batches. It is normally absent after capacity
+  /// exhaustion, except when every assigned partition is held by a Fast sequence gap and the
+  /// prompt gap probe is the only eligible follow-up work.
+  pub next_metadata_eligible_at: Option<OffsetDateTime>,
 }
 
 //

@@ -24,10 +24,7 @@ pub(in crate::consumer) struct ConsumerReaderMetrics {
   broker_metadata_offload_requests: IntCounter,
   broker_metadata_offload_deliveries: IntCounter,
   broker_metadata_offload_fallbacks: IntCounter,
-  recovery_metadata_cache_hits: IntCounter,
-  recovery_metadata_cache_misses: IntCounter,
-  recovery_metadata_cache_inserts: IntCounter,
-  recovery_metadata_cache_invalidations: IntCounter,
+  mature_metadata_cache_reuses: IntCounter,
   recovery_metadata_cache_entries: ContributionGauge,
   recovery_metadata_cache_retained_bytes: ContributionGauge,
   pub(in crate::consumer) metadata_fast_scan_without_lower_bound: IntCounter,
@@ -69,10 +66,7 @@ impl ConsumerReaderMetrics {
       broker_metadata_offload_requests: scope.counter("broker_metadata_offload_requests"),
       broker_metadata_offload_deliveries: scope.counter("broker_metadata_offload_deliveries"),
       broker_metadata_offload_fallbacks: scope.counter("broker_metadata_offload_fallbacks"),
-      recovery_metadata_cache_hits: scope.counter("recovery_metadata_cache_hits"),
-      recovery_metadata_cache_misses: scope.counter("recovery_metadata_cache_misses"),
-      recovery_metadata_cache_inserts: scope.counter("recovery_metadata_cache_inserts"),
-      recovery_metadata_cache_invalidations: scope.counter("recovery_metadata_cache_invalidations"),
+      mature_metadata_cache_reuses: scope.counter("mature_metadata_cache_reuses"),
       recovery_metadata_cache_entries: ContributionGauge::new(
         scope.gauge("recovery_metadata_cache_entries"),
       ),
@@ -129,8 +123,8 @@ impl ConsumerReaderMetrics {
       .observe(started_at.elapsed().as_secs_f64());
   }
 
-  pub(in crate::consumer) fn record_recovery_metadata_cache_hit(&self) {
-    self.recovery_metadata_cache_hits.inc();
+  pub(in crate::consumer) fn record_mature_metadata_cache_reuse(&self) {
+    self.mature_metadata_cache_reuses.inc();
   }
 
   /// Record an RPC sent to the broker metadata cache.
@@ -146,20 +140,6 @@ impl ConsumerReaderMetrics {
   /// Record a scan that retried the original direct query after an attempted broker read.
   pub(in crate::consumer) fn record_broker_metadata_offload_fallback(&self) {
     self.broker_metadata_offload_fallbacks.inc();
-  }
-
-  pub(in crate::consumer) fn record_recovery_metadata_cache_miss(&self) {
-    self.recovery_metadata_cache_misses.inc();
-  }
-
-  pub(in crate::consumer) fn record_recovery_metadata_cache_insert(&self) {
-    self.recovery_metadata_cache_inserts.inc();
-  }
-
-  pub(in crate::consumer) fn record_recovery_metadata_cache_invalidation(&self, count: usize) {
-    self
-      .recovery_metadata_cache_invalidations
-      .inc_by(u64::try_from(count).unwrap_or(u64::MAX));
   }
 
   pub(in crate::consumer) fn record_recovery_metadata_cache_entries(&self, count: usize) {
