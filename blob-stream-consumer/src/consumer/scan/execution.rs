@@ -992,6 +992,9 @@ impl ConsumerReaderImpl {
     let mut blocked_fast_sources = HashSet::new();
     // A deferred recovery window must hold back later windows for the same partition. Otherwise a
     // later sequence could advance the cursor and make the deferred batch permanently ineligible.
+    // TODO: Concurrent Recovery window queries can still miss an unobserved predecessor while a
+    // later window sees its successor. Serialize publication-open Recovery windows or add a
+    // Fast-style sequence barrier if this rare cross-window race needs to be eliminated.
     let mut blocked_recovering_partitions = HashSet::new();
     let mut capacity_deferred_fresh_window_starts = HashSet::new();
     // Recovery can hand an active publication-horizon window to Fast. A handoff is safe only when

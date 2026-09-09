@@ -70,7 +70,9 @@ pub struct ConsumerReadOutcome {
   ///
   /// This covers eventual-consistency visibility delays and Fast cross-window sequence holds.
   ///
-  /// This is present only when the pass has no ready batches and was not stopped by capacity.
+  /// This is present only when the pass has no ready batches. It is normally absent after capacity
+  /// exhaustion, except when every assigned partition is held by a Fast sequence gap and the
+  /// prompt gap probe is the only eligible follow-up work.
   pub next_metadata_eligible_at: Option<OffsetDateTime>,
 }
 
