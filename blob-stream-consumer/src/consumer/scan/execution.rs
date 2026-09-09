@@ -1,3 +1,4 @@
+use super::planning::FAST_GAP_PROBE_INTERVAL;
 use super::{
   Arc,
   BatchReadCandidate,
@@ -528,7 +529,7 @@ impl ConsumerReaderImpl {
         }
         continue;
       }
-      if let Some(retry_at) = self.fast_gap_retry_at(
+      if let Some(maturity_at) = self.fast_gap_maturity_at(
         candidate.virtual_partition_id,
         candidate.window_start_unix_seconds,
         current_cursor,
@@ -536,13 +537,20 @@ impl ConsumerReaderImpl {
         now,
         runtime_settings,
       ) {
+        let retry_at = now.saturating_add(FAST_GAP_PROBE_INTERVAL).min(maturity_at);
         // Discard this decoded result intentionally: accepting it would make a late predecessor
         // permanently ineligible. The targeted Fast retry re-reads the retained tail at `retry_at`.
         if let Some(state) = self
           .virtual_partition_states
           .get_mut(&candidate.virtual_partition_id)
         {
-          state.set_fast_gap_retry_at(retry_at);
+          state.set_fast_gap_hold(
+            retry_at,
+            maturity_at,
+            current_cursor
+              .expect("Fast gap requires an existing cursor")
+              .saturating_add(1),
+          );
         }
         held_fast_sources.insert((
           candidate.virtual_partition_id,
@@ -674,7 +682,7 @@ impl ConsumerReaderImpl {
           next_state = Some(VirtualPartitionState::Fast {
             cursor: *cursor,
             coverage_floor: Some(fast_coverage_floor),
-            gap_retry_at: None,
+            gap: None,
             last_scan: None,
           });
         },
@@ -722,7 +730,7 @@ impl ConsumerReaderImpl {
             next_state = Some(VirtualPartitionState::Fast {
               cursor: *cursor,
               coverage_floor: Some(coverage_floor),
-              gap_retry_at: None,
+              gap: None,
               last_scan: None,
             });
           }
@@ -1351,7 +1359,7 @@ impl ConsumerReaderImpl {
 
     let BatchAcceptance {
       batches: mut output,
-      next_metadata_eligible_at: fast_gap_retry_at,
+      next_metadata_eligible_at: fast_gap_next_probe_at,
       held_fast_sources,
     } = self.accept_batch_read_results(
       batch_read_results,
@@ -1371,25 +1379,29 @@ impl ConsumerReaderImpl {
         next_fast_frontiers.remove(frontier_key);
       }
     }
-    if let Some(fast_gap_retry_at) = fast_gap_retry_at {
+    if let Some(fast_gap_next_probe_at) = fast_gap_next_probe_at {
       next_metadata_eligible_at = Some(
-        next_metadata_eligible_at
-          .map_or(fast_gap_retry_at, |current| current.min(fast_gap_retry_at)),
+        next_metadata_eligible_at.map_or(fast_gap_next_probe_at, |current| {
+          current.min(fast_gap_next_probe_at)
+        }),
       );
     }
-    // A prior pass can emit a contiguous prefix before it finds the held range. Preserve that
-    // partition's stored deadline on the following empty pass so prefetch sleeps until maturity
-    // instead of polling while planning intentionally excludes the held partition.
-    if let Some(pending_fast_gap_retry_at) = self
+    for state in self.virtual_partition_states.values_mut() {
+      state.reschedule_fast_gap_probe_if_due(now, FAST_GAP_PROBE_INTERVAL);
+    }
+    // A prior pass can emit a contiguous prefix before it finds the held range. Preserve its
+    // stored deadline on a following empty pass; a due probe that returns no rows reschedules
+    // itself above until it observes the missing sequence or reaches the maturity boundary.
+    if let Some(pending_fast_gap_next_probe_at) = self
       .virtual_partition_states
       .values()
-      .filter_map(VirtualPartitionState::fast_gap_retry_at)
-      .filter(|retry_at| *retry_at > now)
+      .filter_map(VirtualPartitionState::fast_gap_next_probe_at)
+      .filter(|next_probe_at| *next_probe_at > now)
       .min()
     {
       next_metadata_eligible_at = Some(
-        next_metadata_eligible_at.map_or(pending_fast_gap_retry_at, |current| {
-          current.min(pending_fast_gap_retry_at)
+        next_metadata_eligible_at.map_or(pending_fast_gap_next_probe_at, |current| {
+          current.min(pending_fast_gap_next_probe_at)
         }),
       );
     }
@@ -1422,11 +1434,10 @@ impl ConsumerReaderImpl {
           // A held gap can suppress all requests until the next probe. Those empty passes must
           // keep the older coverage floor, or the later query would start after the sequence that
           // caused the hold.
-          && self
+          && !self
             .virtual_partition_states
             .get(&partition_id)
-            .and_then(VirtualPartitionState::fast_gap_retry_at)
-            .is_none()
+            .is_some_and(VirtualPartitionState::fast_gap_hold_is_pending)
           && let Some(state) = self.virtual_partition_states.get_mut(&partition_id)
         {
           state.set_fast_coverage_floor(fast_scan_start_floor);
@@ -1444,14 +1455,16 @@ impl ConsumerReaderImpl {
     );
 
     // A metadata maturity deadline is useful only when it is the sole reason this successful pass
-    // has no work. Ready output must keep the refill loop hot, and a capacity stop means unscanned
-    // metadata could be ready now, so either case falls back to normal worker behavior.
+    // has no work. Ready output must keep the refill loop hot. Capacity otherwise means unscanned
+    // metadata could be ready now, except when it was consumed by a candidate now held for a gap.
     Ok(ConsumerReadOutcome {
       next_metadata_eligible_at: output
         .is_empty()
         .then_some(next_metadata_eligible_at)
         .flatten()
-        .filter(|deadline| !capacity_exhausted && *deadline > now),
+        .filter(|deadline| {
+          (!capacity_exhausted || !held_fast_sources.is_empty()) && *deadline > now
+        }),
       batches: output,
     })
   }

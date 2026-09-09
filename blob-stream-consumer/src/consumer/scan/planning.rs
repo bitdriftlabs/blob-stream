@@ -26,7 +26,7 @@ use crate::consumer::state::RecoveryState;
 // A cross-window sequence hold is exceptional and partition-scoped. Recheck soon enough to
 // recover the common "published just after the prior query" case without turning normal Fast
 // scans into high-frequency polling.
-const FAST_GAP_PROBE_INTERVAL: time::Duration = time::Duration::milliseconds(500);
+pub(super) const FAST_GAP_PROBE_INTERVAL: time::Duration = time::Duration::milliseconds(500);
 
 impl ConsumerReaderImpl {
   /// Return cache identities for every partition in an immutable metadata request.
@@ -207,7 +207,7 @@ impl ConsumerReaderImpl {
       return None;
     }
     if state
-      .fast_gap_retry_at()
+      .fast_gap_next_probe_at()
       .is_some_and(|retry_at| retry_at > now)
     {
       return None;
@@ -317,19 +317,19 @@ impl ConsumerReaderImpl {
     now.saturating_sub(self.availability_horizon(runtime_settings).duration())
   }
 
-  /// Return the next Fast gap probe while preserving the predecessor maturity deadline as a cap.
+  /// Return the maturity deadline for a Fast sequence hold, if the predecessor remains open.
   ///
   /// Metadata scans can complete in request order without observing a snapshot across window
   /// keys. A newer range that skips the cursor's next sequence may be missing a row published
-  /// immediately after the prior window's query. Most such rows arrive quickly, so retry after
-  /// `FAST_GAP_PROBE_INTERVAL` instead of waiting for the full availability horizon.
+  /// immediately after the prior window's query. The caller probes at `FAST_GAP_PROBE_INTERVAL`
+  /// rather than waiting for the full availability horizon.
   ///
   /// The full horizon remains the correctness boundary. If the candidate window starts at `W`
   /// and the horizon is `D`, `W + D` is when every earlier window is mature. For example, with
   /// `W = 12:00:00`, `D = 15s`, and a gap observed at `12:00:10`, probes run at `12:00:10.500`,
   /// `12:00:11.000`, and so on; the last possible probe deadline is `12:00:15`. At that point
   /// this function returns `None`, allowing a remaining discontinuity to be reported normally.
-  pub(in crate::consumer) fn fast_gap_retry_at(
+  pub(in crate::consumer) fn fast_gap_maturity_at(
     &self,
     partition_id: VirtualPartitionId,
     candidate_window_start_unix_seconds: i64,
@@ -357,11 +357,7 @@ impl ConsumerReaderImpl {
     }
     let maturity_deadline =
       candidate_window_start.saturating_add(self.availability_horizon(runtime_settings).duration());
-    Some(
-      now
-        .saturating_add(FAST_GAP_PROBE_INTERVAL)
-        .min(maturity_deadline),
-    )
+    Some(maturity_deadline)
   }
 
   /// Return the lowest possible segment ID for a timestamp, preserving safety for invalid input.
@@ -488,7 +484,7 @@ impl ConsumerReaderImpl {
     // A sequence hold is local to one Fast partition. Once its predecessor becomes mature, clear
     // it before planning so the normal retained-tail path performs the validating reread.
     for state in self.virtual_partition_states.values_mut() {
-      state.clear_fast_gap_retry_at_if_due(now);
+      state.clear_fast_gap_hold_if_mature(now);
     }
 
     self.start_fast_coverage_recoveries(now, runtime_settings)?;

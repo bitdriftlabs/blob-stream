@@ -30,6 +30,14 @@ pub struct RecoveryState {
 // VirtualPartitionState
 //
 
+/// Pending Fast sequence gap and the bounded retry state that protects it.
+#[derive(Clone, Copy, Debug)]
+pub struct FastGapState {
+  next_probe_at: OffsetDateTime,
+  maturity_at: OffsetDateTime,
+  expected_sequence: u64,
+}
+
 /// Lifecycle, read mode, cursor, and latest scan diagnostic for one virtual partition.
 #[derive(Clone, Debug)]
 pub enum VirtualPartitionState {
@@ -66,8 +74,8 @@ pub enum VirtualPartitionState {
     cursor: Option<u64>,
     /// Oldest Fast time floor whose metadata coverage must be retained after an incomplete pass.
     coverage_floor: Option<OffsetDateTime>,
-    /// Next probe after a newer range exposed a possible gap in an open prior Fast window.
-    gap_retry_at: Option<OffsetDateTime>,
+    /// Bounded retry state for a newer range held behind an open prior Fast window.
+    gap: Option<FastGapState>,
     last_scan: Option<Arc<ConsumerReaderPartitionScanState>>,
   },
 }
@@ -125,7 +133,9 @@ impl VirtualPartitionState {
 
   /// Advance monotonically after reads or durable cursor hydration; never rewind implicitly.
   pub(super) fn advance_cursor(&mut self, cursor: u64) {
-    self.set_cursor(self.cursor().map_or(cursor, |current| current.max(cursor)));
+    let next_cursor = self.cursor().map_or(cursor, |current| current.max(cursor));
+    self.set_cursor(next_cursor);
+    self.resolve_fast_gap_hold_through(next_cursor);
   }
 
   /// Activate pending state without altering the already chosen recovery or fast-path mode.
@@ -148,7 +158,7 @@ impl VirtualPartitionState {
       Self::PendingFast { cursor, last_scan } => Self::Fast {
         cursor: Some(cursor),
         coverage_floor: None,
-        gap_retry_at: None,
+        gap: None,
         last_scan,
       },
       state @ (Self::Fresh { .. } | Self::Recovering { .. } | Self::Fast { .. }) => state,
@@ -253,11 +263,12 @@ impl VirtualPartitionState {
     }
   }
 
-  /// Return the deadline for a targeted Fast sequence-safety retry, if one is pending.
-  pub(super) fn fast_gap_retry_at(&self) -> Option<OffsetDateTime> {
+  /// Return the next scheduled Fast sequence-safety probe, if one is pending.
+  pub(super) fn fast_gap_next_probe_at(&self) -> Option<OffsetDateTime> {
     match self {
-      Self::Fast { gap_retry_at, .. } => *gap_retry_at,
-      Self::PendingCursor { .. }
+      Self::Fast { gap: Some(gap), .. } => Some(gap.next_probe_at),
+      Self::Fast { gap: None, .. }
+      | Self::PendingCursor { .. }
       | Self::PendingRecovering { .. }
       | Self::PendingFast { .. }
       | Self::Fresh { .. }
@@ -265,19 +276,78 @@ impl VirtualPartitionState {
     }
   }
 
-  /// Retain the earliest scheduled probe for a newer Fast range held behind an open prior window.
-  pub(super) fn set_fast_gap_retry_at(&mut self, retry_at: OffsetDateTime) {
-    if let Self::Fast { gap_retry_at, .. } = self {
-      *gap_retry_at = Some(gap_retry_at.map_or(retry_at, |current| current.min(retry_at)));
+  /// Return whether a Fast sequence hold remains unresolved between scheduled probes.
+  pub(super) fn fast_gap_hold_is_pending(&self) -> bool {
+    matches!(self, Self::Fast { gap: Some(_), .. })
+  }
+
+  /// Retain a possible late-publication gap through its maturity boundary.
+  pub(super) fn set_fast_gap_hold(
+    &mut self,
+    retry_at: OffsetDateTime,
+    maturity_at: OffsetDateTime,
+    expected_sequence: u64,
+  ) {
+    if let Self::Fast { gap, .. } = self {
+      match gap {
+        Some(current) if current.maturity_at <= maturity_at => {
+          current.next_probe_at = retry_at.min(current.maturity_at);
+        },
+        Some(_) | None => {
+          *gap = Some(FastGapState {
+            next_probe_at: retry_at.min(maturity_at),
+            maturity_at,
+            expected_sequence,
+          });
+        },
+      }
     }
   }
 
-  /// Clear a Fast sequence-safety hold once its metadata window can be trusted as mature.
-  pub(super) fn clear_fast_gap_retry_at_if_due(&mut self, now: OffsetDateTime) {
-    if let Self::Fast { gap_retry_at, .. } = self
-      && gap_retry_at.is_some_and(|retry_at| retry_at <= now)
+  /// Clear a Fast hold after its missing sequence is observed or its predecessor becomes mature.
+  fn clear_fast_gap_hold(&mut self) {
+    if let Self::Fast { gap, .. } = self {
+      *gap = None;
+    }
+  }
+
+  /// Clear a Fast hold once its predecessor window can no longer receive a late publication.
+  pub(super) fn clear_fast_gap_hold_if_mature(&mut self, now: OffsetDateTime) {
+    if matches!(
+      self,
+      Self::Fast {
+        gap: Some(FastGapState { maturity_at, .. }),
+        ..
+      } if *maturity_at <= now
+    ) {
+      self.clear_fast_gap_hold();
+    }
+  }
+
+  /// Clear a Fast hold when a read has consumed the sequence it was waiting for.
+  pub(super) fn resolve_fast_gap_hold_through(&mut self, cursor: u64) {
+    if matches!(
+      self,
+      Self::Fast {
+        gap: Some(FastGapState { expected_sequence, .. }),
+        ..
+      } if *expected_sequence <= cursor
+    ) {
+      self.clear_fast_gap_hold();
+    }
+  }
+
+  /// Schedule a follow-up probe when a due Fast hold remains unresolved.
+  pub(super) fn reschedule_fast_gap_probe_if_due(
+    &mut self,
+    now: OffsetDateTime,
+    probe_interval: time::Duration,
+  ) {
+    if let Self::Fast { gap: Some(gap), .. } = self
+      && gap.next_probe_at <= now
+      && now < gap.maturity_at
     {
-      *gap_retry_at = None;
+      gap.next_probe_at = now.saturating_add(probe_interval).min(gap.maturity_at);
     }
   }
 

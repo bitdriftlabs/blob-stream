@@ -96,6 +96,17 @@ fn timestamp(unix_seconds: i64) -> OffsetDateTime {
   OffsetDateTime::from_unix_timestamp(unix_seconds).expect("test timestamp is in range")
 }
 
+fn fast_gap_next_probe_at(
+  maturity_at: Option<OffsetDateTime>,
+  now: OffsetDateTime,
+) -> Option<OffsetDateTime> {
+  maturity_at.map(|maturity_at| {
+    now
+      .saturating_add(TimeDuration::milliseconds(500))
+      .min(maturity_at)
+  })
+}
+
 impl ConsumerReaderImpl {
   async fn read_available(&mut self, now_unix_seconds: i64) -> Result<Vec<super::ConsumerBatch>> {
     BoundedConsumerReader::read_available(
@@ -135,7 +146,7 @@ fn fast_coverage_floor_seeds_only_an_uninitialized_fast_partition() {
   let mut state = VirtualPartitionState::Fast {
     cursor: Some(1),
     coverage_floor: None,
-    gap_retry_at: None,
+    gap: None,
     last_scan: None,
   };
 
@@ -2209,7 +2220,7 @@ fn fast_coverage_recovery_clamps_a_stale_floor_to_retention() {
     VirtualPartitionState::Fast {
       cursor: Some(4),
       coverage_floor: Some(timestamp(1_000)),
-      gap_retry_at: None,
+      gap: None,
       last_scan: None,
     },
   );
@@ -2255,7 +2266,7 @@ fn fast_coverage_tail_stays_on_the_fast_path_at_window_rollover() {
     VirtualPartitionState::Fast {
       cursor: Some(4),
       coverage_floor: Some(timestamp(1_199)),
-      gap_retry_at: None,
+      gap: None,
       last_scan: None,
     },
   );
@@ -2310,7 +2321,7 @@ fn fast_coverage_tail_clamps_a_stale_floor_to_the_retained_window() {
     VirtualPartitionState::Fast {
       cursor: Some(4),
       coverage_floor: Some(timestamp(600)),
-      gap_retry_at: None,
+      gap: None,
       last_scan: None,
     },
   );
@@ -2366,7 +2377,7 @@ async fn fast_scan_bound_diagnostics_exclude_partitions_outside_a_targeted_tail(
     VirtualPartitionState::Fast {
       cursor: Some(4),
       coverage_floor: Some(timestamp(1_199)),
-      gap_retry_at: None,
+      gap: None,
       last_scan: None,
     },
   );
@@ -2456,7 +2467,7 @@ async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
       VirtualPartitionState::Fast {
         cursor: Some(0),
         coverage_floor: Some(timestamp(1_199)),
-        gap_retry_at: None,
+        gap: None,
         last_scan: None,
       },
     );
@@ -2573,7 +2584,7 @@ async fn fast_gap_probe_preserves_late_predecessor_and_all_later_window_frontier
     VirtualPartitionState::Fast {
       cursor: Some(1),
       coverage_floor: Some(timestamp(1_194)),
-      gap_retry_at: None,
+      gap: None,
       last_scan: None,
     },
   );
@@ -2622,7 +2633,7 @@ async fn fast_gap_probe_preserves_late_predecessor_and_all_later_window_frontier
     reader
       .virtual_partition_states
       .get(&7)
-      .and_then(VirtualPartitionState::fast_gap_retry_at),
+      .and_then(VirtualPartitionState::fast_gap_next_probe_at),
     Some(timestamp(1_510).saturating_add(TimeDuration::milliseconds(500)))
   );
   assert_eq!(
@@ -2686,6 +2697,155 @@ async fn fast_gap_probe_preserves_late_predecessor_and_all_later_window_frontier
     ]
   );
   assert_eq!(reader.cursor(7), Some(6));
+  assert!(
+    !reader
+      .virtual_partition_states
+      .get(&7)
+      .is_some_and(VirtualPartitionState::fast_gap_hold_is_pending),
+    "consuming the held predecessor must clear its Fast gap hold"
+  );
+}
+
+#[tokio::test]
+async fn fast_gap_hold_reschedules_after_an_empty_intermediate_probe() {
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  let first_probe_at = timestamp(1_210).saturating_add(TimeDuration::milliseconds(500));
+  let mut state = VirtualPartitionState::Fast {
+    cursor: Some(1),
+    coverage_floor: Some(timestamp(1_194)),
+    gap: None,
+    last_scan: None,
+  };
+  state.set_fast_gap_hold(first_probe_at, timestamp(1_215), 2);
+  reader.virtual_partition_states.insert(7, state);
+
+  let after_empty_probe = reader
+    .read_available_with_capacity_and_settings(
+      first_probe_at,
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert!(after_empty_probe.batches.is_empty());
+  assert_eq!(
+    after_empty_probe.next_metadata_eligible_at,
+    Some(timestamp(1_211)),
+    "an empty intermediate probe must retain the next prompt retry"
+  );
+  assert_eq!(
+    reader
+      .virtual_partition_states
+      .get(&7)
+      .and_then(VirtualPartitionState::fast_gap_next_probe_at),
+    Some(timestamp(1_211))
+  );
+  assert!(
+    reader
+      .virtual_partition_states
+      .get(&7)
+      .is_some_and(VirtualPartitionState::fast_gap_hold_is_pending)
+  );
+  assert_eq!(
+    reader
+      .virtual_partition_states
+      .get(&7)
+      .and_then(VirtualPartitionState::fast_coverage_floor),
+    Some(timestamp(1_194)),
+    "an empty intermediate probe must not advance the retained coverage floor"
+  );
+}
+
+#[tokio::test]
+async fn fast_gap_retry_survives_capacity_exhaustion_by_a_held_candidate() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  for (snowflake_timestamp, sequence) in [(1_205, 3), (1_206, 4)] {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      1_200,
+      SnowflakeId::minimum_for_timestamp(timestamp(snowflake_timestamp)).as_u64(),
+      7,
+      SeqRange {
+        start: sequence,
+        end: sequence,
+      },
+      vec![new_record(
+        vec![u8::try_from(sequence).unwrap()],
+        snowflake_timestamp * 1_000,
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  reader.virtual_partition_states.insert(
+    7,
+    VirtualPartitionState::Fast {
+      cursor: Some(1),
+      coverage_floor: Some(timestamp(1_194)),
+      gap: None,
+      last_scan: None,
+    },
+  );
+
+  let outcome = reader
+    .read_available_with_capacity_and_settings(
+      timestamp(1_210),
+      ReadCapacity::with_oversized_batch(0, true),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert!(outcome.batches.is_empty());
+  assert_eq!(
+    outcome.next_metadata_eligible_at,
+    Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500))),
+    "a held candidate must retain its prompt retry even when it exhausted capacity"
+  );
 }
 
 #[test]
@@ -2716,30 +2876,39 @@ fn fast_gap_probes_every_half_second_without_exceeding_maturity_deadline() {
     VirtualPartitionState::Fast {
       cursor: Some(1),
       coverage_floor: Some(timestamp(1_195)),
-      gap_retry_at: None,
+      gap: None,
       last_scan: None,
     },
   );
 
   let runtime_settings = reader.runtime_settings();
   assert_eq!(
-    reader.fast_gap_retry_at(7, 1_200, Some(1), 3, timestamp(1_210), runtime_settings),
+    fast_gap_next_probe_at(
+      reader.fast_gap_maturity_at(7, 1_200, Some(1), 3, timestamp(1_210), runtime_settings),
+      timestamp(1_210),
+    ),
     Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500)))
   );
   assert_eq!(
-    reader.fast_gap_retry_at(
-      7,
-      1_200,
-      Some(1),
-      3,
+    fast_gap_next_probe_at(
+      reader.fast_gap_maturity_at(
+        7,
+        1_200,
+        Some(1),
+        3,
+        timestamp(1_214).saturating_add(TimeDuration::milliseconds(750)),
+        runtime_settings,
+      ),
       timestamp(1_214).saturating_add(TimeDuration::milliseconds(750)),
-      runtime_settings,
     ),
     Some(timestamp(1_215)),
     "the final short probe must stop at the original predecessor maturity deadline"
   );
   assert_eq!(
-    reader.fast_gap_retry_at(7, 1_200, Some(1), 3, timestamp(1_215), runtime_settings),
+    fast_gap_next_probe_at(
+      reader.fast_gap_maturity_at(7, 1_200, Some(1), 3, timestamp(1_215), runtime_settings),
+      timestamp(1_215),
+    ),
     None,
     "a remaining mature discontinuity is a genuine delivery gap, not a Fast hold"
   );
@@ -2796,7 +2965,7 @@ async fn fast_gap_guard_does_not_hold_contiguous_cross_window_batches() {
     VirtualPartitionState::Fast {
       cursor: Some(1),
       coverage_floor: Some(timestamp(1_195)),
-      gap_retry_at: None,
+      gap: None,
       last_scan: None,
     },
   );
@@ -2864,7 +3033,7 @@ async fn fast_gap_guard_releases_a_genuine_gap_after_predecessor_matures() {
     VirtualPartitionState::Fast {
       cursor: Some(1),
       coverage_floor: Some(timestamp(1_195)),
-      gap_retry_at: None,
+      gap: None,
       last_scan: None,
     },
   );
@@ -5840,7 +6009,7 @@ async fn direct_fast_scan_reapplies_each_partition_effective_lower_bound() {
     VirtualPartitionState::Fast {
       cursor: None,
       coverage_floor: Some(timestamp(window_start)),
-      gap_retry_at: None,
+      gap: None,
       last_scan: None,
     },
   );
@@ -5849,7 +6018,7 @@ async fn direct_fast_scan_reapplies_each_partition_effective_lower_bound() {
     VirtualPartitionState::Fast {
       cursor: None,
       coverage_floor: None,
-      gap_retry_at: None,
+      gap: None,
       last_scan: None,
     },
   );

@@ -88,7 +88,7 @@ impl ConsumerReaderImpl {
         VirtualPartitionState::Fast {
           cursor,
           coverage_floor: None,
-          gap_retry_at: None,
+          gap: None,
           last_scan: None,
         },
       );
