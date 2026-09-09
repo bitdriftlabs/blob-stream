@@ -107,6 +107,19 @@ impl VirtualPartitionState {
 
   /// Replace the cursor exactly for an explicit caller-directed seek.
   pub(super) fn set_cursor(&mut self, cursor: u64) {
+    self.store_cursor(cursor);
+    self.clear_fast_gap_hold();
+  }
+
+  /// Advance monotonically after reads or durable cursor hydration; never rewind implicitly.
+  pub(super) fn advance_cursor(&mut self, cursor: u64) {
+    let next_cursor = self.cursor().map_or(cursor, |current| current.max(cursor));
+    self.store_cursor(next_cursor);
+    self.resolve_fast_gap_hold_through(next_cursor);
+  }
+
+  /// Store a cursor value in the representation required by the partition lifecycle.
+  fn store_cursor(&mut self, cursor: u64) {
     match self {
       Self::PendingCursor {
         cursor: current_cursor,
@@ -133,13 +146,6 @@ impl VirtualPartitionState {
         ..
       } => *current_cursor = Some(cursor),
     }
-  }
-
-  /// Advance monotonically after reads or durable cursor hydration; never rewind implicitly.
-  pub(super) fn advance_cursor(&mut self, cursor: u64) {
-    let next_cursor = self.cursor().map_or(cursor, |current| current.max(cursor));
-    self.set_cursor(next_cursor);
-    self.resolve_fast_gap_hold_through(next_cursor);
   }
 
   /// Activate pending state without altering the already chosen recovery or fast-path mode.

@@ -2501,6 +2501,131 @@ async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
 }
 
 #[tokio::test]
+async fn merged_fast_coverage_tail_partial_cache_hit_requeries_and_refreshes_entries() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
+  let tail_floor = SnowflakeId::minimum_for_timestamp(timestamp(1_199));
+  for (partition_id, snowflake_id, sequence) in [
+    (7, tail_floor.as_u64(), 1),
+    (8, tail_floor.as_u64().saturating_add(1 << 25), 1),
+    (8, tail_floor.as_u64().saturating_add(2 << 25), 2),
+  ] {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store_dyn.as_ref(),
+      "telemetry",
+      900,
+      snowflake_id,
+      partition_id,
+      SeqRange {
+        start: sequence,
+        end: sequence,
+      },
+      vec![new_record(
+        vec![u8::try_from(partition_id).unwrap()],
+        900_000,
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    blob_store,
+    metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  for partition_id in [7, 8] {
+    reader.virtual_partition_states.insert(
+      partition_id,
+      VirtualPartitionState::Fast {
+        cursor: Some(0),
+        coverage_floor: Some(timestamp(1_199)),
+        gap: None,
+        last_scan: None,
+      },
+    );
+  }
+
+  let first = reader
+    .read_available_with_capacity_and_settings(
+      timestamp(1_215),
+      ReadCapacity::new(1),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(first.batches[0].virtual_partition_id, 7);
+  assert!(
+    reader
+      .recovery_metadata_cache
+      .remove(&(8, 900, None))
+      .is_some()
+  );
+
+  let second = reader
+    .read_available_with_capacity_and_settings(
+      timestamp(1_215),
+      ReadCapacity::new(1),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(second.batches[0].virtual_partition_id, 8);
+  assert_eq!(second.batches[0].seq_range, SeqRange { start: 1, end: 1 });
+  assert!(reader.recovery_metadata_cache.contains_key(&(7, 900, None)));
+  assert!(reader.recovery_metadata_cache.contains_key(&(8, 900, None)));
+  assert_eq!(
+    metadata_store
+      .scans
+      .lock()
+      .iter()
+      .filter(|(window_start, _)| *window_start == 900)
+      .count(),
+    2,
+    "a partial merged-tail cache hit must fall back to a complete direct scan"
+  );
+
+  let third = reader
+    .read_available_with_capacity_and_settings(
+      timestamp(1_215),
+      ReadCapacity::new(1),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(third.batches[0].virtual_partition_id, 8);
+  assert_eq!(third.batches[0].seq_range, SeqRange { start: 2, end: 2 });
+  assert_eq!(
+    metadata_store
+      .scans
+      .lock()
+      .iter()
+      .filter(|(window_start, _)| *window_start == 900)
+      .count(),
+    2,
+    "the complete fallback result must restore later merged-tail cache reuse"
+  );
+}
+
+#[tokio::test]
 async fn fast_gap_probe_preserves_late_predecessor_and_all_later_window_frontiers() {
   let old_window_start = 900;
   let held_window_start = 1_200;
@@ -2848,6 +2973,87 @@ async fn fast_gap_retry_survives_capacity_exhaustion_by_a_held_candidate() {
   );
 }
 
+#[tokio::test]
+async fn fast_gap_retry_does_not_delay_capacity_deferred_work_for_another_partition() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let first_snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(1_205)).as_u64();
+  for (partition_id, snowflake_id, sequence) in [
+    (7, first_snowflake_id, 3),
+    (8, first_snowflake_id.saturating_add(1 << 25), 1),
+  ] {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      1_200,
+      snowflake_id,
+      partition_id,
+      SeqRange {
+        start: sequence,
+        end: sequence,
+      },
+      vec![new_record(vec![u8::try_from(sequence).unwrap()], 1_205_000)],
+      Compression::none(),
+    )
+    .await;
+  }
+
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      strongly_consistent_metadata_reads: Some(true),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    blob_store,
+    metadata_store,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  for (partition_id, cursor) in [(7, 1), (8, 0)] {
+    reader.virtual_partition_states.insert(
+      partition_id,
+      VirtualPartitionState::Fast {
+        cursor: Some(cursor),
+        coverage_floor: Some(timestamp(1_194)),
+        gap: None,
+        last_scan: None,
+      },
+    );
+  }
+
+  let outcome = reader
+    .read_available_with_capacity_and_settings(
+      timestamp(1_210),
+      ReadCapacity::with_oversized_batch(0, true),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert!(outcome.batches.is_empty());
+  assert_eq!(
+    outcome.next_metadata_eligible_at, None,
+    "a Fast gap deadline must not delay another partition deferred by capacity"
+  );
+  assert!(
+    reader
+      .virtual_partition_states
+      .get(&7)
+      .is_some_and(VirtualPartitionState::fast_gap_hold_is_pending),
+    "the held partition must retain its gap safety state while capacity work takes priority"
+  );
+}
+
 #[test]
 fn fast_gap_probes_every_half_second_without_exceeding_maturity_deadline() {
   let mut reader = ConsumerReaderImpl::new(
@@ -2993,10 +3199,11 @@ async fn fast_gap_guard_does_not_hold_contiguous_cross_window_batches() {
 #[tokio::test]
 async fn fast_gap_guard_releases_a_genuine_gap_after_predecessor_matures() {
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
-  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
   write_segment(
     blob_store.as_ref(),
-    metadata_store.as_ref(),
+    metadata_store_dyn.as_ref(),
     "telemetry",
     1_200,
     SnowflakeId::minimum_for_timestamp(timestamp(1_205)).as_u64(),
@@ -3017,7 +3224,7 @@ async fn fast_gap_guard_releases_a_genuine_gap_after_predecessor_matures() {
     vec![7],
     HashMap::new(),
     blob_store,
-    metadata_store,
+    metadata_store_dyn,
     rejecting_broker_metadata_query(),
     rejecting_broker_blob_range_query(),
     &metrics_scope(),
@@ -3038,9 +3245,29 @@ async fn fast_gap_guard_releases_a_genuine_gap_after_predecessor_matures() {
     },
   );
 
+  let held = reader
+    .read_available_with_capacity_and_settings(
+      timestamp(1_210),
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert!(held.batches.is_empty());
+  assert_eq!(
+    held.next_metadata_eligible_at,
+    Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500)))
+  );
+  assert!(
+    reader
+      .virtual_partition_states
+      .get(&7)
+      .is_some_and(VirtualPartitionState::fast_gap_hold_is_pending)
+  );
+
   let outcome = reader
     .read_available_with_capacity_and_settings(
-      timestamp(1_220),
+      timestamp(1_215),
       ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
       reader.runtime_settings(),
     )
@@ -3056,6 +3283,22 @@ async fn fast_gap_guard_releases_a_genuine_gap_after_predecessor_matures() {
   );
   assert_eq!(outcome.next_metadata_eligible_at, None);
   assert_eq!(reader.cursor(7), Some(3));
+  assert!(
+    reader
+      .virtual_partition_states
+      .get(&7)
+      .is_some_and(|state| !state.fast_gap_hold_is_pending())
+  );
+  assert_eq!(
+    metadata_store
+      .scans
+      .lock()
+      .iter()
+      .filter(|(window_start, _)| *window_start == 1_200)
+      .count(),
+    2,
+    "the matured pass must reread the held rollover window before admitting its discontinuity"
+  );
 }
 
 #[tokio::test]
@@ -6348,7 +6591,19 @@ async fn seek_resets_partition_fast_frontier() {
   assert_eq!(reader.read_available(901).await.unwrap().len(), 2);
   recording_metadata_store.scans.lock().clear();
 
+  reader
+    .virtual_partition_states
+    .get_mut(&7)
+    .expect("assigned partition has Fast state")
+    .set_fast_gap_hold(timestamp(902), timestamp(915), 1);
   reader.set_cursor(7, 0);
+  assert!(
+    !reader
+      .virtual_partition_states
+      .get(&7)
+      .is_some_and(VirtualPartitionState::fast_gap_hold_is_pending),
+    "an explicit cursor reset must clear a stale Fast gap hold"
+  );
   let rewound = reader.read_available(902).await.unwrap();
 
   assert_eq!(rewound.len(), 2);

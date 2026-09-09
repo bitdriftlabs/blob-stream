@@ -1456,14 +1456,21 @@ impl ConsumerReaderImpl {
 
     // A metadata maturity deadline is useful only when it is the sole reason this successful pass
     // has no work. Ready output must keep the refill loop hot. Capacity otherwise means unscanned
-    // metadata could be ready now, except when it was consumed by a candidate now held for a gap.
+    // metadata could be ready now. A gap deadline remains useful only when every assigned
+    // partition is already held; otherwise sleeping until that deadline delays another
+    // partition's capacity-deferred work.
+    let all_assigned_partitions_held = assigned_partition_ids.iter().all(|partition_id| {
+      held_fast_sources
+        .iter()
+        .any(|(held_partition_id, _)| held_partition_id == partition_id)
+    });
     Ok(ConsumerReadOutcome {
       next_metadata_eligible_at: output
         .is_empty()
         .then_some(next_metadata_eligible_at)
         .flatten()
         .filter(|deadline| {
-          (!capacity_exhausted || !held_fast_sources.is_empty()) && *deadline > now
+          (!capacity_exhausted || all_assigned_partitions_held) && *deadline > now
         }),
       batches: output,
     })
