@@ -149,8 +149,8 @@ impl ProduceOutcomeMetrics {
       WriteError::NotLeaseHolder { .. } | WriteError::LeaseFenceLost => {
         self.not_lease_holder_total.inc();
       },
-      WriteError::InvalidRequest(_) => {},
-      WriteError::InvalidPartition { .. } | WriteError::Overloaded(_) | WriteError::Internal(_) => {
+      WriteError::InvalidPartition { .. } | WriteError::InvalidRequest(_) => {},
+      WriteError::Overloaded(_) | WriteError::Internal(_) => {
         self.overloaded_total.inc();
       },
     }

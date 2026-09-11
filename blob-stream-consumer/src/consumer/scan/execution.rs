@@ -1068,7 +1068,7 @@ impl ConsumerReaderImpl {
             .get_mut(&partition_id)
             .expect("assigned partition has scan diagnostic state");
           scan_state.metadata_segments_seen = scan_state.metadata_segments_seen.saturating_add(1);
-          let Some(partition_batches) = segment.segment_index.get(&partition_id) else {
+          let Some(partition_batch) = segment.segment_index.get(&partition_id) else {
             trace!(
               "consumer metadata segment has no partition batches: topic={}, partition={}, \
                window_start={}, snowflake_id={}",
@@ -1096,10 +1096,7 @@ impl ConsumerReaderImpl {
               snowflake_id: segment.snowflake_id.as_u64(),
               blob_key: segment.blob_key.as_str().to_string(),
               metadata_published_at: segment.metadata_published_at,
-              batch_ranges: partition_batches
-                .iter()
-                .map(|batch| batch.seq_range.clone())
-                .collect(),
+              batch_ranges: vec![partition_batch.seq_range.clone()],
             });
           if fast_partition {
             // The shared DynamoDB lower bound is the least restrictive partition bound. Reapply
@@ -1232,78 +1229,62 @@ impl ConsumerReaderImpl {
             continue;
           }
 
-          metadata_batches_scanned =
-            metadata_batches_scanned.saturating_add(partition_batches.len());
-          scan_state.metadata_batches_seen = scan_state
-            .metadata_batches_seen
-            .saturating_add(partition_batches.len());
+          metadata_batches_scanned = metadata_batches_scanned.saturating_add(1);
+          scan_state.metadata_batches_seen = scan_state.metadata_batches_seen.saturating_add(1);
           let current_cursor = partition_state.and_then(VirtualPartitionState::cursor);
 
-          // Avoid sorting historical batches when this partition has already consumed all of
-          // them. Any late batch beyond the cursor still uses the normal sorted path below.
-          if current_cursor.is_some_and(|cursor| {
-            partition_batches
-              .iter()
-              .all(|batch| batch.seq_range.end <= cursor)
-          }) {
+          if current_cursor.is_some_and(|cursor| partition_batch.seq_range.end <= cursor) {
             metadata_batches_skipped_by_cursor =
-              metadata_batches_skipped_by_cursor.saturating_add(partition_batches.len());
+              metadata_batches_skipped_by_cursor.saturating_add(1);
             scan_state.metadata_batches_skipped_by_cursor = scan_state
               .metadata_batches_skipped_by_cursor
-              .saturating_add(partition_batches.len());
+              .saturating_add(1);
             continue;
           }
 
-          // Metadata scans are unordered and can arrive late. Sorting by seq_start keeps
-          // processing deterministic while cursor checks prevent replay.
-          let mut sorted_batches = partition_batches.iter().collect::<Vec<_>>();
-          sorted_batches.sort_by_key(|batch| batch.seq_range.start);
-
-          for batch_metadata in sorted_batches {
-            // Cursor semantics: seq_end <= cursor was already consumed and can be skipped.
-            let current_cursor = self
-              .virtual_partition_states
-              .get(&partition_id)
-              .and_then(VirtualPartitionState::cursor);
-            if current_cursor.is_some_and(|cursor| batch_metadata.seq_range.end <= cursor) {
-              trace!(
-                "consumer skipped batch by cursor: topic={}, partition={}, seq_end={}, cursor={}",
-                self.config.topic,
-                partition_id,
-                batch_metadata.seq_range.end,
-                current_cursor.unwrap_or(0)
-              );
-              metadata_batches_skipped_by_cursor =
-                metadata_batches_skipped_by_cursor.saturating_add(1);
-              scan_state.metadata_batches_skipped_by_cursor = scan_state
-                .metadata_batches_skipped_by_cursor
-                .saturating_add(1);
-              continue;
-            }
-
-            if !capacity.reserve(batch_metadata.payload_bytes) {
-              capacity_exhausted = true;
-              trace!(
-                "consumer deferred batch by prefetch capacity: topic={}, partition={}, \
-                 seq_start={}, seq_end={}, payload_bytes={}",
-                self.config.topic,
-                partition_id,
-                batch_metadata.seq_range.start,
-                batch_metadata.seq_range.end,
-                batch_metadata.payload_bytes
-              );
-              scan_state.metadata_batches_deferred_by_capacity = scan_state
-                .metadata_batches_deferred_by_capacity
-                .saturating_add(1);
-              break;
-            }
-
-            segment_read_candidates.push(BatchReadCandidate {
-              batch_metadata: batch_metadata.clone(),
-              virtual_partition_id: partition_id,
-              window_start_unix_seconds: window.window_start_unix_seconds,
-            });
+          // Cursor semantics: seq_end <= cursor was already consumed and can be skipped.
+          let current_cursor = self
+            .virtual_partition_states
+            .get(&partition_id)
+            .and_then(VirtualPartitionState::cursor);
+          if current_cursor.is_some_and(|cursor| partition_batch.seq_range.end <= cursor) {
+            trace!(
+              "consumer skipped batch by cursor: topic={}, partition={}, seq_end={}, cursor={}",
+              self.config.topic,
+              partition_id,
+              partition_batch.seq_range.end,
+              current_cursor.unwrap_or(0)
+            );
+            metadata_batches_skipped_by_cursor =
+              metadata_batches_skipped_by_cursor.saturating_add(1);
+            scan_state.metadata_batches_skipped_by_cursor = scan_state
+              .metadata_batches_skipped_by_cursor
+              .saturating_add(1);
+            continue;
           }
+
+          if !capacity.reserve(partition_batch.payload_bytes) {
+            capacity_exhausted = true;
+            trace!(
+              "consumer deferred batch by prefetch capacity: topic={}, partition={}, \
+               seq_start={}, seq_end={}, payload_bytes={}",
+              self.config.topic,
+              partition_id,
+              partition_batch.seq_range.start,
+              partition_batch.seq_range.end,
+              partition_batch.payload_bytes
+            );
+            scan_state.metadata_batches_deferred_by_capacity = scan_state
+              .metadata_batches_deferred_by_capacity
+              .saturating_add(1);
+            break;
+          }
+
+          segment_read_candidates.push(BatchReadCandidate {
+            batch_metadata: partition_batch.clone(),
+            virtual_partition_id: partition_id,
+            window_start_unix_seconds: window.window_start_unix_seconds,
+          });
 
           if capacity_exhausted {
             break;

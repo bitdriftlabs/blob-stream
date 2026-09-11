@@ -477,7 +477,7 @@ async fn object_build_balances_uneven_partitions_preserving_source_order() -> Re
           .iter()
           .map(|(virtual_partition_id, partition)| {
             (
-              partition.metadata[0].byte_range.start,
+              partition.metadata.byte_range.start,
               topic.envelope.window.topic.clone(),
               *virtual_partition_id,
             )

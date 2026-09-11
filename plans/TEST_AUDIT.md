@@ -396,9 +396,12 @@ substitute for deterministic synchronization.
 
 ## Verification Standard For Each Checked Item
 
-- The focused `cargo nextest run -p blob-stream-integration-tests <test-name>` passes.
-- `cargo clippy -p blob-stream-integration-tests --bins --examples --tests -- --no-deps`
-  passes for test-only changes; include touched runtime crates when framework/runtime code changes.
-- `cargo +nightly fmt -- --check` passes.
-- The full `cargo nextest run -p blob-stream-integration-tests` suite passes before marking
-  the audit item complete.
+- Use the workflow for the checkout described in [DEVELOPMENT.md](../DEVELOPMENT.md).
+- In a standalone clone, run the focused `cargo nextest run -p blob-stream-integration-tests`
+  expression, the affected Cargo Clippy check, and `cargo +nightly fmt -- --check`.
+- In the monorepo, run the focused generated Bazel Nextest target with
+  `--nocache_test_results`, the corresponding `--config=clippy` target, and the root
+  `just rustfmt -- --check` workflow. See [AGENTS.md](../AGENTS.md) for required target and
+  deterministic-test arguments.
+- Run the full integration-test suite appropriate to the checkout before marking a broad audit
+  item complete.

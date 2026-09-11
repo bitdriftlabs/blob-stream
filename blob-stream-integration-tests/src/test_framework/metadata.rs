@@ -666,7 +666,7 @@ pub async fn write_recovery_segment(
         Compression::none(),
         HashMap::from([(
           virtual_partition_id,
-          vec![BatchMetadata {
+          BatchMetadata {
             seq_range: SeqRange {
               start: sequence,
               end: sequence,
@@ -676,7 +676,7 @@ pub async fn write_recovery_segment(
               end: u64::try_from(encoded.len())?,
             },
             payload_bytes: u64::try_from(encoded.len())?,
-          }],
+          },
         )]),
         OffsetDateTime::UNIX_EPOCH
           + TimeDuration::milliseconds(window_start_unix_seconds.saturating_mul(1_000)),
@@ -713,14 +713,14 @@ pub async fn write_recovery_segment_for_partitions(
     let end = u64::try_from(encoded.len())?;
     segment_index.insert(
       *virtual_partition_id,
-      vec![BatchMetadata {
+      BatchMetadata {
         seq_range: SeqRange {
           start: *sequence,
           end: *sequence,
         },
         byte_range: blob_stream_types::ByteRange { start, end },
         payload_bytes: u64::try_from(batch_encoded.len())?,
-      }],
+      },
     );
   }
   let blob_key = BlobKey::new(format!(

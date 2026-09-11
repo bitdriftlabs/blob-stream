@@ -265,19 +265,6 @@ impl Handler<ReadBlobRangesRequest, ReadBlobRangesResponse> for BrokerGrpc {
 }
 
 #[async_trait::async_trait]
-impl Handler<ProduceBatchRequest, ProduceBatchResponse> for BrokerGrpc {
-  async fn handle(
-    &self,
-    _headers: HeaderMap,
-    _extensions: Extensions,
-    request: ProduceBatchRequest,
-  ) -> bd_grpc::error::Result<ProduceBatchResponse> {
-    self.metrics.rpc_requests_total.inc();
-    Ok(self.handle_batch(request).await)
-  }
-}
-
-#[async_trait::async_trait]
 impl Handler<ProduceBatchesRequest, ProduceBatchesResponse> for BrokerGrpc {
   async fn handle(
     &self,
@@ -313,10 +300,6 @@ pub fn make_broker_router(
   blob_cache: Arc<BlobCache>,
   metrics: &BrokerMetrics,
 ) -> Router {
-  let produce_batch_method = ServiceMethod::<ProduceBatchRequest, ProduceBatchResponse>::new(
-    "BrokerService",
-    "ProduceBatch",
-  );
   let produce_batches_method = ServiceMethod::<ProduceBatchesRequest, ProduceBatchesResponse>::new(
     "BrokerService",
     "ProduceBatches",
@@ -341,16 +324,6 @@ pub fn make_broker_router(
     blob_cache,
     &grpc_metrics_scope,
   ));
-  let produce_batch_router = UnaryRouterBuilder::new(&produce_batch_method, grpc.clone())
-    .request_config(produce_request_config())
-    .error_handler(|error| {
-      warn_every!(
-        15.seconds(),
-        "broker ProduceBatch gRPC handler error: {error}"
-      );
-    })
-    .build()
-    .expect("legacy broker gRPC router should build");
   let produce_batches_router = UnaryRouterBuilder::new(&produce_batches_method, grpc.clone())
     .request_config(produce_request_config())
     .error_handler(|error| {
@@ -381,8 +354,7 @@ pub fn make_broker_router(
     })
     .build()
     .expect("blob cache gRPC router should build");
-  produce_batch_router
-    .merge(produce_batches_router)
+  produce_batches_router
     .merge(metadata_read_router)
     .merge(blob_read_router)
     .route(

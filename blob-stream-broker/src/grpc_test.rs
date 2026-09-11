@@ -25,6 +25,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   BlobRangeRequest,
   BlobReadFailureStatus,
   ProduceBatchRequest,
+  ProduceBatchResponse,
   ProduceBatchesRequest,
   ProduceBatchesResponse,
   ProduceStatus,
@@ -108,6 +109,29 @@ struct GatedWriteEngine {
 
 struct FailingWriteEngine {
   fence_lost: bool,
+}
+
+async fn produce_one_batch(
+  grpc: &BrokerGrpc,
+  request: ProduceBatchRequest,
+) -> Result<ProduceBatchResponse> {
+  let mut response = <BrokerGrpc as Handler<ProduceBatchesRequest, _>>::handle(
+    grpc,
+    HeaderMap::new(),
+    Extensions::new(),
+    ProduceBatchesRequest {
+      batches: vec![request],
+      ..Default::default()
+    },
+  )
+  .await?;
+  assert_eq!(response.results.len(), 1);
+  Ok(
+    response
+      .results
+      .pop()
+      .expect("one submitted batch returns one result"),
+  )
 }
 
 #[async_trait]
@@ -517,9 +541,7 @@ async fn sanitizes_internal_write_errors_and_preserves_fence_loss() -> Result<()
     metadata_cache(),
     &scope,
   );
-  let internal_response = internal_grpc
-    .handle(HeaderMap::new(), Extensions::new(), request.clone())
-    .await?;
+  let internal_response = produce_one_batch(&internal_grpc, request.clone()).await?;
   assert_eq!(
     internal_response.status,
     ProduceStatus::PRODUCE_STATUS_OVERLOADED.into()
@@ -539,9 +561,7 @@ async fn sanitizes_internal_write_errors_and_preserves_fence_loss() -> Result<()
     metadata_cache(),
     &scope,
   );
-  let fence_response = fence_grpc
-    .handle(HeaderMap::new(), Extensions::new(), request)
-    .await?;
+  let fence_response = produce_one_batch(&fence_grpc, request).await?;
   assert_eq!(
     fence_response.status,
     ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER.into()
@@ -587,18 +607,16 @@ async fn returns_overloaded_when_admission_controller_rejects() -> Result<()> {
   );
   let grpc = BrokerGrpc::new(engine, metadata_cache(), &scope);
 
-  let response = grpc
-    .handle(
-      HeaderMap::new(),
-      Extensions::new(),
-      ProduceBatchRequest {
-        topic: "telemetry".into(),
-        virtual_partition_id: 0,
-        records: vec![new_record(vec![1], 1)],
-        ..Default::default()
-      },
-    )
-    .await?;
+  let response = produce_one_batch(
+    &grpc,
+    ProduceBatchRequest {
+      topic: "telemetry".into(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![1], 1)],
+      ..Default::default()
+    },
+  )
+  .await?;
 
   assert_eq!(
     response.status,
@@ -607,6 +625,80 @@ async fn returns_overloaded_when_admission_controller_rejects() -> Result<()> {
   let metrics = String::from_utf8(collector.prometheus_output())?;
   assert!(metrics.contains("blob_stream_broker_test:write:produce_rejected_records_total 1"));
   assert!(metrics.contains("blob_stream_broker_test:write:produce_rejected_payload_bytes_total 1"));
+  shutdown_trigger.shutdown().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn invalid_virtual_partition_returns_bad_request() -> Result<()> {
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let collector = Collector::default();
+  let scope = collector.scope("blob_stream_broker_test");
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      WriteConfig::with_defaults(),
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention: Duration::days(7),
+          max_metadata_publication_lag: Duration::seconds(30),
+          metadata_window_size: Duration::minutes(5),
+        },
+      )]),
+      Arc::new(InMemoryBlobStore::new()),
+      Arc::new(InMemoryMetadataStore::new()),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &scope,
+    )
+    .time_provider(Arc::new(ManualTimeProvider::new(
+      OffsetDateTime::UNIX_EPOCH,
+    )))
+    .build()?,
+  );
+  let grpc = BrokerGrpc::new(engine, metadata_cache(), &scope);
+  let request = ProduceBatchRequest {
+    topic: "telemetry".into(),
+    virtual_partition_id: 1,
+    records: vec![new_record(vec![1], 1)],
+    ..Default::default()
+  };
+
+  let response = <BrokerGrpc as Handler<ProduceBatchesRequest, _>>::handle(
+    &grpc,
+    HeaderMap::new(),
+    Extensions::new(),
+    ProduceBatchesRequest {
+      batches: vec![request],
+      ..Default::default()
+    },
+  )
+  .await?;
+  assert_eq!(response.results.len(), 1);
+  assert_eq!(
+    response.results[0].status,
+    ProduceStatus::PRODUCE_STATUS_BAD_REQUEST.into()
+  );
+  assert_eq!(
+    response.results[0].error_message.as_str(),
+    "invalid virtual partition 1 for topic telemetry"
+  );
+
+  let metrics = Helper::new_with_collector(collector);
+  metrics.assert_counter_eq(
+    1,
+    "blob_stream_broker_test:grpc:responses_bad_request_total",
+    &labels!(),
+  );
+  metrics.assert_counter_eq(
+    0,
+    "blob_stream_broker_test:write:produce_overloaded_total",
+    &labels!(),
+  );
   shutdown_trigger.shutdown().await;
   Ok(())
 }
@@ -647,18 +739,16 @@ async fn successful_batches_record_accepted_write_volume() -> Result<()> {
   );
   let grpc = BrokerGrpc::new(engine, metadata_cache(), &scope);
 
-  let response = grpc
-    .handle(
-      HeaderMap::new(),
-      Extensions::new(),
-      ProduceBatchRequest {
-        topic: "telemetry".into(),
-        virtual_partition_id: 0,
-        records: vec![new_record(vec![1, 2, 3], 1)],
-        ..Default::default()
-      },
-    )
-    .await?;
+  let response = produce_one_batch(
+    &grpc,
+    ProduceBatchRequest {
+      topic: "telemetry".into(),
+      virtual_partition_id: 0,
+      records: vec![new_record(vec![1, 2, 3], 1)],
+      ..Default::default()
+    },
+  )
+  .await?;
 
   assert_eq!(response.status, ProduceStatus::PRODUCE_STATUS_OK.into());
   let metrics = String::from_utf8(collector.prometheus_output())?;
@@ -706,14 +796,6 @@ async fn empty_logical_batches_return_bad_request() -> Result<()> {
     ..Default::default()
   };
 
-  let response = grpc
-    .handle(HeaderMap::new(), Extensions::new(), empty_batch.clone())
-    .await?;
-  assert_eq!(
-    response.status,
-    ProduceStatus::PRODUCE_STATUS_BAD_REQUEST.into()
-  );
-
   let response = <BrokerGrpc as Handler<ProduceBatchesRequest, _>>::handle(
     &grpc,
     HeaderMap::new(),
@@ -731,7 +813,7 @@ async fn empty_logical_batches_return_bad_request() -> Result<()> {
   );
 
   let metrics = String::from_utf8(collector.prometheus_output())?;
-  assert!(metrics.contains("blob_stream_broker_test:grpc:responses_bad_request_total 2"));
+  assert!(metrics.contains("blob_stream_broker_test:grpc:responses_bad_request_total 1"));
   shutdown_trigger.shutdown().await;
   Ok(())
 }

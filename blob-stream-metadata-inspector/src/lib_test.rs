@@ -43,14 +43,14 @@ fn segment(snowflake_id: u64, sequence_start: u64, sequence_end: u64) -> Segment
     Compression::none(),
     HashMap::from([(
       1,
-      vec![BatchMetadata {
+      BatchMetadata {
         seq_range: SeqRange {
           start: sequence_start,
           end: sequence_end,
         },
         byte_range: ByteRange { start: 0, end: 10 },
         payload_bytes: 10,
-      }],
+      },
     )]),
     OffsetDateTime::UNIX_EPOCH,
     OffsetDateTime::UNIX_EPOCH,

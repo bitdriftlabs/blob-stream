@@ -2,7 +2,7 @@
 
 This guide covers live `blob-stream` operation, observability, and consistency controls. See
 [Infrastructure setup](infrastructure.md) for configuration, access, and resource provisioning, and
-[Design](design.md) for the underlying delivery guarantees.
+[Consumption](design/consumption.md) for the underlying delivery guarantees.
 
 ## Investigating A Consumer Delivery Gap
 
@@ -60,7 +60,10 @@ metadata. The broker returns a retryable failure. There is no unfenced fallback 
 Feature flags are local process controls. `TopicConfig.metadata_window_size` defines the durable
 metadata-key layout used by broker publication and consumer scans.
 `ConsumerIteratorBootstrapConfig.broker_discovery` is required. Consumers read metadata and raw
-blob ranges from broker caches, retrying direct storage only after a retryable broker failure.
+blob ranges through brokers. Eventual `Tail` and `FullRecovery` metadata requests can use retained
+cache coverage, while strong reads are coalesced without retained cache. An unusable broker
+metadata response retries the original direct DynamoDB query; any non-`NOT_FOUND` broker blob
+response or rejected payload retries the affected blob group directly from storage.
 
 | Scope | Flags | Adoption | Operational effect |
 | --- | --- | --- | --- |

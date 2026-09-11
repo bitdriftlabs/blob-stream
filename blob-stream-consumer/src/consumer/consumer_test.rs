@@ -961,14 +961,14 @@ async fn write_segment_with_publication_time(
     compression,
     HashMap::from([(
       virtual_partition_id,
-      vec![BatchMetadata {
+      BatchMetadata {
         seq_range,
         byte_range: blob_stream_types::ByteRange {
           start: 0,
           end: payload.len() as u64,
         },
         payload_bytes: summary.payload_bytes,
-      }],
+      },
     )]),
     OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(window_start * 1_000),
     OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(metadata_published_ts_ms),
@@ -1144,14 +1144,18 @@ async fn write_multi_partition_segment(
     payload.extend_from_slice(&encoded);
     let end = u64::try_from(payload.len()).unwrap();
 
-    segment_index
-      .entry(virtual_partition_id)
-      .or_insert_with(Vec::new)
-      .push(BatchMetadata {
-        seq_range,
-        byte_range: blob_stream_types::ByteRange { start, end },
-        payload_bytes: batch.summary().unwrap().payload_bytes,
-      });
+    assert!(
+      segment_index
+        .insert(
+          virtual_partition_id,
+          BatchMetadata {
+            seq_range,
+            byte_range: blob_stream_types::ByteRange { start, end },
+            payload_bytes: batch.summary().unwrap().payload_bytes,
+          }
+        )
+        .is_none()
+    );
   }
 
   let payload_len = u64::try_from(payload.len()).unwrap();
@@ -1226,11 +1230,11 @@ async fn write_shared_blob_segments(
           Compression::none(),
           HashMap::from([(
             virtual_partition_id,
-            vec![BatchMetadata {
+            BatchMetadata {
               seq_range,
               byte_range: blob_stream_types::ByteRange { start, end },
               payload_bytes: record_batch.summary().unwrap().payload_bytes,
-            }],
+            },
           )]),
           OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(window_start * 1_000),
           OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(window_start * 1_000),
@@ -4590,11 +4594,6 @@ async fn coalesces_owned_ranges_from_one_segment() {
         vec![new_record(vec![7], 1_001), new_record(vec![17], 1_004)],
       ),
       (
-        7,
-        SeqRange { start: 3, end: 3 },
-        vec![new_record(vec![27], 1_005)],
-      ),
-      (
         8,
         SeqRange { start: 1, end: 1 },
         vec![new_record(vec![8], 1_002)],
@@ -4634,7 +4633,7 @@ async fn coalesces_owned_ranges_from_one_segment() {
       .iter()
       .map(|batch| batch.virtual_partition_id)
       .collect::<Vec<_>>(),
-    vec![7, 7, 9]
+    vec![7, 9]
   );
   assert_eq!(batches[0].seq_range, SeqRange { start: 1, end: 2 });
   assert_eq!(
@@ -4645,16 +4644,6 @@ async fn coalesces_owned_ranges_from_one_segment() {
       .collect::<Vec<_>>(),
     vec![&[7], &[17]]
   );
-  assert!(Arc::ptr_eq(
-    batches[0]
-      .admission_scan
-      .as_ref()
-      .expect("first batch has admission evidence"),
-    batches[1]
-      .admission_scan
-      .as_ref()
-      .expect("second batch has admission evidence")
-  ));
   assert_eq!(
     blob_store.ranges(),
     vec![ByteRange {
@@ -5479,18 +5468,11 @@ async fn failed_slice_in_segment_read_does_not_advance_cursor() {
     900,
     1,
     Compression::none(),
-    vec![
-      (
-        7,
-        SeqRange { start: 1, end: 1 },
-        vec![new_record(vec![7], 1_001)],
-      ),
-      (
-        7,
-        SeqRange { start: 2, end: 2 },
-        vec![new_record(vec![7], 1_002)],
-      ),
-    ],
+    vec![(
+      7,
+      SeqRange { start: 1, end: 1 },
+      vec![new_record(vec![7], 1_001)],
+    )],
   )
   .await;
 

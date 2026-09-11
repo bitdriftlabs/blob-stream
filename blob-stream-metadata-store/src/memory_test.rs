@@ -24,7 +24,7 @@ fn build_segment(
     byte_range: blob_stream_types::ByteRange { start: 0, end: 512 },
     payload_bytes: 512,
   };
-  segment_index.insert(0 as VirtualPartitionId, vec![batch]);
+  segment_index.insert(0 as VirtualPartitionId, batch);
 
   SegmentMetadata::new(
     TopicWindowKey {
@@ -126,7 +126,11 @@ async fn skips_noncompliant_segment_rows() {
   let encoded = crate::codec::encode(&valid).expect("encode valid metadata");
   let mut invalid_metadata =
     SegmentMetadataV1::parse_from_tokio_bytes(&encoded.payload).expect("parse valid metadata");
-  invalid_metadata.partitions[0].batches[0].byte_end = 0;
+  invalid_metadata.partitions[0]
+    .batch
+    .as_mut()
+    .unwrap()
+    .byte_end = 0;
   store
     .windows
     .write()

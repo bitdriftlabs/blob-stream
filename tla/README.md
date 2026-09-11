@@ -6,7 +6,8 @@ here is correct and appreciate help and feedback.)
 
 This directory contains a small, commented TLA+ model of blob-stream's
 correctness-critical state transitions. It is intended to be read while learning
-TLA+, not merely run in CI.
+TLA+, not merely run in CI. It verifies the documented abstraction and bounded
+configuration; it is not a proof of the complete Rust implementation.
 
 The first model is deliberately narrower than the service:
 
@@ -199,7 +200,7 @@ loss comes only from Fast's incomplete metadata observation, not from a stale
 producer. It adds finite witness-local state for:
 
 - metadata publication time and abstract metadata order, standing in for a
-  source window and Snowflake ordering;
+  source window and Sonyflake ID ordering;
 - whether each row is visible at the eventually consistent replica;
 - what the Fast scan returned, omitted, or excluded by its horizon; and
 - the observed Fast frontier.
@@ -229,14 +230,13 @@ The trace is deliberately causal rather than a magical metadata deletion:
    returns A, and normal cursor filtering skips it because the cursor is already
    `2`.
 
-This is also an accepted product limitation in the default eventual-read mode.
-The witness preserves sequence allocation safety, blob-before-metadata,
-acknowledgement ordering, cursor monotonicity, and the rule that every delivered
-batch came from metadata and a blob. Production strong metadata reads remove the
-replica-omission step represented here, although this model does not yet encode
-the configuration or runtime flag. An unbounded/recovery scan policy would also
-make this witness unreachable and promote its no-loss assertion to a normal
-passing check.
+This is also an accepted product limitation when eventually consistent metadata reads are explicitly
+configured. The witness preserves sequence allocation safety, blob-before-metadata, acknowledgement
+ordering, cursor monotonicity, and the rule that every delivered batch came from metadata and a
+blob. Production strong metadata reads remove the replica-omission step represented here, although
+this model does not yet encode the configuration or runtime flag. An unbounded/recovery scan policy
+would also make this witness unreachable and promote its no-loss assertion to a normal passing
+check.
 
 The model maps most directly to
 [blob-stream-metadata-store/src/lib.rs](../blob-stream-metadata-store/src/lib.rs)

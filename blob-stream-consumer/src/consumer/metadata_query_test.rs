@@ -94,11 +94,11 @@ fn segment() -> SegmentMetadata {
     Compression::none(),
     HashMap::from([(
       0,
-      vec![BatchMetadata {
+      BatchMetadata {
         seq_range: SeqRange { start: 1, end: 2 },
         byte_range: ByteRange { start: 3, end: 4 },
         payload_bytes: 1,
-      }],
+      },
     )]),
     OffsetDateTime::UNIX_EPOCH,
     OffsetDateTime::UNIX_EPOCH,

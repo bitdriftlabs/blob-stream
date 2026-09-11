@@ -22,10 +22,10 @@ enum StoredSegmentCompressionCodec {
   STORED_SEGMENT_COMPRESSION_CODEC_ZSTD = 1;
 }
 
-// Batches indexed for a single virtual partition within a segment.
+// Batch indexed for a single virtual partition within a segment.
 message SegmentPartitionIndex {
   uint32 virtual_partition_id = 1;
-  repeated SegmentBatchMetadata batches = 2;
+  SegmentBatchMetadata batch = 2;
 }
 
 // Consumer-required location and sequence metadata for one stored batch.

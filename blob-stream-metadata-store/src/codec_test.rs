@@ -37,7 +37,7 @@ fn build_segment(compression: Compression) -> SegmentMetadata {
     compression,
     HashMap::from([(
       7 as VirtualPartitionId,
-      vec![BatchMetadata {
+      BatchMetadata {
         seq_range: SeqRange {
           start: 100,
           end: 199,
@@ -47,7 +47,7 @@ fn build_segment(compression: Compression) -> SegmentMetadata {
           end: 2_048,
         },
         payload_bytes: 1_024,
-      }],
+      },
     )]),
     offset_datetime_from_unix_millis(1_700_000_000_000),
     offset_datetime_from_unix_millis(1_700_000_000_100),
@@ -121,20 +121,20 @@ fn rejects_semantically_invalid_payloads() {
         as Box<dyn Fn(&mut SegmentMetadataV1)>,
     ),
     (
-      "missing partition batches",
-      Box::new(|metadata: &mut SegmentMetadataV1| metadata.partitions[0].batches.clear())
+      "missing partition batch",
+      Box::new(|metadata: &mut SegmentMetadataV1| metadata.partitions[0].batch.clear())
         as Box<dyn Fn(&mut SegmentMetadataV1)>,
     ),
     (
       "invalid sequence range",
       Box::new(|metadata: &mut SegmentMetadataV1| {
-        metadata.partitions[0].batches[0].seq_start = 200;
+        metadata.partitions[0].batch.as_mut().unwrap().seq_start = 200;
       }) as Box<dyn Fn(&mut SegmentMetadataV1)>,
     ),
     (
       "empty byte range",
       Box::new(|metadata: &mut SegmentMetadataV1| {
-        metadata.partitions[0].batches[0].byte_end = 1_024;
+        metadata.partitions[0].batch.as_mut().unwrap().byte_end = 1_024;
       }) as Box<dyn Fn(&mut SegmentMetadataV1)>,
     ),
   ] {
@@ -156,7 +156,7 @@ fn representative_segment_metadata_fits_one_dynamodb_read_chunk() {
   for partition_id in 0 .. 8_u64 {
     segment_index.insert(
       VirtualPartitionId::try_from(partition_id).expect("representative partition id fits u32"),
-      vec![BatchMetadata {
+      BatchMetadata {
         seq_range: SeqRange {
           start: partition_id * 10_000,
           end: (partition_id * 10_000) + 9_999,
@@ -166,7 +166,7 @@ fn representative_segment_metadata_fits_one_dynamodb_read_chunk() {
           end: (partition_id + 1) * 32 * 1_024 * 1_024,
         },
         payload_bytes: 32 * 1_024 * 1_024,
-      }],
+      },
     );
   }
   let metadata = SegmentMetadata::new(

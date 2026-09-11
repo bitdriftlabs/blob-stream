@@ -45,19 +45,17 @@ pub fn encode_segment_metadata_v1(metadata: &SegmentMetadata) -> Result<SegmentM
   let partitions = metadata
     .segment_index
     .iter()
-    .map(|(&virtual_partition_id, batches)| SegmentPartitionIndex {
+    .map(|(&virtual_partition_id, batch)| SegmentPartitionIndex {
       virtual_partition_id,
-      batches: batches
-        .iter()
-        .map(|batch| SegmentBatchMetadata {
-          seq_start: batch.seq_range.start,
-          seq_end: batch.seq_range.end,
-          byte_start: batch.byte_range.start,
-          byte_end: batch.byte_range.end,
-          payload_bytes: batch.payload_bytes,
-          ..Default::default()
-        })
-        .collect(),
+      batch: Some(SegmentBatchMetadata {
+        seq_start: batch.seq_range.start,
+        seq_end: batch.seq_range.end,
+        byte_start: batch.byte_range.start,
+        byte_end: batch.byte_range.end,
+        payload_bytes: batch.payload_bytes,
+        ..Default::default()
+      })
+      .into(),
       ..Default::default()
     })
     .collect();
@@ -132,43 +130,32 @@ pub fn decode_segment_metadata_v1(
   let mut segment_index = HashMap::new();
   for partition in metadata.partitions {
     let virtual_partition_id: VirtualPartitionId = partition.virtual_partition_id;
-    if partition.batches.is_empty() {
+    let batch = partition.batch.as_ref().ok_or_else(|| {
+      anyhow!("segment metadata has no batch for virtual partition {virtual_partition_id}")
+    })?;
+    if batch.seq_start > batch.seq_end {
       return Err(anyhow!(
-        "segment metadata has no batches for virtual partition {virtual_partition_id}"
+        "segment metadata has an invalid sequence range for virtual partition \
+         {virtual_partition_id}"
       ));
     }
-    let batches = partition
-      .batches
-      .into_iter()
-      .map(|batch| {
-        if batch.seq_start > batch.seq_end {
-          return Err(anyhow!(
-            "segment metadata has an invalid sequence range for virtual partition \
-             {virtual_partition_id}"
-          ));
-        }
-        if batch.byte_start >= batch.byte_end {
-          return Err(anyhow!(
-            "segment metadata has an empty byte range for virtual partition {virtual_partition_id}"
-          ));
-        }
-        Ok(BatchMetadata {
-          seq_range: SeqRange {
-            start: batch.seq_start,
-            end: batch.seq_end,
-          },
-          byte_range: ByteRange {
-            start: batch.byte_start,
-            end: batch.byte_end,
-          },
-          payload_bytes: batch.payload_bytes,
-        })
-      })
-      .collect::<Result<Vec<_>>>()?;
-    if segment_index
-      .insert(virtual_partition_id, batches)
-      .is_some()
-    {
+    if batch.byte_start >= batch.byte_end {
+      return Err(anyhow!(
+        "segment metadata has an empty byte range for virtual partition {virtual_partition_id}"
+      ));
+    }
+    let batch = BatchMetadata {
+      seq_range: SeqRange {
+        start: batch.seq_start,
+        end: batch.seq_end,
+      },
+      byte_range: ByteRange {
+        start: batch.byte_start,
+        end: batch.byte_end,
+      },
+      payload_bytes: batch.payload_bytes,
+    };
+    if segment_index.insert(virtual_partition_id, batch).is_some() {
       return Err(anyhow!(
         "segment metadata contains duplicate virtual partition {virtual_partition_id}"
       ));

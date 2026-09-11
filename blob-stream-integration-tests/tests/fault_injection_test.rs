@@ -250,7 +250,7 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
   controller
     .enable_fault(NetworkFaultRule {
       target_node_id: None,
-      operation: NetworkOperation::ProduceBatch,
+      operation: NetworkOperation::ProduceBatches,
       fault: NetworkFault::Drop,
       remaining_hits: Some(2),
     })
@@ -275,7 +275,7 @@ async fn network_drop_produce_retry_no_loss() -> Result<()> {
   tokio::pin!(first_produce);
   let fault_matcher = TestEventMatcher {
     category: Some("transport".to_string()),
-    operation: Some("produce_batch".to_string()),
+    operation: Some("produce_batches".to_string()),
     key_contains: None,
     status: Some("fault_applied".to_string()),
   };
@@ -389,7 +389,7 @@ async fn network_response_loss_after_persistence_retries_with_duplicate_batch() 
   controller
     .enable_fault(NetworkFaultRule {
       target_node_id: None,
-      operation: NetworkOperation::ProduceBatch,
+      operation: NetworkOperation::ProduceBatches,
       fault: NetworkFault::DropResponse,
       remaining_hits: Some(1),
     })
@@ -543,7 +543,7 @@ async fn response_loss_retry_during_broker_handoff_preserves_group_delivery_cont
   controller
     .enable_fault(NetworkFaultRule {
       target_node_id: Some(active_node.node_id.to_string()),
-      operation: NetworkOperation::ProduceBatch,
+      operation: NetworkOperation::ProduceBatches,
       fault: NetworkFault::DropResponse,
       remaining_hits: Some(1),
     })
@@ -617,7 +617,7 @@ async fn response_loss_retry_during_broker_handoff_preserves_group_delivery_cont
     .wait_for_event(
       &TestEventMatcher {
         category: Some("transport".to_string()),
-        operation: Some("produce_batch".to_string()),
+        operation: Some("produce_batches".to_string()),
         key_contains: Some(active_node.node_id.to_string()),
         status: Some("response_dropped".to_string()),
       },
@@ -747,7 +747,7 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
   controller
     .enable_fault(NetworkFaultRule {
       target_node_id: None,
-      operation: NetworkOperation::ProduceBatch,
+      operation: NetworkOperation::ProduceBatches,
       fault: NetworkFault::Delay(Duration::from_millis(20)),
       remaining_hits: Some(64),
     })
@@ -755,7 +755,7 @@ async fn network_delay_and_reorder_preserves_cursor_monotonicity() -> Result<()>
   controller
     .enable_fault(NetworkFaultRule {
       target_node_id: None,
-      operation: NetworkOperation::ProduceBatch,
+      operation: NetworkOperation::ProduceBatches,
       fault: NetworkFault::Reorder {
         delay: Duration::from_millis(35),
       },
@@ -906,7 +906,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
   controller
     .enable_fault(NetworkFaultRule {
       target_node_id: Some(active_node.node_id.to_string()),
-      operation: NetworkOperation::ProduceBatch,
+      operation: NetworkOperation::ProduceBatches,
       fault: NetworkFault::Partition,
       remaining_hits: Some(2),
     })
@@ -931,7 +931,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
   tokio::pin!(first_produce);
   let fault_matcher = TestEventMatcher {
     category: Some("transport".to_string()),
-    operation: Some("produce_batch".to_string()),
+    operation: Some("produce_batches".to_string()),
     key_contains: Some(active_node.node_id.to_string()),
     status: Some("fault_applied".to_string()),
   };
@@ -1040,13 +1040,16 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     expected_ids.insert(id);
   }
 
+  let reader_partitions = produced_partitions.into_iter().collect::<Vec<_>>();
+  let reader_now =
+    OffsetDateTime::from_unix_timestamp(framework::now_unix_seconds().saturating_add(3))?;
   let mut reader = ConsumerReaderImpl::new(
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       ..Default::default()
     },
-    produced_partitions.into_iter().collect(),
+    Vec::new(),
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
@@ -1057,11 +1060,14 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
+  // Activate the final direct-reader oracle as Fresh so its first full-window scan cannot advance
+  // a Fast frontier before it has observed the durable pre-reroute records.
+  reader.set_assigned_virtual_partitions(&reader_partitions, reader_now)?;
 
   let deliveries = drain_reader_until_with_trace(
     &mut reader,
     expected_ids.len(),
-    framework::now_unix_seconds().saturating_add(3),
+    reader_now.unix_timestamp(),
     Instant::now() + Duration::from_secs(30),
   )
   .await?;
@@ -1079,7 +1085,7 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     .wait_for_event(
       &TestEventMatcher {
         category: Some("transport".to_string()),
-        operation: Some("produce_batch".to_string()),
+        operation: Some("produce_batches".to_string()),
         key_contains: Some(standby_node.node_id.to_string()),
         status: Some("ok".to_string()),
       },
@@ -1108,7 +1114,7 @@ async fn producer_retry_deadline_respected_after_transport_failures() -> Result<
   controller
     .enable_fault(NetworkFaultRule {
       target_node_id: None,
-      operation: NetworkOperation::ProduceBatch,
+      operation: NetworkOperation::ProduceBatches,
       fault: NetworkFault::Drop,
       remaining_hits: Some(3),
     })
@@ -1132,7 +1138,7 @@ async fn producer_retry_deadline_respected_after_transport_failures() -> Result<
   tokio::pin!(exhausted);
   let fault_matcher = TestEventMatcher {
     category: Some("transport".to_string()),
-    operation: Some("produce_batch".to_string()),
+    operation: Some("produce_batches".to_string()),
     key_contains: None,
     status: Some("fault_applied".to_string()),
   };
@@ -2053,13 +2059,16 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
     expected_ids.insert(id);
   }
 
+  let reader_partitions = produced_partitions.into_iter().collect::<Vec<_>>();
+  let reader_now =
+    OffsetDateTime::from_unix_timestamp(framework::now_unix_seconds().saturating_add(3))?;
   let mut reader = ConsumerReaderImpl::new(
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       ..Default::default()
     },
-    produced_partitions.into_iter().collect(),
+    Vec::new(),
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
@@ -2070,11 +2079,14 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
+  // Activate the final direct-reader oracle as Fresh so its first full-window scan cannot advance
+  // a Fast frontier before it has observed the durable pre-reroute records.
+  reader.set_assigned_virtual_partitions(&reader_partitions, reader_now)?;
 
   let deliveries = drain_reader_until_with_trace(
     &mut reader,
     expected_ids.len(),
-    framework::now_unix_seconds().saturating_add(3),
+    reader_now.unix_timestamp(),
     Instant::now() + Duration::from_secs(45),
   )
   .await?;
@@ -3322,7 +3334,7 @@ async fn combined_network_and_metadata_faults_preserve_producer_publication() ->
   network_controller
     .enable_fault(NetworkFaultRule {
       target_node_id: None,
-      operation: NetworkOperation::ProduceBatch,
+      operation: NetworkOperation::ProduceBatches,
       fault: NetworkFault::Drop,
       remaining_hits: Some(1),
     })
@@ -3360,7 +3372,7 @@ async fn combined_network_and_metadata_faults_preserve_producer_publication() ->
   tokio::pin!(first_produce);
   let transport_fault_matcher = TestEventMatcher {
     category: Some("transport".to_string()),
-    operation: Some("produce_batch".to_string()),
+    operation: Some("produce_batches".to_string()),
     key_contains: None,
     status: Some("fault_applied".to_string()),
   };
@@ -3507,7 +3519,7 @@ async fn run_scripted_transport_fault_scenario() -> Result<Fit012Outcome> {
   controller
     .enable_fault(NetworkFaultRule {
       target_node_id: None,
-      operation: NetworkOperation::ProduceBatch,
+      operation: NetworkOperation::ProduceBatches,
       fault: NetworkFault::Drop,
       remaining_hits: Some(2),
     })
@@ -3531,7 +3543,7 @@ async fn run_scripted_transport_fault_scenario() -> Result<Fit012Outcome> {
   tokio::pin!(first_produce);
   let fault_matcher = TestEventMatcher {
     category: Some("transport".to_string()),
-    operation: Some("produce_batch".to_string()),
+    operation: Some("produce_batches".to_string()),
     key_contains: None,
     status: Some("fault_applied".to_string()),
   };
@@ -3637,7 +3649,7 @@ async fn run_scripted_transport_fault_scenario() -> Result<Fit012Outcome> {
     .snapshot()
     .await
     .into_iter()
-    .filter(|event| event.category == "transport" && event.operation == "produce_batch")
+    .filter(|event| event.category == "transport" && event.operation == "produce_batches")
     .map(|event| {
       format!(
         "{}|{}|{}|{}",

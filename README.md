@@ -53,7 +53,7 @@ after interrupted commits or rebalances, so applications must tolerate duplicate
 
 - [Local end-to-end walkthrough](examples/local-e2e/README.md): run static-discovery brokers,
   interactive text producers, and consumer groups against local Docker Compose dependencies
-- [System design and correctness contract](docs/design.md)
+- [System design and correctness contract](docs/design/README.md)
 - [Infrastructure setup](docs/infrastructure.md): configuration, DynamoDB, S3, IAM, and Kubernetes
   discovery RBAC
 - [Operations guide](docs/operations.md): runtime controls, metrics, diagnostic endpoints, and

@@ -1164,14 +1164,14 @@ async fn write_segment_with_publication_time(
         Compression::none(),
         HashMap::from([(
           virtual_partition_id,
-          vec![BatchMetadata {
+          BatchMetadata {
             seq_range,
             byte_range: blob_stream_types::ByteRange {
               start: 0,
               end: payload.len() as u64,
             },
             payload_bytes: summary.payload_bytes,
-          }],
+          },
         )]),
         OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(metadata_published_ts_ms),
         OffsetDateTime::UNIX_EPOCH + TimeDuration::milliseconds(metadata_published_ts_ms),

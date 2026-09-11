@@ -450,7 +450,8 @@ message ConsumerIteratorBootstrapConfig {
   // Metadata and lease storage backend used by reads/coordination.
   MetadataStoreConfig metadata_store = 4 [(validate.rules).message.required = true];
 
-  // Broker discovery used by the optional consumer-side broker metadata-cache feature.
-  // Discovery is always configured so the feature can be enabled without rebuilding consumers.
+  // Required broker discovery for consumer metadata and blob read routing. Cache-compatible
+  // metadata requests and all blob-range requests use the selected local broker; consumers retry
+  // direct storage only after an unusable broker response.
   BrokerDiscoveryConfig broker_discovery = 5 [(validate.rules).message.required = true];
 }

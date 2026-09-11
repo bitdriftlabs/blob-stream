@@ -2841,12 +2841,11 @@ async fn buffers_until_size_rollover() -> Result<()> {
     )
     .await?;
   assert_eq!(segments.len(), 1);
-  assert_eq!(segments[0].segment_index[&0].len(), 1);
   assert_eq!(
-    segments[0].segment_index[&0][0].seq_range,
+    segments[0].segment_index[&0].seq_range,
     SeqRange { start: 0, end: 1 }
   );
-  assert_eq!(segments[0].segment_index[&0][0].payload_bytes, 12);
+  assert_eq!(segments[0].segment_index[&0].payload_bytes, 12);
   Ok(())
 }
 
@@ -3749,11 +3748,7 @@ async fn same_partition_time_flushes_upload_in_parallel_and_publish_in_order() -
     .await?;
   let mut ranges: Vec<_> = segments
     .iter()
-    .flat_map(|segment| {
-      segment.segment_index[&0]
-        .iter()
-        .map(|batch| batch.seq_range.clone())
-    })
+    .map(|segment| segment.segment_index[&0].seq_range.clone())
     .collect();
   ranges.sort_by_key(|range| range.start);
   assert_eq!(

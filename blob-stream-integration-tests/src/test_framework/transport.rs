@@ -90,7 +90,7 @@ impl BrokerTransport for GrpcTcpTransport {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkOperation {
-  ProduceBatch,
+  ProduceBatches,
 }
 
 //
@@ -386,7 +386,7 @@ impl NetworkFaultController {
       event_log
         .record(
           "transport",
-          describe_network_operation(NetworkOperation::ProduceBatch),
+          describe_network_operation(NetworkOperation::ProduceBatches),
           Some(node_id.to_string()),
           status,
           detail,
@@ -452,7 +452,7 @@ fn max_duration(current: Option<Duration>, candidate: Duration) -> Duration {
 
 fn describe_network_operation(operation: NetworkOperation) -> &'static str {
   match operation {
-    NetworkOperation::ProduceBatch => "produce_batch",
+    NetworkOperation::ProduceBatches => "produce_batches",
   }
 }
 
@@ -673,7 +673,7 @@ impl ProducerBrokerTransport for InMemoryProducerTransport {
 
     let effects = self
       .fault_controller
-      .effects_for_call(node_id, NetworkOperation::ProduceBatch)
+      .effects_for_call(node_id, NetworkOperation::ProduceBatches)
       .await;
 
     if effects.partition {
@@ -756,7 +756,7 @@ impl ProducerBrokerTransport for InMemoryProducerTransport {
       event_log
         .record(
           "transport",
-          "produce_batch",
+          "produce_batches",
           Some(node_id.to_string()),
           "ok",
           Some(format!("copies={copies}")),
