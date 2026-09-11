@@ -399,3 +399,14 @@ fn validate_group_config_rejects_empty_pod_id() {
 
   assert!(validate_group_config(&group).is_err());
 }
+
+#[test]
+fn validate_group_config_rejects_empty_cluster_id() {
+  let mut group = ConsumerGroupConfig::new();
+  group.topic = "telemetry".to_string().into();
+  group.group_id = "group-a".to_string().into();
+  group.member_id = "member-a".to_string().into();
+  group.cluster_id = Some(String::new().into());
+
+  assert!(validate_group_config(&group).is_err());
+}

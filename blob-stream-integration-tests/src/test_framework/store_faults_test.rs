@@ -171,6 +171,7 @@ async fn consumer_member_deregistration_honors_faults_without_removing_membershi
       "group-a",
       "consumer-a",
       None,
+      None,
       offset_datetime_from_unix_millis(1_000),
       Duration::milliseconds(100),
     )
@@ -205,6 +206,7 @@ async fn consumer_member_deregistration_honors_faults_without_removing_membershi
     vec![ConsumerGroupMember {
       member_id: "consumer-a".to_string(),
       pod_id: None,
+      cluster_id: None,
     }]
   );
 }

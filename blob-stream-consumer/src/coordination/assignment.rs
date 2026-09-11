@@ -110,6 +110,8 @@ pub(super) fn cooperative_sticky_assignment_with_pods(
   // group: planning with only some pod IDs would make pod balancing depend on discovery timing.
   let mut pod_members = BTreeMap::<String, Vec<String>>::new();
   let mut member_pods = HashMap::new();
+  let mut pod_clusters = BTreeMap::new();
+  let mut complete_cluster_topology = true;
   for member in members {
     let Some(pod_id) = member.pod_id.as_ref() else {
       let member_ids = members
@@ -129,6 +131,13 @@ pub(super) fn cooperative_sticky_assignment_with_pods(
       .or_default()
       .push(member.member_id.clone());
     member_pods.insert(member.member_id.clone(), pod_id.clone());
+    match (member.cluster_id.as_ref(), pod_clusters.get(pod_id)) {
+      (Some(cluster_id), Some(existing_cluster_id)) if cluster_id == existing_cluster_id => {},
+      (Some(cluster_id), None) => {
+        pod_clusters.insert(pod_id.clone(), cluster_id.clone());
+      },
+      _ => complete_cluster_topology = false,
+    }
   }
   // Each pod's member ordering determines deterministic within-pod tie breaking.
   for members in pod_members.values_mut() {
@@ -138,6 +147,10 @@ pub(super) fn cooperative_sticky_assignment_with_pods(
   if pod_members.is_empty() {
     return HashMap::new();
   }
+  // Cluster metadata remains an optional refinement of pod-aware planning. A missing member value
+  // or conflicting values for a shared pod disables only this tie-breaker during rollout.
+  let pod_clusters = complete_cluster_topology.then_some(pod_clusters);
+  let cluster_pod_counts = pod_clusters.as_ref().map(cluster_pod_counts);
 
   // The pod stage maps partitions to physical pods, then the worker stage below maps each pod's
   // partitions to its current member IDs.
@@ -167,13 +180,28 @@ pub(super) fn cooperative_sticky_assignment_with_pods(
     if partition_pods.contains_key(partition_id) {
       continue;
     }
-    let pod_id = least_loaded_pod(&pod_load);
+    let pod_id = least_loaded_pod(
+      &pod_load,
+      pod_clusters.as_ref(),
+      cluster_pod_counts.as_ref(),
+    );
     partition_pods.insert(*partition_id, pod_id.clone());
     *pod_load.get_mut(&pod_id).expect("selected pod has load") += 1;
   }
 
   // Move only enough partitions to make aggregate pod loads differ by at most one.
   rebalance_pod_loads(&partitions, &mut partition_pods, &mut pod_load);
+  if let (Some(pod_clusters), Some(cluster_pod_counts)) =
+    (pod_clusters.as_ref(), cluster_pod_counts.as_ref())
+  {
+    rebalance_cluster_tie_breaks(
+      &partitions,
+      &mut partition_pods,
+      &mut pod_load,
+      pod_clusters,
+      cluster_pod_counts,
+    );
+  }
 
   let mut assignments = HashMap::new();
   // With stable pod ownership fixed, independently balance each pod's assigned partitions among
@@ -239,31 +267,35 @@ pub(super) fn canonical_member_topology(
   active_members: &[ConsumerGroupMember],
   local_member_id: &str,
   local_pod_id: Option<&str>,
+  local_cluster_id: Option<&str>,
 ) -> Option<Vec<ConsumerGroupMember>> {
   // A pod-aware plan is valid only when every planned member has a pod. Returning `None` for any
   // incomplete view explicitly selects the legacy flat policy until the rollout is complete.
-  let mut pod_ids = active_members
+  let mut member_topology = active_members
     .iter()
     .filter_map(|member| {
-      member
-        .pod_id
-        .as_ref()
-        .map(|pod_id| (member.member_id.as_str(), pod_id.as_str()))
+      member.pod_id.as_ref().map(|pod_id| {
+        (
+          member.member_id.as_str(),
+          (pod_id.as_str(), member.cluster_id.as_deref()),
+        )
+      })
     })
     .collect::<HashMap<_, _>>();
   if let Some(local_pod_id) = local_pod_id {
-    pod_ids.insert(local_member_id, local_pod_id);
+    member_topology.insert(local_member_id, (local_pod_id, local_cluster_id));
   }
 
   // `collect::<Option<_>>()` naturally rejects a missing topology record for any canonical member.
   members
     .iter()
     .map(|member_id| {
-      pod_ids
+      member_topology
         .get(member_id.as_str())
-        .map(|pod_id| ConsumerGroupMember {
+        .map(|(pod_id, cluster_id)| ConsumerGroupMember {
           member_id: member_id.clone(),
           pod_id: Some((*pod_id).to_string()),
+          cluster_id: cluster_id.map(ToString::to_string),
         })
     })
     .collect()
@@ -289,13 +321,83 @@ pub(super) fn assignment_plan_pod_ids(plan: &ConsumerGroupAssignmentPlan) -> Vec
   pod_ids
 }
 
-fn least_loaded_pod(pod_load: &BTreeMap<String, usize>) -> String {
-  // `BTreeMap` order breaks equal-load ties by pod ID, giving independent planners the same pick.
+fn cluster_pod_counts(pod_clusters: &BTreeMap<String, String>) -> BTreeMap<String, usize> {
+  let mut cluster_pod_counts = BTreeMap::new();
+  for cluster_id in pod_clusters.values() {
+    *cluster_pod_counts.entry(cluster_id.clone()).or_default() += 1;
+  }
+  cluster_pod_counts
+}
+
+fn least_loaded_pod(
+  pod_load: &BTreeMap<String, usize>,
+  pod_clusters: Option<&BTreeMap<String, String>>,
+  cluster_pod_counts: Option<&BTreeMap<String, usize>>,
+) -> String {
+  // Cluster pod count decides only equal-load choices; pod ID remains the final deterministic
+  // tie-breaker so all planners make identical assignments from the same membership snapshot.
   pod_load
     .iter()
-    .min_by_key(|(pod_id, load)| (**load, *pod_id))
+    .min_by_key(|(pod_id, load)| {
+      let cluster_pod_count = pod_clusters
+        .and_then(|pod_clusters| pod_clusters.get(*pod_id))
+        .and_then(|cluster_id| cluster_pod_counts.and_then(|counts| counts.get(cluster_id)))
+        .copied()
+        .unwrap_or_default();
+      (**load, cluster_pod_count, *pod_id)
+    })
     .map(|(pod_id, _)| pod_id.clone())
     .unwrap_or_default()
+}
+
+fn rebalance_cluster_tie_breaks(
+  partitions: &[VirtualPartitionId],
+  partition_pods: &mut HashMap<VirtualPartitionId, String>,
+  pod_load: &mut BTreeMap<String, usize>,
+  pod_clusters: &BTreeMap<String, String>,
+  cluster_pod_counts: &BTreeMap<String, usize>,
+) {
+  // Preserve the primary pod balance: only shift a residual assignment from a k + 1 pod in a
+  // larger cluster to a k pod in a smaller cluster. This is the minimum sticky correction that
+  // realizes the cluster preference without turning it into a cluster-load balancing policy.
+  loop {
+    let transfer = pod_load
+      .iter()
+      .flat_map(|(under_pod, under_load)| {
+        pod_load.iter().filter_map(move |(over_pod, over_load)| {
+          let under_cluster_id = pod_clusters.get(under_pod)?;
+          let over_cluster_id = pod_clusters.get(over_pod)?;
+          let under_cluster_pod_count = cluster_pod_counts.get(under_cluster_id)?;
+          let over_cluster_pod_count = cluster_pod_counts.get(over_cluster_id)?;
+          (*over_load == *under_load + 1 && over_cluster_pod_count > under_cluster_pod_count)
+            .then_some((under_cluster_pod_count, under_pod.clone(), over_pod.clone()))
+        })
+      })
+      .min_by_key(|(under_cluster_pod_count, under_pod, over_pod)| {
+        (
+          *under_cluster_pod_count,
+          under_pod.clone(),
+          over_pod.clone(),
+        )
+      });
+    let Some((_, under_pod, over_pod)) = transfer else {
+      break;
+    };
+    let Some(partition_id) = partitions
+      .iter()
+      .find(|partition_id| partition_pods.get(partition_id) == Some(&over_pod))
+      .copied()
+    else {
+      break;
+    };
+    partition_pods.insert(partition_id, under_pod.clone());
+    *pod_load
+      .get_mut(&over_pod)
+      .expect("overloaded pod has load") -= 1;
+    *pod_load
+      .get_mut(&under_pod)
+      .expect("underloaded pod has load") += 1;
+  }
 }
 
 fn rebalance_pod_loads(

@@ -35,6 +35,7 @@ const ATTR_SK: &str = "sk";
 const ATTR_LEASE_EXPIRES: &str = "lease_expiry_ts";
 const ATTR_LAST_HEARTBEAT: &str = "last_heartbeat_ts";
 const ATTR_POD_ID: &str = "pod_id";
+const ATTR_CLUSTER_ID: &str = "cluster_id";
 const ATTR_TTL: &str = "ttl_epoch_seconds";
 const ATTR_RECORD_TYPE: &str = "record_type";
 const ATTR_OWNER: &str = "owner_id";
@@ -53,6 +54,16 @@ const RECORD_TYPE_PLANNER_LEASE: &str = "assignment_planner_lease";
 const ASSIGNMENT_CONTROL_PARTITION_PREFIX: &str = "__blob_stream_assignment_control_v1__";
 const ASSIGNMENT_PLAN_SORT_KEY: &str = "__blob_stream_assignment_plan_v1__";
 const PLANNER_LEASE_SORT_KEY: &str = "__blob_stream_assignment_planner_v1__";
+
+fn membership_topology_update_expression(pod_id_present: bool, cluster_id_present: bool) -> String {
+  match (pod_id_present, cluster_id_present) {
+    (true, true) => format!(", {ATTR_POD_ID} = :pod_id, {ATTR_CLUSTER_ID} = :cluster_id"),
+    (false, true) => format!(", {ATTR_CLUSTER_ID} = :cluster_id REMOVE {ATTR_POD_ID}"),
+    (true, false) => format!(", {ATTR_POD_ID} = :pod_id REMOVE {ATTR_CLUSTER_ID}"),
+    (false, false) => format!(" REMOVE {ATTR_POD_ID}, {ATTR_CLUSTER_ID}"),
+  }
+}
+
 //
 // DynamoConsumerGroupMembershipStore
 //
@@ -205,6 +216,10 @@ impl DynamoConsumerGroupMembershipStore {
             Ok(ConsumerGroupMember {
               member_id,
               pod_id: Some(pod_id),
+              cluster_id: member
+                .get(ATTR_CLUSTER_ID)
+                .and_then(|value| value.as_s().ok())
+                .cloned(),
             })
           })
           .collect::<Result<Vec<_>>>()
@@ -258,6 +273,12 @@ impl DynamoConsumerGroupMembershipStore {
             AttributeValue::S(member.member_id.clone()),
           );
           entry.insert(ATTR_POD_ID.to_string(), AttributeValue::S(pod_id.clone()));
+          if let Some(cluster_id) = &member.cluster_id {
+            entry.insert(
+              ATTR_CLUSTER_ID.to_string(),
+              AttributeValue::S(cluster_id.clone()),
+            );
+          }
           Ok(AttributeValue::M(entry))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -332,6 +353,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
+    cluster_id: Option<String>,
     now: OffsetDateTime,
     ttl: Duration,
   ) -> Result<()> {
@@ -363,16 +385,14 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     if let Some(pod_id) = &pod_id {
       values.insert(":pod_id".to_string(), AttributeValue::S(pod_id.clone()));
     }
-    let pod_id_expression = if pod_id.is_some() {
-      format!(", {ATTR_POD_ID} = :pod_id")
-    } else {
-      String::new()
-    };
-    let pod_id_removal = if pod_id.is_some() {
-      String::new()
-    } else {
-      format!(" REMOVE {ATTR_POD_ID}")
-    };
+    if let Some(cluster_id) = &cluster_id {
+      values.insert(
+        ":cluster_id".to_string(),
+        AttributeValue::S(cluster_id.clone()),
+      );
+    }
+    let topology_update_expression =
+      membership_topology_update_expression(pod_id.is_some(), cluster_id.is_some());
 
     let response = self
       .client
@@ -382,7 +402,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       .key(ATTR_SK, AttributeValue::S(Self::sk(member_id)))
       .update_expression(format!(
         "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_TTL} = :ttl, {ATTR_LAST_HEARTBEAT} = :now, \
-         {ATTR_RECORD_TYPE} = :member_type{pod_id_expression}{pod_id_removal}"
+         {ATTR_RECORD_TYPE} = :member_type{topology_update_expression}"
       ))
       .set_expression_attribute_values(Some(values))
       .return_consumed_capacity(ReturnConsumedCapacity::Total)
@@ -399,6 +419,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
+    cluster_id: Option<String>,
     now: OffsetDateTime,
     ttl: Duration,
   ) -> Result<()> {
@@ -407,7 +428,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       self.table_name, topic, group_id, member_id
     );
     self
-      .register_member(topic, group_id, member_id, pod_id, now, ttl)
+      .register_member(topic, group_id, member_id, pod_id, cluster_id, now, ttl)
       .await
   }
 
@@ -469,7 +490,7 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
           "{ATTR_LEASE_EXPIRES} > :now AND (attribute_not_exists({ATTR_RECORD_TYPE}) OR \
            {ATTR_RECORD_TYPE} = :member_type)"
         ))
-        .projection_expression(format!("{ATTR_SK}, {ATTR_POD_ID}"))
+        .projection_expression(format!("{ATTR_SK}, {ATTR_POD_ID}, {ATTR_CLUSTER_ID}"))
         .set_expression_attribute_values(Some(values));
 
       if let Some(key) = start_key.take() {
@@ -487,6 +508,10 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
             member_id: member_id.clone(),
             pod_id: item
               .get(ATTR_POD_ID)
+              .and_then(|value| value.as_s().ok())
+              .cloned(),
+            cluster_id: item
+              .get(ATTR_CLUSTER_ID)
               .and_then(|value| value.as_s().ok())
               .cloned(),
           });

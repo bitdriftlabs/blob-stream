@@ -324,6 +324,11 @@ impl ConsumerIteratorBuilder<'_> {
         &driver.group_config.group_id,
         &driver.group_config.member_id,
         driver.group_config.pod_id.as_ref().map(ToString::to_string),
+        driver
+          .group_config
+          .cluster_id
+          .as_ref()
+          .map(ToString::to_string),
         now,
         consumer_lease_duration(&driver.group_config),
       )

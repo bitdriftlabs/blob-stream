@@ -648,6 +648,7 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
+    cluster_id: Option<String>,
     now: OffsetDateTime,
     ttl: Duration,
   ) -> Result<()>;
@@ -659,6 +660,7 @@ pub trait ConsumerGroupMembershipStore: Send + Sync {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
+    cluster_id: Option<String>,
     now: OffsetDateTime,
     ttl: Duration,
   ) -> Result<()>;
@@ -731,6 +733,8 @@ pub struct ConsumerGroupMember {
   pub member_id: String,
   /// Stable physical pod identifier when the caller supports pod-aware assignment.
   pub pod_id: Option<String>,
+  /// Stable cluster identifier used for final pod-assignment tie breaking.
+  pub cluster_id: Option<String>,
 }
 
 //

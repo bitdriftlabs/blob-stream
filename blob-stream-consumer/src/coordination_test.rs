@@ -317,6 +317,13 @@ fn pod_aware_assignment_balances_pods_with_minimal_movement() {
       (0 .. 2).map(move |worker_index| ConsumerGroupMember {
         member_id: format!("pod-{pod_index}:worker-{worker_index}"),
         pod_id: Some(format!("pod-{pod_index}")),
+        cluster_id: Some(
+          if pod_index < 3 {
+            "cluster-a".to_string()
+          } else {
+            "cluster-b".to_string()
+          },
+        ),
       })
     })
     .collect::<Vec<_>>();
@@ -367,6 +374,153 @@ fn pod_aware_assignment_balances_pods_with_minimal_movement() {
 }
 
 #[test]
+fn pod_aware_assignment_prefers_cluster_with_fewer_pods_for_residual_load() {
+  let members = vec![
+    ConsumerGroupMember {
+      member_id: "pod-a:worker-0".to_string(),
+      pod_id: Some("pod-a".to_string()),
+      cluster_id: Some("cluster-a".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-b:worker-0".to_string(),
+      pod_id: Some("pod-b".to_string()),
+      cluster_id: Some("cluster-b".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-c:worker-0".to_string(),
+      pod_id: Some("pod-c".to_string()),
+      cluster_id: Some("cluster-b".to_string()),
+    },
+  ];
+  let partitions = vec![0, 1, 2, 3];
+
+  let assignment = cooperative_sticky_assignment_with_pods(&members, &partitions, &HashMap::new());
+  let pod_loads = ["pod-a", "pod-b", "pod-c"]
+    .iter()
+    .map(|pod_id| {
+      assignment
+        .values()
+        .filter(|member_id| member_id.starts_with(pod_id))
+        .count()
+    })
+    .collect::<Vec<_>>();
+
+  assert_eq!(pod_loads, vec![2, 1, 1]);
+}
+
+#[test]
+fn pod_aware_assignment_repairs_sticky_residual_load_for_smaller_cluster() {
+  let members = vec![
+    ConsumerGroupMember {
+      member_id: "pod-a:worker-0".to_string(),
+      pod_id: Some("pod-a".to_string()),
+      cluster_id: Some("cluster-a".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-b:worker-0".to_string(),
+      pod_id: Some("pod-b".to_string()),
+      cluster_id: Some("cluster-b".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-c:worker-0".to_string(),
+      pod_id: Some("pod-c".to_string()),
+      cluster_id: Some("cluster-b".to_string()),
+    },
+  ];
+  let partitions = vec![0, 1, 2, 3];
+  let previous = HashMap::from([
+    (0, "pod-a:worker-0".to_string()),
+    (1, "pod-b:worker-0".to_string()),
+    (2, "pod-b:worker-0".to_string()),
+    (3, "pod-c:worker-0".to_string()),
+  ]);
+
+  let assignment = cooperative_sticky_assignment_with_pods(&members, &partitions, &previous);
+  let moved = partitions
+    .iter()
+    .filter(|partition_id| assignment.get(partition_id) != previous.get(partition_id))
+    .count();
+
+  assert_eq!(assignment.get(&1), Some(&"pod-a:worker-0".to_string()));
+  assert_eq!(moved, 1);
+}
+
+#[test]
+fn pod_aware_assignment_ignores_partial_cluster_topology() {
+  let members = vec![
+    ConsumerGroupMember {
+      member_id: "pod-a:worker-0".to_string(),
+      pod_id: Some("pod-a".to_string()),
+      cluster_id: Some("cluster-b".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-b:worker-0".to_string(),
+      pod_id: Some("pod-b".to_string()),
+      cluster_id: Some("cluster-b".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-z:worker-0".to_string(),
+      pod_id: Some("pod-z".to_string()),
+      cluster_id: None,
+    },
+  ];
+  let partitions = vec![0, 1, 2, 3];
+
+  let assignment = cooperative_sticky_assignment_with_pods(&members, &partitions, &HashMap::new());
+  let pod_loads = ["pod-a", "pod-b", "pod-z"]
+    .iter()
+    .map(|pod_id| {
+      assignment
+        .values()
+        .filter(|member_id| member_id.starts_with(pod_id))
+        .count()
+    })
+    .collect::<Vec<_>>();
+
+  assert_eq!(pod_loads, vec![2, 1, 1]);
+}
+
+#[test]
+fn pod_aware_assignment_ignores_conflicting_cluster_topology() {
+  let members = vec![
+    ConsumerGroupMember {
+      member_id: "pod-a:worker-0".to_string(),
+      pod_id: Some("pod-a".to_string()),
+      cluster_id: Some("cluster-b".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-b:worker-0".to_string(),
+      pod_id: Some("pod-b".to_string()),
+      cluster_id: Some("cluster-b".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-z:worker-0".to_string(),
+      pod_id: Some("pod-z".to_string()),
+      cluster_id: Some("cluster-a".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-z:worker-1".to_string(),
+      pod_id: Some("pod-z".to_string()),
+      cluster_id: Some("cluster-b".to_string()),
+    },
+  ];
+  let partitions = vec![0, 1, 2, 3];
+
+  let assignment = cooperative_sticky_assignment_with_pods(&members, &partitions, &HashMap::new());
+  let pod_loads = ["pod-a", "pod-b", "pod-z"]
+    .iter()
+    .map(|pod_id| {
+      assignment
+        .values()
+        .filter(|member_id| member_id.starts_with(pod_id))
+        .count()
+    })
+    .collect::<Vec<_>>();
+
+  assert_eq!(pod_loads, vec![2, 1, 1]);
+}
+
+#[test]
 fn pod_aware_assignment_plan_snapshot_includes_member_and_pod_identity() {
   let plan = ConsumerGroupAssignmentPlan {
     version: 7,
@@ -376,14 +530,17 @@ fn pod_aware_assignment_plan_snapshot_includes_member_and_pod_identity() {
       ConsumerGroupMember {
         member_id: "pod-a:worker-0".to_string(),
         pod_id: Some("pod-a".to_string()),
+        cluster_id: Some("cluster-a".to_string()),
       },
       ConsumerGroupMember {
         member_id: "pod-b:worker-0".to_string(),
         pod_id: Some("pod-b".to_string()),
+        cluster_id: Some("cluster-b".to_string()),
       },
       ConsumerGroupMember {
         member_id: "pod-c:worker-0".to_string(),
         pod_id: Some("pod-c".to_string()),
+        cluster_id: Some("cluster-b".to_string()),
       },
     ]),
     assignments: vec![
@@ -408,14 +565,17 @@ fn pod_aware_assignment_plan_snapshot_includes_member_and_pod_identity() {
       ConsumerMemberTopologySnapshot {
         member_id: "pod-a:worker-0".to_string(),
         pod_id: "pod-a".to_string(),
+        cluster_id: Some("cluster-a".to_string()),
       },
       ConsumerMemberTopologySnapshot {
         member_id: "pod-b:worker-0".to_string(),
         pod_id: "pod-b".to_string(),
+        cluster_id: Some("cluster-b".to_string()),
       },
       ConsumerMemberTopologySnapshot {
         member_id: "pod-c:worker-0".to_string(),
         pod_id: "pod-c".to_string(),
+        cluster_id: Some("cluster-b".to_string()),
       },
     ]
   );

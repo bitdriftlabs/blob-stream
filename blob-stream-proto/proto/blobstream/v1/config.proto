@@ -425,6 +425,9 @@ message ConsumerGroupConfig {
   // Stable physical pod identity for hierarchical consumer assignment.
   // When unset, the group uses member-only assignment for compatibility.
   optional string pod_id = 7 [(validate.rules).string.min_len = 1];
+
+  // Stable cluster identity used as a final tie-breaker for pod-aware assignment.
+  optional string cluster_id = 8 [(validate.rules).string.min_len = 1];
 }
 
 // Runtime configuration for consumer library applications.

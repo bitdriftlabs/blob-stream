@@ -621,12 +621,13 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
+    cluster_id: Option<String>,
     now: OffsetDateTime,
     ttl: TimeDuration,
   ) -> anyhow::Result<()> {
     self
       .inner
-      .register_member(topic, group_id, member_id, pod_id, now, ttl)
+      .register_member(topic, group_id, member_id, pod_id, cluster_id, now, ttl)
       .await
   }
 
@@ -636,6 +637,7 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
+    cluster_id: Option<String>,
     now: OffsetDateTime,
     ttl: TimeDuration,
   ) -> anyhow::Result<()> {
@@ -649,7 +651,7 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
     }
     self
       .inner
-      .heartbeat_member(topic, group_id, member_id, pod_id, now, ttl)
+      .heartbeat_member(topic, group_id, member_id, pod_id, cluster_id, now, ttl)
       .await
   }
 
