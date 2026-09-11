@@ -53,6 +53,10 @@ after interrupted commits or rebalances, so applications must tolerate duplicate
 
 - [Local end-to-end walkthrough](examples/local-e2e/README.md): run static-discovery brokers,
   interactive text producers, and consumer groups against local Docker Compose dependencies
+- [Dashboard references](examples/dashboards/README.md): broker, producer, and consumer CUE
+  definitions to adapt for an observability configuration
+- [Kubernetes deployment reference](examples/deployment/README.md): per-cluster Terraform for a
+  broker writer, service discovery, and runtime configuration
 - [System design and correctness contract](docs/design/README.md)
 - [Infrastructure setup](docs/infrastructure.md): configuration, DynamoDB, S3, IAM, and Kubernetes
   discovery RBAC
