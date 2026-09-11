@@ -21,6 +21,14 @@ planner balances aggregate partition load across pods first, then balances each 
 among its members. Otherwise it uses the flat policy, which balances all members globally. This
 supports rolling adoption without a migration.
 
+Consumers may also register `cluster_id`. When every pod-aware member has a cluster ID and all
+members on a pod agree on it, the planner uses the number of distinct active pods per cluster as a
+final tie-breaker. It gives a residual assignment, such as 8 instead of 7, to a pod in a cluster
+with fewer pods when that preserves the existing at-most-one partition pod-load difference. It is
+not cluster-load balancing: it never changes primary pod or member balance to equalize aggregate
+cluster load. During a partial or inconsistent cluster-ID rollout, the planner retains pod-aware
+assignment and simply omits this preference.
+
 The planner lease uses a unique coordinator session. Its publication transaction condition-checks
 the lease, preventing a stale process that reused a member ID from publishing or releasing a
 successor's plan.

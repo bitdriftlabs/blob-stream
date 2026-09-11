@@ -1,3 +1,4 @@
+use super::membership_topology_update_expression;
 use crate::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentPlan,
@@ -28,6 +29,27 @@ const REGION: &str = "us-east-1";
 const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
 const RECORD_TYPE_ATTRIBUTE_NAME: &str = "record_type";
 const POD_ID_ATTRIBUTE_NAME: &str = "pod_id";
+const CLUSTER_ID_ATTRIBUTE_NAME: &str = "cluster_id";
+
+#[test]
+fn membership_topology_update_expression_writes_and_removes_attributes() {
+  assert_eq!(
+    membership_topology_update_expression(true, true),
+    ", pod_id = :pod_id, cluster_id = :cluster_id"
+  );
+  assert_eq!(
+    membership_topology_update_expression(false, true),
+    ", cluster_id = :cluster_id REMOVE pod_id"
+  );
+  assert_eq!(
+    membership_topology_update_expression(true, false),
+    ", pod_id = :pod_id REMOVE cluster_id"
+  );
+  assert_eq!(
+    membership_topology_update_expression(false, false),
+    " REMOVE pod_id, cluster_id"
+  );
+}
 
 async fn dynamo_client() -> Result<Client> {
   unsafe {
@@ -114,6 +136,7 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
       "group-a",
       "member-a",
       Some("pod-a".to_string()),
+      Some("cluster-a".to_string()),
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
     )
@@ -124,6 +147,7 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
       "group-a",
       "member-b",
       None,
+      None,
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
     )
@@ -133,6 +157,7 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
       "topic-a",
       "group-b",
       "member-c",
+      None,
       None,
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(100),
@@ -152,10 +177,12 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
       ConsumerGroupMember {
         member_id: "member-a".to_string(),
         pod_id: Some("pod-a".to_string()),
+        cluster_id: Some("cluster-a".to_string()),
       },
       ConsumerGroupMember {
         member_id: "member-b".to_string(),
         pod_id: None,
+        cluster_id: None,
       },
     ]
   );
@@ -166,6 +193,7 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
       "group-a",
       "member-a",
       Some("pod-a".to_string()),
+      None,
       offset_datetime_from_unix_millis(1_120),
       TimeDuration::milliseconds(100),
     )
@@ -183,6 +211,7 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
     vec![ConsumerGroupMember {
       member_id: "member-a".to_string(),
       pod_id: Some("pod-a".to_string()),
+      cluster_id: None,
     }]
   );
 
@@ -221,6 +250,7 @@ async fn register_rejects_invalid_ttl() -> Result<()> {
       "group-a",
       "member-a",
       None,
+      None,
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::ZERO,
     )
@@ -255,6 +285,7 @@ async fn writes_ttl_attribute_for_membership_rows() -> Result<()> {
       "group-a",
       "member-a",
       Some("pod-a".to_string()),
+      Some("cluster-a".to_string()),
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(1_000),
     )
@@ -288,6 +319,12 @@ async fn writes_ttl_attribute_for_membership_rows() -> Result<()> {
       .get(POD_ID_ATTRIBUTE_NAME)
       .and_then(|value| value.as_s().ok().map(String::as_str)),
     Some("pod-a")
+  );
+  assert_eq!(
+    item
+      .get(CLUSTER_ID_ATTRIBUTE_NAME)
+      .and_then(|value| value.as_s().ok().map(String::as_str)),
+    Some("cluster-a")
   );
   for attribute in ["topic", "group_id", "member_id"] {
     assert!(
@@ -377,6 +414,7 @@ async fn planner_records_do_not_appear_in_legacy_member_partition() -> Result<()
       "topic-a",
       "group-a",
       "member-a",
+      None,
       None,
       offset_datetime_from_unix_millis(1_000),
       TimeDuration::milliseconds(1_000),
@@ -478,10 +516,12 @@ async fn assignment_plan_topology_round_trips_and_is_removed_for_flat_plan() -> 
     ConsumerGroupMember {
       member_id: "member-a".to_string(),
       pod_id: Some("pod-a".to_string()),
+      cluster_id: Some("cluster-a".to_string()),
     },
     ConsumerGroupMember {
       member_id: "member-b".to_string(),
       pod_id: Some("pod-b".to_string()),
+      cluster_id: Some("cluster-b".to_string()),
     },
   ];
   assert!(
@@ -551,6 +591,7 @@ fn assignment_plan_topology_missing_pod_id_returns_error() {
     member_topology: Some(vec![ConsumerGroupMember {
       member_id: "member-a".to_string(),
       pod_id: None,
+      cluster_id: None,
     }]),
     assignments: vec![ConsumerGroupAssignment {
       virtual_partition_id: 0,

@@ -502,6 +502,7 @@ impl ConsumerCoordinationSource for MembershipCoordinationSource {
       members.push(ConsumerGroupMember {
         member_id: self.local_member_id.clone(),
         pod_id: None,
+        cluster_id: None,
       });
     }
 

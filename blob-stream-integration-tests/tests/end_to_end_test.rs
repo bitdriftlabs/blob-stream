@@ -7510,25 +7510,29 @@ async fn dynamic_membership_scale_out_rebalances() -> Result<()> {
 async fn consumer_group_balances_partitions_across_configured_pods() -> Result<()> {
   let mut cluster = ClusterHarness::in_memory(1).start().await?;
   let workers = [
-    ("pod-a-worker-0", "pod-a"),
-    ("pod-a-worker-1", "pod-a"),
-    ("pod-b-worker-0", "pod-b"),
-    ("pod-b-worker-1", "pod-b"),
-    ("pod-c-worker-0", "pod-c"),
-    ("pod-c-worker-1", "pod-c"),
+    ("pod-a-worker-0", "pod-a", "cluster-a"),
+    ("pod-a-worker-1", "pod-a", "cluster-a"),
+    ("pod-b-worker-0", "pod-b", "cluster-b"),
+    ("pod-b-worker-1", "pod-b", "cluster-b"),
+    ("pod-c-worker-0", "pod-c", "cluster-b"),
+    ("pod-c-worker-1", "pod-c", "cluster-b"),
   ];
-  let worker_pods = workers.iter().copied().collect::<HashMap<_, _>>();
+  let worker_pods = workers
+    .iter()
+    .map(|(member_id, pod_id, _)| (*member_id, *pod_id))
+    .collect::<HashMap<_, _>>();
   let (event_tx, mut event_rx) = mpsc::unbounded_channel();
   let mut stop_txs = Vec::new();
   let mut consumer_tasks = Vec::new();
 
-  for (member_id, pod_id) in workers {
+  for (member_id, pod_id, cluster_id) in workers {
     let mut runtime = consumer_runtime_config(member_id);
-    runtime
+    let group = runtime
       .group
       .as_mut()
-      .ok_or_else(|| anyhow!("pod balancing consumer group config missing"))?
-      .pod_id = Some(pod_id.to_string().into());
+      .ok_or_else(|| anyhow!("pod balancing consumer group config missing"))?;
+    group.pod_id = Some(pod_id.to_string().into());
+    group.cluster_id = Some(cluster_id.to_string().into());
     let consumer = Box::new(cluster.create_consumer(&runtime).await?);
     let (stop_tx, stop_rx) = watch::channel(false);
     stop_txs.push(stop_tx);
@@ -7582,11 +7586,12 @@ async fn consumer_group_balances_partitions_across_configured_pods() -> Result<(
   let mut sorted_pod_loads = pod_loads.values().copied().collect::<Vec<_>>();
   sorted_pod_loads.sort_unstable();
   assert_eq!(sorted_pod_loads, vec![5, 5, 6]);
+  assert_eq!(pod_loads.get("pod-a"), Some(&6));
   for pod_id in ["pod-a", "pod-b", "pod-c"] {
     let worker_loads = workers
       .iter()
-      .filter(|(_, worker_pod_id)| *worker_pod_id == pod_id)
-      .map(|(member_id, _)| {
+      .filter(|(_, worker_pod_id, _)| *worker_pod_id == pod_id)
+      .map(|(member_id, ..)| {
         member_loads
           .get(member_id)
           .copied()
@@ -7611,9 +7616,10 @@ async fn consumer_group_balances_partitions_across_configured_pods() -> Result<(
     Some(
       workers
         .iter()
-        .map(|(member_id, pod_id)| ConsumerGroupMember {
+        .map(|(member_id, pod_id, cluster_id)| ConsumerGroupMember {
           member_id: (*member_id).to_string(),
           pod_id: Some((*pod_id).to_string()),
+          cluster_id: Some((*cluster_id).to_string()),
         })
         .collect()
     )

@@ -346,6 +346,7 @@ impl ConsumerGroupCoordinatorImpl {
         &active_members,
         &self.config.member_id,
         Some(local_pod_id),
+        self.config.cluster_id.as_deref(),
       )
     } else {
       None

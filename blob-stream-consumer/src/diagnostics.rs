@@ -373,6 +373,7 @@ pub enum ConsumerAssignmentPolicy {
 pub struct ConsumerMemberTopologySnapshot {
   pub member_id: String,
   pub pod_id: String,
+  pub cluster_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -675,7 +676,7 @@ impl ConsumerDiagnostics {
 pub fn assignment_plan_snapshot(
   plan: ConsumerGroupAssignmentPlan,
 ) -> ConsumerAssignmentPlanSnapshot {
-  let member_pods = plan
+  let member_topology_by_id = plan
     .member_topology
     .as_ref()
     .map(|members| {
@@ -685,17 +686,22 @@ pub fn assignment_plan_snapshot(
           member
             .pod_id
             .as_ref()
-            .map(|pod_id| (member.member_id.clone(), pod_id.clone()))
+            .map(|_| (member.member_id.clone(), member.clone()))
         })
         .collect::<BTreeMap<_, _>>()
     })
     .unwrap_or_default();
   let mut pod_loads = BTreeMap::new();
-  for pod_id in member_pods.values() {
-    pod_loads.entry(pod_id.clone()).or_insert(0_usize);
+  for member in member_topology_by_id.values() {
+    if let Some(pod_id) = &member.pod_id {
+      pod_loads.entry(pod_id.clone()).or_insert(0_usize);
+    }
   }
   for assignment in &plan.assignments {
-    if let Some(pod_id) = member_pods.get(&assignment.member_id) {
+    if let Some(pod_id) = member_topology_by_id
+      .get(&assignment.member_id)
+      .and_then(|member| member.pod_id.as_ref())
+    {
       *pod_loads.entry(pod_id.clone()).or_insert(0_usize) += 1;
     }
   }
@@ -708,11 +714,17 @@ pub fn assignment_plan_snapshot(
       ConsumerAssignmentPolicy::FlatMember
     },
     members: plan.members,
-    member_topology: member_pods
+    member_topology: member_topology_by_id
       .iter()
-      .map(|(member_id, pod_id)| ConsumerMemberTopologySnapshot {
-        member_id: member_id.clone(),
-        pod_id: pod_id.clone(),
+      .filter_map(|(member_id, member)| {
+        member
+          .pod_id
+          .as_ref()
+          .map(|pod_id| ConsumerMemberTopologySnapshot {
+            member_id: member_id.clone(),
+            pod_id: pod_id.clone(),
+            cluster_id: member.cluster_id.clone(),
+          })
       })
       .collect(),
     pod_loads: pod_loads
@@ -727,7 +739,9 @@ pub fn assignment_plan_snapshot(
       .into_iter()
       .map(|assignment| ConsumerPartitionAssignmentSnapshot {
         virtual_partition_id: assignment.virtual_partition_id,
-        pod_id: member_pods.get(&assignment.member_id).cloned(),
+        pod_id: member_topology_by_id
+          .get(&assignment.member_id)
+          .and_then(|member| member.pod_id.clone()),
         member_id: assignment.member_id,
       })
       .collect(),

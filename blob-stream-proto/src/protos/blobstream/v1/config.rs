@@ -4127,6 +4127,8 @@ pub struct ConsumerGroupConfig {
     pub rebalance_interval: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.pod_id)
     pub pod_id: ::std::option::Option<::protobuf::Chars>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerGroupConfig.cluster_id)
+    pub cluster_id: ::std::option::Option<::protobuf::Chars>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.ConsumerGroupConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -4144,7 +4146,7 @@ impl ConsumerGroupConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(7);
+        let mut fields = ::std::vec::Vec::with_capacity(8);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "topic",
@@ -4180,6 +4182,11 @@ impl ConsumerGroupConfig {
             "pod_id",
             |m: &ConsumerGroupConfig| { &m.pod_id },
             |m: &mut ConsumerGroupConfig| { &mut m.pod_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "cluster_id",
+            |m: &ConsumerGroupConfig| { &m.cluster_id },
+            |m: &mut ConsumerGroupConfig| { &mut m.cluster_id },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ConsumerGroupConfig>(
             "ConsumerGroupConfig",
@@ -4220,6 +4227,9 @@ impl ::protobuf::Message for ConsumerGroupConfig {
                 58 => {
                     self.pod_id = ::std::option::Option::Some(is.read_tokio_chars()?);
                 },
+                66 => {
+                    self.cluster_id = ::std::option::Option::Some(is.read_tokio_chars()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -4256,6 +4266,9 @@ impl ::protobuf::Message for ConsumerGroupConfig {
         if let Some(v) = self.pod_id.as_ref() {
             my_size += ::protobuf::rt::string_size(7, &v);
         }
+        if let Some(v) = self.cluster_id.as_ref() {
+            my_size += ::protobuf::rt::string_size(8, &v);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -4283,6 +4296,9 @@ impl ::protobuf::Message for ConsumerGroupConfig {
         if let Some(v) = self.pod_id.as_ref() {
             os.write_string(7, v)?;
         }
+        if let Some(v) = self.cluster_id.as_ref() {
+            os.write_string(8, v)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -4307,6 +4323,7 @@ impl ::protobuf::Message for ConsumerGroupConfig {
         self.heartbeat_interval.clear();
         self.rebalance_interval.clear();
         self.pod_id = ::std::option::Option::None;
+        self.cluster_id = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -4319,6 +4336,7 @@ impl ::protobuf::Message for ConsumerGroupConfig {
             heartbeat_interval: ::protobuf::MessageField::none(),
             rebalance_interval: ::protobuf::MessageField::none(),
             pod_id: ::std::option::Option::None,
+            cluster_id: ::std::option::Option::None,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -4946,7 +4964,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     BatchReadsB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x12I\n\x0emax_clock_skew\
     \x18\x0c\x20\x01(\x0b2\x19.google.protobuf.DurationR\x0cmaxClockSkewB\
     \x08\xfaB\x05\xaa\x01\x02*\0B\x15\n\x13_prefetch_max_bytesB\x1a\n\x18_ev\
-    entual_metadata_readsB\x1c\n\x1a_max_in_flight_batch_reads\"\xa2\x03\n\
+    entual_metadata_readsB\x1c\n\x1a_max_in_flight_batch_reads\"\xde\x03\n\
     \x13ConsumerGroupConfig\x12\x1d\n\x05topic\x18\x01\x20\x01(\tR\x05topicB\
     \x07\xfaB\x04r\x02\x10\x01\x12\"\n\x08group_id\x18\x02\x20\x01(\tR\x07gr\
     oupIdB\x07\xfaB\x04r\x02\x10\x01\x12$\n\tmember_id\x18\x03\x20\x01(\tR\
@@ -4957,24 +4975,25 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x01\x02*\0\x12R\n\x12rebalance_interval\x18\x06\x20\x01(\x0b2\x19.googl\
     e.protobuf.DurationR\x11rebalanceIntervalB\x08\xfaB\x05\xaa\x01\x02*\0\
     \x12#\n\x06pod_id\x18\x07\x20\x01(\tH\0R\x05podIdB\x07\xfaB\x04r\x02\x10\
-    \x01\x88\x01\x01B\t\n\x07_pod_id\"\x9c\x01\n\x15ConsumerRuntimeConfig\
-    \x12?\n\x04read\x18\x01\x20\x01(\x0b2!.blobstream.v1.ConsumerReadConfigR\
-    \x04readB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12B\n\x05group\x18\x02\x20\
-    \x01(\x0b2\".blobstream.v1.ConsumerGroupConfigR\x05groupB\x08\xfaB\x05\
-    \x8a\x01\x02\x10\x01\"\xa0\x03\n\x1fConsumerIteratorBootstrapConfig\x12H\
-    \n\x07runtime\x18\x01\x20\x01(\x0b2$.blobstream.v1.ConsumerRuntimeConfig\
-    R\x07runtimeB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12:\n\x05topic\x18\x02\
-    \x20\x01(\x0b2\x1a.blobstream.v1.TopicConfigR\x05topicB\x08\xfaB\x05\x8a\
-    \x01\x02\x10\x01\x12G\n\nblob_store\x18\x03\x20\x01(\x0b2\x1e.blobstream\
-    .v1.BlobStoreConfigR\tblobStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12S\n\
-    \x0emetadata_store\x18\x04\x20\x01(\x0b2\".blobstream.v1.MetadataStoreCo\
-    nfigR\rmetadataStoreB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12Y\n\x10broker_\
-    discovery\x18\x05\x20\x01(\x0b2$.blobstream.v1.BrokerDiscoveryConfigR\
-    \x0fbrokerDiscoveryB\x08\xfaB\x05\x8a\x01\x02\x10\x01*P\n\x12SegmentComp\
-    ression\x12\x1c\n\x18SEGMENT_COMPRESSION_NONE\x10\0\x12\x1c\n\x18SEGMENT\
-    _COMPRESSION_ZSTD\x10\x01*U\n\x13ProducerCompression\x12\x1d\n\x19PRODUC\
-    ER_COMPRESSION_NONE\x10\0\x12\x1f\n\x1bPRODUCER_COMPRESSION_SNAPPY\x10\
-    \x01b\x06proto3\
+    \x01\x88\x01\x01\x12+\n\ncluster_id\x18\x08\x20\x01(\tH\x01R\tclusterIdB\
+    \x07\xfaB\x04r\x02\x10\x01\x88\x01\x01B\t\n\x07_pod_idB\r\n\x0b_cluster_\
+    id\"\x9c\x01\n\x15ConsumerRuntimeConfig\x12?\n\x04read\x18\x01\x20\x01(\
+    \x0b2!.blobstream.v1.ConsumerReadConfigR\x04readB\x08\xfaB\x05\x8a\x01\
+    \x02\x10\x01\x12B\n\x05group\x18\x02\x20\x01(\x0b2\".blobstream.v1.Consu\
+    merGroupConfigR\x05groupB\x08\xfaB\x05\x8a\x01\x02\x10\x01\"\xa0\x03\n\
+    \x1fConsumerIteratorBootstrapConfig\x12H\n\x07runtime\x18\x01\x20\x01(\
+    \x0b2$.blobstream.v1.ConsumerRuntimeConfigR\x07runtimeB\x08\xfaB\x05\x8a\
+    \x01\x02\x10\x01\x12:\n\x05topic\x18\x02\x20\x01(\x0b2\x1a.blobstream.v1\
+    .TopicConfigR\x05topicB\x08\xfaB\x05\x8a\x01\x02\x10\x01\x12G\n\nblob_st\
+    ore\x18\x03\x20\x01(\x0b2\x1e.blobstream.v1.BlobStoreConfigR\tblobStoreB\
+    \x08\xfaB\x05\x8a\x01\x02\x10\x01\x12S\n\x0emetadata_store\x18\x04\x20\
+    \x01(\x0b2\".blobstream.v1.MetadataStoreConfigR\rmetadataStoreB\x08\xfaB\
+    \x05\x8a\x01\x02\x10\x01\x12Y\n\x10broker_discovery\x18\x05\x20\x01(\x0b\
+    2$.blobstream.v1.BrokerDiscoveryConfigR\x0fbrokerDiscoveryB\x08\xfaB\x05\
+    \x8a\x01\x02\x10\x01*P\n\x12SegmentCompression\x12\x1c\n\x18SEGMENT_COMP\
+    RESSION_NONE\x10\0\x12\x1c\n\x18SEGMENT_COMPRESSION_ZSTD\x10\x01*U\n\x13\
+    ProducerCompression\x12\x1d\n\x19PRODUCER_COMPRESSION_NONE\x10\0\x12\x1f\
+    \n\x1bPRODUCER_COMPRESSION_SNAPPY\x10\x01b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

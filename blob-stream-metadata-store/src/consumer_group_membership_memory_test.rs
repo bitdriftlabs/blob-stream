@@ -19,6 +19,7 @@ async fn register_heartbeat_list_and_deregister() {
       "group-a",
       "member-a",
       Some("pod-a".to_string()),
+      Some("cluster-a".to_string()),
       offset_datetime_from_unix_millis(1_000),
       Duration::milliseconds(100),
     )
@@ -30,6 +31,7 @@ async fn register_heartbeat_list_and_deregister() {
       "group-a",
       "member-b",
       None,
+      None,
       offset_datetime_from_unix_millis(1_000),
       Duration::milliseconds(100),
     )
@@ -40,6 +42,7 @@ async fn register_heartbeat_list_and_deregister() {
       "topic-a",
       "group-b",
       "member-c",
+      None,
       None,
       offset_datetime_from_unix_millis(1_000),
       Duration::milliseconds(100),
@@ -61,10 +64,12 @@ async fn register_heartbeat_list_and_deregister() {
       ConsumerGroupMember {
         member_id: "member-a".to_string(),
         pod_id: Some("pod-a".to_string()),
+        cluster_id: Some("cluster-a".to_string()),
       },
       ConsumerGroupMember {
         member_id: "member-b".to_string(),
         pod_id: None,
+        cluster_id: None,
       },
     ]
   );
@@ -75,6 +80,7 @@ async fn register_heartbeat_list_and_deregister() {
       "group-a",
       "member-a",
       Some("pod-a".to_string()),
+      Some("cluster-a".to_string()),
       offset_datetime_from_unix_millis(1_120),
       Duration::milliseconds(100),
     )
@@ -94,6 +100,7 @@ async fn register_heartbeat_list_and_deregister() {
     vec![ConsumerGroupMember {
       member_id: "member-a".to_string(),
       pod_id: Some("pod-a".to_string()),
+      cluster_id: Some("cluster-a".to_string()),
     }]
   );
 
@@ -121,6 +128,7 @@ async fn register_rejects_invalid_ttl() {
       "topic-a",
       "group-a",
       "member-a",
+      None,
       None,
       offset_datetime_from_unix_millis(1_000),
       Duration::ZERO,

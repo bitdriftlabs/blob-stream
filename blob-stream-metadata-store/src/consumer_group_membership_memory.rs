@@ -41,6 +41,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
+    cluster_id: Option<String>,
     now: OffsetDateTime,
     ttl: Duration,
   ) -> Result<()> {
@@ -57,6 +58,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     let state = MemberState {
       lease_expiration_ts_ms: expires_at,
       pod_id,
+      cluster_id,
     };
     self.state.write().members.insert(key, state);
     Ok(())
@@ -68,6 +70,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
     group_id: &str,
     member_id: &str,
     pod_id: Option<String>,
+    cluster_id: Option<String>,
     now: OffsetDateTime,
     ttl: Duration,
   ) -> Result<()> {
@@ -76,7 +79,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
        member_id={member_id}"
     );
     self
-      .register_member(topic, group_id, member_id, pod_id, now, ttl)
+      .register_member(topic, group_id, member_id, pod_id, cluster_id, now, ttl)
       .await
   }
 
@@ -107,6 +110,7 @@ impl ConsumerGroupMembershipStore for InMemoryConsumerGroupMembershipStore {
         members.insert(ConsumerGroupMember {
           member_id: key.member_id.clone(),
           pod_id: state.pod_id.clone(),
+          cluster_id: state.cluster_id.clone(),
         });
       }
     }
@@ -297,6 +301,7 @@ impl MemberKey {
 struct MemberState {
   lease_expiration_ts_ms: i64,
   pod_id: Option<String>,
+  cluster_id: Option<String>,
 }
 
 //
