@@ -190,7 +190,13 @@ pub(super) fn cooperative_sticky_assignment_with_pods(
   }
 
   // Move only enough partitions to make aggregate pod loads differ by at most one.
-  rebalance_pod_loads(&partitions, &mut partition_pods, &mut pod_load);
+  rebalance_pod_loads(
+    &partitions,
+    &mut partition_pods,
+    &mut pod_load,
+    pod_clusters.as_ref(),
+    cluster_pod_counts.as_ref(),
+  );
   if let (Some(pod_clusters), Some(cluster_pod_counts)) =
     (pod_clusters.as_ref(), cluster_pod_counts.as_ref())
   {
@@ -329,6 +335,18 @@ fn cluster_pod_counts(pod_clusters: &BTreeMap<String, String>) -> BTreeMap<Strin
   cluster_pod_counts
 }
 
+fn pod_cluster_count(
+  pod_id: &str,
+  pod_clusters: Option<&BTreeMap<String, String>>,
+  cluster_pod_counts: Option<&BTreeMap<String, usize>>,
+) -> usize {
+  pod_clusters
+    .and_then(|pod_clusters| pod_clusters.get(pod_id))
+    .and_then(|cluster_id| cluster_pod_counts.and_then(|counts| counts.get(cluster_id)))
+    .copied()
+    .unwrap_or_default()
+}
+
 fn least_loaded_pod(
   pod_load: &BTreeMap<String, usize>,
   pod_clusters: Option<&BTreeMap<String, String>>,
@@ -339,12 +357,11 @@ fn least_loaded_pod(
   pod_load
     .iter()
     .min_by_key(|(pod_id, load)| {
-      let cluster_pod_count = pod_clusters
-        .and_then(|pod_clusters| pod_clusters.get(*pod_id))
-        .and_then(|cluster_id| cluster_pod_counts.and_then(|counts| counts.get(cluster_id)))
-        .copied()
-        .unwrap_or_default();
-      (**load, cluster_pod_count, *pod_id)
+      (
+        **load,
+        pod_cluster_count(pod_id, pod_clusters, cluster_pod_counts),
+        *pod_id,
+      )
     })
     .map(|(pod_id, _)| pod_id.clone())
     .unwrap_or_default()
@@ -404,18 +421,33 @@ fn rebalance_pod_loads(
   partitions: &[VirtualPartitionId],
   partition_pods: &mut HashMap<VirtualPartitionId, String>,
   pod_load: &mut BTreeMap<String, usize>,
+  pod_clusters: Option<&BTreeMap<String, String>>,
+  cluster_pod_counts: Option<&BTreeMap<String, usize>>,
 ) {
   // Each iteration moves one partition from the most-loaded pod to the least-loaded pod. Since
   // prior placements are retained until this point, this is the minimum movement needed for the
-  // current load extremes.
+  // current load extremes. Cluster size resolves otherwise equivalent moves so the residual stays
+  // with a smaller cluster and does not require a corrective second handoff.
   loop {
     let over = pod_load
       .iter()
-      .max_by_key(|(pod_id, load)| (**load, *pod_id))
+      .max_by_key(|(pod_id, load)| {
+        (
+          **load,
+          pod_cluster_count(pod_id, pod_clusters, cluster_pod_counts),
+          *pod_id,
+        )
+      })
       .map(|(pod_id, _)| pod_id.clone());
     let under = pod_load
       .iter()
-      .min_by_key(|(pod_id, load)| (**load, *pod_id))
+      .min_by_key(|(pod_id, load)| {
+        (
+          **load,
+          pod_cluster_count(pod_id, pod_clusters, cluster_pod_counts),
+          *pod_id,
+        )
+      })
       .map(|(pod_id, _)| pod_id.clone());
     let (Some(over_pod), Some(under_pod)) = (over, under) else {
       break;

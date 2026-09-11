@@ -446,6 +446,57 @@ fn pod_aware_assignment_repairs_sticky_residual_load_for_smaller_cluster() {
 }
 
 #[test]
+fn pod_aware_assignment_preserves_minimal_movement_with_uneven_sticky_loads() {
+  let members = vec![
+    ConsumerGroupMember {
+      member_id: "pod-a:worker-0".to_string(),
+      pod_id: Some("pod-a".to_string()),
+      cluster_id: Some("cluster-large".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-b:worker-0".to_string(),
+      pod_id: Some("pod-b".to_string()),
+      cluster_id: Some("cluster-large".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-z:worker-0".to_string(),
+      pod_id: Some("pod-z".to_string()),
+      cluster_id: Some("cluster-small".to_string()),
+    },
+  ];
+  let partitions = (0 .. 13).collect::<Vec<_>>();
+  let previous = partitions
+    .iter()
+    .map(|partition_id| {
+      let member_id = match partition_id {
+        0 .. 3 => "pod-a:worker-0",
+        3 .. 8 => "pod-b:worker-0",
+        _ => "pod-z:worker-0",
+      };
+      (*partition_id, member_id.to_string())
+    })
+    .collect::<HashMap<_, _>>();
+
+  let assignment = cooperative_sticky_assignment_with_pods(&members, &partitions, &previous);
+  let pod_loads = ["pod-a", "pod-b", "pod-z"]
+    .iter()
+    .map(|pod_id| {
+      assignment
+        .values()
+        .filter(|member_id| member_id.starts_with(pod_id))
+        .count()
+    })
+    .collect::<Vec<_>>();
+  let moved = partitions
+    .iter()
+    .filter(|partition_id| assignment.get(partition_id) != previous.get(partition_id))
+    .count();
+
+  assert_eq!(pod_loads, vec![4, 4, 5]);
+  assert_eq!(moved, 1);
+}
+
+#[test]
 fn pod_aware_assignment_ignores_partial_cluster_topology() {
   let members = vec![
     ConsumerGroupMember {
