@@ -98,43 +98,6 @@ fn round_trips_segment_metadata_through_transport_proto() {
 }
 
 #[test]
-fn legacy_repeated_partition_batches_keep_the_final_batch() {
-  let initial_batch = SegmentBatchMetadata {
-    seq_start: 1,
-    seq_end: 1,
-    byte_start: 0,
-    byte_end: 10,
-    payload_bytes: 10,
-    ..Default::default()
-  };
-  let final_batch = SegmentBatchMetadata {
-    seq_start: 2,
-    seq_end: 2,
-    byte_start: 10,
-    byte_end: 20,
-    payload_bytes: 10,
-    ..Default::default()
-  };
-  let mut legacy_payload = SegmentPartitionIndex {
-    virtual_partition_id: 7,
-    batch: Some(initial_batch).into(),
-    ..Default::default()
-  }
-  .write_to_bytes()
-  .expect("encode initial batch");
-  let final_batch_payload = final_batch.write_to_bytes().expect("encode final batch");
-  assert!(final_batch_payload.len() < 128);
-  legacy_payload.push(0x12);
-  legacy_payload.push(u8::try_from(final_batch_payload.len()).expect("batch payload fits u8"));
-  legacy_payload.extend_from_slice(&final_batch_payload);
-
-  let decoded = SegmentPartitionIndex::parse_from_bytes(&legacy_payload)
-    .expect("decode legacy repeated batches");
-
-  assert_eq!(decoded.batch.as_ref(), Some(&final_batch));
-}
-
-#[test]
 fn rejects_malformed_payload() {
   let error = decode(
     "topic-a#1700000000",

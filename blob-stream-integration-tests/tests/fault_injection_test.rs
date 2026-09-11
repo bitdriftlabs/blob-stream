@@ -1040,13 +1040,16 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     expected_ids.insert(id);
   }
 
+  let reader_partitions = produced_partitions.into_iter().collect::<Vec<_>>();
+  let reader_now =
+    OffsetDateTime::from_unix_timestamp(framework::now_unix_seconds().saturating_add(3))?;
   let mut reader = ConsumerReaderImpl::new(
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       ..Default::default()
     },
-    produced_partitions.into_iter().collect(),
+    Vec::new(),
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
@@ -1057,11 +1060,14 @@ async fn network_partition_active_broker_takeover() -> Result<()> {
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
+  // Activate the final direct-reader oracle as Fresh so its first full-window scan cannot advance
+  // a Fast frontier before it has observed the durable pre-reroute records.
+  reader.set_assigned_virtual_partitions(&reader_partitions, reader_now)?;
 
   let deliveries = drain_reader_until_with_trace(
     &mut reader,
     expected_ids.len(),
-    framework::now_unix_seconds().saturating_add(3),
+    reader_now.unix_timestamp(),
     Instant::now() + Duration::from_secs(30),
   )
   .await?;
@@ -2053,13 +2059,16 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
     expected_ids.insert(id);
   }
 
+  let reader_partitions = produced_partitions.into_iter().collect::<Vec<_>>();
+  let reader_now =
+    OffsetDateTime::from_unix_timestamp(framework::now_unix_seconds().saturating_add(3))?;
   let mut reader = ConsumerReaderImpl::new(
     Arc::new(SystemTimeProvider),
     ConsumerReadConfig {
       topic: TOPIC.to_string().into(),
       ..Default::default()
     },
-    produced_partitions.into_iter().collect(),
+    Vec::new(),
     HashMap::new(),
     resources.blob_store(),
     resources.metadata_store(),
@@ -2070,11 +2079,14 @@ async fn producer_lease_store_conflicts_then_broker_reroute_preserves_progress()
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
   )?;
+  // Activate the final direct-reader oracle as Fresh so its first full-window scan cannot advance
+  // a Fast frontier before it has observed the durable pre-reroute records.
+  reader.set_assigned_virtual_partitions(&reader_partitions, reader_now)?;
 
   let deliveries = drain_reader_until_with_trace(
     &mut reader,
     expected_ids.len(),
-    framework::now_unix_seconds().saturating_add(3),
+    reader_now.unix_timestamp(),
     Instant::now() + Duration::from_secs(45),
   )
   .await?;
