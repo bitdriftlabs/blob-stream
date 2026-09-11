@@ -4,6 +4,9 @@ This guide covers the resources and configuration needed to deploy `blob-stream`
 behavior, see [Storage](design/storage.md). For runtime diagnostics and consistency controls, see
 [Operations](operations.md).
 
+For a per-cluster Kubernetes resource example, see the
+[deployment reference](../examples/deployment/README.md).
+
 The protobuf schema in
 [`blobstream/v1/config.proto`](../blob-stream-proto/proto/blobstream/v1/config.proto) is the
 canonical field-level configuration reference.
