@@ -3634,14 +3634,13 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     obReadFailureStatus\x12(\n$BLOB_READ_FAILURE_STATUS_BAD_REQUEST\x10\0\
     \x12'\n#BLOB_READ_FAILURE_STATUS_OVERLOADED\x10\x01\x12&\n\"BLOB_READ_FA\
     ILURE_STATUS_TOO_LARGE\x10\x02\x12$\n\x20BLOB_READ_FAILURE_STATUS_STORAG\
-    E\x10\x03\x12&\n\"BLOB_READ_FAILURE_STATUS_NOT_FOUND\x10\x042\x91\x03\n\
-    \rBrokerService\x12W\n\x0cProduceBatch\x12\".blobstream.v1.ProduceBatchR\
-    equest\x1a#.blobstream.v1.ProduceBatchResponse\x12]\n\x0eProduceBatches\
-    \x12$.blobstream.v1.ProduceBatchesRequest\x1a%.blobstream.v1.ProduceBatc\
-    hesResponse\x12i\n\x12ReadMetadataWindow\x12(.blobstream.v1.ReadMetadata\
-    WindowRequest\x1a).blobstream.v1.ReadMetadataWindowResponse\x12]\n\x0eRe\
-    adBlobRanges\x12$.blobstream.v1.ReadBlobRangesRequest\x1a%.blobstream.v1\
-    .ReadBlobRangesResponseb\x06proto3\
+    E\x10\x03\x12&\n\"BLOB_READ_FAILURE_STATUS_NOT_FOUND\x10\x042\xb8\x02\n\
+    \rBrokerService\x12]\n\x0eProduceBatches\x12$.blobstream.v1.ProduceBatch\
+    esRequest\x1a%.blobstream.v1.ProduceBatchesResponse\x12i\n\x12ReadMetada\
+    taWindow\x12(.blobstream.v1.ReadMetadataWindowRequest\x1a).blobstream.v1\
+    .ReadMetadataWindowResponse\x12]\n\x0eReadBlobRanges\x12$.blobstream.v1.\
+    ReadBlobRangesRequest\x1a%.blobstream.v1.ReadBlobRangesResponseb\x06prot\
+    o3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

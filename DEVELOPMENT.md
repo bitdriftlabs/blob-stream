@@ -1,8 +1,8 @@
 # Development Guide
 
 This guide is the canonical workflow reference for contributors. See the
-[repository overview](README.md) for the full documentation map and [Design](docs/design.md) before
-changing architecture-sensitive behavior.
+[repository overview](README.md) for the full documentation map and [Design](docs/design/README.md)
+before changing architecture-sensitive behavior.
 
 ## Choose Your Environment
 
@@ -173,7 +173,7 @@ cargo test -p blob-stream-metadata-store --doc
 
 ## Related Guides
 
-- [Design](docs/design.md): system behavior and correctness contracts
+- [Design](docs/design/README.md): system behavior and correctness contracts
 - [Infrastructure setup](docs/infrastructure.md): local and production resources
 - [Operations guide](docs/operations.md): runtime controls and diagnostics
 - [Integration-test audit](plans/TEST_AUDIT.md): deterministic test rules and hardening work

@@ -245,7 +245,6 @@ fn rows_for_segment(
     .segment_index
     .get(&virtual_partition_id)
     .into_iter()
-    .flatten()
     .map(|batch| row_for_batch(segment, batch, suspect_cursor))
     .collect()
 }

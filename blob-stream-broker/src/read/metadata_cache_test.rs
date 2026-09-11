@@ -176,11 +176,11 @@ fn segment() -> SegmentMetadata {
     Compression::none(),
     HashMap::from([(
       0,
-      vec![BatchMetadata {
+      BatchMetadata {
         seq_range: SeqRange { start: 0, end: 1 },
         byte_range: ByteRange { start: 0, end: 1 },
         payload_bytes: 1,
-      }],
+      },
     )]),
     OffsetDateTime::UNIX_EPOCH,
     OffsetDateTime::UNIX_EPOCH,
@@ -477,19 +477,19 @@ async fn tail_response_filters_each_partition_at_its_requested_bound() {
     HashMap::from([
       (
         0,
-        vec![BatchMetadata {
+        BatchMetadata {
           seq_range: SeqRange { start: 0, end: 1 },
           byte_range: ByteRange { start: 0, end: 1 },
           payload_bytes: 1,
-        }],
+        },
       ),
       (
         1,
-        vec![BatchMetadata {
+        BatchMetadata {
           seq_range: SeqRange { start: 0, end: 1 },
           byte_range: ByteRange { start: 1, end: 2 },
           payload_bytes: 1,
-        }],
+        },
       ),
     ]),
     OffsetDateTime::UNIX_EPOCH,

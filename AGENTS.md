@@ -5,10 +5,10 @@
 
 ## Architecture Changes
 
-- Read [Design](docs/design.md) before changing architecture-sensitive behavior.
-- Update `docs/design.md` in the same change when altering wire protocol, partitioning or routing,
-  lease or sequence behavior, durable storage layout, delivery or cursor guarantees, consumer
-  coordination, or an operational contract.
+- Read the [Design overview](docs/design/README.md) before changing architecture-sensitive behavior.
+- Update the owning document in `docs/design/` in the same change when altering wire protocol,
+  partitioning or routing, lease or sequence behavior, durable storage layout, delivery or cursor
+  guarantees, consumer coordination, or an operational contract.
 - Use [Infrastructure setup](docs/infrastructure.md) and [Operations](docs/operations.md) as the
   sources for deployment and runbook documentation. Do not duplicate those contracts elsewhere.
 - Write documentation as a current-state reference. Do not retain migration history, removed

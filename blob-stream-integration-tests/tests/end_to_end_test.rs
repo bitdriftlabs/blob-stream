@@ -154,11 +154,11 @@ fn fenced_metadata_segment(
     .map(|virtual_partition_id| {
       (
         virtual_partition_id,
-        vec![BatchMetadata {
+        BatchMetadata {
           seq_range: SeqRange { start: 0, end: 0 },
           byte_range: blob_stream_types::ByteRange { start: 0, end: 1 },
           payload_bytes: 1,
-        }],
+        },
       )
     })
     .collect();
@@ -847,9 +847,8 @@ async fn broker_coalesces_same_partition_requests_into_one_consumer_batch() -> R
     tokio::task::yield_now().await;
   };
   assert_eq!(segments.len(), 1);
-  assert_eq!(segments[0].segment_index[&virtual_partition_id].len(), 1);
   assert_eq!(
-    segments[0].segment_index[&virtual_partition_id][0].seq_range,
+    segments[0].segment_index[&virtual_partition_id].seq_range,
     SeqRange { start: 0, end: 1 }
   );
 

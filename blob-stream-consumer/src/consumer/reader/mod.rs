@@ -137,12 +137,10 @@ impl ConsumerReaderImpl {
     bytes = bytes.saturating_add(u64::try_from(segment.window.topic.len()).unwrap_or(u64::MAX));
     bytes =
       bytes.saturating_add(u64::try_from(segment.blob_key.as_str().len()).unwrap_or(u64::MAX));
-    for batches in segment.segment_index.values() {
-      bytes = bytes.saturating_add(
-        u64::try_from(size_of::<BatchMetadata>().saturating_mul(batches.capacity()))
-          .unwrap_or(u64::MAX),
-      );
-    }
+    bytes = bytes.saturating_add(
+      u64::try_from(size_of::<BatchMetadata>().saturating_mul(segment.segment_index.len()))
+        .unwrap_or(u64::MAX),
+    );
     bytes
   }
 }

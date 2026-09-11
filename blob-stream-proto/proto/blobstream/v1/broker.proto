@@ -6,8 +6,6 @@ import "blobstream/v1/metadata.proto";
 
 // Broker gRPC API used by producers to append batches of records.
 service BrokerService {
-  // Append a batch of records to a virtual partition and report persisted acceptance status.
-  rpc ProduceBatch(ProduceBatchRequest) returns (ProduceBatchResponse);
   // Append multiple topic/virtual-partition batches to this broker.
   rpc ProduceBatches(ProduceBatchesRequest) returns (ProduceBatchesResponse);
   // Read bounded segment metadata for one topic window through the local broker cache.

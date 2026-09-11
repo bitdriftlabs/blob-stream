@@ -7,7 +7,11 @@ use super::{
 };
 use crate::SegmentMetadata;
 use blob_stream_blob_store::BlobKey;
-use blob_stream_proto::protos::blobstream::v1::metadata::SegmentMetadataV1;
+use blob_stream_proto::protos::blobstream::v1::metadata::{
+  SegmentBatchMetadata,
+  SegmentMetadataV1,
+  SegmentPartitionIndex,
+};
 use blob_stream_types::{
   BatchMetadata,
   ByteRange,
@@ -37,7 +41,7 @@ fn build_segment(compression: Compression) -> SegmentMetadata {
     compression,
     HashMap::from([(
       7 as VirtualPartitionId,
-      vec![BatchMetadata {
+      BatchMetadata {
         seq_range: SeqRange {
           start: 100,
           end: 199,
@@ -47,7 +51,7 @@ fn build_segment(compression: Compression) -> SegmentMetadata {
           end: 2_048,
         },
         payload_bytes: 1_024,
-      }],
+      },
     )]),
     offset_datetime_from_unix_millis(1_700_000_000_000),
     offset_datetime_from_unix_millis(1_700_000_000_100),
@@ -94,6 +98,43 @@ fn round_trips_segment_metadata_through_transport_proto() {
 }
 
 #[test]
+fn legacy_repeated_partition_batches_keep_the_final_batch() {
+  let initial_batch = SegmentBatchMetadata {
+    seq_start: 1,
+    seq_end: 1,
+    byte_start: 0,
+    byte_end: 10,
+    payload_bytes: 10,
+    ..Default::default()
+  };
+  let final_batch = SegmentBatchMetadata {
+    seq_start: 2,
+    seq_end: 2,
+    byte_start: 10,
+    byte_end: 20,
+    payload_bytes: 10,
+    ..Default::default()
+  };
+  let mut legacy_payload = SegmentPartitionIndex {
+    virtual_partition_id: 7,
+    batch: Some(initial_batch).into(),
+    ..Default::default()
+  }
+  .write_to_bytes()
+  .expect("encode initial batch");
+  let final_batch_payload = final_batch.write_to_bytes().expect("encode final batch");
+  assert!(final_batch_payload.len() < 128);
+  legacy_payload.push(0x12);
+  legacy_payload.push(u8::try_from(final_batch_payload.len()).expect("batch payload fits u8"));
+  legacy_payload.extend_from_slice(&final_batch_payload);
+
+  let decoded = SegmentPartitionIndex::parse_from_bytes(&legacy_payload)
+    .expect("decode legacy repeated batches");
+
+  assert_eq!(decoded.batch.as_ref(), Some(&final_batch));
+}
+
+#[test]
 fn rejects_malformed_payload() {
   let error = decode(
     "topic-a#1700000000",
@@ -121,20 +162,20 @@ fn rejects_semantically_invalid_payloads() {
         as Box<dyn Fn(&mut SegmentMetadataV1)>,
     ),
     (
-      "missing partition batches",
-      Box::new(|metadata: &mut SegmentMetadataV1| metadata.partitions[0].batches.clear())
+      "missing partition batch",
+      Box::new(|metadata: &mut SegmentMetadataV1| metadata.partitions[0].batch.clear())
         as Box<dyn Fn(&mut SegmentMetadataV1)>,
     ),
     (
       "invalid sequence range",
       Box::new(|metadata: &mut SegmentMetadataV1| {
-        metadata.partitions[0].batches[0].seq_start = 200;
+        metadata.partitions[0].batch.as_mut().unwrap().seq_start = 200;
       }) as Box<dyn Fn(&mut SegmentMetadataV1)>,
     ),
     (
       "empty byte range",
       Box::new(|metadata: &mut SegmentMetadataV1| {
-        metadata.partitions[0].batches[0].byte_end = 1_024;
+        metadata.partitions[0].batch.as_mut().unwrap().byte_end = 1_024;
       }) as Box<dyn Fn(&mut SegmentMetadataV1)>,
     ),
   ] {
@@ -156,7 +197,7 @@ fn representative_segment_metadata_fits_one_dynamodb_read_chunk() {
   for partition_id in 0 .. 8_u64 {
     segment_index.insert(
       VirtualPartitionId::try_from(partition_id).expect("representative partition id fits u32"),
-      vec![BatchMetadata {
+      BatchMetadata {
         seq_range: SeqRange {
           start: partition_id * 10_000,
           end: (partition_id * 10_000) + 9_999,
@@ -166,7 +207,7 @@ fn representative_segment_metadata_fits_one_dynamodb_read_chunk() {
           end: (partition_id + 1) * 32 * 1_024 * 1_024,
         },
         payload_bytes: 32 * 1_024 * 1_024,
-      }],
+      },
     );
   }
   let metadata = SegmentMetadata::new(

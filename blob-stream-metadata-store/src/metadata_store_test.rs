@@ -12,7 +12,7 @@ fn formats_partition_and_snowflake_keys() {
     byte_range: blob_stream_types::ByteRange { start: 0, end: 10 },
     payload_bytes: 10,
   };
-  segment_index.insert(0 as blob_stream_types::VirtualPartitionId, vec![batch]);
+  segment_index.insert(0 as blob_stream_types::VirtualPartitionId, batch);
 
   let metadata = SegmentMetadata::new(
     TopicWindowKey {

@@ -317,10 +317,10 @@ impl WriteError {
       Self::NotLeaseHolder { .. } | Self::LeaseFenceLost => {
         ProduceStatus::PRODUCE_STATUS_NOT_LEASE_HOLDER
       },
-      Self::InvalidRequest(_) => ProduceStatus::PRODUCE_STATUS_BAD_REQUEST,
-      Self::InvalidPartition { .. } | Self::Overloaded(_) | Self::Internal(_) => {
-        ProduceStatus::PRODUCE_STATUS_OVERLOADED
+      Self::InvalidPartition { .. } | Self::InvalidRequest(_) => {
+        ProduceStatus::PRODUCE_STATUS_BAD_REQUEST
       },
+      Self::Overloaded(_) | Self::Internal(_) => ProduceStatus::PRODUCE_STATUS_OVERLOADED,
     }
   }
 }

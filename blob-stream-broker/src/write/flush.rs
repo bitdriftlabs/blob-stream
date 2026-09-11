@@ -159,7 +159,7 @@ struct PartitionPublicationState {
 }
 
 struct PersistedPartition {
-  metadata: Vec<BatchMetadata>,
+  metadata: BatchMetadata,
   publication_state: PartitionPublicationState,
 }
 
@@ -231,7 +231,7 @@ impl ObjectBuilder {
       ..encoded_metadata
     };
     let partition = PersistedPartition {
-      metadata: vec![metadata],
+      metadata,
       publication_state: PartitionPublicationState {
         fence,
         publication_predecessor,
@@ -429,7 +429,7 @@ fn minimum_suffix_object_counts(partition_bytes: &[u64], max_segment_bytes: u64)
 impl SegmentEnvelope {
   fn into_metadata(
     self,
-    segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
+    segment_index: HashMap<VirtualPartitionId, BatchMetadata>,
     metadata_published_at: OffsetDateTime,
   ) -> blob_stream_metadata_store::SegmentMetadata {
     blob_stream_metadata_store::SegmentMetadata::new(

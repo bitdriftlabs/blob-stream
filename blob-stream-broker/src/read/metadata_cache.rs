@@ -1391,12 +1391,7 @@ fn response_error(
 
 fn estimate_retained_bytes(segments: &[SegmentMetadata]) -> u32 {
   let bytes = segments.iter().fold(0_u64, |total, segment| {
-    let index_bytes = segment
-      .segment_index
-      .values()
-      .fold(0_u64, |index_total, batches| {
-        index_total.saturating_add(u64::try_from(batches.len()).unwrap_or(u64::MAX) * 40)
-      });
+    let index_bytes = u64::try_from(segment.segment_index.len()).unwrap_or(u64::MAX) * 40;
     total
       .saturating_add(u64::try_from(segment.blob_key.as_str().len()).unwrap_or(u64::MAX))
       .saturating_add(u64::try_from(segment.window.topic.len()).unwrap_or(u64::MAX))

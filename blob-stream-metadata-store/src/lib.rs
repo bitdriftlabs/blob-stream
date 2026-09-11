@@ -84,7 +84,7 @@ pub struct SegmentMetadata {
   /// Compression settings shared by every batch in the segment.
   pub compression: Compression,
   /// Per-partition batch index for byte-range and sequence lookups.
-  pub segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
+  pub segment_index: HashMap<VirtualPartitionId, BatchMetadata>,
   /// Creation instant.
   pub created_at: OffsetDateTime,
   /// Instant immediately before the metadata row was written.
@@ -99,7 +99,7 @@ impl SegmentMetadata {
     snowflake_id: SnowflakeId,
     blob_key: BlobKey,
     compression: Compression,
-    segment_index: HashMap<VirtualPartitionId, Vec<BatchMetadata>>,
+    segment_index: HashMap<VirtualPartitionId, BatchMetadata>,
     created_at: OffsetDateTime,
     metadata_published_at: OffsetDateTime,
   ) -> Self {
