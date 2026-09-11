@@ -12,7 +12,7 @@ points, and operational assumptions.
 | Broker flush delay | 1 second |
 | Broker sequence reservation | 10,000 base sequence values per virtual partition |
 | Broker segment compression | zstd, level 3 |
-| Broker metadata cache | 64 MiB; 250 ms coalescing window; 5-second request deadline |
+| Broker metadata caches | 64 MiB each for Tail and Full Recovery (128 MiB total); 250 ms coalescing window; 5-second request deadline |
 | Broker blob cache | 30-second request deadline; 10-second idle retention when no override is configured |
 | Producer batch records | 10,000 |
 | Producer batch payload bytes | 1 MiB |

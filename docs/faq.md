@@ -96,12 +96,11 @@ that. The metadata store must also support efficient range key scans.
 
 # Why do you rely on out-of-band TTL for records and blobs?
 
-Because its much simpler and the original use case blob-stream was built for uses a single retention
-for all topics. In the future if there is need for variable retention this might initially be
-handled by using different blob prefixes, with the downside of no longer having unified dense blobs
-for all topics. If that is not acceptable, optional built in TTL management can be considered in the
-future or alternatively, compaction into topic specific blobs and continuing to manage TTL
-externally.
+Because it's much simpler, and the original blob-stream use case uses a single retention period for
+all topics. If variable retention is needed in the future, it could initially use different blob
+prefixes, at the cost of losing unified, dense blobs for all topics. If that is unacceptable, we can
+consider optional built-in TTL management or compaction into topic-specific blobs while continuing
+to manage TTL externally.
 
 # Will configuration become centrally managed?
 
