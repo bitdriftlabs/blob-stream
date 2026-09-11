@@ -7,11 +7,7 @@ use super::{
 };
 use crate::SegmentMetadata;
 use blob_stream_blob_store::BlobKey;
-use blob_stream_proto::protos::blobstream::v1::metadata::{
-  SegmentBatchMetadata,
-  SegmentMetadataV1,
-  SegmentPartitionIndex,
-};
+use blob_stream_proto::protos::blobstream::v1::metadata::SegmentMetadataV1;
 use blob_stream_types::{
   BatchMetadata,
   ByteRange,
