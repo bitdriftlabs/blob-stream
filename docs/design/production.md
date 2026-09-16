@@ -79,9 +79,10 @@ already accepted batch, so the producer may retry and applications must tolerate
 ## Appendix: Flush Control Details
 
 Live feature flags can change the broker's byte threshold, maximum flush delay, adaptive-delay
-enablement, adaptive-delay floor, and maximum segment size. Changes apply to future scheduler
-cycles; an existing timer or selected plan retains its prior values. The adaptive controller is
-broker-wide: three matching outcomes can shorten the next delay after split segments or recover it
-after unsplit plans. It changes batching efficiency, not acknowledgement or ordering semantics.
+enablement, adaptive-delay floor, and maximum segment size. Watched updates immediately rearm
+deadlines for buffered, unselected partitions; selected plans retain their prior values. The
+adaptive controller is broker-wide: three matching outcomes can shorten the next delay after split
+segments or recover it after unsplit plans. It changes batching efficiency, not acknowledgement or
+ordering semantics.
 
 [Design overview](README.md) | [Offset allocation](offset-allocation.md) | [Storage](storage.md)

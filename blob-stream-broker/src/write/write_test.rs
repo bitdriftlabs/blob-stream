@@ -76,7 +76,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration as StdDuration;
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, watch};
 
 const DEFAULT_TEST_METADATA_WINDOW_SIZE: TimeDuration = TimeDuration::minutes(5);
 
@@ -2193,6 +2193,45 @@ async fn receive_blob_write(receiver: &mut mpsc::UnboundedReceiver<String>) -> S
   panic!("expected blob write did not begin");
 }
 
+async fn wait_for_buffered_batch_count(engine: &WriteEngineImpl, expected_count: usize) {
+  for _ in 0 .. 100 {
+    let buffered_batch_count = engine
+      .state_snapshot()
+      .await
+      .topics
+      .iter()
+      .flat_map(|topic| &topic.local_partitions)
+      .map(|partition| partition.buffered_batch_count)
+      .sum::<usize>();
+    if buffered_batch_count == expected_count {
+      return;
+    }
+    tokio::task::yield_now().await;
+  }
+  let buffered_batch_count = engine
+    .state_snapshot()
+    .await
+    .topics
+    .iter()
+    .flat_map(|topic| &topic.local_partitions)
+    .map(|partition| partition.buffered_batch_count)
+    .sum::<usize>();
+  assert_eq!(buffered_batch_count, expected_count);
+}
+
+#[tokio::test]
+async fn armed_flush_notification_survives_identity_assignment_wakeup() {
+  let flush_notifier = Notify::new();
+  let notification = flush_notifier.notified();
+  tokio::pin!(notification);
+  notification.as_mut().enable();
+
+  // Simulate identity assignment completing after the scheduler arms its notification but before
+  // it begins to await it.
+  flush_notifier.notify_waiters();
+  notification.await;
+}
+
 async fn wait_for_partition_draining_start(engine: &WriteEngineImpl, virtual_partition_id: u32) {
   for _ in 0 .. 100 {
     let draining = {
@@ -3325,17 +3364,7 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
       })
       .await
   });
-  for _ in 0 .. 100 {
-    if engine
-      .state
-      .lock()
-      .partition_state("telemetry", 0)
-      .is_some()
-    {
-      break;
-    }
-    tokio::task::yield_now().await;
-  }
+  wait_for_buffered_batch_count(&engine, 1).await;
 
   time_provider.advance(TimeDuration::milliseconds(5));
   let second_engine = Arc::clone(&engine);
@@ -3348,20 +3377,7 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
       })
       .await
   });
-  for _ in 0 .. 100 {
-    let buffered_batches = engine
-      .state_snapshot()
-      .await
-      .topics
-      .iter()
-      .flat_map(|topic| &topic.local_partitions)
-      .map(|partition| partition.buffered_batch_count)
-      .sum::<usize>();
-    if buffered_batches == 2 {
-      break;
-    }
-    tokio::task::yield_now().await;
-  }
+  wait_for_buffered_batch_count(&engine, 2).await;
 
   time_provider.advance(TimeDuration::milliseconds(5));
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
@@ -3825,7 +3841,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
       })
       .await
   });
-  tokio::task::yield_now().await;
+  wait_for_buffered_batch_count(&engine, 1).await;
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
   assert!(
@@ -3844,7 +3860,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
       })
       .await
   });
-  tokio::task::yield_now().await;
+  wait_for_buffered_batch_count(&engine, 1).await;
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
 

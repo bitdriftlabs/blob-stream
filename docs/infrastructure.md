@@ -84,14 +84,14 @@ Feature flags affect local process behavior. Broker controls include
 `blob_stream_broker_fenced_metadata_writes`, `blob_stream_broker_max_segment_bytes`,
 `blob_stream_broker_flush_max_bytes`, and `blob_stream_broker_flush_max_delay_ms`. The segment and
 flush threshold overrides accept positive integers; invalid values retain the configured fallback.
-The flush settings are sampled for the next timer cycle, while the segment cap applies to newly
-selected flushes. Consumer reader flags `blob_stream_consumer_prefetch_max_bytes` and
-`blob_stream_consumer_max_in_flight_batch_reads` are live. Metadata consistency is configured
-statically through `eventual_metadata_reads`. `ConsumerIteratorBootstrapConfig.broker_discovery` is
-required. Consumers route metadata and blob reads through brokers. Eventual `Tail` and
-`FullRecovery` metadata requests use separate retained caches; strong requests bypass retained
-coverage. Direct storage is the fallback for an unavailable or unusable broker response. Blob-cache
-idle retention is configured when a broker starts through
+Watched flush settings immediately rearm deadlines for buffered, unselected partitions, while the
+segment cap applies to newly selected flushes. Consumer reader flags
+`blob_stream_consumer_prefetch_max_bytes` and `blob_stream_consumer_max_in_flight_batch_reads` are
+live. Metadata consistency is configured statically through `eventual_metadata_reads`.
+`ConsumerIteratorBootstrapConfig.broker_discovery` is required. Consumers route metadata and blob
+reads through brokers. Eventual `Tail` and `FullRecovery` metadata requests use separate retained
+caches; strong requests bypass retained coverage. Direct storage is the fallback for an unavailable
+or unusable broker response. Blob-cache idle retention is configured when a broker starts through
 `blob_stream_broker_blob_cache_idle_ttl_ms`; it defaults to 10 seconds and must be positive. The
 broker admits each complete object from its reported content length and current cgroup headroom
 before reading its body. Consumer polling and group scheduling flags are sampled when a consumer is

@@ -292,6 +292,12 @@ impl WriteEngineImpl {
           return;
         }
 
+        // An identity assignment can make a buffered successor eligible on another runtime
+        // worker. Arm this before scanning so its notify_waiters wake cannot be lost.
+        let flush_notification = flush_notifier.notified();
+        tokio::pin!(flush_notification);
+        flush_notification.as_mut().enable();
+
         // Reserve a plan slot before moving batches out of WriteState. The permit and active-plan
         // gauge remain held through terminal notification, bounding all outstanding plans.
         let mut scheduled_flush = false;
@@ -380,7 +386,7 @@ impl WriteEngineImpl {
               },
             }
           },
-          () = flush_notifier.notified() => {},
+          () = &mut flush_notification => {},
           Some(result) = flushes.join_next(), if !flushes.is_empty() => {
             match result {
               Ok(feedback) => {
