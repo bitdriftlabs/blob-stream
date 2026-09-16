@@ -140,6 +140,7 @@ impl WriteEngine for WriteEngineImpl {
             partition_state.seq_allocator.remaining_capacity(),
           );
           let flush_config = *self.effective_flush_config.read();
+          let buffer_was_empty = partition_state.buffer.batches.is_empty();
           let was_byte_due = partition_state.buffer.buffered_bytes >= flush_config.max_bytes;
           partition_state.buffer.push(
             BufferedBatch {
@@ -153,8 +154,9 @@ impl WriteEngine for WriteEngineImpl {
           );
           let flush_became_byte_due =
             !was_byte_due && partition_state.buffer.buffered_bytes >= flush_config.max_bytes;
-          let should_notify_flush =
-            flush_became_byte_due || partition_state.buffer.is_time_due(now, &flush_config);
+          let should_notify_flush = buffer_was_empty
+            || flush_became_byte_due
+            || partition_state.buffer.is_time_due(now, &flush_config);
           Some((completion_rx, seq_range, should_notify_flush))
         }
       };
@@ -277,9 +279,8 @@ impl WriteEngine for WriteEngineImpl {
       }
     };
 
-    // Timer ticks handle sub-threshold delay-bound buffers. Notify when this batch crosses the
-    // byte threshold or encounters an already-time-due buffer, avoiding a complete planner pass
-    // for ordinary sub-threshold batches while preserving the latency bound.
+    // Wake the scheduler when a partition becomes nonempty so it can arm that buffer's deadline.
+    // Byte-due and already-time-due batches still need an immediate planner pass.
     if should_notify_flush {
       self.flush_notifier.notify_one();
     }

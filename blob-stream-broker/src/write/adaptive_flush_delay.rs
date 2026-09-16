@@ -1,6 +1,6 @@
 //! The controller starts at the effective flush-delay maximum and only affects future scheduler
-//! cycles. While disabled, it holds that maximum. Reconfiguration resets the outcome history and
-//! clamps the active delay to the new floor and maximum.
+//! decisions. While disabled, it holds that maximum. Reconfiguration resets the outcome history
+//! and clamps the active delay to the new floor and maximum.
 //!
 //! A completed plan is classified as a split, a successful unsplit plan, or a failed unsplit
 //! plan. Three consecutive split plans are required before reducing the delay, and three
@@ -28,7 +28,7 @@ const SPLIT_REDUCTION_FRACTION_DENOMINATOR: i128 = 4;
 // AdaptiveFlushDelay
 //
 
-/// Maintains the delay applied to future broker flush-scheduler cycles.
+/// Maintains the delay applied to broker buffer deadlines and future flush selections.
 pub(super) struct AdaptiveFlushDelay {
   config: AdaptiveFlushDelayConfig,
   current_delay: Duration,

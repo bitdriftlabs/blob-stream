@@ -264,6 +264,26 @@ fn flush_trigger(
   }
 }
 
+pub(super) fn earliest_time_flush_deadline(
+  state: &Arc<Mutex<WriteState>>,
+  flush_config: &EffectiveFlushConfig,
+) -> Option<time::OffsetDateTime> {
+  let state = state.lock();
+  state
+    .topics
+    .values()
+    .flat_map(|topic| topic.partitions.values())
+    .filter(|partition_state| {
+      !partition_state.draining
+        && !partition_state
+          .publication_tail
+          .as_ref()
+          .is_some_and(|tail| matches!(*tail.state_rx.borrow(), FlushPublicationState::Pending))
+    })
+    .filter_map(|partition_state| partition_state.buffer.time_deadline(flush_config))
+    .min()
+}
+
 fn take_flush_partitions(
   state: &mut WriteState,
   topic: &Chars,

@@ -99,7 +99,7 @@ pub struct WriteConfig {
 // EffectiveFlushConfig
 //
 
-/// Flush thresholds captured at the start of one scheduler cycle.
+/// Flush thresholds currently effective for scheduler decisions.
 #[derive(Clone, Copy, Debug)]
 pub struct EffectiveFlushConfig {
   pub(crate) max_bytes: u64,

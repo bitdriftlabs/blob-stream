@@ -76,7 +76,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration as StdDuration;
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, watch};
 
 const DEFAULT_TEST_METADATA_WINDOW_SIZE: TimeDuration = TimeDuration::minutes(5);
 
@@ -1213,7 +1213,7 @@ async fn maintenance_success_clears_retry_after_foreground_acquisition() -> Resu
   )?;
 
   // The initial maintenance attempt is held by the old owner and schedules a logical retry.
-  time_provider.wait_until_sleeping(2).await;
+  time_provider.wait_until_sleeping(1).await;
   assert_eq!(
     lease_store
       .acquire_and_reserve_attempts
@@ -2193,6 +2193,45 @@ async fn receive_blob_write(receiver: &mut mpsc::UnboundedReceiver<String>) -> S
   panic!("expected blob write did not begin");
 }
 
+async fn wait_for_buffered_batch_count(engine: &WriteEngineImpl, expected_count: usize) {
+  for _ in 0 .. 100 {
+    let buffered_batch_count = engine
+      .state_snapshot()
+      .await
+      .topics
+      .iter()
+      .flat_map(|topic| &topic.local_partitions)
+      .map(|partition| partition.buffered_batch_count)
+      .sum::<usize>();
+    if buffered_batch_count == expected_count {
+      return;
+    }
+    tokio::task::yield_now().await;
+  }
+  let buffered_batch_count = engine
+    .state_snapshot()
+    .await
+    .topics
+    .iter()
+    .flat_map(|topic| &topic.local_partitions)
+    .map(|partition| partition.buffered_batch_count)
+    .sum::<usize>();
+  assert_eq!(buffered_batch_count, expected_count);
+}
+
+#[tokio::test]
+async fn armed_flush_notification_survives_identity_assignment_wakeup() {
+  let flush_notifier = Notify::new();
+  let notification = flush_notifier.notified();
+  tokio::pin!(notification);
+  notification.as_mut().enable();
+
+  // Simulate identity assignment completing after the scheduler arms its notification but before
+  // it begins to await it.
+  flush_notifier.notify_waiters();
+  notification.await;
+}
+
 async fn wait_for_partition_draining_start(engine: &WriteEngineImpl, virtual_partition_id: u32) {
   for _ in 0 .. 100 {
     let draining = {
@@ -2569,29 +2608,31 @@ async fn state_snapshot_reports_effective_runtime_policy() -> Result<()> {
       .with_integer_flag("blob_stream_broker_flush_max_delay_ms", 500)
       .with_integer_flag("blob_stream_broker_max_segment_bytes", 32 * 1024 * 1024),
   ));
-  let engine = WriteEngineBuilder::new(
-    config,
-    HashMap::from([(
-      "telemetry".into(),
-      TopicInfo {
-        name: "telemetry".into(),
-        partition_count: 1,
-        num_writers: 1,
-        retention: TimeDuration::days(7),
-        max_metadata_publication_lag: TimeDuration::seconds(30),
-        metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
-      },
-    )]),
-    Arc::new(InMemoryBlobStore::new()),
-    Arc::new(InMemoryMetadataStore::new()),
-    Arc::new(InMemoryProducerPartitionLeaseStore::new()),
-    "test-node".to_string(),
-    shutdown_trigger.make_handle(),
-    &metrics_scope(),
-  )
-  .time_provider(time_provider.clone())
-  .feature_flags(Some(feature_flags.snapshot_watch()))
-  .build()?;
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config,
+      HashMap::from([(
+        "telemetry".into(),
+        TopicInfo {
+          name: "telemetry".into(),
+          partition_count: 1,
+          num_writers: 1,
+          retention: TimeDuration::days(7),
+          max_metadata_publication_lag: TimeDuration::seconds(30),
+          metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
+        },
+      )]),
+      Arc::new(InMemoryBlobStore::new()),
+      Arc::new(InMemoryMetadataStore::new()),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider.clone())
+    .feature_flags(Some(feature_flags.snapshot_watch()))
+    .build()?,
+  );
 
   let snapshot = engine.state_snapshot().await;
   assert_eq!(snapshot.flush_max_bytes, 128 * 1024 * 1024);
@@ -2604,6 +2645,47 @@ async fn state_snapshot_reports_effective_runtime_policy() -> Result<()> {
   assert_eq!(snapshot.max_segment_bytes, 128 * 1024 * 1024);
   assert_eq!(snapshot.effective_max_segment_bytes, 32 * 1024 * 1024);
 
+  let deadline_sleep = time_provider.sleep_registration_count();
+  let write_engine = Arc::clone(&engine);
+  let write = tokio::spawn(async move {
+    write_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 1)],
+      })
+      .await
+  });
+  for _ in 0 .. 100 {
+    if engine
+      .state_snapshot()
+      .await
+      .topics
+      .iter()
+      .flat_map(|topic| &topic.local_partitions)
+      .map(|partition| partition.buffered_batch_count)
+      .sum::<usize>()
+      == 1
+    {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+  assert_eq!(
+    engine
+      .state_snapshot()
+      .await
+      .topics
+      .iter()
+      .flat_map(|topic| &topic.local_partitions)
+      .map(|partition| partition.buffered_batch_count)
+      .sum::<usize>(),
+    1
+  );
+  let rearmed_deadline_sleep = time_provider
+    .wait_for_sleep_registration_after(deadline_sleep)
+    .await;
+
   feature_flags.update(Arc::new(
     DefaultFeatureFlags::default()
       .with_integer_flag("blob_stream_broker_flush_max_bytes", 16 * 1024 * 1024)
@@ -2611,17 +2693,9 @@ async fn state_snapshot_reports_effective_runtime_policy() -> Result<()> {
       .with_integer_flag("blob_stream_broker_max_segment_bytes", 16 * 1024 * 1024),
   ));
   tokio::task::yield_now().await;
-
-  let snapshot = engine.state_snapshot().await;
-  assert_eq!(snapshot.effective_flush_max_bytes, 32 * 1024 * 1024);
-  assert_eq!(
-    snapshot.effective_flush_max_delay,
-    StdDuration::from_millis(500)
-  );
-
-  time_provider.advance(TimeDuration::milliseconds(500));
-  tokio::time::advance(StdDuration::from_millis(500)).await;
-  tokio::task::yield_now().await;
+  time_provider
+    .wait_for_sleep_registration_after(rearmed_deadline_sleep)
+    .await;
 
   let snapshot = engine.state_snapshot().await;
   assert_eq!(snapshot.effective_flush_max_bytes, 16 * 1024 * 1024);
@@ -2629,6 +2703,16 @@ async fn state_snapshot_reports_effective_runtime_policy() -> Result<()> {
     snapshot.effective_flush_max_delay,
     StdDuration::from_millis(250)
   );
+
+  time_provider.advance(TimeDuration::milliseconds(249));
+  tokio::time::advance(StdDuration::from_millis(249)).await;
+  tokio::task::yield_now().await;
+  assert!(!write.is_finished());
+
+  time_provider.advance(TimeDuration::milliseconds(1));
+  tokio::time::advance(StdDuration::from_millis(1)).await;
+  tokio::task::yield_now().await;
+  write.await??;
   Ok(())
 }
 
@@ -3060,6 +3144,198 @@ async fn flushes_on_time_rollover() -> Result<()> {
 }
 
 #[tokio::test(start_paused = true)]
+async fn flushes_at_the_buffer_deadline_after_an_idle_period() -> Result<()> {
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 1024;
+  config.flush_max_delay = TimeDuration::milliseconds(500);
+  let metadata_window_size = TimeDuration::seconds(60);
+
+  let (engine, _metadata_store) = make_engine_with_metadata_window_size(
+    time_provider.clone(),
+    config.clone(),
+    metadata_window_size,
+    shutdown_trigger.make_handle(),
+  )?;
+
+  tokio::task::yield_now().await;
+  time_provider.advance(TimeDuration::milliseconds(1));
+  tokio::time::advance(StdDuration::from_millis(1)).await;
+
+  let write_engine = Arc::clone(&engine);
+  let write = tokio::spawn(async move {
+    write_engine
+      .produce_batch(WriteRequest {
+        topic: "telemetry".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![3; 4], 30)],
+      })
+      .await
+  });
+  for _ in 0 .. 100 {
+    if engine
+      .state_snapshot()
+      .await
+      .topics
+      .iter()
+      .flat_map(|topic| &topic.local_partitions)
+      .map(|partition| partition.buffered_batch_count)
+      .sum::<usize>()
+      == 1
+    {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+  assert_eq!(
+    engine
+      .state_snapshot()
+      .await
+      .topics
+      .iter()
+      .flat_map(|topic| &topic.local_partitions)
+      .map(|partition| partition.buffered_batch_count)
+      .sum::<usize>(),
+    1
+  );
+
+  time_provider.advance(TimeDuration::milliseconds(499));
+  tokio::time::advance(StdDuration::from_millis(499)).await;
+  tokio::task::yield_now().await;
+  assert!(!write.is_finished());
+
+  time_provider.advance(TimeDuration::milliseconds(1));
+  tokio::time::advance(StdDuration::from_millis(1)).await;
+  tokio::task::yield_now().await;
+  write.await??;
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn waits_for_flush_capacity_before_retrying_a_due_buffer() -> Result<()> {
+  let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
+    1_700_000_000_000,
+  )));
+  let shutdown_trigger = ComponentShutdownTrigger::default();
+  let mut config = WriteConfig::with_defaults();
+  config.flush_max_bytes = 2;
+  config.flush_max_delay = TimeDuration::milliseconds(10);
+  let topics = ["first", "second", "third", "fourth", "fifth"].map(|name| {
+    (
+      name.into(),
+      TopicInfo {
+        name: name.into(),
+        partition_count: 1,
+        num_writers: 1,
+        retention: TimeDuration::days(7),
+        max_metadata_publication_lag: TimeDuration::seconds(30),
+        metadata_window_size: DEFAULT_TEST_METADATA_WINDOW_SIZE,
+      },
+    )
+  });
+  let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+  let release = Arc::new(Semaphore::new(0));
+  let engine = Arc::new(
+    WriteEngineBuilder::new(
+      config.clone(),
+      HashMap::from(topics),
+      Arc::new(BlockingBlobStore {
+        entered_tx,
+        release: Arc::clone(&release),
+      }),
+      Arc::new(InMemoryMetadataStore::new()),
+      Arc::new(InMemoryProducerPartitionLeaseStore::new()),
+      "test-node".to_string(),
+      shutdown_trigger.make_handle(),
+      &metrics_scope(),
+    )
+    .time_provider(time_provider.clone())
+    .build()?,
+  );
+
+  let deadline_sleep = time_provider.sleep_registration_count();
+  let fifth_engine = Arc::clone(&engine);
+  let fifth = tokio::spawn(async move {
+    fifth_engine
+      .produce_batch(WriteRequest {
+        topic: "fifth".into(),
+        virtual_partition_id: 0,
+        records: vec![new_record(vec![1], 4)],
+      })
+      .await
+  });
+  time_provider
+    .wait_for_sleep_registration_after(deadline_sleep)
+    .await;
+
+  let mut writes = Vec::new();
+  for (topic, timestamp) in ["first", "second", "third", "fourth"]
+    .into_iter()
+    .zip(0_i64 ..)
+  {
+    let write_engine = Arc::clone(&engine);
+    writes.push(tokio::spawn(async move {
+      write_engine
+        .produce_batch(WriteRequest {
+          topic: topic.into(),
+          virtual_partition_id: 0,
+          records: vec![
+            new_record(vec![1], timestamp),
+            new_record(vec![2], timestamp),
+          ],
+        })
+        .await
+    }));
+  }
+  for _ in 0 .. 4 {
+    receive_blob_write(&mut entered_rx).await;
+  }
+
+  for _ in 0 .. 100 {
+    if engine
+      .state_snapshot()
+      .await
+      .topics
+      .iter()
+      .flat_map(|topic| &topic.local_partitions)
+      .map(|partition| partition.buffered_batch_count)
+      .sum::<usize>()
+      == 1
+    {
+      break;
+    }
+    tokio::task::yield_now().await;
+  }
+  assert_eq!(
+    engine
+      .state_snapshot()
+      .await
+      .topics
+      .iter()
+      .flat_map(|topic| &topic.local_partitions)
+      .map(|partition| partition.buffered_batch_count)
+      .sum::<usize>(),
+    1
+  );
+
+  let due_deadline_sleep = time_provider.sleep_registration_count();
+  time_provider.advance(config.flush_max_delay);
+  tokio::time::advance(std_duration(config.flush_max_delay)).await;
+  tokio::task::yield_now().await;
+  assert_eq!(time_provider.sleep_registration_count(), due_deadline_sleep);
+
+  release.add_permits(5);
+  for write in writes {
+    write.await??;
+  }
+  fifth.await??;
+  Ok(())
+}
+
+#[tokio::test(start_paused = true)]
 async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
   let now_ms = 1_700_000_000_000;
   let time_provider = Arc::new(ManualTimeProvider::new(offset_datetime_from_unix_millis(
@@ -3088,17 +3364,7 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
       })
       .await
   });
-  for _ in 0 .. 100 {
-    if engine
-      .state
-      .lock()
-      .partition_state("telemetry", 0)
-      .is_some()
-    {
-      break;
-    }
-    tokio::task::yield_now().await;
-  }
+  wait_for_buffered_batch_count(&engine, 1).await;
 
   time_provider.advance(TimeDuration::milliseconds(5));
   let second_engine = Arc::clone(&engine);
@@ -3111,20 +3377,7 @@ async fn time_flush_coalesces_staggered_partitions_for_a_topic() -> Result<()> {
       })
       .await
   });
-  for _ in 0 .. 100 {
-    let buffered_batches = engine
-      .state_snapshot()
-      .await
-      .topics
-      .iter()
-      .flat_map(|topic| &topic.local_partitions)
-      .map(|partition| partition.buffered_batch_count)
-      .sum::<usize>();
-    if buffered_batches == 2 {
-      break;
-    }
-    tokio::task::yield_now().await;
-  }
+  wait_for_buffered_batch_count(&engine, 2).await;
 
   time_provider.advance(TimeDuration::milliseconds(5));
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
@@ -3237,7 +3490,7 @@ async fn time_due_flush_completes_before_later_byte_flush() -> Result<()> {
     metadata_window_size,
     shutdown_trigger.make_handle(),
   )?;
-  time_provider.wait_until_sleeping(1).await;
+  tokio::task::yield_now().await;
   let first_engine = Arc::clone(&engine);
   let first = tokio::spawn(async move {
     first_engine
@@ -3576,7 +3829,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
     .time_provider(time_provider.clone())
     .build()?,
   );
-  time_provider.wait_until_sleeping(1).await;
+  tokio::task::yield_now().await;
 
   let first_engine = Arc::clone(&engine);
   let first = tokio::spawn(async move {
@@ -3588,7 +3841,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
       })
       .await
   });
-  tokio::task::yield_now().await;
+  wait_for_buffered_batch_count(&engine, 1).await;
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
   assert!(
@@ -3607,7 +3860,7 @@ async fn time_flush_collects_later_plans_while_a_prior_plan_is_in_flight() -> Re
       })
       .await
   });
-  tokio::task::yield_now().await;
+  wait_for_buffered_batch_count(&engine, 1).await;
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
 
@@ -3689,13 +3942,9 @@ async fn same_partition_time_flushes_upload_in_parallel_and_publish_in_order() -
     }
     tokio::task::yield_now().await;
   }
-  let sleep_registrations = time_provider.sleep_registration_count();
   time_provider.advance(config.flush_max_delay);
   tokio::time::advance(std_duration(config.flush_max_delay)).await;
   receive_blob_write(&mut entered_rx).await;
-  time_provider
-    .wait_for_sleep_registration_after(sleep_registrations)
-    .await;
 
   let second_engine = Arc::clone(&engine);
   let second = tokio::spawn(async move {
@@ -4665,14 +4914,8 @@ async fn adaptive_flush_delay_requires_consecutive_split_and_unsplit_plans() -> 
         .sum::<usize>(),
       1
     );
-    // The split adjustment retains the timer that was scheduled before its plan completed.
-    let timer_delay = if sequence == 0 {
-      config.flush_max_delay
-    } else {
-      adaptive_delay
-    };
-    time_provider.advance(timer_delay);
-    tokio::time::advance(std_duration(timer_delay)).await;
+    time_provider.advance(adaptive_delay);
+    tokio::time::advance(std_duration(adaptive_delay)).await;
     recovery_write.await??;
   }
   for _ in 0 .. 100 {

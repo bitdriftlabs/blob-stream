@@ -1071,7 +1071,7 @@ async fn lease_assignment_retries_held_partition_before_heartbeat() -> Result<()
   .time_provider(time_provider.clone())
   .build()?;
 
-  time_provider.wait_until_sleeping(2).await;
+  time_provider.wait_until_sleeping(1).await;
   lease_store
     .release_lease(
       &key,
@@ -1146,7 +1146,7 @@ async fn lease_assignment_does_not_retry_held_partition_on_early_heartbeat() -> 
   .time_provider(time_provider.clone())
   .build()?;
 
-  time_provider.wait_until_sleeping(2).await;
+  time_provider.wait_until_sleeping(1).await;
   lease_store
     .release_lease(
       &key,
