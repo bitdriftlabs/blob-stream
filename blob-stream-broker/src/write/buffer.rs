@@ -102,8 +102,14 @@ impl BufferState {
 
   pub(super) fn is_time_due(&self, now: OffsetDateTime, config: &EffectiveFlushConfig) -> bool {
     self
+      .time_deadline(config)
+      .is_some_and(|deadline| now >= deadline)
+  }
+
+  pub(super) fn time_deadline(&self, config: &EffectiveFlushConfig) -> Option<OffsetDateTime> {
+    self
       .first_buffered_at
-      .is_some_and(|first_buffered_at| now - first_buffered_at >= config.max_delay)
+      .map(|first_buffered_at| first_buffered_at + config.max_delay)
   }
 
   pub(super) fn reset(&mut self) {

@@ -5,6 +5,7 @@ use super::super::metrics::WriteMetrics;
 use super::super::scheduler::{
   begin_shutdown_drain,
   collect_next_flush_plan,
+  earliest_time_flush_deadline,
   flush_plan_and_notify,
 };
 use super::super::state::WriteState;
@@ -283,11 +284,8 @@ impl WriteEngineImpl {
       let mut flush_config = *effective_flush_config.read();
       let mut adaptive_flush_delay = AdaptiveFlushDelay::new(flush_config.adaptive_flush_delay);
       flush_config.max_delay = adaptive_flush_delay.current_delay();
-      let mut flush_tick =
-        Box::pin(time_provider.sleep(flush_config.max_delay.max(TimeDuration::milliseconds(1))));
       let mut flushes = JoinSet::new();
       let mut shutdown_requested = false;
-      let mut flush_config_needs_reload = false;
       loop {
         if shutdown_requested && flushes.is_empty() {
           log::info!("broker flush loop shutdown complete");
@@ -338,6 +336,14 @@ impl WriteEngineImpl {
           continue;
         }
 
+        // A due buffer cannot make progress until a running plan releases its permit. Waiting on
+        // that completion avoids repeatedly rechecking an expired deadline while capacity is full.
+        let next_flush_deadline = if flush_plan_permits.available_permits() > 0 {
+          earliest_time_flush_deadline(&state, &flush_config)
+        } else {
+          None
+        };
+
         tokio::select! {
           () = shutdown.cancelled(), if !shutdown_requested => {
             shutdown_requested = true;
@@ -345,21 +351,13 @@ impl WriteEngineImpl {
             flush_notifier.notify_waiters();
             log::info!("broker flush loop draining buffered writes for shutdown");
           },
-          () = &mut flush_tick => {
-            if flush_config_needs_reload {
-              flush_config = flush_context
-                .config()
-                .effective_flush_config(feature_flags.as_ref());
-              adaptive_flush_delay.reconfigure(flush_config.adaptive_flush_delay);
-              flush_config.max_delay = adaptive_flush_delay.current_delay();
-              *effective_flush_config.write() = flush_config;
-              metrics.set_adaptive_flush_max_delay(flush_config.max_delay);
-              flush_config_needs_reload = false;
-            }
-            flush_tick = Box::pin(time_provider.sleep(
-              flush_config.max_delay.max(TimeDuration::milliseconds(1)),
-            ));
-          },
+          () = async {
+            let Some(deadline) = next_flush_deadline else {
+              std::future::pending().await
+            };
+            let delay = (deadline - time_provider.now()).max(TimeDuration::milliseconds(1));
+            time_provider.sleep(delay).await;
+          } => {},
           feature_flag_change = async {
             let Some(feature_flags) = feature_flag_changes.as_mut() else {
               std::future::pending().await
@@ -367,7 +365,15 @@ impl WriteEngineImpl {
             feature_flags.changed().await
           }, if feature_flag_changes.is_some() => {
             match feature_flag_change {
-              Ok(()) => flush_config_needs_reload = true,
+              Ok(()) => {
+                flush_config = flush_context
+                  .config()
+                  .effective_flush_config(feature_flags.as_ref());
+                adaptive_flush_delay.reconfigure(flush_config.adaptive_flush_delay);
+                flush_config.max_delay = adaptive_flush_delay.current_delay();
+                *effective_flush_config.write() = flush_config;
+                metrics.set_adaptive_flush_max_delay(flush_config.max_delay);
+              },
               Err(error) => {
                 feature_flag_changes = None;
                 log::debug!("broker feature flag watch closed: {error}");
