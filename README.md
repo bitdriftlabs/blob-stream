@@ -79,3 +79,9 @@ after interrupted commits or rebalances, so applications must tolerate duplicate
 The protobuf configuration schema in
 [blobstream/v1/config.proto](blob-stream-proto/proto/blobstream/v1/config.proto) is the canonical
 field-level reference for broker, producer, and consumer configuration.
+
+### Contact
+
+For async response open GitHub issues and I will try to respond when I can. For lack of a better
+option right now, I've also created a #blob-stream channel in [Envoy
+Slack](https://www.envoyproxy.io/slack). I will try to answer questions there as well.
