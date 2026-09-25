@@ -78,6 +78,15 @@ been implemented including reading metadata and blobs via broker caches as well 
 topics into a single blob. We are always looking for ways to improve the system and welcome
 contributions.
 
+# Are there still any costs that scale with the number of partitions?
+
+Currently both consumer and producer lease maintenance costs do scale with the number of partitions.
+This also has implications on the cost of the fenced metadata write mode which require fencing
+against every partition lease record. I have a rough
+[plan](https://github.com/bitdriftlabs/blob-stream/blob/cheaper-leases/plans/LEASE_COORDINATION_COST_OPTIONS.md)
+to improve this but I haven't had time to implement it yet. Once implemented this should make fenced
+write mode much more reasonable from a cost perspective.
+
 # Are you going to implement the Kafka API?
 
 No.
