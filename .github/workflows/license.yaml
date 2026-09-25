@@ -21,13 +21,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: org-read-only-install token
-        id: org-read-only
-        uses: getsentry/action-github-app-token@v2
-        with:
-          app_id: ${{ secrets.ORG_READ_ONLY_APP_ID }}
-          private_key: ${{ secrets.ORG_READ_ONLY_APP_PRIVATE_KEY }}
-
       - name: Setup Git credentials
         uses: de-vri-es/setup-git-credentials@v2
         with:
