@@ -8,7 +8,6 @@ use super::{
   RevokedPartitionsImpl,
   Span,
   VirtualPartitionId,
-  assignment_plan_snapshot,
   consumer_rebalance_interval,
   emit_partition_handoff_snapshots,
   field,
@@ -29,7 +28,8 @@ impl ConsumerDriver {
       // Keep reporting the last structurally valid plan when this rebalance did not receive a
       // replacement. It remains the best available explanation of desired ownership.
       if let Some(plan) = plan {
-        shared_state.diagnostics.assignment_plan = Some(assignment_plan_snapshot(plan));
+        shared_state.diagnostics.assignment_plan =
+          Some(self.diagnostics.assignment_plan_snapshot(plan));
       }
     }
   }

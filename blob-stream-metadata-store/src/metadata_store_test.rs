@@ -1,8 +1,28 @@
 use crate::SegmentMetadata;
+use anyhow::Result;
+use aws_config::BehaviorVersion;
+use aws_sdk_dynamodb::Client;
 use blob_stream_blob_store::BlobKey;
 use blob_stream_types::{BatchMetadata, Compression, SeqRange, SnowflakeId, TopicWindowKey};
 use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
+
+pub async fn dynamo_client() -> Result<Client> {
+  unsafe {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+    std::env::set_var("AWS_REGION", "us-east-1");
+  }
+
+  let config = aws_config::defaults(BehaviorVersion::latest())
+    .endpoint_url(
+      std::env::var("BD_ITEST_DYNAMODB_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:8000".to_string()),
+    )
+    .load()
+    .await;
+  Ok(Client::new(&config))
+}
 
 #[test]
 fn formats_partition_and_snowflake_keys() {

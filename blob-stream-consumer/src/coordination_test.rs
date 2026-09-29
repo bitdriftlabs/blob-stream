@@ -3,10 +3,13 @@
 use crate::config::ConsumerGroupConfig;
 use crate::coordination::{
   AssignmentPlanValidationError,
+  COLOCATE_LOGICAL_PARTITIONS_FEATURE_FLAG,
   ConsumerGroupCoordinator,
   ConsumerGroupCoordinatorImpl,
   LeaseClaimCounts,
   assignment_plan_validation_error,
+  cooperative_colocated_assignment,
+  cooperative_colocated_assignment_with_pods,
   cooperative_sticky_assignment,
   cooperative_sticky_assignment_with_pods,
 };
@@ -16,6 +19,8 @@ use crate::diagnostics::{
   ConsumerPodLoadSnapshot,
   assignment_plan_snapshot,
 };
+use bd_runtime_config::loader::Loader;
+use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_metadata_store::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentOutcome,
@@ -252,6 +257,257 @@ fn sticky_assignment_stable_for_same_membership() {
   let second = cooperative_sticky_assignment(&members, &partitions, &first, "member-a");
 
   assert_eq!(first, second);
+}
+
+#[test]
+fn colocated_assignment_keeps_logical_partitions_together_when_balanced() {
+  let members = vec!["member-a".to_string(), "member-b".to_string()];
+  let partitions = (0 .. 8).collect::<Vec<_>>();
+  let assignments =
+    cooperative_colocated_assignment(&members, &partitions, &HashMap::new(), "member-a", 4);
+
+  assert_eq!(assignments.len(), 8);
+  for logical_id in 0 .. 4 {
+    assert_eq!(
+      assignments.get(&logical_id),
+      assignments.get(&(logical_id + 4))
+    );
+  }
+  assert_eq!(
+    assignments
+      .values()
+      .filter(|owner| *owner == "member-a")
+      .count(),
+    4
+  );
+  assert_eq!(
+    assignments
+      .values()
+      .filter(|owner| *owner == "member-b")
+      .count(),
+    4
+  );
+}
+
+#[test]
+fn colocated_assignment_prefers_whole_groups_over_previous_owners() {
+  let members = ["member-a", "member-b", "member-c"]
+    .map(ToString::to_string)
+    .to_vec();
+  let partitions = (0 .. 10).collect::<Vec<_>>();
+  let previous_assignment = [
+    (0, "member-a"),
+    (4, "member-a"),
+    (8, "member-a"),
+    (6, "member-a"),
+    (1, "member-b"),
+    (5, "member-b"),
+    (9, "member-b"),
+    (2, "member-c"),
+    (3, "member-c"),
+    (7, "member-c"),
+  ]
+  .into_iter()
+  .map(|(partition_id, member_id)| (partition_id, member_id.to_string()))
+  .collect::<HashMap<_, _>>();
+
+  let assignment =
+    cooperative_colocated_assignment(&members, &partitions, &previous_assignment, "member-a", 4);
+  for logical_id in 0 .. 4 {
+    let owner = assignment.get(&logical_id);
+    for partition_id in (logical_id + 4 .. 10).step_by(4) {
+      assert_eq!(assignment.get(&partition_id), owner);
+    }
+  }
+  let mut loads = members
+    .iter()
+    .map(|member| assignment.values().filter(|owner| *owner == member).count())
+    .collect::<Vec<_>>();
+  loads.sort_unstable();
+  assert_eq!(loads, vec![3, 3, 4]);
+  assert_eq!(
+    assignment,
+    cooperative_colocated_assignment(&members, &partitions, &assignment, "member-a", 4)
+  );
+}
+
+#[test]
+fn colocated_assignment_splits_only_when_balance_requires_it() {
+  let members = vec!["member-a".to_string(), "member-b".to_string()];
+  let partitions = vec![2, 0, 1, 1];
+  let assignment =
+    cooperative_colocated_assignment(&members, &partitions, &HashMap::new(), "member-a", 1);
+  assert_eq!(assignment.len(), 3);
+  assert_eq!(
+    assignment
+      .values()
+      .filter(|owner| *owner == "member-a")
+      .count(),
+    2
+  );
+  assert_eq!(
+    assignment
+      .values()
+      .filter(|owner| *owner == "member-b")
+      .count(),
+    1
+  );
+  let replanned =
+    cooperative_colocated_assignment(&members, &partitions, &assignment, "member-a", 1);
+  assert_eq!(assignment, replanned);
+}
+
+#[test]
+fn colocated_assignment_with_pods_balances_pods_and_workers() {
+  let members = ["pod-a", "pod-b"]
+    .into_iter()
+    .flat_map(|pod_id| {
+      ["worker-a", "worker-b"]
+        .into_iter()
+        .map(move |worker_id| ConsumerGroupMember {
+          member_id: format!("{pod_id}:{worker_id}"),
+          pod_id: Some(pod_id.to_string()),
+          cluster_id: None,
+        })
+    })
+    .collect::<Vec<_>>();
+  let partitions = (0 .. 8).collect::<Vec<_>>();
+  let assignment =
+    cooperative_colocated_assignment_with_pods(&members, &partitions, &HashMap::new(), 4);
+  for logical_id in 0 .. 4 {
+    assert_eq!(
+      assignment.get(&logical_id),
+      assignment.get(&(logical_id + 4))
+    );
+  }
+  assert!(members.iter().all(|member| {
+    assignment
+      .values()
+      .filter(|owner| *owner == &member.member_id)
+      .count()
+      == 2
+  }));
+}
+
+#[test]
+fn colocated_assignment_moves_residual_to_smaller_cluster_after_topology_change() {
+  let members = vec![
+    ConsumerGroupMember {
+      member_id: "pod-a:worker-0".to_string(),
+      pod_id: Some("pod-a".to_string()),
+      cluster_id: Some("cluster-small".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-b:worker-0".to_string(),
+      pod_id: Some("pod-b".to_string()),
+      cluster_id: Some("cluster-large".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-c:worker-0".to_string(),
+      pod_id: Some("pod-c".to_string()),
+      cluster_id: Some("cluster-large".to_string()),
+    },
+  ];
+  let partitions = vec![0, 1, 2, 3];
+  let previous = HashMap::from([
+    (0, "pod-b:worker-0".to_string()),
+    (1, "pod-b:worker-0".to_string()),
+    (2, "pod-a:worker-0".to_string()),
+    (3, "pod-c:worker-0".to_string()),
+  ]);
+
+  let assignment = cooperative_colocated_assignment_with_pods(&members, &partitions, &previous, 4);
+  let pod_loads = members
+    .iter()
+    .map(|member| {
+      assignment
+        .values()
+        .filter(|owner| *owner == &member.member_id)
+        .count()
+    })
+    .collect::<Vec<_>>();
+  assert_eq!(pod_loads, vec![2, 1, 1]);
+  assert_eq!(
+    assignment,
+    cooperative_colocated_assignment_with_pods(&members, &partitions, &assignment, 4)
+  );
+}
+
+#[tokio::test]
+async fn grouping_flag_replans_and_rolls_back_with_active_planner() {
+  let flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
+  let membership_store = membership_store();
+  let mut coordinator = ConsumerGroupCoordinatorImpl::new(
+    ConsumerGroupConfig {
+      topic: "topic-a".to_string().into(),
+      group_id: "group-a".to_string().into(),
+      member_id: "member-a".to_string().into(),
+      ..Default::default()
+    },
+    Arc::new(InMemoryConsumerGroupLeaseStore::new()),
+    Arc::clone(&membership_store),
+  )
+  .unwrap()
+  .with_logical_partition_count(4, Some(flags.snapshot_watch()))
+  .unwrap();
+  let members = vec!["member-a".to_string(), "member-b".to_string()];
+  let partitions = (0 .. 8).collect::<Vec<_>>();
+  let first = coordinator
+    .rebalance(
+      members.clone(),
+      partitions.clone(),
+      offset_datetime_from_unix_millis(1_000),
+    )
+    .await
+    .unwrap();
+  assert!(
+    !first
+      .accepted_assignment_plan
+      .unwrap()
+      .colocate_logical_partitions
+  );
+  flags.update(Arc::new(
+    DefaultFeatureFlags::default().with_bool_flag(COLOCATE_LOGICAL_PARTITIONS_FEATURE_FLAG, true),
+  ));
+  let second = coordinator
+    .rebalance(
+      members.clone(),
+      partitions.clone(),
+      offset_datetime_from_unix_millis(1_001),
+    )
+    .await
+    .unwrap();
+  let second_plan = second.accepted_assignment_plan.unwrap();
+  assert_eq!(second_plan.version, 2);
+  assert!(second_plan.colocate_logical_partitions);
+  let assignments = second_plan
+    .assignments
+    .iter()
+    .map(|assignment| (assignment.virtual_partition_id, &assignment.member_id))
+    .collect::<HashMap<_, _>>();
+  for logical_id in 0 .. 4 {
+    assert_eq!(
+      assignments.get(&logical_id),
+      assignments.get(&(logical_id + 4))
+    );
+  }
+  let stable = coordinator
+    .rebalance(
+      members.clone(),
+      partitions.clone(),
+      offset_datetime_from_unix_millis(1_002),
+    )
+    .await
+    .unwrap();
+  assert_eq!(stable.accepted_assignment_plan.unwrap().version, 2);
+  flags.update(Arc::new(DefaultFeatureFlags::default()));
+  let rolled_back = coordinator
+    .rebalance(members, partitions, offset_datetime_from_unix_millis(1_003))
+    .await
+    .unwrap();
+  let plan = rolled_back.accepted_assignment_plan.unwrap();
+  assert_eq!(plan.version, 3);
+  assert!(!plan.colocate_logical_partitions);
 }
 
 #[test]
@@ -572,7 +828,7 @@ fn pod_aware_assignment_ignores_conflicting_cluster_topology() {
 }
 
 #[test]
-fn pod_aware_assignment_plan_snapshot_includes_member_and_pod_identity() {
+fn pod_aware_assignment_plan_snapshot_includes_logical_groups_and_topology() {
   let plan = ConsumerGroupAssignmentPlan {
     version: 7,
     planner_member_id: "pod-a:worker-0".to_string(),
@@ -594,6 +850,7 @@ fn pod_aware_assignment_plan_snapshot_includes_member_and_pod_identity() {
         cluster_id: Some("cluster-b".to_string()),
       },
     ]),
+    colocate_logical_partitions: true,
     assignments: vec![
       ConsumerGroupAssignment {
         virtual_partition_id: 0,
@@ -603,13 +860,40 @@ fn pod_aware_assignment_plan_snapshot_includes_member_and_pod_identity() {
         virtual_partition_id: 1,
         member_id: "pod-b:worker-0".to_string(),
       },
+      ConsumerGroupAssignment {
+        virtual_partition_id: 2,
+        member_id: "pod-b:worker-0".to_string(),
+      },
     ],
     published_ts_ms: 1_000,
   };
 
-  let snapshot = assignment_plan_snapshot(plan);
+  let snapshot = assignment_plan_snapshot(plan, 2);
 
   assert_eq!(snapshot.policy, ConsumerAssignmentPolicy::PodAware);
+  assert!(snapshot.colocate_logical_partitions);
+  assert_eq!(
+    snapshot
+      .assignments
+      .iter()
+      .map(|assignment| assignment.logical_partition_id)
+      .collect::<Vec<_>>(),
+    vec![0, 1, 0]
+  );
+  assert_eq!(
+    snapshot.logical_partitions[0].virtual_partition_ids,
+    vec![0, 2]
+  );
+  assert_eq!(
+    snapshot.logical_partitions[0].member_ids,
+    vec!["pod-a:worker-0", "pod-b:worker-0"]
+  );
+  assert!(!snapshot.logical_partitions[0].colocated);
+  assert_eq!(
+    snapshot.logical_partitions[1].virtual_partition_ids,
+    vec![1]
+  );
+  assert!(snapshot.logical_partitions[1].colocated);
   assert_eq!(
     snapshot.member_topology,
     vec![
@@ -639,7 +923,7 @@ fn pod_aware_assignment_plan_snapshot_includes_member_and_pod_identity() {
       },
       ConsumerPodLoadSnapshot {
         pod_id: "pod-b".to_string(),
-        partition_count: 1,
+        partition_count: 2,
       },
       ConsumerPodLoadSnapshot {
         pod_id: "pod-c".to_string(),
@@ -664,6 +948,7 @@ fn assignment_plan_validation_reports_imbalanced_load() {
     planner_member_id: "member-a".to_string(),
     members,
     member_topology: None,
+    colocate_logical_partitions: false,
     assignments: (0 .. 6)
       .map(|virtual_partition_id| ConsumerGroupAssignment {
         virtual_partition_id,

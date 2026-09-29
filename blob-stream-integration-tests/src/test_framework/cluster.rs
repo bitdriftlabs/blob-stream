@@ -20,6 +20,7 @@ use super::transport::{
 };
 use crate::test_framework::{PARTITION_COUNT, SECOND_TOPIC, TOPIC, WINDOW_SIZE_SECONDS};
 use anyhow::{Result, anyhow};
+use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_server_stats::stats::Collector;
 use bd_shutdown::{ComponentShutdownTrigger, ComponentShutdownTriggerHandle};
 use bd_time::{SystemTimeProvider, TimeProvider};
@@ -43,7 +44,11 @@ use blob_stream_broker::write::{
 };
 use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode};
 use blob_stream_consumer::consumer::{GrpcBrokerBlobRangeQuery, GrpcBrokerMetadataQuery};
-use blob_stream_consumer::iterator::{ConsumerIteratorBuilder, ConsumerIteratorImpl};
+use blob_stream_consumer::iterator::{
+  ConsumerIteratorBuilder,
+  ConsumerIteratorImpl,
+  TopicPartitionLayout,
+};
 use blob_stream_consumer::{
   ConsumerRuntimeConfig,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG,
@@ -68,7 +73,7 @@ use blob_stream_producer::{
   ProducerTopicConfig,
 };
 use blob_stream_proto::protos::blobstream::v1::config::{BrokerConfig, RuntimeConfig, TopicConfig};
-use blob_stream_types::ToProtoDuration;
+use blob_stream_types::{ToProtoDuration, virtual_partition_count};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -728,22 +733,49 @@ impl ClusterHarness {
       .await
   }
 
+  /// Build a consumer with watched assignment flags for live group tests.
+  pub async fn create_consumer_with_feature_flags(
+    &self,
+    runtime: &ConsumerRuntimeConfig,
+    feature_flags: FeatureFlagsWatch,
+  ) -> Result<ConsumerIteratorImpl> {
+    self
+      .create_consumer_with_discovery_and_feature_flags(
+        runtime,
+        Arc::new(self.producer_discovery()),
+        Some(feature_flags),
+      )
+      .await
+  }
+
   /// Build a consumer with an explicit broker discovery source for routing tests.
   pub async fn create_consumer_with_discovery(
     &self,
     runtime: &ConsumerRuntimeConfig,
     discovery: Arc<dyn BrokerDiscovery>,
   ) -> Result<ConsumerIteratorImpl> {
+    self
+      .create_consumer_with_discovery_and_feature_flags(runtime, discovery, None)
+      .await
+  }
+
+  async fn create_consumer_with_discovery_and_feature_flags(
+    &self,
+    runtime: &ConsumerRuntimeConfig,
+    discovery: Arc<dyn BrokerDiscovery>,
+    feature_flags: Option<FeatureFlagsWatch>,
+  ) -> Result<ConsumerIteratorImpl> {
     let group = runtime
       .group
       .as_ref()
       .ok_or_else(|| anyhow!("consumer runtime config requires a group config"))?;
+    let partition_total = virtual_partition_count(self.partition_count, self.topic_num_writers)?;
     let coordination_source = Arc::new(
       MembershipCoordinationSource::new(
         group.topic.to_string(),
         group.group_id.to_string(),
         group.member_id.to_string(),
-        (0 .. self.partition_count).collect(),
+        (0 .. partition_total).collect(),
         Arc::clone(&self.consumer_membership_store),
       )
       .time_provider(Arc::clone(&self.consumer_coordination_time_provider)),
@@ -763,7 +795,8 @@ impl ClusterHarness {
       Collector::default().scope("blob_stream_consumer_it"),
       time::Duration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-      None,
+      feature_flags,
+      TopicPartitionLayout::new(self.partition_count)?,
     )
     .metadata_cache_max_age(self.metadata_cache_settings.effective_max_age())
     .lifecycle_hooks(Arc::new(self.lifecycle_hooks.clone()))
@@ -853,6 +886,7 @@ impl ClusterHarness {
       time::Duration::days(1),
       time::Duration::ZERO,
       None,
+      TopicPartitionLayout::new(self.partition_count)?,
     )
     .metadata_cache_max_age(time::Duration::milliseconds(250))
     .lifecycle_hooks(Arc::new(self.lifecycle_hooks.clone()))

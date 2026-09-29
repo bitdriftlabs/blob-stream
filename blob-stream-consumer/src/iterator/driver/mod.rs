@@ -32,7 +32,6 @@ use crate::diagnostics::{
   ConsumerCommittedCursorSnapshot,
   ConsumerDiagnostics,
   ConsumerStateSnapshot,
-  assignment_plan_snapshot,
   emit_partition_handoff_snapshots,
 };
 use anyhow::{Result, anyhow, ensure};

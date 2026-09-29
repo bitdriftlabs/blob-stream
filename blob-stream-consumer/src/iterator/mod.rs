@@ -22,6 +22,6 @@ pub use api::{
   NoopConsumerLifecycleHooks,
   RevokedPartitions,
 };
-pub use builder::ConsumerIteratorBuilder;
+pub use builder::{ConsumerIteratorBuilder, TopicPartitionLayout};
 pub use facade::ConsumerIteratorImpl;
 pub use shared::{ConsumerDeliveryState, ConsumerSharedState};

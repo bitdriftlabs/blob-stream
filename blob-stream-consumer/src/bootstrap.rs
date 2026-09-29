@@ -17,6 +17,7 @@ use crate::iterator::{
   ConsumerIteratorImpl,
   ConsumerLifecycleHooks,
   CoordinationSnapshot,
+  TopicPartitionLayout,
 };
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
@@ -318,6 +319,7 @@ impl ConsumerIteratorImpl {
       retention,
       topic_max_metadata_publication_lag(&config.topic),
       feature_flags,
+      TopicPartitionLayout::from_topic(&config.topic)?,
     )
     .metadata_window_size(metadata_window_size)
     .metadata_cache_max_age(topic_metadata_cache_max_age(&config.topic))

@@ -4,6 +4,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupMember,
 };
 use blob_stream_types::VirtualPartitionId;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 //
@@ -98,6 +99,212 @@ pub fn cooperative_sticky_assignment(
     &mut load,
   );
 
+  assignments
+}
+
+pub(super) fn cooperative_colocated_assignment(
+  members: &[String],
+  partitions: &[VirtualPartitionId],
+  previous_assignment: &HashMap<VirtualPartitionId, String>,
+  local_member_id: &str,
+  logical_partition_count: u32,
+) -> HashMap<VirtualPartitionId, String> {
+  let members = canonical_members(members, local_member_id);
+  assign_colocated_groups(
+    &members,
+    partitions,
+    previous_assignment,
+    logical_partition_count,
+    None,
+  )
+}
+
+fn assign_colocated_groups(
+  owners: &[String],
+  partitions: &[VirtualPartitionId],
+  previous_assignment: &HashMap<VirtualPartitionId, String>,
+  logical_partition_count: u32,
+  residual_preference: Option<&BTreeMap<String, usize>>,
+) -> HashMap<VirtualPartitionId, String> {
+  debug_assert!(logical_partition_count > 0);
+  if owners.is_empty() || partitions.is_empty() {
+    return HashMap::new();
+  }
+
+  let mut groups = BTreeMap::<u32, Vec<VirtualPartitionId>>::new();
+  for partition_id in partitions {
+    groups
+      .entry(partition_id % logical_partition_count)
+      .or_default()
+      .push(*partition_id);
+  }
+  for group in groups.values_mut() {
+    group.sort_unstable();
+    group.dedup();
+  }
+  let mut groups = groups.into_iter().collect::<Vec<_>>();
+  groups.sort_by_key(|(logical_id, partitions)| (Reverse(partitions.len()), *logical_id));
+
+  let total = groups.iter().map(|(_, group)| group.len()).sum::<usize>();
+  let mut capacity = owners
+    .iter()
+    .map(|owner| (owner.clone(), total / owners.len()))
+    .collect::<HashMap<_, _>>();
+  let mut previous_load = HashMap::<&str, usize>::new();
+  for previous_owner in previous_assignment.values() {
+    *previous_load.entry(previous_owner.as_str()).or_default() += 1;
+  }
+  let mut residual_owners = owners.to_vec();
+  residual_owners.sort_by_key(|owner| {
+    (
+      residual_preference
+        .and_then(|preference| preference.get(owner))
+        .copied()
+        .unwrap_or_default(),
+      Reverse(
+        previous_load
+          .get(owner.as_str())
+          .copied()
+          .unwrap_or_default(),
+      ),
+      owner.clone(),
+    )
+  });
+  for owner in residual_owners.iter().take(total % owners.len()) {
+    *capacity.get_mut(owner).expect("active owner has capacity") += 1;
+  }
+
+  let mut assignments = HashMap::new();
+  for (_, group) in groups {
+    let whole_owner = owners
+      .iter()
+      .filter(|owner| capacity.get(*owner).copied().unwrap_or_default() >= group.len())
+      .min_by_key(|owner| {
+        (
+          capacity.get(*owner).copied().unwrap_or_default() - group.len(),
+          Reverse(
+            group
+              .iter()
+              .filter(|partition_id| previous_assignment.get(partition_id) == Some(*owner))
+              .count(),
+          ),
+          residual_preference
+            .and_then(|preference| preference.get(*owner))
+            .copied()
+            .unwrap_or_default(),
+          *owner,
+        )
+      });
+    if let Some(owner) = whole_owner {
+      for partition_id in group {
+        assignments.insert(partition_id, owner.clone());
+        *capacity.get_mut(owner).expect("active owner has capacity") -= 1;
+      }
+    } else {
+      for partition_id in group {
+        let owner = owners
+          .iter()
+          .filter(|owner| capacity.get(*owner).copied().unwrap_or_default() > 0)
+          .min_by_key(|owner| {
+            (
+              Reverse(previous_assignment.get(&partition_id) == Some(*owner)),
+              Reverse(capacity.get(*owner).copied().unwrap_or_default()),
+              *owner,
+            )
+          })
+          .expect("total remaining capacity covers unassigned partitions");
+        assignments.insert(partition_id, owner.clone());
+        *capacity.get_mut(owner).expect("active owner has capacity") -= 1;
+      }
+    }
+  }
+  assignments
+}
+
+pub(super) fn cooperative_colocated_assignment_with_pods(
+  members: &[ConsumerGroupMember],
+  partitions: &[VirtualPartitionId],
+  previous_assignment: &HashMap<VirtualPartitionId, String>,
+  logical_partition_count: u32,
+) -> HashMap<VirtualPartitionId, String> {
+  let mut pod_members = BTreeMap::<String, Vec<String>>::new();
+  let mut member_pods = HashMap::new();
+  let mut pod_clusters = BTreeMap::new();
+  let mut complete_cluster_topology = true;
+  for member in members {
+    let Some(pod_id) = member.pod_id.as_ref() else {
+      let member_ids = members
+        .iter()
+        .map(|member| member.member_id.clone())
+        .collect::<Vec<_>>();
+      return cooperative_colocated_assignment(
+        &member_ids,
+        partitions,
+        previous_assignment,
+        member_ids.first().map_or("", String::as_str),
+        logical_partition_count,
+      );
+    };
+    pod_members
+      .entry(pod_id.clone())
+      .or_default()
+      .push(member.member_id.clone());
+    member_pods.insert(member.member_id.clone(), pod_id.clone());
+    match (member.cluster_id.as_ref(), pod_clusters.get(pod_id)) {
+      (Some(cluster_id), Some(existing_cluster_id)) if cluster_id == existing_cluster_id => {},
+      (Some(cluster_id), None) => {
+        pod_clusters.insert(pod_id.clone(), cluster_id.clone());
+      },
+      _ => complete_cluster_topology = false,
+    }
+  }
+  for pod_member_ids in pod_members.values_mut() {
+    pod_member_ids.sort();
+    pod_member_ids.dedup();
+  }
+  let pod_ids = pod_members.keys().cloned().collect::<Vec<_>>();
+  let previous_pods = previous_assignment
+    .iter()
+    .filter_map(|(partition_id, member_id)| {
+      member_pods
+        .get(member_id)
+        .map(|pod_id| (*partition_id, pod_id.clone()))
+    })
+    .collect();
+  let residual_preference = complete_cluster_topology.then(|| {
+    let counts = cluster_pod_counts(&pod_clusters);
+    pod_ids
+      .iter()
+      .map(|pod_id| {
+        (
+          pod_id.clone(),
+          pod_cluster_count(pod_id, Some(&pod_clusters), Some(&counts)),
+        )
+      })
+      .collect::<BTreeMap<_, _>>()
+  });
+  let partition_pods = assign_colocated_groups(
+    &pod_ids,
+    partitions,
+    &previous_pods,
+    logical_partition_count,
+    residual_preference.as_ref(),
+  );
+  let mut assignments = HashMap::new();
+  for (pod_id, pod_member_ids) in &pod_members {
+    let pod_partitions = partitions
+      .iter()
+      .filter(|partition_id| partition_pods.get(partition_id) == Some(pod_id))
+      .copied()
+      .collect::<Vec<_>>();
+    assignments.extend(assign_colocated_groups(
+      pod_member_ids,
+      &pod_partitions,
+      previous_assignment,
+      logical_partition_count,
+      None,
+    ));
+  }
   assignments
 }
 
@@ -237,6 +444,7 @@ pub(super) fn assignment_plan(
   partitions: &[VirtualPartitionId],
   assignments: &HashMap<VirtualPartitionId, String>,
   member_topology: Option<Vec<ConsumerGroupMember>>,
+  colocate_logical_partitions: bool,
   local_member_id: &str,
   published_ts_ms: i64,
 ) -> ConsumerGroupAssignmentPlan {
@@ -263,6 +471,7 @@ pub(super) fn assignment_plan(
     planner_member_id: local_member_id.to_string(),
     members,
     member_topology,
+    colocate_logical_partitions,
     assignments,
     published_ts_ms,
   }

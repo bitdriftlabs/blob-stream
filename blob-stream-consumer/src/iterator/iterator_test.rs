@@ -13,6 +13,7 @@ use super::{
   ConsumerSeekTarget,
   CoordinationSnapshot,
   NextResult,
+  TopicPartitionLayout,
 };
 use crate::EventualMetadataReadsConfig;
 use crate::config::{
@@ -20,6 +21,7 @@ use crate::config::{
   ConsumerReadConfig,
   ConsumerRuntimeConfig,
   DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+  TopicConfig,
   consumer_max_clock_skew,
 };
 use crate::consumer::{BrokerBlobRangeQuery, BrokerMetadataQuery, ConsumerBatchSource};
@@ -931,6 +933,7 @@ async fn cursor_hydration_keeps_last_delivered_offset_for_retained_partition() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .time_provider(time_provider)
   .build()
@@ -1096,6 +1099,7 @@ async fn build_iterator_with_recovered_cursor_record(
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .time_provider(time_provider)
   .build()
@@ -1189,6 +1193,25 @@ fn runtime_config() -> ConsumerRuntimeConfig {
   runtime_config_with_prefetch_max_bytes(None)
 }
 
+fn topic_layout() -> TopicPartitionLayout {
+  TopicPartitionLayout::new(2).unwrap()
+}
+
+#[test]
+fn topic_layout_uses_logical_partition_count_not_virtual_partition_count() {
+  let mut topic = TopicConfig::new();
+  topic.partition_count = 4;
+  topic.num_writers = 3;
+
+  assert_eq!(
+    TopicPartitionLayout::from_topic(&topic)
+      .unwrap()
+      .partition_count(),
+    4
+  );
+  assert!(TopicPartitionLayout::new(0).is_err());
+}
+
 fn runtime_config_with_prefetch_max_bytes(
   prefetch_max_bytes: Option<u64>,
 ) -> ConsumerRuntimeConfig {
@@ -1232,6 +1255,7 @@ async fn build_iterator_with_clock_skew(
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .maximum_clock_skew(maximum_clock_skew)
   .build()
@@ -1279,6 +1303,7 @@ async fn idle_prefetch_worker_processes_hydration_command_without_clock_advance(
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .time_provider(time_provider.clone())
   .build()
@@ -1388,6 +1413,7 @@ async fn visibility_deferred_empty_scan_waits_until_metadata_is_eligible() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .time_provider(time_provider.clone())
   .build()
@@ -1473,6 +1499,7 @@ async fn iterator_builder_applies_configured_clock_skew_to_reader_scan_horizon()
     TimeDuration::days(1),
     TimeDuration::ZERO,
     None,
+    topic_layout(),
   )
   .maximum_clock_skew(maximum_clock_skew)
   .metadata_window_size(TimeDuration::seconds(1))
@@ -1634,6 +1661,7 @@ async fn failed_membership_heartbeats_fence_at_lease_deadline() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .time_provider(time_provider.clone())
   .build()
@@ -1700,6 +1728,7 @@ async fn partial_heartbeat_failure_revokes_fenced_partition() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .time_provider(time_provider.clone())
   .build()
@@ -1797,6 +1826,7 @@ async fn lifecycle_hook_gates_commit_until_released() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .time_provider(Arc::new(SystemTimeProvider))
   .lifecycle_hooks(hooks)
@@ -1849,6 +1879,7 @@ async fn diagnostics_report_assignment_and_start_state() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -1876,6 +1907,8 @@ async fn diagnostics_report_assignment_and_start_state() {
   assert_eq!(snapshot.prefetch_pending_record_count, 0);
   assert_eq!(snapshot.prefetch_pending_bytes, 0);
   assert_eq!(snapshot.local.partitions.len(), 2);
+  assert_eq!(snapshot.local.partitions[0].logical_partition_id, 0);
+  assert_eq!(snapshot.local.partitions[1].logical_partition_id, 1);
   assert!(snapshot.local.partitions.iter().all(|partition| {
     partition.owned
       && partition.active
@@ -1907,7 +1940,7 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
     Arc::new(InMemoryConsumerGroupMembershipStore::new());
   let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
     members: vec!["member-a".to_string(), "member-b".to_string()],
-    virtual_partitions: vec![0, 1],
+    virtual_partitions: vec![0, 1, 2, 3],
   }));
   let iterator = ConsumerIteratorImpl::from_config(
     &runtime_config(),
@@ -1922,6 +1955,7 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -1973,10 +2007,35 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
       .map(|plan| plan.version),
     Some(1)
   );
+  let plan = response.state.assignment_plan.as_ref().unwrap();
+  assert!(!plan.colocate_logical_partitions);
+  assert_eq!(
+    plan
+      .assignments
+      .iter()
+      .map(|assignment| (
+        assignment.virtual_partition_id,
+        assignment.logical_partition_id
+      ))
+      .collect::<Vec<_>>(),
+    vec![(0, 0), (1, 1), (2, 0), (3, 1)]
+  );
+  assert_eq!(
+    plan
+      .logical_partitions
+      .iter()
+      .map(|group| (
+        group.logical_partition_id,
+        group.virtual_partition_ids.clone(),
+        group.colocated
+      ))
+      .collect::<Vec<_>>(),
+    vec![(0, vec![0, 2], true), (1, vec![1, 3], true)]
+  );
   let ConsumerGroupLeaseObservation::Fresh { partitions } = response.group_lease_observation else {
     panic!("expected fresh group lease observation");
   };
-  assert_eq!(partitions.len(), 2);
+  assert_eq!(partitions.len(), 4);
   let member_b_partition = partitions
     .iter()
     .find(|partition| partition.virtual_partition_id == 1)
@@ -1986,6 +2045,7 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
     Some("member-b")
   );
   assert_eq!(member_b_partition.owner_id.as_deref(), Some("member-b"));
+  assert_eq!(member_b_partition.logical_partition_id, 1);
   assert_eq!(member_b_partition.generation, Some(7));
   assert_eq!(member_b_partition.committed_offset, Some(42));
   assert_eq!(
@@ -2004,6 +2064,11 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
     Some("member-a")
   );
   assert_eq!(member_a_partition.owner_id.as_deref(), Some("member-a"));
+  assert_eq!(member_a_partition.logical_partition_id, 0);
+  assert_eq!(partitions[2].logical_partition_id, 0);
+  assert_eq!(partitions[2].owner_id.as_deref(), Some("member-a"));
+  assert_eq!(partitions[3].logical_partition_id, 1);
+  assert!(partitions[3].owner_id.is_none());
 }
 
 #[tokio::test]
@@ -2030,6 +2095,7 @@ async fn state_response_reports_lease_lookup_failure_without_blocking_local_diag
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -2050,21 +2116,25 @@ fn group_lease_observation_includes_unleased_plan_partitions() {
     version: 1,
     planner_member_id: "member-a".to_string(),
     policy: ConsumerAssignmentPolicy::FlatMember,
+    colocate_logical_partitions: false,
     members: vec!["member-a".to_string(), "member-b".to_string()],
     member_topology: vec![],
     pod_loads: vec![],
     assignments: vec![
       ConsumerPartitionAssignmentSnapshot {
         virtual_partition_id: 0,
+        logical_partition_id: 0,
         member_id: "member-a".to_string(),
         pod_id: None,
       },
       ConsumerPartitionAssignmentSnapshot {
         virtual_partition_id: 1,
+        logical_partition_id: 1,
         member_id: "member-b".to_string(),
         pod_id: None,
       },
     ],
+    logical_partitions: vec![],
     published_at: datetime!(2026-07-17 0:00 UTC),
   };
   let observation = crate::diagnostics::group_lease_observation(
@@ -2082,6 +2152,7 @@ fn group_lease_observation_includes_unleased_plan_partitions() {
       committed_cursor: None,
       committed_ts_ms: None,
     }],
+    2,
   );
   let ConsumerGroupLeaseObservation::Fresh { partitions } = observation else {
     panic!("expected fresh group lease observation");
@@ -2171,6 +2242,7 @@ fn suspected_lagging_partitions_uses_configured_metadata_window() {
         committed_ts_ms: Some(0),
       },
     ],
+    2,
   );
   let ConsumerGroupLeaseObservation::Fresh { partitions } = observation else {
     panic!("expected fresh group lease observation");
@@ -2221,6 +2293,7 @@ async fn assignment_callback_replays_active_partitions() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -2291,6 +2364,7 @@ async fn next_returns_revocation_until_completed() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -2369,6 +2443,7 @@ async fn next_does_not_lose_notification_between_state_check_and_wait() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -2450,6 +2525,7 @@ async fn commit_during_revocation_persists_revoked_partition_cursor() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -2575,6 +2651,7 @@ async fn next_delivers_records_and_commit_renews() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -2649,6 +2726,7 @@ async fn scheduled_heartbeats_do_not_depend_on_next_polling() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -2730,6 +2808,7 @@ async fn seek_waits_for_prefetch_scan_without_stalling_heartbeats() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -2813,6 +2892,7 @@ async fn shutdown_releases_owned_partitions_when_deregistration_fails() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -2923,6 +3003,7 @@ async fn seek_interrupts_prefetch_read_retries_without_clock_advance() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .time_provider(time_provider.clone())
   .build()
@@ -2983,6 +3064,7 @@ fn shutdown_span_reports_success_after_all_work_completes() {
       TimeDuration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
+      topic_layout(),
     )
     .await
     .unwrap();
@@ -3052,6 +3134,7 @@ fn shutdown_span_reports_best_effort_cleanup_failure() {
       TimeDuration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
+      topic_layout(),
     )
     .await
     .unwrap();
@@ -3118,6 +3201,7 @@ fn revocation_handoff_span_reports_success_after_reassignment() {
       TimeDuration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
+      topic_layout(),
     )
     .lifecycle_hooks(hooks.clone())
     .build()
@@ -3243,6 +3327,7 @@ async fn seek_discards_prefetched_records_slices_the_resume_batch_and_rewinds_fa
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -3416,6 +3501,7 @@ async fn seek_end_to_end_replays_current_and_earlier_windows_with_source_checkpo
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -3539,6 +3625,7 @@ async fn revocation_drops_buffered_batches_for_revoked_partitions() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -3633,6 +3720,7 @@ async fn cancelled_next_does_not_restart_scheduled_heartbeat() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -3704,6 +3792,7 @@ async fn cancelled_next_does_not_restart_rebalance() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();
@@ -3776,6 +3865,7 @@ async fn cancelled_next_preserves_prefetched_record() {
     TimeDuration::days(1),
     DEFAULT_MAX_METADATA_PUBLICATION_LAG,
     None,
+    topic_layout(),
   )
   .await
   .unwrap();

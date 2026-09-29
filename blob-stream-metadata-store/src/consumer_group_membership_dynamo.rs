@@ -44,6 +44,7 @@ const ATTR_PLAN_VERSION: &str = "plan_version";
 const ATTR_PLAN_PLANNER: &str = "plan_planner_member_id";
 const ATTR_PLAN_MEMBERS: &str = "plan_members";
 const ATTR_PLAN_MEMBER_TOPOLOGY: &str = "plan_member_topology";
+const ATTR_PLAN_COLOCATE_LOGICAL_PARTITIONS: &str = "plan_colocate_logical_partitions";
 const ATTR_PLAN_ASSIGNMENTS: &str = "plan_assignments";
 const ATTR_PLAN_PUBLISHED: &str = "plan_published_ts";
 const ATTR_ASSIGNMENT_PARTITION: &str = "virtual_partition_id";
@@ -231,6 +232,16 @@ impl DynamoConsumerGroupMembershipStore {
       planner_member_id,
       members,
       member_topology,
+      colocate_logical_partitions: item
+        .get(ATTR_PLAN_COLOCATE_LOGICAL_PARTITIONS)
+        .map(|value| {
+          value
+            .as_bool()
+            .map_err(|_| anyhow!("assignment plan grouping mode must be a bool"))
+        })
+        .transpose()?
+        .copied()
+        .unwrap_or(false),
       assignments,
       published_ts_ms,
     })
@@ -256,6 +267,10 @@ impl DynamoConsumerGroupMembershipStore {
           .map(AttributeValue::S)
           .collect(),
       ),
+    );
+    values.insert(
+      ":colocate_logical_partitions".to_string(),
+      AttributeValue::Bool(plan.colocate_logical_partitions),
     );
     if let Some(member_topology) = &plan.member_topology {
       let member_topology = member_topology
@@ -781,7 +796,8 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
       .update_expression(format!(
         "SET {ATTR_RECORD_TYPE} = :plan_type, {ATTR_PLAN_VERSION} = :version, {ATTR_PLAN_PLANNER} \
          = :planner, {ATTR_PLAN_MEMBERS} = :members, {ATTR_PLAN_ASSIGNMENTS} = :assignments, \
-         {ATTR_PLAN_PUBLISHED} = :published{topology_update}{topology_removal}"
+         {ATTR_PLAN_PUBLISHED} = :published, {ATTR_PLAN_COLOCATE_LOGICAL_PARTITIONS} = \
+         :colocate_logical_partitions{topology_update}{topology_removal}"
       ))
       .set_expression_attribute_values(Some(plan_values))
       .build()?;

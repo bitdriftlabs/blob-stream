@@ -16,10 +16,23 @@ partitions to balance load. A valid plan names its planner as a member, covers e
 virtual partition exactly once, and assigns each partition to a plan member. Until a consumer sees
 a structurally valid plan, it makes no local desired-ownership decision.
 
+When the `blob_stream_consumer_colocate_logical_partitions` flag is enabled, the planner instead
+groups virtual partitions by `virtual_partition_id % TopicConfig.partition_count` and tries to
+assign each logical group to one member. It retains the same at-most-one virtual-partition load
+difference, preferring the tightest whole-group fit before prior ownership and splitting a group
+when no remaining owner can fit it. This mode favors co-location over prior virtual-partition
+ownership. Without the flag, the existing cooperative sticky policy remains in effect. The active
+planner reads the flag on each rebalance; changing it publishes a new versioned assignment plan even
+if membership is unchanged. The plan records the chosen mode so members with different flag
+snapshots still follow one shared plan.
+
 Consumers can register an optional stable `pod_id`. When every active member supplies one, the
 planner balances aggregate partition load across pods first, then balances each pod's partitions
 among its members. Otherwise it uses the flat policy, which balances all members globally. This
-supports rolling adoption without a migration.
+supports rolling adoption without a migration. In co-location mode, the planner first tries to keep
+whole logical groups on a pod, then on a worker within that pod. Pod balance takes precedence over
+worker co-location; a logical group may span pods or workers when their respective virtual-partition
+balance requires it.
 
 Consumers may also register `cluster_id`. When every pod-aware member has a cluster ID and all
 members on a pod agree on it, the planner uses the number of distinct active pods per cluster as a
@@ -66,7 +79,11 @@ consistent lease-table query bounded to one second. A lookup failure is reported
 local state.
 
 The response joins retained leases with the last valid assignment plan, so it includes planned but
-unleased partitions and other members' ownership, generation, heartbeat, and committed cursor.
+unleased partitions and other members' ownership, generation, heartbeat, and committed cursor. Plan
+and local/lease partition rows include the logical partition ID. The plan reports its
+`colocate_logical_partitions` mode and groups virtual partition IDs and distinct planned member IDs
+under `logical_partitions`; `colocated` is false when a group spans multiple planned members. These
+groupings describe desired ownership, not a guarantee that leases have converged.
 
 ## Invariants
 

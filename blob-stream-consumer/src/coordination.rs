@@ -6,17 +6,20 @@ mod tests;
 mod assignment;
 
 use crate::config::{ConsumerGroupConfig, consumer_lease_duration, validate_group_config};
-use anyhow::{Error, Result};
+use anyhow::{Error, Result, ensure};
 pub use assignment::cooperative_sticky_assignment;
 use assignment::{
   assignment_plan,
   assignment_plan_pod_ids,
   assignment_plan_policy,
   canonical_member_topology,
+  cooperative_colocated_assignment,
+  cooperative_colocated_assignment_with_pods,
   cooperative_sticky_assignment_with_pods,
 };
 use async_trait::async_trait;
 use bd_log_util::warn_every;
+use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
 use bd_time::OffsetDateTimeExt;
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
@@ -59,6 +62,8 @@ use time::ext::NumericalDuration;
 use uuid::Uuid;
 
 const MAX_CONCURRENT_PARTITION_LEASE_OPERATIONS: usize = 16;
+const COLOCATE_LOGICAL_PARTITIONS_FEATURE_FLAG: &str =
+  "blob_stream_consumer_colocate_logical_partitions";
 
 #[derive(Clone, Copy)]
 enum LeaseMaintenanceOperation {
@@ -270,6 +275,8 @@ pub trait ConsumerGroupCoordinator: Send + Sync {
 /// Default lease-store-backed coordinator implementation.
 pub struct ConsumerGroupCoordinatorImpl {
   config: ConsumerGroupConfig,
+  logical_partition_count: u32,
+  feature_flags: Option<FeatureFlagsWatch>,
   lease_store: Arc<dyn ConsumerGroupLeaseStore>,
   membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   planner_session_id: String,
@@ -289,12 +296,28 @@ impl ConsumerGroupCoordinatorImpl {
     validate_group_config(&config)?;
     Ok(Self {
       config,
+      logical_partition_count: 0,
+      feature_flags: None,
       lease_store,
       membership_store,
       planner_session_id: Uuid::new_v4().to_string(),
       generation: 0,
       owned: HashMap::new(),
     })
+  }
+
+  pub fn with_logical_partition_count(
+    mut self,
+    logical_partition_count: u32,
+    feature_flags: Option<FeatureFlagsWatch>,
+  ) -> Result<Self> {
+    ensure!(
+      logical_partition_count > 0,
+      "logical partition count must be positive"
+    );
+    self.logical_partition_count = logical_partition_count;
+    self.feature_flags = feature_flags;
+    Ok(self)
   }
 
   async fn shared_assignment(
@@ -354,6 +377,13 @@ impl ConsumerGroupCoordinatorImpl {
     let topology_changed = current_plan.as_ref().is_some_and(|plan| {
       plan.members != current_members || plan.member_topology != member_topology
     });
+    let colocate_logical_partitions = self
+      .feature_flags
+      .as_ref()
+      .is_some_and(|flags| flags.get_bool(COLOCATE_LOGICAL_PARTITIONS_FEATURE_FLAG, false));
+    let policy_changed = current_plan
+      .as_ref()
+      .is_some_and(|plan| plan.colocate_logical_partitions != colocate_logical_partitions);
     if let Some(plan) = current_plan.as_ref()
       && current_plan_is_valid
     {
@@ -380,7 +410,7 @@ impl ConsumerGroupCoordinatorImpl {
           rejected_assignment_plan_version,
         });
       }
-      if planner_is_active && !topology_changed {
+      if planner_is_active && !topology_changed && !policy_changed {
         let outcome = self
           .membership_store
           .acquire_or_renew_planner(
@@ -422,19 +452,30 @@ impl ConsumerGroupCoordinatorImpl {
         .as_ref()
         .map(plan_assignment_map)
         .unwrap_or_default();
-      let assignment = member_topology.as_deref().map_or_else(
-        || {
-          cooperative_sticky_assignment(
-            members,
-            partitions,
-            &previous_assignment,
-            &self.config.member_id,
-          )
-        },
-        |member_topology| {
+      let assignment = match (member_topology.as_deref(), colocate_logical_partitions) {
+        (Some(member_topology), true) => cooperative_colocated_assignment_with_pods(
+          member_topology,
+          partitions,
+          &previous_assignment,
+          self.logical_partition_count,
+        ),
+        (None, true) => cooperative_colocated_assignment(
+          members,
+          partitions,
+          &previous_assignment,
+          &self.config.member_id,
+          self.logical_partition_count,
+        ),
+        (Some(member_topology), false) => {
           cooperative_sticky_assignment_with_pods(member_topology, partitions, &previous_assignment)
         },
-      );
+        (None, false) => cooperative_sticky_assignment(
+          members,
+          partitions,
+          &previous_assignment,
+          &self.config.member_id,
+        ),
+      };
       let plan = assignment_plan(
         current_plan
           .as_ref()
@@ -443,6 +484,7 @@ impl ConsumerGroupCoordinatorImpl {
         partitions,
         &assignment,
         member_topology,
+        colocate_logical_partitions,
         &self.config.member_id,
         now.unix_timestamp_ms(),
       );

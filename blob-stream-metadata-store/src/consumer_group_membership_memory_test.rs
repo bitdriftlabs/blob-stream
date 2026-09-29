@@ -176,6 +176,7 @@ async fn planner_lease_fences_plan_publication() {
     planner_member_id: "member-a".to_string(),
     members: vec!["member-a".to_string(), "member-b".to_string()],
     member_topology: None,
+    colocate_logical_partitions: false,
     assignments: vec![
       ConsumerGroupAssignment {
         virtual_partition_id: 0,
@@ -244,6 +245,7 @@ async fn planner_release_allows_immediate_takeover_and_preserves_successor() {
     planner_member_id: "member-a".to_string(),
     members: vec!["member-a".to_string()],
     member_topology: None,
+    colocate_logical_partitions: false,
     assignments: vec![ConsumerGroupAssignment {
       virtual_partition_id: 0,
       member_id: "member-a".to_string(),
@@ -328,6 +330,7 @@ async fn planner_session_fences_stale_same_member_process() {
     planner_member_id: "member-a".to_string(),
     members: vec!["member-a".to_string()],
     member_topology: None,
+    colocate_logical_partitions: false,
     assignments: vec![ConsumerGroupAssignment {
       virtual_partition_id: 0,
       member_id: "member-a".to_string(),
@@ -419,6 +422,7 @@ async fn planner_rejects_plan_declared_for_a_different_member() {
     planner_member_id: "member-b".to_string(),
     members: vec!["member-a".to_string()],
     member_topology: None,
+    colocate_logical_partitions: false,
     assignments: vec![ConsumerGroupAssignment {
       virtual_partition_id: 0,
       member_id: "member-a".to_string(),

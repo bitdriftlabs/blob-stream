@@ -9,6 +9,7 @@ use super::{
 use crate::config::{
   ConsumerRuntimeConfig,
   DEFAULT_MAX_CLOCK_SKEW,
+  TopicConfig,
   consumer_idle_poll_delay,
   consumer_lease_duration,
   consumer_max_clock_skew,
@@ -33,6 +34,7 @@ use blob_stream_types::DEFAULT_METADATA_WINDOW_SIZE;
 use log::info;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use time::Duration;
@@ -42,9 +44,36 @@ use tokio::sync::Notify;
 // ConsumerIteratorBuilder
 //
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Topic partition layout needed to map virtual partitions to logical partitions.
+pub struct TopicPartitionLayout {
+  partition_count: NonZeroU32,
+}
+
+impl TopicPartitionLayout {
+  /// Construct a layout for direct iterator construction without a full topic config.
+  pub fn new(partition_count: u32) -> Result<Self> {
+    Ok(Self {
+      partition_count: NonZeroU32::new(partition_count)
+        .ok_or_else(|| anyhow!("logical partition count must be positive"))?,
+    })
+  }
+
+  /// Use the logical partition count from the configured topic.
+  pub fn from_topic(topic: &TopicConfig) -> Result<Self> {
+    Self::new(topic.partition_count)
+  }
+
+  #[must_use]
+  pub fn partition_count(self) -> u32 {
+    self.partition_count.get()
+  }
+}
+
 /// Configures a consumer iterator and runtime dependencies.
 pub struct ConsumerIteratorBuilder<'a> {
   runtime: &'a ConsumerRuntimeConfig,
+  topic_layout: TopicPartitionLayout,
   blob_store: Arc<dyn BlobStore>,
   metadata_store: Arc<dyn MetadataStore>,
   lease_store: Arc<dyn ConsumerGroupLeaseStore>,
@@ -79,9 +108,11 @@ impl<'a> ConsumerIteratorBuilder<'a> {
     retention: Duration,
     maximum_metadata_publication_lag: Duration,
     feature_flags: Option<FeatureFlagsWatch>,
+    topic_layout: TopicPartitionLayout,
   ) -> Self {
     Self {
       runtime,
+      topic_layout,
       blob_store,
       metadata_store,
       lease_store,
@@ -163,6 +194,7 @@ impl ConsumerIteratorImpl {
     retention: Duration,
     maximum_metadata_publication_lag: Duration,
     feature_flags: Option<FeatureFlagsWatch>,
+    topic_layout: TopicPartitionLayout,
   ) -> Result<Self> {
     ConsumerIteratorBuilder::new(
       runtime,
@@ -177,6 +209,7 @@ impl ConsumerIteratorImpl {
       retention,
       maximum_metadata_publication_lag,
       feature_flags,
+      topic_layout,
     )
     .build()
     .await
@@ -188,6 +221,7 @@ impl ConsumerIteratorBuilder<'_> {
   pub async fn build(self) -> Result<ConsumerIteratorImpl> {
     let Self {
       runtime,
+      topic_layout,
       blob_store,
       metadata_store,
       lease_store,
@@ -207,6 +241,7 @@ impl ConsumerIteratorBuilder<'_> {
       lifecycle_hooks,
     } = self;
     validate_runtime_config(runtime)?;
+    let logical_partition_count = topic_layout.partition_count();
     ensure!(
       retention.is_positive(),
       "consumer retention recovery requires topic retention greater than zero"
@@ -232,6 +267,7 @@ impl ConsumerIteratorBuilder<'_> {
     let idle_poll_delay = consumer_idle_poll_delay(&read_config);
     let max_idle_poll_delay = Some(consumer_max_idle_poll_delay(&read_config));
     let prefetch_max_bytes = consumer_prefetch_max_bytes(&read_config);
+    let coordinator_feature_flags = feature_flags.clone();
 
     let active_assignment = HashSet::new();
     let assignment_callback = Arc::new(Mutex::new(None));
@@ -257,7 +293,8 @@ impl ConsumerIteratorBuilder<'_> {
       group_config.clone(),
       Arc::clone(&lease_store),
       Arc::clone(&membership_store),
-    )?;
+    )?
+    .with_logical_partition_count(logical_partition_count, coordinator_feature_flags)?;
     let now = driver_time_provider.now();
     let now_ts_ms = now.unix_timestamp_ms();
     let membership_lease_duration = consumer_lease_duration(&group_config);
@@ -269,6 +306,7 @@ impl ConsumerIteratorBuilder<'_> {
     let prefetch_shutdown = Arc::new(AtomicBool::new(false));
     let diagnostics = ConsumerDiagnostics::new(
       group_config.clone(),
+      logical_partition_count,
       Arc::clone(&shared_state),
       prefetch_max_bytes,
       metadata_window_size,
