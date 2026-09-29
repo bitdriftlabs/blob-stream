@@ -7539,16 +7539,38 @@ async fn colocated_assignment_mode_switch_preserves_group_delivery() -> Result<(
       .create_consumer_with_feature_flags(&runtime_a, flags.snapshot_watch())
       .await?,
   );
-  let consumer_b = Box::new(cluster.create_consumer(&runtime_b).await?);
-  let follower_diagnostics = consumer_b.diagnostics().unwrap().clone();
+  let membership_store = cluster.consumer_membership_store();
+  let planner_plan = membership_store
+    .get_assignment_plan(TOPIC, "integration-group")
+    .await?
+    .ok_or_else(|| anyhow!("first consumer did not publish its initial plan"))?;
+  assert_eq!(planner_plan.planner_member_id, "colocate-a");
+  assert_eq!(planner_plan.members, ["colocate-a"]);
+  let mut planner_started_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "colocate-a",
+      None,
+      None,
+    )
+    .await?;
   let (event_tx, mut event_rx) = mpsc::unbounded_channel();
   let (stop_tx_a, stop_rx_a) = watch::channel(false);
-  let (stop_tx_b, stop_rx_b) = watch::channel(false);
   let task_a = tokio::spawn(run_consumer_task(consumer_a, stop_rx_a, event_tx.clone()));
+  timeout(
+    Duration::from_secs(10),
+    planner_started_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("planner did not start before the second consumer joined"))??;
+  planner_started_gate.release()?;
+
+  let consumer_b = Box::new(cluster.create_consumer(&runtime_b).await?);
+  let follower_diagnostics = consumer_b.diagnostics().unwrap().clone();
+  let (stop_tx_b, stop_rx_b) = watch::channel(false);
   let task_b = tokio::spawn(run_consumer_task(consumer_b, stop_rx_b, event_tx));
   let mut deliveries = ConsumerDeliveryTraces::new();
   let mut revocations = 0;
-  let membership_store = cluster.consumer_membership_store();
   let lease_store = cluster.consumer_lease_store();
 
   let initial_plan = timeout(Duration::from_secs(10), async {

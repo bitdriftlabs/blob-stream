@@ -157,16 +157,16 @@ fn assign_colocated_groups(
   let mut residual_owners = owners.to_vec();
   residual_owners.sort_by_key(|owner| {
     (
+      residual_preference
+        .and_then(|preference| preference.get(owner))
+        .copied()
+        .unwrap_or_default(),
       Reverse(
         previous_load
           .get(owner.as_str())
           .copied()
           .unwrap_or_default(),
       ),
-      residual_preference
-        .and_then(|preference| preference.get(owner))
-        .copied()
-        .unwrap_or_default(),
       owner.clone(),
     )
   });

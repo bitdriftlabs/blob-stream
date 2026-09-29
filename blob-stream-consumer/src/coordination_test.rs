@@ -389,6 +389,50 @@ fn colocated_assignment_with_pods_balances_pods_and_workers() {
   }));
 }
 
+#[test]
+fn colocated_assignment_moves_residual_to_smaller_cluster_after_topology_change() {
+  let members = vec![
+    ConsumerGroupMember {
+      member_id: "pod-a:worker-0".to_string(),
+      pod_id: Some("pod-a".to_string()),
+      cluster_id: Some("cluster-small".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-b:worker-0".to_string(),
+      pod_id: Some("pod-b".to_string()),
+      cluster_id: Some("cluster-large".to_string()),
+    },
+    ConsumerGroupMember {
+      member_id: "pod-c:worker-0".to_string(),
+      pod_id: Some("pod-c".to_string()),
+      cluster_id: Some("cluster-large".to_string()),
+    },
+  ];
+  let partitions = vec![0, 1, 2, 3];
+  let previous = HashMap::from([
+    (0, "pod-b:worker-0".to_string()),
+    (1, "pod-b:worker-0".to_string()),
+    (2, "pod-a:worker-0".to_string()),
+    (3, "pod-c:worker-0".to_string()),
+  ]);
+
+  let assignment = cooperative_colocated_assignment_with_pods(&members, &partitions, &previous, 4);
+  let pod_loads = members
+    .iter()
+    .map(|member| {
+      assignment
+        .values()
+        .filter(|owner| *owner == &member.member_id)
+        .count()
+    })
+    .collect::<Vec<_>>();
+  assert_eq!(pod_loads, vec![2, 1, 1]);
+  assert_eq!(
+    assignment,
+    cooperative_colocated_assignment_with_pods(&members, &partitions, &assignment, 4)
+  );
+}
+
 #[tokio::test]
 async fn grouping_flag_replans_and_rolls_back_with_active_planner() {
   let flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
