@@ -13,9 +13,6 @@ rust_library_with_test(
     crate_name = "blob_stream_metadata_store",
     crate_root = "src/lib.rs",
     edition = "2024",
-    nextest_args = [
-        "-E",
-        "!test(dynamo)",
-    ],
+    itest_deps = ["dynamodb"],
     deps = all_crate_deps(normal = True),
 )

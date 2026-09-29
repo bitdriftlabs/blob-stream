@@ -4,6 +4,11 @@ This guide is the canonical workflow reference for contributors. See the
 [repository overview](README.md) for the full documentation map and [Design](docs/design/README.md)
 before changing architecture-sensitive behavior.
 
+Shared language and style instructions come from
+[bitdriftlabs/ai-instructions](https://github.com/bitdriftlabs/ai-instructions); this repository's
+[AGENTS.md](AGENTS.md) adds Blob Stream-specific agent rules. The command-owning checkout root
+selects the build, lint, test, and format workflow below.
+
 ## Choose Your Environment
 
 Use the workflow that matches how the repository was checked out.
@@ -11,15 +16,15 @@ Use the workflow that matches how the repository was checked out.
 | Environment | Build, lint, and test | Formatting |
 | --- | --- | --- |
 | Standalone `blob-stream` clone | Cargo and Cargo Nextest | `cargo +nightly fmt` |
-| Blob Stream in the monorepo | Bazel from the monorepo root or `../bazelw` from this directory | Root `just rustfmt`; use `just format` and `just check-format` for TOML |
+| Blob Stream in the monorepo | Bazel from the monorepo root or `../bazelw` from this directory | Root `just rustfmt`; `just format` and `just check-format` for Bazel, Starlark, or TOML |
 
-The monorepo's [AGENTS.md](AGENTS.md) adds mandatory agent constraints, especially for deterministic
-integration tests. It does not replace this guide.
+When nested in the monorepo, its root `AGENTS.md` and Bazel execution profile add mandatory agent
+constraints. Do not use standalone Cargo commands for normal monorepo builds, lint, or tests.
 
 ## Prerequisites
 
 - Rust toolchain for edition 2024
-- Docker and Docker Compose for local dependencies
+- Docker for service-backed tests; Docker Compose for standalone local dependencies
 - AWS CLI when using optional local-cloud emulation commands
 - Bazel wrapper dependencies when working in the monorepo
 
@@ -46,11 +51,12 @@ Use `RUST_LOG=blob_stream=trace,bd=trace` only for targeted investigation.
 ### Monorepo Worktree
 
 Run Bazel tests and Clippy from the monorepo root, or use `../bazelw` from the `blob-stream`
-directory. For example:
+directory. The normal metadata-store test wrapper starts its DynamoDB dependency. From the
+monorepo root, for example:
 
 ```bash
-../bazelw test //blob-stream/blob-stream-metadata-store:unit-test
-../bazelw test --config=clippy //blob-stream/blob-stream-metadata-store:blob-stream-metadata-store__clippy
+./bazelw test //blob-stream/blob-stream-metadata-store:test
+./bazelw test --config=clippy //blob-stream/blob-stream-metadata-store/...
 ```
 
 Service-backed Blob Stream integration tests must use their generated Nextest wrappers, not raw
@@ -65,8 +71,8 @@ For a standalone clone, format Rust from this directory:
 cargo +nightly fmt
 ```
 
-For a monorepo checkout, follow the root execution profile: format Rust with the root `just
-rustfmt` workflow. When TOML changes, also run from the monorepo root:
+For a monorepo checkout, follow the root execution profile. Format Rust with `just rustfmt` from
+the monorepo root. When Bazel, Starlark, or TOML changes, also run from that root:
 
 ```bash
 just format
@@ -82,14 +88,15 @@ git diff --check
 
 ## Local Infrastructure
 
-Start S3 and DynamoDB emulation:
+For standalone Cargo tests or the standalone stress runner, start S3 and DynamoDB emulation:
 
 ```bash
 docker compose up -d
 ```
 
 This starts DynamoDB Local at `http://localhost:8000` and LocalStack S3 at
-`http://localhost:4566`.
+`http://localhost:4566`. Monorepo Bazel test wrappers start their required pooled services; do not
+start Compose for those tests.
 
 ## Local End-To-End Walkthrough
 
@@ -105,11 +112,22 @@ The optional stress runner exercises in-process TCP brokers, LocalStack S3, Dyna
 producer client, and production consumer bootstrap. Each run creates and cleans up an isolated
 bucket and DynamoDB table set.
 
-Start local dependencies, then run a small workload:
+### Standalone Clone
+
+From the standalone checkout, start local dependencies with Compose, then run a small workload:
 
 ```bash
 RUST_LOG=off cargo run -p blob-stream-integration-tests --bin blob-stream-stress -- \
   --brokers 1 --producers 1 --consumers 1 --partitions 4 --records 100
+```
+
+For a larger standalone workload:
+
+```bash
+RUST_LOG=off cargo run -p blob-stream-integration-tests --bin blob-stream-stress -- \
+  --brokers 3 --producers 4 --consumers 3 --partitions 16 --records 100000 \
+  --payload-bytes 1024 --overall-timeout-seconds 600 --producer-timeout-seconds 600 \
+  --drain-timeout-seconds 120
 ```
 
 ### Monorepo Worktree
@@ -126,16 +144,7 @@ RUST_LOG=off ./bazelw run //blob-stream/blob-stream-integration-tests:blob-strea
   --brokers 1 --producers 1 --consumers 1 --partitions 4 --records 100
 ```
 
-A larger example:
-
-```bash
-RUST_LOG=off cargo run -p blob-stream-integration-tests --bin blob-stream-stress -- \
-  --brokers 3 --producers 4 --consumers 3 --partitions 16 --records 100000 \
-  --payload-bytes 1024 --overall-timeout-seconds 600 --producer-timeout-seconds 600 \
-  --drain-timeout-seconds 120
-```
-
-Run the same larger workload through Bazel with:
+A larger workload through Bazel:
 
 ```bash
 RUST_LOG=off ./bazelw run //blob-stream/blob-stream-integration-tests:blob-stream-stress-itest -- \
@@ -154,13 +163,13 @@ phase rather than treating a larger overall deadline as a fix.
 
 ## Rustdocs And Doctests
 
-Build local API documentation:
+For a standalone checkout, build local API documentation:
 
 ```bash
 cargo doc --workspace --no-deps --open
 ```
 
-Run doctests for public crates:
+Run doctests for public crates in the standalone checkout:
 
 ```bash
 cargo test -p blob-stream-producer --doc

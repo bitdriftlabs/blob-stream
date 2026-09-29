@@ -23,7 +23,7 @@ use blob_stream_types::{
 use log::debug;
 use parking_lot::Mutex;
 use serde::{Serialize, Serializer};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -96,6 +96,7 @@ pub struct ConsumerLocalStateSnapshot {
 /// All local consumer state associated with one virtual partition.
 pub struct ConsumerLocalPartitionSnapshot {
   pub virtual_partition_id: VirtualPartitionId,
+  pub logical_partition_id: u32,
   pub owned: bool,
   pub active: bool,
   pub pending_assignment: bool,
@@ -330,6 +331,7 @@ pub struct ConsumerCommittedCursorSnapshot {
 /// Desired and observed lease state for one consumer-group virtual partition.
 pub struct ConsumerGroupPartitionLeaseSnapshot {
   pub virtual_partition_id: VirtualPartitionId,
+  pub logical_partition_id: u32,
   pub desired_owner_id: Option<String>,
   pub owner_id: Option<String>,
   pub generation: Option<u64>,
@@ -353,10 +355,12 @@ pub struct ConsumerAssignmentPlanSnapshot {
   pub version: u64,
   pub planner_member_id: String,
   pub policy: ConsumerAssignmentPolicy,
+  pub colocate_logical_partitions: bool,
   pub members: Vec<String>,
   pub member_topology: Vec<ConsumerMemberTopologySnapshot>,
   pub pod_loads: Vec<ConsumerPodLoadSnapshot>,
   pub assignments: Vec<ConsumerPartitionAssignmentSnapshot>,
+  pub logical_partitions: Vec<ConsumerLogicalPartitionAssignmentSnapshot>,
   #[serde(with = "time::serde::rfc3339")]
   pub published_at: OffsetDateTime,
 }
@@ -391,8 +395,17 @@ pub struct ConsumerPodLoadSnapshot {
 /// Desired shared-plan owner for one virtual partition.
 pub struct ConsumerPartitionAssignmentSnapshot {
   pub virtual_partition_id: VirtualPartitionId,
+  pub logical_partition_id: u32,
   pub member_id: String,
   pub pod_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ConsumerLogicalPartitionAssignmentSnapshot {
+  pub logical_partition_id: u32,
+  pub virtual_partition_ids: Vec<VirtualPartitionId>,
+  pub member_ids: Vec<String>,
+  pub colocated: bool,
 }
 
 //
@@ -450,6 +463,7 @@ pub struct ConsumerDiagnosticsRuntimeState {
 #[derive(Clone)]
 pub struct ConsumerDiagnostics {
   group_config: ConsumerGroupConfig,
+  logical_partition_count: u32,
   shared_state: Arc<Mutex<ConsumerSharedState>>,
   prefetch_max_bytes: u64,
   metadata_window_size: TimeDuration,
@@ -459,6 +473,7 @@ pub struct ConsumerDiagnostics {
 impl ConsumerDiagnostics {
   pub fn new(
     group_config: ConsumerGroupConfig,
+    logical_partition_count: u32,
     shared_state: Arc<Mutex<ConsumerSharedState>>,
     prefetch_max_bytes: u64,
     metadata_window_size: TimeDuration,
@@ -466,6 +481,7 @@ impl ConsumerDiagnostics {
   ) -> Self {
     Self {
       group_config,
+      logical_partition_count,
       shared_state,
       prefetch_max_bytes,
       metadata_window_size,
@@ -476,6 +492,13 @@ impl ConsumerDiagnostics {
   #[must_use]
   pub fn state_snapshot(&self) -> ConsumerStateSnapshot {
     self.build_state_snapshot()
+  }
+
+  pub fn assignment_plan_snapshot(
+    &self,
+    plan: ConsumerGroupAssignmentPlan,
+  ) -> ConsumerAssignmentPlanSnapshot {
+    assignment_plan_snapshot(plan, self.logical_partition_count)
   }
 
   fn build_state_snapshot(&self) -> ConsumerStateSnapshot {
@@ -522,20 +545,43 @@ impl ConsumerDiagnostics {
     // present one complete local view per partition instead of parallel, correlated lists.
     let mut local_partitions = BTreeMap::new();
     for partition_id in runtime_state.owned_partitions {
-      local_partition_snapshot(&mut local_partitions, partition_id).owned = true;
+      local_partition_snapshot(
+        &mut local_partitions,
+        partition_id,
+        self.logical_partition_count,
+      )
+      .owned = true;
     }
     for partition_id in runtime_state.active_assignment {
-      local_partition_snapshot(&mut local_partitions, partition_id).active = true;
+      local_partition_snapshot(
+        &mut local_partitions,
+        partition_id,
+        self.logical_partition_count,
+      )
+      .active = true;
     }
     for partition_id in runtime_state.pending_assignment.unwrap_or_default() {
-      local_partition_snapshot(&mut local_partitions, partition_id).pending_assignment = true;
+      local_partition_snapshot(
+        &mut local_partitions,
+        partition_id,
+        self.logical_partition_count,
+      )
+      .pending_assignment = true;
     }
     for (partition_id, commit) in pending_commit_state {
-      local_partition_snapshot(&mut local_partitions, partition_id).pending_commit_offset =
-        Some(commit.offset);
+      local_partition_snapshot(
+        &mut local_partitions,
+        partition_id,
+        self.logical_partition_count,
+      )
+      .pending_commit_offset = Some(commit.offset);
     }
     for (partition_id, committed_cursor) in runtime_state.last_committed_cursors {
-      let partition = local_partition_snapshot(&mut local_partitions, partition_id);
+      let partition = local_partition_snapshot(
+        &mut local_partitions,
+        partition_id,
+        self.logical_partition_count,
+      );
       partition.last_committed_offset = Some(committed_cursor.offset);
       partition.last_committed_source_checkpoint = committed_cursor
         .source_checkpoint
@@ -546,8 +592,12 @@ impl ConsumerDiagnostics {
         .map(offset_datetime_from_unix_millis);
     }
     for cursor in runtime_state.cursors {
-      local_partition_snapshot(&mut local_partitions, cursor.virtual_partition_id).cursor =
-        Some(cursor.offset);
+      local_partition_snapshot(
+        &mut local_partitions,
+        cursor.virtual_partition_id,
+        self.logical_partition_count,
+      )
+      .cursor = Some(cursor.offset);
     }
     for reader_partition in runtime_state.reader_partitions {
       let ConsumerReaderPartitionSnapshot {
@@ -557,19 +607,32 @@ impl ConsumerDiagnostics {
         recovery_cutover_window_start,
         fast_coverage_floor,
       } = reader_partition;
-      local_partition_snapshot(&mut local_partitions, virtual_partition_id).reader =
-        Some(ConsumerReaderStateSnapshot {
-          mode,
-          recovery_next_window_start,
-          recovery_cutover_window_start,
-          fast_coverage_floor,
-        });
+      local_partition_snapshot(
+        &mut local_partitions,
+        virtual_partition_id,
+        self.logical_partition_count,
+      )
+      .reader = Some(ConsumerReaderStateSnapshot {
+        mode,
+        recovery_next_window_start,
+        recovery_cutover_window_start,
+        fast_coverage_floor,
+      });
     }
     for (partition_id, scan) in runtime_state.reader_partition_scans {
-      local_partition_snapshot(&mut local_partitions, partition_id).last_scan = Some(scan);
+      local_partition_snapshot(
+        &mut local_partitions,
+        partition_id,
+        self.logical_partition_count,
+      )
+      .last_scan = Some(scan);
     }
     for (partition_id, record_count) in &buffered_batches {
-      let snapshot = local_partition_snapshot(&mut local_partitions, *partition_id);
+      let snapshot = local_partition_snapshot(
+        &mut local_partitions,
+        *partition_id,
+        self.logical_partition_count,
+      );
       snapshot.prefetch_buffered_batch_count =
         snapshot.prefetch_buffered_batch_count.saturating_add(1);
       snapshot.prefetch_buffered_record_count = snapshot
@@ -579,7 +642,11 @@ impl ConsumerDiagnostics {
     // The active batch has already left the queue, but its remaining records are still buffered
     // locally until `next()` yields them. Attribute them without changing the queued batch count.
     if let Some((partition_id, record_count)) = current_batch {
-      let snapshot = local_partition_snapshot(&mut local_partitions, partition_id);
+      let snapshot = local_partition_snapshot(
+        &mut local_partitions,
+        partition_id,
+        self.logical_partition_count,
+      );
       snapshot.prefetch_buffered_record_count = snapshot
         .prefetch_buffered_record_count
         .saturating_add(record_count);
@@ -633,7 +700,11 @@ impl ConsumerDiagnostics {
     )
     .await
     {
-      Ok(Ok(leases)) => group_lease_observation(state.assignment_plan.as_ref(), leases),
+      Ok(Ok(leases)) => group_lease_observation(
+        state.assignment_plan.as_ref(),
+        leases,
+        self.logical_partition_count,
+      ),
       Ok(Err(error)) => {
         debug!(
           "consumer state lease lookup failed: topic={}, group_id={}, error={error:#}",
@@ -675,7 +746,16 @@ impl ConsumerDiagnostics {
 
 pub fn assignment_plan_snapshot(
   plan: ConsumerGroupAssignmentPlan,
+  logical_partition_count: u32,
 ) -> ConsumerAssignmentPlanSnapshot {
+  let mut logical_partitions = BTreeMap::<u32, (Vec<VirtualPartitionId>, BTreeSet<String>)>::new();
+  for assignment in &plan.assignments {
+    let (virtual_ids, member_ids) = logical_partitions
+      .entry(assignment.virtual_partition_id % logical_partition_count)
+      .or_default();
+    virtual_ids.push(assignment.virtual_partition_id);
+    member_ids.insert(assignment.member_id.clone());
+  }
   let member_topology_by_id = plan
     .member_topology
     .as_ref()
@@ -708,6 +788,7 @@ pub fn assignment_plan_snapshot(
   ConsumerAssignmentPlanSnapshot {
     version: plan.version,
     planner_member_id: plan.planner_member_id,
+    colocate_logical_partitions: plan.colocate_logical_partitions,
     policy: if plan.member_topology.is_some() {
       ConsumerAssignmentPolicy::PodAware
     } else {
@@ -739,11 +820,26 @@ pub fn assignment_plan_snapshot(
       .into_iter()
       .map(|assignment| ConsumerPartitionAssignmentSnapshot {
         virtual_partition_id: assignment.virtual_partition_id,
+        logical_partition_id: assignment.virtual_partition_id % logical_partition_count,
         pod_id: member_topology_by_id
           .get(&assignment.member_id)
           .and_then(|member| member.pod_id.clone()),
         member_id: assignment.member_id,
       })
+      .collect(),
+    logical_partitions: logical_partitions
+      .into_iter()
+      .map(
+        |(logical_partition_id, (mut virtual_partition_ids, member_ids))| {
+          virtual_partition_ids.sort_unstable();
+          ConsumerLogicalPartitionAssignmentSnapshot {
+            logical_partition_id,
+            virtual_partition_ids,
+            colocated: member_ids.len() == 1,
+            member_ids: member_ids.into_iter().collect(),
+          }
+        },
+      )
       .collect(),
     published_at: offset_datetime_from_unix_millis(plan.published_ts_ms),
   }
@@ -752,6 +848,7 @@ pub fn assignment_plan_snapshot(
 pub fn group_lease_observation(
   assignment_plan: Option<&ConsumerAssignmentPlanSnapshot>,
   leases: Vec<ConsumerGroupLease>,
+  logical_partition_count: u32,
 ) -> ConsumerGroupLeaseObservation {
   let desired_owners = assignment_plan
     .map(|plan| {
@@ -775,6 +872,7 @@ pub fn group_lease_observation(
         virtual_partition_id,
         desired_owners.get(&virtual_partition_id).cloned(),
         Some(lease),
+        logical_partition_count,
       )
     })
     .collect::<Vec<_>>();
@@ -788,6 +886,7 @@ pub fn group_lease_observation(
         virtual_partition_id,
         Some(desired_owner_id),
         None,
+        logical_partition_count,
       ));
     }
   }
@@ -817,10 +916,12 @@ fn group_partition_lease_snapshot(
   virtual_partition_id: VirtualPartitionId,
   desired_owner_id: Option<String>,
   lease: Option<ConsumerGroupLease>,
+  logical_partition_count: u32,
 ) -> ConsumerGroupPartitionLeaseSnapshot {
   let Some(lease) = lease else {
     return ConsumerGroupPartitionLeaseSnapshot {
       virtual_partition_id,
+      logical_partition_id: virtual_partition_id % logical_partition_count,
       desired_owner_id,
       owner_id: None,
       generation: None,
@@ -834,6 +935,7 @@ fn group_partition_lease_snapshot(
 
   ConsumerGroupPartitionLeaseSnapshot {
     virtual_partition_id,
+    logical_partition_id: virtual_partition_id % logical_partition_count,
     desired_owner_id,
     owner_id: Some(lease.owner_id),
     generation: Some(lease.generation),
@@ -865,11 +967,13 @@ fn source_checkpoint_snapshot(
 fn local_partition_snapshot(
   snapshots: &mut BTreeMap<VirtualPartitionId, ConsumerLocalPartitionSnapshot>,
   virtual_partition_id: VirtualPartitionId,
+  logical_partition_count: u32,
 ) -> &mut ConsumerLocalPartitionSnapshot {
   snapshots
     .entry(virtual_partition_id)
     .or_insert(ConsumerLocalPartitionSnapshot {
       virtual_partition_id,
+      logical_partition_id: virtual_partition_id % logical_partition_count,
       owned: false,
       active: false,
       pending_assignment: false,

@@ -1,4 +1,5 @@
 use super::membership_topology_update_expression;
+use crate::tests::dynamo_client;
 use crate::{
   ConsumerGroupAssignment,
   ConsumerGroupAssignmentPlan,
@@ -8,7 +9,6 @@ use crate::{
   DynamoConsumerGroupMembershipStore,
 };
 use anyhow::{Context, Result, anyhow};
-use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{
   AttributeDefinition,
@@ -19,13 +19,12 @@ use aws_sdk_dynamodb::types::{
   ScalarAttributeType,
 };
 use blob_stream_types::offset_datetime_from_unix_millis;
+use std::collections::HashMap;
 use std::time::Duration;
 use time::Duration as TimeDuration;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-const LOCAL_ENDPOINT: &str = "http://localhost:8000";
-const REGION: &str = "us-east-1";
 const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
 const RECORD_TYPE_ATTRIBUTE_NAME: &str = "record_type";
 const POD_ID_ATTRIBUTE_NAME: &str = "pod_id";
@@ -51,18 +50,42 @@ fn membership_topology_update_expression_writes_and_removes_attributes() {
   );
 }
 
-async fn dynamo_client() -> Result<Client> {
-  unsafe {
-    std::env::set_var("AWS_ACCESS_KEY_ID", "test");
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-    std::env::set_var("AWS_REGION", REGION);
-  }
+#[test]
+fn assignment_plan_without_grouping_attribute_defaults_to_legacy_mode() {
+  let item = HashMap::from([
+    (
+      "plan_version".to_string(),
+      AttributeValue::N("1".to_string()),
+    ),
+    (
+      "plan_planner_member_id".to_string(),
+      AttributeValue::S("member-a".to_string()),
+    ),
+    (
+      "plan_members".to_string(),
+      AttributeValue::L(vec![AttributeValue::S("member-a".to_string())]),
+    ),
+    (
+      "plan_assignments".to_string(),
+      AttributeValue::L(vec![AttributeValue::M(HashMap::from([
+        (
+          "virtual_partition_id".to_string(),
+          AttributeValue::N("0".to_string()),
+        ),
+        (
+          "member_id".to_string(),
+          AttributeValue::S("member-a".to_string()),
+        ),
+      ]))]),
+    ),
+    (
+      "plan_published_ts".to_string(),
+      AttributeValue::N("1000".to_string()),
+    ),
+  ]);
 
-  let config = aws_config::defaults(BehaviorVersion::latest())
-    .endpoint_url(LOCAL_ENDPOINT)
-    .load()
-    .await;
-  Ok(Client::new(&config))
+  let plan = DynamoConsumerGroupMembershipStore::plan_from_item(&item).unwrap();
+  assert!(!plan.colocate_logical_partitions);
 }
 
 async fn create_membership_table(client: &Client, table_name: &str) -> Result<()> {
@@ -446,6 +469,7 @@ async fn planner_records_do_not_appear_in_legacy_member_partition() -> Result<()
           planner_member_id: "member-a".to_string(),
           members: vec!["member-a".to_string()],
           member_topology: None,
+          colocate_logical_partitions: false,
           assignments: vec![ConsumerGroupAssignment {
             virtual_partition_id: 0,
             member_id: "member-a".to_string(),
@@ -537,6 +561,7 @@ async fn assignment_plan_topology_round_trips_and_is_removed_for_flat_plan() -> 
           planner_member_id: "member-a".to_string(),
           members: vec!["member-a".to_string(), "member-b".to_string()],
           member_topology: Some(member_topology.clone()),
+          colocate_logical_partitions: true,
           assignments: assignments.clone(),
           published_ts_ms: 1_000,
         },
@@ -547,8 +572,8 @@ async fn assignment_plan_topology_round_trips_and_is_removed_for_flat_plan() -> 
     store
       .get_assignment_plan("topic-a", "group-a")
       .await?
-      .and_then(|plan| plan.member_topology),
-    Some(member_topology)
+      .map(|plan| (plan.member_topology, plan.colocate_logical_partitions)),
+    Some((Some(member_topology), true))
   );
 
   assert!(
@@ -564,6 +589,7 @@ async fn assignment_plan_topology_round_trips_and_is_removed_for_flat_plan() -> 
           planner_member_id: "member-a".to_string(),
           members: vec!["member-a".to_string(), "member-b".to_string()],
           member_topology: None,
+          colocate_logical_partitions: false,
           assignments,
           published_ts_ms: 1_001,
         },
@@ -574,8 +600,8 @@ async fn assignment_plan_topology_round_trips_and_is_removed_for_flat_plan() -> 
     store
       .get_assignment_plan("topic-a", "group-a")
       .await?
-      .and_then(|plan| plan.member_topology),
-    None
+      .map(|plan| (plan.member_topology, plan.colocate_logical_partitions)),
+    Some((None, false))
   );
 
   client.delete_table().table_name(table_name).send().await?;
@@ -593,6 +619,7 @@ fn assignment_plan_topology_missing_pod_id_returns_error() {
       pod_id: None,
       cluster_id: None,
     }]),
+    colocate_logical_partitions: false,
     assignments: vec![ConsumerGroupAssignment {
       virtual_partition_id: 0,
       member_id: "member-a".to_string(),
@@ -652,6 +679,7 @@ async fn planner_session_fences_stale_process_and_mismatched_plan_publisher() ->
     planner_member_id: "member-a".to_string(),
     members: vec!["member-a".to_string()],
     member_topology: None,
+    colocate_logical_partitions: false,
     assignments: vec![ConsumerGroupAssignment {
       virtual_partition_id: 0,
       member_id: "member-a".to_string(),

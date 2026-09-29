@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow};
+use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::{Collector, Scope};
+use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::BlobKey;
 use blob_stream_broker::write::{BrokerLeaseStatus, WriteRequest};
@@ -9,7 +11,12 @@ use blob_stream_consumer::consumer::{
   GrpcBrokerBlobRangeQuery,
   GrpcBrokerMetadataQuery,
 };
-use blob_stream_consumer::iterator::{ConsumerIterator, ConsumerIteratorImpl, NextResult};
+use blob_stream_consumer::iterator::{
+  ConsumerIterator,
+  ConsumerIteratorImpl,
+  NextResult,
+  TopicPartitionLayout,
+};
 use blob_stream_consumer::{
   ConsumerBootstrapConfig,
   ConsumerBootstrapIteratorBuilder,
@@ -1990,6 +1997,7 @@ async fn iterator_reuses_mature_recovery_metadata_across_prefetch_capacity_cycle
       TimeDuration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
+      TopicPartitionLayout::new(PARTITION_COUNT)?,
     )
     .await?,
   );
@@ -2265,6 +2273,7 @@ async fn iterator_recovers_persisted_checkpoint_across_multiple_recovery_slices(
       TimeDuration::days(1),
       DEFAULT_MAX_METADATA_PUBLICATION_LAG,
       None,
+      TopicPartitionLayout::new(PARTITION_COUNT)?,
     )
     .await?,
   );
@@ -7505,6 +7514,276 @@ async fn dynamic_membership_scale_out_rebalances() -> Result<()> {
   Ok(())
 }
 
+// High-level: verifies a live pod-aware mode change preserves group delivery and durable progress.
+#[tokio::test]
+async fn colocated_assignment_mode_switch_preserves_group_delivery() -> Result<()> {
+  const FLAG: &str = "blob_stream_consumer_colocate_logical_partitions";
+  let flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
+  let mut cluster = ClusterHarness::in_memory(1)
+    .topic_num_writers(2)
+    .start()
+    .await?;
+  let producer = cluster
+    .create_producer(
+      producer_config(),
+      vec![producer_topic_named_with_writers(TOPIC, 2)],
+    )
+    .await?;
+  let hooks = cluster.lifecycle_hooks();
+  let mut runtime_a = consumer_runtime_config("colocate-a");
+  runtime_a.group.as_mut().unwrap().pod_id = Some("pod-a".into());
+  let mut runtime_b = consumer_runtime_config("colocate-b");
+  runtime_b.group.as_mut().unwrap().pod_id = Some("pod-b".into());
+  let consumer_a = Box::new(
+    cluster
+      .create_consumer_with_feature_flags(&runtime_a, flags.snapshot_watch())
+      .await?,
+  );
+  let consumer_b = Box::new(cluster.create_consumer(&runtime_b).await?);
+  let follower_diagnostics = consumer_b.diagnostics().unwrap().clone();
+  let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+  let (stop_tx_a, stop_rx_a) = watch::channel(false);
+  let (stop_tx_b, stop_rx_b) = watch::channel(false);
+  let task_a = tokio::spawn(run_consumer_task(consumer_a, stop_rx_a, event_tx.clone()));
+  let task_b = tokio::spawn(run_consumer_task(consumer_b, stop_rx_b, event_tx));
+  let mut deliveries = ConsumerDeliveryTraces::new();
+  let mut revocations = 0;
+  let membership_store = cluster.consumer_membership_store();
+  let lease_store = cluster.consumer_lease_store();
+
+  let initial_plan = timeout(Duration::from_secs(10), async {
+    loop {
+      while let Ok(event) = event_rx.try_recv() {
+        handle_consumer_event_with_trace(event, &mut deliveries, &mut revocations);
+      }
+      if let Some(plan) = membership_store
+        .get_assignment_plan(TOPIC, "integration-group")
+        .await?
+        && plan.members.len() == 2
+        && plan.member_topology.is_some()
+      {
+        let leases = lease_store
+          .list_group_leases(TOPIC, "integration-group")
+          .await?;
+        if leases.len() == (PARTITION_COUNT * 2) as usize
+          && plan.assignments.iter().all(|assignment| {
+            leases.iter().any(|lease| {
+              lease.key.virtual_partition_id == assignment.virtual_partition_id
+                && lease.owner_id == assignment.member_id
+            })
+          })
+        {
+          return Ok::<_, anyhow::Error>(plan);
+        }
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("legacy two-member assignment did not converge"))??;
+  assert_eq!(initial_plan.planner_member_id, "colocate-a");
+  assert!(!initial_plan.colocate_logical_partitions);
+  let previous_owners = initial_plan
+    .assignments
+    .iter()
+    .map(|assignment| (assignment.virtual_partition_id, &assignment.member_id))
+    .collect::<HashMap<_, _>>();
+  assert!(
+    (0 .. PARTITION_COUNT).any(|logical_id| previous_owners.get(&logical_id)
+      != previous_owners.get(&(logical_id + PARTITION_COUNT)))
+  );
+
+  let keys = (0 .. PARTITION_COUNT)
+    .map(|logical_id| {
+      (0 .. 4_096)
+        .map(|index| format!("colocate-key-{logical_id}-{index}").into_bytes())
+        .find(|key| logical_partition_for_key(key, PARTITION_COUNT) == logical_id)
+        .ok_or_else(|| anyhow!("no key found for logical partition {logical_id}"))
+    })
+    .collect::<Result<Vec<_>>>()?;
+  for (logical_id, key) in keys.iter().enumerate() {
+    produce_message(&producer, key.clone(), &format!("before-{logical_id}")).await?;
+  }
+  timeout(Duration::from_secs(10), async {
+    while (0 .. PARTITION_COUNT)
+      .any(|logical_id| !deliveries.contains_key(&format!("before-{logical_id}")))
+    {
+      let event = event_rx
+        .recv()
+        .await
+        .ok_or_else(|| anyhow!("group consumers stopped before the first phase"))?;
+      handle_consumer_event_with_trace(event, &mut deliveries, &mut revocations);
+    }
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| anyhow!("group did not deliver before switching modes"))??;
+  wait_for_group_offsets_committed(
+    &cluster,
+    &maximum_delivery_offsets(&deliveries),
+    "pre-switch deliveries were not committed",
+  )
+  .await?;
+  let revocations_before_switch = revocations;
+
+  let mut enable_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "colocate-a",
+      None,
+      None,
+    )
+    .await?;
+  timeout(Duration::from_secs(10), enable_gate.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("planner did not reach the enable-mode rebalance"))??;
+  flags.update(Arc::new(
+    DefaultFeatureFlags::default().with_bool_flag(FLAG, true),
+  ));
+  enable_gate.release()?;
+
+  let enabled_plan = timeout(Duration::from_secs(10), async {
+    loop {
+      while let Ok(event) = event_rx.try_recv() {
+        handle_consumer_event_with_trace(event, &mut deliveries, &mut revocations);
+      }
+      if let Some(plan) = membership_store
+        .get_assignment_plan(TOPIC, "integration-group")
+        .await?
+        && plan.version > initial_plan.version
+        && plan.colocate_logical_partitions
+      {
+        let leases = lease_store
+          .list_group_leases(TOPIC, "integration-group")
+          .await?;
+        if leases.len() == (PARTITION_COUNT * 2) as usize
+          && plan.assignments.iter().all(|assignment| {
+            leases.iter().any(|lease| {
+              lease.key.virtual_partition_id == assignment.virtual_partition_id
+                && lease.owner_id == assignment.member_id
+                && lease.generation == plan.version
+            })
+          })
+          && follower_diagnostics
+            .state_snapshot()
+            .assignment_plan
+            .as_ref()
+            .is_some_and(|snapshot| {
+              snapshot.version == plan.version && snapshot.colocate_logical_partitions
+            })
+        {
+          return Ok::<_, anyhow::Error>(plan);
+        }
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("co-located plan and leases did not converge across members"))??;
+  assert!(revocations > revocations_before_switch);
+  let owners = enabled_plan
+    .assignments
+    .iter()
+    .map(|assignment| (assignment.virtual_partition_id, &assignment.member_id))
+    .collect::<HashMap<_, _>>();
+  for logical_id in 0 .. PARTITION_COUNT {
+    assert_eq!(
+      owners.get(&logical_id),
+      owners.get(&(logical_id + PARTITION_COUNT))
+    );
+  }
+
+  for (logical_id, key) in keys.iter().enumerate() {
+    produce_message(&producer, key.clone(), &format!("after-{logical_id}")).await?;
+  }
+  timeout(Duration::from_secs(10), async {
+    while deliveries.len() < (PARTITION_COUNT * 2) as usize {
+      let event = event_rx
+        .recv()
+        .await
+        .ok_or_else(|| anyhow!("group consumers stopped after switching modes"))?;
+      handle_consumer_event_with_trace(event, &mut deliveries, &mut revocations);
+    }
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| anyhow!("group did not deliver after switching modes"))??;
+  assert!(
+    delivery_counts(&deliveries)
+      .values()
+      .all(|count| *count >= 1)
+  );
+  wait_for_group_offsets_committed(
+    &cluster,
+    &maximum_delivery_offsets(&deliveries),
+    "post-switch deliveries were not committed",
+  )
+  .await?;
+
+  let mut disable_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      "colocate-a",
+      None,
+      None,
+    )
+    .await?;
+  timeout(Duration::from_secs(10), disable_gate.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("planner did not reach the disable-mode rebalance"))??;
+  flags.update(Arc::new(DefaultFeatureFlags::default()));
+  disable_gate.release()?;
+  timeout(Duration::from_secs(10), async {
+    loop {
+      while let Ok(event) = event_rx.try_recv() {
+        handle_consumer_event_with_trace(event, &mut deliveries, &mut revocations);
+      }
+      if let Some(plan) = membership_store
+        .get_assignment_plan(TOPIC, "integration-group")
+        .await?
+        && plan.version > enabled_plan.version
+        && !plan.colocate_logical_partitions
+        && follower_diagnostics
+          .state_snapshot()
+          .assignment_plan
+          .as_ref()
+          .is_some_and(|snapshot| {
+            snapshot.version == plan.version && !snapshot.colocate_logical_partitions
+          })
+      {
+        let leases = lease_store
+          .list_group_leases(TOPIC, "integration-group")
+          .await?;
+        if leases.len() == (PARTITION_COUNT * 2) as usize
+          && plan.assignments.iter().all(|assignment| {
+            leases.iter().any(|lease| {
+              lease.key.virtual_partition_id == assignment.virtual_partition_id
+                && lease.owner_id == assignment.member_id
+                && lease.generation == plan.version
+            })
+          })
+        {
+          return Ok::<_, anyhow::Error>(());
+        }
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("mixed-flag follower did not accept rollback"))??;
+
+  let _ = stop_tx_a.send(true);
+  let _ = stop_tx_b.send(true);
+  task_a
+    .await
+    .map_err(|error| anyhow!("planner consumer stopped: {error}"))??;
+  task_b
+    .await
+    .map_err(|error| anyhow!("follower consumer stopped: {error}"))??;
+  cluster.shutdown().await;
+  Ok(())
+}
+
 // High-level: verifies workers on the same physical pod share an aggregate partition budget.
 #[tokio::test]
 async fn consumer_group_balances_partitions_across_configured_pods() -> Result<()> {
@@ -7611,6 +7890,7 @@ async fn consumer_group_balances_partitions_across_configured_pods() -> Result<(
     .get_assignment_plan(TOPIC, "integration-group")
     .await?
     .ok_or_else(|| anyhow!("pod-aware consumer group did not persist an assignment plan"))?;
+  assert!(!plan.colocate_logical_partitions);
   assert_eq!(
     plan.member_topology,
     Some(

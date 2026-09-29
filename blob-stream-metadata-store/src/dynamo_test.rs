@@ -1,7 +1,7 @@
 use crate::aws::transaction_cancellation_has_code;
+use crate::tests::dynamo_client;
 use crate::{DynamoMetadataStore, MetadataReadConsistency, MetadataStore, SegmentMetadata};
 use anyhow::{Context, Result, anyhow};
-use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
@@ -32,23 +32,7 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-const LOCAL_ENDPOINT: &str = "http://localhost:8000";
-const REGION: &str = "us-east-1";
 const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
-
-async fn dynamo_client() -> Result<Client> {
-  unsafe {
-    std::env::set_var("AWS_ACCESS_KEY_ID", "test");
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-    std::env::set_var("AWS_REGION", REGION);
-  }
-
-  let config = aws_config::defaults(BehaviorVersion::latest())
-    .endpoint_url(LOCAL_ENDPOINT)
-    .load()
-    .await;
-  Ok(Client::new(&config))
-}
 
 async fn create_segments_table(client: &Client, table_name: &str) -> Result<()> {
   client
