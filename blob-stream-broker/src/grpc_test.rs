@@ -66,6 +66,7 @@ fn metadata_cache() -> Arc<MetadataCache> {
   Arc::new(MetadataCache::new(
     Arc::new(InMemoryMetadataStore::new()),
     config,
+    None,
   ))
 }
 

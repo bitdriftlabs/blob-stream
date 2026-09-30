@@ -62,14 +62,20 @@ metadata-key layout used by broker publication and consumer scans.
 `ConsumerIteratorBootstrapConfig.broker_discovery` is required. Consumers read metadata and raw
 blob ranges through brokers. Eventual `Tail` and `FullRecovery` metadata requests can use retained
 cache coverage, while strong reads are coalesced without retained cache. An unusable broker
-metadata response retries the original direct DynamoDB query; any non-`NOT_FOUND` broker blob
+metadata response retries the original direct DynamoDB query, except an exhausted storage
+throttle, which is returned without direct fallback and delays the next prefetch retry. All failed
+prefetch reads use positive, capped exponential full-jitter backoff, including failures from direct
+storage. Any non-`NOT_FOUND` broker blob
 response or rejected payload retries the affected blob group directly from storage.
 
 | Scope | Flags | Adoption | Operational effect |
 | --- | --- | --- | --- |
-| Consumer reader | `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads` | Live | Configures prefetch capacity and range-read concurrency. Metadata consistency is static `runtime.read` configuration. Non-`NOT_FOUND` broker blob failures retry the full affected group directly. |
+| Consumer reader | `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads`, `blob_stream_consumer_broker_metadata_direct_fallback` | Live, per scan pass | Configures prefetch capacity and range-read concurrency. Broker metadata fallback defaults on; turning it off returns broker metadata errors without a direct retry. Direct-only scans are unaffected. Metadata consistency is static `runtime.read` configuration. Non-`NOT_FOUND` broker blob failures retry the full affected group directly. |
+| Broker and consumer metadata Query | `blob_stream_metadata_query_initial_delay_ms`, `blob_stream_metadata_query_max_delay_ms`, `blob_stream_metadata_query_page_timeout_ms` | Live, per Query page | Both processes use the same flags and defaults: 50-200 ms full-jitter backoff and a three-second deadline per page. Valid ranges are 2-2000 ms initial delay, initial-2000 ms maximum delay, and maximum-4000 ms page timeout. Invalid snapshots retain the previous valid policy. Only metadata Query disables SDK retries and operation timeouts; other DynamoDB operations keep theirs. |
 | Consumer assignment | `blob_stream_consumer_colocate_logical_partitions` | Live on active planner rebalance | Defaults off. When enabled, tries to assign all virtual partitions of a logical partition to the same consumer while retaining pod-first and within-pod virtual-partition balance. A change publishes a new assignment-plan version; disabling returns to the sticky policy. |
-| Broker metadata-cache startup | `blob_stream_broker_metadata_recovery_cache_max_bytes`, `blob_stream_broker_metadata_cache_max_waiters_per_key`, `blob_stream_broker_metadata_cache_max_waiters`, `blob_stream_broker_metadata_cache_max_refills`, `blob_stream_broker_metadata_cache_max_request_partitions`, `blob_stream_broker_metadata_cache_max_response_items`, `blob_stream_broker_metadata_cache_max_response_bytes`, `blob_stream_broker_metadata_cache_max_entry_items` | Restart the broker | Overrides the internal cache defaults when a feature-flag loader is configured. Values must be positive; the per-key waiter limit cannot exceed the global waiter limit, and the response-byte limit is capped at the gRPC request maximum. |
+| Broker metadata-cache admission | `blob_stream_broker_metadata_cache_max_waiters_per_key`, `blob_stream_broker_metadata_cache_max_waiters`, `blob_stream_broker_metadata_cache_max_refills`, `blob_stream_broker_metadata_cache_max_request_partitions`, `blob_stream_broker_metadata_cache_max_response_items`, `blob_stream_broker_metadata_cache_max_response_bytes`, `blob_stream_broker_metadata_cache_max_entry_items`, `blob_stream_broker_metadata_cache_request_timeout_ms` | Live on watched updates | Positive limits govern new requests and refills; limits are parsed at construction and only when flags change. Invalid snapshots retain the previous valid limits; removing a flag restores its unflagged default. Per-key waiters cannot exceed global waiters, refills cannot exceed 1024, and response bytes cannot exceed the 16 MiB transport cap. The request timeout accepts 1-60000 ms and must leave at least half its budget beyond the configured coalescing window. Downshifting refill concurrency rejects new work until active refills fall below the limit. |
+| Consumer broker metadata RPC | `blob_stream_consumer_broker_metadata_rpc_timeout_ms` | Live, per request | Overrides the configured seven-second default with 1-120000 ms; invalid values use the startup-configured timeout. |
+| Broker metadata-cache capacity | `blob_stream_broker_metadata_recovery_cache_max_bytes` | Restart the broker | Sets the retained Full Recovery cache byte budget at construction. |
 | Broker blob-cache startup | `blob_stream_broker_blob_cache_idle_ttl_ms` | Restart the broker | Sets positive idle retention for complete immutable blobs; absent means 10 seconds. Blob requests remain limited to 16 MiB; broker responses allow the effective `max_segment_bytes` amount of requested compressed bytes, covering normal segment objects. The broker admits each object from its reported content length and current cgroup headroom before reading its body. Cgroup-aware memory admission can flush entries or disable cache admission without disabling direct consumer reads. |
 | Broker write path | `blob_stream_broker_flush_max_bytes`, `blob_stream_broker_flush_max_delay_ms`, `blob_stream_broker_max_segment_bytes`, `blob_stream_broker_adaptive_flush_max_delay_enabled`, `blob_stream_broker_adaptive_flush_max_delay_floor_ms` | Live | A time-due local partition always pulls every available buffered non-draining local topic section into bounded shared objects. Positive byte overrides and positive delay overrides no greater than `flush_max_delay` apply when the scheduler observes the watched update and rearm pending buffer deadlines; invalid values retain static configuration. Adaptive delay defaults on and may be disabled statically with `adaptive_flush_max_delay_enabled: false` or live with its watched flag. Its static or watched floor defaults to half the live maximum delay and must be positive and no greater than that maximum. Three consecutive split plans derive a proportional target from their extra objects, then reduce the delay by one quarter of the distance to it; three consecutive successful unsplit plans recover half the remaining headroom. Every adjustment requires a new three-plan streak, and failures or opposite outcomes reset the streak. Positive segment-cap overrides apply to future flush plans. Independently byte-triggered and lease-drain work remain local. |
 | Consumer startup | `blob_stream_consumer_idle_poll_delay_ms`, `blob_stream_consumer_max_idle_poll_delay_ms`, `blob_stream_consumer_lease_duration_ms`, `blob_stream_consumer_heartbeat_interval_ms`, `blob_stream_consumer_rebalance_interval_ms` | Rebuild or restart the iterator | Changes local polling and consumer-group scheduling. Persistent lease state stores absolute expiry timestamps, so members may use different local durations. |
@@ -83,6 +89,14 @@ live delay ceiling retain the configured value. An explicit static adaptive floo
 producer retains its previous effective values when a runtime snapshot is invalid. Invalid consumer
 startup duration overrides fail iterator construction. A running consumer continues with its
 already-applied startup settings.
+
+The broker metadata-cache request deadline defaults to five seconds and the consumer broker
+metadata RPC deadline defaults to seven seconds; both accept live overrides of their static
+configuration. Keep the consumer deadline above the broker deadline when overriding either. A
+storage throttle after the shared page retry budget is an `OVERLOADED` response with reason
+`STORAGE_THROTTLED`; other overload reasons and failures retain direct fallback when the consumer
+fallback flag is enabled. Inspect rate-limited internal Query throttle logs for service codes and
+throttling reasons; broker response messages omit backend identifiers.
 
 ## HTTP Endpoints
 
@@ -154,8 +168,9 @@ retained bytes and byte budgets, oldest retained-entry ages, in-flight refills, 
 available refill permits, and total failures. It intentionally contains no topic, window, or
 partition identifiers. Use sustained full byte budgets, eviction growth, exhausted refill permits,
 or overload failures to decide whether the configured cache limits need capacity or workload
-changes. A broker cache overload is safe for delivery because consumers retry the original direct
-metadata scan.
+changes. Broker admission and size overloads fall back to a direct metadata scan; exhausted
+storage throttling instead backs off without a direct scan. Consult the broker's rate-limited
+failure logs to distinguish these cases; cache metrics do not label individual reasons.
 
 ## Metrics
 

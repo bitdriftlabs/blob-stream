@@ -12,11 +12,16 @@ use super::{
 };
 use crate::consumer::ConsumerReadOutcome;
 use async_trait::async_trait;
+use std::convert::Infallible;
 use time::OffsetDateTime;
 
 impl ConsumerReaderImpl {
   pub(crate) fn runtime_settings(&self) -> ConsumerReadRuntimeSettings {
-    consumer_read_runtime_settings(&self.config, self.feature_flags.as_ref())
+    let mut watched = self.runtime_settings.lock();
+    let (settings, _) = watched.current(|flags, _| {
+      Ok::<_, Infallible>(consumer_read_runtime_settings(&self.config, Some(flags)))
+    });
+    *settings
   }
 
   pub(crate) async fn read_available_with_capacity_and_settings(

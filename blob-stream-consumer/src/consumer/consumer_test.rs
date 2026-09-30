@@ -52,6 +52,9 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   BlobReadFailureStatus,
   BlobReadSuccess,
   BrokerSegmentMetadata,
+  MetadataReadFailure,
+  MetadataReadFailureStatus,
+  MetadataReadOverloadReason,
   MetadataReadSuccess,
   ReadBlobRangesRequest,
   ReadBlobRangesResponse,
@@ -798,6 +801,7 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
     ConsumerReadRuntimeSettings {
       prefetch_max_bytes: 16,
       max_in_flight_batch_reads: 2,
+      broker_metadata_direct_fallback: true,
       metadata_read_consistency: MetadataReadConsistency::Strong,
       metadata_visibility_delay: time::Duration::ZERO,
     }
@@ -806,13 +810,18 @@ fn reader_applies_live_feature_flag_updates_between_scan_passes() {
   feature_flags.update(Arc::new(
     DefaultFeatureFlags::default()
       .with_integer_flag("blob_stream_consumer_prefetch_max_bytes", 32)
-      .with_integer_flag("blob_stream_consumer_max_in_flight_batch_reads", 4),
+      .with_integer_flag("blob_stream_consumer_max_in_flight_batch_reads", 4)
+      .with_bool_flag(
+        "blob_stream_consumer_broker_metadata_direct_fallback",
+        false,
+      ),
   ));
   assert_eq!(
     reader.runtime_settings(),
     ConsumerReadRuntimeSettings {
       prefetch_max_bytes: 32,
       max_in_flight_batch_reads: 4,
+      broker_metadata_direct_fallback: false,
       metadata_read_consistency: MetadataReadConsistency::Strong,
       metadata_visibility_delay: time::Duration::ZERO,
     }
@@ -6336,6 +6345,106 @@ async fn broker_offload_read(
   let mut reader = reader;
   let batches = reader.read_available(901).await.unwrap();
   (batches, reader.cursor(7), metrics)
+}
+
+#[tokio::test]
+async fn broker_storage_throttle_does_not_start_direct_metadata_scan() {
+  let store = Arc::new(RecordingMetadataStore::new());
+  let throttle = ReadMetadataWindowResponse {
+    result: Some(read_metadata_window_response::Result::Failure(
+      MetadataReadFailure {
+        status: MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_OVERLOADED.into(),
+        overload_reason:
+          MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_STORAGE_THROTTLED.into(),
+        ..Default::default()
+      },
+    )),
+    ..Default::default()
+  };
+  let broker = Arc::new(FixedBrokerMetadataQuery {
+    responses: HashMap::from([(600, throttle.clone()), (900, throttle)]),
+  });
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".into(),
+      ..Default::default()
+    },
+    vec![7],
+    HashMap::new(),
+    Arc::new(InMemoryBlobStore::new()),
+    store.clone(),
+    broker,
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )
+  .unwrap();
+
+  let error = reader.read_available(901).await.unwrap_err();
+  assert!(
+    error
+      .chain()
+      .any(<dyn std::error::Error>::is::<super::BrokerMetadataThrottled>)
+  );
+  assert!(store.scans.lock().is_empty());
+}
+
+#[tokio::test]
+async fn broker_metadata_direct_fallback_respects_live_flag() {
+  for malformed_response in [false, true] {
+    let store = Arc::new(RecordingMetadataStore::new());
+    let flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default().with_bool_flag(
+      "blob_stream_consumer_broker_metadata_direct_fallback",
+      false,
+    )));
+    let mut response = broker_metadata_response(&[], timestamp(901));
+    if let Some(read_metadata_window_response::Result::Success(success)) = response.result.as_mut()
+    {
+      success.generation = 0;
+    }
+    let broker = Arc::new(FixedBrokerMetadataQuery {
+      responses: if malformed_response {
+        HashMap::from([(600, response.clone()), (900, response)])
+      } else {
+        HashMap::new()
+      },
+    });
+    let mut reader = ConsumerReaderImpl::new(
+      Arc::new(SystemTimeProvider),
+      ConsumerReadConfig {
+        topic: "telemetry".into(),
+        ..Default::default()
+      },
+      vec![7],
+      HashMap::new(),
+      Arc::new(InMemoryBlobStore::new()),
+      store.clone(),
+      broker,
+      rejecting_broker_blob_range_query(),
+      &metrics_scope(),
+      TimeDuration::days(1),
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+      Some(flags.snapshot_watch()),
+    )
+    .unwrap();
+
+    let error = reader.read_available(901).await.unwrap_err();
+    assert!(error.to_string().contains(
+      if malformed_response {
+        "broker metadata response has an invalid cache generation"
+      } else {
+        "missing scripted broker response"
+      }
+    ));
+    assert!(store.scans.lock().is_empty());
+
+    flags.update(Arc::new(DefaultFeatureFlags::default()));
+    assert!(reader.read_available(901).await.unwrap().is_empty());
+    assert!(!store.scans.lock().is_empty());
+  }
 }
 
 #[tokio::test]

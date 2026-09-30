@@ -7,11 +7,15 @@ use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use bd_grpc::compression::Compression;
 use bd_grpc::service::ServiceMethod;
+use bd_log_util::warn_every;
+use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch, WatchedFeatureFlags};
 use blob_stream_broker_discovery::{BrokerDiscovery, metadata_window_owner};
 use blob_stream_metadata_store::{SegmentMetadata, decode_segment_metadata_v1};
 use blob_stream_proto::protos::blobstream::v1::broker::{
   FullRecoveryMetadataCoverage,
   MetadataReadConsistency,
+  MetadataReadFailureStatus,
+  MetadataReadOverloadReason,
   ReadMetadataWindowRequest,
   ReadMetadataWindowResponse,
   read_metadata_window_request,
@@ -19,12 +23,47 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 };
 use blob_stream_proto::protos::blobstream::v1::config::BrokerDiscoveryConfig;
 use blob_stream_types::{SnowflakeId, TopicWindowKey};
+use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
+use time::ext::NumericalDuration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(7);
+const REQUEST_TIMEOUT_FLAG: &str = "blob_stream_consumer_broker_metadata_rpc_timeout_ms";
+
+fn metadata_rpc_timeout(flags: &dyn FeatureFlags, configured: &Duration) -> Result<Duration, ()> {
+  let default_timeout_ms = u64::try_from(configured.as_millis()).unwrap_or(u64::MAX);
+  let timeout_ms = flags.get_integer(REQUEST_TIMEOUT_FLAG, default_timeout_ms);
+  if timeout_ms == default_timeout_ms {
+    return Ok(*configured);
+  }
+  if !(1 ..= 120_000).contains(&timeout_ms) {
+    return Err(());
+  }
+  Ok(Duration::from_millis(timeout_ms))
+}
+
+fn current_metadata_rpc_timeout(watched: &Mutex<WatchedFeatureFlags<Duration>>) -> Duration {
+  let mut watched = watched.lock();
+  let (timeout, error) = watched.current(metadata_rpc_timeout);
+  if error.is_some() {
+    warn_every!(15.seconds(), "ignoring invalid broker metadata RPC timeout");
+  }
+  *timeout
+}
+
+#[derive(Debug)]
+pub struct BrokerMetadataThrottled;
+
+impl std::fmt::Display for BrokerMetadataThrottled {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str("broker metadata Query throttled")
+  }
+}
+
+impl std::error::Error for BrokerMetadataThrottled {}
 
 //
 // BrokerMetadataResult
@@ -53,6 +92,7 @@ pub trait BrokerMetadataQuery: Send + Sync {
 /// has to treat `Pending` as either an empty membership or a retryable route.
 pub struct GrpcBrokerMetadataQuery {
   client_pool: Arc<BrokerClientPool>,
+  request_timeout: Mutex<WatchedFeatureFlags<Duration>>,
 }
 
 impl GrpcBrokerMetadataQuery {
@@ -71,7 +111,22 @@ impl GrpcBrokerMetadataQuery {
   }
 
   pub(crate) fn from_client_pool(client_pool: Arc<BrokerClientPool>) -> Self {
-    Self { client_pool }
+    Self {
+      client_pool,
+      request_timeout: Mutex::new(WatchedFeatureFlags::new(None, Arc::new(REQUEST_TIMEOUT))),
+    }
+  }
+
+  pub(crate) fn with_request_timeout(
+    mut self,
+    request_timeout: Duration,
+    feature_flags: Option<FeatureFlagsWatch>,
+  ) -> Self {
+    self.request_timeout = Mutex::new(WatchedFeatureFlags::new(
+      feature_flags,
+      Arc::new(request_timeout),
+    ));
+    self
   }
 }
 
@@ -97,7 +152,7 @@ impl BrokerMetadataQuery for GrpcBrokerMetadataQuery {
       "BrokerService",
       "ReadMetadataWindow",
     );
-    let timeout = TimeDuration::try_from(REQUEST_TIMEOUT)
+    let timeout = TimeDuration::try_from(current_metadata_rpc_timeout(&self.request_timeout))
       .map_err(|_| anyhow!("metadata request timeout exceeds supported range"))?;
     client
       .unary(&method, None, request, timeout, Compression::None)
@@ -115,6 +170,13 @@ pub(super) fn decode_metadata_response(
   let success = match response.result {
     Some(read_metadata_window_response::Result::Success(success)) => success,
     Some(read_metadata_window_response::Result::Failure(failure)) => {
+      if failure.status.enum_value()
+        == Ok(MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_OVERLOADED)
+        && failure.overload_reason.enum_value()
+          == Ok(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_STORAGE_THROTTLED)
+      {
+        return Err(BrokerMetadataThrottled.into());
+      }
       return Err(anyhow!(
         "broker metadata request failed: {}",
         failure.error_message

@@ -35,6 +35,8 @@ const RESERVED_MEMBER_ID_PREFIX: &str = "__blob_stream_";
 const PREFETCH_MAX_BYTES_FEATURE_FLAG: &str = "blob_stream_consumer_prefetch_max_bytes";
 const MAX_IN_FLIGHT_BATCH_READS_FEATURE_FLAG: &str =
   "blob_stream_consumer_max_in_flight_batch_reads";
+const BROKER_METADATA_DIRECT_FALLBACK_FEATURE_FLAG: &str =
+  "blob_stream_consumer_broker_metadata_direct_fallback";
 const IDLE_POLL_DELAY_FEATURE_FLAG: &str = "blob_stream_consumer_idle_poll_delay_ms";
 const MAX_IDLE_POLL_DELAY_FEATURE_FLAG: &str = "blob_stream_consumer_max_idle_poll_delay_ms";
 const LEASE_DURATION_FEATURE_FLAG: &str = "blob_stream_consumer_lease_duration_ms";
@@ -49,6 +51,7 @@ const REBALANCE_INTERVAL_FEATURE_FLAG: &str = "blob_stream_consumer_rebalance_in
 pub struct ConsumerReadRuntimeSettings {
   pub(crate) prefetch_max_bytes: u64,
   pub(crate) max_in_flight_batch_reads: usize,
+  pub(crate) broker_metadata_direct_fallback: bool,
   pub(crate) metadata_read_consistency: MetadataReadConsistency,
   pub(crate) metadata_visibility_delay: Duration,
 }
@@ -185,7 +188,7 @@ pub fn consumer_max_in_flight_batch_reads(config: &ConsumerReadConfig) -> u64 {
 /// Resolve immutable settings for one consumer scan pass.
 pub fn consumer_read_runtime_settings(
   config: &ConsumerReadConfig,
-  feature_flags: Option<&FeatureFlagsWatch>,
+  feature_flags: Option<&dyn FeatureFlags>,
 ) -> ConsumerReadRuntimeSettings {
   let configured_prefetch_max_bytes = consumer_prefetch_max_bytes(config);
   let prefetch_max_bytes = feature_flags.map_or(configured_prefetch_max_bytes, |feature_flags| {
@@ -227,10 +230,14 @@ pub fn consumer_read_runtime_settings(
 
   let metadata_read_consistency = consumer_metadata_read_consistency(config);
   let metadata_visibility_delay = consumer_metadata_visibility_delay(config);
+  let broker_metadata_direct_fallback = feature_flags.is_none_or(|feature_flags| {
+    feature_flags.get_bool(BROKER_METADATA_DIRECT_FALLBACK_FEATURE_FLAG, true)
+  });
 
   ConsumerReadRuntimeSettings {
     prefetch_max_bytes,
     max_in_flight_batch_reads,
+    broker_metadata_direct_fallback,
     metadata_read_consistency,
     metadata_visibility_delay,
   }

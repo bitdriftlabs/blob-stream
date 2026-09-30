@@ -318,6 +318,7 @@ fn runtime_feature_flags_override_configured_reader_settings() {
     super::ConsumerReadRuntimeSettings {
       prefetch_max_bytes: 32,
       max_in_flight_batch_reads: 4,
+      broker_metadata_direct_fallback: true,
       metadata_read_consistency: MetadataReadConsistency::Strong,
       metadata_visibility_delay: Duration::ZERO,
     }

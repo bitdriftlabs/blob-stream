@@ -159,6 +159,7 @@ impl ConsumerReaderImpl {
       let broker_metadata_query = Arc::clone(&self.broker_metadata_query);
       let metrics = self.metrics.clone();
       let metadata_read_consistency = runtime_settings.metadata_read_consistency;
+      let broker_metadata_direct_fallback = runtime_settings.broker_metadata_direct_fallback;
       let metadata_cache_max_age = self.metadata_cache_max_age;
       let time_provider = Arc::clone(&self.time_provider);
       let broker_request = broker_request_for_scan(&request, metadata_read_consistency);
@@ -186,6 +187,12 @@ impl ConsumerReaderImpl {
               ) {
                 Ok(result) => Some(result),
                 Err(error) => {
+                  if error.is::<crate::consumer::BrokerMetadataThrottled>() {
+                    return Err(error);
+                  }
+                  if !broker_metadata_direct_fallback {
+                    return Err(error);
+                  }
                   trace!(
                     "consumer broker metadata response rejected; falling back direct: {error}"
                   );
@@ -194,6 +201,9 @@ impl ConsumerReaderImpl {
               }
             },
             Err(error) => {
+              if !broker_metadata_direct_fallback {
+                return Err(error);
+              }
               trace!("consumer broker metadata query failed; falling back direct: {error}");
               None
             },

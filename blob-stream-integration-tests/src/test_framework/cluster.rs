@@ -1050,6 +1050,7 @@ impl ClusterHarness {
         topic_num_writers,
         self.metadata_cache_settings,
       )?,
+      None,
     )
     .time_provider(Arc::clone(&self.metadata_cache_time_provider));
     let metadata_cache = Arc::new(metadata_cache);

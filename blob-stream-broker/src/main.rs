@@ -69,14 +69,19 @@ async fn async_main() -> Result<()> {
     .map(|feature_flags| feature_flags.snapshot_watch());
   let broker_shutdown_trigger = ComponentShutdownTrigger::default();
   let dynamo_capacity_metrics = DynamoCapacityMetrics::new(&metrics_scope.scope("dynamo"));
-  let metadata_store =
-    build_runtime_metadata_store(&config, dynamo_capacity_metrics.clone()).await?;
+  let metadata_store = build_runtime_metadata_store(
+    &config,
+    dynamo_capacity_metrics.clone(),
+    feature_flags_watch.clone(),
+  )
+  .await?;
   let broker_blob_store = build_runtime_blob_store(&config).await?;
   let metadata_cache_config =
     MetadataCacheConfig::from_runtime_config(&config, feature_flags_watch.as_ref())?;
   let metadata_cache = MetadataCache::new_with_metrics(
     Arc::clone(&metadata_store),
     metadata_cache_config,
+    feature_flags_watch.clone(),
     &broker_shutdown_trigger.make_handle(),
     &metrics_scope,
   );

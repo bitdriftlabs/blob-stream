@@ -512,6 +512,7 @@ impl<'a> RuntimeWriteEngineBuilder<'a> {
 pub async fn build_runtime_metadata_store(
   config: &RuntimeConfig,
   capacity_metrics: DynamoCapacityMetrics,
+  feature_flags: Option<FeatureFlagsWatch>,
 ) -> Result<Arc<dyn MetadataStore>> {
   proto_validate::validate(config)?;
   let metadata_store_config = config
@@ -519,7 +520,13 @@ pub async fn build_runtime_metadata_store(
     .as_ref()
     .context("runtime config missing metadata_store config")?;
   let topics = build_topics(&config.topics)?;
-  build_metadata_store(metadata_store_config, &topics, capacity_metrics).await
+  build_metadata_store(
+    metadata_store_config,
+    &topics,
+    capacity_metrics,
+    feature_flags,
+  )
+  .await
 }
 
 async fn build_producer_partition_lease_store(
@@ -683,6 +690,7 @@ async fn build_metadata_store(
   config: &MetadataStoreConfig,
   topics: &HashMap<Chars, TopicInfo>,
   capacity_metrics: DynamoCapacityMetrics,
+  feature_flags: Option<FeatureFlagsWatch>,
 ) -> Result<Arc<dyn MetadataStore>> {
   if config.has_in_memory() {
     debug!("using in-memory metadata store backend");
@@ -707,15 +715,17 @@ async fn build_metadata_store(
       ProtoDurationExt::to_time_duration,
     );
 
-    let store: Arc<dyn MetadataStore> =
-      Arc::new(blob_stream_metadata_store::DynamoMetadataStore::new(
+    let store: Arc<dyn MetadataStore> = Arc::new(
+      blob_stream_metadata_store::DynamoMetadataStore::new(
         client,
         table_name,
         producer_partition_lease_table_name,
         retention_by_topic,
         ttl_buffer,
         Some(capacity_metrics),
-      ));
+      )
+      .with_feature_flags(feature_flags),
+    );
     return Ok(store);
   }
 

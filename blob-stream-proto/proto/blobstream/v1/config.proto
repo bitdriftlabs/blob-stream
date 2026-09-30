@@ -400,6 +400,10 @@ message ConsumerReadConfig {
   // Default when unset: 10 ms. Set this to a proven, monitored deployment bound; it is not a
   // universal NTP guarantee.
   google.protobuf.Duration max_clock_skew = 12 [(validate.rules).duration.gt = {}];
+
+  // Deadline for one broker metadata RPC. Default when unset: 7 seconds, exceeding the broker's
+  // default 5-second metadata request deadline so a typed failure can reach the consumer.
+  google.protobuf.Duration broker_metadata_rpc_timeout = 13 [(validate.rules).duration.gt = {}];
 }
 
 // Consumer group lease and heartbeat settings.
