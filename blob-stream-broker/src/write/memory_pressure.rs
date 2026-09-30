@@ -30,6 +30,7 @@ use time::ext::NumericalDuration;
 
 #[cfg(any(target_os = "linux", test))]
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+// TODO: Live pressure thresholds must update this shared read/write admission policy together.
 const OVERLOADED_ON_PERMYRIAD: u32 = 8_000;
 const PERMYRIAD: u32 = 10_000;
 #[cfg(target_os = "linux")]

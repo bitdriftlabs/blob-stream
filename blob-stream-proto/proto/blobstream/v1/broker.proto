@@ -198,6 +198,15 @@ enum BlobReadFailureStatus {
   BLOB_READ_FAILURE_STATUS_NOT_FOUND = 4;
 }
 
+// Why the broker could not serve an overloaded blob-range request.
+enum BlobReadOverloadReason {
+  BLOB_READ_OVERLOAD_REASON_UNSPECIFIED = 0;
+  BLOB_READ_OVERLOAD_REASON_REQUEST_TIMEOUT = 1;
+  BLOB_READ_OVERLOAD_REASON_MEMORY_PRESSURE = 2;
+  BLOB_READ_OVERLOAD_REASON_FETCH_CONCURRENCY = 3;
+  BLOB_READ_OVERLOAD_REASON_CACHE_ADMISSION_REJECTED = 4;
+}
+
 // One half-open byte range `[start, end)` within a blob.
 message BlobRangeRequest {
   // Inclusive byte offset.
@@ -232,6 +241,8 @@ message BlobReadFailure {
   BlobReadFailureStatus status = 1;
   // Diagnostic detail. It is not stable for programmatic matching.
   string error_message = 2;
+  // Set for overloaded failures; unspecified for other statuses and older brokers.
+  BlobReadOverloadReason overload_reason = 3;
 }
 
 // Broker blob-cache response for one bounded blob-key request.
