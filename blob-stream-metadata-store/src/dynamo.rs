@@ -20,8 +20,11 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use aws_sdk_dynamodb::Client;
-use aws_sdk_dynamodb::error::SdkError;
+use aws_config::retry::RetryConfig;
+use aws_config::timeout::TimeoutConfig;
+use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_dynamodb::operation::query::builders::QueryFluentBuilder;
+use aws_sdk_dynamodb::operation::query::{QueryError, QueryOutput};
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
   AttributeValue,
@@ -30,14 +33,21 @@ use aws_sdk_dynamodb::types::{
   ReturnConsumedCapacity,
   TransactWriteItem,
 };
+use aws_sdk_dynamodb::{Client, Config};
+use bd_backoff::{ExponentialBackoffBuilder, Finite, InfiniteBackoff as _, SystemClock};
 use bd_log_util::warn_every;
+use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch, WatchedFeatureFlags};
 use blob_stream_types::{SnowflakeId, TopicWindowKey, offset_datetime_from_unix_seconds};
 use bytes::Bytes;
 use log::{debug, trace};
+use parking_lot::Mutex;
 use protobuf::Chars;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use time::Duration;
 use time::ext::NumericalDuration;
+use tokio::time::{Instant, sleep, timeout_at};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -45,7 +55,189 @@ use uuid::Uuid;
 mod tests;
 
 const ATTR_SEGMENT_METADATA_V1: &str = "segment_metadata_v1";
+const QUERY_INITIAL_DELAY_FLAG: &str = "blob_stream_metadata_query_initial_delay_ms";
+const QUERY_MAX_DELAY_FLAG: &str = "blob_stream_metadata_query_max_delay_ms";
+const QUERY_PAGE_TIMEOUT_FLAG: &str = "blob_stream_metadata_query_page_timeout_ms";
 pub const MAX_FENCED_METADATA_PARTITIONS: usize = 99;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueryRetryPolicy {
+  initial_delay: StdDuration,
+  max_delay: StdDuration,
+  page_timeout: StdDuration,
+}
+
+impl Default for QueryRetryPolicy {
+  fn default() -> Self {
+    Self {
+      initial_delay: StdDuration::from_millis(50),
+      max_delay: StdDuration::from_millis(200),
+      page_timeout: StdDuration::from_secs(3),
+    }
+  }
+}
+
+impl QueryRetryPolicy {
+  fn from_flags(flags: &dyn FeatureFlags) -> Option<Self> {
+    let initial = flags.get_integer(QUERY_INITIAL_DELAY_FLAG, 50);
+    let maximum = flags.get_integer(QUERY_MAX_DELAY_FLAG, 200);
+    let timeout = flags.get_integer(QUERY_PAGE_TIMEOUT_FLAG, 3_000);
+    if !(2 ..= 2_000).contains(&initial)
+      || !(initial ..= 2_000).contains(&maximum)
+      || !(maximum ..= 4_000).contains(&timeout)
+    {
+      return None;
+    }
+    Some(Self {
+      initial_delay: StdDuration::from_millis(initial),
+      max_delay: StdDuration::from_millis(maximum),
+      page_timeout: StdDuration::from_millis(timeout),
+    })
+  }
+}
+
+//
+// MetadataQueryThrottled
+//
+
+/// A metadata read whose `DynamoDB` throttling persisted beyond its page retry budget.
+#[derive(Debug, thiserror::Error)]
+#[error("metadata Query throttled after {attempts} attempts")]
+pub struct MetadataQueryThrottled {
+  attempts: u32,
+  #[source]
+  source: SdkError<QueryError>,
+}
+
+fn query_error_is_throttled(error: &SdkError<QueryError>) -> bool {
+  error
+    .as_service_error()
+    .is_some_and(query_service_is_throttled)
+}
+
+fn query_service_is_throttled(service: &QueryError) -> bool {
+  matches!(
+    service,
+    QueryError::ThrottlingException(_)
+      | QueryError::ProvisionedThroughputExceededException(_)
+      | QueryError::RequestLimitExceeded(_)
+  ) || matches!(
+    service.code(),
+    Some("ThrottlingException" | "ProvisionedThroughputExceededException" | "RequestLimitExceeded")
+  )
+}
+
+fn query_throttling_reasons(service: &QueryError) -> &[aws_sdk_dynamodb::types::ThrottlingReason] {
+  match service {
+    QueryError::ThrottlingException(error) => error.throttling_reasons(),
+    QueryError::ProvisionedThroughputExceededException(error) => error.throttling_reasons(),
+    QueryError::RequestLimitExceeded(error) => error.throttling_reasons(),
+    _ => &[],
+  }
+}
+
+fn exhausted_throttle(
+  source: SdkError<QueryError>,
+  attempts: u32,
+  window: &TopicWindowKey,
+) -> anyhow::Error {
+  let code = source
+    .as_service_error()
+    .and_then(ProvideErrorMetadata::code);
+  let reasons = source
+    .as_service_error()
+    .map(query_throttling_reasons)
+    .unwrap_or_default();
+  warn_every!(
+    15.seconds(),
+    "metadata(dynamo) Query throttle exhausted: topic={}, window_start={}, attempts={}, \
+     code={code:?}, reasons={reasons:?}, error={source}",
+    window.topic,
+    window.window_start_unix_seconds,
+    attempts
+  );
+  MetadataQueryThrottled { attempts, source }.into()
+}
+
+fn query_error_is_retryable(error: &SdkError<QueryError>) -> bool {
+  query_error_is_throttled(error)
+    || matches!(
+      error,
+      SdkError::TimeoutError(_) | SdkError::DispatchFailure(_)
+    )
+    || matches!(
+      error.as_service_error(),
+      Some(QueryError::InternalServerError(_))
+    )
+    || matches!(error, SdkError::ServiceError(service) if service.raw().status().as_u16() >= 500)
+}
+
+async fn query_page_with_retries(
+  query: QueryFluentBuilder,
+  window: &TopicWindowKey,
+  policy: QueryRetryPolicy,
+) -> Result<QueryOutput> {
+  let deadline = Instant::now() + policy.page_timeout;
+  // A 100% jitter factor produces delays in [0, 2 * interval].
+  let mut backoff = ExponentialBackoffBuilder::<SystemClock, Finite>::new_infinite()
+    .with_initial_interval(Duration::milliseconds(
+      i64::try_from(policy.initial_delay.as_millis() / 2).unwrap_or(i64::MAX),
+    ))
+    .with_max_interval(Duration::milliseconds(
+      i64::try_from(policy.max_delay.as_millis() / 2).unwrap_or(i64::MAX),
+    ))
+    .with_randomization_factor(1.0)
+    .with_multiplier(2.0)
+    .build();
+  let mut last_throttle = None;
+  let mut attempt = 0;
+  loop {
+    attempt += 1;
+    let response = timeout_at(
+      deadline,
+      query
+        .clone()
+        .customize()
+        .config_override(
+          Config::builder()
+            .retry_config(RetryConfig::disabled())
+            .timeout_config(TimeoutConfig::disabled()),
+        )
+        .send(),
+    )
+    .await;
+    let error = match response {
+      Ok(Ok(output)) => return Ok(output),
+      Ok(Err(error)) => error,
+      Err(_) => {
+        return Err(last_throttle.map_or_else(
+          || anyhow!("metadata Query page timed out"),
+          |(attempts, source)| exhausted_throttle(source, attempts, window),
+        ));
+      },
+    };
+    let throttled = query_error_is_throttled(&error);
+    if !query_error_is_retryable(&error) {
+      return if throttled {
+        Err(exhausted_throttle(error, attempt, window))
+      } else {
+        Err(error.into())
+      };
+    }
+    debug!(
+      "metadata(dynamo) Query retry: topic={}, window_start={}, attempt={}, throttled={throttled}",
+      window.topic, window.window_start_unix_seconds, attempt
+    );
+    last_throttle = throttled.then_some((attempt, error));
+    let delay = backoff.next_backoff().unsigned_abs();
+    if timeout_at(deadline, sleep(delay)).await.is_err() {
+      return Err(last_throttle.map_or_else(
+        || anyhow!("metadata Query page timed out"),
+        |(attempts, source)| exhausted_throttle(source, attempts, window),
+      ));
+    }
+  }
+}
 
 //
 // DynamoMetadataStore
@@ -59,6 +251,7 @@ pub struct DynamoMetadataStore {
   topic_retention: HashMap<Chars, Duration>,
   ttl_buffer: Duration,
   capacity_metrics: Option<DynamoCapacityMetrics>,
+  watched_query_policy: Arc<Mutex<WatchedFeatureFlags<QueryRetryPolicy>>>,
 }
 
 impl DynamoMetadataStore {
@@ -84,7 +277,32 @@ impl DynamoMetadataStore {
       topic_retention,
       ttl_buffer,
       capacity_metrics,
+      watched_query_policy: Arc::new(Mutex::new(WatchedFeatureFlags::new(
+        None,
+        Arc::new(QueryRetryPolicy::default()),
+      ))),
     }
+  }
+
+  #[must_use]
+  pub fn with_feature_flags(mut self, feature_flags: Option<FeatureFlagsWatch>) -> Self {
+    self.watched_query_policy = Arc::new(Mutex::new(WatchedFeatureFlags::new(
+      feature_flags,
+      Arc::new(QueryRetryPolicy::default()),
+    )));
+    self
+  }
+
+  fn query_retry_policy(&self) -> QueryRetryPolicy {
+    let mut watched = self.watched_query_policy.lock();
+    let (policy, error) = watched.current(|flags, _| QueryRetryPolicy::from_flags(flags).ok_or(()));
+    if error.is_some() {
+      warn_every!(
+        15.seconds(),
+        "metadata(dynamo) ignoring invalid Query retry feature flags"
+      );
+    }
+    *policy
   }
 
   fn record_read_capacity(
@@ -344,14 +562,16 @@ impl MetadataStore for DynamoMetadataStore {
         .projection_expression(format!("{ATTR_PK}, {ATTR_SK}, {ATTR_SEGMENT_METADATA_V1}"))
         .set_expression_attribute_values(Some(values))
         .consistent_read(matches!(consistency, MetadataReadConsistency::Strong));
-      if let Some(key) = start_key.take() {
+      if let Some(key) = start_key.clone() {
         query = query.set_exclusive_start_key(Some(key));
       }
 
-      let response = query
-        .return_consumed_capacity(ReturnConsumedCapacity::Total)
-        .send()
-        .await?;
+      let response = query_page_with_retries(
+        query.return_consumed_capacity(ReturnConsumedCapacity::Total),
+        window,
+        self.query_retry_policy(),
+      )
+      .await?;
       self.record_read_capacity(response.consumed_capacity.as_ref());
       for item in response.items.unwrap_or_default() {
         match Self::decode_item(item) {

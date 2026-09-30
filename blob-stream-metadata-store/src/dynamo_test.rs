@@ -1,11 +1,24 @@
 use crate::aws::transaction_cancellation_has_code;
+use crate::dynamo::{
+  QUERY_PAGE_TIMEOUT_FLAG,
+  QueryRetryPolicy,
+  query_page_with_retries,
+  query_service_is_throttled,
+};
 use crate::tests::dynamo_client;
 use crate::{DynamoMetadataStore, MetadataReadConsistency, MetadataStore, SegmentMetadata};
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::config::{Credentials, Region};
+use aws_sdk_dynamodb::operation::query::QueryError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::primitives::Blob;
-use aws_sdk_dynamodb::types::error::TransactionCanceledException;
+use aws_sdk_dynamodb::types::error::{
+  ProvisionedThroughputExceededException,
+  RequestLimitExceeded,
+  ThrottlingException,
+  TransactionCanceledException,
+};
 use aws_sdk_dynamodb::types::{
   AttributeDefinition,
   AttributeValue,
@@ -15,6 +28,8 @@ use aws_sdk_dynamodb::types::{
   KeyType,
   ScalarAttributeType,
 };
+use bd_runtime_config::loader::Loader;
+use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_blob_store::BlobKey;
 use blob_stream_proto::protos::blobstream::v1::metadata::SegmentMetadataV1;
 use blob_stream_types::{
@@ -27,12 +42,294 @@ use blob_stream_types::{
 };
 use protobuf::Message;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::time::sleep;
 use uuid::Uuid;
 
 const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
+
+#[tokio::test]
+async fn metadata_query_disables_sdk_retries_per_application_attempt() -> Result<()> {
+  let listener = TcpListener::bind("127.0.0.1:0").await?;
+  let address = listener.local_addr()?;
+  let requests = Arc::new(AtomicUsize::new(0));
+  let counter = Arc::clone(&requests);
+  let server = tokio::spawn(async move {
+    loop {
+      let (mut socket, _) = listener.accept().await.unwrap();
+      let mut request = [0; 8192];
+      assert!(socket.read(&mut request).await.unwrap() > 0);
+      counter.fetch_add(1, Ordering::Relaxed);
+      let body = r#"{"__type":"com.amazonaws.dynamodb.v20120810#ThrottlingException","message":"throttled","ThrottlingReasons":[{"reason":"TableReadKeyRangeThroughputExceeded","resource":"arn:aws:dynamodb:us-east-1:123456789012:table/metadata"}]}"#;
+      let response = format!(
+        "HTTP/1.1 400 Bad Request\r\ncontent-type: \
+         application/x-amz-json-1.0\r\nx-amzn-ErrorType: ThrottlingException\r\ncontent-length: \
+         {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+      );
+      socket.write_all(response.as_bytes()).await.unwrap();
+    }
+  });
+  let config = aws_sdk_dynamodb::Config::builder()
+    .region(Region::new("us-east-1"))
+    .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+    .endpoint_url(format!("http://{address}"))
+    .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(4))
+    .behavior_version_latest()
+    .build();
+  let client = Client::from_conf(config);
+  let window = TopicWindowKey {
+    topic: "topic".to_string(),
+    window_start_unix_seconds: 0,
+  };
+  let query = client
+    .query()
+    .table_name("metadata")
+    .key_condition_expression("pk = :pk")
+    .expression_attribute_values(":pk", AttributeValue::S(window.format()));
+  let error = tokio::time::timeout(
+    Duration::from_secs(5),
+    query_page_with_retries(
+      query,
+      &window,
+      QueryRetryPolicy {
+        initial_delay: Duration::from_millis(2),
+        max_delay: Duration::from_millis(2),
+        page_timeout: Duration::from_millis(350),
+      },
+    ),
+  )
+  .await?
+  .unwrap_err();
+  server.abort();
+  assert!(error.is::<crate::MetadataQueryThrottled>());
+  assert!(requests.load(Ordering::Relaxed) > 2);
+  Ok(())
+}
+
+#[tokio::test]
+async fn metadata_query_retries_server_errors_but_not_nonretryable_errors() -> Result<()> {
+  for (retryable, expected_requests) in [(true, 2), (false, 1)] {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&requests);
+    let server = tokio::spawn(async move {
+      for _ in 0 .. expected_requests {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 8192];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        let attempt = counter.fetch_add(1, Ordering::Relaxed);
+        let (status, body) = if retryable && attempt > 0 {
+          ("200 OK", r#"{"Items":[],"Count":0,"ScannedCount":0}"#)
+        } else if retryable {
+          (
+            "500 Internal Server Error",
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"retry"}"#,
+          )
+        } else {
+          (
+            "400 Bad Request",
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException","message":"missing"}"#,
+          )
+        };
+        let response = format!(
+          "HTTP/1.1 {status}\r\ncontent-type: application/x-amz-json-1.0\r\ncontent-length: \
+           {}\r\nconnection: close\r\n\r\n{body}",
+          body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+      }
+    });
+    let config = aws_sdk_dynamodb::Config::builder()
+      .region(Region::new("us-east-1"))
+      .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+      .endpoint_url(format!("http://{address}"))
+      .behavior_version_latest()
+      .build();
+    let client = Client::from_conf(config);
+    let window = TopicWindowKey {
+      topic: "topic".to_string(),
+      window_start_unix_seconds: 0,
+    };
+    let query = client
+      .query()
+      .table_name("metadata")
+      .key_condition_expression("pk = :pk")
+      .expression_attribute_values(":pk", AttributeValue::S(window.format()));
+    let result = tokio::time::timeout(
+      Duration::from_secs(3),
+      query_page_with_retries(query, &window, QueryRetryPolicy::default()),
+    )
+    .await?;
+    assert_eq!(result.is_ok(), retryable);
+    tokio::time::timeout(Duration::from_secs(1), server).await??;
+    assert_eq!(requests.load(Ordering::Relaxed), expected_requests);
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn metadata_query_uses_page_deadline_instead_of_sdk_timeout() -> Result<()> {
+  let listener = TcpListener::bind("127.0.0.1:0").await?;
+  let address = listener.local_addr()?;
+  let server = tokio::spawn(async move {
+    let (mut socket, _) = listener.accept().await.unwrap();
+    let mut request = [0; 8192];
+    assert!(socket.read(&mut request).await.unwrap() > 0);
+    sleep(Duration::from_millis(80)).await;
+    let body = r#"{"Items":[],"Count":0,"ScannedCount":0}"#;
+    let response = format!(
+      "HTTP/1.1 200 OK\r\ncontent-type: application/x-amz-json-1.0\r\ncontent-length: \
+       {}\r\nconnection: close\r\n\r\n{body}",
+      body.len()
+    );
+    socket.write_all(response.as_bytes()).await.unwrap();
+  });
+  let config = aws_sdk_dynamodb::Config::builder()
+    .region(Region::new("us-east-1"))
+    .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+    .endpoint_url(format!("http://{address}"))
+    .timeout_config(
+      aws_config::timeout::TimeoutConfig::builder()
+        .operation_timeout(Duration::from_millis(20))
+        .operation_attempt_timeout(Duration::from_millis(10))
+        .build(),
+    )
+    .behavior_version_latest()
+    .build();
+  let window = TopicWindowKey {
+    topic: "topic".to_string(),
+    window_start_unix_seconds: 0,
+  };
+  let query = Client::from_conf(config)
+    .query()
+    .table_name("metadata")
+    .key_condition_expression("pk = :pk")
+    .expression_attribute_values(":pk", AttributeValue::S(window.format()));
+  tokio::time::timeout(
+    Duration::from_secs(3),
+    query_page_with_retries(
+      query,
+      &window,
+      QueryRetryPolicy {
+        page_timeout: Duration::from_millis(300),
+        ..Default::default()
+      },
+    ),
+  )
+  .await??;
+  server.await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn metadata_query_page_deadline_cancels_inflight_sdk_attempt() -> Result<()> {
+  let listener = TcpListener::bind("127.0.0.1:0").await?;
+  let address = listener.local_addr()?;
+  let server = tokio::spawn(async move {
+    let (mut socket, _) = listener.accept().await.unwrap();
+    let mut request = [0; 8192];
+    assert!(socket.read(&mut request).await.unwrap() > 0);
+    let mut drain = [0; 1];
+    assert_eq!(socket.read(&mut drain).await.unwrap(), 0);
+  });
+  let config = aws_sdk_dynamodb::Config::builder()
+    .region(Region::new("us-east-1"))
+    .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+    .endpoint_url(format!("http://{address}"))
+    .behavior_version_latest()
+    .build();
+  let client = Client::from_conf(config);
+  let window = TopicWindowKey {
+    topic: "topic".to_string(),
+    window_start_unix_seconds: 0,
+  };
+  let query = client
+    .query()
+    .table_name("metadata")
+    .key_condition_expression("pk = :pk")
+    .expression_attribute_values(":pk", AttributeValue::S(window.format()));
+  let result = tokio::time::timeout(
+    Duration::from_secs(3),
+    query_page_with_retries(
+      query,
+      &window,
+      QueryRetryPolicy {
+        page_timeout: Duration::from_millis(80),
+        ..Default::default()
+      },
+    ),
+  )
+  .await?;
+  assert!(result.unwrap_err().to_string().contains("timed out"));
+  tokio::time::timeout(Duration::from_secs(1), server).await??;
+  Ok(())
+}
+
+#[tokio::test]
+async fn query_retry_flags_keep_last_valid_policy() -> Result<()> {
+  let loader = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(QUERY_PAGE_TIMEOUT_FLAG, 1_000),
+  ));
+  let store = DynamoMetadataStore::new_read_only(dynamo_client().await?, "metadata")
+    .with_feature_flags(Some(loader.snapshot_watch()));
+  let first = store.query_retry_policy();
+  assert_eq!(first.page_timeout, Duration::from_secs(1));
+
+  loader.update(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(QUERY_PAGE_TIMEOUT_FLAG, 0),
+  ));
+  assert_eq!(store.query_retry_policy(), first);
+
+  loader.update(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(QUERY_PAGE_TIMEOUT_FLAG, 2_000),
+  ));
+  assert_eq!(
+    store.query_retry_policy().page_timeout,
+    Duration::from_secs(2)
+  );
+  Ok(())
+}
+
+#[test]
+fn classifies_query_throttle_variants_and_reasons() {
+  let throttling = QueryError::ThrottlingException(
+    ThrottlingException::builder()
+      .throttling_reasons(
+        aws_sdk_dynamodb::types::ThrottlingReason::builder()
+          .reason("TableReadKeyRangeThroughputExceeded")
+          .build(),
+      )
+      .build(),
+  );
+  assert!(query_service_is_throttled(&throttling));
+  let QueryError::ThrottlingException(throttling) = throttling else {
+    unreachable!();
+  };
+  assert_eq!(
+    throttling.throttling_reasons()[0].reason(),
+    Some("TableReadKeyRangeThroughputExceeded")
+  );
+  assert!(query_service_is_throttled(
+    &QueryError::ProvisionedThroughputExceededException(
+      ProvisionedThroughputExceededException::builder().build()
+    )
+  ));
+  assert!(query_service_is_throttled(
+    &QueryError::RequestLimitExceeded(RequestLimitExceeded::builder().build())
+  ));
+  assert!(!query_service_is_throttled(
+    &QueryError::ResourceNotFoundException(
+      aws_sdk_dynamodb::types::error::ResourceNotFoundException::builder().build()
+    )
+  ));
+}
 
 async fn create_segments_table(client: &Client, table_name: &str) -> Result<()> {
   client

@@ -4,10 +4,11 @@ mod tests;
 
 use anyhow::{Result, anyhow, ensure};
 use bd_log_util::warn_every;
-use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
+use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch, WatchedFeatureFlags};
 use bd_shutdown::ComponentShutdownTriggerHandle;
 use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_metadata_store::{
+  MetadataQueryThrottled,
   MetadataReadConsistency as StoreConsistency,
   MetadataStore,
   SegmentMetadata,
@@ -19,6 +20,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   MetadataReadConsistency,
   MetadataReadFailure,
   MetadataReadFailureStatus,
+  MetadataReadOverloadReason,
   MetadataReadSuccess,
   ReadMetadataWindowRequest,
   ReadMetadataWindowResponse,
@@ -45,7 +47,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration as StdDuration;
 use time::ext::NumericalDuration;
 use time::{Duration, OffsetDateTime};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 
 const DEFAULT_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_COALESCING_WINDOW: Duration = Duration::milliseconds(250);
@@ -75,6 +77,93 @@ const MAX_RESPONSE_ITEMS_FEATURE_FLAG: &str =
 const MAX_RESPONSE_BYTES_FEATURE_FLAG: &str =
   "blob_stream_broker_metadata_cache_max_response_bytes";
 const MAX_ENTRY_ITEMS_FEATURE_FLAG: &str = "blob_stream_broker_metadata_cache_max_entry_items";
+const REQUEST_TIMEOUT_FEATURE_FLAG: &str = "blob_stream_broker_metadata_cache_request_timeout_ms";
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct MetadataCacheOverload {
+  reason: MetadataReadOverloadReason,
+  message: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MetadataCacheLimits {
+  request_timeout: StdDuration,
+  max_waiters_per_key: usize,
+  max_waiters: usize,
+  max_refills: usize,
+  max_request_partitions: usize,
+  max_response_items: usize,
+  max_response_bytes: u64,
+  max_entry_items: usize,
+}
+
+impl MetadataCacheLimits {
+  fn from_flags(
+    flags: &dyn FeatureFlags,
+    defaults: Self,
+    coalescing_window: StdDuration,
+  ) -> Result<Self> {
+    let default_timeout_ms =
+      u64::try_from(defaults.request_timeout.as_millis()).unwrap_or(u64::MAX);
+    let timeout_ms = flags.get_integer(REQUEST_TIMEOUT_FEATURE_FLAG, default_timeout_ms);
+    ensure!(
+      timeout_ms == default_timeout_ms || (1 ..= 60_000).contains(&timeout_ms),
+      "invalid metadata request timeout"
+    );
+    let limits = Self {
+      request_timeout: if timeout_ms == default_timeout_ms {
+        defaults.request_timeout
+      } else {
+        StdDuration::from_millis(timeout_ms)
+      },
+      max_waiters_per_key: feature_flag_limit(
+        Some(flags),
+        MAX_WAITERS_PER_KEY_FEATURE_FLAG,
+        defaults.max_waiters_per_key,
+      )?,
+      max_waiters: feature_flag_limit(Some(flags), MAX_WAITERS_FEATURE_FLAG, defaults.max_waiters)?,
+      max_refills: feature_flag_limit(Some(flags), MAX_REFILLS_FEATURE_FLAG, defaults.max_refills)?,
+      max_request_partitions: feature_flag_limit(
+        Some(flags),
+        MAX_REQUEST_PARTITIONS_FEATURE_FLAG,
+        defaults.max_request_partitions,
+      )?,
+      max_response_items: feature_flag_limit(
+        Some(flags),
+        MAX_RESPONSE_ITEMS_FEATURE_FLAG,
+        defaults.max_response_items,
+      )?,
+      max_response_bytes: feature_flag_bytes(
+        Some(flags),
+        MAX_RESPONSE_BYTES_FEATURE_FLAG,
+        defaults.max_response_bytes,
+      )?,
+      max_entry_items: feature_flag_limit(
+        Some(flags),
+        MAX_ENTRY_ITEMS_FEATURE_FLAG,
+        defaults.max_entry_items,
+      )?,
+    };
+    ensure!(
+      coalescing_window <= limits.request_timeout / 2,
+      "metadata coalescing window exceeds half the request timeout"
+    );
+    ensure!(
+      limits.max_waiters_per_key <= limits.max_waiters,
+      "per-key waiters exceed global cap"
+    );
+    ensure!(
+      limits.max_refills <= 1024,
+      "metadata refill concurrency exceeds 1024"
+    );
+    ensure!(
+      limits.max_response_bytes <= MAX_METADATA_READ_REQUEST_BYTES as u64,
+      "metadata response limit exceeds transport cap"
+    );
+    Ok(limits)
+  }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadCoverage {
@@ -91,14 +180,7 @@ pub struct MetadataCacheConfig {
   tail_max_bytes: u64,
   recovery_max_bytes: u64,
   coalescing_window: StdDuration,
-  request_timeout: StdDuration,
-  max_waiters_per_key: usize,
-  max_waiters: usize,
-  max_refills: usize,
-  max_request_partitions: usize,
-  max_response_items: usize,
-  max_response_bytes: u64,
-  max_entry_items: usize,
+  limits: MetadataCacheLimits,
   topics: HashMap<String, TopicCacheContract>,
 }
 
@@ -115,6 +197,7 @@ impl MetadataCacheConfig {
     config: &RuntimeConfig,
     feature_flags: Option<&FeatureFlagsWatch>,
   ) -> Result<Self> {
+    let feature_flags = feature_flags.map(|flags| flags as &dyn FeatureFlags);
     let broker = config
       .broker
       .as_ref()
@@ -154,7 +237,20 @@ impl MetadataCacheConfig {
       "broker metadata_cache_coalescing_window must leave half the request timeout for refill and \
        response"
     );
-    let config = Self {
+    let limits = MetadataCacheLimits {
+      request_timeout,
+      max_waiters_per_key: DEFAULT_MAX_WAITERS_PER_KEY,
+      max_waiters: DEFAULT_MAX_WAITERS,
+      max_refills: DEFAULT_MAX_REFILLS,
+      max_request_partitions: DEFAULT_MAX_REQUEST_PARTITIONS,
+      max_response_items: DEFAULT_MAX_RESPONSE_ITEMS,
+      max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+      max_entry_items: DEFAULT_MAX_ENTRY_ITEMS,
+    };
+    if let Some(flags) = feature_flags {
+      MetadataCacheLimits::from_flags(flags, limits, coalescing_window)?;
+    }
+    Ok(Self {
       tail_max_bytes: broker
         .metadata_cache_max_bytes
         .unwrap_or(DEFAULT_CACHE_MAX_BYTES),
@@ -164,55 +260,14 @@ impl MetadataCacheConfig {
         DEFAULT_RECOVERY_CACHE_MAX_BYTES,
       )?,
       coalescing_window,
-      request_timeout,
-      max_waiters_per_key: feature_flag_limit(
-        feature_flags,
-        MAX_WAITERS_PER_KEY_FEATURE_FLAG,
-        DEFAULT_MAX_WAITERS_PER_KEY,
-      )?,
-      max_waiters: feature_flag_limit(
-        feature_flags,
-        MAX_WAITERS_FEATURE_FLAG,
-        DEFAULT_MAX_WAITERS,
-      )?,
-      max_refills: feature_flag_limit(
-        feature_flags,
-        MAX_REFILLS_FEATURE_FLAG,
-        DEFAULT_MAX_REFILLS,
-      )?,
-      max_request_partitions: feature_flag_limit(
-        feature_flags,
-        MAX_REQUEST_PARTITIONS_FEATURE_FLAG,
-        DEFAULT_MAX_REQUEST_PARTITIONS,
-      )?,
-      max_response_items: feature_flag_limit(
-        feature_flags,
-        MAX_RESPONSE_ITEMS_FEATURE_FLAG,
-        DEFAULT_MAX_RESPONSE_ITEMS,
-      )?,
-      max_response_bytes: feature_flag_bytes(
-        feature_flags,
-        MAX_RESPONSE_BYTES_FEATURE_FLAG,
-        DEFAULT_MAX_RESPONSE_BYTES,
-      )?
-      .min(u64::try_from(MAX_METADATA_READ_REQUEST_BYTES).unwrap_or(u64::MAX)),
-      max_entry_items: feature_flag_limit(
-        feature_flags,
-        MAX_ENTRY_ITEMS_FEATURE_FLAG,
-        DEFAULT_MAX_ENTRY_ITEMS,
-      )?,
+      limits,
       topics,
-    };
-    ensure!(
-      config.max_waiters_per_key <= config.max_waiters,
-      "broker metadata cache max waiters per key must not exceed max waiters"
-    );
-    Ok(config)
+    })
   }
 }
 
 fn feature_flag_limit(
-  feature_flags: Option<&FeatureFlagsWatch>,
+  feature_flags: Option<&dyn FeatureFlags>,
   name: &str,
   default: usize,
 ) -> Result<usize> {
@@ -226,7 +281,7 @@ fn feature_flag_limit(
 }
 
 fn feature_flag_bytes(
-  feature_flags: Option<&FeatureFlagsWatch>,
+  feature_flags: Option<&dyn FeatureFlags>,
   name: &str,
   default: u64,
 ) -> Result<u64> {
@@ -273,12 +328,13 @@ pub struct MetadataCache {
   metadata_store: Arc<dyn MetadataStore>,
   time_provider: Arc<dyn TimeProvider>,
   config: MetadataCacheConfig,
+  last_valid_limits: Mutex<WatchedFeatureFlags<MetadataCacheLimits>>,
   eventual_tail_entries: Cache<CacheKey, Arc<CacheEntry>>,
   eventual_recovery_entries: Cache<CacheKey, Arc<CacheEntry>>,
   // Registration is synchronous and short-lived; refills run outside this lock.
   in_flight: Mutex<HashMap<CacheKey, Arc<PendingRefill>>>,
   active_waiters: Arc<AtomicUsize>,
-  refill_permits: Arc<Semaphore>,
+  active_refills: Arc<AtomicUsize>,
   tail_retained_metrics: RetainedCacheMetrics,
   recovery_retained_metrics: RetainedCacheMetrics,
   generation: AtomicU64,
@@ -435,11 +491,16 @@ pub struct MetadataCacheSnapshot {
 
 impl MetadataCache {
   #[must_use]
-  pub fn new(metadata_store: Arc<dyn MetadataStore>, config: MetadataCacheConfig) -> Self {
+  pub fn new(
+    metadata_store: Arc<dyn MetadataStore>,
+    config: MetadataCacheConfig,
+    feature_flags: Option<FeatureFlagsWatch>,
+  ) -> Self {
     let collector = bd_server_stats::stats::Collector::default();
     Self::new_inner(
       metadata_store,
       config,
+      feature_flags,
       &collector.scope("blob_stream_broker"),
     )
   }
@@ -455,10 +516,16 @@ impl MetadataCache {
   pub fn new_with_metrics(
     metadata_store: Arc<dyn MetadataStore>,
     config: MetadataCacheConfig,
+    feature_flags: Option<FeatureFlagsWatch>,
     shutdown_trigger_handle: &ComponentShutdownTriggerHandle,
     metrics_scope: &bd_server_stats::stats::Scope,
   ) -> Arc<Self> {
-    let cache = Arc::new(Self::new_inner(metadata_store, config, metrics_scope));
+    let cache = Arc::new(Self::new_inner(
+      metadata_store,
+      config,
+      feature_flags,
+      metrics_scope,
+    ));
     cache.spawn_maintenance(shutdown_trigger_handle);
     cache
   }
@@ -466,9 +533,10 @@ impl MetadataCache {
   fn new_inner(
     metadata_store: Arc<dyn MetadataStore>,
     config: MetadataCacheConfig,
+    feature_flags: Option<FeatureFlagsWatch>,
     metrics_scope: &bd_server_stats::stats::Scope,
   ) -> Self {
-    let max_refills = config.max_refills;
+    let initial_limits = WatchedFeatureFlags::new(feature_flags, Arc::new(config.limits));
     let metrics = MetadataCacheMetrics::new(metrics_scope);
     let tail_retained_metrics = RetainedCacheMetrics::new(
       metrics.tail_entries.clone(),
@@ -507,12 +575,13 @@ impl MetadataCache {
     Self {
       metadata_store,
       time_provider: Arc::new(SystemTimeProvider),
+      last_valid_limits: Mutex::new(initial_limits),
       config,
       eventual_tail_entries,
       eventual_recovery_entries,
       in_flight: Mutex::new(HashMap::new()),
       active_waiters: Arc::new(AtomicUsize::new(0)),
-      refill_permits: Arc::new(Semaphore::new(max_refills)),
+      active_refills: Arc::new(AtomicUsize::new(0)),
       tail_retained_metrics,
       recovery_retained_metrics,
       generation: AtomicU64::new(0),
@@ -521,9 +590,33 @@ impl MetadataCache {
     }
   }
 
-  #[must_use]
-  pub fn request_timeout(&self) -> StdDuration {
-    self.config.request_timeout
+  fn limits(&self) -> MetadataCacheLimits {
+    let mut watched = self.last_valid_limits.lock();
+    let (limits, error) = watched.current(|flags, defaults| {
+      MetadataCacheLimits::from_flags(flags, *defaults, self.config.coalescing_window)
+    });
+    if let Some(error) = error {
+      warn_every!(
+        15.seconds(),
+        "broker metadata cache ignoring invalid limits: {error}"
+      );
+    }
+    *limits
+  }
+
+  fn try_admit_refill(&self, limit: usize) -> Result<RefillAdmission> {
+    self
+      .active_refills
+      .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
+        (active < limit).then_some(active + 1)
+      })
+      .map_err(|_| {
+        anyhow!(MetadataCacheOverload {
+          reason: MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REFILL_CONCURRENCY,
+          message: "metadata cache overloaded: refill concurrency limit reached",
+        })
+      })?;
+    Ok(RefillAdmission(Arc::clone(&self.active_refills)))
   }
 
   /// Runs cache eviction work independently of read traffic.
@@ -563,7 +656,10 @@ impl MetadataCache {
       ),
       in_flight_refills: self.in_flight.lock().len(),
       active_waiters: self.active_waiters.load(Ordering::Relaxed),
-      available_refill_permits: self.refill_permits.available_permits(),
+      available_refill_permits: self
+        .limits()
+        .max_refills
+        .saturating_sub(self.active_refills.load(Ordering::Relaxed)),
       failure_total: self.failures.load(Ordering::Relaxed),
     };
     self.record_cache_state(&snapshot);
@@ -590,12 +686,16 @@ impl MetadataCache {
     request: ReadMetadataWindowRequest,
   ) -> ReadMetadataWindowResponse {
     self.metrics.requests.inc();
-    if request_partition_count(&request) > self.config.max_request_partitions {
+    let limits = self.limits();
+    if request_partition_count(&request) > limits.max_request_partitions {
       self.record_failure(MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_OVERLOADED);
       return response_error(
         &request,
         MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_OVERLOADED,
-        "metadata request exceeds the configured partition limit",
+        &anyhow!(MetadataCacheOverload {
+          reason: MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REQUEST_PARTITIONS,
+          message: "metadata request exceeds the configured partition limit",
+        }),
       );
     }
     let specification = match self.validate_request(&request) {
@@ -605,14 +705,14 @@ impl MetadataCache {
         return response_error(
           &request,
           MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_BAD_REQUEST,
-          error,
+          &error,
         );
       },
     };
-    let response_limit = response_limit(&request, &self.config);
+    let response_limit = response_limit(&request, limits.max_response_bytes);
     // The request budget covers retained-entry lookup, coalescing, refill, and response shaping.
     let response = match tokio::time::timeout(
-      self.config.request_timeout,
+      limits.request_timeout,
       self.entry_for(specification.clone()),
     )
     .await
@@ -621,27 +721,30 @@ impl MetadataCache {
         &specification,
         &entry.entry,
         response_limit,
-        self.config.max_response_items,
+        limits.max_response_items,
         entry.retained_coverage,
       ) {
         Ok(response) => response,
         Err(error) => {
           let status = failure_status(&error);
           self.record_failure(status);
-          response_error(&request, status, error)
+          response_error(&request, status, &error)
         },
       },
       Ok(Err(error)) => {
         let status = failure_status(&error);
         self.record_failure(status);
-        response_error(&request, status, error)
+        response_error(&request, status, &error)
       },
       Err(_) => {
         self.record_failure(MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_OVERLOADED);
         response_error(
           &request,
           MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_OVERLOADED,
-          anyhow!("metadata cache request timed out"),
+          &anyhow!(MetadataCacheOverload {
+            reason: MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REQUEST_TIMEOUT,
+            message: "metadata cache request timed out",
+          }),
         )
       },
     };
@@ -730,6 +833,7 @@ impl MetadataCache {
     self: &Arc<Self>,
     specification: &ReadSpecification,
   ) -> Result<(Arc<PendingRefill>, PendingWaiter)> {
+    let limits = self.limits();
     let mut in_flight = self.in_flight.lock();
     if let Some(pending) = in_flight.get(&specification.key).cloned()
       && !pending.is_complete()
@@ -737,8 +841,8 @@ impl MetadataCache {
       let waiter = pending.try_add_waiter(
         Arc::clone(&self.active_waiters),
         self.metrics.active_waiters.clone(),
-        self.config.max_waiters_per_key,
-        self.config.max_waiters,
+        limits.max_waiters_per_key,
+        limits.max_waiters,
       )?;
       // Tail requests arriving during the coalescing window lower per-partition bounds before the
       // worker snapshots them, allowing one scan to cover all admitted waiters.
@@ -766,8 +870,8 @@ impl MetadataCache {
     let waiter = pending.try_add_waiter(
       Arc::clone(&self.active_waiters),
       self.metrics.active_waiters.clone(),
-      self.config.max_waiters_per_key,
-      self.config.max_waiters,
+      limits.max_waiters_per_key,
+      limits.max_waiters,
     )?;
     in_flight.insert(specification.key.clone(), Arc::clone(&pending));
     debug!(
@@ -808,21 +912,30 @@ impl MetadataCache {
         cache.time_provider.now(),
       );
       let (request, coalescing_window_requests) = worker.begin();
-      let result = match cache.refill_permits.clone().try_acquire_owned() {
+      let result = match cache.try_admit_refill(cache.limits().max_refills) {
         Ok(permit) => {
           cache
             .metrics
             .coalescing_window_requests
             .inc_by(u64::try_from(coalescing_window_requests).unwrap_or(u64::MAX));
           cache.metrics.active_refills.inc();
-          let result = cache.load_entry(request).await;
+          let remaining = cache
+            .limits()
+            .request_timeout
+            .saturating_sub(cache.config.coalescing_window);
+          let result = tokio::time::timeout(remaining, cache.load_entry(request))
+            .await
+            .unwrap_or_else(|_| {
+              Err(anyhow!(MetadataCacheOverload {
+                reason: MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REQUEST_TIMEOUT,
+                message: "metadata cache refill timed out",
+              }))
+            });
           drop(permit);
           cache.metrics.active_refills.dec();
           result
         },
-        Err(_) => Err(anyhow!(
-          "metadata cache overloaded: refill concurrency limit reached"
-        )),
+        Err(error) => Err(error),
       };
       worker.complete(result);
       cache.remove_pending_refill(&key, &worker);
@@ -862,8 +975,11 @@ impl MetadataCache {
       .await?;
     segments.sort_by_key(|segment| segment.snowflake_id);
     ensure!(
-      segments.len() <= self.config.max_entry_items,
-      "metadata cache overloaded: cache generation exceeds the configured item limit"
+      segments.len() <= self.limits().max_entry_items,
+      MetadataCacheOverload {
+        reason: MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_ENTRY_ITEMS,
+        message: "metadata cache overloaded: cache generation exceeds the configured item limit",
+      }
     );
     let entry = Arc::new(CacheEntry {
       refill_floor: min_snowflake,
@@ -1146,8 +1262,26 @@ struct PendingRefillState {
   // Tail bounds may be widened while coalescing. Once the worker calls `begin`, this snapshot is
   // immutable and late callers retry if it does not cover them.
   specification: ReadSpecification,
-  completed: Option<Result<Arc<CacheEntry>, String>>,
+  completed: Option<Result<Arc<CacheEntry>, SharedRefillError>>,
   waiter_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct SharedRefillError {
+  source: Arc<anyhow::Error>,
+  reason: Option<MetadataReadOverloadReason>,
+}
+
+impl std::fmt::Display for SharedRefillError {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    self.source.fmt(formatter)
+  }
+}
+
+impl std::error::Error for SharedRefillError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(self.source.as_ref().as_ref())
+  }
 }
 
 impl PendingRefill {
@@ -1197,16 +1331,18 @@ impl PendingRefill {
     let active_waiter_count = active_waiters.fetch_add(1, Ordering::Relaxed);
     if active_waiter_count >= max_waiters {
       active_waiters.fetch_sub(1, Ordering::Relaxed);
-      return Err(anyhow!(
-        "metadata cache overloaded: global waiter limit reached"
-      ));
+      return Err(anyhow!(MetadataCacheOverload {
+        reason: MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_GLOBAL_WAITERS,
+        message: "metadata cache overloaded: global waiter limit reached",
+      }));
     }
     let mut state = self.state.lock();
     if state.waiter_count >= max_waiters_per_key {
       active_waiters.fetch_sub(1, Ordering::Relaxed);
-      return Err(anyhow!(
-        "metadata cache overloaded: per-key waiter limit reached"
-      ));
+      return Err(anyhow!(MetadataCacheOverload {
+        reason: MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_PER_KEY_WAITERS,
+        message: "metadata cache overloaded: per-key waiter limit reached",
+      }));
     }
     state.waiter_count = state.waiter_count.saturating_add(1);
     active_waiters_gauge
@@ -1224,7 +1360,10 @@ impl PendingRefill {
   }
 
   fn complete(&self, result: Result<Arc<CacheEntry>>) {
-    let result = result.map_err(|error| error.to_string());
+    let result = result.map_err(|error| SharedRefillError {
+      reason: overload_reason(&error),
+      source: Arc::new(error),
+    });
     self.state.lock().completed = Some(result);
     self.ready.notify_waiters();
   }
@@ -1235,7 +1374,7 @@ impl PendingRefill {
       // the state check and `await`.
       let notified = self.ready.notified();
       if let Some(result) = self.state.lock().completed.clone() {
-        return result.map_err(|error| anyhow!(error));
+        return result.map_err(anyhow::Error::from);
       }
       notified.await;
     }
@@ -1251,6 +1390,14 @@ struct PendingWaiter {
   pending: Arc<PendingRefill>,
   active_waiters: Arc<AtomicUsize>,
   active_waiters_gauge: prometheus::IntGauge,
+}
+
+struct RefillAdmission(Arc<AtomicUsize>);
+
+impl Drop for RefillAdmission {
+  fn drop(&mut self) {
+    self.0.fetch_sub(1, Ordering::AcqRel);
+  }
 }
 
 impl Drop for PendingWaiter {
@@ -1274,20 +1421,35 @@ fn request_partition_count(request: &ReadMetadataWindowRequest) -> usize {
   }
 }
 
-fn response_limit(request: &ReadMetadataWindowRequest, config: &MetadataCacheConfig) -> u64 {
+fn response_limit(request: &ReadMetadataWindowRequest, max_response_bytes: u64) -> u64 {
   // A caller can request less, but never more than the broker's configured response budget.
-  request
-    .max_response_bytes
-    .min(config.max_response_bytes)
-    .max(1)
+  request.max_response_bytes.min(max_response_bytes).max(1)
 }
 
 fn failure_status(error: &anyhow::Error) -> MetadataReadFailureStatus {
-  if error.to_string().starts_with("metadata cache overloaded:") {
+  if overload_reason(error).is_some() {
     MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_OVERLOADED
   } else {
     MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_FAILED
   }
+}
+
+fn overload_reason(error: &anyhow::Error) -> Option<MetadataReadOverloadReason> {
+  error.chain().find_map(|cause| {
+    cause
+      .downcast_ref::<MetadataCacheOverload>()
+      .map(|overload| overload.reason)
+      .or_else(|| {
+        cause
+          .downcast_ref::<SharedRefillError>()
+          .and_then(|shared| shared.reason)
+      })
+      .or_else(|| {
+        cause
+          .is::<MetadataQueryThrottled>()
+          .then_some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_STORAGE_THROTTLED)
+      })
+  })
 }
 
 fn response_from_entry(
@@ -1328,11 +1490,17 @@ fn response_from_entry(
     response_bytes = response_bytes.saturating_add(metadata_bytes);
     ensure!(
       response_bytes <= response_limit,
-      "metadata cache overloaded: response exceeds configured byte limit"
+      MetadataCacheOverload {
+        reason: MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_RESPONSE_BYTES,
+        message: "metadata cache overloaded: response exceeds configured byte limit",
+      }
     );
     ensure!(
       segments.len() < max_response_items,
-      "metadata cache overloaded: response exceeds configured item limit"
+      MetadataCacheOverload {
+        reason: MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_RESPONSE_ITEMS,
+        message: "metadata cache overloaded: response exceeds configured item limit",
+      }
     );
     segments.push(BrokerSegmentMetadata {
       snowflake_id: segment.snowflake_id.as_u64(),
@@ -1364,19 +1532,23 @@ fn response_from_entry(
 fn response_error(
   request: &ReadMetadataWindowRequest,
   status: MetadataReadFailureStatus,
-  error: impl std::fmt::Display,
+  error: &anyhow::Error,
 ) -> ReadMetadataWindowResponse {
+  let reason = overload_reason(error);
   warn_every!(
     5.seconds(),
     "broker metadata cache request failed: topic={}, window_start={}, status={status:?}, \
-     error={error:#}",
+     reason={reason:?}, partitions={}, max_response_bytes={}, error={error:#}",
     request.topic,
-    request.window_start_unix_seconds
+    request.window_start_unix_seconds,
+    request_partition_count(request),
+    request.max_response_bytes
   );
   ReadMetadataWindowResponse {
     result: Some(read_metadata_window_response::Result::Failure(
       MetadataReadFailure {
         status: status.into(),
+        overload_reason: reason.unwrap_or_default().into(),
         error_message: if status == MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_FAILED {
           "metadata cache request failed".into()
         } else {

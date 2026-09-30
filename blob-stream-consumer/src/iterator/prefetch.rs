@@ -36,7 +36,13 @@ use crate::diagnostics::{
   reader_partition_scan_snapshot,
 };
 use anyhow::Result;
-use bd_backoff::{ExponentialBackoff, ExponentialBackoffBuilder, InfiniteBackoff as _};
+use bd_backoff::{
+  ExponentialBackoff,
+  ExponentialBackoffBuilder,
+  Finite,
+  InfiniteBackoff as _,
+  SystemClock,
+};
 use bd_log_util::warn_every;
 use bd_time::TimeProvider;
 use blob_stream_types::{VirtualPartitionId, offset_datetime_from_unix_seconds};
@@ -754,13 +760,19 @@ impl PrefetchWorker {
     pending_remains
   }
 
-  /// Retry one failed read immediately, then wait before subsequent retry attempts.
+  /// Retry failed reads with capped exponential backoff, interruptible by reader commands.
   async fn read_available_with_retry(
     &mut self,
     capacity: ReadCapacity,
     runtime_settings: crate::config::ConsumerReadRuntimeSettings,
   ) -> ReadAvailableOutcome {
     let mut read_attempt: u8 = 0;
+    let mut read_backoff = ExponentialBackoffBuilder::<SystemClock, Finite>::new_infinite()
+      .with_initial_interval(time::Duration::milliseconds(100))
+      .with_max_interval(time::Duration::seconds(1))
+      .with_randomization_factor(1.0)
+      .with_multiplier(2.0)
+      .build();
     loop {
       let now = self.time_provider.now();
       match self
@@ -775,18 +787,20 @@ impl PrefetchWorker {
             self.metrics.retries.inc();
             warn_every!(
               15.seconds(),
-              "consumer prefetch read retrying after error: error={read_error:#}"
+              "consumer prefetch read retrying after backoff: error={read_error:#}"
             );
-            continue;
+          } else {
+            self.metrics.failures.inc();
+            warn_every!(
+              15.seconds(),
+              "consumer prefetch read failed after retry; backing off: error={read_error:#}"
+            );
           }
-
-          self.metrics.failures.inc();
-          warn_every!(
-            15.seconds(),
-            "consumer prefetch read failed after retry: error={read_error:#}"
-          );
+          let delay = read_backoff
+            .next_backoff()
+            .max(time::Duration::milliseconds(1));
           tokio::select! {
-            () = self.time_provider.sleep(self.base_idle_delay) => {},
+            () = self.time_provider.sleep(delay) => {},
             () = self.reader_command_notify.notified() => {
               return ReadAvailableOutcome::CommandPending;
             },

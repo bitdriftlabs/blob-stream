@@ -13,6 +13,8 @@ points, and operational assumptions.
 | Broker sequence reservation | 10,000 base sequence values per virtual partition |
 | Broker segment compression | zstd, level 3 |
 | Broker metadata caches | 64 MiB each for Tail and Full Recovery (128 MiB total); 250 ms coalescing window; 5-second request deadline |
+| Metadata Query retries | Deadline-bounded attempts per page; 50-200 ms full-jitter exponential backoff; 3-second page deadline; SDK retries disabled only for Query |
+| Consumer broker metadata RPC timeout | 7 seconds by default; configurable in `ConsumerReadConfig` |
 | Broker blob cache | 30-second request deadline; 10-second idle retention when no override is configured |
 | Producer batch records | 10,000 |
 | Producer batch payload bytes | 1 MiB |
@@ -47,7 +49,9 @@ points, and operational assumptions.
 Consumer bootstrap requires broker discovery. Every metadata and blob-range read uses the selected
 local broker. Eventual `Tail` and `FullRecovery` metadata requests use separate retained caches;
 strong metadata reads bypass retained coverage. Direct storage is the fallback for an unavailable or
-unusable broker response. See [Consumption](consumption.md) for the read protocol.
+unusable broker response except exhausted metadata storage throttling; a live flag can disable
+broker-to-direct metadata fallback. See
+[Consumption](consumption.md) for the read protocol.
 
 ### Clock Synchronization
 

@@ -40,6 +40,54 @@ struct GatedMetadataStore {
 
 struct FailingMetadataStore;
 
+#[derive(Debug)]
+struct CountingFeatureFlags {
+  flags: DefaultFeatureFlags,
+  reads: Arc<AtomicUsize>,
+}
+
+impl FeatureFlags for CountingFeatureFlags {
+  fn feature_enabled(&self, name: &str, default: bool) -> bool {
+    self.flags.feature_enabled(name, default)
+  }
+
+  fn get_bool(&self, name: &str, default: bool) -> bool {
+    self.flags.get_bool(name, default)
+  }
+
+  fn get_integer(&self, name: &str, default: u64) -> u64 {
+    self.reads.fetch_add(1, Ordering::Relaxed);
+    self.flags.get_integer(name, default)
+  }
+
+  fn get_string(&self, name: &str, default: &Arc<String>) -> Arc<String> {
+    self.flags.get_string(name, default)
+  }
+}
+
+#[test]
+fn shared_refill_error_retains_overload_reason_and_source() {
+  let original = anyhow!(MetadataCacheOverload {
+    reason: MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_ENTRY_ITEMS,
+    message: "metadata cache overloaded: entry limit",
+  });
+  let shared = SharedRefillError {
+    reason: overload_reason(&original),
+    source: Arc::new(original),
+  };
+  let error = anyhow!(shared.clone());
+  assert_eq!(
+    overload_reason(&error),
+    Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_ENTRY_ITEMS)
+  );
+  assert!(
+    error
+      .chain()
+      .any(<dyn std::error::Error>::is::<MetadataCacheOverload>)
+  );
+  assert_eq!(shared.to_string(), "metadata cache overloaded: entry limit");
+}
+
 #[async_trait]
 impl MetadataStore for CountingMetadataStore {
   async fn write_segment(
@@ -116,14 +164,16 @@ fn cache_config(maximum_age: Duration, coalescing_window: StdDuration) -> Metada
     tail_max_bytes: 1024 * 1024,
     recovery_max_bytes: 1024 * 1024,
     coalescing_window,
-    request_timeout: StdDuration::from_secs(1),
-    max_waiters_per_key: DEFAULT_MAX_WAITERS_PER_KEY,
-    max_waiters: DEFAULT_MAX_WAITERS,
-    max_refills: DEFAULT_MAX_REFILLS,
-    max_request_partitions: DEFAULT_MAX_REQUEST_PARTITIONS,
-    max_response_items: DEFAULT_MAX_RESPONSE_ITEMS,
-    max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
-    max_entry_items: DEFAULT_MAX_ENTRY_ITEMS,
+    limits: MetadataCacheLimits {
+      request_timeout: StdDuration::from_secs(1),
+      max_waiters_per_key: DEFAULT_MAX_WAITERS_PER_KEY,
+      max_waiters: DEFAULT_MAX_WAITERS,
+      max_refills: DEFAULT_MAX_REFILLS,
+      max_request_partitions: DEFAULT_MAX_REQUEST_PARTITIONS,
+      max_response_items: DEFAULT_MAX_RESPONSE_ITEMS,
+      max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+      max_entry_items: DEFAULT_MAX_ENTRY_ITEMS,
+    },
     topics: HashMap::from([(
       "topic".to_string(),
       TopicCacheContract {
@@ -156,13 +206,199 @@ fn runtime_feature_flags_override_metadata_cache_defaults() {
   let config = MetadataCacheConfig::from_runtime_config(&runtime, Some(&feature_flags)).unwrap();
 
   assert_eq!(config.recovery_max_bytes, 1_024);
-  assert_eq!(config.max_waiters_per_key, 2);
-  assert_eq!(config.max_waiters, 3);
-  assert_eq!(config.max_refills, 4);
-  assert_eq!(config.max_request_partitions, 5);
-  assert_eq!(config.max_response_items, 6);
-  assert_eq!(config.max_response_bytes, 7);
-  assert_eq!(config.max_entry_items, 8);
+  assert_eq!(config.limits.max_refills, DEFAULT_MAX_REFILLS);
+  let cache = MetadataCache::new(
+    Arc::new(CountingMetadataStore {
+      scans: AtomicUsize::new(0),
+      observed_bounds: Mutex::new(Vec::new()),
+      segments: Vec::new(),
+    }),
+    config,
+    Some(feature_flags),
+  );
+  let limits = cache.limits();
+  assert_eq!(limits.max_waiters_per_key, 2);
+  assert_eq!(limits.max_waiters, 3);
+  assert_eq!(limits.max_refills, 4);
+  assert_eq!(limits.max_request_partitions, 5);
+  assert_eq!(limits.max_response_items, 6);
+  assert_eq!(limits.max_response_bytes, 7);
+  assert_eq!(limits.max_entry_items, 8);
+}
+
+#[test]
+fn invalid_startup_limit_flags_are_rejected() {
+  let mut runtime = RuntimeConfig::new();
+  runtime.broker = Some(BrokerConfig::new()).into();
+  let loader = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(MAX_WAITERS_PER_KEY_FEATURE_FLAG, 5_000),
+  ));
+  let error = MetadataCacheConfig::from_runtime_config(&runtime, Some(&loader.snapshot_watch()))
+    .err()
+    .unwrap();
+  assert!(
+    error
+      .to_string()
+      .contains("per-key waiters exceed global cap")
+  );
+}
+
+#[test]
+fn removing_startup_limit_flags_restores_static_defaults() {
+  let mut runtime = RuntimeConfig::new();
+  runtime.broker = Some(BrokerConfig::new()).into();
+  let loader = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag(MAX_REFILLS_FEATURE_FLAG, 2)
+      .with_integer_flag(MAX_RESPONSE_BYTES_FEATURE_FLAG, 1_024),
+  ));
+  let config =
+    MetadataCacheConfig::from_runtime_config(&runtime, Some(&loader.snapshot_watch())).unwrap();
+  let cache = MetadataCache::new(
+    Arc::new(CountingMetadataStore {
+      scans: AtomicUsize::new(0),
+      observed_bounds: Mutex::new(Vec::new()),
+      segments: Vec::new(),
+    }),
+    config,
+    Some(loader.snapshot_watch()),
+  );
+  assert_eq!(cache.limits().max_refills, 2);
+  assert_eq!(cache.limits().max_response_bytes, 1_024);
+
+  loader.update(Arc::new(DefaultFeatureFlags::default()));
+  assert_eq!(cache.limits().max_refills, DEFAULT_MAX_REFILLS);
+  assert_eq!(
+    cache.limits().max_response_bytes,
+    DEFAULT_MAX_RESPONSE_BYTES
+  );
+}
+
+#[test]
+fn live_refill_limit_downshifts_and_upshifts_without_losing_inflight_work() {
+  let store = Arc::new(CountingMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: Vec::new(),
+  });
+  let loader = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(MAX_REFILLS_FEATURE_FLAG, 2),
+  ));
+  let cache = MetadataCache::new(
+    store,
+    cache_config(Duration::seconds(1), StdDuration::ZERO),
+    Some(loader.snapshot_watch()),
+  );
+  let first = cache.try_admit_refill(cache.limits().max_refills).unwrap();
+
+  loader.update(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(MAX_REFILLS_FEATURE_FLAG, 1),
+  ));
+  assert!(cache.try_admit_refill(cache.limits().max_refills).is_err());
+
+  loader.update(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(MAX_REFILLS_FEATURE_FLAG, 3),
+  ));
+  let second = cache.try_admit_refill(cache.limits().max_refills).unwrap();
+  assert_eq!(cache.active_refills.load(Ordering::Relaxed), 2);
+  drop(first);
+  drop(second);
+  assert_eq!(cache.active_refills.load(Ordering::Relaxed), 0);
+
+  loader.update(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_integer_flag(MAX_RESPONSE_BYTES_FEATURE_FLAG, 32 * 1024 * 1024),
+  ));
+  assert_eq!(cache.limits().max_refills, 3);
+}
+
+#[test]
+fn live_metadata_request_timeout_keeps_last_valid_value() {
+  let store = Arc::new(CountingMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: Vec::new(),
+  });
+  let loader = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(REQUEST_TIMEOUT_FEATURE_FLAG, 800),
+  ));
+  let cache = MetadataCache::new(
+    store,
+    cache_config(Duration::seconds(1), StdDuration::from_millis(250)),
+    Some(loader.snapshot_watch()),
+  );
+  assert_eq!(
+    cache.limits().request_timeout,
+    StdDuration::from_millis(800)
+  );
+
+  loader.update(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(REQUEST_TIMEOUT_FEATURE_FLAG, 400),
+  ));
+  assert_eq!(
+    cache.limits().request_timeout,
+    StdDuration::from_millis(800)
+  );
+
+  loader.update(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(REQUEST_TIMEOUT_FEATURE_FLAG, 1200),
+  ));
+  assert_eq!(
+    cache.limits().request_timeout,
+    StdDuration::from_millis(1200)
+  );
+}
+
+#[test]
+fn metadata_request_timeout_keeps_static_submillisecond_precision() {
+  let store = Arc::new(CountingMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: Vec::new(),
+  });
+  let mut config = cache_config(Duration::seconds(1), StdDuration::from_millis(250));
+  config.limits.request_timeout = StdDuration::from_micros(800_500);
+  let loader = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
+  let cache = MetadataCache::new(store, config, Some(loader.snapshot_watch()));
+  assert_eq!(
+    cache.limits().request_timeout,
+    StdDuration::from_micros(800_500)
+  );
+}
+
+#[test]
+fn metadata_cache_limits_parse_only_after_flag_updates() {
+  let store = Arc::new(CountingMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: Vec::new(),
+  });
+  let reads = Arc::new(AtomicUsize::new(0));
+  let flags = |max_refills| {
+    Arc::new(CountingFeatureFlags {
+      flags: DefaultFeatureFlags::default()
+        .with_integer_flag(MAX_REFILLS_FEATURE_FLAG, max_refills),
+      reads: Arc::clone(&reads),
+    })
+  };
+  let loader = FakeLoader::new(flags(2));
+  let cache = MetadataCache::new(
+    store,
+    cache_config(Duration::seconds(1), StdDuration::ZERO),
+    Some(loader.snapshot_watch()),
+  );
+  assert_eq!(cache.limits().max_refills, 2);
+  let initial_reads = reads.load(Ordering::Relaxed);
+  assert!(initial_reads > 0);
+  assert_eq!(cache.limits().max_refills, 2);
+  assert_eq!(reads.load(Ordering::Relaxed), initial_reads);
+
+  loader.update(flags(3));
+  assert_eq!(cache.limits().max_refills, 3);
+  let updated_reads = reads.load(Ordering::Relaxed);
+  assert_eq!(updated_reads, initial_reads * 2);
+  assert_eq!(cache.limits().max_refills, 3);
+  assert_eq!(reads.load(Ordering::Relaxed), updated_reads);
 }
 
 fn segment() -> SegmentMetadata {
@@ -247,6 +483,7 @@ async fn returns_failure_branch_for_invalid_request() {
       segments: Vec::new(),
     }),
     cache_config(Duration::seconds(1), StdDuration::ZERO),
+    None,
   ));
 
   let response = cache.read(ReadMetadataWindowRequest::new()).await;
@@ -270,6 +507,7 @@ async fn coalesces_tail_requests_at_the_lowest_bound() {
   let cache = Arc::new(MetadataCache::new(
     store.clone(),
     cache_config(Duration::seconds(1), StdDuration::from_millis(20)),
+    None,
   ));
 
   let (lower, higher) = tokio::join!(
@@ -311,6 +549,7 @@ async fn records_coalescing_metrics_for_strong_queries() {
   let cache = MetadataCache::new_with_metrics(
     store.clone(),
     cache_config(Duration::seconds(1), StdDuration::from_millis(20)),
+    None,
     &shutdown_trigger.make_handle(),
     &collector.scope("blob_stream_broker_test"),
   );
@@ -360,6 +599,7 @@ async fn narrower_strong_request_after_refill_start_runs_a_follow_up_refill() {
   let cache = Arc::new(MetadataCache::new(
     store.clone(),
     cache_config(Duration::seconds(1), StdDuration::ZERO),
+    None,
   ));
 
   let first_cache = cache.clone();
@@ -425,8 +665,8 @@ async fn rejected_waiter_does_not_start_an_unowned_refill() {
     release_scan: Semaphore::new(0),
   });
   let mut config = cache_config(Duration::seconds(1), StdDuration::ZERO);
-  config.max_waiters = 1;
-  let cache = Arc::new(MetadataCache::new(store.clone(), config));
+  config.limits.max_waiters = 1;
+  let cache = Arc::new(MetadataCache::new(store.clone(), config, None));
 
   let first_cache = cache.clone();
   let first = tokio::spawn(async move {
@@ -502,7 +742,7 @@ async fn tail_response_filters_each_partition_at_its_requested_bound() {
   });
   let mut config = cache_config(Duration::seconds(1), StdDuration::ZERO);
   config.topics.get_mut("topic").unwrap().partition_count = 2;
-  let cache = Arc::new(MetadataCache::new(store, config));
+  let cache = Arc::new(MetadataCache::new(store, config, None));
 
   let response = cache
     .read(tail_request_with_bounds(
@@ -537,6 +777,7 @@ async fn does_not_retain_completed_strong_reads() {
   let cache = Arc::new(MetadataCache::new(
     store.clone(),
     cache_config(Duration::seconds(1), StdDuration::ZERO),
+    None,
   ));
 
   let first = cache
@@ -573,6 +814,7 @@ async fn reports_whether_eventual_response_used_retained_coverage() {
   let cache = Arc::new(MetadataCache::new(
     store,
     cache_config(Duration::seconds(1), StdDuration::ZERO),
+    None,
   ));
 
   let first = cache
@@ -608,6 +850,7 @@ async fn retains_full_recovery_in_its_separate_budget() {
   let cache = Arc::new(MetadataCache::new(
     store.clone(),
     cache_config(Duration::seconds(1), StdDuration::ZERO),
+    None,
   ));
 
   let first = cache.read(full_recovery_request()).await;
@@ -639,6 +882,7 @@ async fn recovery_cache_maintenance_evicts_invalidated_entries() {
       segments: vec![segment()],
     }),
     cache_config(Duration::seconds(1), StdDuration::ZERO),
+    None,
     &shutdown_trigger.make_handle(),
     &collector.scope("blob_stream_broker_test"),
   );
@@ -682,8 +926,8 @@ async fn rejects_response_item_limit_without_partial_success() {
     segments: vec![segment(), second_segment],
   });
   let mut config = cache_config(Duration::seconds(1), StdDuration::ZERO);
-  config.max_response_items = 1;
-  let cache = Arc::new(MetadataCache::new(store, config));
+  config.limits.max_response_items = 1;
+  let cache = Arc::new(MetadataCache::new(store, config, None));
 
   let response = cache
     .read(tail_request(
@@ -715,8 +959,8 @@ async fn rejects_oversized_cache_generation_without_retention() {
     segments: vec![segment(), second_segment],
   });
   let mut config = cache_config(Duration::seconds(1), StdDuration::ZERO);
-  config.max_entry_items = 1;
-  let cache = Arc::new(MetadataCache::new(store, config));
+  config.limits.max_entry_items = 1;
+  let cache = Arc::new(MetadataCache::new(store, config, None));
 
   let response = cache
     .read(tail_request(
@@ -739,6 +983,7 @@ async fn sanitizes_internal_storage_failures() {
   let cache = Arc::new(MetadataCache::new(
     Arc::new(FailingMetadataStore),
     cache_config(Duration::seconds(1), StdDuration::ZERO),
+    None,
   ));
 
   let response = cache
@@ -774,6 +1019,7 @@ async fn records_cache_hit_miss_refill_and_response_metrics() {
   let cache = MetadataCache::new_with_metrics(
     store,
     cache_config(Duration::seconds(1), StdDuration::ZERO),
+    None,
     &shutdown_trigger.make_handle(),
     &collector.scope("blob_stream_broker_test"),
   );
@@ -865,8 +1111,8 @@ async fn rejects_partition_limit_before_metadata_store_scan() {
   });
   let mut config = cache_config(Duration::seconds(1), StdDuration::ZERO);
   config.topics.get_mut("topic").unwrap().partition_count = 2;
-  config.max_request_partitions = 1;
-  let cache = Arc::new(MetadataCache::new(store.clone(), config));
+  config.limits.max_request_partitions = 1;
+  let cache = Arc::new(MetadataCache::new(store.clone(), config, None));
 
   let response = cache
     .read(tail_request_with_bounds(

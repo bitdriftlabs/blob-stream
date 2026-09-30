@@ -1930,6 +1930,8 @@ pub struct MetadataReadFailure {
     pub status: ::protobuf::EnumOrUnknown<MetadataReadFailureStatus>,
     // @@protoc_insertion_point(field:blobstream.v1.MetadataReadFailure.error_message)
     pub error_message: ::protobuf::Chars,
+    // @@protoc_insertion_point(field:blobstream.v1.MetadataReadFailure.overload_reason)
+    pub overload_reason: ::protobuf::EnumOrUnknown<MetadataReadOverloadReason>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.MetadataReadFailure.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -1947,7 +1949,7 @@ impl MetadataReadFailure {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut fields = ::std::vec::Vec::with_capacity(3);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "status",
@@ -1958,6 +1960,11 @@ impl MetadataReadFailure {
             "error_message",
             |m: &MetadataReadFailure| { &m.error_message },
             |m: &mut MetadataReadFailure| { &mut m.error_message },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "overload_reason",
+            |m: &MetadataReadFailure| { &m.overload_reason },
+            |m: &mut MetadataReadFailure| { &mut m.overload_reason },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MetadataReadFailure>(
             "MetadataReadFailure",
@@ -1983,6 +1990,9 @@ impl ::protobuf::Message for MetadataReadFailure {
                 18 => {
                     self.error_message = is.read_tokio_chars()?;
                 },
+                24 => {
+                    self.overload_reason = is.read_enum_or_unknown()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -2001,6 +2011,9 @@ impl ::protobuf::Message for MetadataReadFailure {
         if !self.error_message.is_empty() {
             my_size += ::protobuf::rt::string_size(2, &self.error_message);
         }
+        if self.overload_reason != ::protobuf::EnumOrUnknown::new(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_UNSPECIFIED) {
+            my_size += ::protobuf::rt::int32_size(3, self.overload_reason.value());
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -2012,6 +2025,9 @@ impl ::protobuf::Message for MetadataReadFailure {
         }
         if !self.error_message.is_empty() {
             os.write_string(2, &self.error_message)?;
+        }
+        if self.overload_reason != ::protobuf::EnumOrUnknown::new(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_UNSPECIFIED) {
+            os.write_enum(3, ::protobuf::EnumOrUnknown::value(&self.overload_reason))?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -2032,6 +2048,7 @@ impl ::protobuf::Message for MetadataReadFailure {
     fn clear(&mut self) {
         self.status = ::protobuf::EnumOrUnknown::new(MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_BAD_REQUEST);
         self.error_message.clear();
+        self.overload_reason = ::protobuf::EnumOrUnknown::new(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_UNSPECIFIED);
         self.special_fields.clear();
     }
 
@@ -2039,6 +2056,7 @@ impl ::protobuf::Message for MetadataReadFailure {
         static instance: MetadataReadFailure = MetadataReadFailure {
             status: ::protobuf::EnumOrUnknown::from_i32(0),
             error_message: ::protobuf::Chars::new(),
+            overload_reason: ::protobuf::EnumOrUnknown::from_i32(0),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -3491,6 +3509,108 @@ impl MetadataReadFailureStatus {
 }
 
 #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
+// @@protoc_insertion_point(enum:blobstream.v1.MetadataReadOverloadReason)
+pub enum MetadataReadOverloadReason {
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadOverloadReason.METADATA_READ_OVERLOAD_REASON_UNSPECIFIED)
+    METADATA_READ_OVERLOAD_REASON_UNSPECIFIED = 0,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadOverloadReason.METADATA_READ_OVERLOAD_REASON_REQUEST_PARTITIONS)
+    METADATA_READ_OVERLOAD_REASON_REQUEST_PARTITIONS = 1,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadOverloadReason.METADATA_READ_OVERLOAD_REASON_REQUEST_TIMEOUT)
+    METADATA_READ_OVERLOAD_REASON_REQUEST_TIMEOUT = 2,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadOverloadReason.METADATA_READ_OVERLOAD_REASON_GLOBAL_WAITERS)
+    METADATA_READ_OVERLOAD_REASON_GLOBAL_WAITERS = 3,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadOverloadReason.METADATA_READ_OVERLOAD_REASON_PER_KEY_WAITERS)
+    METADATA_READ_OVERLOAD_REASON_PER_KEY_WAITERS = 4,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadOverloadReason.METADATA_READ_OVERLOAD_REASON_REFILL_CONCURRENCY)
+    METADATA_READ_OVERLOAD_REASON_REFILL_CONCURRENCY = 5,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadOverloadReason.METADATA_READ_OVERLOAD_REASON_ENTRY_ITEMS)
+    METADATA_READ_OVERLOAD_REASON_ENTRY_ITEMS = 6,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadOverloadReason.METADATA_READ_OVERLOAD_REASON_RESPONSE_ITEMS)
+    METADATA_READ_OVERLOAD_REASON_RESPONSE_ITEMS = 7,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadOverloadReason.METADATA_READ_OVERLOAD_REASON_RESPONSE_BYTES)
+    METADATA_READ_OVERLOAD_REASON_RESPONSE_BYTES = 8,
+    // @@protoc_insertion_point(enum_value:blobstream.v1.MetadataReadOverloadReason.METADATA_READ_OVERLOAD_REASON_STORAGE_THROTTLED)
+    METADATA_READ_OVERLOAD_REASON_STORAGE_THROTTLED = 9,
+}
+
+impl ::protobuf::Enum for MetadataReadOverloadReason {
+    const NAME: &'static str = "MetadataReadOverloadReason";
+
+    fn value(&self) -> i32 {
+        *self as i32
+    }
+
+    fn from_i32(value: i32) -> ::std::option::Option<MetadataReadOverloadReason> {
+        match value {
+            0 => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_UNSPECIFIED),
+            1 => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REQUEST_PARTITIONS),
+            2 => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REQUEST_TIMEOUT),
+            3 => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_GLOBAL_WAITERS),
+            4 => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_PER_KEY_WAITERS),
+            5 => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REFILL_CONCURRENCY),
+            6 => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_ENTRY_ITEMS),
+            7 => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_RESPONSE_ITEMS),
+            8 => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_RESPONSE_BYTES),
+            9 => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_STORAGE_THROTTLED),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    fn from_str(str: &str) -> ::std::option::Option<MetadataReadOverloadReason> {
+        match str {
+            "METADATA_READ_OVERLOAD_REASON_UNSPECIFIED" => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_UNSPECIFIED),
+            "METADATA_READ_OVERLOAD_REASON_REQUEST_PARTITIONS" => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REQUEST_PARTITIONS),
+            "METADATA_READ_OVERLOAD_REASON_REQUEST_TIMEOUT" => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REQUEST_TIMEOUT),
+            "METADATA_READ_OVERLOAD_REASON_GLOBAL_WAITERS" => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_GLOBAL_WAITERS),
+            "METADATA_READ_OVERLOAD_REASON_PER_KEY_WAITERS" => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_PER_KEY_WAITERS),
+            "METADATA_READ_OVERLOAD_REASON_REFILL_CONCURRENCY" => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REFILL_CONCURRENCY),
+            "METADATA_READ_OVERLOAD_REASON_ENTRY_ITEMS" => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_ENTRY_ITEMS),
+            "METADATA_READ_OVERLOAD_REASON_RESPONSE_ITEMS" => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_RESPONSE_ITEMS),
+            "METADATA_READ_OVERLOAD_REASON_RESPONSE_BYTES" => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_RESPONSE_BYTES),
+            "METADATA_READ_OVERLOAD_REASON_STORAGE_THROTTLED" => ::std::option::Option::Some(MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_STORAGE_THROTTLED),
+            _ => ::std::option::Option::None
+        }
+    }
+
+    const VALUES: &'static [MetadataReadOverloadReason] = &[
+        MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_UNSPECIFIED,
+        MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REQUEST_PARTITIONS,
+        MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REQUEST_TIMEOUT,
+        MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_GLOBAL_WAITERS,
+        MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_PER_KEY_WAITERS,
+        MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REFILL_CONCURRENCY,
+        MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_ENTRY_ITEMS,
+        MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_RESPONSE_ITEMS,
+        MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_RESPONSE_BYTES,
+        MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_STORAGE_THROTTLED,
+    ];
+}
+
+impl ::protobuf::EnumFull for MetadataReadOverloadReason {
+    fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().enum_by_package_relative_name("MetadataReadOverloadReason").unwrap()).clone()
+    }
+
+    fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
+        let index = *self as usize;
+        Self::enum_descriptor().value_by_index(index)
+    }
+}
+
+impl ::std::default::Default for MetadataReadOverloadReason {
+    fn default() -> Self {
+        MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_UNSPECIFIED
+    }
+}
+
+impl MetadataReadOverloadReason {
+    fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
+        ::protobuf::reflect::GeneratedEnumDescriptorData::new::<MetadataReadOverloadReason>("MetadataReadOverloadReason")
+    }
+}
+
+#[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
 // @@protoc_insertion_point(enum:blobstream.v1.BlobReadFailureStatus)
 pub enum BlobReadFailureStatus {
     // @@protoc_insertion_point(enum_value:blobstream.v1.BlobReadFailureStatus.BLOB_READ_FAILURE_STATUS_BAD_REQUEST)
@@ -3604,43 +3724,53 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x12\x1e\n\ngeneration\x18\x03\x20\x01(\x04R\ngeneration\x12+\n\x11retai\
     ned_coverage\x18\x04\x20\x01(\x08R\x10retainedCoverage\x12@\n\x08segment\
     s\x18\x05\x20\x03(\x0b2$.blobstream.v1.BrokerSegmentMetadataR\x08segment\
-    sB\x0f\n\r_refill_floor\"|\n\x13MetadataReadFailure\x12@\n\x06status\x18\
-    \x01\x20\x01(\x0e2(.blobstream.v1.MetadataReadFailureStatusR\x06status\
-    \x12#\n\rerror_message\x18\x02\x20\x01(\tR\x0cerrorMessage\"\xa6\x01\n\
-    \x1aReadMetadataWindowResponse\x12>\n\x07success\x18\x01\x20\x01(\x0b2\"\
-    .blobstream.v1.MetadataReadSuccessH\0R\x07success\x12>\n\x07failure\x18\
-    \x02\x20\x01(\x0b2\".blobstream.v1.MetadataReadFailureH\0R\x07failureB\
-    \x08\n\x06result\":\n\x10BlobRangeRequest\x12\x14\n\x05start\x18\x01\x20\
-    \x01(\x04R\x05start\x12\x10\n\x03end\x18\x02\x20\x01(\x04R\x03end\"+\n\
-    \x0fBlobRangeResult\x12\x18\n\x07payload\x18\x01\x20\x01(\x0cR\x07payloa\
-    d\"k\n\x15ReadBlobRangesRequest\x12\x19\n\x08blob_key\x18\x01\x20\x01(\t\
-    R\x07blobKey\x127\n\x06ranges\x18\x02\x20\x03(\x0b2\x1f.blobstream.v1.Bl\
-    obRangeRequestR\x06ranges\"I\n\x0fBlobReadSuccess\x126\n\x06ranges\x18\
-    \x01\x20\x03(\x0b2\x1e.blobstream.v1.BlobRangeResultR\x06ranges\"t\n\x0f\
-    BlobReadFailure\x12<\n\x06status\x18\x01\x20\x01(\x0e2$.blobstream.v1.Bl\
-    obReadFailureStatusR\x06status\x12#\n\rerror_message\x18\x02\x20\x01(\tR\
-    \x0cerrorMessage\"\x9a\x01\n\x16ReadBlobRangesResponse\x12:\n\x07success\
-    \x18\x01\x20\x01(\x0b2\x1e.blobstream.v1.BlobReadSuccessH\0R\x07success\
-    \x12:\n\x07failure\x18\x02\x20\x01(\x0b2\x1e.blobstream.v1.BlobReadFailu\
-    reH\0R\x07failureB\x08\n\x06result*\xac\x01\n\rProduceStatus\x12\x15\n\
-    \x11PRODUCE_STATUS_OK\x10\0\x12#\n\x1fPRODUCE_STATUS_NOT_LEASE_HOLDER\
-    \x10\x01\x12\x20\n\x1cPRODUCE_STATUS_UNKNOWN_TOPIC\x10\x02\x12\x1d\n\x19\
-    PRODUCE_STATUS_OVERLOADED\x10\x03\x12\x1e\n\x1aPRODUCE_STATUS_BAD_REQUES\
-    T\x10\x04*g\n\x17MetadataReadConsistency\x12&\n\"METADATA_READ_CONSISTEN\
-    CY_EVENTUAL\x10\0\x12$\n\x20METADATA_READ_CONSISTENCY_STRONG\x10\x01*\
-    \x9f\x01\n\x19MetadataReadFailureStatus\x12,\n(METADATA_READ_FAILURE_STA\
-    TUS_BAD_REQUEST\x10\0\x12+\n'METADATA_READ_FAILURE_STATUS_OVERLOADED\x10\
-    \x01\x12'\n#METADATA_READ_FAILURE_STATUS_FAILED\x10\x02*\xe0\x01\n\x15Bl\
-    obReadFailureStatus\x12(\n$BLOB_READ_FAILURE_STATUS_BAD_REQUEST\x10\0\
-    \x12'\n#BLOB_READ_FAILURE_STATUS_OVERLOADED\x10\x01\x12&\n\"BLOB_READ_FA\
-    ILURE_STATUS_TOO_LARGE\x10\x02\x12$\n\x20BLOB_READ_FAILURE_STATUS_STORAG\
-    E\x10\x03\x12&\n\"BLOB_READ_FAILURE_STATUS_NOT_FOUND\x10\x042\xb8\x02\n\
-    \rBrokerService\x12]\n\x0eProduceBatches\x12$.blobstream.v1.ProduceBatch\
-    esRequest\x1a%.blobstream.v1.ProduceBatchesResponse\x12i\n\x12ReadMetada\
-    taWindow\x12(.blobstream.v1.ReadMetadataWindowRequest\x1a).blobstream.v1\
-    .ReadMetadataWindowResponse\x12]\n\x0eReadBlobRanges\x12$.blobstream.v1.\
-    ReadBlobRangesRequest\x1a%.blobstream.v1.ReadBlobRangesResponseb\x06prot\
-    o3\
+    sB\x0f\n\r_refill_floor\"\xd0\x01\n\x13MetadataReadFailure\x12@\n\x06sta\
+    tus\x18\x01\x20\x01(\x0e2(.blobstream.v1.MetadataReadFailureStatusR\x06s\
+    tatus\x12#\n\rerror_message\x18\x02\x20\x01(\tR\x0cerrorMessage\x12R\n\
+    \x0foverload_reason\x18\x03\x20\x01(\x0e2).blobstream.v1.MetadataReadOve\
+    rloadReasonR\x0eoverloadReason\"\xa6\x01\n\x1aReadMetadataWindowResponse\
+    \x12>\n\x07success\x18\x01\x20\x01(\x0b2\".blobstream.v1.MetadataReadSuc\
+    cessH\0R\x07success\x12>\n\x07failure\x18\x02\x20\x01(\x0b2\".blobstream\
+    .v1.MetadataReadFailureH\0R\x07failureB\x08\n\x06result\":\n\x10BlobRang\
+    eRequest\x12\x14\n\x05start\x18\x01\x20\x01(\x04R\x05start\x12\x10\n\x03\
+    end\x18\x02\x20\x01(\x04R\x03end\"+\n\x0fBlobRangeResult\x12\x18\n\x07pa\
+    yload\x18\x01\x20\x01(\x0cR\x07payload\"k\n\x15ReadBlobRangesRequest\x12\
+    \x19\n\x08blob_key\x18\x01\x20\x01(\tR\x07blobKey\x127\n\x06ranges\x18\
+    \x02\x20\x03(\x0b2\x1f.blobstream.v1.BlobRangeRequestR\x06ranges\"I\n\
+    \x0fBlobReadSuccess\x126\n\x06ranges\x18\x01\x20\x03(\x0b2\x1e.blobstrea\
+    m.v1.BlobRangeResultR\x06ranges\"t\n\x0fBlobReadFailure\x12<\n\x06status\
+    \x18\x01\x20\x01(\x0e2$.blobstream.v1.BlobReadFailureStatusR\x06status\
+    \x12#\n\rerror_message\x18\x02\x20\x01(\tR\x0cerrorMessage\"\x9a\x01\n\
+    \x16ReadBlobRangesResponse\x12:\n\x07success\x18\x01\x20\x01(\x0b2\x1e.b\
+    lobstream.v1.BlobReadSuccessH\0R\x07success\x12:\n\x07failure\x18\x02\
+    \x20\x01(\x0b2\x1e.blobstream.v1.BlobReadFailureH\0R\x07failureB\x08\n\
+    \x06result*\xac\x01\n\rProduceStatus\x12\x15\n\x11PRODUCE_STATUS_OK\x10\
+    \0\x12#\n\x1fPRODUCE_STATUS_NOT_LEASE_HOLDER\x10\x01\x12\x20\n\x1cPRODUC\
+    E_STATUS_UNKNOWN_TOPIC\x10\x02\x12\x1d\n\x19PRODUCE_STATUS_OVERLOADED\
+    \x10\x03\x12\x1e\n\x1aPRODUCE_STATUS_BAD_REQUEST\x10\x04*g\n\x17Metadata\
+    ReadConsistency\x12&\n\"METADATA_READ_CONSISTENCY_EVENTUAL\x10\0\x12$\n\
+    \x20METADATA_READ_CONSISTENCY_STRONG\x10\x01*\x9f\x01\n\x19MetadataReadF\
+    ailureStatus\x12,\n(METADATA_READ_FAILURE_STATUS_BAD_REQUEST\x10\0\x12+\
+    \n'METADATA_READ_FAILURE_STATUS_OVERLOADED\x10\x01\x12'\n#METADATA_READ_\
+    FAILURE_STATUS_FAILED\x10\x02*\x97\x04\n\x1aMetadataReadOverloadReason\
+    \x12-\n)METADATA_READ_OVERLOAD_REASON_UNSPECIFIED\x10\0\x124\n0METADATA_\
+    READ_OVERLOAD_REASON_REQUEST_PARTITIONS\x10\x01\x121\n-METADATA_READ_OVE\
+    RLOAD_REASON_REQUEST_TIMEOUT\x10\x02\x120\n,METADATA_READ_OVERLOAD_REASO\
+    N_GLOBAL_WAITERS\x10\x03\x121\n-METADATA_READ_OVERLOAD_REASON_PER_KEY_WA\
+    ITERS\x10\x04\x124\n0METADATA_READ_OVERLOAD_REASON_REFILL_CONCURRENCY\
+    \x10\x05\x12-\n)METADATA_READ_OVERLOAD_REASON_ENTRY_ITEMS\x10\x06\x120\n\
+    ,METADATA_READ_OVERLOAD_REASON_RESPONSE_ITEMS\x10\x07\x120\n,METADATA_RE\
+    AD_OVERLOAD_REASON_RESPONSE_BYTES\x10\x08\x123\n/METADATA_READ_OVERLOAD_\
+    REASON_STORAGE_THROTTLED\x10\t*\xe0\x01\n\x15BlobReadFailureStatus\x12(\
+    \n$BLOB_READ_FAILURE_STATUS_BAD_REQUEST\x10\0\x12'\n#BLOB_READ_FAILURE_S\
+    TATUS_OVERLOADED\x10\x01\x12&\n\"BLOB_READ_FAILURE_STATUS_TOO_LARGE\x10\
+    \x02\x12$\n\x20BLOB_READ_FAILURE_STATUS_STORAGE\x10\x03\x12&\n\"BLOB_REA\
+    D_FAILURE_STATUS_NOT_FOUND\x10\x042\xb8\x02\n\rBrokerService\x12]\n\x0eP\
+    roduceBatches\x12$.blobstream.v1.ProduceBatchesRequest\x1a%.blobstream.v\
+    1.ProduceBatchesResponse\x12i\n\x12ReadMetadataWindow\x12(.blobstream.v1\
+    .ReadMetadataWindowRequest\x1a).blobstream.v1.ReadMetadataWindowResponse\
+    \x12]\n\x0eReadBlobRanges\x12$.blobstream.v1.ReadBlobRangesRequest\x1a%.\
+    blobstream.v1.ReadBlobRangesResponseb\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -3680,10 +3810,11 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
             messages.push(BlobReadSuccess::generated_message_descriptor_data());
             messages.push(BlobReadFailure::generated_message_descriptor_data());
             messages.push(ReadBlobRangesResponse::generated_message_descriptor_data());
-            let mut enums = ::std::vec::Vec::with_capacity(4);
+            let mut enums = ::std::vec::Vec::with_capacity(5);
             enums.push(ProduceStatus::generated_enum_descriptor_data());
             enums.push(MetadataReadConsistency::generated_enum_descriptor_data());
             enums.push(MetadataReadFailureStatus::generated_enum_descriptor_data());
+            enums.push(MetadataReadOverloadReason::generated_enum_descriptor_data());
             enums.push(BlobReadFailureStatus::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),

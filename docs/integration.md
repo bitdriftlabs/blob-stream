@@ -130,8 +130,9 @@ perform the final commit and release membership and leases during controlled ter
 | `topic` | The shared partition and durable metadata-window contract used to derive the complete virtual partition space. |
 | `blob_store` and `metadata_store` | S3/DynamoDB production stores or in-memory local/test stores. |
 
-Feature flags are optional at construction time. Prefetch capacity and batch-read concurrency update
-live. Metadata consistency, idle polling, lease duration, heartbeat interval, and rebalance interval
+Feature flags are optional at construction time. Prefetch capacity, batch-read concurrency, and the
+default-true broker metadata direct-fallback switch update live between scan passes. Metadata
+consistency, idle polling, lease duration, heartbeat interval, and rebalance interval
 are sampled at construction and require rebuilding the iterator to adopt a new value. See
 [Infrastructure setup](infrastructure.md) and [Operations](operations.md) for deployment and
 consistency effects.

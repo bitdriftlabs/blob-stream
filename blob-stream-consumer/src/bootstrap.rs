@@ -60,6 +60,7 @@ use blob_stream_types::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use time::Duration;
 
 const DEFAULT_MEMBERSHIP_TTL_BUFFER: Duration = Duration::hours(1);
@@ -284,6 +285,7 @@ impl ConsumerIteratorImpl {
       &config.metadata_store,
       retention,
       dynamo_capacity_metrics,
+      feature_flags.clone(),
     )
     .await?;
 
@@ -299,9 +301,18 @@ impl ConsumerIteratorImpl {
     );
     let broker_client_pool =
       Arc::new(BrokerClientPool::from_config(&config.broker_discovery).await?);
-    let broker_metadata_query = Arc::new(GrpcBrokerMetadataQuery::from_client_pool(Arc::clone(
-      &broker_client_pool,
-    )));
+    let broker_rpc_timeout = config
+      .runtime
+      .read
+      .as_ref()
+      .and_then(|read| read.broker_metadata_rpc_timeout.as_ref())
+      .map_or(Duration::seconds(7), ProtoDurationExt::to_time_duration);
+    let broker_rpc_timeout = StdDuration::try_from(broker_rpc_timeout)
+      .map_err(|_| anyhow!("broker metadata RPC timeout exceeds supported range"))?;
+    let broker_metadata_query = Arc::new(
+      GrpcBrokerMetadataQuery::from_client_pool(Arc::clone(&broker_client_pool))
+        .with_request_timeout(broker_rpc_timeout, feature_flags.clone()),
+    );
     let broker_blob_range_query = Arc::new(GrpcBrokerBlobRangeQuery::from_client_pool(
       broker_client_pool,
     ));
@@ -387,6 +398,7 @@ async fn build_metadata_and_coordination_stores(
   config: &MetadataStoreConfig,
   retention: Duration,
   capacity_metrics: DynamoCapacityMetrics,
+  feature_flags: Option<FeatureFlagsWatch>,
 ) -> Result<(
   Arc<dyn MetadataStore>,
   Arc<dyn ConsumerGroupLeaseStore>,
@@ -410,14 +422,17 @@ async fn build_metadata_and_coordination_stores(
 
     let client = build_dynamo_client(dynamo.region.as_str(), dynamo.endpoint.as_str()).await;
 
-    let metadata_store: Arc<dyn MetadataStore> = Arc::new(DynamoMetadataStore::new(
-      client.clone(),
-      metadata_table,
-      producer_partition_lease_table,
-      HashMap::new(),
-      DEFAULT_MEMBERSHIP_TTL_BUFFER,
-      Some(capacity_metrics.clone()),
-    ));
+    let metadata_store: Arc<dyn MetadataStore> = Arc::new(
+      DynamoMetadataStore::new(
+        client.clone(),
+        metadata_table,
+        producer_partition_lease_table,
+        HashMap::new(),
+        DEFAULT_MEMBERSHIP_TTL_BUFFER,
+        Some(capacity_metrics.clone()),
+      )
+      .with_feature_flags(feature_flags),
+    );
     let membership_ttl_buffer = dynamo.lease_ttl_buffer.as_ref().map_or(
       DEFAULT_MEMBERSHIP_TTL_BUFFER,
       ProtoDurationExt::to_time_duration,

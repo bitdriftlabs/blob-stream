@@ -1,6 +1,8 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
+use bd_runtime_config::loader::Loader;
+use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_blob_store::BlobKey;
 use blob_stream_metadata_store::{SegmentMetadata, encode_segment_metadata_v1};
 use blob_stream_proto::protos::blobstream::v1::broker::{
@@ -8,6 +10,9 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   FullRecoveryMetadataCoverage,
   MetadataPartitionBound,
   MetadataReadConsistency,
+  MetadataReadFailure,
+  MetadataReadFailureStatus,
+  MetadataReadOverloadReason,
   MetadataReadSuccess,
   ReadMetadataWindowRequest,
   ReadMetadataWindowResponse,
@@ -18,6 +23,38 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 use blob_stream_types::{BatchMetadata, ByteRange, Compression, SeqRange, TopicWindowKey};
 use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
+
+#[test]
+fn broker_metadata_rpc_timeout_tracks_live_flags() {
+  let configured = std::time::Duration::from_secs(7);
+  let loader = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(REQUEST_TIMEOUT_FLAG, 8_000),
+  ));
+  let watched = Mutex::new(WatchedFeatureFlags::new(
+    Some(loader.snapshot_watch()),
+    Arc::new(configured),
+  ));
+  assert_eq!(current_metadata_rpc_timeout(&watched).as_secs(), 8);
+
+  loader.update(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(REQUEST_TIMEOUT_FLAG, 9_000),
+  ));
+  assert_eq!(current_metadata_rpc_timeout(&watched).as_secs(), 9);
+
+  loader.update(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(REQUEST_TIMEOUT_FLAG, 0),
+  ));
+  assert_eq!(current_metadata_rpc_timeout(&watched).as_secs(), 9);
+
+  let precise = std::time::Duration::from_micros(7_000_500);
+  loader.update(Arc::new(DefaultFeatureFlags::default()));
+  assert_eq!(current_metadata_rpc_timeout(&watched), configured);
+  let precise_default = Mutex::new(WatchedFeatureFlags::new(
+    Some(loader.snapshot_watch()),
+    Arc::new(precise),
+  ));
+  assert_eq!(current_metadata_rpc_timeout(&precise_default), precise);
+}
 
 fn tail_request() -> ReadMetadataWindowRequest {
   ReadMetadataWindowRequest {
@@ -50,6 +87,37 @@ fn full_recovery_request() -> ReadMetadataWindowRequest {
       },
     )),
     ..Default::default()
+  }
+}
+
+#[test]
+fn only_typed_storage_throttling_skips_broker_fallback() {
+  for reason in [
+    MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_STORAGE_THROTTLED,
+    MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_UNSPECIFIED,
+  ] {
+    let response = ReadMetadataWindowResponse {
+      result: Some(read_metadata_window_response::Result::Failure(
+        MetadataReadFailure {
+          status: MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_OVERLOADED.into(),
+          overload_reason: reason.into(),
+          error_message: "broker unavailable".into(),
+          ..Default::default()
+        },
+      )),
+      ..Default::default()
+    };
+    let error = decode_metadata_response(
+      &tail_request(),
+      response,
+      OffsetDateTime::UNIX_EPOCH,
+      Duration::seconds(1),
+    )
+    .unwrap_err();
+    assert_eq!(
+      error.is::<BrokerMetadataThrottled>(),
+      reason == MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_STORAGE_THROTTLED
+    );
   }
 }
 

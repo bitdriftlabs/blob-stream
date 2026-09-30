@@ -90,6 +90,21 @@ enum MetadataReadFailureStatus {
   METADATA_READ_FAILURE_STATUS_FAILED = 2;
 }
 
+// Why the broker could not serve an overloaded metadata request.
+enum MetadataReadOverloadReason {
+  METADATA_READ_OVERLOAD_REASON_UNSPECIFIED = 0;
+  METADATA_READ_OVERLOAD_REASON_REQUEST_PARTITIONS = 1;
+  METADATA_READ_OVERLOAD_REASON_REQUEST_TIMEOUT = 2;
+  METADATA_READ_OVERLOAD_REASON_GLOBAL_WAITERS = 3;
+  METADATA_READ_OVERLOAD_REASON_PER_KEY_WAITERS = 4;
+  METADATA_READ_OVERLOAD_REASON_REFILL_CONCURRENCY = 5;
+  METADATA_READ_OVERLOAD_REASON_ENTRY_ITEMS = 6;
+  METADATA_READ_OVERLOAD_REASON_RESPONSE_ITEMS = 7;
+  METADATA_READ_OVERLOAD_REASON_RESPONSE_BYTES = 8;
+  // The shared DynamoDB metadata Query retry budget was exhausted by throttling.
+  METADATA_READ_OVERLOAD_REASON_STORAGE_THROTTLED = 9;
+}
+
 // One virtual partition's inclusive lower Snowflake bound for a live-tail request.
 message MetadataPartitionBound {
   // Virtual partition whose metadata must be included in the response.
@@ -156,6 +171,8 @@ message MetadataReadFailure {
   MetadataReadFailureStatus status = 1;
   // Diagnostic detail. It is not stable for programmatic matching.
   string error_message = 2;
+  // Set only for OVERLOADED; unknown and unspecified reasons retain legacy fallback behavior.
+  MetadataReadOverloadReason overload_reason = 3;
 }
 
 // Broker metadata cache response for one bounded request.

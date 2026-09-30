@@ -3893,6 +3893,8 @@ pub struct ConsumerReadConfig {
     pub max_in_flight_batch_reads: ::std::option::Option<u64>,
     // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.max_clock_skew)
     pub max_clock_skew: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
+    // @@protoc_insertion_point(field:blobstream.v1.ConsumerReadConfig.broker_metadata_rpc_timeout)
+    pub broker_metadata_rpc_timeout: ::protobuf::MessageField<::protobuf::well_known_types::duration::Duration>,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.ConsumerReadConfig.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -3910,7 +3912,7 @@ impl ConsumerReadConfig {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(7);
+        let mut fields = ::std::vec::Vec::with_capacity(8);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "topic",
@@ -3946,6 +3948,11 @@ impl ConsumerReadConfig {
             "max_clock_skew",
             |m: &ConsumerReadConfig| { &m.max_clock_skew },
             |m: &mut ConsumerReadConfig| { &mut m.max_clock_skew },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, ::protobuf::well_known_types::duration::Duration>(
+            "broker_metadata_rpc_timeout",
+            |m: &ConsumerReadConfig| { &m.broker_metadata_rpc_timeout },
+            |m: &mut ConsumerReadConfig| { &mut m.broker_metadata_rpc_timeout },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ConsumerReadConfig>(
             "ConsumerReadConfig",
@@ -3986,6 +3993,9 @@ impl ::protobuf::Message for ConsumerReadConfig {
                 98 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.max_clock_skew)?;
                 },
+                106 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.broker_metadata_rpc_timeout)?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -4023,6 +4033,10 @@ impl ::protobuf::Message for ConsumerReadConfig {
             let len = v.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
+        if let Some(v) = self.broker_metadata_rpc_timeout.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -4050,6 +4064,9 @@ impl ::protobuf::Message for ConsumerReadConfig {
         if let Some(v) = self.max_clock_skew.as_ref() {
             ::protobuf::rt::write_message_field_with_cached_size(12, v, os)?;
         }
+        if let Some(v) = self.broker_metadata_rpc_timeout.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(13, v, os)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -4074,6 +4091,7 @@ impl ::protobuf::Message for ConsumerReadConfig {
         self.eventual_metadata_reads.clear();
         self.max_in_flight_batch_reads = ::std::option::Option::None;
         self.max_clock_skew.clear();
+        self.broker_metadata_rpc_timeout.clear();
         self.special_fields.clear();
     }
 
@@ -4086,6 +4104,7 @@ impl ::protobuf::Message for ConsumerReadConfig {
             eventual_metadata_reads: ::protobuf::MessageField::none(),
             max_in_flight_batch_reads: ::std::option::Option::None,
             max_clock_skew: ::protobuf::MessageField::none(),
+            broker_metadata_rpc_timeout: ::protobuf::MessageField::none(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -4951,7 +4970,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     2\x1a.blobstream.v1.TopicConfigR\x06topicsB\x08\xfaB\x05\x92\x01\x02\x08\
     \x01\"m\n\x1bEventualMetadataReadsConfig\x12N\n\x10visibility_delay\x18\
     \x01\x20\x01(\x0b2\x19.google.protobuf.DurationR\x0fvisibilityDelayB\x08\
-    \xfaB\x05\xaa\x01\x022\0\"\xdd\x04\n\x12ConsumerReadConfig\x12\x1d\n\x05\
+    \xfaB\x05\xaa\x01\x022\0\"\xc1\x05\n\x12ConsumerReadConfig\x12\x1d\n\x05\
     topic\x18\x01\x20\x01(\tR\x05topicB\x07\xfaB\x04r\x02\x10\x01\x12K\n\x0f\
     idle_poll_delay\x18\x04\x20\x01(\x0b2\x19.google.protobuf.DurationR\ridl\
     ePollDelayB\x08\xfaB\x05\xaa\x01\x02*\0\x12R\n\x13max_idle_poll_delay\
@@ -4963,8 +4982,10 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     F\n\x19max_in_flight_batch_reads\x18\n\x20\x01(\x04H\x02R\x15maxInFlight\
     BatchReadsB\x07\xfaB\x042\x02\x20\0\x88\x01\x01\x12I\n\x0emax_clock_skew\
     \x18\x0c\x20\x01(\x0b2\x19.google.protobuf.DurationR\x0cmaxClockSkewB\
-    \x08\xfaB\x05\xaa\x01\x02*\0B\x15\n\x13_prefetch_max_bytesB\x1a\n\x18_ev\
-    entual_metadata_readsB\x1c\n\x1a_max_in_flight_batch_reads\"\xde\x03\n\
+    \x08\xfaB\x05\xaa\x01\x02*\0\x12b\n\x1bbroker_metadata_rpc_timeout\x18\r\
+    \x20\x01(\x0b2\x19.google.protobuf.DurationR\x18brokerMetadataRpcTimeout\
+    B\x08\xfaB\x05\xaa\x01\x02*\0B\x15\n\x13_prefetch_max_bytesB\x1a\n\x18_e\
+    ventual_metadata_readsB\x1c\n\x1a_max_in_flight_batch_reads\"\xde\x03\n\
     \x13ConsumerGroupConfig\x12\x1d\n\x05topic\x18\x01\x20\x01(\tR\x05topicB\
     \x07\xfaB\x04r\x02\x10\x01\x12\"\n\x08group_id\x18\x02\x20\x01(\tR\x07gr\
     oupIdB\x07\xfaB\x04r\x02\x10\x01\x12$\n\tmember_id\x18\x03\x20\x01(\tR\

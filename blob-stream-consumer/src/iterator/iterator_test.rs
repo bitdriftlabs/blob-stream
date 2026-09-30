@@ -70,11 +70,15 @@ use blob_stream_metadata_store::{
   SegmentMetadata,
 };
 use blob_stream_proto::protos::blobstream::v1::broker::{
+  MetadataReadFailure,
+  MetadataReadFailureStatus,
+  MetadataReadOverloadReason,
   ReadBlobRangesRequest,
   ReadBlobRangesResponse,
   ReadMetadataWindowRequest,
   ReadMetadataWindowResponse,
   StoredRecordBatch,
+  read_metadata_window_response,
 };
 use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::{
@@ -97,7 +101,7 @@ use blob_stream_types::{
 use bytes::Bytes;
 use parking_lot::Mutex;
 use protobuf::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -109,6 +113,33 @@ use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep, timeout};
 
 struct RejectingBrokerMetadataQuery;
+
+struct ThrottledBrokerMetadataQuery {
+  requests: AtomicUsize,
+  windows: Mutex<Vec<i64>>,
+}
+
+#[async_trait::async_trait]
+impl BrokerMetadataQuery for ThrottledBrokerMetadataQuery {
+  async fn read_metadata_window(
+    &self,
+    request: ReadMetadataWindowRequest,
+  ) -> anyhow::Result<ReadMetadataWindowResponse> {
+    self.windows.lock().push(request.window_start_unix_seconds);
+    self.requests.fetch_add(1, Ordering::SeqCst);
+    Ok(ReadMetadataWindowResponse {
+      result: Some(read_metadata_window_response::Result::Failure(
+        MetadataReadFailure {
+          status: MetadataReadFailureStatus::METADATA_READ_FAILURE_STATUS_OVERLOADED.into(),
+          overload_reason:
+            MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_STORAGE_THROTTLED.into(),
+          ..Default::default()
+        },
+      )),
+      ..Default::default()
+    })
+  }
+}
 
 #[async_trait::async_trait]
 impl BrokerMetadataQuery for RejectingBrokerMetadataQuery {
@@ -3012,13 +3043,14 @@ async fn seek_interrupts_prefetch_read_retries_without_clock_advance() {
 
   iterator.start().unwrap();
   timeout(Duration::from_secs(1), async {
-    while blob_store.failed_reads.load(Ordering::SeqCst) < 2 {
+    while blob_store.failed_reads.load(Ordering::SeqCst) == 0 {
       tokio::task::yield_now().await;
     }
   })
   .await
-  .expect("prefetch worker did not retry the injected read failure");
+  .expect("prefetch worker did not encounter the injected read failure");
   time_provider.wait_until_sleeping(2).await;
+  assert_eq!(blob_store.failed_reads.load(Ordering::SeqCst), 1);
 
   timeout(
     Duration::from_secs(1),
@@ -3033,6 +3065,84 @@ async fn seek_interrupts_prefetch_read_retries_without_clock_advance() {
   )
   .await
   .expect("seek did not interrupt the prefetch retry backoff")
+  .unwrap();
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn broker_metadata_throttle_delays_prefetch_retry_and_seek_interrupts_backoff() {
+  let time_provider = Arc::new(ManualTimeProvider::new(
+    time::OffsetDateTime::from_unix_timestamp(305).unwrap(),
+  ));
+  let broker_query = Arc::new(ThrottledBrokerMetadataQuery {
+    requests: AtomicUsize::new(0),
+    windows: Mutex::new(Vec::new()),
+  });
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    300,
+    1,
+    3,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![1], 300_000)],
+  )
+  .await;
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![3],
+    }));
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    Arc::new(InMemoryConsumerGroupLeaseStore::new()),
+    Arc::new(InMemoryConsumerGroupMembershipStore::new()),
+    source,
+    broker_query.clone(),
+    rejecting_broker_blob_range_query(),
+    metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+    topic_layout(),
+  )
+  .time_provider(time_provider.clone())
+  .build()
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  timeout(Duration::from_secs(1), async {
+    while broker_query.requests.load(Ordering::SeqCst) == 0 {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("prefetch worker did not query the broker");
+  time_provider.wait_until_sleeping(2).await;
+  {
+    let windows = broker_query.windows.lock();
+    assert_eq!(windows.len(), windows.iter().collect::<HashSet<_>>().len());
+  }
+
+  timeout(
+    Duration::from_secs(1),
+    iterator.seek(
+      3,
+      ConsumerSeekTarget {
+        offset: 0,
+        window_start_unix_seconds: 300,
+        snowflake_id: None,
+      },
+    ),
+  )
+  .await
+  .expect("seek did not interrupt the throttle backoff")
   .unwrap();
   Box::new(iterator).shutdown().await.unwrap();
 }

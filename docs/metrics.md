@@ -52,7 +52,7 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 | `metadata_fast_scan_requests`, `metadata_fast_scan_segments` | Counters | Metadata work on the steady-state fast path. |
 | `metadata_recovery_scan_requests`, `metadata_recovery_scan_segments`, `metadata_recovery_scan_failures` | Counters | Metadata work and failures while replaying retained history. |
 | `metadata_recovery_scan_hits`, `metadata_recovery_scan_batches_read` | Counters | Recovery scans that returned any batch and the batches returned by them. |
-| `broker_metadata_offload_requests`, `broker_metadata_offload_deliveries`, `broker_metadata_offload_fallbacks` | Counters | Broker metadata RPCs attempted, validated broker responses delivered, and original direct queries retried after an unusable broker response. Requests equal deliveries plus fallbacks. |
+| `broker_metadata_offload_requests`, `broker_metadata_offload_deliveries`, `broker_metadata_offload_fallbacks` | Counters | Broker metadata RPCs attempted, validated broker responses delivered, and original direct queries retried after an unusable broker response. Exhausted storage throttling or a disabled direct-fallback flag can return without direct retry, so requests can exceed deliveries plus fallbacks. |
 | `mature_metadata_cache_reuses` | Counter | Per-partition mature metadata responses reused without a metadata query. |
 | `recovery_metadata_cache_entries`, `recovery_metadata_cache_retained_bytes` | Gauges | Current retained recovery cache entry count and bytes. |
 | `metadata_fast_scan_without_lower_bound` | Counter | Fast scans that could not use a derived metadata lower bound. |
@@ -70,7 +70,7 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 | --- | --- | --- |
 | `batches_delivered`, `records_delivered`, `delivery_gap_events` | Counters | Batches and records yielded to application code, and application-visible sequence discontinuities. A gap is an observation, not a root-cause classification; its rate-limited warning includes `admission_scan_json`, the immutable reader scan that admitted the batch, plus live supplemental partition state. |
 | `next_latency_seconds`, `commit_latency_seconds` | Histograms | Application-visible `next()` and explicit `commit()` operation latency. |
-| `retries`, `failures`, `seeks`, `revocations` | Counters | Iterator retry attempts, terminal failures, explicit cursor seeks, and revocation events surfaced to the application. |
+| `retries`, `failures`, `seeks`, `revocations` | Counters | Iterator retry attempts (including delayed retries after exhausted broker or direct metadata throttling), terminal failures, explicit cursor seeks, and revocation events surfaced to the application. |
 | `rebalance_failures_total` | Counters | Rebalance attempts that failed before an assignment applied. |
 | `assignment_plans_applied_total`, `assignment_plan_rejections_total`, `assignment_applications_total` | Counters | Accepted assignment plans, rejected plan versions, and local assignment changes that reached the reader. |
 | `lease_claims_initial`, `lease_claims_retained`, `lease_claims_graceful_handoff`, `lease_claims_expiry_takeover` | Counters | Partition claims classified by initial ownership, retention, cooperative handoff, or takeover after owner expiry. |
@@ -98,7 +98,7 @@ Broker metrics use `blob_stream_broker` with the component scopes below.
 | `storage_queries_total` | Counter | Authoritative metadata-store queries started after coalescing, for both eventual and strong reads. |
 | `tail_refills_total`, `recovery_baselines_total`, `recovery_seals_total` | Counters | Tail refills and complete Full Recovery snapshots installed. Full Recovery is unpaged, so its baseline and final seal are recorded together. |
 | `invalidations_total`, `evictions_total` | Counters | Retained entries removed because they no longer satisfy a request and entries evicted by cache policy. |
-| `failures_total`, `overloads_total` | Counters | Rejected or failed metadata-cache reads and the subset caused by admission, size, or timeout overload. |
+| `failures_total`, `overloads_total` | Counters | Rejected or failed metadata-cache reads and the subset caused by admission, size, timeout, or exhausted storage throttling. Reasons are in rate-limited logs and the typed broker response, not metric labels. |
 | `response_items_total`, `response_bytes_total` | Counters | Metadata segments and encoded metadata bytes returned in successful broker responses. |
 | `coalescing_window_requests_total` | Counter | Requests still admitted when a coalescing window starts its authoritative query, including the request that created the query group. |
 | `observation_age_seconds` | Histogram | Age of a retained hit. |

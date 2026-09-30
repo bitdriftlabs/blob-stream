@@ -16,6 +16,7 @@ aws-sdk-dynamodb.workspace  = true
 bd-backoff.workspace        = true
 bd-log.workspace            = true
 bd-log-util.workspace       = true
+bd-runtime-config.workspace = true
 bd-server-stats.workspace   = true
 blob-stream-blob-store.path = "../blob-stream-blob-store"
 blob-stream-proto.path      = "../blob-stream-proto"
@@ -33,4 +34,5 @@ tokio.workspace             = true
 uuid.workspace              = true
 
 [dev-dependencies]
-mockall.workspace = true
+bd-test-helpers-core.workspace = true
+mockall.workspace              = true

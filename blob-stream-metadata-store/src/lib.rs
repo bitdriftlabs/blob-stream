@@ -44,7 +44,7 @@ pub use consumer_group_leases_dynamo::DynamoConsumerGroupLeaseStore;
 pub use consumer_group_leases_memory::InMemoryConsumerGroupLeaseStore;
 pub use consumer_group_membership_dynamo::DynamoConsumerGroupMembershipStore;
 pub use consumer_group_membership_memory::InMemoryConsumerGroupMembershipStore;
-pub use dynamo::{DynamoMetadataStore, MAX_FENCED_METADATA_PARTITIONS};
+pub use dynamo::{DynamoMetadataStore, MAX_FENCED_METADATA_PARTITIONS, MetadataQueryThrottled};
 pub use dynamo_metrics::DynamoCapacityMetrics;
 pub use memory::InMemoryMetadataStore;
 pub use producer_partition_leases_dynamo::DynamoProducerPartitionLeaseStore;

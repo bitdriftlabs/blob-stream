@@ -8,11 +8,27 @@ coordination](consumer-coordination.md) for group ownership and commits.
 
 Consumer bootstrap requires broker discovery. Every planned metadata-window request and every
 grouped blob-range request route to the deterministically selected local broker. An eventual
-metadata request may use or refill a retained broker cache entry: `Tail` and `FullRecovery`
-coverage use separate caches. Strong metadata requests bypass retained coverage but still route
-through the broker to DynamoDB. A Fresh-only scan uses `FullRecovery` coverage for the current
-window because it has no checkpoint bound. An unavailable membership, broker failure, invalid
-response, overload, or timeout makes the consumer fail over to its original direct DynamoDB read.
+metadata request may use or refill a retained broker cache entry: `Tail` and `FullRecovery` coverage
+use separate caches. Strong metadata requests bypass retained coverage but still route through the
+broker to DynamoDB. A Fresh-only scan uses `FullRecovery` coverage for the current window because it
+has no checkpoint bound. An unavailable membership, broker failure, invalid response, non-storage
+overload, or timeout makes the consumer fail over to its original direct DynamoDB read. An exhausted
+DynamoDB Query throttle, reported by the broker as `STORAGE_THROTTLED`, does not fall back to
+another Query. The same rule applies to a direct metadata scan that exhausts its throttle budget.
+The live `blob_stream_consumer_broker_metadata_direct_fallback` flag defaults to true; disabling it
+returns broker metadata errors instead of retrying those requests directly. Direct-only scans are
+unaffected. Prefetch backs off with a positive, capped full-jitter delay after every failed read;
+failed scans restore cursor and frontier state. Unknown or unspecified broker overload reasons
+retain the direct fallback when the flag is enabled.
+
+Each metadata Query page, whether read by the broker or directly by the consumer, disables SDK
+retries and operation timeouts for that operation. A live, three-second page deadline bounds
+application retries for confirmed throttling and transient connection, timeout, or server failures.
+Non-retryable errors fail immediately. A retry repeats only the failed page; completed pages remain
+in the scan. Other DynamoDB operations retain their SDK retry and timeout settings. The broker
+bounds a metadata request to five seconds including coalescing and refill work; the consumer's
+broker RPC timeout defaults to seven seconds. Both request deadlines can change via live feature
+flags. A broker request timeout is not assumed to mean storage throttling.
 
 The broker returns `NOT_FOUND` authoritatively for an immutable blob object. Consumers follow the
 normal missing-batch path in that case; every other blob-service failure falls back to direct blob

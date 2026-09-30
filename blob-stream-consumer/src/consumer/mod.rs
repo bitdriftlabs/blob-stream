@@ -28,6 +28,7 @@ pub(crate) use diagnostics::{
   ConsumerReaderFastScanBoundState,
   ConsumerReaderPartitionScanState,
 };
+pub(crate) use metadata_query::BrokerMetadataThrottled;
 pub use metadata_query::{BrokerMetadataQuery, GrpcBrokerMetadataQuery};
 use metrics::ConsumerReaderMetrics;
 pub use reader::ConsumerReaderImpl;
