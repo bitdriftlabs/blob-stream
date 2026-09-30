@@ -37,7 +37,9 @@ use crate::diagnostics::{
   ConsumerSourceCheckpointSnapshot,
   ConsumerStateSnapshot,
 };
+use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
+use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use bd_time::SystemTimeProvider;
 use blob_stream_blob_store::{
   BlobCacheAdmission,
@@ -113,6 +115,21 @@ use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep, timeout};
 
 struct RejectingBrokerMetadataQuery;
+
+struct CountingRejectingBrokerMetadataQuery {
+  requests: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl BrokerMetadataQuery for CountingRejectingBrokerMetadataQuery {
+  async fn read_metadata_window(
+    &self,
+    _request: ReadMetadataWindowRequest,
+  ) -> anyhow::Result<ReadMetadataWindowResponse> {
+    self.requests.fetch_add(1, Ordering::SeqCst);
+    Err(anyhow::anyhow!("test broker metadata query is unavailable"))
+  }
+}
 
 struct ThrottledBrokerMetadataQuery {
   requests: AtomicUsize,
@@ -3144,6 +3161,81 @@ async fn broker_metadata_throttle_delays_prefetch_retry_and_seek_interrupts_back
   .await
   .expect("seek did not interrupt the throttle backoff")
   .unwrap();
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn prefetch_retry_uses_updated_broker_metadata_fallback() {
+  let time_provider = Arc::new(ManualTimeProvider::new(
+    time::OffsetDateTime::from_unix_timestamp(305).unwrap(),
+  ));
+  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default().with_bool_flag(
+    "blob_stream_consumer_broker_metadata_direct_fallback",
+    false,
+  )));
+  let broker_query = Arc::new(CountingRejectingBrokerMetadataQuery {
+    requests: AtomicUsize::new(0),
+  });
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    300,
+    1,
+    3,
+    SeqRange { start: 1, end: 1 },
+    vec![new_record(vec![1], 300_000)],
+  )
+  .await;
+  let source: Arc<dyn ConsumerCoordinationSource> =
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![3],
+    }));
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    Arc::new(InMemoryConsumerGroupLeaseStore::new()),
+    Arc::new(InMemoryConsumerGroupMembershipStore::new()),
+    source,
+    broker_query.clone(),
+    rejecting_broker_blob_range_query(),
+    metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    Some(feature_flags.snapshot_watch()),
+    topic_layout(),
+  )
+  .time_provider(time_provider.clone())
+  .build()
+  .await
+  .unwrap();
+
+  iterator.start().unwrap();
+  timeout(Duration::from_secs(1), async {
+    while broker_query.requests.load(Ordering::SeqCst) == 0 {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("prefetch worker did not query the broker");
+  time_provider.wait_until_sleeping(2).await;
+  feature_flags.update(Arc::new(
+    DefaultFeatureFlags::default()
+      .with_bool_flag("blob_stream_consumer_broker_metadata_direct_fallback", true),
+  ));
+  time_provider.advance(TimeDuration::seconds(1));
+
+  assert!(matches!(
+    timeout(Duration::from_secs(1), iterator.next())
+      .await
+      .expect("prefetch retry did not use the updated fallback")
+      .unwrap(),
+    NextResult::Record(_)
+  ));
   Box::new(iterator).shutdown().await.unwrap();
 }
 

@@ -188,7 +188,7 @@ pub fn consumer_max_in_flight_batch_reads(config: &ConsumerReadConfig) -> u64 {
 /// Resolve immutable settings for one consumer scan pass.
 pub fn consumer_read_runtime_settings(
   config: &ConsumerReadConfig,
-  feature_flags: Option<&FeatureFlagsWatch>,
+  feature_flags: Option<&dyn FeatureFlags>,
 ) -> ConsumerReadRuntimeSettings {
   let configured_prefetch_max_bytes = consumer_prefetch_max_bytes(config);
   let prefetch_max_bytes = feature_flags.map_or(configured_prefetch_max_bytes, |feature_flags| {

@@ -17,13 +17,14 @@ use crate::config::{
 };
 use crate::consumer::{BrokerBlobRangeQuery, BrokerMetadataQuery};
 use anyhow::{Result, ensure};
-use bd_runtime_config::feature_flags::FeatureFlagsWatch;
+use bd_runtime_config::feature_flags::{FeatureFlagsWatch, WatchedFeatureFlags};
 use bd_server_stats::stats::Scope;
 use bd_time::TimeProvider;
 use blob_stream_blob_store::BlobStore;
 use blob_stream_metadata_store::{MetadataStore, SegmentMetadata};
 use blob_stream_types::{BatchMetadata, CommittedCursor, SnowflakeId, VirtualPartitionId, Window};
 use log::info;
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::sync::Arc;
@@ -112,7 +113,7 @@ pub struct ConsumerReaderImpl {
   pub(in crate::consumer) recovery_scan_last_partition: Option<VirtualPartitionId>,
   pub(in crate::consumer) recovery_metadata_cache:
     HashMap<RecoveryMetadataCacheKey, Arc<[SegmentMetadata]>>,
-  pub(in crate::consumer) feature_flags: Option<FeatureFlagsWatch>,
+  pub(in crate::consumer) runtime_settings: Mutex<WatchedFeatureFlags<ConsumerReadRuntimeSettings>>,
   pub(in crate::consumer) metrics: ConsumerReaderMetrics,
 }
 

@@ -294,10 +294,7 @@ impl PrefetchWorker {
       };
 
       let read_started_at = Instant::now();
-      let read_outcome = match self
-        .read_available_with_retry(capacity, runtime_settings)
-        .await
-      {
+      let read_outcome = match self.read_available_with_retry(capacity).await {
         ReadAvailableOutcome::Batches(batches) => batches,
         ReadAvailableOutcome::CommandPending => continue,
       };
@@ -761,11 +758,7 @@ impl PrefetchWorker {
   }
 
   /// Retry failed reads with capped exponential backoff, interruptible by reader commands.
-  async fn read_available_with_retry(
-    &mut self,
-    capacity: ReadCapacity,
-    runtime_settings: crate::config::ConsumerReadRuntimeSettings,
-  ) -> ReadAvailableOutcome {
+  async fn read_available_with_retry(&mut self, capacity: ReadCapacity) -> ReadAvailableOutcome {
     let mut read_attempt: u8 = 0;
     let mut read_backoff = ExponentialBackoffBuilder::<SystemClock, Finite>::new_infinite()
       .with_initial_interval(time::Duration::milliseconds(100))
@@ -775,6 +768,7 @@ impl PrefetchWorker {
       .build();
     loop {
       let now = self.time_provider.now();
+      let runtime_settings = self.reader.runtime_settings();
       match self
         .reader
         .read_available_with_capacity_and_settings(now, capacity, runtime_settings)

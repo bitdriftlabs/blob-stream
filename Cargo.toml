@@ -20,8 +20,8 @@ resolver = "2"
 anyhow               = "1.0.104"
 async-trait          = "0.1.92"
 aws-config           = "1.12.0"
-aws-sdk-dynamodb     = "1.128.0"
-aws-sdk-s3           = "1.150.0"
+aws-sdk-dynamodb     = "1.129.0"
+aws-sdk-s3           = "1.151.0"
 aws-types            = "1.6.0"
 axum                 = { version = "0.8.9", features = ["http2", "macros"] }
 bd-backoff           = { git = "https://github.com/bitdriftlabs/shared-core.git" }

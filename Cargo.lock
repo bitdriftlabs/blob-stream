@@ -404,9 +404,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-dynamodb"
-version = "1.128.0"
+version = "1.129.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "875e1078bcdeab3da04c91bd4b6d169a2cd48ce1c7b027a747c0958c6aedab97"
+checksum = "06027c5a4de74b9ff7db7cb851dba0ac945b726ec3b35d756fa0d756d655e685"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -430,9 +430,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3"
-version = "1.150.0"
+version = "1.151.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fecaa77c862fa1e9d636d54fa06e0049a19a4f071b0d72ea1b9086887d09359"
+checksum = "c82d4b41fe41bfca3c9e1de55645d9a525868ef5ce5e14cee9499ccaf1fc7225"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -633,9 +633,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-http-client"
-version = "1.4.2"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bd25384a4e437aa8d8f339afad4b69e786b936a7cb10db668a7aaf66717b1a8"
+checksum = "51c89cc3f1f281d659a67a519a1b5c6d445b5ce09fa7e5aee40c2c2707e9509d"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api",
@@ -696,9 +696,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime"
-version = "1.15.0"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "591e0024cdf2a8de8711860f7e1d5cfbca26b800ce13793a9aa2f4f5918e6d95"
+checksum = "d6e302ac1d88b99652489df31abdec6ac42a2ab2ac3982ad0ac49f64dfaf28ba"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-http",
@@ -720,9 +720,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime-api"
-version = "1.18.0"
+version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bb0deb40a69de59f7809251cfe1ab16de135f42c49d222d1202b4d0ce19720f"
+checksum = "c0730c16f91124c6a2abb4932c77e299288b3dd9f967ea2e9ec48cc6731e87a4"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api-macros",
@@ -944,7 +944,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "bd-backoff"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "bd-workspace-hack",
  "rand 0.10.3",
@@ -954,7 +954,7 @@ dependencies = [
 [[package]]
 name = "bd-grpc"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "anyhow",
  "assert_matches",
@@ -997,7 +997,7 @@ dependencies = [
 [[package]]
 name = "bd-grpc-codec"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "bd-stats-common",
  "bd-workspace-hack",
@@ -1011,7 +1011,7 @@ dependencies = [
 [[package]]
 name = "bd-log"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "anyhow",
  "bd-workspace-hack",
@@ -1032,7 +1032,7 @@ dependencies = [
 [[package]]
 name = "bd-log-util"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "bd-workspace-hack",
  "log",
@@ -1044,7 +1044,7 @@ dependencies = [
 [[package]]
 name = "bd-panic"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "bd-workspace-hack",
  "color-backtrace",
@@ -1055,7 +1055,7 @@ dependencies = [
 [[package]]
 name = "bd-pgv"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "bd-workspace-hack",
  "log",
@@ -1068,7 +1068,7 @@ dependencies = [
 [[package]]
 name = "bd-rt"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "bd-workspace-hack",
  "log",
@@ -1078,7 +1078,7 @@ dependencies = [
 [[package]]
 name = "bd-runtime-config"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "async-trait",
  "bd-server-stats",
@@ -1099,7 +1099,7 @@ dependencies = [
 [[package]]
 name = "bd-server-stats"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "anyhow",
  "bd-stats-common",
@@ -1119,7 +1119,7 @@ dependencies = [
 [[package]]
 name = "bd-shutdown"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "bd-workspace-hack",
  "log",
@@ -1129,7 +1129,7 @@ dependencies = [
 [[package]]
 name = "bd-stats-common"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "anyhow",
  "bd-workspace-hack",
@@ -1139,7 +1139,7 @@ dependencies = [
 [[package]]
 name = "bd-test-helpers-core"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "async-trait",
  "bd-log",
@@ -1152,7 +1152,7 @@ dependencies = [
 [[package]]
 name = "bd-time"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#889bbb65dc80c7471f950e305675c31c355eca1a"
 dependencies = [
  "async-trait",
  "bd-workspace-hack",
@@ -3512,9 +3512,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "opentelemetry"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
+checksum = "6cdb0b1b267eb9db3331b434ed9ddab10d50e280a9adf9d13e5233e2002b61b5"
 dependencies = [
  "futures-core",
  "futures-sink",
@@ -3526,9 +3526,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-http"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5683015d09e2df236ef005b17f6f196f0d5f6313c4fa43a7b6a53b52776e4331"
+checksum = "ee2c3625b8aa04209f7e01e513bc8044da9687fa38a9eacf59628ca5f3b87300"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3539,11 +3539,12 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-otlp"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
+checksum = "699a67345e21962a231955b9059a157e428b219fa5df8efe11f08346fb23a344"
 dependencies = [
  "http 1.5.0",
+ "httpdate",
  "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-proto",
@@ -3558,9 +3559,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-proto"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
+checksum = "25da1ac11a0aeccf38d7f77ee0348715adaf8340f65ad46c94a02c6b20e2f65d"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
@@ -3571,9 +3572,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry_sdk"
-version = "0.32.1"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b59f80e1ac4d5ff7a2db8fb6c80badb7f0f3f858211fba08dd9aaec750894f9"
+checksum = "cb39533d9d1c912123efd7d41d7e0c29d16917b60ce15b4c8d87cb1af7f67520"
 dependencies = [
  "futures-channel",
  "futures-executor",
@@ -5310,9 +5311,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-opentelemetry"
-version = "0.33.0"
+version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adbc64cba7137545b8044cb1fe9814f7aacf3c6b5f9b45be8bb5db538befdb26"
+checksum = "0a904802a1b902f43638b677ff2a650847e3b4404101b6c586d648e8c1e3e8fe"
 dependencies = [
  "js-sys",
  "opentelemetry",

@@ -11,12 +11,14 @@ use super::{
   HashMap,
   HashSet,
   MetadataStore,
+  Mutex,
   RecoveryState,
   Result,
   Scope,
   SnowflakeId,
   VirtualPartitionId,
   VirtualPartitionState,
+  WatchedFeatureFlags,
   Window,
   consumer_read_runtime_settings,
   ensure,
@@ -56,16 +58,8 @@ impl ConsumerReaderImpl {
       !maximum_metadata_publication_lag.is_negative(),
       "consumer maximum metadata publication lag must not be negative"
     );
-    info!(
-      "consumer reader initialized: topic={}, retention={}, maximum_metadata_publication_lag={}, \
-       max_in_flight_batch_reads={}, assigned_partitions={}, initial_cursors={}",
-      config.topic,
-      retention,
-      maximum_metadata_publication_lag,
-      consumer_read_runtime_settings(&config, feature_flags.as_ref()).max_in_flight_batch_reads,
-      assigned_virtual_partitions.len(),
-      initial_cursors.len()
-    );
+    let assigned_partitions = assigned_virtual_partitions.len();
+    let initial_cursor_count = initial_cursors.len();
 
     let mut virtual_partition_states = initial_cursors
       .into_iter()
@@ -94,7 +88,11 @@ impl ConsumerReaderImpl {
       );
     }
 
-    Ok(Self {
+    let runtime_settings = Mutex::new(WatchedFeatureFlags::new(
+      feature_flags,
+      Arc::new(consumer_read_runtime_settings(&config, None)),
+    ));
+    let reader = Self {
       virtual_partition_states,
       retention,
       maximum_metadata_publication_lag,
@@ -110,9 +108,20 @@ impl ConsumerReaderImpl {
       metadata_store,
       broker_metadata_query,
       broker_blob_range_query,
-      feature_flags,
+      runtime_settings,
       metrics: ConsumerReaderMetrics::new(metrics_scope),
-    })
+    };
+    info!(
+      "consumer reader initialized: topic={}, retention={}, maximum_metadata_publication_lag={}, \
+       max_in_flight_batch_reads={}, assigned_partitions={}, initial_cursors={}",
+      reader.config.topic,
+      retention,
+      maximum_metadata_publication_lag,
+      reader.runtime_settings().max_in_flight_batch_reads,
+      assigned_partitions,
+      initial_cursor_count
+    );
+    Ok(reader)
   }
 
   #[must_use]
@@ -262,8 +271,7 @@ impl ConsumerReaderImpl {
       .max(self.retention_floor_window_start(cutover_window_start));
     let starts_at_target_window = recovery_start_window == target_window_start;
     self.set_cursor(virtual_partition_id, target.offset);
-    let runtime_settings =
-      consumer_read_runtime_settings(&self.config, self.feature_flags.as_ref());
+    let runtime_settings = self.runtime_settings();
     let first_window_min_snowflake = starts_at_target_window
       .then(|| {
         target
@@ -323,8 +331,7 @@ impl ConsumerReaderImpl {
     // A later runtime consistency change affects new scan passes but deliberately does not rewrite
     // this hydrated source-window overlap or replay already planned recovery work.
     let cutover_window_start = self.window_start(now);
-    let runtime_settings =
-      consumer_read_runtime_settings(&self.config, self.feature_flags.as_ref());
+    let runtime_settings = self.runtime_settings();
     let retention_floor = self.retention_floor_window_start(cutover_window_start);
     let source_checkpoint = committed_cursor.source_checkpoint.as_ref();
     let source_window_start = committed_cursor
