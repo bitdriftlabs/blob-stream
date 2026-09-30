@@ -6,13 +6,14 @@ use crate::write::memory_pressure::MemoryPressureController;
 use crate::write::{DEFAULT_MAX_SEGMENT_BYTES, effective_max_segment_bytes};
 use anyhow::{Result, anyhow, ensure};
 use bd_log_util::warn_every;
-use bd_runtime_config::feature_flags::FeatureFlagsWatch;
+use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch, WatchedFeatureFlags};
 use bd_time::TimeProvider;
 use blob_stream_blob_store::{BlobKey, BlobStore, BlobStoreError};
 use blob_stream_proto::protos::blobstream::v1::broker::{
   BlobRangeResult,
   BlobReadFailure,
   BlobReadFailureStatus,
+  BlobReadOverloadReason,
   BlobReadSuccess,
   ReadBlobRangesRequest,
   ReadBlobRangesResponse,
@@ -33,15 +34,37 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use time::OffsetDateTime;
 use time::ext::NumericalDuration;
-use tokio::sync::Semaphore;
 
 const DEFAULT_REQUEST_TIMEOUT: time::Duration = time::Duration::seconds(30);
 const DEFAULT_IDLE_TTL: time::Duration = time::Duration::seconds(10);
 const DEFAULT_MAX_FETCHES: usize = 32;
 pub const BLOB_CACHE_IDLE_TTL_FEATURE_FLAG: &str = "blob_stream_broker_blob_cache_idle_ttl_ms";
+const MAX_FETCHES_FEATURE_FLAG: &str = "blob_stream_broker_blob_cache_max_fetches";
 pub const MAX_BLOB_READ_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 type SharedFetch = Shared<BoxFuture<'static, std::result::Result<Bytes, BlobCacheError>>>;
+
+#[derive(Clone, Copy, Debug)]
+struct BlobCacheLimits {
+  max_fetches: usize,
+}
+
+impl BlobCacheLimits {
+  fn from_flags(flags: &dyn FeatureFlags, defaults: Self) -> Result<Self> {
+    let max_fetches = flags.get_integer(
+      MAX_FETCHES_FEATURE_FLAG,
+      u64::try_from(defaults.max_fetches).unwrap_or(u64::MAX),
+    );
+    ensure!(
+      (1 ..= 1024).contains(&max_fetches),
+      "feature flag {MAX_FETCHES_FEATURE_FLAG} must be between 1 and 1024"
+    );
+    Ok(Self {
+      max_fetches: usize::try_from(max_fetches)
+        .map_err(|_| anyhow!("feature flag {MAX_FETCHES_FEATURE_FLAG} exceeds usize"))?,
+    })
+  }
+}
 
 //
 // BlobCacheConfig
@@ -86,6 +109,14 @@ impl BlobCacheConfig {
       idle_ttl.is_positive(),
       "feature flag {BLOB_CACHE_IDLE_TTL_FEATURE_FLAG} must be positive"
     );
+    if let Some(flags) = feature_flags {
+      BlobCacheLimits::from_flags(
+        flags,
+        BlobCacheLimits {
+          max_fetches: DEFAULT_MAX_FETCHES,
+        },
+      )?;
+    }
     Ok(Self {
       request_timeout: Duration::try_from(request_timeout)
         .map_err(|_| anyhow!("blob_cache_request_timeout exceeds supported range"))?,
@@ -137,7 +168,7 @@ pub struct BlobCache {
   // expiration without adding a hash table or mutex acquisition to production cache hits.
   logical_idle_expiry: Option<LogicalIdleExpiry>,
   in_flight: Mutex<HashMap<String, Arc<SharedFetch>>>,
-  fetch_permits: Arc<Semaphore>,
+  last_valid_limits: Mutex<WatchedFeatureFlags<BlobCacheLimits>>,
   cache_generation: Arc<AtomicU64>,
   failures: AtomicU64,
   metrics: BlobCacheMetrics,
@@ -195,8 +226,8 @@ impl BlobCacheMetrics {
 enum BlobCacheError {
   #[error("{0}")]
   BadRequest(String),
-  #[error("blob cache overloaded")]
-  Overloaded,
+  #[error("blob cache overloaded: {0:?}")]
+  Overloaded(BlobReadOverloadReason),
   #[error("blob not found")]
   NotFound,
   #[error("blob cache storage failure: {0:#}")]
@@ -214,12 +245,18 @@ impl BlobCache {
     let metrics = BlobCacheMetrics::new(metrics_scope);
     let evictions = metrics.evictions.clone();
     let idle_ttl = config.idle_ttl;
-    let max_fetches = config.max_fetches;
+    let last_valid_limits = Mutex::new(WatchedFeatureFlags::new(
+      config.feature_flags.clone(),
+      Arc::new(BlobCacheLimits {
+        max_fetches: config.max_fetches,
+      }),
+    ));
     let cache = Self {
       blob_store,
       config,
       pressure,
       entries: Cache::builder()
+        // TODO: Live idle TTL needs a dynamic expiry policy or a safe cache rebuild.
         .time_to_idle(idle_ttl)
         .weigher(|_key: &String, value: &Bytes| u32::try_from(value.len()).unwrap_or(u32::MAX))
         .eviction_listener(move |_key, _value, cause| {
@@ -230,7 +267,7 @@ impl BlobCache {
         .build(),
       logical_idle_expiry: None,
       in_flight: Mutex::new(HashMap::new()),
-      fetch_permits: Arc::new(Semaphore::new(max_fetches)),
+      last_valid_limits,
       cache_generation: Arc::new(AtomicU64::new(0)),
       failures: AtomicU64::new(0),
       metrics,
@@ -251,7 +288,12 @@ impl BlobCache {
     let evictions = metrics.evictions.clone();
     let last_access = Arc::new(Mutex::new(HashMap::new()));
     let eviction_last_access = Arc::clone(&last_access);
-    let max_fetches = config.max_fetches;
+    let last_valid_limits = Mutex::new(WatchedFeatureFlags::new(
+      config.feature_flags.clone(),
+      Arc::new(BlobCacheLimits {
+        max_fetches: config.max_fetches,
+      }),
+    ));
     let cache = Self {
       blob_store,
       config,
@@ -270,7 +312,7 @@ impl BlobCache {
         time_provider,
       }),
       in_flight: Mutex::new(HashMap::new()),
-      fetch_permits: Arc::new(Semaphore::new(max_fetches)),
+      last_valid_limits,
       cache_generation: Arc::new(AtomicU64::new(0)),
       failures: AtomicU64::new(0),
       metrics,
@@ -282,6 +324,19 @@ impl BlobCache {
   #[must_use]
   pub fn request_timeout(&self) -> Duration {
     self.config.request_timeout
+  }
+
+  fn limits(&self) -> BlobCacheLimits {
+    let mut watched = self.last_valid_limits.lock();
+    let (limits, error) =
+      watched.current(|flags, defaults| BlobCacheLimits::from_flags(flags, *defaults));
+    if let Some(error) = error {
+      warn_every!(
+        15.seconds(),
+        "broker blob cache ignoring invalid limits: {error}"
+      );
+    }
+    *limits
   }
 
   pub async fn read(self: &Arc<Self>, request: ReadBlobRangesRequest) -> ReadBlobRangesResponse {
@@ -306,7 +361,9 @@ impl BlobCache {
             ..Default::default()
           },
           Ok(Err(error)) => self.response_error(error),
-          Err(_) => self.response_error(BlobCacheError::Overloaded),
+          Err(_) => self.response_error(BlobCacheError::Overloaded(
+            BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_REQUEST_TIMEOUT,
+          )),
         }
       },
       Err(error) => self.response_error(BlobCacheError::BadRequest(error.to_string())),
@@ -376,7 +433,9 @@ impl BlobCache {
     request: &ReadBlobRangesRequest,
   ) -> std::result::Result<Vec<Bytes>, BlobCacheError> {
     if self.pressure.is_overloaded() {
-      return Err(BlobCacheError::Overloaded);
+      return Err(BlobCacheError::Overloaded(
+        BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_MEMORY_PRESSURE,
+      ));
     }
     let key = request.blob_key.to_string();
     self.expire_idle_entry(&key).await;
@@ -409,18 +468,18 @@ impl BlobCache {
   }
 
   async fn fetch_blob(self: &Arc<Self>, key: String) -> std::result::Result<Bytes, BlobCacheError> {
+    let max_fetches = self.limits().max_fetches;
     let (fetch, started) = {
       let mut in_flight = self.in_flight.lock();
       if let Some(fetch) = in_flight.get(&key).cloned() {
         (fetch, false)
       } else {
-        // Refuse new keys when storage fetch capacity is saturated; existing same-key waiters
-        // still join their shared worker without consuming another permit.
-        let permit = self
-          .fetch_permits
-          .clone()
-          .try_acquire_owned()
-          .map_err(|_| BlobCacheError::Overloaded)?;
+        // The spawned worker owns this map entry until completion, even if callers time out.
+        if in_flight.len() >= max_fetches {
+          return Err(BlobCacheError::Overloaded(
+            BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_FETCH_CONCURRENCY,
+          ));
+        }
         let cache = self.entries.clone();
         let blob_store = Arc::clone(&self.blob_store);
         let pressure = self.pressure.clone();
@@ -431,7 +490,6 @@ impl BlobCache {
         let fetch_key = key.clone();
         let fetch = Arc::new(
           async move {
-            let _permit = permit;
             metrics.fetches.inc();
             let reservation = Arc::new(Mutex::new(None));
             let admission = {
@@ -526,16 +584,48 @@ impl BlobCache {
   }
 
   fn response_error(&self, error: BlobCacheError) -> ReadBlobRangesResponse {
-    warn_every!(
-      5.seconds(),
-      "broker blob cache request failed: error={error:#}"
-    );
+    let overload_reason = match &error {
+      BlobCacheError::Overloaded(reason) => *reason,
+      _ => BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_UNSPECIFIED,
+    };
+    match overload_reason {
+      BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_REQUEST_TIMEOUT => warn_every!(
+        5.seconds(),
+        "broker blob cache request timed out: timeout_ms={}",
+        self.config.request_timeout.as_millis()
+      ),
+      BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_MEMORY_PRESSURE => warn_every!(
+        5.seconds(),
+        "broker blob cache read rejected by memory pressure: current_headroom_bytes={:?}, \
+         reserved_bytes={}",
+        self.pressure.cache_headroom_bytes(),
+        self.pressure.cache_reservations()
+      ),
+      BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_FETCH_CONCURRENCY => warn_every!(
+        5.seconds(),
+        "broker blob cache fetch capacity reached: active_fetches={}, max_fetches={}",
+        self.in_flight.lock().len(),
+        self.limits().max_fetches
+      ),
+      BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_CACHE_ADMISSION_REJECTED => warn_every!(
+        5.seconds(),
+        "broker blob cache whole-object admission rejected: current_headroom_bytes={:?}, \
+         reserved_bytes={}, memory_overloaded={}",
+        self.pressure.cache_headroom_bytes(),
+        self.pressure.cache_reservations(),
+        self.pressure.is_overloaded()
+      ),
+      BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_UNSPECIFIED => warn_every!(
+        5.seconds(),
+        "broker blob cache request failed: error={error:#}"
+      ),
+    }
     let (status, error_message) = match error {
       BlobCacheError::BadRequest(message) => (
         BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_BAD_REQUEST,
         message,
       ),
-      BlobCacheError::Overloaded => {
+      BlobCacheError::Overloaded(_) => {
         self.metrics.overloaded.inc();
         (
           BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED,
@@ -561,6 +651,7 @@ impl BlobCache {
         BlobReadFailure {
           status: status.into(),
           error_message: error_message.into(),
+          overload_reason: overload_reason.into(),
           ..Default::default()
         },
       )),
@@ -634,7 +725,9 @@ impl BlobCache {
 fn blob_store_error(error: BlobStoreError) -> BlobCacheError {
   match error {
     BlobStoreError::NotFound { .. } => BlobCacheError::NotFound,
-    BlobStoreError::AdmissionRejected { .. } => BlobCacheError::Overloaded,
+    BlobStoreError::AdmissionRejected { .. } => BlobCacheError::Overloaded(
+      BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_CACHE_ADMISSION_REJECTED,
+    ),
     error @ (BlobStoreError::InvalidRange { .. } | BlobStoreError::Read { .. }) => {
       BlobCacheError::Storage(Arc::new(anyhow!(error)))
     },

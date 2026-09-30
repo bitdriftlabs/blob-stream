@@ -23,6 +23,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 use blob_stream_test_utils::ManualTimeProvider;
 use parking_lot::Mutex;
 use prometheus::labels;
+use protobuf::Message;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use time::OffsetDateTime;
@@ -299,6 +300,40 @@ fn request_for_blob(blob_key: &str, ranges: &[(u64, u64)]) -> ReadBlobRangesRequ
   }
 }
 
+fn assert_overload_reason(response: ReadBlobRangesResponse, reason: BlobReadOverloadReason) {
+  let Some(read_blob_ranges_response::Result::Failure(failure)) = response.result else {
+    panic!("expected overloaded failure");
+  };
+  assert_eq!(
+    failure.status,
+    BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED.into()
+  );
+  assert_eq!(failure.overload_reason, reason.into());
+  assert_eq!(failure.error_message.as_str(), "blob cache overloaded");
+}
+
+#[test]
+fn overload_reason_round_trips_on_the_wire() {
+  let response = ReadBlobRangesResponse {
+    result: Some(read_blob_ranges_response::Result::Failure(
+      BlobReadFailure {
+        status: BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED.into(),
+        error_message: "blob cache overloaded".into(),
+        overload_reason: BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_FETCH_CONCURRENCY.into(),
+        ..Default::default()
+      },
+    )),
+    ..Default::default()
+  };
+
+  let encoded = response.write_to_bytes().unwrap();
+  let decoded = ReadBlobRangesResponse::parse_from_bytes(&encoded).unwrap();
+  assert_overload_reason(
+    decoded,
+    BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_FETCH_CONCURRENCY,
+  );
+}
+
 #[test]
 fn config_reads_idle_ttl_from_feature_flags() {
   let feature_flags = FakeLoader::new(Arc::new(
@@ -347,6 +382,22 @@ fn config_rejects_nonpositive_idle_ttl_feature_flags() {
   let feature_flags = feature_flags.snapshot_watch();
 
   assert!(BlobCacheConfig::from_broker_config(&BrokerConfig::new(), Some(&feature_flags)).is_err());
+}
+
+#[test]
+fn config_rejects_invalid_fetch_limits() {
+  for max_fetches in [0, 1025] {
+    let feature_flags = FakeLoader::new(Arc::new(
+      DefaultFeatureFlags::default().with_integer_flag(MAX_FETCHES_FEATURE_FLAG, max_fetches),
+    ));
+    assert!(
+      BlobCacheConfig::from_broker_config(
+        &BrokerConfig::new(),
+        Some(&feature_flags.snapshot_watch())
+      )
+      .is_err()
+    );
+  }
 }
 
 #[test]
@@ -489,6 +540,10 @@ async fn invalid_range_does_not_read_or_cache() {
     failure.status,
     BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_BAD_REQUEST.into()
   );
+  assert_eq!(
+    failure.overload_reason,
+    BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_UNSPECIFIED.into()
+  );
   assert_eq!(cache.snapshot().await.entry_count, 0);
 }
 
@@ -542,12 +597,9 @@ async fn insufficient_pressure_headroom_rejects_cache_admission() {
 
   let response = cache.read(request(&[(0, 1)])).await;
 
-  let Some(read_blob_ranges_response::Result::Failure(failure)) = response.result else {
-    panic!("expected failure");
-  };
-  assert_eq!(
-    failure.status,
-    BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED.into()
+  assert_overload_reason(
+    response,
+    BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_CACHE_ADMISSION_REJECTED,
   );
 }
 
@@ -588,12 +640,9 @@ async fn overload_flushes_retained_entries_before_rejecting_new_reads() {
 
   let response = cache.read(request(&[(0, 1)])).await;
 
-  let Some(read_blob_ranges_response::Result::Failure(failure)) = response.result else {
-    panic!("expected failure");
-  };
-  assert_eq!(
-    failure.status,
-    BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED.into()
+  assert_overload_reason(
+    response,
+    BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_MEMORY_PRESSURE,
   );
   assert_eq!(cache.snapshot().await.entry_count, 0);
 }
@@ -701,12 +750,9 @@ async fn saturated_fetch_capacity_rejects_a_distinct_blob_key() {
   store.entered.notified().await;
 
   let response = cache.read(request_for_blob("topic/two", &[(0, 1)])).await;
-  let Some(read_blob_ranges_response::Result::Failure(failure)) = response.result else {
-    panic!("expected overloaded failure");
-  };
-  assert_eq!(
-    failure.status,
-    BlobReadFailureStatus::BLOB_READ_FAILURE_STATUS_OVERLOADED.into()
+  assert_overload_reason(
+    response,
+    BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_FETCH_CONCURRENCY,
   );
   assert_eq!(store.get_calls.load(Ordering::Relaxed), 1);
 
@@ -715,6 +761,86 @@ async fn saturated_fetch_capacity_rejects_a_distinct_blob_key() {
     first.await.unwrap().result,
     Some(read_blob_ranges_response::Result::Success(_))
   ));
+}
+
+#[tokio::test]
+async fn live_fetch_limit_retains_last_valid_and_restores_default() {
+  let store = Arc::new(GatedBlobStore::new());
+  for key in ["topic/one", "topic/two", "topic/three"] {
+    store
+      .put(&BlobKey::from(key), Bytes::from_static(b"abcdefgh"))
+      .await
+      .unwrap();
+  }
+  let flags = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(MAX_FETCHES_FEATURE_FLAG, 1),
+  ));
+  let config =
+    BlobCacheConfig::from_broker_config(&BrokerConfig::new(), Some(&flags.snapshot_watch()))
+      .unwrap();
+  let cache = Arc::new(BlobCache::new(
+    Arc::clone(&store) as Arc<dyn BlobStore>,
+    config,
+    pressure(0, 1_000),
+    &Collector::default().scope("blob_cache_test"),
+  ));
+
+  let first_cache = Arc::clone(&cache);
+  let first = tokio::spawn(async move {
+    first_cache
+      .read(request_for_blob("topic/one", &[(0, 1)]))
+      .await
+  });
+  store.entered.notified().await;
+  flags.update(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(MAX_FETCHES_FEATURE_FLAG, 0),
+  ));
+  assert_overload_reason(
+    cache.read(request_for_blob("topic/two", &[(0, 1)])).await,
+    BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_FETCH_CONCURRENCY,
+  );
+
+  flags.update(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(MAX_FETCHES_FEATURE_FLAG, 2),
+  ));
+  let second_cache = Arc::clone(&cache);
+  let second = tokio::spawn(async move {
+    second_cache
+      .read(request_for_blob("topic/two", &[(0, 1)]))
+      .await
+  });
+  store.entered.notified().await;
+  flags.update(Arc::new(
+    DefaultFeatureFlags::default().with_integer_flag(MAX_FETCHES_FEATURE_FLAG, 1),
+  ));
+  let same_key_cache = Arc::clone(&cache);
+  let same_key = tokio::spawn(async move {
+    same_key_cache
+      .read(request_for_blob("topic/one", &[(1, 2)]))
+      .await
+  });
+  assert_overload_reason(
+    cache.read(request_for_blob("topic/three", &[(0, 1)])).await,
+    BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_FETCH_CONCURRENCY,
+  );
+  flags.update(Arc::new(DefaultFeatureFlags::default()));
+  let third_cache = Arc::clone(&cache);
+  let third = tokio::spawn(async move {
+    third_cache
+      .read(request_for_blob("topic/three", &[(0, 1)]))
+      .await
+  });
+  store.entered.notified().await;
+  assert_eq!(store.get_calls.load(Ordering::Relaxed), 3);
+
+  store.release.notify_waiters();
+  for response in [first, second, same_key, third] {
+    assert!(matches!(
+      response.await.unwrap().result,
+      Some(read_blob_ranges_response::Result::Success(_))
+    ));
+  }
+  assert_eq!(cache.snapshot().await.active_fetches, 0);
 }
 
 #[tokio::test]
@@ -828,10 +954,10 @@ async fn timed_out_request_keeps_fetch_cleanup_running() {
   let request = tokio::spawn(async move { cache_for_request.read(request(&[(0, 1)])).await });
   store.entered.notified().await;
   tokio::time::advance(Duration::from_millis(1)).await;
-  assert!(matches!(
-    request.await.unwrap().result,
-    Some(read_blob_ranges_response::Result::Failure(_))
-  ));
+  assert_overload_reason(
+    request.await.unwrap(),
+    BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_REQUEST_TIMEOUT,
+  );
   assert_eq!(cache.snapshot().await.active_fetches, 1);
   assert_eq!(pressure.cache_reservations(), 8);
 
@@ -880,6 +1006,10 @@ async fn storage_failures_have_a_sanitized_public_message() {
   );
   assert_eq!(failure.error_message.as_str(), "blob storage failure");
   assert!(!failure.error_message.contains("private bucket"));
+  assert_eq!(
+    failure.overload_reason,
+    BlobReadOverloadReason::BLOB_READ_OVERLOAD_REASON_UNSPECIFIED.into()
+  );
   assert_eq!(pressure.cache_reservations(), 0);
 }
 

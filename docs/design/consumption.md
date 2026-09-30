@@ -32,8 +32,10 @@ flags. A broker request timeout is not assumed to mean storage throttling.
 
 The broker returns `NOT_FOUND` authoritatively for an immutable blob object. Consumers follow the
 normal missing-batch path in that case; every other blob-service failure falls back to direct blob
-storage. Consumers retain authority for decompression, validation, ordering, and cursor
-progression.
+storage. `OVERLOADED` blob responses identify request timeout, memory pressure, fetch concurrency,
+or whole-object cache-admission rejection with an additive typed reason. Unknown or unspecified
+reasons have the same direct-storage fallback as other non-`NOT_FOUND` failures. Consumers retain
+authority for decompression, validation, ordering, and cursor progression.
 
 ## Progress Markers
 
