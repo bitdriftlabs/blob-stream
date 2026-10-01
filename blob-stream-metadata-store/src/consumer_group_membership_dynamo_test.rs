@@ -249,7 +249,7 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
       offset_datetime_from_unix_millis(1_151),
     )
     .await?;
-  assert!(members.is_empty());
+  assert_eq!(members, Vec::new());
 
   client.delete_table().table_name(table_name).send().await?;
   Ok(())

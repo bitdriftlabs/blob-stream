@@ -653,7 +653,7 @@ async fn single_broker_single_record_end_to_end() -> Result<()> {
 
   // Step 5: Re-scan to verify dedupe behavior after cursor advancement.
   let duplicate_scan = reader.read_available(now_unix_seconds()).await?;
-  assert!(duplicate_scan.is_empty());
+  assert_eq!(duplicate_scan.len(), 0);
 
   // Step 6: Tear down broker and dependency resources.
   cluster.shutdown().await;
@@ -1253,10 +1253,10 @@ async fn single_broker_cursor_monotonicity_and_dedup() -> Result<()> {
   );
 
   let duplicate_scan = reader.read_available(now_unix_seconds()).await?;
-  assert!(duplicate_scan.is_empty());
+  assert_eq!(duplicate_scan.len(), 0);
   let cursors_after_duplicate_scan = reader.cursors();
   let duplicate_scan_again = reader.read_available(now_unix_seconds()).await?;
-  assert!(duplicate_scan_again.is_empty());
+  assert_eq!(duplicate_scan_again.len(), 0);
   assert_eq!(reader.cursors(), cursors_after_duplicate_scan);
 
   // Step 4: Clean up resources.
@@ -4763,7 +4763,7 @@ async fn delayed_metadata_cross_window_no_loss() -> Result<()> {
     "delayed metadata reader observed duplicate delivery: {deliveries:?}"
   );
   let duplicate_scan = reader.read_available(now_unix_seconds()).await?;
-  assert!(duplicate_scan.is_empty());
+  assert_eq!(duplicate_scan.len(), 0);
 
   // Step 4: Clean up all resources.
   cluster.shutdown().await;
@@ -6411,7 +6411,7 @@ async fn live_consumer_commit_race_is_fenced_and_redelivered() -> Result<()> {
       .map_err(|_| anyhow!("stale owner commit did not resume after gate release"))??;
     (stale_report, takeover_generation)
   };
-  assert!(stale_report.renewed_partitions.is_empty());
+  assert_eq!(stale_report.renewed_partitions.len(), 0);
   assert!(stale_report.fenced_partitions.contains(&target_partition));
 
   let lease_before_redelivery = cluster
@@ -6653,7 +6653,7 @@ async fn multi_writer_virtual_partition_merge_correctness() -> Result<()> {
 
   // Step 5: Verify duplicate scans are empty and clean up resources.
   let duplicate_scan = reader.read_available(now_unix_seconds()).await?;
-  assert!(duplicate_scan.is_empty());
+  assert_eq!(duplicate_scan.len(), 0);
 
   writer_0_cluster.shutdown().await;
   writer_1_cluster.shutdown().await;

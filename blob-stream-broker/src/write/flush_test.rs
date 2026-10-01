@@ -405,7 +405,7 @@ fn target_fill_boundaries_preserve_the_minimum_contiguous_object_count() {
     .collect::<Vec<_>>()
   };
 
-  assert!(target_fill_groups(&[], 100).is_empty());
+  assert_eq!(target_fill_groups(&[], 100), Vec::<Vec<u64>>::new());
   assert_eq!(
     target_fill_groups(&[50, 50, 50], 100),
     vec![vec![50, 50], vec![50]]
@@ -756,11 +756,11 @@ async fn lost_fence_does_not_fall_back_to_ordinary_metadata_write() -> Result<()
   assert_eq!(publisher.calls.load(Ordering::Relaxed), 1);
 
   let window = Window::for_timestamp(now, time::Duration::minutes(5)).key("telemetry");
-  assert!(
+  assert_eq!(
     metadata_store
       .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Eventual)
-      .await?
-      .is_empty()
+      .await?,
+    Vec::new()
   );
   Ok(())
 }
@@ -837,11 +837,11 @@ async fn shared_blob_upload_failure_prevents_every_metadata_publication() -> Res
   assert!(results.iter().all(|result| result.error.is_some()));
   for topic in ["first", "second"] {
     let window = Window::for_timestamp(now, time::Duration::minutes(5)).key(topic);
-    assert!(
+    assert_eq!(
       metadata_store
         .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Eventual)
-        .await?
-        .is_empty()
+        .await?,
+      Vec::new()
     );
   }
   Ok(())
@@ -1076,11 +1076,11 @@ async fn upload_deadline_includes_pre_upload_hook_delay() -> Result<()> {
   assert_eq!(results.len(), 1);
   assert_eq!(results[0].error, Some(FlushCompletionError::Internal));
   let window = Window::for_timestamp(now, time::Duration::minutes(5)).key("telemetry");
-  assert!(
+  assert_eq!(
     metadata_store
       .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Eventual)
-      .await?
-      .is_empty()
+      .await?,
+    Vec::new()
   );
   Ok(())
 }

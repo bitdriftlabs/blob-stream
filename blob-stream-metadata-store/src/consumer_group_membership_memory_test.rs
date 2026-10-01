@@ -117,7 +117,7 @@ async fn register_heartbeat_list_and_deregister() {
     )
     .await
     .expect("list members");
-  assert!(members.is_empty());
+  assert_eq!(members, Vec::new());
 }
 
 #[tokio::test]

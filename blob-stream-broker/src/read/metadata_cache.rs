@@ -467,12 +467,12 @@ impl RetainedCacheMetrics {
   fn record_eviction(&self, retained_bytes: u32) {
     let _ = self
       .entries
-      .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |entries| {
+      .try_update(Ordering::Relaxed, Ordering::Relaxed, |entries| {
         Some(entries.saturating_sub(1))
       });
     let _ = self
       .retained_bytes
-      .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
+      .try_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
         Some(bytes.saturating_sub(u64::from(retained_bytes)))
       });
     self.record_gauges();
@@ -658,7 +658,7 @@ impl MetadataCache {
   fn try_admit_refill(&self, limit: usize) -> Result<RefillAdmission> {
     self
       .active_refills
-      .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
+      .try_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
         (active < limit).then_some(active + 1)
       })
       .map_err(|_| {

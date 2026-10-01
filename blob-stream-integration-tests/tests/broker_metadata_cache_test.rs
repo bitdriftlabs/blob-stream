@@ -129,7 +129,7 @@ async fn broker_metadata_cache_real_transport_uses_equal_fast_frontier() -> Resu
   )
   .await?;
   let now = now_unix_seconds();
-  assert!(reader.read_available(now).await?.is_empty());
+  assert_eq!(reader.read_available(now).await?.len(), 0);
   let (window, initial_floor) = metadata_store
     .scan_requests()
     .await
@@ -203,7 +203,7 @@ async fn broker_metadata_cache_real_transport_uses_lowest_mixed_fast_frontier() 
   )
   .await?;
   let now = now_unix_seconds();
-  assert!(reader.read_available(now).await?.is_empty());
+  assert_eq!(reader.read_available(now).await?.len(), 0);
   let (window, initial_floor) = metadata_store
     .scan_requests()
     .await
@@ -287,7 +287,7 @@ async fn broker_metadata_cache_real_transport_defers_late_eventual_metadata() ->
   .await?;
   let first_read_at = now_unix_seconds();
   let maturity_read_at = first_read_at.saturating_add(1);
-  assert!(reader.read_available(first_read_at).await?.is_empty());
+  assert_eq!(reader.read_available(first_read_at).await?.len(), 0);
   let window = metadata_store
     .scan_requests()
     .await

@@ -1074,7 +1074,7 @@ async fn seek_slices_a_multi_record_batch_and_suppresses_a_fully_consumed_batch(
     },
     timestamp(900),
   );
-  assert!(reader.read_available(900).await.unwrap().is_empty());
+  assert_eq!(reader.read_available(900).await.unwrap().len(), 0);
   assert_eq!(reader.cursor(7), Some(3));
 }
 
@@ -1388,7 +1388,7 @@ async fn visibility_delay_defers_newly_published_metadata() {
     )
     .await
     .unwrap();
-  assert!(outcome.batches.is_empty());
+  assert_eq!(outcome.batches.len(), 0);
   assert_eq!(
     outcome.next_metadata_eligible_at,
     Some(OffsetDateTime::from_unix_timestamp(903).unwrap())
@@ -1584,7 +1584,7 @@ async fn derived_horizon_retries_visibility_deferred_metadata_across_window_boun
   )
   .unwrap();
 
-  assert!(reader.read_available(1_200).await.unwrap().is_empty());
+  assert_eq!(reader.read_available(1_200).await.unwrap().len(), 0);
   let batches = reader.read_available(1_500).await.unwrap();
   assert_eq!(batches.len(), 1);
   assert_eq!(batches[0].seq_range, SeqRange { start: 1, end: 1 });
@@ -1875,12 +1875,13 @@ async fn broker_recovery_uses_tail_for_checkpoint_and_full_recovery_afterward() 
     .set_assigned_virtual_partitions(&[7], timestamp(window_start + 300))
     .unwrap();
 
-  assert!(
+  assert_eq!(
     reader
       .read_available(window_start + 300)
       .await
       .unwrap()
-      .is_empty()
+      .len(),
+    0
   );
   let requests = broker_query.requests();
   let checkpoint_request = requests
@@ -2134,7 +2135,7 @@ async fn retention_recovery_clamps_legacy_cursor_to_retention_floor() {
     .set_assigned_virtual_partitions(&[7], timestamp(90_000))
     .unwrap();
 
-  assert!(reader.read_available(90_000).await.unwrap().is_empty());
+  assert_eq!(reader.read_available(90_000).await.unwrap().len(), 0);
   let scans = metadata_store.scans.lock();
   assert_eq!(scans.first(), Some(&(3_600, None)));
   assert_eq!(scans.len(), 32);
@@ -2324,7 +2325,7 @@ async fn fast_scan_bound_diagnostics_exclude_partitions_outside_a_targeted_tail(
     },
   );
 
-  assert!(reader.read_available(1_215).await.unwrap().is_empty());
+  assert_eq!(reader.read_available(1_215).await.unwrap().len(), 0);
   let scan_states = reader.partition_scan_states();
   let tail_partition = scan_states
     .iter()
@@ -2705,7 +2706,7 @@ async fn fast_gap_probe_preserves_late_predecessor_and_all_later_window_frontier
 
   let (mut reader, first) = read_task.await.unwrap();
   let first = first.unwrap();
-  assert!(first.batches.is_empty());
+  assert_eq!(first.batches.len(), 0);
   assert_eq!(reader.cursor(7), Some(1));
   assert_eq!(
     first.next_metadata_eligible_at,
@@ -2742,7 +2743,7 @@ async fn fast_gap_probe_preserves_late_predecessor_and_all_later_window_frontier
     )
     .await
     .unwrap();
-  assert!(before_probe.batches.is_empty());
+  assert_eq!(before_probe.batches.len(), 0);
   assert_eq!(
     before_probe.next_metadata_eligible_at,
     Some(timestamp(1_510).saturating_add(TimeDuration::milliseconds(500)))
@@ -2829,7 +2830,7 @@ async fn fast_gap_hold_reschedules_after_an_empty_intermediate_probe() {
     )
     .await
     .unwrap();
-  assert!(after_empty_probe.batches.is_empty());
+  assert_eq!(after_empty_probe.batches.len(), 0);
   assert_eq!(
     after_empty_probe.next_metadata_eligible_at,
     Some(timestamp(1_211)),
@@ -2921,7 +2922,7 @@ async fn fast_gap_retry_survives_capacity_exhaustion_by_a_held_candidate() {
     )
     .await
     .unwrap();
-  assert!(outcome.batches.is_empty());
+  assert_eq!(outcome.batches.len(), 0);
   assert_eq!(
     outcome.next_metadata_eligible_at,
     Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500))),
@@ -2995,7 +2996,7 @@ async fn fast_gap_retry_does_not_delay_capacity_deferred_work_for_another_partit
     )
     .await
     .unwrap();
-  assert!(outcome.batches.is_empty());
+  assert_eq!(outcome.batches.len(), 0);
   assert_eq!(
     outcome.next_metadata_eligible_at, None,
     "a Fast gap deadline must not delay another partition deferred by capacity"
@@ -3205,7 +3206,7 @@ async fn fast_gap_guard_releases_a_genuine_gap_after_predecessor_matures() {
     )
     .await
     .unwrap();
-  assert!(held.batches.is_empty());
+  assert_eq!(held.batches.len(), 0);
   assert_eq!(
     held.next_metadata_eligible_at,
     Some(timestamp(1_210).saturating_add(TimeDuration::milliseconds(500)))
@@ -3414,12 +3415,13 @@ async fn recovery_waits_for_visibility_deferred_window_before_advancing() {
       .len(),
     1
   );
-  assert!(
+  assert_eq!(
     reader
       .read_available(cutover_window_start)
       .await
       .unwrap()
-      .is_empty()
+      .len(),
+    0
   );
   let VirtualPartitionState::Recovering { recovery_state, .. } =
     reader.virtual_partition_states.get(&7).unwrap()
@@ -3518,12 +3520,9 @@ async fn recovery_does_not_advance_cursor_past_visibility_deferred_window() {
     .set_assigned_virtual_partitions(&[7], timestamp(cutover_window))
     .unwrap();
 
-  assert!(
-    reader
-      .read_available(cutover_window)
-      .await
-      .unwrap()
-      .is_empty()
+  assert_eq!(
+    reader.read_available(cutover_window).await.unwrap().len(),
+    0
   );
   assert_eq!(reader.cursor(7), Some(1));
 
@@ -3595,13 +3594,7 @@ async fn recovery_hands_active_window_visibility_deferral_to_fast() {
     .set_assigned_virtual_partitions(&[7], timestamp(window_start))
     .unwrap();
 
-  assert!(
-    reader
-      .read_available(window_start)
-      .await
-      .unwrap()
-      .is_empty()
-  );
+  assert_eq!(reader.read_available(window_start).await.unwrap().len(), 0);
   assert!(matches!(
     reader.virtual_partition_states.get(&7),
     Some(VirtualPartitionState::Fast { .. })
@@ -3656,7 +3649,7 @@ async fn advances_cursor_and_dedupes_on_rescan() {
   assert_eq!(reader.cursor(7), Some(2));
 
   let second = reader.read_available(950).await.unwrap();
-  assert!(second.is_empty());
+  assert_eq!(second.len(), 0);
   assert_eq!(reader.cursor(7), Some(2));
 }
 
@@ -4107,7 +4100,7 @@ async fn recovery_capacity_deferral_keeps_unprocessed_cutover_partitions_recover
     )
     .await
     .unwrap();
-  assert!(first.batches.is_empty());
+  assert_eq!(first.batches.len(), 0);
   for partition_id in [7, 8] {
     assert!(matches!(
       reader.virtual_partition_states.get(&partition_id),
@@ -4188,7 +4181,7 @@ async fn fresh_capacity_deferral_retries_the_initial_window_before_fast_path() {
     )
     .await
     .unwrap();
-  assert!(first.batches.is_empty());
+  assert_eq!(first.batches.len(), 0);
   for partition_id in [7, 8] {
     assert!(matches!(
       reader.virtual_partition_states.get(&partition_id),
@@ -4381,7 +4374,7 @@ async fn uncached_recovery_windows_start_concurrently() {
   .await
   .unwrap();
   store.release();
-  assert!(read.await.unwrap().unwrap().batches.is_empty());
+  assert_eq!(read.await.unwrap().unwrap().batches.len(), 0);
 }
 
 #[tokio::test]
@@ -4465,7 +4458,7 @@ async fn recovery_retries_a_prior_window_when_its_predecessor_publishes_late() {
   metadata_store.release();
   let (mut reader, first) = read.await.unwrap();
   let first = first.unwrap();
-  assert!(first.batches.is_empty());
+  assert_eq!(first.batches.len(), 0);
   assert_eq!(reader.cursor(7), Some(1));
   assert_eq!(
     first.next_metadata_eligible_at,
@@ -4722,12 +4715,13 @@ async fn empty_sealed_prefix_survives_late_suffix_and_capacity_stall() {
     },
   );
 
-  assert!(
+  assert_eq!(
     reader
       .read_available(window_start + 100)
       .await
       .unwrap()
-      .is_empty()
+      .len(),
+    0
   );
   let prefix = reader
     .sealed_metadata_prefixes
@@ -5328,7 +5322,7 @@ async fn broker_blob_cache_reads_ranges_without_object_store_access() {
 
   assert_eq!(batches.len(), 1);
   assert_eq!(query.requests().len(), 1);
-  assert!(blob_store.ranges().is_empty());
+  assert_eq!(blob_store.ranges().len(), 0);
 }
 
 #[tokio::test]
@@ -5393,7 +5387,7 @@ async fn broker_blob_cache_groups_same_key_plans_and_decodes_validated_ranges() 
       .collect::<Vec<_>>(),
     vec![7, 8]
   );
-  assert!(blob_store.ranges().is_empty());
+  assert_eq!(blob_store.ranges().len(), 0);
   assert_eq!(
     query.requests(),
     vec![ReadBlobRangesRequest {
@@ -5491,7 +5485,7 @@ async fn broker_blob_cache_handles_many_ranges_from_one_blob_key() {
   let batches = reader.read_available(950).await.unwrap();
 
   assert_eq!(batches.len(), 16);
-  assert!(blob_store.ranges().is_empty());
+  assert_eq!(blob_store.ranges().len(), 0);
   let requests = query.requests();
   assert_eq!(requests.len(), 1);
   assert_eq!(requests[0].blob_key.as_str(), blob_key.as_str());
@@ -5870,7 +5864,7 @@ async fn broker_blob_cache_accepts_mixed_key_outcomes_without_direct_retry() {
   assert_eq!(reader.cursor(7), Some(1));
   assert_eq!(reader.cursor(8), Some(1));
   assert_eq!(query.requests().len(), 2);
-  assert!(blob_store.ranges().is_empty());
+  assert_eq!(blob_store.ranges().len(), 0);
 }
 
 #[tokio::test]
@@ -5924,10 +5918,10 @@ async fn authoritative_broker_blob_not_found_skips_direct_retry() {
   .unwrap();
   let batches = reader.read_available(950).await.unwrap();
 
-  assert!(batches.is_empty());
+  assert_eq!(batches.len(), 0);
   assert_eq!(reader.cursor(7), Some(1));
   assert_eq!(query.requests().len(), 1);
-  assert!(blob_store.ranges().is_empty());
+  assert_eq!(blob_store.ranges().len(), 0);
   let metric = "blob_stream_consumer_broker_blob_not_found_test:reader";
   metrics.assert_counter_eq(
     1,
@@ -6342,7 +6336,7 @@ async fn fast_scan_uses_per_partition_inclusive_frontier() {
   recording_metadata_store.scans.lock().clear();
 
   let batches = reader.read_available(902).await.unwrap();
-  assert!(batches.is_empty());
+  assert_eq!(batches.len(), 0);
   assert_eq!(
     *recording_metadata_store.scans.lock(),
     vec![(600, Some(SnowflakeId(0))), (900, Some(SnowflakeId(2)))]
@@ -6380,12 +6374,9 @@ async fn fast_scan_retains_coverage_after_capacity_stall() {
   )
   .unwrap();
 
-  assert!(
-    reader
-      .read_available(scan_started_at)
-      .await
-      .unwrap()
-      .is_empty()
+  assert_eq!(
+    reader.read_available(scan_started_at).await.unwrap().len(),
+    0
   );
   write_segment(
     blob_store.as_ref(),
@@ -6400,7 +6391,7 @@ async fn fast_scan_retains_coverage_after_capacity_stall() {
   )
   .await;
 
-  assert!(
+  assert_eq!(
     BoundedConsumerReader::read_available(
       &mut reader,
       timestamp(first_source_at),
@@ -6408,7 +6399,8 @@ async fn fast_scan_retains_coverage_after_capacity_stall() {
     )
     .await
     .unwrap()
-    .is_empty()
+    .len(),
+    0
   );
   write_segment(
     blob_store.as_ref(),
@@ -6470,12 +6462,9 @@ async fn fast_scan_catches_up_coverage_across_window_stall() {
   )
   .unwrap();
 
-  assert!(
-    reader
-      .read_available(scan_started_at)
-      .await
-      .unwrap()
-      .is_empty()
+  assert_eq!(
+    reader.read_available(scan_started_at).await.unwrap().len(),
+    0
   );
   write_segment(
     blob_store.as_ref(),
@@ -6489,7 +6478,7 @@ async fn fast_scan_catches_up_coverage_across_window_stall() {
     Compression::none(),
   )
   .await;
-  assert!(
+  assert_eq!(
     BoundedConsumerReader::read_available(
       &mut reader,
       timestamp(first_source_at),
@@ -6497,7 +6486,8 @@ async fn fast_scan_catches_up_coverage_across_window_stall() {
     )
     .await
     .unwrap()
-    .is_empty()
+    .len(),
+    0
   );
   write_segment(
     blob_store.as_ref(),
@@ -6560,12 +6550,9 @@ async fn fast_coverage_tail_retains_visibility_deferred_rows_below_the_fast_floo
   )
   .unwrap();
 
-  assert!(
-    reader
-      .read_available(initial_scan_at)
-      .await
-      .unwrap()
-      .is_empty()
+  assert_eq!(
+    reader.read_available(initial_scan_at).await.unwrap().len(),
+    0
   );
   write_segment(
     blob_store.as_ref(),
@@ -6579,7 +6566,7 @@ async fn fast_coverage_tail_retains_visibility_deferred_rows_below_the_fast_floo
     Compression::none(),
   )
   .await;
-  assert!(
+  assert_eq!(
     BoundedConsumerReader::read_available(
       &mut reader,
       timestamp(stalled_source_at),
@@ -6587,7 +6574,8 @@ async fn fast_coverage_tail_retains_visibility_deferred_rows_below_the_fast_floo
     )
     .await
     .unwrap()
-    .is_empty()
+    .len(),
+    0
   );
   write_segment_with_publication_time(
     blob_store.as_ref(),
@@ -7074,7 +7062,7 @@ async fn broker_metadata_direct_fallback_respects_live_flag() {
     assert!(store.scans.lock().is_empty());
 
     flags.update(Arc::new(DefaultFeatureFlags::default()));
-    assert!(reader.read_available(901).await.unwrap().is_empty());
+    assert_eq!(reader.read_available(901).await.unwrap().len(), 0);
     assert!(!store.scans.lock().is_empty());
   }
 }
@@ -7361,7 +7349,7 @@ async fn source_directed_seek_normalizes_target_window_and_handles_future_window
     })
   ));
 
-  assert!(reader.read_available(1_200).await.unwrap().is_empty());
+  assert_eq!(reader.read_available(1_200).await.unwrap().len(), 0);
   assert!(matches!(
     reader.virtual_partition_states.get(&7),
     Some(VirtualPartitionState::Fast { .. })
@@ -7579,12 +7567,9 @@ async fn fast_scan_omits_windows_before_the_safe_publication_floor() {
   )
   .unwrap();
 
-  assert!(
-    reader
-      .read_available(now_unix_seconds)
-      .await
-      .unwrap()
-      .is_empty()
+  assert_eq!(
+    reader.read_available(now_unix_seconds).await.unwrap().len(),
+    0
   );
   assert_eq!(
     *metadata_store.scans.lock(),
@@ -7763,12 +7748,13 @@ async fn fast_scan_prunes_frontiers_for_windows_before_the_safe_publication_floo
     },
   );
 
-  assert!(
+  assert_eq!(
     reader
       .read_available(current_window_start + 120)
       .await
       .unwrap()
-      .is_empty()
+      .len(),
+    0
   );
   let frontiers_after_cutoff = reader
     .partition_scan_states()
@@ -7877,12 +7863,13 @@ async fn fast_scan_bounds_sparse_partitions_with_the_safe_publication_floor() {
   );
 
   metadata_store.scans.lock().clear();
-  assert!(
+  assert_eq!(
     reader
       .read_available(now_unix_seconds.saturating_add(1))
       .await
       .unwrap()
-      .is_empty()
+      .len(),
+    0
   );
   assert_eq!(
     *metadata_store.scans.lock(),

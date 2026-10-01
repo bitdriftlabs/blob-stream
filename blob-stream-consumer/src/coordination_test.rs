@@ -1035,7 +1035,7 @@ async fn oversubscribed_consumers_keep_stable_assignments_without_fencing() {
       .heartbeat_and_commit(offset_datetime_from_unix_millis(1_010), &HashMap::new())
       .await
       .unwrap();
-    assert!(report.fenced_partitions.is_empty());
+    assert_eq!(report.fenced_partitions.len(), 0);
   }
 
   for (coordinator, ownership) in coordinators.iter_mut().zip(&expected_ownership) {
@@ -1055,7 +1055,7 @@ async fn oversubscribed_consumers_keep_stable_assignments_without_fencing() {
       .await
       .unwrap();
     assert_eq!(heartbeat.renewed_partitions, *ownership);
-    assert!(heartbeat.fenced_partitions.is_empty());
+    assert_eq!(heartbeat.fenced_partitions.len(), 0);
   }
 }
 
@@ -1172,7 +1172,7 @@ async fn coordinator_does_not_create_local_assignment_without_shared_plan() {
     .await
     .unwrap();
 
-  assert!(report.owned_partitions.is_empty());
+  assert_eq!(report.owned_partitions.len(), 0);
   assert_eq!(coordinator.generation(), 0);
 }
 
@@ -1214,7 +1214,7 @@ async fn heartbeat_commit_renews_and_commits_cursor() {
     .await
     .unwrap();
   assert_eq!(report.renewed_partitions, vec![7]);
-  assert!(report.fenced_partitions.is_empty());
+  assert_eq!(report.fenced_partitions.len(), 0);
 }
 
 #[tokio::test]
@@ -1253,7 +1253,7 @@ async fn commit_cursors_does_not_renew_partition_leases() {
     .await
     .unwrap();
   assert_eq!(report.renewed_partitions, vec![7]);
-  assert!(report.fenced_partitions.is_empty());
+  assert_eq!(report.fenced_partitions.len(), 0);
 
   let leases = concrete_store
     .list_group_leases("topic-a", "group-a")
@@ -1433,9 +1433,9 @@ async fn heartbeat_detects_fencing_by_new_generation() {
     .await
     .unwrap();
 
-  assert!(report.renewed_partitions.is_empty());
+  assert_eq!(report.renewed_partitions.len(), 0);
   assert_eq!(report.fenced_partitions, vec![7]);
-  assert!(coordinator.owned_partitions().is_empty());
+  assert_eq!(coordinator.owned_partitions().len(), 0);
 }
 
 #[tokio::test]
@@ -1610,7 +1610,7 @@ async fn release_owned_releases_partitions_for_fast_takeover() {
     .await
     .unwrap();
   assert_eq!(released, vec![7]);
-  assert!(coordinator.owned_partitions().is_empty());
+  assert_eq!(coordinator.owned_partitions().len(), 0);
 
   let key = ConsumerGroupLeaseKey {
     topic: "topic-a".to_string(),
