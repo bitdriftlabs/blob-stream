@@ -4858,7 +4858,6 @@ async fn empty_sealed_prefix_survives_late_suffix_and_capacity_stall() {
     .await;
   }
   for sequence in 1_u64 ..= 2 {
-    clock.advance(TimeDuration::seconds(1));
     let outcome = reader
       .read_available_with_capacity_and_settings(
         timestamp(window_start + 100 + i64::try_from(sequence).unwrap()),
