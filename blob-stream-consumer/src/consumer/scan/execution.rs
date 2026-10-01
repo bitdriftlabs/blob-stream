@@ -781,16 +781,19 @@ impl ConsumerReaderImpl {
         && offset_datetime_from_unix_seconds(candidate.window_start_unix_seconds)
           > self.fast_scan_safe_timestamp(now, runtime_settings)
       {
-        // The previous window can still publish a missing predecessor after its scan returned.
-        // Keep the cursor behind this range and revisit that window before resuming Recovery.
-        let retry_window = candidate
-          .window_start_unix_seconds
-          .saturating_sub(self.metadata_window_size.whole_seconds())
-          .max(
-            recovery_state
-              .first_window_start_unix_seconds
-              .unwrap_or(recovery_state.next_window_start_unix_seconds),
-          );
+        // Any window inside the availability horizon can still publish a missing predecessor.
+        // Keep the cursor behind this range and revisit the oldest open Recovery window.
+        let retry_window = Window::for_timestamp(
+          self.fast_scan_safe_timestamp(now, runtime_settings),
+          self.metadata_window_size,
+        )
+        .start
+        .unix_timestamp()
+        .max(
+          recovery_state
+            .first_window_start_unix_seconds
+            .unwrap_or(recovery_state.next_window_start_unix_seconds),
+        );
         held_recovery_windows.insert(candidate.virtual_partition_id, retry_window);
         let retry_at = now.saturating_add(FAST_GAP_PROBE_INTERVAL);
         next_metadata_eligible_at =

@@ -616,10 +616,16 @@ impl MetadataCache {
         recovery_eviction_metrics.record_eviction(entry.retained_bytes);
       })
       .build();
+    let strong_evictions = metrics.evictions.clone();
     let strong_sealed_entries = Cache::builder()
       .max_capacity(strong_sealed_byte_budget)
       .time_to_idle(CACHE_IDLE_TTL)
       .weigher(|_key: &CacheKey, entry: &Arc<CacheEntry>| entry.retained_bytes)
+      .eviction_listener(move |_key, _entry, cause| {
+        if cause.was_evicted() {
+          strong_evictions.inc();
+        }
+      })
       .build();
     Self {
       metadata_store,
@@ -945,7 +951,9 @@ impl MetadataCache {
         if specification.consistency == StoreConsistency::Strong
           && let Some(requested) = specification.requested_seal_before
         {
-          let sealed_at = entry.sealed_at.unwrap_or(entry.observed_at);
+          let sealed_at = entry
+            .sealed_at
+            .ok_or_else(|| anyhow!("strong refill missing pre-scan seal proof time"))?;
           let safe_at_observation = SnowflakeId::minimum_for_timestamp(
             sealed_at.saturating_sub(
               specification.requested_seal_horizon.max(
@@ -1288,7 +1296,7 @@ impl MetadataCache {
       refill_floor: min_snowflake,
       observed_at,
       sealed_before,
-      sealed_at: sealed_before.map(|_| scan_started_at),
+      sealed_at: (specification.consistency == StoreConsistency::Strong).then_some(scan_started_at),
       retained_bytes: estimate_retained_bytes(&segments),
       generation: self
         .generation
@@ -1892,9 +1900,12 @@ fn response_from_entry(
         generation: entry.generation,
         retained_coverage,
         sealed_before: entry.sealed_before.map(SnowflakeId::as_u64),
-        sealed_at_unix_ms: entry.sealed_at.and_then(|observed_at| {
-          i64::try_from(observed_at.unix_timestamp_nanos().div_euclid(1_000_000)).ok()
-        }),
+        sealed_at_unix_ms: entry
+          .sealed_before
+          .and(entry.sealed_at)
+          .and_then(|observed_at| {
+            i64::try_from(observed_at.unix_timestamp_nanos().div_euclid(1_000_000)).ok()
+          }),
         retained_strong_coverage,
         segments,
         ..Default::default()

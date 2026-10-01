@@ -737,6 +737,76 @@ async fn late_strong_waiter_receives_its_own_seal_horizon() {
 }
 
 #[tokio::test]
+async fn late_seal_waiter_uses_pre_scan_time_for_unsealed_strong_refill() {
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let store = Arc::new(GatedMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: Vec::new(),
+    scan_started: Semaphore::new(0),
+    release_scan: Semaphore::new(0),
+  });
+  let clock = Arc::new(ManualTimeProvider::new(timestamp(100)));
+  let cache = Arc::new(
+    MetadataCache::new(
+      store.clone(),
+      cache_config(Duration::seconds(1), StdDuration::ZERO),
+      None,
+    )
+    .time_provider(clock.clone()),
+  );
+  let mut request = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  request.window_start_unix_seconds = window_start;
+  let first_cache = cache.clone();
+  let first = tokio::spawn(async move { first_cache.read(request).await });
+  let _scan = timeout(StdDuration::from_secs(1), store.scan_started.acquire())
+    .await
+    .unwrap()
+    .unwrap();
+
+  let mut late_request = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  late_request.window_start_unix_seconds = window_start;
+  late_request.requested_seal_before =
+    Some(SnowflakeId::minimum_for_timestamp(timestamp(300)).as_u64());
+  let second_cache = cache.clone();
+  let second = tokio::spawn(async move { second_cache.read(late_request).await });
+  timeout(StdDuration::from_secs(1), async {
+    while cache.snapshot().await.active_waiters < 2 {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .unwrap();
+  clock.advance(Duration::seconds(30));
+  store.release_scan.add_permits(1);
+
+  let Some(read_metadata_window_response::Result::Success(first)) = first.await.unwrap().result
+  else {
+    panic!("unsealed strong read must succeed");
+  };
+  let Some(read_metadata_window_response::Result::Success(second)) = second.await.unwrap().result
+  else {
+    panic!("coalesced sealing read must succeed");
+  };
+  let expected_seal = SnowflakeId::minimum_for_timestamp(
+    timestamp(100).saturating_sub(Duration::seconds(15) + DEFAULT_SEAL_MAX_CLOCK_SKEW),
+  );
+  assert_eq!(store.scans.load(Ordering::Relaxed), 1);
+  assert_eq!(first.sealed_before, None);
+  assert_eq!(first.sealed_at_unix_ms, None);
+  assert_eq!(second.sealed_before, Some(expected_seal.as_u64()));
+  assert_eq!(
+    second.sealed_at_unix_ms,
+    Some(timestamp(100).unix_timestamp() * 1_000)
+  );
+  assert_eq!(
+    second.observed_at_unix_ms,
+    timestamp(130).unix_timestamp() * 1_000
+  );
+}
+
+#[tokio::test]
 async fn rejected_waiter_does_not_start_an_unowned_refill() {
   let store = Arc::new(GatedMetadataStore {
     scans: AtomicUsize::new(0),
@@ -1525,6 +1595,60 @@ async fn strong_prefix_and_eventual_entries_share_the_configured_total_budget() 
   assert_eq!(
     snapshot.tail_byte_budget + snapshot.recovery_byte_budget + snapshot.strong_sealed_byte_budget,
     config.tail_max_bytes + config.recovery_max_bytes
+  );
+}
+
+#[tokio::test]
+async fn strong_prefix_capacity_eviction_increments_evictions_total() {
+  let collector = Collector::default();
+  let metrics = Helper::new_with_collector(collector.clone());
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let mut metadata = segment();
+  metadata.window.window_start_unix_seconds = window_start;
+  metadata.snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(30));
+  let mut config = cache_config(Duration::seconds(1), StdDuration::ZERO);
+  config.tail_max_bytes = u64::from(estimate_retained_bytes(&[metadata.clone()])) * 2;
+  config.recovery_max_bytes = 0;
+  let cache = Arc::new(
+    MetadataCache::new_inner(
+      Arc::new(CountingMetadataStore {
+        scans: AtomicUsize::new(0),
+        observed_bounds: Mutex::new(Vec::new()),
+        segments: vec![metadata],
+      }),
+      config,
+      None,
+      &collector.scope("blob_stream_broker_test"),
+    )
+    .time_provider(Arc::new(ManualTimeProvider::new(timestamp(100)))),
+  );
+
+  let mut tail = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  tail.window_start_unix_seconds = window_start;
+  tail.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(300)).as_u64());
+  assert!(matches!(
+    cache.read(tail).await.result,
+    Some(read_metadata_window_response::Result::Success(_))
+  ));
+  cache.run_maintenance().await;
+  assert_eq!(cache.snapshot().await.strong_sealed_entry_count, 1);
+
+  let mut recovery = full_recovery_request();
+  recovery.consistency = MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG.into();
+  recovery.window_start_unix_seconds = window_start;
+  recovery.requested_seal_before =
+    Some(SnowflakeId::minimum_for_timestamp(timestamp(300)).as_u64());
+  assert!(matches!(
+    cache.read(recovery).await.result,
+    Some(read_metadata_window_response::Result::Success(_))
+  ));
+  cache.run_maintenance().await;
+  assert_eq!(cache.snapshot().await.strong_sealed_entry_count, 1);
+  metrics.assert_counter_eq(
+    1,
+    "blob_stream_broker_test:metadata_cache:evictions_total",
+    &labels!(),
   );
 }
 

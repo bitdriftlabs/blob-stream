@@ -4488,6 +4488,112 @@ async fn recovery_retries_a_prior_window_when_its_predecessor_publishes_late() {
 }
 
 #[tokio::test]
+async fn recovery_retries_the_oldest_still_open_window_across_multiple_windows() {
+  let old_window_start = 600;
+  let newer_window_start = 1_200;
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(SnapshotGatedWindowMetadataStore::new(old_window_start));
+  let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store_dyn.as_ref(),
+    "telemetry",
+    newer_window_start,
+    SnowflakeId::minimum_for_timestamp(timestamp(1_205)).as_u64(),
+    7,
+    SeqRange { start: 3, end: 3 },
+    vec![new_record(vec![3], 1_205_000)],
+    Compression::none(),
+  )
+  .await;
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    Vec::new(),
+    HashMap::new(),
+    Arc::clone(&blob_store),
+    metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(615),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  reader.hydrate_cursor_with_source(
+    7,
+    &CommittedCursor {
+      virtual_partition_id: 7,
+      seq_end: 1,
+      source_checkpoint: Some(CommittedSourceCheckpoint {
+        window_start_unix_seconds: old_window_start,
+        snowflake_id: SnowflakeId::minimum_for_timestamp(timestamp(601)).as_u64(),
+      }),
+    },
+    Some(old_window_start * 1_000),
+    timestamp(1_210),
+  );
+  reader
+    .set_assigned_virtual_partitions(&[7], timestamp(1_210))
+    .unwrap();
+  let read = tokio::spawn(async move {
+    let outcome = reader
+      .read_available_with_capacity_and_settings(
+        timestamp(1_210),
+        ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+        reader.runtime_settings(),
+      )
+      .await;
+    (reader, outcome)
+  });
+  metadata_store.wait_for_snapshot().await;
+  write_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    old_window_start,
+    SnowflakeId::minimum_for_timestamp(timestamp(894)).as_u64(),
+    7,
+    SeqRange { start: 2, end: 2 },
+    vec![new_record(vec![2], 894_000)],
+    Compression::none(),
+  )
+  .await;
+  metadata_store.release();
+  let (mut reader, first) = read.await.unwrap();
+  let first = first.unwrap();
+  assert_eq!(first.batches.len(), 0);
+  assert_eq!(reader.cursor(7), Some(1));
+  assert!(matches!(
+    reader.virtual_partition_states.get(&7),
+    Some(VirtualPartitionState::Recovering { recovery_state, .. })
+      if recovery_state.next_window_start_unix_seconds == old_window_start
+  ));
+  let retried = reader
+    .read_available_with_capacity_and_settings(
+      timestamp(1_211),
+      ReadCapacity::new(TEST_READ_CAPACITY_BYTES),
+      reader.runtime_settings(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(
+    retried
+      .batches
+      .iter()
+      .map(|batch| batch.seq_range.start)
+      .collect::<Vec<_>>(),
+    vec![2, 3]
+  );
+}
+
+#[tokio::test]
 async fn sealed_fast_prefix_fills_capacity_before_querying_open_suffix() {
   let window_start = 1_735_689_600;
   let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
