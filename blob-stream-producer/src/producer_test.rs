@@ -1716,7 +1716,7 @@ async fn produce_with_no_records_is_a_no_op() {
   .await
   .unwrap();
 
-  assert!(producer.produce(Vec::new()).await.is_empty());
+  assert_eq!(producer.produce(Vec::new()).await.len(), 0);
   assert!(transport.sent.lock().await.is_empty());
 }
 

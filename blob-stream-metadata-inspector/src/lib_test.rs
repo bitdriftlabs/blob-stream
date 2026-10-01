@@ -130,14 +130,14 @@ fn report_flags_source_order_that_differs_from_sequence_order() {
       },
     ]
   );
-  assert!(report.continuity_issues.is_empty());
+  assert_eq!(report.continuity_issues, Vec::new());
 }
 
 #[test]
 fn report_does_not_flag_the_consumed_prefix_of_a_cursor_crossing_batch() {
   let report = build_report(&request(10), vec![1_788_612_500], vec![segment(1, 1, 100)]);
 
-  assert!(report.continuity_issues.is_empty());
+  assert_eq!(report.continuity_issues, Vec::new());
 }
 
 #[test]

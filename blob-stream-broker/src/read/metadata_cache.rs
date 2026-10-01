@@ -30,6 +30,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
 };
 use blob_stream_proto::protos::blobstream::v1::config::{RuntimeConfig, TopicConfig};
 use blob_stream_types::{
+  DEFAULT_MAX_METADATA_PUBLICATION_LAG,
   ProtoDurationExt,
   SnowflakeId,
   TopicWindowKey,
@@ -53,6 +54,7 @@ const DEFAULT_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_COALESCING_WINDOW: Duration = Duration::milliseconds(250);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::seconds(5);
 const DEFAULT_METADATA_CACHE_MAX_AGE: Duration = Duration::milliseconds(250);
+const DEFAULT_SEAL_MAX_CLOCK_SKEW: Duration = Duration::milliseconds(10);
 const DEFAULT_RECOVERY_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MAX_WAITERS_PER_KEY: usize = 128;
 const DEFAULT_MAX_WAITERS: usize = 4096;
@@ -179,6 +181,7 @@ enum ReadCoverage {
 pub struct MetadataCacheConfig {
   tail_max_bytes: u64,
   recovery_max_bytes: u64,
+  seal_clock_skew: Duration,
   coalescing_window: StdDuration,
   limits: MetadataCacheLimits,
   topics: HashMap<String, TopicCacheContract>,
@@ -190,6 +193,7 @@ struct TopicCacheContract {
   num_writers: u32,
   metadata_window_size: Duration,
   metadata_cache_max_age: Duration,
+  max_metadata_publication_lag: Duration,
 }
 
 impl MetadataCacheConfig {
@@ -247,6 +251,14 @@ impl MetadataCacheConfig {
       max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
       max_entry_items: DEFAULT_MAX_ENTRY_ITEMS,
     };
+    let seal_clock_skew = broker.metadata_seal_max_clock_skew.as_ref().map_or(
+      DEFAULT_SEAL_MAX_CLOCK_SKEW,
+      ProtoDurationExt::to_time_duration,
+    );
+    ensure!(
+      seal_clock_skew.is_positive(),
+      "metadata seal clock skew must be positive"
+    );
     if let Some(flags) = feature_flags {
       MetadataCacheLimits::from_flags(flags, limits, coalescing_window)?;
     }
@@ -259,6 +271,7 @@ impl MetadataCacheConfig {
         RECOVERY_CACHE_MAX_BYTES_FEATURE_FLAG,
         DEFAULT_RECOVERY_CACHE_MAX_BYTES,
       )?,
+      seal_clock_skew,
       coalescing_window,
       limits,
       topics,
@@ -308,6 +321,10 @@ impl TopicCacheContract {
       num_writers: topic.num_writers,
       metadata_window_size: topic_metadata_window_size(topic)?,
       metadata_cache_max_age,
+      max_metadata_publication_lag: topic.max_metadata_publication_lag.as_ref().map_or(
+        DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+        ProtoDurationExt::to_time_duration,
+      ),
     })
   }
 
@@ -331,8 +348,10 @@ pub struct MetadataCache {
   last_valid_limits: Mutex<WatchedFeatureFlags<MetadataCacheLimits>>,
   eventual_tail_entries: Cache<CacheKey, Arc<CacheEntry>>,
   eventual_recovery_entries: Cache<CacheKey, Arc<CacheEntry>>,
+  strong_sealed_entries: Cache<CacheKey, Arc<CacheEntry>>,
   // Registration is synchronous and short-lived; refills run outside this lock.
   in_flight: Mutex<HashMap<CacheKey, Arc<PendingRefill>>>,
+  strong_suffix_in_flight: Mutex<HashMap<StrongSuffixKey, Arc<PendingRefill>>>,
   active_waiters: Arc<AtomicUsize>,
   active_refills: Arc<AtomicUsize>,
   tail_retained_metrics: RetainedCacheMetrics,
@@ -355,6 +374,9 @@ struct MetadataCacheMetrics {
   tail_refills: prometheus::IntCounter,
   recovery_baselines: prometheus::IntCounter,
   recovery_seals: prometheus::IntCounter,
+  strong_sealed_installs: prometheus::IntCounter,
+  strong_sealed_reuses: prometheus::IntCounter,
+  strong_suffix_queries: prometheus::IntCounter,
   invalidations: prometheus::IntCounter,
   evictions: prometheus::IntCounter,
   failures: prometheus::IntCounter,
@@ -369,6 +391,8 @@ struct MetadataCacheMetrics {
   recovery_entries: prometheus::IntGauge,
   tail_retained_bytes: prometheus::IntGauge,
   recovery_retained_bytes: prometheus::IntGauge,
+  strong_sealed_entries: prometheus::IntGauge,
+  strong_sealed_retained_bytes: prometheus::IntGauge,
 }
 
 impl MetadataCacheMetrics {
@@ -382,6 +406,9 @@ impl MetadataCacheMetrics {
       tail_refills: scope.counter("tail_refills_total"),
       recovery_baselines: scope.counter("recovery_baselines_total"),
       recovery_seals: scope.counter("recovery_seals_total"),
+      strong_sealed_installs: scope.counter("strong_sealed_installs_total"),
+      strong_sealed_reuses: scope.counter("strong_sealed_reuses_total"),
+      strong_suffix_queries: scope.counter("strong_suffix_queries_total"),
       invalidations: scope.counter("invalidations_total"),
       evictions: scope.counter("evictions_total"),
       failures: scope.counter("failures_total"),
@@ -396,6 +423,8 @@ impl MetadataCacheMetrics {
       recovery_entries: scope.gauge("recovery_entries"),
       tail_retained_bytes: scope.gauge("tail_retained_bytes"),
       recovery_retained_bytes: scope.gauge("recovery_retained_bytes"),
+      strong_sealed_entries: scope.gauge("strong_sealed_entries"),
+      strong_sealed_retained_bytes: scope.gauge("strong_sealed_retained_bytes"),
     }
   }
 }
@@ -438,12 +467,12 @@ impl RetainedCacheMetrics {
   fn record_eviction(&self, retained_bytes: u32) {
     let _ = self
       .entries
-      .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |entries| {
+      .try_update(Ordering::Relaxed, Ordering::Relaxed, |entries| {
         Some(entries.saturating_sub(1))
       });
     let _ = self
       .retained_bytes
-      .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
+      .try_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
         Some(bytes.saturating_sub(u64::from(retained_bytes)))
       });
     self.record_gauges();
@@ -481,6 +510,9 @@ pub struct MetadataCacheSnapshot {
   pub recovery_entry_count: u64,
   pub recovery_retained_bytes: u64,
   pub recovery_byte_budget: u64,
+  pub strong_sealed_entry_count: u64,
+  pub strong_sealed_retained_bytes: u64,
+  pub strong_sealed_byte_budget: u64,
   pub tail_oldest_entry_age_seconds: Option<u64>,
   pub recovery_oldest_entry_age_seconds: Option<u64>,
   pub in_flight_refills: usize,
@@ -538,6 +570,10 @@ impl MetadataCache {
   ) -> Self {
     let initial_limits = WatchedFeatureFlags::new(feature_flags, Arc::new(config.limits));
     let metrics = MetadataCacheMetrics::new(metrics_scope);
+    let strong_sealed_byte_budget = config
+      .tail_max_bytes
+      .saturating_div(2)
+      .saturating_add(config.recovery_max_bytes.saturating_div(2));
     let tail_retained_metrics = RetainedCacheMetrics::new(
       metrics.tail_entries.clone(),
       metrics.tail_retained_bytes.clone(),
@@ -545,7 +581,11 @@ impl MetadataCache {
     let tail_evictions = metrics.evictions.clone();
     let tail_eviction_metrics = tail_retained_metrics.clone();
     let eventual_tail_entries = Cache::builder()
-      .max_capacity(config.tail_max_bytes)
+      .max_capacity(
+        config
+          .tail_max_bytes
+          .saturating_sub(config.tail_max_bytes / 2),
+      )
       .time_to_idle(CACHE_IDLE_TTL)
       .weigher(|_key: &CacheKey, entry: &Arc<CacheEntry>| entry.retained_bytes)
       .eviction_listener(move |_key, entry, cause| {
@@ -562,7 +602,11 @@ impl MetadataCache {
     let recovery_evictions = metrics.evictions.clone();
     let recovery_eviction_metrics = recovery_retained_metrics.clone();
     let eventual_recovery_entries = Cache::builder()
-      .max_capacity(config.recovery_max_bytes)
+      .max_capacity(
+        config
+          .recovery_max_bytes
+          .saturating_sub(config.recovery_max_bytes / 2),
+      )
       .time_to_idle(CACHE_IDLE_TTL)
       .weigher(|_key: &CacheKey, entry: &Arc<CacheEntry>| entry.retained_bytes)
       .eviction_listener(move |_key, entry, cause| {
@@ -572,6 +616,17 @@ impl MetadataCache {
         recovery_eviction_metrics.record_eviction(entry.retained_bytes);
       })
       .build();
+    let strong_evictions = metrics.evictions.clone();
+    let strong_sealed_entries = Cache::builder()
+      .max_capacity(strong_sealed_byte_budget)
+      .time_to_idle(CACHE_IDLE_TTL)
+      .weigher(|_key: &CacheKey, entry: &Arc<CacheEntry>| entry.retained_bytes)
+      .eviction_listener(move |_key, _entry, cause| {
+        if cause.was_evicted() {
+          strong_evictions.inc();
+        }
+      })
+      .build();
     Self {
       metadata_store,
       time_provider: Arc::new(SystemTimeProvider),
@@ -579,7 +634,9 @@ impl MetadataCache {
       config,
       eventual_tail_entries,
       eventual_recovery_entries,
+      strong_sealed_entries,
       in_flight: Mutex::new(HashMap::new()),
+      strong_suffix_in_flight: Mutex::new(HashMap::new()),
       active_waiters: Arc::new(AtomicUsize::new(0)),
       active_refills: Arc::new(AtomicUsize::new(0)),
       tail_retained_metrics,
@@ -607,7 +664,7 @@ impl MetadataCache {
   fn try_admit_refill(&self, limit: usize) -> Result<RefillAdmission> {
     self
       .active_refills
-      .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
+      .try_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
         (active < limit).then_some(active + 1)
       })
       .map_err(|_| {
@@ -642,10 +699,23 @@ impl MetadataCache {
     let snapshot = MetadataCacheSnapshot {
       tail_entry_count: self.eventual_tail_entries.entry_count(),
       tail_retained_bytes: self.eventual_tail_entries.weighted_size(),
-      tail_byte_budget: self.config.tail_max_bytes,
+      tail_byte_budget: self
+        .config
+        .tail_max_bytes
+        .saturating_sub(self.config.tail_max_bytes / 2),
       recovery_entry_count: self.eventual_recovery_entries.entry_count(),
       recovery_retained_bytes: self.eventual_recovery_entries.weighted_size(),
-      recovery_byte_budget: self.config.recovery_max_bytes,
+      recovery_byte_budget: self
+        .config
+        .recovery_max_bytes
+        .saturating_sub(self.config.recovery_max_bytes / 2),
+      strong_sealed_entry_count: self.strong_sealed_entries.entry_count(),
+      strong_sealed_retained_bytes: self.strong_sealed_entries.weighted_size(),
+      strong_sealed_byte_budget: self
+        .config
+        .tail_max_bytes
+        .saturating_div(2)
+        .saturating_add(self.config.recovery_max_bytes.saturating_div(2)),
       tail_oldest_entry_age_seconds: oldest_entry_age_seconds(
         &self.eventual_tail_entries,
         self.time_provider.now(),
@@ -654,7 +724,11 @@ impl MetadataCache {
         &self.eventual_recovery_entries,
         self.time_provider.now(),
       ),
-      in_flight_refills: self.in_flight.lock().len(),
+      in_flight_refills: self
+        .in_flight
+        .lock()
+        .len()
+        .saturating_add(self.strong_suffix_in_flight.lock().len()),
       active_waiters: self.active_waiters.load(Ordering::Relaxed),
       available_refill_permits: self
         .limits()
@@ -671,6 +745,15 @@ impl MetadataCache {
     // needs a maintenance driver so its retained-entry metrics converge without an admin read.
     self.eventual_tail_entries.run_pending_tasks().await;
     self.eventual_recovery_entries.run_pending_tasks().await;
+    self.strong_sealed_entries.run_pending_tasks().await;
+    self
+      .metrics
+      .strong_sealed_entries
+      .set(i64::try_from(self.strong_sealed_entries.entry_count()).unwrap_or(i64::MAX));
+    self
+      .metrics
+      .strong_sealed_retained_bytes
+      .set(i64::try_from(self.strong_sealed_entries.weighted_size()).unwrap_or(i64::MAX));
     self.tail_retained_metrics.record_exact(
       self.eventual_tail_entries.entry_count(),
       self.eventual_tail_entries.weighted_size(),
@@ -723,6 +806,7 @@ impl MetadataCache {
         response_limit,
         limits.max_response_items,
         entry.retained_coverage,
+        entry.retained_strong_coverage,
       ) {
         Ok(response) => response,
         Err(error) => {
@@ -770,6 +854,50 @@ impl MetadataCache {
     specification: ReadSpecification,
   ) -> Result<LoadedCacheEntry> {
     loop {
+      if specification.consistency == StoreConsistency::Strong
+        && specification.requested_seal_before.is_some()
+        && let Some(entry) = self.strong_sealed_entries.get(&specification.key).await
+        && entry.covers(&specification)
+        && let (Some(stored_bound), Some(sealed_at)) = (entry.sealed_before, entry.sealed_at)
+      {
+        let safe_at_observation = SnowflakeId::minimum_for_timestamp(
+          sealed_at.saturating_sub(
+            specification.requested_seal_horizon.max(
+              specification
+                .topic
+                .max_metadata_publication_lag
+                .saturating_add(self.config.seal_clock_skew),
+            ),
+          ),
+        );
+        let bound = stored_bound
+          .min(specification.requested_seal_before.expect("seal requested"))
+          .min(safe_at_observation);
+        if specification
+          .min_snowflake()
+          .is_none_or(|floor| floor < bound)
+        {
+          self.metrics.strong_sealed_reuses.inc();
+          if specification
+            .window_end_snowflake()
+            .is_some_and(|window_end| bound < window_end)
+          {
+            let entry = self
+              .coalesced_strong_suffix(&specification, entry, bound)
+              .await?;
+            return Ok(LoadedCacheEntry {
+              entry,
+              retained_coverage: false,
+              retained_strong_coverage: true,
+            });
+          }
+          return Ok(LoadedCacheEntry {
+            entry,
+            retained_coverage: false,
+            retained_strong_coverage: true,
+          });
+        }
+      }
       // Strong reads intentionally bypass retained data. Eventual entries are usable only when
       // their refill floor and observation age cover this caller's request.
       let entries = self.eventual_entries(specification.coverage);
@@ -800,6 +928,7 @@ impl MetadataCache {
           return Ok(LoadedCacheEntry {
             entry,
             retained_coverage: true,
+            retained_strong_coverage: false,
           });
         }
         debug!(
@@ -817,16 +946,179 @@ impl MetadataCache {
       }
 
       let (pending, _waiter) = self.join_or_start_refill(&specification)?;
-      let entry = pending.wait().await?;
+      let mut entry = pending.wait().await?;
       if entry.covers(&specification) {
+        if specification.consistency == StoreConsistency::Strong
+          && let Some(requested) = specification.requested_seal_before
+        {
+          let sealed_at = entry
+            .sealed_at
+            .ok_or_else(|| anyhow!("strong refill missing pre-scan seal proof time"))?;
+          let safe_at_observation = SnowflakeId::minimum_for_timestamp(
+            sealed_at.saturating_sub(
+              specification.requested_seal_horizon.max(
+                specification
+                  .topic
+                  .max_metadata_publication_lag
+                  .saturating_add(self.config.seal_clock_skew),
+              ),
+            ),
+          );
+          let bound = entry
+            .sealed_before
+            .unwrap_or(requested)
+            .min(requested)
+            .min(safe_at_observation);
+          let seal = specification
+            .min_snowflake()
+            .is_none_or(|floor| floor < bound);
+          entry = Arc::new(CacheEntry {
+            refill_floor: entry.refill_floor,
+            observed_at: entry.observed_at,
+            sealed_before: seal.then_some(bound),
+            sealed_at: seal.then_some(sealed_at),
+            retained_bytes: entry.retained_bytes,
+            generation: entry.generation,
+            prefix_segments: entry.prefix_segments.clone(),
+            segments: Arc::clone(&entry.segments),
+          });
+        }
         return Ok(LoadedCacheEntry {
           entry,
           retained_coverage: false,
+          retained_strong_coverage: false,
         });
       }
       // A worker may have captured its request before this waiter joined. Retry so a narrower
       // Tail bound starts a refill that covers the caller instead of returning partial metadata.
     }
+  }
+
+  async fn coalesced_strong_suffix(
+    self: &Arc<Self>,
+    specification: &ReadSpecification,
+    prefix: Arc<CacheEntry>,
+    seal_before: SnowflakeId,
+  ) -> Result<Arc<CacheEntry>> {
+    let floor = specification
+      .min_snowflake()
+      .map_or(seal_before, |floor| floor.max(seal_before));
+    let key = (
+      specification.key.clone(),
+      prefix.generation,
+      seal_before.as_u64(),
+      floor.as_u64(),
+    );
+    let limits = self.limits();
+    let (pending, _waiter) = {
+      let mut in_flight = self.strong_suffix_in_flight.lock();
+      if let Some(pending) = in_flight.get(&key)
+        && !pending.is_complete()
+      {
+        let waiter = pending.try_add_waiter(
+          Arc::clone(&self.active_waiters),
+          self.metrics.active_waiters.clone(),
+          limits.max_waiters_per_key,
+          limits.max_waiters,
+        )?;
+        (Arc::clone(pending), waiter)
+      } else {
+        let pending = Arc::new(PendingRefill::new(specification));
+        let waiter = pending.try_add_waiter(
+          Arc::clone(&self.active_waiters),
+          self.metrics.active_waiters.clone(),
+          limits.max_waiters_per_key,
+          limits.max_waiters,
+        )?;
+        in_flight.insert(key.clone(), Arc::clone(&pending));
+        let cache = Arc::clone(self);
+        let request = specification.clone();
+        let worker = Arc::clone(&pending);
+        tokio::spawn(async move {
+          let result = match cache.try_admit_refill(cache.limits().max_refills) {
+            Ok(permit) => {
+              cache.metrics.active_refills.inc();
+              let result = tokio::time::timeout(
+                cache.limits().request_timeout,
+                cache.refill_strong_suffix(&request, prefix, seal_before),
+              )
+              .await
+              .unwrap_or_else(|_| {
+                Err(anyhow!(MetadataCacheOverload {
+                  reason: MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REQUEST_TIMEOUT,
+                  message: "metadata cache suffix refill timed out",
+                }))
+              });
+              cache.metrics.active_refills.dec();
+              drop(permit);
+              result
+            },
+            Err(error) => Err(error),
+          };
+          worker.complete(result);
+          let mut in_flight = cache.strong_suffix_in_flight.lock();
+          if in_flight
+            .get(&key)
+            .is_some_and(|pending| Arc::ptr_eq(pending, &worker))
+          {
+            in_flight.remove(&key);
+          }
+        });
+        (pending, waiter)
+      }
+    };
+    pending.wait().await
+  }
+
+  async fn refill_strong_suffix(
+    &self,
+    specification: &ReadSpecification,
+    prefix: Arc<CacheEntry>,
+    seal_before: SnowflakeId,
+  ) -> Result<Arc<CacheEntry>> {
+    let min_snowflake = Some(
+      specification
+        .min_snowflake()
+        .map_or(seal_before, |floor| floor.max(seal_before)),
+    );
+    self.metrics.strong_suffix_queries.inc();
+    self.metrics.storage_queries.inc();
+    let mut suffix = self
+      .metadata_store
+      .scan_window_from_snowflake(
+        &specification.window,
+        min_snowflake,
+        StoreConsistency::Strong,
+      )
+      .await?;
+    suffix.retain(|segment| segment.snowflake_id >= seal_before);
+    suffix.sort_by_key(|segment| segment.snowflake_id);
+    let prefix_len = prefix
+      .segments
+      .partition_point(|segment| segment.snowflake_id < seal_before);
+    ensure!(
+      prefix_len.saturating_add(suffix.len()) <= self.limits().max_entry_items,
+      MetadataCacheOverload {
+        reason: MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_ENTRY_ITEMS,
+        message: "metadata cache overloaded: cache generation exceeds the configured item limit",
+      }
+    );
+    let retained_bytes = prefix
+      .retained_bytes
+      .saturating_add(estimate_retained_bytes(&suffix));
+    Ok(Arc::new(CacheEntry {
+      refill_floor: prefix.refill_floor,
+      observed_at: self.time_provider.now(),
+      sealed_before: Some(seal_before),
+      sealed_at: prefix.sealed_at,
+      retained_bytes,
+      generation: self
+        .generation
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1),
+      prefix_segments: Some((Arc::clone(&prefix.segments), prefix_len)),
+      segments: suffix.into(),
+    }))
   }
 
   fn join_or_start_refill(
@@ -957,14 +1249,16 @@ impl MetadataCache {
     let min_snowflake = specification.min_snowflake();
     debug!(
       "broker metadata cache refill: topic={}, window_start={}, consistency={:?}, coverage={:?}, \
-       min_snowflake={:?}",
+       min_snowflake={:?}, max_metadata_publication_lag={}",
       specification.window.topic,
       specification.window.window_start_unix_seconds,
       specification.consistency,
       specification.coverage,
       min_snowflake.map(SnowflakeId::as_u64),
+      specification.topic.max_metadata_publication_lag,
     );
     self.metrics.storage_queries.inc();
+    let scan_started_at = self.time_provider.now();
     let mut segments = self
       .metadata_store
       .scan_window_from_snowflake(
@@ -981,14 +1275,34 @@ impl MetadataCache {
         message: "metadata cache overloaded: cache generation exceeds the configured item limit",
       }
     );
+    let observed_at = self.time_provider.now();
+    let sealed_before = if specification.consistency == StoreConsistency::Strong {
+      specification.requested_seal_before.map(|requested| {
+        requested.min(SnowflakeId::minimum_for_timestamp(
+          scan_started_at.saturating_sub(
+            specification.requested_seal_horizon.max(
+              specification
+                .topic
+                .max_metadata_publication_lag
+                .saturating_add(self.config.seal_clock_skew),
+            ),
+          ),
+        ))
+      })
+    } else {
+      None
+    };
     let entry = Arc::new(CacheEntry {
       refill_floor: min_snowflake,
-      observed_at: self.time_provider.now(),
+      observed_at,
+      sealed_before,
+      sealed_at: (specification.consistency == StoreConsistency::Strong).then_some(scan_started_at),
       retained_bytes: estimate_retained_bytes(&segments),
       generation: self
         .generation
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1),
+      prefix_segments: None,
       segments: segments.into(),
     });
     // A strong read establishes no reusable eventual observation. Both eventual coverage modes
@@ -1017,6 +1331,36 @@ impl MetadataCache {
             .record_insert(entry.retained_bytes);
         },
       }
+    } else if let Some(bound) = sealed_before
+      && specification
+        .min_snowflake()
+        .is_none_or(|floor| floor < bound)
+      && specification.window_end_snowflake().is_some()
+    {
+      self.metrics.strong_sealed_installs.inc();
+      let mut sealed_segments = entry
+        .segments
+        .iter()
+        .filter(|segment| segment.snowflake_id < bound)
+        .cloned()
+        .collect::<Vec<_>>();
+      sealed_segments.shrink_to_fit();
+      self
+        .strong_sealed_entries
+        .insert(
+          specification.key,
+          Arc::new(CacheEntry {
+            refill_floor: entry.refill_floor,
+            observed_at,
+            sealed_before,
+            sealed_at: entry.sealed_at,
+            retained_bytes: estimate_retained_bytes(&sealed_segments),
+            generation: entry.generation,
+            prefix_segments: None,
+            segments: sealed_segments.into(),
+          }),
+        )
+        .await;
     }
     Ok(entry)
   }
@@ -1136,6 +1480,15 @@ impl MetadataCache {
       coverage,
       partitions: partition_ids,
       min_by_partition,
+      requested_seal_before: request.requested_seal_before.map(SnowflakeId),
+      requested_seal_horizon: request.requested_seal_horizon_ms.map_or(
+        Ok(Duration::ZERO),
+        |milliseconds| {
+          i64::try_from(milliseconds)
+            .map(Duration::milliseconds)
+            .map_err(|_| anyhow!("requested metadata seal horizon is too large"))
+        },
+      )?,
     })
   }
 }
@@ -1143,6 +1496,8 @@ impl MetadataCache {
 //
 // CacheKey
 //
+
+type StrongSuffixKey = (CacheKey, u64, u64, u64);
 
 /// Identifies data that can share a storage scan; caller-specific bounds stay in
 /// `ReadSpecification`.
@@ -1190,6 +1545,8 @@ struct ReadSpecification {
   coverage: ReadCoverage,
   partitions: BTreeSet<u32>,
   min_by_partition: Option<HashMap<u32, SnowflakeId>>,
+  requested_seal_before: Option<SnowflakeId>,
+  requested_seal_horizon: Duration,
 }
 
 impl ReadSpecification {
@@ -1199,6 +1556,17 @@ impl ReadSpecification {
       .as_ref()
       .and_then(|bounds| bounds.values().copied().min())
   }
+
+  fn window_end_snowflake(&self) -> Option<SnowflakeId> {
+    OffsetDateTime::from_unix_timestamp(
+      self
+        .window
+        .window_start_unix_seconds
+        .saturating_add(self.topic.metadata_window_size.whole_seconds()),
+    )
+    .ok()
+    .map(SnowflakeId::minimum_for_timestamp)
+  }
 }
 
 struct CacheEntry {
@@ -1206,8 +1574,11 @@ struct CacheEntry {
   // lowest requested partition bound.
   refill_floor: Option<SnowflakeId>,
   observed_at: OffsetDateTime,
+  sealed_before: Option<SnowflakeId>,
+  sealed_at: Option<OffsetDateTime>,
   retained_bytes: u32,
   generation: u64,
+  prefix_segments: Option<(Arc<[SegmentMetadata]>, usize)>,
   segments: Arc<[SegmentMetadata]>,
 }
 
@@ -1233,6 +1604,7 @@ fn oldest_entry_age_seconds(
 struct LoadedCacheEntry {
   entry: Arc<CacheEntry>,
   retained_coverage: bool,
+  retained_strong_coverage: bool,
 }
 
 impl CacheEntry {
@@ -1458,12 +1830,18 @@ fn response_from_entry(
   response_limit: u64,
   max_response_items: usize,
   retained_coverage: bool,
+  retained_strong_coverage: bool,
 ) -> Result<ReadMetadataWindowResponse> {
   // Shared entries contain complete segments. Project them here so one caller cannot observe
   // partitions or Tail rows outside the coverage it requested.
   let mut segments = Vec::new();
   let mut response_bytes = 0_u64;
-  for segment in entry.segments.iter() {
+  for segment in entry
+    .prefix_segments
+    .iter()
+    .flat_map(|(segments, prefix_len)| segments[.. *prefix_len].iter())
+    .chain(entry.segments.iter())
+  {
     if let Some(min_snowflake) = specification.min_snowflake()
       && segment.snowflake_id < min_snowflake
     {
@@ -1521,6 +1899,14 @@ fn response_from_entry(
         refill_floor: entry.refill_floor.map(SnowflakeId::as_u64),
         generation: entry.generation,
         retained_coverage,
+        sealed_before: entry.sealed_before.map(SnowflakeId::as_u64),
+        sealed_at_unix_ms: entry
+          .sealed_before
+          .and(entry.sealed_at)
+          .and_then(|observed_at| {
+            i64::try_from(observed_at.unix_timestamp_nanos().div_euclid(1_000_000)).ok()
+          }),
+        retained_strong_coverage,
         segments,
         ..Default::default()
       },

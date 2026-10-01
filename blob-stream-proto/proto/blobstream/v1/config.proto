@@ -84,6 +84,10 @@ message BrokerConfig {
   // Lower bound for the adaptive flush delay. Default when unset: half the current effective
   // flush_max_delay. Runtime max-delay overrides remain the upper bound.
   google.protobuf.Duration adaptive_flush_max_delay_floor = 19 [(validate.rules).duration.gt = {}];
+
+  // Broker clock-skew budget used to seal strongly observed metadata. Defaults to 10 ms; set
+  // this to the monitored deployment bound if clocks may differ by more.
+  google.protobuf.Duration metadata_seal_max_clock_skew = 20 [(validate.rules).duration.gt = {}];
 }
 
 // Filesystem paths used to reload broker feature flags.

@@ -11,11 +11,11 @@ compressed segment blobs, publish metadata indexes, and serve consumer metadata 
 - Ordering and sequence progress are per virtual partition. There is no global or cross-partition
   ordering guarantee.
 - Brokers have no local durable storage. DynamoDB stores metadata and leases; blob storage holds
-  immutable segment payloads. Consumer bootstrap requires broker discovery. All metadata queries
-  and blob-range reads route through local brokers; eventual `Tail` and `FullRecovery` metadata
-  requests can use retained cache coverage. Direct metadata storage is the default fallback for an
-  unusable broker response except exhausted DynamoDB metadata throttling; consumers can disable
-  metadata fallback with a live feature flag.
+  immutable segment payloads. Consumer bootstrap requires broker discovery. All metadata queries and
+  blob-range reads route through local brokers; eventual `Tail` and `FullRecovery` metadata requests
+  can use retained cache coverage, while strong reads can reuse a proven sealed prefix. Direct
+  metadata storage is the default fallback for an unusable broker response except exhausted DynamoDB
+  metadata throttling; consumers can disable metadata fallback with a live feature flag.
 - New consumer groups begin in the current metadata window. Resumed partitions recover from their
   committed source checkpoint while it remains within retention.
 - Consumers and brokers require a shared, accurate clock. See the [FAQ](../faq.md#what-time-source-is-required-to-operate-blob-stream-correctly).

@@ -231,7 +231,7 @@ impl ProducerPartitionLeaseStore for TransientHeartbeatLeaseStore {
   ) -> Result<LeaseHeartbeatOutcome> {
     if self
       .heartbeat_failures_remaining
-      .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+      .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
         remaining.checked_sub(1)
       })
       .is_ok()
@@ -466,7 +466,7 @@ fn ownership_changes_with_membership() {
     address: "10.0.0.2:8080".into(),
   }]);
   let owned_after_move = WriteEngineImpl::owned_virtual_partitions(&topics, 0, "node-a", &solo_b);
-  assert!(owned_after_move.is_empty());
+  assert_eq!(owned_after_move, Vec::new());
 
   let owned_empty = WriteEngineImpl::owned_virtual_partitions(
     &topics,
@@ -474,7 +474,7 @@ fn ownership_changes_with_membership() {
     "node-a",
     &BrokerMembership::new(Vec::new()),
   );
-  assert!(owned_empty.is_empty());
+  assert_eq!(owned_empty, Vec::new());
 }
 
 #[test]
@@ -770,7 +770,7 @@ async fn terminal_release_outcomes_retire_unassigned_partition_state() {
       )
       .await;
     }
-    assert!(state.lock().partition_keys().is_empty());
+    assert_eq!(state.lock().partition_keys(), Vec::new());
     assert_eq!(lease_store_impl.release_calls.load(Ordering::Acquire), 1);
   }
 }

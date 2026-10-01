@@ -149,7 +149,7 @@ fn allocation_rejects_unassigned_partition_without_creating_state() {
     decision,
     AllocationTransitionDecision::NotAssigned
   ));
-  assert!(state.lock().partition_keys().is_empty());
+  assert_eq!(state.lock().partition_keys(), Vec::new());
 }
 
 #[test]

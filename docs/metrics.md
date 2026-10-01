@@ -53,8 +53,9 @@ Consumer bootstrap adds the `consumer` scope, then the reader and iterator add t
 | `metadata_recovery_scan_requests`, `metadata_recovery_scan_segments`, `metadata_recovery_scan_failures` | Counters | Metadata work and failures while replaying retained history. |
 | `metadata_recovery_scan_hits`, `metadata_recovery_scan_batches_read` | Counters | Recovery scans that returned any batch and the batches returned by them. |
 | `broker_metadata_offload_requests`, `broker_metadata_offload_deliveries`, `broker_metadata_offload_fallbacks` | Counters | Broker metadata RPCs attempted, validated broker responses delivered, and original direct queries retried after an unusable broker response. Exhausted storage throttling or a disabled direct-fallback flag can return without direct retry, so requests can exceed deliveries plus fallbacks. |
-| `mature_metadata_cache_reuses` | Counter | Per-partition mature metadata responses reused without a metadata query. |
-| `recovery_metadata_cache_entries`, `recovery_metadata_cache_retained_bytes` | Gauges | Current retained recovery cache entry count and bytes. |
+| `mature_metadata_cache_reuses`, `sealed_metadata_prefix_installs` | Counters | Per-partition mature windows or sealed Fast prefixes reused, and new sealed Fast prefixes installed. |
+| `metadata_queries_avoided_by_capacity` | Counter | Suffix or later planned metadata queries not issued because cached work fills prefetch capacity; already-prefetched Recovery queries are not counted. |
+| `mature_metadata_cache_entries`, `mature_metadata_cache_retained_bytes` | Gauges | Current retained complete recovery windows plus sealed Fast prefixes and their metadata bytes. |
 | `metadata_fast_scan_without_lower_bound` | Counter | Fast scans that could not use a derived metadata lower bound. |
 | `metadata_segments_deferred_by_visibility_delay` | Counter | Segment rows deferred by the eventual-read visibility maturity delay. Strong reads accept every validated row and do not increment this counter. |
 | `metadata_batches_scanned`, `metadata_batches_skipped_by_cursor` | Counters | Batches decoded from metadata and batches skipped because the committed cursor had already passed them. |
@@ -97,6 +98,7 @@ Broker metrics use `blob_stream_broker` with the component scopes below.
 | `requests_total`, `tail_hits_total`, `recovery_hits_total` | Counters | Metadata-cache RPCs and retained Tail or Full Recovery hits. |
 | `storage_queries_total` | Counter | Authoritative metadata-store queries started after coalescing, for both eventual and strong reads. |
 | `tail_refills_total`, `recovery_baselines_total`, `recovery_seals_total` | Counters | Tail refills and complete Full Recovery snapshots installed. Full Recovery is unpaged, so its baseline and final seal are recorded together. |
+| `strong_sealed_installs_total`, `strong_sealed_reuses_total`, `strong_suffix_queries_total` | Counters | Strong sealed prefixes installed, reused, and fresh open-window suffix queries after reuse. |
 | `invalidations_total`, `evictions_total` | Counters | Retained entries removed because they no longer satisfy a request and entries evicted by cache policy. |
 | `failures_total`, `overloads_total` | Counters | Rejected or failed metadata-cache reads and the subset caused by admission, size, timeout, or exhausted storage throttling. Reasons are in rate-limited logs and the typed broker response, not metric labels. |
 | `response_items_total`, `response_bytes_total` | Counters | Metadata segments and encoded metadata bytes returned in successful broker responses. |
@@ -104,6 +106,7 @@ Broker metrics use `blob_stream_broker` with the component scopes below.
 | `observation_age_seconds` | Histogram | Age of a retained hit. |
 | `active_waiters`, `active_refills` | Gauges | Requests currently waiting on refill work and refills holding concurrency permits. |
 | `tail_entries`, `recovery_entries`, `tail_retained_bytes`, `recovery_retained_bytes` | Gauges | Current retained entry count and weighted bytes for each cache. |
+| `strong_sealed_entries`, `strong_sealed_retained_bytes` | Gauges | Retained strong sealed entry count and weighted bytes, updated on cache maintenance. |
 
 These metrics have no topic, metadata-window, partition, or consumer-group labels. Inspect
 aggregate capacity and current admission state through `/admin/metadata-cache`.

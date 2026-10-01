@@ -2729,7 +2729,7 @@ async fn next_delivers_records_and_commit_renews() {
     .unwrap();
   let report = iterator.commit().await.unwrap();
   assert_eq!(report.renewed_partitions, vec![3]);
-  assert!(report.fenced_partitions.is_empty());
+  assert_eq!(report.fenced_partitions.len(), 0);
 
   let state = iterator.diagnostics.state_snapshot();
   let partition = local_partition(&state, 3);

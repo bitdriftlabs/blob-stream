@@ -49,6 +49,11 @@ failure modes and can be selected independently.
 
 Strong reads have no eventual-read visibility margin; the broker's metadata publication deadline
 and the consumer's configured `max_clock_skew` still apply to the Fast and checkpoint horizon.
+Set `BrokerConfig.metadata_seal_max_clock_skew` to at least the monitored maximum pairwise broker
+clock offset so a strong metadata scan cannot seal a prefix before a slower broker may publish it.
+It defaults to 10 ms when unset, must be positive, and requires a broker restart to change. An
+offset beyond this bound can cause a broker to certify incomplete metadata.
+
 Fenced writes retain a durable holder ID, lease epoch, and session ID in every producer lease row
 regardless of whether the mode is enabled.
 
@@ -61,9 +66,10 @@ Feature flags are local process controls. `TopicConfig.metadata_window_size` def
 metadata-key layout used by broker publication and consumer scans.
 `ConsumerIteratorBootstrapConfig.broker_discovery` is required. Consumers read metadata and raw
 blob ranges through brokers. Eventual `Tail` and `FullRecovery` metadata requests can use retained
-cache coverage, while strong reads are coalesced without retained cache. An unusable broker
-metadata response retries the original direct DynamoDB query, except an exhausted storage
-throttle, which is returned without direct fallback and delays the next prefetch retry. All failed
+cache coverage, while strong reads coalesce and can retain a proven sealed prefix. Open strong
+suffixes are re-queried. An unusable broker metadata response retries the original direct
+DynamoDB query, except an exhausted storage throttle, which is returned without direct fallback
+and delays the next prefetch retry. All failed
 prefetch reads use positive, capped exponential full-jitter backoff, including failures from direct
 storage. Any non-`NOT_FOUND` broker blob
 response or rejected payload retries the affected blob group directly from storage.
@@ -75,7 +81,7 @@ response or rejected payload retries the affected blob group directly from stora
 | Consumer assignment | `blob_stream_consumer_colocate_logical_partitions` | Live on active planner rebalance | Defaults off. When enabled, tries to assign all virtual partitions of a logical partition to the same consumer while retaining pod-first and within-pod virtual-partition balance. A change publishes a new assignment-plan version; disabling returns to the sticky policy. |
 | Broker metadata-cache admission | `blob_stream_broker_metadata_cache_max_waiters_per_key`, `blob_stream_broker_metadata_cache_max_waiters`, `blob_stream_broker_metadata_cache_max_refills`, `blob_stream_broker_metadata_cache_max_request_partitions`, `blob_stream_broker_metadata_cache_max_response_items`, `blob_stream_broker_metadata_cache_max_response_bytes`, `blob_stream_broker_metadata_cache_max_entry_items`, `blob_stream_broker_metadata_cache_request_timeout_ms` | Live on watched updates | Positive limits govern new requests and refills; limits are parsed at construction and only when flags change. Invalid snapshots retain the previous valid limits; removing a flag restores its unflagged default. Per-key waiters cannot exceed global waiters, refills cannot exceed 1024, and response bytes cannot exceed the 16 MiB transport cap. The request timeout accepts 1-60000 ms and must leave at least half its budget beyond the configured coalescing window. Downshifting refill concurrency rejects new work until active refills fall below the limit. |
 | Consumer broker metadata RPC | `blob_stream_consumer_broker_metadata_rpc_timeout_ms` | Live, per request | Overrides the configured seven-second default with 1-120000 ms; invalid values use the startup-configured timeout. |
-| Broker metadata-cache capacity | `blob_stream_broker_metadata_recovery_cache_max_bytes` | Restart the broker | Sets the retained Full Recovery cache byte budget at construction. |
+| Broker metadata-cache capacity | `blob_stream_broker_metadata_recovery_cache_max_bytes` | Restart the broker | Sets the Recovery share of the total metadata-cache budget at construction. Half of each configured Tail and Recovery budget goes to its eventual cache; the other halves fund the shared strong sealed-prefix cache. |
 | Broker blob-cache fetch admission | `blob_stream_broker_blob_cache_max_fetches` | Live on watched updates | Defaults to 32 distinct in-flight whole-object fetches; accepts 1-1024. An invalid value at startup prevents broker construction; invalid watched updates after startup retain the last valid cap. Removing the flag restores 32. Downshifts reject new distinct keys until active workers fall below the cap; requests for an already in-flight key still join that worker. |
 | Broker blob-cache startup | `blob_stream_broker_blob_cache_idle_ttl_ms` | Restart the broker | Sets positive idle retention for complete immutable blobs; absent means 10 seconds. Blob requests remain limited to 16 MiB; broker responses allow the effective live `max_segment_bytes` amount of requested compressed bytes, covering normal segment objects. The broker admits each object from its reported content length and current cgroup headroom before reading its body. Cgroup-aware memory admission can flush entries or disable cache admission without disabling direct consumer reads. |
 | Broker write path | `blob_stream_broker_flush_max_bytes`, `blob_stream_broker_flush_max_delay_ms`, `blob_stream_broker_max_segment_bytes`, `blob_stream_broker_adaptive_flush_max_delay_enabled`, `blob_stream_broker_adaptive_flush_max_delay_floor_ms` | Live | A time-due local partition always pulls every available buffered non-draining local topic section into bounded shared objects. Positive byte overrides and positive delay overrides no greater than `flush_max_delay` apply when the scheduler observes the watched update and rearm pending buffer deadlines; invalid values retain static configuration. Adaptive delay defaults on and may be disabled statically with `adaptive_flush_max_delay_enabled: false` or live with its watched flag. Its static or watched floor defaults to half the live maximum delay and must be positive and no greater than that maximum. Three consecutive split plans derive a proportional target from their extra objects, then reduce the delay by one quarter of the distance to it; three consecutive successful unsplit plans recover half the remaining headroom. Every adjustment requires a new three-plan streak, and failures or opposite outcomes reset the streak. Positive segment-cap overrides apply to future flush plans. Independently byte-triggered and lease-drain work remain local. |
@@ -171,14 +177,15 @@ mutations, never used as inputs to fencing, allocation, replay, or recovery.
 
 ### Metadata Cache State
 
-`/admin/metadata-cache` reports only aggregate cache state: Tail and Full Recovery entry counts,
-retained bytes and byte budgets, oldest retained-entry ages, in-flight refills, active waiters,
-available refill permits, and total failures. It intentionally contains no topic, window, or
-partition identifiers. Use sustained full byte budgets, eviction growth, exhausted refill permits,
-or overload failures to decide whether the configured cache limits need capacity or workload
-changes. Broker admission and size overloads fall back to a direct metadata scan; exhausted
-storage throttling instead backs off without a direct scan. Consult the broker's rate-limited
-failure logs to distinguish these cases; cache metrics do not label individual reasons.
+`/admin/metadata-cache` reports only aggregate cache state: eventual Tail, eventual Full Recovery,
+and strong sealed-prefix entry counts, retained bytes and byte budgets, oldest eventual-entry ages,
+in-flight refills (including strong suffix scans), active waiters, available refill permits, and
+total failures. It intentionally contains no topic, window, or partition identifiers. Use sustained
+full byte budgets, eviction growth, exhausted refill permits, or overload failures to decide whether
+the configured cache limits need capacity or workload changes. Broker admission and size overloads
+fall back to a direct metadata scan; exhausted storage throttling instead backs off without a direct
+scan. Consult the broker's rate-limited failure logs to distinguish these cases; cache metrics do
+not label individual reasons.
 
 ## Metrics
 

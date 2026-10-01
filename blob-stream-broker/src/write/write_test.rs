@@ -905,7 +905,7 @@ async fn produce_rejects_pending_and_foreign_membership_without_creating_a_lease
     engine.produce_batch(request()).await,
     Err(WriteError::NotLeaseHolder { .. })
   ));
-  assert!(engine.state.lock().partition_keys().is_empty());
+  assert_eq!(engine.state.lock().partition_keys(), Vec::new());
   assert!(lease_store.get_lease(&key).await?.is_none());
 
   membership_tx.send(BrokerMembership::new(Vec::new()))?;
@@ -914,7 +914,7 @@ async fn produce_rejects_pending_and_foreign_membership_without_creating_a_lease
     engine.produce_batch(request()).await,
     Err(WriteError::NotLeaseHolder { .. })
   ));
-  assert!(engine.state.lock().partition_keys().is_empty());
+  assert_eq!(engine.state.lock().partition_keys(), Vec::new());
   assert!(lease_store.get_lease(&key).await?.is_none());
 
   membership_tx.send(BrokerMembership::new(vec![BrokerNode {
@@ -926,7 +926,7 @@ async fn produce_rejects_pending_and_foreign_membership_without_creating_a_lease
     engine.produce_batch(request()).await,
     Err(WriteError::NotLeaseHolder { .. })
   ));
-  assert!(engine.state.lock().partition_keys().is_empty());
+  assert_eq!(engine.state.lock().partition_keys(), Vec::new());
   assert!(lease_store.get_lease(&key).await?.is_none());
 
   Ok(())
@@ -2906,7 +2906,7 @@ async fn buffers_until_size_rollover() -> Result<()> {
       MetadataReadConsistency::Eventual,
     )
     .await?;
-  assert!(segments.is_empty());
+  assert_eq!(segments, Vec::new());
 
   let request = WriteRequest {
     topic: "telemetry".into(),
@@ -3973,15 +3973,15 @@ async fn same_partition_time_flushes_upload_in_parallel_and_publish_in_order() -
   assert!(!second.is_finished());
 
   let window = Window::for_timestamp(time_provider.now(), TimeDuration::seconds(60));
-  assert!(
+  assert_eq!(
     metadata_store
       .scan_window_from_snowflake(
         &window.key("telemetry"),
         None,
         MetadataReadConsistency::Eventual,
       )
-      .await?
-      .is_empty()
+      .await?,
+    Vec::new()
   );
 
   release_first.add_permits(1);
@@ -4086,15 +4086,15 @@ async fn failed_predecessor_prevents_successor_metadata_publication() -> Result<
   assert!(second.await?.is_err());
 
   let window = Window::for_timestamp(time_provider.now(), TimeDuration::seconds(60));
-  assert!(
+  assert_eq!(
     inner_metadata_store
       .scan_window_from_snowflake(
         &window.key("telemetry"),
         None,
         MetadataReadConsistency::Eventual,
       )
-      .await?
-      .is_empty()
+      .await?,
+    Vec::new()
   );
   Ok(())
 }

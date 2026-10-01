@@ -420,6 +420,10 @@ title: "blob-stream broker"
 						expr:         "sum(loop:$environment:blob_stream_broker:blob_stream_broker:metadata_cache:recovery_hits_total)"
 						legendFormat: "Recovery hits"
 					},
+					lib.#target & {
+						expr:         "sum(loop:$environment:blob_stream_broker:blob_stream_broker:metadata_cache:strong_sealed_reuses_total)"
+						legendFormat: "Strong sealed reuses"
+					},
 				]
 			},
 			lib.#panel & {
@@ -436,6 +440,14 @@ title: "blob-stream broker"
 					lib.#target & {
 						expr:         "sum(loop:$environment:blob_stream_broker:blob_stream_broker:metadata_cache:recovery_seals_total)"
 						legendFormat: "Recovery seals"
+					},
+					lib.#target & {
+						expr:         "sum(loop:$environment:blob_stream_broker:blob_stream_broker:metadata_cache:strong_sealed_installs_total)"
+						legendFormat: "Strong sealed installs"
+					},
+					lib.#target & {
+						expr:         "sum(loop:$environment:blob_stream_broker:blob_stream_broker:metadata_cache:strong_suffix_queries_total)"
+						legendFormat: "Strong suffix queries"
 					},
 				]
 			},
@@ -530,6 +542,10 @@ title: "blob-stream broker"
 						expr:         "sum(loop:$environment:blob_stream_broker:blob_stream_broker:metadata_cache:recovery_entries)"
 						legendFormat: "Recovery"
 					},
+					lib.#target & {
+						expr:         "sum(loop:$environment:blob_stream_broker:blob_stream_broker:metadata_cache:strong_sealed_entries)"
+						legendFormat: "Strong sealed"
+					},
 				]
 			},
 			lib.#panel & {
@@ -542,6 +558,10 @@ title: "blob-stream broker"
 					lib.#target & {
 						expr:         "sum(loop:$environment:blob_stream_broker:blob_stream_broker:metadata_cache:recovery_retained_bytes)"
 						legendFormat: "Recovery"
+					},
+					lib.#target & {
+						expr:         "sum(loop:$environment:blob_stream_broker:blob_stream_broker:metadata_cache:strong_sealed_retained_bytes)"
+						legendFormat: "Strong sealed"
 					},
 				]
 				#y_format: "bytes"

@@ -490,25 +490,33 @@ import "github.com/bitdriftlabs/dashboards/lib"
 			]
 		},
 		lib.#panel & {
-			title: "Mature Metadata Cache Reuses"
+			title: "Mature Metadata Cache Activity"
 			targets: [
 				lib.#target & {
 					expr:         "sum(loop:$environment:\(#metric_scope):consumer:reader:mature_metadata_cache_reuses)"
 					legendFormat: "Reuses"
 				},
+				lib.#target & {
+					expr:         "sum(loop:$environment:\(#metric_scope):consumer:reader:sealed_metadata_prefix_installs)"
+					legendFormat: "Sealed prefix installs"
+				},
+				lib.#target & {
+					expr:         "sum(loop:$environment:\(#metric_scope):consumer:reader:metadata_queries_avoided_by_capacity)"
+					legendFormat: "Queries deferred by capacity"
+				},
 			]
 		},
 		lib.#panel & {
-			title: "Recovery Metadata Cache Entries"
+			title: "Mature Metadata Cache Entries"
 			targets: [lib.#target & {
-				expr:         "sum(loop:$environment:\(#metric_scope):consumer:reader:recovery_metadata_cache_entries)"
+				expr:         "sum(loop:$environment:\(#metric_scope):consumer:reader:mature_metadata_cache_entries)"
 				legendFormat: "Entries"
 			}]
 		},
 		lib.#panel & {
-			title: "Recovery Metadata Cache Retained Bytes"
+			title: "Mature Metadata Cache Retained Bytes"
 			targets: [lib.#target & {
-				expr:         "sum(loop:$environment:\(#metric_scope):consumer:reader:recovery_metadata_cache_retained_bytes)"
+				expr:         "sum(loop:$environment:\(#metric_scope):consumer:reader:mature_metadata_cache_retained_bytes)"
 				legendFormat: "Metadata"
 			}]
 			#y_format: "bytes"

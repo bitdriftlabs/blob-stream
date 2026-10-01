@@ -9,14 +9,17 @@ coordination](consumer-coordination.md) for group ownership and commits.
 Consumer bootstrap requires broker discovery. Every planned metadata-window request and every
 grouped blob-range request route to the deterministically selected local broker. An eventual
 metadata request may use or refill a retained broker cache entry: `Tail` and `FullRecovery` coverage
-use separate caches. Strong metadata requests bypass retained coverage but still route through the
-broker to DynamoDB. A Fresh-only scan uses `FullRecovery` coverage for the current window because it
-has no checkpoint bound. An unavailable membership, broker failure, invalid response, non-storage
-overload, or timeout makes the consumer fail over to its original direct DynamoDB read. An exhausted
-DynamoDB Query throttle, reported by the broker as `STORAGE_THROTTLED`, does not fall back to
-another Query. The same rule applies to a direct metadata scan that exhausts its throttle budget.
-The live `blob_stream_consumer_broker_metadata_direct_fallback` flag defaults to true; disabling it
-returns broker metadata errors instead of retrying those requests directly. Direct-only scans are
+use separate caches. Strong metadata requests cannot reuse eventual coverage; they may reuse a
+complete sealed window or a sealed prefix from a prior strong observation. In an open window the
+broker reads the suffix from the inclusive seal boundary on every request (concurrent readers of the
+same prefix generation and suffix floor share an in-flight query). A Fresh-only scan uses
+`FullRecovery` coverage for the current window because it has no checkpoint bound. An unavailable
+membership, broker failure, invalid response, non-storage overload, or timeout makes the consumer
+fail over to its original direct DynamoDB read. An exhausted DynamoDB Query throttle, reported by
+the broker as `STORAGE_THROTTLED`, does not fall back to another Query. The same rule applies to a
+direct metadata scan that exhausts its throttle budget. The live
+`blob_stream_consumer_broker_metadata_direct_fallback` flag defaults to true; disabling it returns
+broker metadata errors instead of retrying those requests directly. Direct-only scans are
 unaffected. Prefetch backs off with a positive, capped full-jitter delay after every failed read;
 failed scans restore cursor and frontier state. Unknown or unspecified broker overload reasons
 retain the direct fallback when the flag is enabled.
@@ -65,15 +68,33 @@ A partition moves through these modes:
 2. **Recovering:** A resumed partition starts at the checkpoint window, clamped to retention, and
    scans chronologically to a captured current-window cutover. A usable checkpoint applies an
    inclusive overlap bound only to its first window; later windows are full scans. Recovery scans
-   at most 32 consecutive windows per pass.
+   at most 32 consecutive windows per pass, issuing up to eight independent uncached window
+   metadata queries concurrently while finalizing results in chronological order.
 3. **Fast:** After Fresh or Recovery reaches its cutover, the reader scans the bounded recent
    horizon where metadata may still be unpublished or invisible. Fast is an optimization and
    never replaces retained recovery for a resumed partition.
 
+The reader retains complete mature recovery windows and per-partition sealed Fast prefixes. A prefix
+`[window lower bound, sealed_before)` is installed only after a complete strong scan whose original
+observation proves the metadata publication deadline has passed; neither an eventual response nor
+elapsed time alone establishes that proof. The broker caps a requested seal using its
+publication-lag and clock-skew budget measured before the storage scan begins, even when the
+refill's first caller did not request a seal, and returns that original observation. Direct strong
+scans use the same pre-scan proof time. The reader also caps the seal at its pass-start Fast safety
+floor, validates broker proofs against its own horizon, and falls back to direct strong storage on
+an unusable broker response. Later Fast passes process cached batches before asking for the
+inclusive `[sealed_before, window end)` suffix; capacity admission can defer that query altogether.
+Cached prefixes preserve cursor, gap, visibility, and window ordering rules and do not certify an
+open suffix. Assignment changes, seeks, and windows leaving the Fast horizon discard their prefixes.
+The broker's strong cache has a byte budget and idle expiry; the consumer holds prefixes only for
+eligible Fast windows.
+
 A visibility deferral, a sequence discontinuity whose predecessor may still appear, or exhausted
-prefetch capacity blocks cursor progress at the earliest affected batch/window. A later batch
-cannot advance a partition cursor past that barrier. Failed metadata or blob reads restore the
-pass state so an undelivered batch is retried.
+prefetch capacity blocks cursor progress at the earliest affected batch/window. If concurrent
+Recovery scans expose a later sequence while an earlier window can still publish its predecessor,
+Recovery holds the later batch and promptly re-queries the oldest still-open window, clamped to the
+Recovery start, before advancing. Later batches cannot advance a partition cursor past that barrier.
+Failed metadata or blob reads restore the pass state so an undelivered batch is retried.
 
 ## Sonyflake Time Bounds And Clock Synchronization
 

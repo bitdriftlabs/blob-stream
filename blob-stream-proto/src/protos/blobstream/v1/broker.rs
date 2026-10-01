@@ -1247,6 +1247,10 @@ pub struct ReadMetadataWindowRequest {
     pub consistency: ::protobuf::EnumOrUnknown<MetadataReadConsistency>,
     // @@protoc_insertion_point(field:blobstream.v1.ReadMetadataWindowRequest.max_response_bytes)
     pub max_response_bytes: u64,
+    // @@protoc_insertion_point(field:blobstream.v1.ReadMetadataWindowRequest.requested_seal_before)
+    pub requested_seal_before: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.ReadMetadataWindowRequest.requested_seal_horizon_ms)
+    pub requested_seal_horizon_ms: ::std::option::Option<u64>,
     // message oneof groups
     pub coverage: ::std::option::Option<read_metadata_window_request::Coverage>,
     // special fields
@@ -1364,7 +1368,7 @@ impl ReadMetadataWindowRequest {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(6);
+        let mut fields = ::std::vec::Vec::with_capacity(8);
         let mut oneofs = ::std::vec::Vec::with_capacity(1);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "topic",
@@ -1399,6 +1403,16 @@ impl ReadMetadataWindowRequest {
             "max_response_bytes",
             |m: &ReadMetadataWindowRequest| { &m.max_response_bytes },
             |m: &mut ReadMetadataWindowRequest| { &mut m.max_response_bytes },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "requested_seal_before",
+            |m: &ReadMetadataWindowRequest| { &m.requested_seal_before },
+            |m: &mut ReadMetadataWindowRequest| { &mut m.requested_seal_before },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "requested_seal_horizon_ms",
+            |m: &ReadMetadataWindowRequest| { &m.requested_seal_horizon_ms },
+            |m: &mut ReadMetadataWindowRequest| { &mut m.requested_seal_horizon_ms },
         ));
         oneofs.push(read_metadata_window_request::Coverage::generated_oneof_descriptor_data());
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ReadMetadataWindowRequest>(
@@ -1437,6 +1451,12 @@ impl ::protobuf::Message for ReadMetadataWindowRequest {
                 56 => {
                     self.max_response_bytes = is.read_uint64()?;
                 },
+                64 => {
+                    self.requested_seal_before = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                72 => {
+                    self.requested_seal_horizon_ms = ::std::option::Option::Some(is.read_uint64()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -1460,6 +1480,12 @@ impl ::protobuf::Message for ReadMetadataWindowRequest {
         }
         if self.max_response_bytes != 0 {
             my_size += ::protobuf::rt::uint64_size(7, self.max_response_bytes);
+        }
+        if let Some(v) = self.requested_seal_before {
+            my_size += ::protobuf::rt::uint64_size(8, v);
+        }
+        if let Some(v) = self.requested_seal_horizon_ms {
+            my_size += ::protobuf::rt::uint64_size(9, v);
         }
         if let ::std::option::Option::Some(ref v) = self.coverage {
             match v {
@@ -1490,6 +1516,12 @@ impl ::protobuf::Message for ReadMetadataWindowRequest {
         }
         if self.max_response_bytes != 0 {
             os.write_uint64(7, self.max_response_bytes)?;
+        }
+        if let Some(v) = self.requested_seal_before {
+            os.write_uint64(8, v)?;
+        }
+        if let Some(v) = self.requested_seal_horizon_ms {
+            os.write_uint64(9, v)?;
         }
         if let ::std::option::Option::Some(ref v) = self.coverage {
             match v {
@@ -1524,6 +1556,8 @@ impl ::protobuf::Message for ReadMetadataWindowRequest {
         self.coverage = ::std::option::Option::None;
         self.coverage = ::std::option::Option::None;
         self.max_response_bytes = 0;
+        self.requested_seal_before = ::std::option::Option::None;
+        self.requested_seal_horizon_ms = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -1533,6 +1567,8 @@ impl ::protobuf::Message for ReadMetadataWindowRequest {
             window_start_unix_seconds: 0,
             consistency: ::protobuf::EnumOrUnknown::from_i32(0),
             max_response_bytes: 0,
+            requested_seal_before: ::std::option::Option::None,
+            requested_seal_horizon_ms: ::std::option::Option::None,
             coverage: ::std::option::Option::None,
             special_fields: ::protobuf::SpecialFields::new(),
         };
@@ -1741,6 +1777,12 @@ pub struct MetadataReadSuccess {
     pub retained_coverage: bool,
     // @@protoc_insertion_point(field:blobstream.v1.MetadataReadSuccess.segments)
     pub segments: ::std::vec::Vec<BrokerSegmentMetadata>,
+    // @@protoc_insertion_point(field:blobstream.v1.MetadataReadSuccess.sealed_before)
+    pub sealed_before: ::std::option::Option<u64>,
+    // @@protoc_insertion_point(field:blobstream.v1.MetadataReadSuccess.sealed_at_unix_ms)
+    pub sealed_at_unix_ms: ::std::option::Option<i64>,
+    // @@protoc_insertion_point(field:blobstream.v1.MetadataReadSuccess.retained_strong_coverage)
+    pub retained_strong_coverage: bool,
     // special fields
     // @@protoc_insertion_point(special_field:blobstream.v1.MetadataReadSuccess.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -1758,7 +1800,7 @@ impl MetadataReadSuccess {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(5);
+        let mut fields = ::std::vec::Vec::with_capacity(8);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "observed_at_unix_ms",
@@ -1784,6 +1826,21 @@ impl MetadataReadSuccess {
             "segments",
             |m: &MetadataReadSuccess| { &m.segments },
             |m: &mut MetadataReadSuccess| { &mut m.segments },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "sealed_before",
+            |m: &MetadataReadSuccess| { &m.sealed_before },
+            |m: &mut MetadataReadSuccess| { &mut m.sealed_before },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "sealed_at_unix_ms",
+            |m: &MetadataReadSuccess| { &m.sealed_at_unix_ms },
+            |m: &mut MetadataReadSuccess| { &mut m.sealed_at_unix_ms },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "retained_strong_coverage",
+            |m: &MetadataReadSuccess| { &m.retained_strong_coverage },
+            |m: &mut MetadataReadSuccess| { &mut m.retained_strong_coverage },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MetadataReadSuccess>(
             "MetadataReadSuccess",
@@ -1818,6 +1875,15 @@ impl ::protobuf::Message for MetadataReadSuccess {
                 42 => {
                     self.segments.push(is.read_message()?);
                 },
+                48 => {
+                    self.sealed_before = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                56 => {
+                    self.sealed_at_unix_ms = ::std::option::Option::Some(is.read_int64()?);
+                },
+                64 => {
+                    self.retained_strong_coverage = is.read_bool()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -1846,6 +1912,15 @@ impl ::protobuf::Message for MetadataReadSuccess {
             let len = value.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         };
+        if let Some(v) = self.sealed_before {
+            my_size += ::protobuf::rt::uint64_size(6, v);
+        }
+        if let Some(v) = self.sealed_at_unix_ms {
+            my_size += ::protobuf::rt::int64_size(7, v);
+        }
+        if self.retained_strong_coverage != false {
+            my_size += 1 + 1;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -1867,6 +1942,15 @@ impl ::protobuf::Message for MetadataReadSuccess {
         for v in &self.segments {
             ::protobuf::rt::write_message_field_with_cached_size(5, v, os)?;
         };
+        if let Some(v) = self.sealed_before {
+            os.write_uint64(6, v)?;
+        }
+        if let Some(v) = self.sealed_at_unix_ms {
+            os.write_int64(7, v)?;
+        }
+        if self.retained_strong_coverage != false {
+            os.write_bool(8, self.retained_strong_coverage)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -1889,6 +1973,9 @@ impl ::protobuf::Message for MetadataReadSuccess {
         self.generation = 0;
         self.retained_coverage = false;
         self.segments.clear();
+        self.sealed_before = ::std::option::Option::None;
+        self.sealed_at_unix_ms = ::std::option::Option::None;
+        self.retained_strong_coverage = false;
         self.special_fields.clear();
     }
 
@@ -1899,6 +1986,9 @@ impl ::protobuf::Message for MetadataReadSuccess {
             generation: 0,
             retained_coverage: false,
             segments: ::std::vec::Vec::new(),
+            sealed_before: ::std::option::Option::None,
+            sealed_at_unix_ms: ::std::option::Option::None,
+            retained_strong_coverage: false,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -3803,25 +3893,33 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     erage\x12P\n\x10partition_bounds\x18\x01\x20\x03(\x0b2%.blobstream.v1.Me\
     tadataPartitionBoundR\x0fpartitionBounds\"R\n\x1cFullRecoveryMetadataCov\
     erage\x122\n\x15virtual_partition_ids\x18\x01\x20\x03(\rR\x13virtualPart\
-    itionIds\"\xff\x02\n\x19ReadMetadataWindowRequest\x12\x14\n\x05topic\x18\
+    itionIds\"\xb0\x04\n\x19ReadMetadataWindowRequest\x12\x14\n\x05topic\x18\
     \x01\x20\x01(\tR\x05topic\x129\n\x19window_start_unix_seconds\x18\x02\
     \x20\x01(\x03R\x16windowStartUnixSeconds\x12H\n\x0bconsistency\x18\x03\
     \x20\x01(\x0e2&.blobstream.v1.MetadataReadConsistencyR\x0bconsistency\
     \x129\n\x04tail\x18\x05\x20\x01(\x0b2#.blobstream.v1.TailMetadataCoverag\
     eH\0R\x04tail\x12R\n\rfull_recovery\x18\x06\x20\x01(\x0b2+.blobstream.v1\
     .FullRecoveryMetadataCoverageH\0R\x0cfullRecovery\x12,\n\x12max_response\
-    _bytes\x18\x07\x20\x01(\x04R\x10maxResponseBytesB\n\n\x08coverage\"x\n\
-    \x15BrokerSegmentMetadata\x12!\n\x0csnowflake_id\x18\x01\x20\x01(\x04R\
-    \x0bsnowflakeId\x12<\n\x08metadata\x18\x02\x20\x01(\x0b2\x20.blobstream.\
-    v1.SegmentMetadataV1R\x08metadata\"\x8c\x02\n\x13MetadataReadSuccess\x12\
-    -\n\x13observed_at_unix_ms\x18\x01\x20\x01(\x03R\x10observedAtUnixMs\x12\
-    &\n\x0crefill_floor\x18\x02\x20\x01(\x04H\0R\x0brefillFloor\x88\x01\x01\
-    \x12\x1e\n\ngeneration\x18\x03\x20\x01(\x04R\ngeneration\x12+\n\x11retai\
-    ned_coverage\x18\x04\x20\x01(\x08R\x10retainedCoverage\x12@\n\x08segment\
-    s\x18\x05\x20\x03(\x0b2$.blobstream.v1.BrokerSegmentMetadataR\x08segment\
-    sB\x0f\n\r_refill_floor\"\xd0\x01\n\x13MetadataReadFailure\x12@\n\x06sta\
-    tus\x18\x01\x20\x01(\x0e2(.blobstream.v1.MetadataReadFailureStatusR\x06s\
-    tatus\x12#\n\rerror_message\x18\x02\x20\x01(\tR\x0cerrorMessage\x12R\n\
+    _bytes\x18\x07\x20\x01(\x04R\x10maxResponseBytes\x127\n\x15requested_sea\
+    l_before\x18\x08\x20\x01(\x04H\x01R\x13requestedSealBefore\x88\x01\x01\
+    \x12>\n\x19requested_seal_horizon_ms\x18\t\x20\x01(\x04H\x02R\x16request\
+    edSealHorizonMs\x88\x01\x01B\n\n\x08coverageB\x18\n\x16_requested_seal_b\
+    eforeB\x1c\n\x1a_requested_seal_horizon_ms\"x\n\x15BrokerSegmentMetadata\
+    \x12!\n\x0csnowflake_id\x18\x01\x20\x01(\x04R\x0bsnowflakeId\x12<\n\x08m\
+    etadata\x18\x02\x20\x01(\x0b2\x20.blobstream.v1.SegmentMetadataV1R\x08me\
+    tadata\"\xc8\x03\n\x13MetadataReadSuccess\x12-\n\x13observed_at_unix_ms\
+    \x18\x01\x20\x01(\x03R\x10observedAtUnixMs\x12&\n\x0crefill_floor\x18\
+    \x02\x20\x01(\x04H\0R\x0brefillFloor\x88\x01\x01\x12\x1e\n\ngeneration\
+    \x18\x03\x20\x01(\x04R\ngeneration\x12+\n\x11retained_coverage\x18\x04\
+    \x20\x01(\x08R\x10retainedCoverage\x12@\n\x08segments\x18\x05\x20\x03(\
+    \x0b2$.blobstream.v1.BrokerSegmentMetadataR\x08segments\x12(\n\rsealed_b\
+    efore\x18\x06\x20\x01(\x04H\x01R\x0csealedBefore\x88\x01\x01\x12.\n\x11s\
+    ealed_at_unix_ms\x18\x07\x20\x01(\x03H\x02R\x0esealedAtUnixMs\x88\x01\
+    \x01\x128\n\x18retained_strong_coverage\x18\x08\x20\x01(\x08R\x16retaine\
+    dStrongCoverageB\x0f\n\r_refill_floorB\x10\n\x0e_sealed_beforeB\x14\n\
+    \x12_sealed_at_unix_ms\"\xd0\x01\n\x13MetadataReadFailure\x12@\n\x06stat\
+    us\x18\x01\x20\x01(\x0e2(.blobstream.v1.MetadataReadFailureStatusR\x06st\
+    atus\x12#\n\rerror_message\x18\x02\x20\x01(\tR\x0cerrorMessage\x12R\n\
     \x0foverload_reason\x18\x03\x20\x01(\x0e2).blobstream.v1.MetadataReadOve\
     rloadReasonR\x0eoverloadReason\"\xa6\x01\n\x1aReadMetadataWindowResponse\
     \x12>\n\x07success\x18\x01\x20\x01(\x0b2\".blobstream.v1.MetadataReadSuc\
