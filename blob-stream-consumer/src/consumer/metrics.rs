@@ -25,8 +25,10 @@ pub(in crate::consumer) struct ConsumerReaderMetrics {
   broker_metadata_offload_deliveries: IntCounter,
   broker_metadata_offload_fallbacks: IntCounter,
   mature_metadata_cache_reuses: IntCounter,
-  recovery_metadata_cache_entries: ContributionGauge,
-  recovery_metadata_cache_retained_bytes: ContributionGauge,
+  sealed_metadata_prefix_installs: IntCounter,
+  metadata_queries_avoided_by_capacity: IntCounter,
+  mature_metadata_cache_entries: ContributionGauge,
+  mature_metadata_cache_retained_bytes: ContributionGauge,
   pub(in crate::consumer) metadata_fast_scan_without_lower_bound: IntCounter,
   pub(in crate::consumer) metadata_segments_deferred_by_visibility_delay: IntCounter,
   metadata_batches_scanned: IntCounter,
@@ -67,11 +69,13 @@ impl ConsumerReaderMetrics {
       broker_metadata_offload_deliveries: scope.counter("broker_metadata_offload_deliveries"),
       broker_metadata_offload_fallbacks: scope.counter("broker_metadata_offload_fallbacks"),
       mature_metadata_cache_reuses: scope.counter("mature_metadata_cache_reuses"),
-      recovery_metadata_cache_entries: ContributionGauge::new(
-        scope.gauge("recovery_metadata_cache_entries"),
+      sealed_metadata_prefix_installs: scope.counter("sealed_metadata_prefix_installs"),
+      metadata_queries_avoided_by_capacity: scope.counter("metadata_queries_avoided_by_capacity"),
+      mature_metadata_cache_entries: ContributionGauge::new(
+        scope.gauge("mature_metadata_cache_entries"),
       ),
-      recovery_metadata_cache_retained_bytes: ContributionGauge::new(
-        scope.gauge("recovery_metadata_cache_retained_bytes"),
+      mature_metadata_cache_retained_bytes: ContributionGauge::new(
+        scope.gauge("mature_metadata_cache_retained_bytes"),
       ),
       metadata_fast_scan_without_lower_bound: scope
         .counter("metadata_fast_scan_without_lower_bound"),
@@ -127,6 +131,14 @@ impl ConsumerReaderMetrics {
     self.mature_metadata_cache_reuses.inc();
   }
 
+  pub(in crate::consumer) fn record_sealed_metadata_prefix_install(&self) {
+    self.sealed_metadata_prefix_installs.inc();
+  }
+
+  pub(in crate::consumer) fn record_metadata_query_avoided_by_capacity(&self) {
+    self.metadata_queries_avoided_by_capacity.inc();
+  }
+
   /// Record an RPC sent to the broker metadata cache.
   pub(in crate::consumer) fn record_broker_metadata_offload_request(&self) {
     self.broker_metadata_offload_requests.inc();
@@ -142,15 +154,15 @@ impl ConsumerReaderMetrics {
     self.broker_metadata_offload_fallbacks.inc();
   }
 
-  pub(in crate::consumer) fn record_recovery_metadata_cache_entries(&self, count: usize) {
+  pub(in crate::consumer) fn record_mature_metadata_cache_entries(&self, count: usize) {
     self
-      .recovery_metadata_cache_entries
+      .mature_metadata_cache_entries
       .set(i64::try_from(count).unwrap_or(i64::MAX));
   }
 
-  pub(in crate::consumer) fn record_recovery_metadata_cache_retained_bytes(&self, bytes: u64) {
+  pub(in crate::consumer) fn record_mature_metadata_cache_retained_bytes(&self, bytes: u64) {
     self
-      .recovery_metadata_cache_retained_bytes
+      .mature_metadata_cache_retained_bytes
       .set(i64::try_from(bytes).unwrap_or(i64::MAX));
   }
 

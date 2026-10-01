@@ -140,4 +140,8 @@ impl ReadCapacity {
     }
     false
   }
+
+  pub(in crate::consumer) fn has_room(&self) -> bool {
+    self.remaining_payload_bytes > 0 || self.oversized_batch_allowed
+  }
 }

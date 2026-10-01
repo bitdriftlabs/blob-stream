@@ -74,6 +74,7 @@ impl std::error::Error for BrokerMetadataThrottled {}
 pub(super) struct BrokerMetadataResult {
   pub(super) segments: Vec<SegmentMetadata>,
   pub(super) observed_at: OffsetDateTime,
+  pub(super) sealed_prefix: Option<(SnowflakeId, OffsetDateTime)>,
 }
 
 #[async_trait]
@@ -166,6 +167,7 @@ pub(super) fn decode_metadata_response(
   response: ReadMetadataWindowResponse,
   received_at: OffsetDateTime,
   metadata_cache_max_age: TimeDuration,
+  seal_horizon: TimeDuration,
 ) -> Result<BrokerMetadataResult> {
   let success = match response.result {
     Some(read_metadata_window_response::Result::Success(success)) => success,
@@ -198,12 +200,48 @@ pub(super) fn decode_metadata_response(
     .consistency
     .enum_value()
     .map_err(|_| anyhow!("broker metadata request has an unsupported consistency"))?;
-  // A strongly consistent read must originate from storage, not a broker-retained observation.
+  // Ordinary eventual coverage cannot satisfy a strong request. Retained strong coverage must
+  // carry its original observation time: a fresh suffix read cannot retroactively seal a prefix.
   ensure!(
     consistency == MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL
       || !success.retained_coverage,
     "strong broker metadata response cannot use retained coverage"
   );
+  ensure!(
+    consistency == MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG
+      || (success.sealed_before.is_none()
+        && success.sealed_at_unix_ms.is_none()
+        && !success.retained_strong_coverage),
+    "eventual broker metadata response cannot attest strong sealed coverage"
+  );
+  let sealed_prefix = if let (Some(sealed_before), Some(sealed_at_unix_ms)) =
+    (success.sealed_before, success.sealed_at_unix_ms)
+  {
+    let sealed_at =
+      OffsetDateTime::from_unix_timestamp_nanos(i128::from(sealed_at_unix_ms) * 1_000_000)
+        .map_err(|_| anyhow!("broker seal observation timestamp is out of range"))?;
+    ensure!(
+      request
+        .requested_seal_before
+        .is_some_and(|requested| sealed_before <= requested)
+        && SnowflakeId(sealed_before)
+          <= SnowflakeId::minimum_for_timestamp(sealed_at.saturating_sub(seal_horizon)),
+      "broker strong seal exceeds the reader's safe observation boundary"
+    );
+    ensure!(
+      sealed_at <= observed_at,
+      "broker strong seal observation follows its response observation"
+    );
+    Some((SnowflakeId(sealed_before), sealed_at))
+  } else {
+    ensure!(
+      success.sealed_before.is_none()
+        && success.sealed_at_unix_ms.is_none()
+        && !success.retained_strong_coverage,
+      "broker retained strong coverage is missing its seal proof"
+    );
+    None
+  };
   if consistency == MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL {
     // The broker's observation time, rather than receipt time, defines the retained-data age.
     ensure!(
@@ -311,5 +349,6 @@ pub(super) fn decode_metadata_response(
   Ok(BrokerMetadataResult {
     segments,
     observed_at,
+    sealed_prefix,
   })
 }

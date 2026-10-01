@@ -141,6 +141,10 @@ message ReadMetadataWindowRequest {
   }
   // The caller's response budget. The server additionally enforces its configured maximum.
   uint64 max_response_bytes = 7;
+  // Exclusive upper bound the caller considers sealed; the broker may attest a smaller prefix.
+  optional uint64 requested_seal_before = 8;
+  // Reader availability horizon; the broker uses the stricter of this and its own safety budget.
+  optional uint64 requested_seal_horizon_ms = 9;
 }
 
 // Metadata row returned by a broker read.
@@ -163,6 +167,12 @@ message MetadataReadSuccess {
   bool retained_coverage = 4;
   // Segment rows matching the requested partition coverage and caller response budget.
   repeated BrokerSegmentMetadata segments = 5;
+  // Exclusive upper bound of coverage observed strongly after it was safe to seal.
+  optional uint64 sealed_before = 6;
+  // Original strong observation time for the sealed prefix (not the fresh suffix).
+  optional int64 sealed_at_unix_ms = 7;
+  // True only when sealed coverage was reused from a prior strong observation.
+  bool retained_strong_coverage = 8;
 }
 
 // Failed broker metadata read result.

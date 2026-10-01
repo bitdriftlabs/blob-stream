@@ -112,6 +112,7 @@ fn only_typed_storage_throttling_skips_broker_fallback() {
       response,
       OffsetDateTime::UNIX_EPOCH,
       Duration::seconds(1),
+      Duration::seconds(15),
     )
     .unwrap_err();
     assert_eq!(
@@ -141,6 +142,7 @@ fn rejects_eventual_response_older_than_configured_cache_age() {
     response,
     OffsetDateTime::UNIX_EPOCH.saturating_add(Duration::seconds(1)),
     Duration::milliseconds(250),
+    Duration::seconds(15),
   )
   .unwrap_err();
 
@@ -192,6 +194,7 @@ fn full_recovery_response_rejects_partial_refill_floor() {
     response,
     OffsetDateTime::UNIX_EPOCH,
     Duration::seconds(1),
+    Duration::seconds(15),
   )
   .unwrap_err();
 
@@ -228,6 +231,7 @@ fn full_recovery_response_rejects_unrequested_partitions() {
     response,
     OffsetDateTime::UNIX_EPOCH,
     Duration::seconds(1),
+    Duration::seconds(15),
   )
   .unwrap_err();
 
@@ -236,4 +240,112 @@ fn full_recovery_response_rejects_unrequested_partitions() {
       .to_string()
       .contains("broker metadata response has an unrequested partition 1")
   );
+}
+
+#[test]
+fn strong_retained_prefix_requires_original_safe_observation() {
+  let observed_at = OffsetDateTime::from_unix_timestamp(1_735_689_700).unwrap();
+  let sealed_before = SnowflakeId::minimum_for_timestamp(observed_at - Duration::seconds(16));
+  let mut request = tail_request();
+  request.consistency = MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG.into();
+  request.requested_seal_before = Some(sealed_before.as_u64());
+  let response = || ReadMetadataWindowResponse {
+    result: Some(read_metadata_window_response::Result::Success(
+      MetadataReadSuccess {
+        observed_at_unix_ms: observed_at.unix_timestamp() * 1_000,
+        refill_floor: Some(100),
+        generation: 1,
+        sealed_before: Some(sealed_before.as_u64()),
+        sealed_at_unix_ms: Some(observed_at.unix_timestamp() * 1_000),
+        retained_strong_coverage: true,
+        ..Default::default()
+      },
+    )),
+    ..Default::default()
+  };
+  decode_metadata_response(
+    &request,
+    response(),
+    observed_at,
+    Duration::ZERO,
+    Duration::seconds(15),
+  )
+  .unwrap();
+  assert!(
+    decode_metadata_response(
+      &request,
+      response(),
+      observed_at,
+      Duration::ZERO,
+      Duration::seconds(20),
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("safe observation boundary")
+  );
+}
+
+#[test]
+fn rejects_retained_prefix_without_valid_original_seal_proof() {
+  let observed_at = OffsetDateTime::from_unix_timestamp(1_735_689_700).unwrap();
+  let sealed_before = SnowflakeId::minimum_for_timestamp(observed_at - Duration::seconds(20));
+  let mut request = tail_request();
+  request.consistency = MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG.into();
+  request.requested_seal_before = Some(sealed_before.as_u64());
+  let success = MetadataReadSuccess {
+    observed_at_unix_ms: observed_at.unix_timestamp() * 1_000,
+    refill_floor: Some(100),
+    generation: 1,
+    sealed_before: Some(sealed_before.as_u64()),
+    sealed_at_unix_ms: Some(observed_at.unix_timestamp() * 1_000),
+    retained_strong_coverage: true,
+    ..Default::default()
+  };
+  for (malformed, expected) in [
+    (
+      MetadataReadSuccess {
+        sealed_before: None,
+        ..success.clone()
+      },
+      "missing its seal proof",
+    ),
+    (
+      MetadataReadSuccess {
+        sealed_at_unix_ms: None,
+        ..success.clone()
+      },
+      "missing its seal proof",
+    ),
+    (
+      MetadataReadSuccess {
+        sealed_before: Some(sealed_before.as_u64() + 1),
+        ..success.clone()
+      },
+      "safe observation boundary",
+    ),
+    (
+      MetadataReadSuccess {
+        sealed_at_unix_ms: Some((observed_at + Duration::seconds(1)).unix_timestamp() * 1_000),
+        ..success
+      },
+      "response observation",
+    ),
+  ] {
+    let response = ReadMetadataWindowResponse {
+      result: Some(read_metadata_window_response::Result::Success(malformed)),
+      ..Default::default()
+    };
+    assert!(
+      decode_metadata_response(
+        &request,
+        response,
+        observed_at,
+        Duration::ZERO,
+        Duration::seconds(15),
+      )
+      .unwrap_err()
+      .to_string()
+      .contains(expected)
+    );
+  }
 }

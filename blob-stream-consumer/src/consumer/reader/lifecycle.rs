@@ -103,6 +103,7 @@ impl ConsumerReaderImpl {
       fast_frontiers: HashMap::new(),
       recovery_scan_last_partition: None,
       recovery_metadata_cache: HashMap::new(),
+      sealed_metadata_prefixes: HashMap::new(),
       config,
       blob_store,
       metadata_store,
@@ -195,7 +196,10 @@ impl ConsumerReaderImpl {
     self
       .recovery_metadata_cache
       .retain(|(partition_id, ..), _| assigned.contains(partition_id));
-    self.record_recovery_metadata_cache_state();
+    self
+      .sealed_metadata_prefixes
+      .retain(|(partition_id, _), _| assigned.contains(partition_id));
+    self.record_mature_metadata_cache_state();
     // A revoked partition has no reader-local work left after the iterator drains it. Its durable
     // cursor belongs in the consumer-group lease and is hydrated again if this reader reacquires
     // the partition.
@@ -250,7 +254,10 @@ impl ConsumerReaderImpl {
     self
       .recovery_metadata_cache
       .retain(|(partition_id, ..), _| *partition_id != virtual_partition_id);
-    self.record_recovery_metadata_cache_state();
+    self
+      .sealed_metadata_prefixes
+      .retain(|(partition_id, _), _| *partition_id != virtual_partition_id);
+    self.record_mature_metadata_cache_state();
   }
 
   /// Reposition a partition cursor and recover from the caller-provided metadata source.

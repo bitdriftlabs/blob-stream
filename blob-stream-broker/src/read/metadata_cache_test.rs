@@ -16,6 +16,7 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   read_metadata_window_request,
 };
 use blob_stream_proto::protos::blobstream::v1::config::BrokerConfig;
+use blob_stream_test_utils::ManualTimeProvider;
 use blob_stream_types::{BatchMetadata, ByteRange, Compression, SeqRange};
 use prometheus::labels;
 use std::collections::HashMap;
@@ -131,7 +132,7 @@ impl MetadataStore for GatedMetadataStore {
     self.scans.fetch_add(1, Ordering::Relaxed);
     self.observed_bounds.lock().push(min_snowflake);
     self.scan_started.add_permits(1);
-    let _permit = self.release_scan.acquire().await.unwrap();
+    self.release_scan.acquire().await.unwrap().forget();
     Ok(self.segments.clone())
   }
 }
@@ -163,6 +164,7 @@ fn cache_config(maximum_age: Duration, coalescing_window: StdDuration) -> Metada
   MetadataCacheConfig {
     tail_max_bytes: 1024 * 1024,
     recovery_max_bytes: 1024 * 1024,
+    seal_clock_skew: DEFAULT_SEAL_MAX_CLOCK_SKEW,
     coalescing_window,
     limits: MetadataCacheLimits {
       request_timeout: StdDuration::from_secs(1),
@@ -181,9 +183,27 @@ fn cache_config(maximum_age: Duration, coalescing_window: StdDuration) -> Metada
         num_writers: 1,
         metadata_window_size: Duration::minutes(5),
         metadata_cache_max_age: maximum_age,
+        max_metadata_publication_lag: Duration::seconds(15),
       },
     )]),
   }
+}
+
+#[test]
+fn topic_contract_seal_follows_publication_lag() {
+  let mut contract = cache_config(Duration::ZERO, StdDuration::ZERO)
+    .topics
+    .remove("topic")
+    .unwrap();
+  assert_eq!(contract.max_metadata_publication_lag, Duration::seconds(15));
+  contract.max_metadata_publication_lag = Duration::seconds(30);
+  assert_eq!(contract.max_metadata_publication_lag, Duration::seconds(30));
+  assert_eq!(
+    TopicCacheContract::from_proto(&TopicConfig::new())
+      .unwrap()
+      .max_metadata_publication_lag,
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG
+  );
 }
 
 #[test]
@@ -656,6 +676,67 @@ async fn narrower_strong_request_after_refill_start_runs_a_follow_up_refill() {
 }
 
 #[tokio::test]
+async fn late_strong_waiter_receives_its_own_seal_horizon() {
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let store = Arc::new(GatedMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: Vec::new(),
+    scan_started: Semaphore::new(0),
+    release_scan: Semaphore::new(0),
+  });
+  let cache = Arc::new(
+    MetadataCache::new(
+      store.clone(),
+      cache_config(Duration::seconds(1), StdDuration::ZERO),
+      None,
+    )
+    .time_provider(Arc::new(ManualTimeProvider::new(timestamp(100)))),
+  );
+  let mut request = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  request.window_start_unix_seconds = window_start;
+  request.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(85)).as_u64());
+  let first_cache = cache.clone();
+  let first = tokio::spawn(async move { first_cache.read(request.clone()).await });
+  let _first_scan = timeout(StdDuration::from_secs(1), store.scan_started.acquire())
+    .await
+    .unwrap()
+    .unwrap();
+
+  let mut late_request = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  late_request.window_start_unix_seconds = window_start;
+  late_request.requested_seal_before =
+    Some(SnowflakeId::minimum_for_timestamp(timestamp(65)).as_u64());
+  late_request.requested_seal_horizon_ms = Some(45_000);
+  let second_cache = cache.clone();
+  let second = tokio::spawn(async move { second_cache.read(late_request).await });
+  timeout(StdDuration::from_secs(1), async {
+    while cache.snapshot().await.active_waiters < 2 {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .unwrap();
+  store.release_scan.add_permits(1);
+  let Some(read_metadata_window_response::Result::Success(first)) = first.await.unwrap().result
+  else {
+    panic!("initial strong read must succeed");
+  };
+  let Some(read_metadata_window_response::Result::Success(second)) = second.await.unwrap().result
+  else {
+    panic!("coalesced strong read must succeed");
+  };
+  assert_eq!(store.scans.load(Ordering::Relaxed), 1);
+  assert!(first.sealed_before.unwrap() > second.sealed_before.unwrap());
+  assert_eq!(
+    second.sealed_before,
+    Some(SnowflakeId::minimum_for_timestamp(timestamp(55)).as_u64())
+  );
+  assert_eq!(second.sealed_at_unix_ms, first.sealed_at_unix_ms);
+}
+
+#[tokio::test]
 async fn rejected_waiter_does_not_start_an_unowned_refill() {
   let store = Arc::new(GatedMetadataStore {
     scans: AtomicUsize::new(0),
@@ -702,6 +783,77 @@ async fn rejected_waiter_does_not_start_an_unowned_refill() {
     first.await.unwrap().result,
     Some(read_metadata_window_response::Result::Success(_))
   ));
+}
+
+#[tokio::test]
+async fn timed_out_strong_suffix_releases_waiter_and_refill_admission() {
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let mut segment = segment();
+  segment.window.window_start_unix_seconds = window_start;
+  segment.snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(30));
+  let store = Arc::new(GatedMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: vec![segment],
+    scan_started: Semaphore::new(0),
+    release_scan: Semaphore::new(1),
+  });
+  let mut config = cache_config(Duration::seconds(1), StdDuration::ZERO);
+  config.limits.request_timeout = StdDuration::from_millis(500);
+  let cache = Arc::new(
+    MetadataCache::new(store.clone(), config.clone(), None)
+      .time_provider(Arc::new(ManualTimeProvider::new(timestamp(100)))),
+  );
+  let mut request = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  request.window_start_unix_seconds = window_start;
+  request.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(85)).as_u64());
+  assert!(matches!(
+    cache.read(request.clone()).await.result,
+    Some(read_metadata_window_response::Result::Success(_))
+  ));
+  let _initial_scan = store.scan_started.acquire().await.unwrap();
+  let mut readers = Vec::new();
+  for _ in 0 .. 3 {
+    let reader_cache = cache.clone();
+    let reader_request = request.clone();
+    readers.push(tokio::spawn(async move {
+      reader_cache.read(reader_request).await
+    }));
+  }
+  let _suffix_scan = timeout(StdDuration::from_secs(1), store.scan_started.acquire())
+    .await
+    .unwrap()
+    .unwrap();
+  timeout(StdDuration::from_millis(200), async {
+    while cache.snapshot().await.active_waiters < 3 {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .unwrap();
+  for reader in readers {
+    let Some(read_metadata_window_response::Result::Failure(failure)) =
+      reader.await.unwrap().result
+    else {
+      panic!("timed out suffix must fail for every waiter");
+    };
+    assert_eq!(
+      failure.overload_reason.enum_value().unwrap(),
+      MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_REQUEST_TIMEOUT
+    );
+  }
+  timeout(StdDuration::from_secs(1), async {
+    while cache.snapshot().await.in_flight_refills != 0 {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .unwrap();
+  let snapshot = cache.snapshot().await;
+  assert_eq!(snapshot.active_waiters, 0);
+  assert_eq!(snapshot.available_refill_permits, config.limits.max_refills);
+  assert_eq!(store.scans.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]
@@ -805,6 +957,463 @@ async fn does_not_retain_completed_strong_reads() {
 }
 
 #[tokio::test]
+async fn retains_strong_reads_of_sealed_windows() {
+  let window_start = 1_735_689_600;
+  let mut metadata = segment();
+  metadata.window.window_start_unix_seconds = window_start;
+  metadata.snowflake_id = SnowflakeId::minimum_for_timestamp(
+    OffsetDateTime::from_unix_timestamp(window_start + 100).unwrap(),
+  );
+  let store = Arc::new(CountingMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: vec![metadata],
+  });
+  let cache = Arc::new(MetadataCache::new(
+    store.clone(),
+    cache_config(Duration::seconds(1), StdDuration::ZERO),
+    None,
+  ));
+  let mut request = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  request.window_start_unix_seconds = window_start;
+  let window_end = SnowflakeId::minimum_for_timestamp(
+    OffsetDateTime::from_unix_timestamp(window_start + 300).unwrap(),
+  );
+  request.requested_seal_before = Some(window_end.as_u64());
+
+  let first = cache.read(request.clone()).await;
+  let second = cache.read(request).await;
+  let Some(read_metadata_window_response::Result::Success(first)) = first.result else {
+    panic!("initial strong read must succeed");
+  };
+  let Some(read_metadata_window_response::Result::Success(second)) = second.result else {
+    panic!("retained strong read must succeed");
+  };
+  assert_eq!(store.scans.load(Ordering::Relaxed), 1);
+  assert!(!first.retained_strong_coverage);
+  assert!(second.retained_strong_coverage);
+  assert!(!second.retained_coverage);
+  assert_eq!(second.sealed_before, Some(window_end.as_u64()));
+  assert_eq!(first.sealed_at_unix_ms, second.sealed_at_unix_ms);
+  assert_eq!(second.segments.len(), 1);
+}
+
+#[tokio::test]
+async fn slow_strong_scan_seals_only_the_pre_scan_safe_prefix() {
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let store = Arc::new(GatedMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: Vec::new(),
+    scan_started: Semaphore::new(0),
+    release_scan: Semaphore::new(0),
+  });
+  let clock = Arc::new(ManualTimeProvider::new(timestamp(100)));
+  let cache = Arc::new(
+    MetadataCache::new(
+      store.clone(),
+      cache_config(Duration::seconds(1), StdDuration::ZERO),
+      None,
+    )
+    .time_provider(clock.clone()),
+  );
+  let mut request = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  request.window_start_unix_seconds = window_start;
+  request.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(300)).as_u64());
+  let first_cache = cache.clone();
+  let first_request = request.clone();
+  let first = tokio::spawn(async move { first_cache.read(first_request).await });
+  let _scan = timeout(StdDuration::from_secs(1), store.scan_started.acquire())
+    .await
+    .unwrap()
+    .unwrap();
+  clock.advance(Duration::seconds(30));
+  store.release_scan.add_permits(1);
+  let Some(read_metadata_window_response::Result::Success(first)) = first.await.unwrap().result
+  else {
+    panic!("first strong scan must succeed");
+  };
+  let expected_seal = SnowflakeId::minimum_for_timestamp(
+    timestamp(100).saturating_sub(Duration::seconds(15) + DEFAULT_SEAL_MAX_CLOCK_SKEW),
+  );
+  assert_eq!(first.sealed_before, Some(expected_seal.as_u64()));
+  assert_eq!(
+    first.sealed_at_unix_ms,
+    Some(timestamp(100).unix_timestamp() * 1_000)
+  );
+  assert_eq!(
+    first.observed_at_unix_ms,
+    timestamp(130).unix_timestamp() * 1_000
+  );
+
+  store.release_scan.add_permits(1);
+  let Some(read_metadata_window_response::Result::Success(second)) =
+    cache.read(request).await.result
+  else {
+    panic!("open suffix scan must succeed");
+  };
+  assert_eq!(store.observed_bounds.lock()[1], Some(expected_seal));
+  assert_eq!(second.sealed_at_unix_ms, first.sealed_at_unix_ms);
+}
+
+#[tokio::test]
+async fn strong_full_recovery_queries_open_suffix_but_reuses_mature_window() {
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let mut prefix = segment();
+  prefix.window.window_start_unix_seconds = window_start;
+  prefix.snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(30));
+  let mut suffix = prefix.clone();
+  suffix.snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(90));
+  let store = Arc::new(CountingMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: vec![prefix, suffix],
+  });
+  let mut request = full_recovery_request();
+  request.window_start_unix_seconds = window_start;
+  request.consistency = MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG.into();
+  request.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(300)).as_u64());
+  let open_cache = Arc::new(
+    MetadataCache::new(
+      store.clone(),
+      cache_config(Duration::seconds(1), StdDuration::ZERO),
+      None,
+    )
+    .time_provider(Arc::new(ManualTimeProvider::new(timestamp(100)))),
+  );
+  let first = open_cache.read(request.clone()).await;
+  let second = open_cache.read(request.clone()).await;
+  let Some(read_metadata_window_response::Result::Success(first)) = first.result else {
+    panic!("initial strong recovery read must succeed");
+  };
+  let Some(read_metadata_window_response::Result::Success(second)) = second.result else {
+    panic!("open strong recovery read must succeed");
+  };
+  assert!(!first.retained_strong_coverage);
+  assert!(second.retained_strong_coverage);
+  assert_eq!(second.segments.len(), 2);
+  assert_eq!(store.scans.load(Ordering::Relaxed), 2);
+  assert_eq!(
+    store.observed_bounds.lock()[1],
+    second.sealed_before.map(SnowflakeId)
+  );
+
+  let mature_cache = Arc::new(
+    MetadataCache::new(
+      store.clone(),
+      cache_config(Duration::seconds(1), StdDuration::ZERO),
+      None,
+    )
+    .time_provider(Arc::new(ManualTimeProvider::new(timestamp(500)))),
+  );
+  let mature_first = mature_cache.read(request.clone()).await;
+  let mature_second = mature_cache.read(request.clone()).await;
+  let Some(read_metadata_window_response::Result::Success(mature_first)) = mature_first.result
+  else {
+    panic!("first mature recovery read must succeed");
+  };
+  let Some(read_metadata_window_response::Result::Success(mature_second)) = mature_second.result
+  else {
+    panic!("retained mature recovery read must succeed");
+  };
+  assert!(!mature_first.retained_strong_coverage);
+  assert!(mature_second.retained_strong_coverage);
+  assert_eq!(mature_second.sealed_before, request.requested_seal_before);
+  assert_eq!(store.scans.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn tail_floor_at_the_seal_boundary_does_not_reuse_a_prefix() {
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let store = Arc::new(CountingMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: Vec::new(),
+  });
+  let cache = Arc::new(
+    MetadataCache::new(
+      store.clone(),
+      cache_config(Duration::seconds(1), StdDuration::ZERO),
+      None,
+    )
+    .time_provider(Arc::new(ManualTimeProvider::new(timestamp(100)))),
+  );
+  let mut request = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  request.window_start_unix_seconds = window_start;
+  request.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(85)).as_u64());
+  let Some(read_metadata_window_response::Result::Success(initial)) =
+    cache.read(request.clone()).await.result
+  else {
+    panic!("initial read must succeed");
+  };
+  let seal = initial.sealed_before.unwrap();
+  request = tail_request(
+    seal,
+    MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG,
+  );
+  request.window_start_unix_seconds = window_start;
+  request.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(85)).as_u64());
+  for _ in 0 .. 2 {
+    let Some(read_metadata_window_response::Result::Success(response)) =
+      cache.read(request.clone()).await.result
+    else {
+      panic!("boundary read must succeed");
+    };
+    assert!(!response.retained_strong_coverage);
+    assert_eq!(response.sealed_before, None);
+  }
+  assert_eq!(store.scans.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn refills_open_tail_after_reusing_strong_sealed_prefix() {
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let mut prefix = segment();
+  prefix.window.window_start_unix_seconds = window_start;
+  prefix.snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(30));
+  let mut suffix = prefix.clone();
+  suffix.snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(90));
+  let store = Arc::new(CountingMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: vec![prefix.clone(), suffix.clone()],
+  });
+  let observed_at = timestamp(100);
+  let clock = Arc::new(ManualTimeProvider::new(observed_at));
+  let cache = Arc::new(
+    MetadataCache::new(
+      store.clone(),
+      cache_config(Duration::seconds(1), StdDuration::ZERO),
+      None,
+    )
+    .time_provider(clock),
+  );
+  let mut request = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  request.window_start_unix_seconds = window_start;
+  request.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(85)).as_u64());
+
+  let first = cache.read(request.clone()).await;
+  let second = cache.read(request).await;
+  let Some(read_metadata_window_response::Result::Success(first)) = first.result else {
+    panic!("first open Tail read must succeed");
+  };
+  let Some(read_metadata_window_response::Result::Success(second)) = second.result else {
+    panic!("refilled open Tail read must succeed");
+  };
+  assert_eq!(store.scans.load(Ordering::Relaxed), 2);
+  assert_eq!(
+    store.observed_bounds.lock()[1],
+    first.sealed_before.map(SnowflakeId)
+  );
+  assert_eq!(first.segments.len(), 2);
+  assert_eq!(second.segments.len(), 2);
+  assert!(second.retained_strong_coverage);
+  assert_eq!(second.sealed_at_unix_ms, first.sealed_at_unix_ms);
+  assert!(prefix.snowflake_id.as_u64() < second.sealed_before.unwrap());
+  assert!(suffix.snowflake_id.as_u64() >= second.sealed_before.unwrap());
+}
+
+#[tokio::test]
+async fn concurrent_open_tail_reads_share_the_strong_suffix_scan() {
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let mut prefix = segment();
+  prefix.window.window_start_unix_seconds = window_start;
+  prefix.snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(30));
+  prefix
+    .segment_index
+    .insert(1, prefix.segment_index[&0].clone());
+  let mut suffix = prefix.clone();
+  suffix.snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(90));
+  let store = Arc::new(GatedMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: vec![prefix, suffix],
+    scan_started: Semaphore::new(0),
+    release_scan: Semaphore::new(1),
+  });
+  let mut config = cache_config(Duration::seconds(1), StdDuration::ZERO);
+  config.limits.request_timeout = StdDuration::from_secs(5);
+  config.limits.max_refills = 1;
+  config.limits.max_waiters_per_key = 12;
+  config.limits.max_waiters = 13;
+  config.topics.get_mut("topic").unwrap().partition_count = 2;
+  let cache = Arc::new(
+    MetadataCache::new(store.clone(), config, None)
+      .time_provider(Arc::new(ManualTimeProvider::new(timestamp(100)))),
+  );
+  let mut request = tail_request_with_bounds(
+    vec![(0, 0), (1, 0)],
+    MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG,
+  );
+  request.window_start_unix_seconds = window_start;
+  request.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(85)).as_u64());
+  assert!(matches!(
+    cache.read(request.clone()).await.result,
+    Some(read_metadata_window_response::Result::Success(_))
+  ));
+  let _initial_scan = store.scan_started.acquire().await.unwrap();
+
+  let first_cache = cache.clone();
+  let first_request = request.clone();
+  let first = tokio::spawn(async move { first_cache.read(first_request).await });
+  let _suffix_scan = timeout(StdDuration::from_secs(1), store.scan_started.acquire())
+    .await
+    .unwrap()
+    .unwrap();
+  let second_cache = cache.clone();
+  let mut narrower = request.clone();
+  if let Some(read_metadata_window_request::Coverage::Tail(coverage)) = narrower.coverage.as_mut() {
+    coverage.partition_bounds[1].min_snowflake =
+      SnowflakeId::minimum_for_timestamp(timestamp(70)).as_u64();
+  }
+  let second = tokio::spawn(async move { second_cache.read(narrower).await });
+  let mut readers = vec![(first, 2), (second, 1)];
+  for _ in 0 .. 10 {
+    let reader_cache = cache.clone();
+    let reader_request = request.clone();
+    readers.push((
+      tokio::spawn(async move { reader_cache.read(reader_request).await }),
+      2,
+    ));
+  }
+  let joined = timeout(StdDuration::from_secs(1), async {
+    while cache.snapshot().await.active_waiters < 12 {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await;
+  assert!(
+    joined.is_ok(),
+    "suffix scan waiters={}, scans={}",
+    cache.snapshot().await.active_waiters,
+    store.scans.load(Ordering::Relaxed)
+  );
+  assert_eq!(store.scans.load(Ordering::Relaxed), 2);
+  assert_eq!(cache.snapshot().await.in_flight_refills, 1);
+  let rejected = cache.read(request).await;
+  let Some(read_metadata_window_response::Result::Failure(failure)) = rejected.result else {
+    panic!("thirteenth suffix waiter must be rejected");
+  };
+  assert_eq!(
+    failure.overload_reason.enum_value().unwrap(),
+    MetadataReadOverloadReason::METADATA_READ_OVERLOAD_REASON_PER_KEY_WAITERS
+  );
+  assert_eq!(store.scans.load(Ordering::Relaxed), 2);
+  store.release_scan.add_permits(1);
+  for (read, prefix_partitions) in readers {
+    let Some(read_metadata_window_response::Result::Success(response)) = read.await.unwrap().result
+    else {
+      panic!("coalesced strong suffix read must succeed");
+    };
+    assert_eq!(response.segments.len(), 2);
+    assert!(response.retained_strong_coverage);
+    assert_eq!(
+      response.segments[0]
+        .metadata
+        .as_ref()
+        .unwrap()
+        .partitions
+        .len(),
+      prefix_partitions
+    );
+  }
+  assert_eq!(store.scans.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn retained_strong_prefix_respects_a_later_narrower_seal_and_horizon() {
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let mut prefix = segment();
+  prefix.window.window_start_unix_seconds = window_start;
+  prefix.snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(30));
+  let mut suffix = prefix.clone();
+  suffix.snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(70));
+  let store = Arc::new(CountingMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: vec![prefix, suffix],
+  });
+  let clock = Arc::new(ManualTimeProvider::new(timestamp(100)));
+  let cache = Arc::new(
+    MetadataCache::new(
+      store.clone(),
+      cache_config(Duration::seconds(1), StdDuration::ZERO),
+      None,
+    )
+    .time_provider(clock),
+  );
+  let mut request = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  request.window_start_unix_seconds = window_start;
+  request.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(85)).as_u64());
+  let first = cache.read(request.clone()).await;
+  request.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(65)).as_u64());
+  request.requested_seal_horizon_ms = Some(45_000);
+  let second = cache.read(request).await;
+  let Some(read_metadata_window_response::Result::Success(first)) = first.result else {
+    panic!("initial strong read must succeed");
+  };
+  let Some(read_metadata_window_response::Result::Success(second)) = second.result else {
+    panic!("narrower strong read must succeed");
+  };
+  assert_eq!(store.scans.load(Ordering::Relaxed), 2);
+  assert_eq!(
+    second.sealed_before,
+    Some(SnowflakeId::minimum_for_timestamp(timestamp(55)).as_u64())
+  );
+  assert_eq!(
+    store.observed_bounds.lock()[1],
+    second.sealed_before.map(SnowflakeId)
+  );
+  assert_eq!(second.segments.len(), 2);
+  assert!(second.retained_strong_coverage);
+  assert_eq!(second.sealed_at_unix_ms, first.sealed_at_unix_ms);
+}
+
+#[tokio::test]
+async fn tail_floor_beyond_retained_strong_prefix_starts_a_fresh_scan() {
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let store = Arc::new(CountingMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: Vec::new(),
+  });
+  let cache = Arc::new(
+    MetadataCache::new(
+      store.clone(),
+      cache_config(Duration::seconds(1), StdDuration::ZERO),
+      None,
+    )
+    .time_provider(Arc::new(ManualTimeProvider::new(timestamp(100)))),
+  );
+  let mut request = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  request.window_start_unix_seconds = window_start;
+  request.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(85)).as_u64());
+  let first = cache.read(request.clone()).await;
+  assert!(matches!(
+    first.result,
+    Some(read_metadata_window_response::Result::Success(_))
+  ));
+  let floor = SnowflakeId::minimum_for_timestamp(timestamp(90));
+  if let Some(read_metadata_window_request::Coverage::Tail(tail)) = request.coverage.as_mut() {
+    tail.partition_bounds[0].min_snowflake = floor.as_u64();
+  }
+  let second = cache.read(request).await;
+  assert!(matches!(
+    second.result,
+    Some(read_metadata_window_response::Result::Success(_))
+  ));
+  assert_eq!(store.scans.load(Ordering::Relaxed), 2);
+  assert_eq!(store.observed_bounds.lock()[1], Some(floor));
+}
+
+#[tokio::test]
 async fn reports_whether_eventual_response_used_retained_coverage() {
   let store = Arc::new(CountingMetadataStore {
     scans: AtomicUsize::new(0),
@@ -868,6 +1477,55 @@ async fn retains_full_recovery_in_its_separate_budget() {
   assert_eq!(snapshot.tail_entry_count, 0);
   assert_eq!(snapshot.recovery_entry_count, 1);
   assert!(snapshot.recovery_retained_bytes > 0);
+}
+
+#[tokio::test]
+async fn strong_prefix_and_eventual_entries_share_the_configured_total_budget() {
+  let mut config = cache_config(Duration::seconds(1), StdDuration::ZERO);
+  config.tail_max_bytes = 1_048_577;
+  config.recovery_max_bytes = 2_097_155;
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let mut metadata = segment();
+  metadata.window.window_start_unix_seconds = window_start;
+  metadata.snowflake_id = SnowflakeId::minimum_for_timestamp(timestamp(100));
+  let cache = Arc::new(MetadataCache::new(
+    Arc::new(CountingMetadataStore {
+      scans: AtomicUsize::new(0),
+      observed_bounds: Mutex::new(Vec::new()),
+      segments: vec![metadata],
+    }),
+    config.clone(),
+    None,
+  ));
+  let mut eventual = tail_request(
+    0,
+    MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL,
+  );
+  eventual.window_start_unix_seconds = window_start;
+  cache.read(eventual).await;
+  let mut recovery = full_recovery_request();
+  recovery.window_start_unix_seconds = window_start;
+  cache.read(recovery).await;
+  let mut strong = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  strong.window_start_unix_seconds = window_start;
+  strong.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(300)).as_u64());
+  cache.read(strong).await;
+  let snapshot = cache.snapshot().await;
+  assert_eq!(snapshot.tail_entry_count, 1);
+  assert_eq!(snapshot.recovery_entry_count, 1);
+  assert_eq!(snapshot.strong_sealed_entry_count, 1);
+  assert!(snapshot.strong_sealed_retained_bytes > 0);
+  assert!(snapshot.tail_retained_bytes <= snapshot.tail_byte_budget);
+  assert!(snapshot.recovery_retained_bytes <= snapshot.recovery_byte_budget);
+  assert!(snapshot.strong_sealed_retained_bytes <= snapshot.strong_sealed_byte_budget);
+  assert_eq!(snapshot.tail_byte_budget, 524_289);
+  assert_eq!(snapshot.recovery_byte_budget, 1_048_578);
+  assert_eq!(snapshot.strong_sealed_byte_budget, 1_572_865);
+  assert_eq!(
+    snapshot.tail_byte_budget + snapshot.recovery_byte_budget + snapshot.strong_sealed_byte_budget,
+    config.tail_max_bytes + config.recovery_max_bytes
+  );
 }
 
 #[tokio::test]
