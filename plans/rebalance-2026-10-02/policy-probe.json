@@ -1,0 +1,50 @@
+{
+  "kind": "synthetic_uniform_cluster_counterexample_not_event_replay",
+  "logical_groups": 4,
+  "partitions": 8,
+  "departed": "pod-00",
+  "greedy_moves": 4,
+  "sticky_moves": 2,
+  "greedy_whole_groups": 3,
+  "sticky_whole_groups": 3,
+  "greedy_load": {
+    "pod-03": 2,
+    "pod-01": 3,
+    "pod-02": 3
+  },
+  "sticky_load": {
+    "pod-01": 3,
+    "pod-02": 3,
+    "pod-03": 2
+  },
+  "old": {
+    "0": "pod-00",
+    "4": "pod-00",
+    "1": "pod-01",
+    "5": "pod-01",
+    "2": "pod-02",
+    "6": "pod-02",
+    "3": "pod-03",
+    "7": "pod-03"
+  },
+  "greedy": {
+    "0": "pod-03",
+    "4": "pod-03",
+    "1": "pod-01",
+    "5": "pod-01",
+    "2": "pod-02",
+    "6": "pod-02",
+    "3": "pod-01",
+    "7": "pod-02"
+  },
+  "sticky": {
+    "1": "pod-01",
+    "5": "pod-01",
+    "2": "pod-02",
+    "6": "pod-02",
+    "3": "pod-03",
+    "7": "pod-03",
+    "0": "pod-01",
+    "4": "pod-02"
+  }
+}

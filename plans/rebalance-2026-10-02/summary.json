@@ -1,0 +1,1143 @@
+{
+  "totals": {
+    "metadata_batches_seen": 423158,
+    "batches_skipped_by_cursor": 418711,
+    "batches_accepted": 3399,
+    "records_accepted": 38760451,
+    "batches_deferred_by_capacity": 1048,
+    "segments_deferred_by_visibility": 0,
+    "segments_skipped_by_frontier": 0,
+    "recovery_segments_blocked_by_visibility": 0,
+    "recovery_segments_handed_to_fast_by_visibility": 0,
+    "partitions": 63,
+    "cursor_skip_fraction": 0.9894909230122082,
+    "metadata_observations_per_accepted_batch": 124.49485142689026,
+    "recovery_min_seconds": 0.151885542,
+    "recovery_median_seconds": 11.875195597,
+    "recovery_p95_seconds": 36.5375978633,
+    "recovery_max_seconds": 36.537643912,
+    "revocation_min_seconds": 6.181550543,
+    "revocation_max_seconds": 14.967108974
+  },
+  "recoveries_by_pod": [
+    {
+      "pod": "merge-worker-6db9859bf-nkxt6",
+      "generation": "4196",
+      "partitions": 6,
+      "start": "2026-10-02 21:43:37.517004206",
+      "max_seconds": 36.537643912,
+      "median_seconds": 36.537608077499996,
+      "scan_passes": [
+        194
+      ],
+      "outcomes": {
+        "fast_path_active": 6
+      },
+      "metadata_batches_seen": 89532,
+      "batches_skipped_by_cursor": 88743,
+      "batches_accepted": 604,
+      "records_accepted": 7880611,
+      "batches_deferred_by_capacity": 185,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9911875083768932
+    },
+    {
+      "pod": "merge-worker-848db95476-h52ll",
+      "generation": "4196",
+      "partitions": 7,
+      "start": "2026-10-02 21:43:44.625068625",
+      "max_seconds": 22.141093945,
+      "median_seconds": 22.141077487,
+      "scan_passes": [
+        1,
+        163
+      ],
+      "outcomes": {
+        "fast_path_active": 7
+      },
+      "metadata_batches_seen": 59173,
+      "batches_skipped_by_cursor": 58601,
+      "batches_accepted": 419,
+      "records_accepted": 5611843,
+      "batches_deferred_by_capacity": 153,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9903334290977304
+    },
+    {
+      "pod": "merge-worker-6db9859bf-85t5h",
+      "generation": "4196",
+      "partitions": 1,
+      "start": "2026-10-02 21:43:46.118020997",
+      "max_seconds": 6.097885318,
+      "median_seconds": 6.097885318,
+      "scan_passes": [
+        58
+      ],
+      "outcomes": {
+        "fast_path_active": 1
+      },
+      "metadata_batches_seen": 2442,
+      "batches_skipped_by_cursor": 2409,
+      "batches_accepted": 27,
+      "records_accepted": 229350,
+      "batches_deferred_by_capacity": 6,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9864864864864865
+    },
+    {
+      "pod": "merge-worker-848db95476-2mlb6",
+      "generation": "4196",
+      "partitions": 1,
+      "start": "2026-10-02 21:43:47.764910604",
+      "max_seconds": 0.846965927,
+      "median_seconds": 0.846965927,
+      "scan_passes": [
+        3
+      ],
+      "outcomes": {
+        "fast_path_active": 1
+      },
+      "metadata_batches_seen": 146,
+      "batches_skipped_by_cursor": 122,
+      "batches_accepted": 24,
+      "records_accepted": 246404,
+      "batches_deferred_by_capacity": 0,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.8356164383561644
+    },
+    {
+      "pod": "merge-worker-6db9859bf-7lh5g",
+      "generation": "4196",
+      "partitions": 1,
+      "start": "2026-10-02 21:43:47.966111998",
+      "max_seconds": 4.394445845,
+      "median_seconds": 4.394445845,
+      "scan_passes": [
+        42
+      ],
+      "outcomes": {
+        "fast_path_active": 1
+      },
+      "metadata_batches_seen": 1771,
+      "batches_skipped_by_cursor": 1736,
+      "batches_accepted": 26,
+      "records_accepted": 225815,
+      "batches_deferred_by_capacity": 9,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9802371541501976
+    },
+    {
+      "pod": "merge-worker-848db95476-fwnvl",
+      "generation": "4196",
+      "partitions": 7,
+      "start": "2026-10-02 21:43:48.090048986",
+      "max_seconds": 11.875212394,
+      "median_seconds": 11.875195597,
+      "scan_passes": [
+        86
+      ],
+      "outcomes": {
+        "fast_path_active": 7
+      },
+      "metadata_batches_seen": 31440,
+      "batches_skipped_by_cursor": 31015,
+      "batches_accepted": 340,
+      "records_accepted": 3139174,
+      "batches_deferred_by_capacity": 85,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9864821882951654
+    },
+    {
+      "pod": "merge-worker-848db95476-8lhtz",
+      "generation": "4196",
+      "partitions": 1,
+      "start": "2026-10-02 21:43:48.136411985",
+      "max_seconds": 0.332955282,
+      "median_seconds": 0.332955282,
+      "scan_passes": [
+        1
+      ],
+      "outcomes": {
+        "fast_path_active": 1
+      },
+      "metadata_batches_seen": 45,
+      "batches_skipped_by_cursor": 24,
+      "batches_accepted": 21,
+      "records_accepted": 150253,
+      "batches_deferred_by_capacity": 0,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.5333333333333333
+    },
+    {
+      "pod": "merge-worker-848db95476-6lwm2",
+      "generation": "4196",
+      "partitions": 1,
+      "start": "2026-10-02 21:43:48.468478789",
+      "max_seconds": 0.151885542,
+      "median_seconds": 0.151885542,
+      "scan_passes": [
+        1
+      ],
+      "outcomes": {
+        "fast_path_active": 1
+      },
+      "metadata_batches_seen": 42,
+      "batches_skipped_by_cursor": 23,
+      "batches_accepted": 19,
+      "records_accepted": 198539,
+      "batches_deferred_by_capacity": 0,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.5476190476190477
+    },
+    {
+      "pod": "merge-worker-848db95476-kffcg",
+      "generation": "4196",
+      "partitions": 1,
+      "start": "2026-10-02 21:43:49.980907907",
+      "max_seconds": 1.184240465,
+      "median_seconds": 1.184240465,
+      "scan_passes": [
+        10
+      ],
+      "outcomes": {
+        "fast_path_active": 1
+      },
+      "metadata_batches_seen": 473,
+      "batches_skipped_by_cursor": 446,
+      "batches_accepted": 22,
+      "records_accepted": 263598,
+      "batches_deferred_by_capacity": 5,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9429175475687104
+    },
+    {
+      "pod": "merge-worker-canary-58d78c7fc-xcwpz",
+      "generation": "4196",
+      "partitions": 1,
+      "start": "2026-10-02 21:43:50.015346936",
+      "max_seconds": 0.219612827,
+      "median_seconds": 0.219612827,
+      "scan_passes": [
+        1
+      ],
+      "outcomes": {
+        "fast_path_active": 1
+      },
+      "metadata_batches_seen": 47,
+      "batches_skipped_by_cursor": 23,
+      "batches_accepted": 24,
+      "records_accepted": 222641,
+      "batches_deferred_by_capacity": 0,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.48936170212765956
+    },
+    {
+      "pod": "merge-worker-6db9859bf-kxqtx",
+      "generation": "4196",
+      "partitions": 1,
+      "start": "2026-10-02 21:43:50.066515935",
+      "max_seconds": 12.795355353,
+      "median_seconds": 12.795355353,
+      "scan_passes": [
+        105
+      ],
+      "outcomes": {
+        "fast_path_active": 1
+      },
+      "metadata_batches_seen": 5792,
+      "batches_skipped_by_cursor": 5720,
+      "batches_accepted": 49,
+      "records_accepted": 537571,
+      "batches_deferred_by_capacity": 23,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9875690607734806
+    },
+    {
+      "pod": "merge-worker-canary-56689b886d-sstsj",
+      "generation": "4196",
+      "partitions": 6,
+      "start": "2026-10-02 21:43:50.213009697",
+      "max_seconds": 5.282629198,
+      "median_seconds": 5.2826271495,
+      "scan_passes": [
+        51
+      ],
+      "outcomes": {
+        "fast_path_active": 6
+      },
+      "metadata_batches_seen": 13274,
+      "batches_skipped_by_cursor": 13046,
+      "batches_accepted": 178,
+      "records_accepted": 1683287,
+      "batches_deferred_by_capacity": 50,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9828235648636432
+    },
+    {
+      "pod": "merge-worker-6db9859bf-wz7bg",
+      "generation": "4196",
+      "partitions": 6,
+      "start": "2026-10-02 21:43:51.070006255",
+      "max_seconds": 12.624988971,
+      "median_seconds": 12.6249815925,
+      "scan_passes": [
+        97
+      ],
+      "outcomes": {
+        "fast_path_active": 6
+      },
+      "metadata_batches_seen": 29960,
+      "batches_skipped_by_cursor": 29572,
+      "batches_accepted": 292,
+      "records_accepted": 3392065,
+      "batches_deferred_by_capacity": 96,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9870493991989319
+    },
+    {
+      "pod": "merge-worker-6db9859bf-skjq2",
+      "generation": "4196",
+      "partitions": 6,
+      "start": "2026-10-02 21:43:51.274353222",
+      "max_seconds": 8.475888733,
+      "median_seconds": 8.4758795895,
+      "scan_passes": [
+        69
+      ],
+      "outcomes": {
+        "fast_path_active": 6
+      },
+      "metadata_batches_seen": 18785,
+      "batches_skipped_by_cursor": 18498,
+      "batches_accepted": 219,
+      "records_accepted": 2194093,
+      "batches_deferred_by_capacity": 68,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9847218525419218
+    },
+    {
+      "pod": "merge-worker-6db9859bf-52dmv",
+      "generation": "4196",
+      "partitions": 1,
+      "start": "2026-10-02 21:43:53.309660707",
+      "max_seconds": 23.408832821,
+      "median_seconds": 23.408832821,
+      "scan_passes": [
+        178
+      ],
+      "outcomes": {
+        "fast_path_active": 1
+      },
+      "metadata_batches_seen": 10367,
+      "batches_skipped_by_cursor": 10290,
+      "batches_accepted": 65,
+      "records_accepted": 570533,
+      "batches_deferred_by_capacity": 12,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9925725860904794
+    },
+    {
+      "pod": "merge-worker-6db9859bf-5r9pd",
+      "generation": "4196",
+      "partitions": 1,
+      "start": "2026-10-02 21:43:54.456646976",
+      "max_seconds": 9.125341337,
+      "median_seconds": 9.125341337,
+      "scan_passes": [
+        87
+      ],
+      "outcomes": {
+        "fast_path_active": 1
+      },
+      "metadata_batches_seen": 4625,
+      "batches_skipped_by_cursor": 4566,
+      "batches_accepted": 46,
+      "records_accepted": 401346,
+      "batches_deferred_by_capacity": 13,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9872432432432432
+    },
+    {
+      "pod": "merge-worker-6db9859bf-gfffd",
+      "generation": "4196",
+      "partitions": 1,
+      "start": "2026-10-02 21:43:54.730668260",
+      "max_seconds": 16.832110812,
+      "median_seconds": 16.832110812,
+      "scan_passes": [
+        132
+      ],
+      "outcomes": {
+        "fast_path_active": 1
+      },
+      "metadata_batches_seen": 7894,
+      "batches_skipped_by_cursor": 7817,
+      "batches_accepted": 60,
+      "records_accepted": 527882,
+      "batches_deferred_by_capacity": 17,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9902457562705853
+    },
+    {
+      "pod": "merge-worker-f9d6db8f9-v524p",
+      "generation": "4196",
+      "partitions": 6,
+      "start": "2026-10-02 21:43:56.721925410",
+      "max_seconds": 11.10692734,
+      "median_seconds": 11.106911266000001,
+      "scan_passes": [
+        82
+      ],
+      "outcomes": {
+        "fast_path_active": 6
+      },
+      "metadata_batches_seen": 28894,
+      "batches_skipped_by_cursor": 28499,
+      "batches_accepted": 321,
+      "records_accepted": 2989425,
+      "batches_deferred_by_capacity": 74,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9863293417318475
+    },
+    {
+      "pod": "merge-worker-848db95476-pgsbw",
+      "generation": "4196",
+      "partitions": 1,
+      "start": "2026-10-02 21:43:57.206958141",
+      "max_seconds": 1.419216867,
+      "median_seconds": 1.419216867,
+      "scan_passes": [
+        9
+      ],
+      "outcomes": {
+        "fast_path_active": 1
+      },
+      "metadata_batches_seen": 494,
+      "batches_skipped_by_cursor": 448,
+      "batches_accepted": 38,
+      "records_accepted": 432898,
+      "batches_deferred_by_capacity": 8,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9068825910931174
+    },
+    {
+      "pod": "merge-worker-848db95476-kfwws",
+      "generation": "4196",
+      "partitions": 7,
+      "start": "2026-10-02 21:43:58.050498754",
+      "max_seconds": 31.656292335,
+      "median_seconds": 31.65627293,
+      "scan_passes": [
+        245
+      ],
+      "outcomes": {
+        "fast_path_active": 7
+      },
+      "metadata_batches_seen": 117962,
+      "batches_skipped_by_cursor": 117113,
+      "batches_accepted": 605,
+      "records_accepted": 7863123,
+      "batches_deferred_by_capacity": 244,
+      "segments_deferred_by_visibility": 0,
+      "segments_skipped_by_frontier": 0,
+      "recovery_segments_blocked_by_visibility": 0,
+      "recovery_segments_handed_to_fast_by_visibility": 0,
+      "cursor_skip_fraction": 0.9928027669927604
+    }
+  ],
+  "handoff_phases": {
+    "shutdown_pre_release": 6,
+    "shutdown_release_result": 6,
+    "revocation_pre_release": 57,
+    "revocation_release_result": 57,
+    "rebalance_assigned": 141,
+    "startup_assigned": 33
+  },
+  "assignments": [
+    {
+      "timestamp": "2026-10-02 21:43:38.260870213",
+      "duration_seconds": 1.0401e-05,
+      "pod": "merge-worker-canary-56689b886d-sstsj",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "6a0cacbf50d8832d5ff0626f1495922f",
+      "assignment.partition_count": "0",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:38.292714944",
+      "duration_seconds": 8.3905e-05,
+      "pod": "merge-worker-6db9859bf-kxqtx",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "b25b128839163b5360fc2057aa6eb0ff",
+      "assignment.partition_count": "6",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:40.770923786",
+      "duration_seconds": 7.724e-06,
+      "pod": "merge-worker-848db95476-h52ll",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "1e663d8aa1779211367dbf84b8971bd0",
+      "assignment.partition_count": "0",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:43.172362180",
+      "duration_seconds": 6.3186e-05,
+      "pod": "merge-worker-6db9859bf-52dmv",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "a312723ae3edcdf69c77998967a9bf8f",
+      "assignment.partition_count": "6",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:43.184930455",
+      "duration_seconds": 5.7428e-05,
+      "pod": "merge-worker-6db9859bf-5r9pd",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "81d03689ceb15d753eb2e8c141d56b82",
+      "assignment.partition_count": "6",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:43.185746419",
+      "duration_seconds": 6.7932e-05,
+      "pod": "merge-worker-6db9859bf-gfffd",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "0b0873eaf53d50497a4879681ad1c1ea",
+      "assignment.partition_count": "6",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:44.625003011",
+      "duration_seconds": 3.2755e-05,
+      "pod": "merge-worker-848db95476-h52ll",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "2eb64b48da456c19f06135f662c9af07",
+      "assignment.partition_count": "1",
+      "assignment.phase": "startup_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:44.631591769",
+      "duration_seconds": 6.0698e-05,
+      "pod": "merge-worker-6db9859bf-85t5h",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "c07ef7c3f591ceed5a570ffda3f1cb3c",
+      "assignment.partition_count": "6",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:44.858268250",
+      "duration_seconds": 7.525e-06,
+      "pod": "merge-worker-848db95476-kfwws",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "208ddc6483753a3bd8237e02ec8ff085",
+      "assignment.partition_count": "0",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:44.859688755",
+      "duration_seconds": 0.0001549,
+      "pod": "merge-worker-6db9859bf-7lh5g",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "7c02f698129d302aabf42f92b36264b6",
+      "assignment.partition_count": "6",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:44.980052562",
+      "duration_seconds": 3.6469e-05,
+      "pod": "merge-worker-f9d6db8f9-v524p",
+      "cluster": "prod0-bitdrift",
+      "trace_id": "e47800efc9ee740fdc6b6a6ef1bf93af",
+      "assignment.partition_count": "1",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:45.029325596",
+      "duration_seconds": 5.5114e-05,
+      "pod": "merge-worker-6db9859bf-nkxt6",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "481248b84f2b0de8ba493fff9041e727",
+      "assignment.partition_count": "6",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:45.090799575",
+      "duration_seconds": 7.302e-06,
+      "pod": "merge-worker-848db95476-fwnvl",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "ea96de5506f2c158ff0fccd9e940db96",
+      "assignment.partition_count": "0",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:46.117900509",
+      "duration_seconds": 9.2677e-05,
+      "pod": "merge-worker-6db9859bf-85t5h",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "5b6c8961d1a9819e2418b6c7ec4e81ed",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:47.764768078",
+      "duration_seconds": 9.9425e-05,
+      "pod": "merge-worker-848db95476-2mlb6",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "6d9ae9e05d2c60f9be5272480225c7bb",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:47.965990648",
+      "duration_seconds": 9.3923e-05,
+      "pod": "merge-worker-6db9859bf-7lh5g",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "e6e6594e1458a54753544ad8cf191e9b",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:48.089938282",
+      "duration_seconds": 8.1001e-05,
+      "pod": "merge-worker-848db95476-fwnvl",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "cb64fe8745237a286e37a55b6a07e2ad",
+      "assignment.partition_count": "7",
+      "assignment.phase": "startup_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:48.136292781",
+      "duration_seconds": 8.9023e-05,
+      "pod": "merge-worker-848db95476-8lhtz",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "b7375698a764bfa960b0e529e2412102",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:48.468324835",
+      "duration_seconds": 0.000110028,
+      "pod": "merge-worker-848db95476-6lwm2",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "eea76274e9222a83d4522d100726d717",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:49.980764335",
+      "duration_seconds": 0.00010569,
+      "pod": "merge-worker-848db95476-kffcg",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "f598a6e1ddaeba677d2f71a2a546e256",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:50.015212084",
+      "duration_seconds": 9.2834e-05,
+      "pod": "merge-worker-canary-58d78c7fc-xcwpz",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "dcafffe741080d91b9d03dc99cbb3585",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:50.066377757",
+      "duration_seconds": 9.1407e-05,
+      "pod": "merge-worker-6db9859bf-kxqtx",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "d641c3d9711b172e9cd894136484f861",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:50.212933983",
+      "duration_seconds": 5.5322e-05,
+      "pod": "merge-worker-canary-56689b886d-sstsj",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "886b7b9c675b2581218bafad089cd526",
+      "assignment.partition_count": "6",
+      "assignment.phase": "startup_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:51.046526644",
+      "duration_seconds": 6.96e-06,
+      "pod": "merge-worker-6db9859bf-wz7bg",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "10b62408310b5c9a03f40f219e98371f",
+      "assignment.partition_count": "0",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:51.069920442",
+      "duration_seconds": 6.1411e-05,
+      "pod": "merge-worker-6db9859bf-wz7bg",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "24c51e3d2d3f110a9178d5809c7c3391",
+      "assignment.partition_count": "6",
+      "assignment.phase": "startup_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:51.239842897",
+      "duration_seconds": 9.674e-06,
+      "pod": "merge-worker-6db9859bf-skjq2",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "87ea27eb16069634e841264838b6b982",
+      "assignment.partition_count": "0",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:51.274212715",
+      "duration_seconds": 8.6189e-05,
+      "pod": "merge-worker-6db9859bf-skjq2",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "5bf743d8ad013f4427c95b3b8a24360a",
+      "assignment.partition_count": "6",
+      "assignment.phase": "startup_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:53.309523338",
+      "duration_seconds": 9.0734e-05,
+      "pod": "merge-worker-6db9859bf-52dmv",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "7558c7c5ade11ffafd0b70edd52ad67c",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:54.456474642",
+      "duration_seconds": 9.7608e-05,
+      "pod": "merge-worker-6db9859bf-5r9pd",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "192aba7c9538bf170b84fe85237111d3",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:54.730531256",
+      "duration_seconds": 9.2007e-05,
+      "pod": "merge-worker-6db9859bf-gfffd",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "53ddf95b8e4d7330aba019640ec41640",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:54.738904379",
+      "duration_seconds": 9.6553e-05,
+      "pod": "merge-worker-848db95476-h52ll",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "e5d9d74dc1aa2e6e53ae7f42712a6024",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:56.721818055",
+      "duration_seconds": 8.1734e-05,
+      "pod": "merge-worker-f9d6db8f9-v524p",
+      "cluster": "prod0-bitdrift",
+      "trace_id": "7d87909f82240cb96e2b15b989e87292",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:57.206836789",
+      "duration_seconds": 9.0509e-05,
+      "pod": "merge-worker-848db95476-pgsbw",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "e1b71a9a9544b76313e44da2a52c78ce",
+      "assignment.partition_count": "7",
+      "assignment.phase": "rebalance_assigned",
+      "consumer.generation": "4196"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:58.038210036",
+      "duration_seconds": 9.4362e-05,
+      "pod": "merge-worker-848db95476-kfwws",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "2ffcb0cd63aa80c85921170afc8bb69a",
+      "assignment.partition_count": "7",
+      "assignment.phase": "startup_assigned",
+      "consumer.generation": "4196"
+    }
+  ],
+  "revocations": [
+    {
+      "timestamp": "2026-10-02 21:43:20.530951444",
+      "duration_seconds": 0.037334433,
+      "span": "shutdown",
+      "pod": "merge-worker-848db95476-c8rcb",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "0bb64d67b9c05f030308ae15a0f34ff8",
+      "span_id": "46da4a0d7083c40d",
+      "busy_ns": "348305",
+      "consumer.generation": "4195",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-848db95476-c8rcb:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "idle_ns": "36987285",
+      "level": "INFO",
+      "shutdown.commit_outcome": "succeeded",
+      "shutdown.deregistration_outcome": "succeeded",
+      "shutdown.lease_release_outcome": "succeeded",
+      "shutdown.planner_release_outcome": "succeeded"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:29.758379484",
+      "duration_seconds": 8.534137649,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-6db9859bf-kxqtx",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "c3d57e08c22d06282de301394105219d",
+      "span_id": "0f811bcfcf1c2aec",
+      "busy_ns": "53759",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-6db9859bf-kxqtx:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "1",
+      "idle_ns": "8534085444",
+      "level": "INFO"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:30.118710727",
+      "duration_seconds": 8.142006124,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-canary-56689b886d-sstsj",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "c06d4ed982a18a77945dd9be61db92d6",
+      "span_id": "104ebad6e96f0277",
+      "busy_ns": "123414",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-canary-56689b886d-sstsj:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "6",
+      "idle_ns": "8141883345",
+      "level": "INFO"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:33.294414641",
+      "duration_seconds": 9.877804287,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-6db9859bf-52dmv",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "1b4129a94ca84b6f894a8f30ba737997",
+      "span_id": "4f6cee83a20adb07",
+      "busy_ns": "49559",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-6db9859bf-52dmv:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "1",
+      "idle_ns": "9877755852",
+      "level": "INFO"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:34.378359524",
+      "duration_seconds": 8.806409758,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-6db9859bf-5r9pd",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "9fd1821b0043066b2c36b91b2f66e3fd",
+      "span_id": "dd704601ac40efdb",
+      "busy_ns": "49779",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-6db9859bf-5r9pd:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "1",
+      "idle_ns": "8806361191",
+      "level": "INFO"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:34.517625487",
+      "duration_seconds": 8.667960054,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-6db9859bf-gfffd",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "c683ae276a62bdf4124d765552839c3f",
+      "span_id": "871fec4009391bdb",
+      "busy_ns": "44286",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-6db9859bf-gfffd:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "1",
+      "idle_ns": "8667916966",
+      "level": "INFO"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:34.589169127",
+      "duration_seconds": 6.181550543,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-848db95476-h52ll",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "306c34e714c3e5a9a4f4d7e36c97cbbf",
+      "span_id": "606740e8e29eb8e2",
+      "busy_ns": "107644",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-848db95476-h52ll:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "6",
+      "idle_ns": "6181443977",
+      "level": "INFO"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:36.079189519",
+      "duration_seconds": 14.967108974,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-6db9859bf-wz7bg",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "82d80ff41bc3708b490b5eac03ad8ac9",
+      "span_id": "2d0d11502d50ddee",
+      "busy_ns": "106914",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-6db9859bf-wz7bg:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "7",
+      "idle_ns": "14967002715",
+      "level": "INFO"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:36.110935972",
+      "duration_seconds": 8.520492917,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-6db9859bf-85t5h",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "4a773c2cfa4011b2d566af8a8cdb738f",
+      "span_id": "fd07a8f392f271d2",
+      "busy_ns": "52614",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-6db9859bf-85t5h:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "1",
+      "idle_ns": "8520441576",
+      "level": "INFO"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:36.266469662",
+      "duration_seconds": 8.713411801,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-f9d6db8f9-v524p",
+      "cluster": "prod0-bitdrift",
+      "trace_id": "a586269efd23192f9b9eab97218ca699",
+      "span_id": "9fd51b866043091f",
+      "busy_ns": "88336",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-f9d6db8f9-v524p:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "6",
+      "idle_ns": "8713324180",
+      "level": "INFO"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:37.461008994",
+      "duration_seconds": 7.568137943,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-6db9859bf-nkxt6",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "93916f8456579a320265f6d638c1c55f",
+      "span_id": "ed161c42d2923cfc",
+      "busy_ns": "94962",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-6db9859bf-nkxt6:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "7",
+      "idle_ns": "7568045160",
+      "level": "INFO"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:37.533856138",
+      "duration_seconds": 13.704941644,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-6db9859bf-skjq2",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "3efaabf733e00664580ea0b0047dad03",
+      "span_id": "69e6e632717924b9",
+      "busy_ns": "91918",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-6db9859bf-skjq2:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "7",
+      "idle_ns": "13704851534",
+      "level": "INFO"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:37.945521298",
+      "duration_seconds": 6.914018128,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-6db9859bf-7lh5g",
+      "cluster": "prod2-bitdrift",
+      "trace_id": "cd6a5b6dbe9aab5b32f0be1a9984b721",
+      "span_id": "143166efcf1b2859",
+      "busy_ns": "45653",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-6db9859bf-7lh5g:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "1",
+      "idle_ns": "6913973869",
+      "level": "INFO"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:37.954920442",
+      "duration_seconds": 6.90317945,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-848db95476-kfwws",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "ded9a504bb0b7aa169ead3b47f547634",
+      "span_id": "ed3351b279116fbc",
+      "busy_ns": "90628",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-848db95476-kfwws:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "6",
+      "idle_ns": "6903091479",
+      "level": "INFO"
+    },
+    {
+      "timestamp": "2026-10-02 21:43:38.062210093",
+      "duration_seconds": 7.028405605,
+      "span": "revocation_handoff",
+      "pod": "merge-worker-848db95476-fwnvl",
+      "cluster": "prod1-bitdrift",
+      "trace_id": "c23d97a02f0cdffd6fdc05270a6a94a3",
+      "span_id": "f8756e13672e0a49",
+      "busy_ns": "80943",
+      "consumer.generation": "4196",
+      "consumer.group_id": "loop-api-insights_v1",
+      "consumer.member_id": "merge-worker-848db95476-fwnvl:merge-worker:0",
+      "consumer.topic": "insights_v1",
+      "handoff.assignment_outcome": "succeeded",
+      "handoff.lease_release_outcome": "succeeded",
+      "handoff.revoked_partition_count": "6",
+      "idle_ns": "7028325287",
+      "level": "INFO"
+    }
+  ]
+}

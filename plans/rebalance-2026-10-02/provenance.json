@@ -1,0 +1,254 @@
+[
+  {
+    "file": "raw/batch-00.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_lvVlADfG22j7YBgedqjgpHj9__vscode-1790903619611/content.json",
+    "rows": 10,
+    "sha256": "316891546b74c45bff92f1d7c03ce193597281d8bc7e48c2fefce3306989df37"
+  },
+  {
+    "file": "raw/batch-01.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_psZ2K2jVfw57yDo3gUOu22uK__vscode-1790903619612/content.json",
+    "rows": 10,
+    "sha256": "d91a9430f840758b0b5e0177e321aee5a8b70ad91fa1c055dd367a07b676191e"
+  },
+  {
+    "file": "raw/batch-02.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_iliPHAtlzklb1q7W3xa1NxX8__vscode-1790903619613/content.json",
+    "rows": 10,
+    "sha256": "491211ba608b46f5e3ccd8cc628d9d744283d547d24e1c0c70a00944bad47747"
+  },
+  {
+    "file": "raw/batch-03.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_mv0BfjcO2SQcM0xKjdycaodG__vscode-1790903619614/content.json",
+    "rows": 10,
+    "sha256": "b673c71b4a690e41ffa51e35228526a91fc2c0b102c93e8307c10d10c5d0be28"
+  },
+  {
+    "file": "raw/batch-04.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_fItRBsyX2svVCSq6h1BtFWqw__vscode-1790903619615/content.json",
+    "rows": 10,
+    "sha256": "730b7aac1e0cc6cca18ea3b0f66449add956aa0912dc5a7c819fef6a9d9ba114"
+  },
+  {
+    "file": "raw/batch-05.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_SzaQa9cLeIvLlLXmEKFo8m7O__vscode-1790903619616/content.json",
+    "rows": 10,
+    "sha256": "6607807e50427c5077498229dfd918eff1b48ae6258cd83bff342e273a7fe7a3"
+  },
+  {
+    "file": "raw/batch-06.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_UZvOQWG9ot7C4940i8YjYjOd__vscode-1790903619618/content.json",
+    "rows": 10,
+    "sha256": "238f7423f24d54c9b8559cdae0f3b8388955b0bb7146ba36f9ba9e57905b16fe"
+  },
+  {
+    "file": "raw/batch-07.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_GqrPTzH1vdbuFEbVrkNXYxqK__vscode-1790903619619/content.json",
+    "rows": 10,
+    "sha256": "96ff565ca998fadb35e0d5df3890ced09ddae03b6da91467863da4348a5d6388"
+  },
+  {
+    "file": "raw/batch-08.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_7QvNsCInmCg4qeTBXNkLl59Y__vscode-1790903619620/content.json",
+    "rows": 10,
+    "sha256": "985acdd77a203ff9ba810cc3844159f1545c4cf900303a9167d8904b2e3c112a"
+  },
+  {
+    "file": "raw/batch-09.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_H9s4i7FYQa1IF9XsBt3G0oTk__vscode-1790903619621/content.json",
+    "rows": 10,
+    "sha256": "e3c1d2c751bdaede94aac71566cc54a67451d0aa299ac5eb73217e0fb50d3661"
+  },
+  {
+    "file": "raw/batch-10.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_94ogtFBCm7r8e3M0udwLSeak__vscode-1790903619622/content.json",
+    "rows": 10,
+    "sha256": "e530184b0f6aef67602723fb98809b377b92869db17c936c82090d71921de280"
+  },
+  {
+    "file": "raw/batch-11.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_GS9JwYofF0AngWU4yTdPCW1J__vscode-1790903619623/content.json",
+    "rows": 10,
+    "sha256": "8b85187e7090b9454a253f2c5bc2031a82e9ece4d301afcac4f68660fb14757f"
+  },
+  {
+    "file": "raw/batch-12.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_tgIIugKGsAZ06CTMHGdzoATf__vscode-1790903619624/content.json",
+    "rows": 10,
+    "sha256": "c355e911877fcb8dd7c042926a6cdfc455876953328391a174d5ea216c92156b"
+  },
+  {
+    "file": "raw/batch-13.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_WA7qmYLIGy8GiBqC2r5JZH8u__vscode-1790903619625/content.json",
+    "rows": 10,
+    "sha256": "8035e1e5b86fd8ae214f8e739ca3659bbf3b25d457f6a72909fa35480735bae5"
+  },
+  {
+    "file": "raw/batch-14.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_A95eMJz4jf9SjIRI3sQjOhdI__vscode-1790903619626/content.json",
+    "rows": 10,
+    "sha256": "8c4ba399b3473359f54976cd7601c07f22e2ce5d8bc1362e513da16e551dcd62"
+  },
+  {
+    "file": "raw/batch-15.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_tDEWO43qcTsIvaHwhnCEpMey__vscode-1790903619627/content.json",
+    "rows": 10,
+    "sha256": "71f7a2c1c97bec4dfcb2fa9a6f38097afde8e13a78e24d91874bbdedc30c9d25"
+  },
+  {
+    "file": "raw/batch-16.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_PJdZptMVa9gtenSLMtymOpRt__vscode-1790903619628/content.json",
+    "rows": 10,
+    "sha256": "ff6faea0fa5efe957f67b529aad374e14fd3c29193d7d6ad7e19c56e25d0828a"
+  },
+  {
+    "file": "raw/batch-17.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_LfghySvXWd5gcF5WUrq1cBsv__vscode-1790903619629/content.json",
+    "rows": 10,
+    "sha256": "3c08b1a5284d27c25916d48bfbbf995bb59eedd16c5a5f2f50458cf5ab2f4072"
+  },
+  {
+    "file": "raw/batch-18.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_VaYf8apcLNmRq4T1DwNsGDWq__vscode-1790903619630/content.json",
+    "rows": 10,
+    "sha256": "0c82551028749d07cec9bd50184bcce15c47fe68777b85d6a491470f1b717f15"
+  },
+  {
+    "file": "raw/batch-19.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_1AT02K239XEvng1mEIIxuRk7__vscode-1790903619631/content.json",
+    "rows": 10,
+    "sha256": "77af995507d412559503ce0e55c55a0fed777b37fe9d43c6d7f2d5f0cfa05d31"
+  },
+  {
+    "file": "raw/batch-20.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_lPoPEBXxLmY4wiv3YLqIinZC__vscode-1790903619632/content.json",
+    "rows": 10,
+    "sha256": "878fa2bc1452188e21cce86f702b4399ff2ac583ef43b570d7748e560c2b7fc2"
+  },
+  {
+    "file": "raw/batch-21.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_nWNsr0OhcKpVxFHnM8v6YC3n__vscode-1790903619633/content.json",
+    "rows": 10,
+    "sha256": "91445f867440e7badf30c47b1d459411d9220b7e3a9e8e3d6abf3c6fb00fa577"
+  },
+  {
+    "file": "raw/batch-22.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_PZxW1oyx0VOaEWSoLLSWy0xm__vscode-1790903619634/content.json",
+    "rows": 10,
+    "sha256": "4285fbdb50ce0c515b2b9ae19b725b6f93f68615566fe28860273486ab2ec41f"
+  },
+  {
+    "file": "raw/batch-23.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_aX1DHdwdqB55mn3b83BWKnK4__vscode-1790903619635/content.json",
+    "rows": 10,
+    "sha256": "ba15af09a2d91b91d2b37064a8534ee94c88f9cad57313c4d4837778b9f2e168"
+  },
+  {
+    "file": "raw/batch-24.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_FAUbEwjcDUhUsPpmLBWRnopJ__vscode-1790903619636/content.json",
+    "rows": 10,
+    "sha256": "6b9a0206591429fa767ba69a8b1827a9a04c835a417c9ad17115be3950d3197e"
+  },
+  {
+    "file": "raw/batch-25.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_JWUCCvCjBWktCqzDYKvJ3nV1__vscode-1790903619637/content.json",
+    "rows": 10,
+    "sha256": "ba69734026c0d0bfb9ea4e2f527201f14b3d052c83e48d868dbe3f22a8df4435"
+  },
+  {
+    "file": "raw/batch-26.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_plOysuz8ggnZEtKhOnm5zgiV__vscode-1790903619638/content.json",
+    "rows": 10,
+    "sha256": "97ae6f0240ad913a052b86edf8588bb3f4c71c89dbab6036d227a600310695f4"
+  },
+  {
+    "file": "raw/batch-27.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_Rj3norWyEv2OO8EbS03021rv__vscode-1790903619639/content.json",
+    "rows": 10,
+    "sha256": "8ddb37fefd1563764c0dced868f5eca02bf7d9dedbd13c0a25bd49f4c002978e"
+  },
+  {
+    "file": "raw/batch-28.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_ebaBVOuAOAThpPbNH5ZSimph__vscode-1790903619640/content.json",
+    "rows": 10,
+    "sha256": "fee477fc4e02163ad97fd7f0467ebe41f6f750b46560b083a3a128d27834e2ac"
+  },
+  {
+    "file": "raw/batch-29.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_cXaiAaFB778r16GAlwVr4w6M__vscode-1790903619641/content.json",
+    "rows": 10,
+    "sha256": "8837e52f43aa6e4af91b88bf6e53acca787ab77e3182cc4432ba093e4affad27"
+  },
+  {
+    "file": "raw/batch-30.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_E81dHVIYta12DTJUiSrU1bpN__vscode-1790903619642/content.json",
+    "rows": 10,
+    "sha256": "46fd728cc96843fa69b068d04275d5a55c4470f6ab659a94f5c4cbdf351686ce"
+  },
+  {
+    "file": "raw/batch-31.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_NPKKHv7y1vjQAcbY0IQRRgbo__vscode-1790903619643/content.json",
+    "rows": 10,
+    "sha256": "935c6166faf8efa1d6f0b8c2ac460ea8cc0a5b0fb76a997654963d91dd3c798f"
+  },
+  {
+    "file": "raw/batch-32.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_Fks5rpEU6PP2jWVOu4aXZkSq__vscode-1790903619644/content.json",
+    "rows": 10,
+    "sha256": "36175383a13ed93478ecb5c04284c4979c26af2431c9b3713d9864b935a88e84"
+  },
+  {
+    "file": "raw/batch-33.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_wyF6z3RjbfpaDEaRjxhsIfwn__vscode-1790903619645/content.json",
+    "rows": 10,
+    "sha256": "0c89392e9dddf77172fcf81f4d2c440e474c27fb6340a4969c20a023f28bd1de"
+  },
+  {
+    "file": "raw/batch-34.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_EQ2X3IdXrdSuio2hXxBFf2dH__vscode-1790903619646/content.json",
+    "rows": 10,
+    "sha256": "1639a235aed1062b9890734b9a147897cd7cd4abf9495153c83191f544c32166"
+  },
+  {
+    "file": "raw/batch-35.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_0kosYh9apRppU6QqAdKQAQ28__vscode-1790903619647/content.json",
+    "rows": 10,
+    "sha256": "3a4776c7142ab65cf1db54341abea3a80744f0be66929af906c3c0a9a157e5ba"
+  },
+  {
+    "file": "raw/batch-36.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_RcH7InqXriXHnn4xswGPO1XP__vscode-1790903619648/content.json",
+    "rows": 10,
+    "sha256": "6c77e2bbaffbb3b5ec89df942c07d2d1b69fad943e72820ac84683270ca0f8bd"
+  },
+  {
+    "file": "raw/batch-37.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_h02Id1x8u9u7le790KI6EaT5__vscode-1790903619649/content.json",
+    "rows": 10,
+    "sha256": "379a055f98a2fb278c4f7144e29a1abc0ae81c7dc77425d157253ef1ff9af2eb"
+  },
+  {
+    "file": "raw/batch-38.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_adetPbzVW3M3ewshdkF5BYTI__vscode-1790903619650/content.json",
+    "rows": 10,
+    "sha256": "6782d572c324d685e9e9e7ea57980a8fd3ea3f0a9728db3b0a79539c99505eb4"
+  },
+  {
+    "file": "raw/batch-39.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_39gyRr8i8oMmLVRjU0lksVt7__vscode-1790903619651/content.json",
+    "rows": 10,
+    "sha256": "9322c974c1d41eac511cd65c53ede197f1cc1d530405da838db885ed9751c5b2"
+  },
+  {
+    "file": "raw/batch-40.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_mBiB0jf0VJgeBKYvSdEbz1Sz__vscode-1790903619652/content.json",
+    "rows": 10,
+    "sha256": "fd2260691700cd8fdd13b45ea0c972cd4c6f17adf20f81128cd5734a97af2302"
+  },
+  {
+    "file": "raw/batch-41.json",
+    "original": "/Users/mklein/Library/Application Support/Code/User/workspaceStorage/09dc51d66248d22b53ac83d988ae2c2c/GitHub.copilot-chat/chat-session-resources/6f1ce641-b58c-4568-9159-ae3d2b4c4f3d/call_zMTpxNJ1GOHZQxotk0rePRSD__vscode-1790903619653/content.json",
+    "rows": 2,
+    "sha256": "d04b6e734e432a033833b3aebd185cfb217b4cf7c742795c858fd550633086e7"
+  }
+]

@@ -1,0 +1,648 @@
+{
+  "sourceId": "69e134032e628e9e2c5f1bd5",
+  "startTime": "2026-10-02T21:40:54.000Z",
+  "endTime": "2026-10-02T21:44:54.000Z",
+  "whereLanguage": "sql",
+  "expected": 412,
+  "batches": [
+    {
+      "buckets": [
+        321,
+        364,
+        399,
+        11
+      ],
+      "expected": 10,
+      "index": 0,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (321,364,399,11)"
+    },
+    {
+      "buckets": [
+        533,
+        754,
+        809,
+        12
+      ],
+      "expected": 10,
+      "index": 1,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (533,754,809,12)"
+    },
+    {
+      "buckets": [
+        814,
+        883,
+        16,
+        31
+      ],
+      "expected": 10,
+      "index": 2,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (814,883,16,31)"
+    },
+    {
+      "buckets": [
+        41,
+        86,
+        112,
+        113,
+        148
+      ],
+      "expected": 10,
+      "index": 3,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (41,86,112,113,148)"
+    },
+    {
+      "buckets": [
+        155,
+        187,
+        217,
+        225,
+        226
+      ],
+      "expected": 10,
+      "index": 4,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (155,187,217,225,226)"
+    },
+    {
+      "buckets": [
+        240,
+        242,
+        249,
+        260,
+        271
+      ],
+      "expected": 10,
+      "index": 5,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (240,242,249,260,271)"
+    },
+    {
+      "buckets": [
+        274,
+        283,
+        309,
+        311,
+        337
+      ],
+      "expected": 10,
+      "index": 6,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (274,283,309,311,337)"
+    },
+    {
+      "buckets": [
+        349,
+        369,
+        409,
+        461,
+        476
+      ],
+      "expected": 10,
+      "index": 7,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (349,369,409,461,476)"
+    },
+    {
+      "buckets": [
+        526,
+        542,
+        582,
+        677,
+        684
+      ],
+      "expected": 10,
+      "index": 8,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (526,542,582,677,684)"
+    },
+    {
+      "buckets": [
+        706,
+        716,
+        743,
+        752,
+        758
+      ],
+      "expected": 10,
+      "index": 9,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (706,716,743,752,758)"
+    },
+    {
+      "buckets": [
+        786,
+        808,
+        815,
+        841,
+        843
+      ],
+      "expected": 10,
+      "index": 10,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (786,808,815,841,843)"
+    },
+    {
+      "buckets": [
+        857,
+        898,
+        904,
+        905,
+        915
+      ],
+      "expected": 10,
+      "index": 11,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (857,898,904,905,915)"
+    },
+    {
+      "buckets": [
+        961,
+        970,
+        973,
+        1004,
+        19,
+        20
+      ],
+      "expected": 10,
+      "index": 12,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (961,970,973,1004,19,20)"
+    },
+    {
+      "buckets": [
+        21,
+        32,
+        33,
+        40,
+        47,
+        53,
+        55,
+        57,
+        58,
+        59
+      ],
+      "expected": 10,
+      "index": 13,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (21,32,33,40,47,53,55,57,58,59)"
+    },
+    {
+      "buckets": [
+        60,
+        79,
+        80,
+        84,
+        85,
+        87,
+        88,
+        91,
+        93,
+        97
+      ],
+      "expected": 10,
+      "index": 14,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (60,79,80,84,85,87,88,91,93,97)"
+    },
+    {
+      "buckets": [
+        99,
+        100,
+        105,
+        106,
+        110,
+        117,
+        121,
+        129,
+        131,
+        133
+      ],
+      "expected": 10,
+      "index": 15,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (99,100,105,106,110,117,121,129,131,133)"
+    },
+    {
+      "buckets": [
+        134,
+        135,
+        137,
+        150,
+        152,
+        154,
+        157,
+        158,
+        163,
+        165
+      ],
+      "expected": 10,
+      "index": 16,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (134,135,137,150,152,154,157,158,163,165)"
+    },
+    {
+      "buckets": [
+        168,
+        170,
+        172,
+        175,
+        176,
+        178,
+        179,
+        180,
+        183,
+        184
+      ],
+      "expected": 10,
+      "index": 17,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (168,170,172,175,176,178,179,180,183,184)"
+    },
+    {
+      "buckets": [
+        190,
+        201,
+        202,
+        204,
+        218,
+        220,
+        231,
+        234,
+        235,
+        241
+      ],
+      "expected": 10,
+      "index": 18,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (190,201,202,204,218,220,231,234,235,241)"
+    },
+    {
+      "buckets": [
+        243,
+        246,
+        250,
+        254,
+        258,
+        259,
+        261,
+        265,
+        267,
+        280
+      ],
+      "expected": 10,
+      "index": 19,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (243,246,250,254,258,259,261,265,267,280)"
+    },
+    {
+      "buckets": [
+        287,
+        290,
+        292,
+        295,
+        298,
+        299,
+        302,
+        306,
+        317,
+        329
+      ],
+      "expected": 10,
+      "index": 20,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (287,290,292,295,298,299,302,306,317,329)"
+    },
+    {
+      "buckets": [
+        331,
+        333,
+        338,
+        339,
+        340,
+        341,
+        343,
+        344,
+        348,
+        351
+      ],
+      "expected": 10,
+      "index": 21,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (331,333,338,339,340,341,343,344,348,351)"
+    },
+    {
+      "buckets": [
+        353,
+        356,
+        358,
+        359,
+        362,
+        370,
+        371,
+        374,
+        375,
+        379
+      ],
+      "expected": 10,
+      "index": 22,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (353,356,358,359,362,370,371,374,375,379)"
+    },
+    {
+      "buckets": [
+        380,
+        385,
+        387,
+        391,
+        394,
+        400,
+        404,
+        418,
+        419,
+        421
+      ],
+      "expected": 10,
+      "index": 23,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (380,385,387,391,394,400,404,418,419,421)"
+    },
+    {
+      "buckets": [
+        425,
+        439,
+        440,
+        441,
+        443,
+        454,
+        466,
+        470,
+        471,
+        472
+      ],
+      "expected": 10,
+      "index": 24,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (425,439,440,441,443,454,466,470,471,472)"
+    },
+    {
+      "buckets": [
+        477,
+        480,
+        486,
+        492,
+        494,
+        499,
+        500,
+        502,
+        507,
+        509
+      ],
+      "expected": 10,
+      "index": 25,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (477,480,486,492,494,499,500,502,507,509)"
+    },
+    {
+      "buckets": [
+        511,
+        518,
+        523,
+        530,
+        531,
+        532,
+        551,
+        552,
+        556,
+        562
+      ],
+      "expected": 10,
+      "index": 26,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (511,518,523,530,531,532,551,552,556,562)"
+    },
+    {
+      "buckets": [
+        565,
+        568,
+        571,
+        575,
+        576,
+        577,
+        581,
+        584,
+        586,
+        588
+      ],
+      "expected": 10,
+      "index": 27,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (565,568,571,575,576,577,581,584,586,588)"
+    },
+    {
+      "buckets": [
+        589,
+        595,
+        596,
+        604,
+        606,
+        609,
+        610,
+        611,
+        612,
+        616
+      ],
+      "expected": 10,
+      "index": 28,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (589,595,596,604,606,609,610,611,612,616)"
+    },
+    {
+      "buckets": [
+        621,
+        622,
+        629,
+        632,
+        638,
+        641,
+        642,
+        644,
+        645,
+        648
+      ],
+      "expected": 10,
+      "index": 29,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (621,622,629,632,638,641,642,644,645,648)"
+    },
+    {
+      "buckets": [
+        649,
+        650,
+        651,
+        652,
+        656,
+        657,
+        661,
+        667,
+        668,
+        669
+      ],
+      "expected": 10,
+      "index": 30,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (649,650,651,652,656,657,661,667,668,669)"
+    },
+    {
+      "buckets": [
+        672,
+        675,
+        678,
+        681,
+        689,
+        690,
+        692,
+        694,
+        695,
+        698
+      ],
+      "expected": 10,
+      "index": 31,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (672,675,678,681,689,690,692,694,695,698)"
+    },
+    {
+      "buckets": [
+        700,
+        701,
+        704,
+        717,
+        718,
+        720,
+        723,
+        726,
+        727,
+        728
+      ],
+      "expected": 10,
+      "index": 32,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (700,701,704,717,718,720,723,726,727,728)"
+    },
+    {
+      "buckets": [
+        730,
+        733,
+        740,
+        742,
+        745,
+        747,
+        755,
+        756,
+        757,
+        760
+      ],
+      "expected": 10,
+      "index": 33,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (730,733,740,742,745,747,755,756,757,760)"
+    },
+    {
+      "buckets": [
+        762,
+        766,
+        768,
+        779,
+        780,
+        787,
+        791,
+        792,
+        794,
+        801
+      ],
+      "expected": 10,
+      "index": 34,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (762,766,768,779,780,787,791,792,794,801)"
+    },
+    {
+      "buckets": [
+        802,
+        804,
+        807,
+        811,
+        819,
+        823,
+        827,
+        829,
+        833,
+        834
+      ],
+      "expected": 10,
+      "index": 35,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (802,804,807,811,819,823,827,829,833,834)"
+    },
+    {
+      "buckets": [
+        835,
+        836,
+        842,
+        848,
+        850,
+        852,
+        860,
+        862,
+        865,
+        867
+      ],
+      "expected": 10,
+      "index": 36,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (835,836,842,848,850,852,860,862,865,867)"
+    },
+    {
+      "buckets": [
+        871,
+        891,
+        893,
+        910,
+        911,
+        918,
+        920,
+        923,
+        927,
+        928
+      ],
+      "expected": 10,
+      "index": 37,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (871,891,893,910,911,918,920,923,927,928)"
+    },
+    {
+      "buckets": [
+        930,
+        933,
+        937,
+        940,
+        948,
+        952,
+        953,
+        955,
+        959,
+        962
+      ],
+      "expected": 10,
+      "index": 38,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (930,933,937,940,948,952,953,955,959,962)"
+    },
+    {
+      "buckets": [
+        965,
+        972,
+        974,
+        975,
+        978,
+        980,
+        981,
+        982,
+        987,
+        988
+      ],
+      "expected": 10,
+      "index": 39,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (965,972,974,975,978,980,981,982,987,988)"
+    },
+    {
+      "buckets": [
+        992,
+        995,
+        996,
+        999,
+        1001,
+        1003,
+        1008,
+        1012,
+        1014,
+        1017
+      ],
+      "expected": 10,
+      "index": 40,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (992,995,996,999,1001,1003,1008,1012,1014,1017)"
+    },
+    {
+      "buckets": [
+        1019,
+        1020
+      ],
+      "expected": 2,
+      "index": 41,
+      "where": "ResourceAttributes['k8s.pod.name'] LIKE '%merge-worker%' AND ServiceName = 'loop-api' AND SpanName IN ('blob_stream.consumer.assignment', 'blob_stream.consumer.partition_handoff', 'blob_stream.consumer.partition_recovery', 'blob_stream.consumer.revocation_handoff', 'blob_stream.consumer.shutdown') AND cityHash64(SpanId) % 1024 IN (1019,1020)"
+    }
+  ]
+}

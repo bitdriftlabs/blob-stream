@@ -1,0 +1,588 @@
+{
+  "result": {
+    "meta": [
+      {
+        "name": "Timestamp",
+        "type": "DateTime64(9)"
+      },
+      {
+        "name": "TraceId",
+        "type": "String"
+      },
+      {
+        "name": "SpanId",
+        "type": "String"
+      },
+      {
+        "name": "ParentSpanId",
+        "type": "String"
+      },
+      {
+        "name": "TraceState",
+        "type": "String"
+      },
+      {
+        "name": "SpanName",
+        "type": "LowCardinality(String)"
+      },
+      {
+        "name": "SpanKind",
+        "type": "LowCardinality(String)"
+      },
+      {
+        "name": "ServiceName",
+        "type": "LowCardinality(String)"
+      },
+      {
+        "name": "ResourceAttributes",
+        "type": "Map(LowCardinality(String), String)"
+      },
+      {
+        "name": "ScopeName",
+        "type": "String"
+      },
+      {
+        "name": "ScopeVersion",
+        "type": "String"
+      },
+      {
+        "name": "SpanAttributes",
+        "type": "Map(LowCardinality(String), String)"
+      },
+      {
+        "name": "Duration",
+        "type": "UInt64"
+      },
+      {
+        "name": "StatusCode",
+        "type": "LowCardinality(String)"
+      },
+      {
+        "name": "StatusMessage",
+        "type": "String"
+      },
+      {
+        "name": "Events.Timestamp",
+        "type": "Array(DateTime64(9))"
+      },
+      {
+        "name": "Events.Name",
+        "type": "Array(LowCardinality(String))"
+      },
+      {
+        "name": "Events.Attributes",
+        "type": "Array(Map(LowCardinality(String), String))"
+      },
+      {
+        "name": "Links.TraceId",
+        "type": "Array(String)"
+      },
+      {
+        "name": "Links.SpanId",
+        "type": "Array(String)"
+      },
+      {
+        "name": "Links.TraceState",
+        "type": "Array(String)"
+      },
+      {
+        "name": "Links.Attributes",
+        "type": "Array(Map(LowCardinality(String), String))"
+      },
+      {
+        "name": "timestamp_ns",
+        "type": "String"
+      },
+      {
+        "name": "duration_ns",
+        "type": "String"
+      },
+      {
+        "name": "event_timestamps_ns",
+        "type": "Array(String)"
+      }
+    ],
+    "data": [
+      {
+        "Timestamp": "2026-10-02T21:43:56.721927686Z",
+        "TraceId": "c49e68c6e77dded0544848da97bb2f67",
+        "SpanId": "10c5cbdb0a1a1654",
+        "ParentSpanId": "",
+        "TraceState": "",
+        "SpanName": "blob_stream.consumer.partition_recovery",
+        "SpanKind": "Consumer",
+        "ServiceName": "loop-api",
+        "ResourceAttributes": {
+          "k8s.cluster.name": "prod0-bitdrift",
+          "k8s.pod.name": "merge-worker-f9d6db8f9-v524p",
+          "service.name": "loop-api"
+        },
+        "ScopeName": "loop-api",
+        "ScopeVersion": "",
+        "SpanAttributes": {
+          "busy_ns": "0",
+          "consumer.generation": "4196",
+          "consumer.group_id": "loop-api-insights_v1",
+          "consumer.topic": "insights_v1",
+          "handoff.cursor_key": "insights_v1:loop-api-insights_v1:55:59205244480:2026-10-02 21:40:00.0 +00:00:00:1279926474010264775",
+          "idle_ns": "0",
+          "level": "INFO",
+          "messaging.partition": "55",
+          "recovery.committed_cursor": "Some(59205244480)",
+          "recovery.cutover_window_start": "1790977200",
+          "recovery.duration_ms": "11106",
+          "recovery.next_window_start": "1790977200",
+          "recovery.outcome": "fast_path_active",
+          "recovery.scan_passes": "82",
+          "recovery.start_cursor": "Some(59205244480)",
+          "recovery.summary_json": "{\"batches_accepted\":53,\"batches_deferred_by_capacity\":12,\"batches_skipped_by_cursor\":4714,\"metadata_batches_seen\":4779,\"records_accepted\":437238,\"recovery_segments_blocked_by_visibility\":0,\"recovery_segments_handed_to_fast_by_visibility\":0,\"segments_deferred_by_visibility\":0,\"segments_skipped_by_frontier\":0}"
+        },
+        "Duration": "11106895928",
+        "StatusCode": "Ok",
+        "StatusMessage": "",
+        "Events.Timestamp": [],
+        "Events.Name": [],
+        "Events.Attributes": [],
+        "Links.TraceId": [],
+        "Links.SpanId": [],
+        "Links.TraceState": [],
+        "Links.Attributes": [],
+        "timestamp_ns": "2026-10-02 21:43:56.721927686",
+        "duration_ns": "11106895928",
+        "event_timestamps_ns": []
+      },
+      {
+        "Timestamp": "2026-10-02T21:43:54.739316178Z",
+        "TraceId": "9756eeede326cc5d31a02962acc8eab4",
+        "SpanId": "378159a6cc32200e",
+        "ParentSpanId": "",
+        "TraceState": "",
+        "SpanName": "blob_stream.consumer.partition_recovery",
+        "SpanKind": "Consumer",
+        "ServiceName": "loop-api",
+        "ResourceAttributes": {
+          "k8s.cluster.name": "prod1-bitdrift",
+          "k8s.pod.name": "merge-worker-848db95476-h52ll",
+          "service.name": "loop-api"
+        },
+        "ScopeName": "loop-api",
+        "ScopeVersion": "",
+        "SpanAttributes": {
+          "busy_ns": "0",
+          "consumer.generation": "4196",
+          "consumer.group_id": "loop-api-insights_v1",
+          "consumer.topic": "insights_v1",
+          "handoff.cursor_key": "insights_v1:loop-api-insights_v1:50:57851813528:2026-10-02 21:40:00.0 +00:00:00:1279926481258022087",
+          "idle_ns": "0",
+          "level": "INFO",
+          "messaging.partition": "50",
+          "recovery.committed_cursor": "Some(57851813528)",
+          "recovery.cutover_window_start": "1790977200",
+          "recovery.duration_ms": "22141",
+          "recovery.next_window_start": "1790977200",
+          "recovery.outcome": "fast_path_active",
+          "recovery.scan_passes": "163",
+          "recovery.start_cursor": "Some(57851813528)",
+          "recovery.summary_json": "{\"batches_accepted\":65,\"batches_deferred_by_capacity\":23,\"batches_skipped_by_cursor\":9478,\"metadata_batches_seen\":9566,\"records_accepted\":720769,\"recovery_segments_blocked_by_visibility\":0,\"recovery_segments_handed_to_fast_by_visibility\":0,\"segments_deferred_by_visibility\":0,\"segments_skipped_by_frontier\":0}"
+        },
+        "Duration": "22141077736",
+        "StatusCode": "Ok",
+        "StatusMessage": "",
+        "Events.Timestamp": [],
+        "Events.Name": [],
+        "Events.Attributes": [],
+        "Links.TraceId": [],
+        "Links.SpanId": [],
+        "Links.TraceState": [],
+        "Links.Attributes": [],
+        "timestamp_ns": "2026-10-02 21:43:54.739316178",
+        "duration_ns": "22141077736",
+        "event_timestamps_ns": []
+      },
+      {
+        "Timestamp": "2026-10-02T21:43:54.730609205Z",
+        "TraceId": "53ddf95b8e4d7330aba019640ec41640",
+        "SpanId": "965a1ea8720b8c2c",
+        "ParentSpanId": "3a7dbcb48ec90cc7",
+        "TraceState": "",
+        "SpanName": "blob_stream.consumer.partition_handoff",
+        "SpanKind": "Internal",
+        "ServiceName": "loop-api",
+        "ResourceAttributes": {
+          "k8s.cluster.name": "prod2-bitdrift",
+          "k8s.pod.name": "merge-worker-6db9859bf-gfffd",
+          "service.name": "loop-api"
+        },
+        "ScopeName": "loop-api",
+        "ScopeVersion": "",
+        "SpanAttributes": {
+          "busy_ns": "0",
+          "consumer.generation": "4196",
+          "consumer.group_id": "loop-api-insights_v1",
+          "consumer.member_id": "merge-worker-6db9859bf-gfffd:merge-worker:0",
+          "consumer.topic": "insights_v1",
+          "handoff.commit_outcome": "not_applicable",
+          "handoff.cursor_key": "insights_v1:loop-api-insights_v1:174:58391893848:2026-10-02 21:40:00.0 +00:00:00:1279926473171411442",
+          "handoff.last_committed_offset": "Some(58391893848)",
+          "handoff.outcome": "assigned",
+          "handoff.phase": "rebalance_assigned",
+          "handoff.reader_mode": "Some(Fast)",
+          "handoff.recovery_cutover_window_start": "None",
+          "handoff.recovery_next_window_start": "None",
+          "handoff.snapshot_json": "{\"virtual_partition_id\":174,\"logical_partition_id\":46,\"owned\":true,\"active\":true,\"pending_assignment\":false,\"pending_commit_offset\":58391893848,\"last_committed_offset\":58391893848,\"last_committed_source_checkpoint\":{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926473171411442},\"last_committed_at\":\"2026-10-02T21:43:43.174Z\",\"cursor\":58392076669,\"reader\":{\"mode\":\"fast\",\"recovery_next_window_start\":null,\"recovery_cutover_window_start\":null,\"fast_coverage_floor\":\"2026-10-02T21:43:20.508922704Z\"},\"last_scan\":{\"completed_at\":\"2026-10-02T21:43:54Z\",\"scanned_window_starts\":[\"2026-10-02T21:40:00Z\"],\"scanned_window_starts_truncated\":false,\"fast_scan_bounds\":[{\"window_start\":\"2026-10-02T21:40:00Z\",\"floor_timestamp\":\"2026-10-02T21:43:20.508922704Z\",\"time_floor_snowflake_id\":1279926428342681600,\"observed_frontier_snowflake_id\":1279926502162440690,\"partition_lower_bound_snowflake_id\":1279926502162440690,\"query_lower_bound_snowflake_id\":1279926500384048327}],\"fast_scan_bounds_truncated\":false,\"fast_frontiers\":[{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926503840162290}],\"fast_frontiers_truncated\":false,\"cursor_before\":58392066298,\"cursor_after\":58392076669,\"metadata_segments_seen\":9,\"metadata_segments_without_partition_batches\":7,\"metadata_sources\":[{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926502162440690,\"blob_key\":\"blob-stream/shared/1790977200/1279926502162440690.zst\",\"metadata_published_at\":\"2026-10-02T21:43:42.644Z\",\"batch_ranges\":[{\"start\":58392055755,\"end\":58392066298}]},{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926503840162290,\"blob_key\":\"blob-stream/shared/1790977200/1279926503840162290.zst\",\"metadata_published_at\":\"2026-10-02T21:43:43.225Z\",\"batch_ranges\":[{\"start\":58392066299,\"end\":58392076669}]}],\"metadata_sources_truncated\":false,\"metadata_sources_incomplete_by_capacity\":true,\"metadata_batches_seen\":2,\"metadata_batches_skipped_by_cursor\":1,\"metadata_segments_skipped_by_frontier\":0,\"metadata_segments_deferred_by_visibility\":0,\"metadata_segments_blocked_by_visibility\":0,\"recovery_segments_handed_to_fast_by_visibility\":0,\"recovery_segments_blocked_by_visibility\":0,\"mature_metadata_cache_reuses\":0,\"metadata_batches_deferred_by_capacity\":0,\"batches_accepted\":1,\"records_accepted\":10371},\"prefetch_buffered_batch_count\":3,\"prefetch_buffered_record_count\":31961}",
+          "level": "INFO",
+          "messaging.partition": "174"
+        },
+        "Duration": "2266",
+        "StatusCode": "Unset",
+        "StatusMessage": "",
+        "Events.Timestamp": [],
+        "Events.Name": [],
+        "Events.Attributes": [],
+        "Links.TraceId": [],
+        "Links.SpanId": [],
+        "Links.TraceState": [],
+        "Links.Attributes": [],
+        "timestamp_ns": "2026-10-02 21:43:54.730609205",
+        "duration_ns": "2266",
+        "event_timestamps_ns": []
+      },
+      {
+        "Timestamp": "2026-10-02T21:43:54.456646976Z",
+        "TraceId": "d0ca229b8d953db0c08bdf69ef6573c0",
+        "SpanId": "06bddff0aca9e46d",
+        "ParentSpanId": "",
+        "TraceState": "",
+        "SpanName": "blob_stream.consumer.partition_recovery",
+        "SpanKind": "Consumer",
+        "ServiceName": "loop-api",
+        "ResourceAttributes": {
+          "k8s.cluster.name": "prod2-bitdrift",
+          "k8s.pod.name": "merge-worker-6db9859bf-5r9pd",
+          "service.name": "loop-api"
+        },
+        "ScopeName": "loop-api",
+        "ScopeVersion": "",
+        "SpanAttributes": {
+          "busy_ns": "0",
+          "consumer.generation": "4196",
+          "consumer.group_id": "loop-api-insights_v1",
+          "consumer.topic": "insights_v1",
+          "handoff.cursor_key": "insights_v1:loop-api-insights_v1:184:58442056824:2026-10-02 21:40:00.0 +00:00:00:1279926477231497714",
+          "idle_ns": "0",
+          "level": "INFO",
+          "messaging.partition": "184",
+          "recovery.committed_cursor": "Some(58442056824)",
+          "recovery.cutover_window_start": "1790977200",
+          "recovery.duration_ms": "9125",
+          "recovery.next_window_start": "1790977200",
+          "recovery.outcome": "fast_path_active",
+          "recovery.scan_passes": "87",
+          "recovery.start_cursor": "Some(58442056824)",
+          "recovery.summary_json": "{\"batches_accepted\":46,\"batches_deferred_by_capacity\":13,\"batches_skipped_by_cursor\":4566,\"metadata_batches_seen\":4625,\"records_accepted\":401346,\"recovery_segments_blocked_by_visibility\":0,\"recovery_segments_handed_to_fast_by_visibility\":0,\"segments_deferred_by_visibility\":0,\"segments_skipped_by_frontier\":0}"
+        },
+        "Duration": "9125341337",
+        "StatusCode": "Ok",
+        "StatusMessage": "",
+        "Events.Timestamp": [],
+        "Events.Name": [],
+        "Events.Attributes": [],
+        "Links.TraceId": [],
+        "Links.SpanId": [],
+        "Links.TraceState": [],
+        "Links.Attributes": [],
+        "timestamp_ns": "2026-10-02 21:43:54.456646976",
+        "duration_ns": "9125341337",
+        "event_timestamps_ns": []
+      },
+      {
+        "Timestamp": "2026-10-02T21:43:54.456543559Z",
+        "TraceId": "192aba7c9538bf170b84fe85237111d3",
+        "SpanId": "556314117d24d900",
+        "ParentSpanId": "80242cdb50c4967f",
+        "TraceState": "",
+        "SpanName": "blob_stream.consumer.partition_handoff",
+        "SpanKind": "Internal",
+        "ServiceName": "loop-api",
+        "ResourceAttributes": {
+          "k8s.cluster.name": "prod2-bitdrift",
+          "k8s.pod.name": "merge-worker-6db9859bf-5r9pd",
+          "service.name": "loop-api"
+        },
+        "ScopeName": "loop-api",
+        "ScopeVersion": "",
+        "SpanAttributes": {
+          "busy_ns": "0",
+          "consumer.generation": "4196",
+          "consumer.group_id": "loop-api-insights_v1",
+          "consumer.member_id": "merge-worker-6db9859bf-5r9pd:merge-worker:0",
+          "consumer.topic": "insights_v1",
+          "handoff.commit_outcome": "not_applicable",
+          "handoff.cursor_key": "insights_v1:loop-api-insights_v1:104:58320159868:2026-10-02 21:40:00.0 +00:00:00:1279926470587717398",
+          "handoff.last_committed_offset": "Some(58320159868)",
+          "handoff.outcome": "assigned",
+          "handoff.phase": "rebalance_assigned",
+          "handoff.reader_mode": "Some(Fast)",
+          "handoff.recovery_cutover_window_start": "None",
+          "handoff.recovery_next_window_start": "None",
+          "handoff.snapshot_json": "{\"virtual_partition_id\":104,\"logical_partition_id\":40,\"owned\":true,\"active\":true,\"pending_assignment\":false,\"pending_commit_offset\":58320159868,\"last_committed_offset\":58320159868,\"last_committed_source_checkpoint\":{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926470587717398},\"last_committed_at\":\"2026-10-02T21:43:43.174Z\",\"cursor\":58320337187,\"reader\":{\"mode\":\"fast\",\"recovery_next_window_start\":null,\"recovery_cutover_window_start\":null,\"fast_coverage_floor\":\"2026-10-02T21:43:21.002427334Z\"},\"last_scan\":{\"completed_at\":\"2026-10-02T21:43:54Z\",\"scanned_window_starts\":[\"2026-10-02T21:40:00Z\"],\"scanned_window_starts_truncated\":false,\"fast_scan_bounds\":[{\"window_start\":\"2026-10-02T21:40:00Z\",\"floor_timestamp\":\"2026-10-02T21:43:21.002427334Z\",\"time_floor_snowflake_id\":1279926430020403200,\"observed_frontier_snowflake_id\":1279926505014564630,\"partition_lower_bound_snowflake_id\":1279926505014564630,\"query_lower_bound_snowflake_id\":1279926504276370878}],\"fast_scan_bounds_truncated\":false,\"fast_frontiers\":[{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926507430483734}],\"fast_frontiers_truncated\":false,\"cursor_before\":58320325470,\"cursor_after\":58320337187,\"metadata_segments_seen\":11,\"metadata_segments_without_partition_batches\":9,\"metadata_sources\":[{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926505014564630,\"blob_key\":\"blob-stream/shared/1790977200/1279926505014564630.zst\",\"metadata_published_at\":\"2026-10-02T21:43:43.555Z\",\"batch_ranges\":[{\"start\":58320313561,\"end\":58320325470}]},{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926507430483734,\"blob_key\":\"blob-stream/shared/1790977200/1279926507430483734.zst\",\"metadata_published_at\":\"2026-10-02T21:43:44.252Z\",\"batch_ranges\":[{\"start\":58320325471,\"end\":58320337187}]}],\"metadata_sources_truncated\":false,\"metadata_sources_incomplete_by_capacity\":true,\"metadata_batches_seen\":2,\"metadata_batches_skipped_by_cursor\":1,\"metadata_segments_skipped_by_frontier\":0,\"metadata_segments_deferred_by_visibility\":0,\"metadata_segments_blocked_by_visibility\":0,\"recovery_segments_handed_to_fast_by_visibility\":0,\"recovery_segments_blocked_by_visibility\":0,\"mature_metadata_cache_reuses\":0,\"metadata_batches_deferred_by_capacity\":0,\"batches_accepted\":1,\"records_accepted\":11717},\"prefetch_buffered_batch_count\":2,\"prefetch_buffered_record_count\":23341}",
+          "level": "INFO",
+          "messaging.partition": "104"
+        },
+        "Duration": "2406",
+        "StatusCode": "Unset",
+        "StatusMessage": "",
+        "Events.Timestamp": [],
+        "Events.Name": [],
+        "Events.Attributes": [],
+        "Links.TraceId": [],
+        "Links.SpanId": [],
+        "Links.TraceState": [],
+        "Links.Attributes": [],
+        "timestamp_ns": "2026-10-02 21:43:54.456543559",
+        "duration_ns": "2406",
+        "event_timestamps_ns": []
+      },
+      {
+        "Timestamp": "2026-10-02T21:43:53.309523338Z",
+        "TraceId": "7558c7c5ade11ffafd0b70edd52ad67c",
+        "SpanId": "85b9b591b5e9867d",
+        "ParentSpanId": "",
+        "TraceState": "",
+        "SpanName": "blob_stream.consumer.assignment",
+        "SpanKind": "Internal",
+        "ServiceName": "loop-api",
+        "ResourceAttributes": {
+          "k8s.cluster.name": "prod2-bitdrift",
+          "k8s.pod.name": "merge-worker-6db9859bf-52dmv",
+          "service.name": "loop-api"
+        },
+        "ScopeName": "loop-api",
+        "ScopeVersion": "",
+        "SpanAttributes": {
+          "assignment.partition_count": "7",
+          "assignment.phase": "rebalance_assigned",
+          "busy_ns": "46760",
+          "consumer.generation": "4196",
+          "consumer.group_id": "loop-api-insights_v1",
+          "consumer.member_id": "merge-worker-6db9859bf-52dmv:merge-worker:0",
+          "consumer.topic": "insights_v1",
+          "idle_ns": "44824",
+          "level": "INFO"
+        },
+        "Duration": "90734",
+        "StatusCode": "Ok",
+        "StatusMessage": "",
+        "Events.Timestamp": [],
+        "Events.Name": [],
+        "Events.Attributes": [],
+        "Links.TraceId": [],
+        "Links.SpanId": [],
+        "Links.TraceState": [],
+        "Links.Attributes": [],
+        "timestamp_ns": "2026-10-02 21:43:53.309523338",
+        "duration_ns": "90734",
+        "event_timestamps_ns": []
+      },
+      {
+        "Timestamp": "2026-10-02T21:43:50.066515935Z",
+        "TraceId": "25965073b6c970419e8ff069ba519b8a",
+        "SpanId": "2156ff48f24166eb",
+        "ParentSpanId": "",
+        "TraceState": "",
+        "SpanName": "blob_stream.consumer.partition_recovery",
+        "SpanKind": "Consumer",
+        "ServiceName": "loop-api",
+        "ResourceAttributes": {
+          "k8s.cluster.name": "prod2-bitdrift",
+          "k8s.pod.name": "merge-worker-6db9859bf-kxqtx",
+          "service.name": "loop-api"
+        },
+        "ScopeName": "loop-api",
+        "ScopeVersion": "",
+        "SpanAttributes": {
+          "busy_ns": "0",
+          "consumer.generation": "4196",
+          "consumer.group_id": "loop-api-insights_v1",
+          "consumer.topic": "insights_v1",
+          "handoff.cursor_key": "insights_v1:loop-api-insights_v1:58:58710218450:2026-10-02 21:40:00.0 +00:00:00:1279926466796061021",
+          "idle_ns": "0",
+          "level": "INFO",
+          "messaging.partition": "58",
+          "recovery.committed_cursor": "Some(58710218450)",
+          "recovery.cutover_window_start": "1790977200",
+          "recovery.duration_ms": "12795",
+          "recovery.next_window_start": "1790977200",
+          "recovery.outcome": "fast_path_active",
+          "recovery.scan_passes": "105",
+          "recovery.start_cursor": "Some(58710218450)",
+          "recovery.summary_json": "{\"batches_accepted\":49,\"batches_deferred_by_capacity\":23,\"batches_skipped_by_cursor\":5720,\"metadata_batches_seen\":5792,\"records_accepted\":537571,\"recovery_segments_blocked_by_visibility\":0,\"recovery_segments_handed_to_fast_by_visibility\":0,\"segments_deferred_by_visibility\":0,\"segments_skipped_by_frontier\":0}"
+        },
+        "Duration": "12795355353",
+        "StatusCode": "Ok",
+        "StatusMessage": "",
+        "Events.Timestamp": [],
+        "Events.Name": [],
+        "Events.Attributes": [],
+        "Links.TraceId": [],
+        "Links.SpanId": [],
+        "Links.TraceState": [],
+        "Links.Attributes": [],
+        "timestamp_ns": "2026-10-02 21:43:50.066515935",
+        "duration_ns": "12795355353",
+        "event_timestamps_ns": []
+      },
+      {
+        "Timestamp": "2026-10-02T21:43:47.764849845Z",
+        "TraceId": "6d9ae9e05d2c60f9be5272480225c7bb",
+        "SpanId": "3f929ba314245154",
+        "ParentSpanId": "8c8de04a2021930f",
+        "TraceState": "",
+        "SpanName": "blob_stream.consumer.partition_handoff",
+        "SpanKind": "Internal",
+        "ServiceName": "loop-api",
+        "ResourceAttributes": {
+          "k8s.cluster.name": "prod1-bitdrift",
+          "k8s.pod.name": "merge-worker-848db95476-2mlb6",
+          "service.name": "loop-api"
+        },
+        "ScopeName": "loop-api",
+        "ScopeVersion": "",
+        "SpanAttributes": {
+          "busy_ns": "0",
+          "consumer.generation": "4196",
+          "consumer.group_id": "loop-api-insights_v1",
+          "consumer.member_id": "merge-worker-848db95476-2mlb6:merge-worker:0",
+          "consumer.topic": "insights_v1",
+          "handoff.commit_outcome": "not_applicable",
+          "handoff.cursor_key": "insights_v1:loop-api-insights_v1:122:58703190705:2026-10-02 21:40:00.0 +00:00:00:1279926471359469956",
+          "handoff.last_committed_offset": "Some(58703190705)",
+          "handoff.outcome": "assigned",
+          "handoff.phase": "rebalance_assigned",
+          "handoff.reader_mode": "Some(Recovering)",
+          "handoff.recovery_cutover_window_start": "Some(2026-10-02 21:40:00.0 +00:00:00)",
+          "handoff.recovery_next_window_start": "Some(2026-10-02 21:40:00.0 +00:00:00)",
+          "handoff.snapshot_json": "{\"virtual_partition_id\":122,\"logical_partition_id\":58,\"owned\":true,\"active\":true,\"pending_assignment\":false,\"pending_commit_offset\":null,\"last_committed_offset\":58703190705,\"last_committed_source_checkpoint\":{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926471359469956},\"last_committed_at\":\"2026-10-02T21:43:43.174Z\",\"cursor\":58703190705,\"reader\":{\"mode\":\"recovering\",\"recovery_next_window_start\":\"2026-10-02T21:40:00Z\",\"recovery_cutover_window_start\":\"2026-10-02T21:40:00Z\",\"fast_coverage_floor\":null},\"last_scan\":null,\"prefetch_buffered_batch_count\":0,\"prefetch_buffered_record_count\":0}",
+          "level": "INFO",
+          "messaging.partition": "122"
+        },
+        "Duration": "3204",
+        "StatusCode": "Unset",
+        "StatusMessage": "",
+        "Events.Timestamp": [],
+        "Events.Name": [],
+        "Events.Attributes": [],
+        "Links.TraceId": [],
+        "Links.SpanId": [],
+        "Links.TraceState": [],
+        "Links.Attributes": [],
+        "timestamp_ns": "2026-10-02 21:43:47.764849845",
+        "duration_ns": "3204",
+        "event_timestamps_ns": []
+      },
+      {
+        "Timestamp": "2026-10-02T21:43:44.979859656Z",
+        "TraceId": "a586269efd23192f9b9eab97218ca699",
+        "SpanId": "64253c5b780d4771",
+        "ParentSpanId": "9fd51b866043091f",
+        "TraceState": "",
+        "SpanName": "blob_stream.consumer.partition_handoff",
+        "SpanKind": "Internal",
+        "ServiceName": "loop-api",
+        "ResourceAttributes": {
+          "k8s.cluster.name": "prod0-bitdrift",
+          "k8s.pod.name": "merge-worker-f9d6db8f9-v524p",
+          "service.name": "loop-api"
+        },
+        "ScopeName": "loop-api",
+        "ScopeVersion": "",
+        "SpanAttributes": {
+          "busy_ns": "0",
+          "consumer.generation": "4196",
+          "consumer.group_id": "loop-api-insights_v1",
+          "consumer.member_id": "merge-worker-f9d6db8f9-v524p:merge-worker:0",
+          "consumer.topic": "insights_v1",
+          "handoff.commit_outcome": "not_attempted",
+          "handoff.cursor_key": "insights_v1:loop-api-insights_v1:121:57752054868:2026-10-02 21:40:00.0 +00:00:00:1279926370964608790",
+          "handoff.last_committed_offset": "Some(57752054868)",
+          "handoff.outcome": "released",
+          "handoff.phase": "revocation_release_result",
+          "handoff.reader_mode": "Some(Fast)",
+          "handoff.recovery_cutover_window_start": "None",
+          "handoff.recovery_next_window_start": "None",
+          "handoff.snapshot_json": "{\"virtual_partition_id\":121,\"logical_partition_id\":57,\"owned\":true,\"active\":true,\"pending_assignment\":false,\"pending_commit_offset\":57752054868,\"last_committed_offset\":57752054868,\"last_committed_source_checkpoint\":{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926370964608790},\"last_committed_at\":\"2026-10-02T21:43:23.213Z\",\"cursor\":57752503306,\"reader\":{\"mode\":\"fast\",\"recovery_next_window_start\":null,\"recovery_cutover_window_start\":null,\"fast_coverage_floor\":\"2026-10-02T21:43:20.644058532Z\"},\"last_scan\":{\"completed_at\":\"2026-10-02T21:43:35Z\",\"scanned_window_starts\":[\"2026-10-02T21:40:00Z\"],\"scanned_window_starts_truncated\":false,\"fast_scan_bounds\":[{\"window_start\":\"2026-10-02T21:40:00Z\",\"floor_timestamp\":\"2026-10-02T21:43:20.220986056Z\",\"time_floor_snowflake_id\":1279926427403157504,\"observed_frontier_snowflake_id\":1279926478003246870,\"partition_lower_bound_snowflake_id\":1279926478003246870,\"query_lower_bound_snowflake_id\":1279926476526846301}],\"fast_scan_bounds_truncated\":false,\"fast_frontiers\":[{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926478003246870}],\"fast_frontiers_truncated\":false,\"cursor_before\":57752503306,\"cursor_after\":57752503306,\"metadata_segments_seen\":8,\"metadata_segments_without_partition_batches\":7,\"metadata_sources\":[{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926478003246870,\"blob_key\":\"blob-stream/shared/1790977200/1279926478003246870.zst\",\"metadata_published_at\":\"2026-10-02T21:43:35.463Z\",\"batch_ranges\":[{\"start\":57752494007,\"end\":57752503306}]}],\"metadata_sources_truncated\":false,\"metadata_sources_incomplete_by_capacity\":false,\"metadata_batches_seen\":1,\"metadata_batches_skipped_by_cursor\":1,\"metadata_segments_skipped_by_frontier\":0,\"metadata_segments_deferred_by_visibility\":0,\"metadata_segments_blocked_by_visibility\":0,\"recovery_segments_handed_to_fast_by_visibility\":0,\"recovery_segments_blocked_by_visibility\":0,\"mature_metadata_cache_reuses\":0,\"metadata_batches_deferred_by_capacity\":0,\"batches_accepted\":0,\"records_accepted\":0},\"prefetch_buffered_batch_count\":0,\"prefetch_buffered_record_count\":0}",
+          "level": "INFO",
+          "messaging.partition": "121"
+        },
+        "Duration": "2375",
+        "StatusCode": "Unset",
+        "StatusMessage": "",
+        "Events.Timestamp": [],
+        "Events.Name": [],
+        "Events.Attributes": [],
+        "Links.TraceId": [],
+        "Links.SpanId": [],
+        "Links.TraceState": [],
+        "Links.Attributes": [],
+        "timestamp_ns": "2026-10-02 21:43:44.979859656",
+        "duration_ns": "2375",
+        "event_timestamps_ns": []
+      },
+      {
+        "Timestamp": "2026-10-02T21:43:20.568020925Z",
+        "TraceId": "0bb64d67b9c05f030308ae15a0f34ff8",
+        "SpanId": "f9bc60053171219f",
+        "ParentSpanId": "46da4a0d7083c40d",
+        "TraceState": "",
+        "SpanName": "blob_stream.consumer.partition_handoff",
+        "SpanKind": "Internal",
+        "ServiceName": "loop-api",
+        "ResourceAttributes": {
+          "k8s.cluster.name": "prod1-bitdrift",
+          "k8s.pod.name": "merge-worker-848db95476-c8rcb",
+          "service.name": "loop-api"
+        },
+        "ScopeName": "loop-api",
+        "ScopeVersion": "",
+        "SpanAttributes": {
+          "busy_ns": "0",
+          "consumer.generation": "4195",
+          "consumer.group_id": "loop-api-insights_v1",
+          "consumer.member_id": "merge-worker-848db95476-c8rcb:merge-worker:0",
+          "consumer.topic": "insights_v1",
+          "handoff.commit_outcome": "succeeded",
+          "handoff.cursor_key": "insights_v1:loop-api-insights_v1:128:58099660334:2026-10-02 21:40:00.0 +00:00:00:1279926397606830578",
+          "handoff.last_committed_offset": "Some(58099660334)",
+          "handoff.outcome": "released",
+          "handoff.phase": "shutdown_release_result",
+          "handoff.reader_mode": "Some(Fast)",
+          "handoff.recovery_cutover_window_start": "None",
+          "handoff.recovery_next_window_start": "None",
+          "handoff.snapshot_json": "{\"virtual_partition_id\":128,\"logical_partition_id\":0,\"owned\":true,\"active\":true,\"pending_assignment\":false,\"pending_commit_offset\":58099660334,\"last_committed_offset\":58099660334,\"last_committed_source_checkpoint\":{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926397606830578},\"last_committed_at\":\"2026-10-02T21:43:20.53Z\",\"cursor\":58099683048,\"reader\":{\"mode\":\"fast\",\"recovery_next_window_start\":null,\"recovery_cutover_window_start\":null,\"fast_coverage_floor\":\"2026-10-02T21:42:58.03370289Z\"},\"last_scan\":{\"completed_at\":\"2026-10-02T21:43:18Z\",\"scanned_window_starts\":[\"2026-10-02T21:40:00Z\"],\"scanned_window_starts_truncated\":false,\"fast_scan_bounds\":[{\"window_start\":\"2026-10-02T21:40:00Z\",\"floor_timestamp\":\"2026-10-02T21:42:58.03370289Z\",\"time_floor_snowflake_id\":1279926352945872896,\"observed_frontier_snowflake_id\":1279926403344638450,\"partition_lower_bound_snowflake_id\":1279926403344638450,\"query_lower_bound_snowflake_id\":1279926402036007261}],\"fast_scan_bounds_truncated\":false,\"fast_frontiers\":[{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926403344638450}],\"fast_frontiers_truncated\":false,\"cursor_before\":58099683048,\"cursor_after\":58099683048,\"metadata_segments_seen\":4,\"metadata_segments_without_partition_batches\":3,\"metadata_sources\":[{\"window_start\":\"2026-10-02T21:40:00Z\",\"snowflake_id\":1279926403344638450,\"blob_key\":\"blob-stream/shared/1790977200/1279926403344638450.zst\",\"metadata_published_at\":\"2026-10-02T21:43:13.206Z\",\"batch_ranges\":[{\"start\":58099677011,\"end\":58099683048}]}],\"metadata_sources_truncated\":false,\"metadata_sources_incomplete_by_capacity\":true,\"metadata_batches_seen\":1,\"metadata_batches_skipped_by_cursor\":1,\"metadata_segments_skipped_by_frontier\":0,\"metadata_segments_deferred_by_visibility\":0,\"metadata_segments_blocked_by_visibility\":0,\"recovery_segments_handed_to_fast_by_visibility\":0,\"recovery_segments_blocked_by_visibility\":0,\"mature_metadata_cache_reuses\":0,\"metadata_batches_deferred_by_capacity\":0,\"batches_accepted\":0,\"records_accepted\":0},\"prefetch_buffered_batch_count\":3,\"prefetch_buffered_record_count\":22714}",
+          "level": "INFO",
+          "messaging.partition": "128"
+        },
+        "Duration": "256893",
+        "StatusCode": "Unset",
+        "StatusMessage": "",
+        "Events.Timestamp": [],
+        "Events.Name": [],
+        "Events.Attributes": [],
+        "Links.TraceId": [],
+        "Links.SpanId": [],
+        "Links.TraceState": [],
+        "Links.Attributes": [],
+        "timestamp_ns": "2026-10-02 21:43:20.568020925",
+        "duration_ns": "256893",
+        "event_timestamps_ns": []
+      }
+    ],
+    "rows": 10,
+    "rows_before_limit_at_least": 10,
+    "statistics": {
+      "elapsed": 0.021020436,
+      "rows_read": 8660,
+      "bytes_read": 8511148
+    }
+  }
+}

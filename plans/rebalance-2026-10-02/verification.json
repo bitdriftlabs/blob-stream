@@ -1,0 +1,16 @@
+{
+  "rows": 412,
+  "unique_trace_span_pairs": 412,
+  "raw_responses": 42,
+  "span_types": {
+    "shutdown": 1,
+    "partition_handoff": 300,
+    "revocation_handoff": 14,
+    "partition_recovery": 63,
+    "assignment": 34
+  },
+  "all_responses_complete": true,
+  "no_trimming_markers": true,
+  "first_span_start": "2026-10-02 21:43:20.530951444",
+  "last_span_start": "2026-10-02 21:43:58.050522051"
+}
