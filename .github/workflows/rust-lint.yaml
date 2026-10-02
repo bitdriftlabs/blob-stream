@@ -24,7 +24,7 @@ jobs:
       - if: github.event_name == 'push'
         name: Checkout
         uses: actions/checkout@v4
-      - uses: tj-actions/changed-files@v41
+      - uses: tj-actions/changed-files@v46
         id: rust-changes
         with:
           files_ignore: |
