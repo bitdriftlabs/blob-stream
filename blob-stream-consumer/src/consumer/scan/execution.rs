@@ -1131,6 +1131,8 @@ impl ConsumerReaderImpl {
   }
 
   /// Execute one metadata scan pass, then advance scan modes only for windows fully observed.
+  /// Metadata queries may overlap, but cached prefixes and query results are admitted in window
+  /// order so capacity and visibility stops leave every later source eligible for another pass.
   pub(in crate::consumer) async fn read_available_impl_inner(
     &mut self,
     now: time::OffsetDateTime,
@@ -1216,6 +1218,8 @@ impl ConsumerReaderImpl {
     self.record_fast_scan_bounds(&scan_requests, now, runtime_settings, &mut scan_states);
     let mut partition_finalizations =
       HashMap::<VirtualPartitionId, PartitionScanFinalization>::new();
+    // Start with the planned Recovery endpoint; a visibility or capacity stop below can move it
+    // back to the first window that was not fully observed.
     for request in &scan_requests {
       for &partition_id in &request.eligibility.recovering_partitions {
         let partition_finalization = partition_finalizations.entry(partition_id).or_default();
@@ -1252,24 +1256,26 @@ impl ConsumerReaderImpl {
     let mut capacity_exhausted = false;
     let mut capacity_filled_from_cache = false;
     let capacity_had_room_at_start = capacity.has_room();
-    // Query neighboring Recovery windows in parallel, but consume the results in plan order so a
-    // capacity stop or deferred window cannot advance Recovery past unread earlier work.
-    let mut prefetched_recovery_windows = VecDeque::new();
+    // Prefetch independent Recovery or Fast queries, but consume this queue in plan order. Other
+    // windows use the single-window path so capacity can be checked before each new query.
+    let mut prefetched_window_results = VecDeque::new();
     'windows: for (request_index, planned_request) in scan_requests.iter().enumerate() {
       let cached_keys = self.mature_metadata_cache_keys(planned_request, now, runtime_settings);
       let has_cached_window = !cached_keys.is_empty()
         && cached_keys
           .iter()
           .all(|key| self.recovery_metadata_cache.contains_key(key));
+      // Once a prior window fills capacity, do not start another query. An already fetched empty
+      // window or a complete cache hit can still be inspected without adding metadata-store work.
       if capacity_had_room_at_start
         && !capacity.has_room()
-        && !prefetched_recovery_windows
+        && !prefetched_window_results
           .front()
           .is_some_and(|(_, segments, _): &(_, Arc<[SegmentMetadata]>, _)| segments.is_empty())
         && !has_cached_window
       {
         capacity_exhausted = true;
-        if capacity_filled_from_cache && prefetched_recovery_windows.is_empty() {
+        if capacity_filled_from_cache && prefetched_window_results.is_empty() {
           self.metrics.record_metadata_query_avoided_by_capacity();
         }
         defer_scan_requests_by_capacity(
@@ -1281,7 +1287,13 @@ impl ConsumerReaderImpl {
         );
         break;
       }
-      let cached_prefix = self.cached_fast_prefix(planned_request, runtime_settings);
+      // A prefetched response already includes its newly installed sealed prefix. Admit that
+      // response once rather than replaying the prefix before consuming the same rows again.
+      let cached_prefix = if prefetched_window_results.is_empty() {
+        self.cached_fast_prefix(planned_request, runtime_settings)
+      } else {
+        None
+      };
       if cached_prefix.is_some() {
         for _ in &planned_request.fast_partition_bounds {
           self.metrics.record_mature_metadata_cache_reuse();
@@ -1310,6 +1322,8 @@ impl ConsumerReaderImpl {
         } else {
           let mut request = planned_request.clone();
           if let Some(prefix) = cached_prefix.as_ref() {
+            // The cached phase already covered everything below the seal; restrict both the
+            // shared query floor and each partition's bound to the still-open suffix.
             request.min_snowflake =
               Some(request.min_snowflake.map_or(prefix.sealed_before, |bound| {
                 bound.max(prefix.sealed_before)
@@ -1318,7 +1332,9 @@ impl ConsumerReaderImpl {
               *bound = (*bound).max(prefix.sealed_before);
             }
           }
-          if prefetched_recovery_windows.is_empty()
+          // Batch only consecutive uncached, Recovery-only windows. A cache hit or a different
+          // scan mode is a boundary where capacity must be reconsidered before the next query.
+          if prefetched_window_results.is_empty()
             && !request.eligibility.recovering_partitions.is_empty()
             && !request.eligibility.fast
             && !request.eligibility.fresh
@@ -1342,7 +1358,7 @@ impl ConsumerReaderImpl {
               end += 1;
             }
             if end > request_index + 1 {
-              prefetched_recovery_windows = self
+              prefetched_window_results = self
                 .materialize_window_results(
                   &scan_requests[request_index .. end],
                   recovery_scan,
@@ -1355,7 +1371,36 @@ impl ConsumerReaderImpl {
                 .into();
             }
           }
-          if let Some(result) = prefetched_recovery_windows.pop_front() {
+          if prefetched_window_results.is_empty()
+            && request.eligibility.fast
+            && !request.eligibility.fresh
+            && request.recovery_partition_bounds.is_empty()
+          {
+            // Overlap this Fast query (possibly an open suffix) with the next uncached Fast window.
+            // A cached prefix in the next window must be admitted first, so it is not prefetched
+            // here.
+            if let Some(next) = scan_requests.get(request_index + 1)
+              && next.eligibility.fast
+              && !next.eligibility.fresh
+              && next.recovery_partition_bounds.is_empty()
+              && self.cached_fast_prefix(next, runtime_settings).is_none()
+            {
+              prefetched_window_results = self
+                .materialize_window_results(
+                  &[request.clone(), next.clone()],
+                  recovery_scan,
+                  now,
+                  runtime_settings,
+                  visibility_cutoff,
+                  &mut scan_states,
+                )
+                .await?
+                .into();
+            }
+          }
+          // Prefetch changes when queries run, not the order in which their batches are admitted.
+          // A lone request still uses the same materialization and cache-installation path.
+          if let Some(result) = prefetched_window_results.pop_front() {
             (result.0, Some(result.1), result.2)
           } else {
             let (request, segments, visibility_cutoff) = self
@@ -1385,6 +1430,8 @@ impl ConsumerReaderImpl {
           )
         );
 
+        // With a cached prefix, replay only its proven range and query only the open suffix.
+        // Without one, query from the planned bound; all phases use the same admission checks.
         for segment in cached_prefix
           .as_ref()
           .filter(|_| segments.is_none())
@@ -1392,7 +1439,8 @@ impl ConsumerReaderImpl {
           .flat_map(CachedFastPrefix::iter)
           .chain(segments.iter().flat_map(|segments| segments.iter()))
         {
-          // Restrict work to currently assigned virtual partitions only.
+          // A merged window result can contain batches for other partitions or scan modes;
+          // only the partitions eligible for this window may reserve capacity or advance state.
           let mut segment_read_candidates = Vec::new();
           for &partition_id in &assigned_partition_ids {
             let partition_state = self.virtual_partition_states.get(&partition_id);
@@ -1646,6 +1694,8 @@ impl ConsumerReaderImpl {
               break;
             }
             if had_room && !capacity.has_room() {
+              // Track whether cached metadata filled capacity so the next skipped query can be
+              // attributed to cache reuse rather than to an earlier network response.
               capacity_filled_from_cache =
                 has_cached_window || (phase == 0 && cached_prefix.is_some());
             }
@@ -1693,6 +1743,8 @@ impl ConsumerReaderImpl {
       }
     }
 
+    // Read only the segment ranges admitted above. Their decoded results are ordered by partition
+    // sequence before cursor advancement, independently of metadata query completion order.
     let batch_read_results = self
       .execute_segment_reads(segment_read_plans, runtime_settings)
       .await?;
