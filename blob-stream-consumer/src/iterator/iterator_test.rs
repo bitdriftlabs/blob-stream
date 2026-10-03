@@ -2056,7 +2056,6 @@ async fn state_response_includes_fresh_group_leases_and_other_member_commits() {
     Some(1)
   );
   let plan = response.state.assignment_plan.as_ref().unwrap();
-  assert!(!plan.colocate_logical_partitions);
   assert_eq!(
     plan
       .assignments
@@ -2164,7 +2163,6 @@ fn group_lease_observation_includes_unleased_plan_partitions() {
     version: 1,
     planner_member_id: "member-a".to_string(),
     policy: ConsumerAssignmentPolicy::FlatMember,
-    colocate_logical_partitions: false,
     members: vec!["member-a".to_string(), "member-b".to_string()],
     member_topology: vec![],
     pod_loads: vec![],
