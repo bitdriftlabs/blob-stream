@@ -765,7 +765,7 @@ pub struct ConsumerGroupAssignmentPlan {
   pub members: Vec<String>,
   /// Optional canonical topology snapshot for pod-aware assignment plans.
   pub member_topology: Option<Vec<ConsumerGroupMember>>,
-  /// Whether this plan prefers co-locating virtual partitions of each logical partition.
+  /// Fixed reader-compatibility marker. Plans set true; this is not a selectable placement policy.
   pub colocate_logical_partitions: bool,
   /// Canonically sorted partition ownership entries.
   pub assignments: Vec<ConsumerGroupAssignment>,

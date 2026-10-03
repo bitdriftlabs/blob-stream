@@ -1,17 +1,18 @@
 #![allow(clippy::unwrap_used)]
 
 use crate::config::ConsumerGroupConfig;
+use crate::coordination::assignment::cooperative_sticky_assignment;
+use crate::coordination::assignment::tests::{
+  cooperative_colocated_assignment,
+  cooperative_colocated_assignment_with_pods,
+};
 use crate::coordination::{
   AssignmentPlanValidationError,
-  COLOCATE_LOGICAL_PARTITIONS_FEATURE_FLAG,
   ConsumerGroupCoordinator,
   ConsumerGroupCoordinatorImpl,
   LeaseClaimCounts,
   assignment_plan_validation_error,
-  cooperative_colocated_assignment,
-  cooperative_colocated_assignment_with_pods,
-  cooperative_sticky_assignment,
-  cooperative_sticky_assignment_with_pods,
+  plan_assignment_map,
 };
 use crate::diagnostics::{
   ConsumerAssignmentPolicy,
@@ -249,14 +250,43 @@ impl ConsumerGroupLeaseStore for BlockingAssignmentLeaseStore {
 }
 
 #[test]
-fn sticky_assignment_stable_for_same_membership() {
+fn colocated_assignment_stable_for_same_membership() {
   let members = vec!["member-a".to_string(), "member-b".to_string()];
   let partitions = vec![0, 1, 2, 3, 4, 5];
 
-  let first = cooperative_sticky_assignment(&members, &partitions, &HashMap::new(), "member-a");
-  let second = cooperative_sticky_assignment(&members, &partitions, &first, "member-a");
+  let first =
+    cooperative_colocated_assignment(&members, &partitions, &HashMap::new(), "member-a", 64);
+  let second = cooperative_colocated_assignment(&members, &partitions, &first, "member-a", 64);
 
   assert_eq!(first, second);
+}
+
+#[test]
+fn colocated_assignment_retains_survivors_when_an_early_group_departs() {
+  let members = ["pod-01", "pod-02", "pod-03"].map(ToString::to_string);
+  let partitions = (0 .. 8).collect::<Vec<_>>();
+  let previous = (0 .. 8)
+    .map(|partition_id| (partition_id, format!("pod-{:02}", partition_id % 4)))
+    .collect::<HashMap<_, _>>();
+  let assignment = cooperative_colocated_assignment(&members, &partitions, &previous, "pod-01", 4);
+
+  assert_eq!(assignment.len(), partitions.len());
+  for partition_id in &partitions {
+    if partition_id % 4 != 0 {
+      assert_eq!(assignment.get(partition_id), previous.get(partition_id));
+    }
+  }
+  let mut loads = members
+    .iter()
+    .map(|member| assignment.values().filter(|owner| *owner == member).count())
+    .collect::<Vec<_>>();
+  loads.sort_unstable();
+  assert_eq!(loads, vec![2, 3, 3]);
+  assert_ne!(assignment.get(&0), assignment.get(&4));
+  assert_eq!(
+    assignment,
+    cooperative_colocated_assignment(&members, &partitions, &assignment, "pod-01", 4)
+  );
 }
 
 #[test]
@@ -290,7 +320,74 @@ fn colocated_assignment_keeps_logical_partitions_together_when_balanced() {
 }
 
 #[test]
-fn colocated_assignment_prefers_whole_groups_over_previous_owners() {
+fn colocated_assignment_event_shaped_departure_moves_only_six_orphans() {
+  let owners = (0 .. 21)
+    .map(|pod| format!("pod-{pod:02}"))
+    .collect::<Vec<_>>();
+  let mut previous = HashMap::new();
+  for logical_id in 0 .. 42 {
+    for copy in 0 .. 3 {
+      previous.insert(
+        logical_id + copy * 64,
+        owners[(logical_id / 2) as usize].clone(),
+      );
+    }
+  }
+  for logical_id in 42 .. 45 {
+    for copy in 0 .. 3 {
+      previous.insert(
+        logical_id + copy * 64,
+        owners[((logical_id - 42) * 3 + copy) as usize].clone(),
+      );
+    }
+  }
+  previous.insert(63, owners[9].clone());
+  let mut partitions = previous.keys().copied().collect::<Vec<_>>();
+  partitions.sort_unstable();
+  let survivors = &owners[.. 20];
+  let assignment =
+    cooperative_colocated_assignment(survivors, &partitions, &previous, &owners[0], 64);
+  assert_eq!(assignment.len(), 136);
+  assert_eq!(
+    partitions
+      .iter()
+      .filter(|partition| assignment.get(partition) != previous.get(partition))
+      .count(),
+    6
+  );
+  for partition in &partitions {
+    if previous[partition] != owners[20] {
+      assert_eq!(assignment.get(partition), previous.get(partition));
+    }
+  }
+  let loads = survivors
+    .iter()
+    .map(|owner| {
+      assignment
+        .values()
+        .filter(|assigned| *assigned == owner)
+        .count()
+    })
+    .collect::<Vec<_>>();
+  assert_eq!(loads.iter().filter(|load| **load == 7).count(), 16);
+  assert_eq!(loads.iter().filter(|load| **load == 6).count(), 4);
+  assert_eq!(
+    (0 .. 45)
+      .filter(
+        |logical| assignment.get(logical) != assignment.get(&(logical + 64))
+          || assignment.get(logical) != assignment.get(&(logical + 128))
+      )
+      .count(),
+    5
+  );
+  assert_eq!(
+    assignment,
+    cooperative_colocated_assignment(survivors, &partitions, &assignment, &owners[0], 64)
+  );
+}
+
+#[test]
+fn sticky_assignment_preserves_survivors_before_colocation() {
   let members = ["member-a", "member-b", "member-c"]
     .map(ToString::to_string)
     .to_vec();
@@ -313,12 +410,7 @@ fn colocated_assignment_prefers_whole_groups_over_previous_owners() {
 
   let assignment =
     cooperative_colocated_assignment(&members, &partitions, &previous_assignment, "member-a", 4);
-  for logical_id in 0 .. 4 {
-    let owner = assignment.get(&logical_id);
-    for partition_id in (logical_id + 4 .. 10).step_by(4) {
-      assert_eq!(assignment.get(&partition_id), owner);
-    }
-  }
+  assert_eq!(assignment, previous_assignment);
   let mut loads = members
     .iter()
     .map(|member| assignment.values().filter(|owner| *owner == member).count())
@@ -434,8 +526,7 @@ fn colocated_assignment_moves_residual_to_smaller_cluster_after_topology_change(
 }
 
 #[tokio::test]
-async fn grouping_flag_replans_and_rolls_back_with_active_planner() {
-  let flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
+async fn coordinator_always_publishes_colocated_plan() {
   let membership_store = membership_store();
   let mut coordinator = ConsumerGroupCoordinatorImpl::new(
     ConsumerGroupConfig {
@@ -446,9 +537,9 @@ async fn grouping_flag_replans_and_rolls_back_with_active_planner() {
     },
     Arc::new(InMemoryConsumerGroupLeaseStore::new()),
     Arc::clone(&membership_store),
+    4,
+    None,
   )
-  .unwrap()
-  .with_logical_partition_count(4, Some(flags.snapshot_watch()))
   .unwrap();
   let members = vec!["member-a".to_string(), "member-b".to_string()];
   let partitions = (0 .. 8).collect::<Vec<_>>();
@@ -460,27 +551,10 @@ async fn grouping_flag_replans_and_rolls_back_with_active_planner() {
     )
     .await
     .unwrap();
-  assert!(
-    !first
-      .accepted_assignment_plan
-      .unwrap()
-      .colocate_logical_partitions
-  );
-  flags.update(Arc::new(
-    DefaultFeatureFlags::default().with_bool_flag(COLOCATE_LOGICAL_PARTITIONS_FEATURE_FLAG, true),
-  ));
-  let second = coordinator
-    .rebalance(
-      members.clone(),
-      partitions.clone(),
-      offset_datetime_from_unix_millis(1_001),
-    )
-    .await
-    .unwrap();
-  let second_plan = second.accepted_assignment_plan.unwrap();
-  assert_eq!(second_plan.version, 2);
-  assert!(second_plan.colocate_logical_partitions);
-  let assignments = second_plan
+  let plan = first.accepted_assignment_plan.unwrap();
+  assert_eq!(plan.version, 1);
+  assert!(plan.colocate_logical_partitions);
+  let assignments = plan
     .assignments
     .iter()
     .map(|assignment| (assignment.virtual_partition_id, &assignment.member_id))
@@ -499,19 +573,11 @@ async fn grouping_flag_replans_and_rolls_back_with_active_planner() {
     )
     .await
     .unwrap();
-  assert_eq!(stable.accepted_assignment_plan.unwrap().version, 2);
-  flags.update(Arc::new(DefaultFeatureFlags::default()));
-  let rolled_back = coordinator
-    .rebalance(members, partitions, offset_datetime_from_unix_millis(1_003))
-    .await
-    .unwrap();
-  let plan = rolled_back.accepted_assignment_plan.unwrap();
-  assert_eq!(plan.version, 3);
-  assert!(!plan.colocate_logical_partitions);
+  assert_eq!(stable.accepted_assignment_plan.unwrap(), plan);
 }
 
 #[test]
-fn sticky_assignment_moves_minimal_partitions_on_scale_out() {
+fn colocated_assignment_moves_minimal_partitions_on_scale_out() {
   let initial_members = vec!["member-a".to_string(), "member-b".to_string()];
   let scaled_members = vec![
     "member-a".to_string(),
@@ -520,9 +586,15 @@ fn sticky_assignment_moves_minimal_partitions_on_scale_out() {
   ];
   let partitions = vec![0, 1, 2, 3, 4, 5];
 
-  let before =
-    cooperative_sticky_assignment(&initial_members, &partitions, &HashMap::new(), "member-a");
-  let after = cooperative_sticky_assignment(&scaled_members, &partitions, &before, "member-a");
+  let before = cooperative_colocated_assignment(
+    &initial_members,
+    &partitions,
+    &HashMap::new(),
+    "member-a",
+    64,
+  );
+  let after =
+    cooperative_colocated_assignment(&scaled_members, &partitions, &before, "member-a", 64);
 
   let moved = partitions
     .iter()
@@ -532,8 +604,352 @@ fn sticky_assignment_moves_minimal_partitions_on_scale_out() {
   assert_eq!(moved, 2);
 }
 
+#[tokio::test]
+async fn coordinator_preserves_accepted_plans_until_planner_authority_transfers() {
+  for local_member in ["member-b", "member-a"] {
+    let membership = membership_store();
+    let now = offset_datetime_from_unix_millis(1_000);
+    let members = ["member-a", "member-b"].map(ToString::to_string).to_vec();
+    let partitions = (0 .. 8).collect::<Vec<_>>();
+    let plan = ConsumerGroupAssignmentPlan {
+      version: 7,
+      planner_member_id: members[0].clone(),
+      members: members.clone(),
+      member_topology: None,
+      colocate_logical_partitions: true,
+      assignments: partitions
+        .iter()
+        .map(|partition| ConsumerGroupAssignment {
+          virtual_partition_id: *partition,
+          member_id: members[usize::from(*partition >= 4)].clone(),
+        })
+        .collect(),
+      published_ts_ms: now.unix_timestamp() * 1_000,
+    };
+    membership
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        "member-a",
+        "old-session",
+        now,
+        TimeDuration::milliseconds(1_000),
+      )
+      .await
+      .unwrap();
+    assert!(
+      membership
+        .publish_assignment_plan(
+          "topic-a",
+          "group-a",
+          "member-a",
+          "old-session",
+          now,
+          plan.clone()
+        )
+        .await
+        .unwrap()
+    );
+    let mut coordinator = ConsumerGroupCoordinatorImpl::new(
+      ConsumerGroupConfig {
+        topic: "topic-a".to_string().into(),
+        group_id: "group-a".to_string().into(),
+        member_id: local_member.to_string().into(),
+        lease_duration: TimeDuration::milliseconds(1_000).into_proto(),
+        heartbeat_interval: TimeDuration::milliseconds(50).into_proto(),
+        rebalance_interval: TimeDuration::milliseconds(50).into_proto(),
+        ..Default::default()
+      },
+      Arc::new(InMemoryConsumerGroupLeaseStore::new()),
+      Arc::clone(&membership),
+      4,
+      None,
+    )
+    .unwrap();
+    let accepted = coordinator
+      .rebalance(
+        members.clone(),
+        partitions.clone(),
+        offset_datetime_from_unix_millis(1_001),
+      )
+      .await
+      .unwrap();
+    assert_eq!(accepted.accepted_assignment_plan, Some(plan.clone()));
+    assert_eq!(
+      membership
+        .get_assignment_plan("topic-a", "group-a")
+        .await
+        .unwrap(),
+      Some(plan.clone())
+    );
+    let replacement = coordinator
+      .rebalance(members, partitions, offset_datetime_from_unix_millis(2_001))
+      .await
+      .unwrap()
+      .accepted_assignment_plan
+      .unwrap();
+    assert_eq!(replacement.version, 8);
+    assert_eq!(replacement.planner_member_id, local_member);
+    assert!(replacement.colocate_logical_partitions);
+    // Planner/session transfer is not a membership transition and must not spend optional repair.
+    assert_eq!(replacement.assignments, plan.assignments);
+  }
+}
+
 #[test]
-fn sticky_assignment_repairs_zero_owner_when_other_members_are_at_ceiling() {
+fn coordinator_rejects_zero_logical_partition_count() {
+  let error = ConsumerGroupCoordinatorImpl::new(
+    ConsumerGroupConfig {
+      topic: "topic-a".to_string().into(),
+      group_id: "group-a".to_string().into(),
+      member_id: "member-a".to_string().into(),
+      ..Default::default()
+    },
+    Arc::new(InMemoryConsumerGroupLeaseStore::new()),
+    membership_store(),
+    0,
+    None,
+  )
+  .err()
+  .unwrap();
+  assert_eq!(
+    error.to_string(),
+    "logical partition count must be positive"
+  );
+}
+
+#[tokio::test]
+async fn coordinator_rejected_plan_does_not_enable_optional_repair() {
+  let membership = membership_store();
+  let members = ["member-a", "member-b"].map(ToString::to_string).to_vec();
+  let partitions = (0 .. 8).collect::<Vec<_>>();
+  let previous = [0, 1, 0, 1, 1, 0, 0, 1]
+    .into_iter()
+    .enumerate()
+    .map(|(partition, owner)| (u32::try_from(partition).unwrap(), members[owner].clone()))
+    .collect::<HashMap<_, _>>();
+  assert_ne!(
+    cooperative_sticky_assignment(&members, &partitions, &previous, &members[0], 4, 10),
+    previous
+  );
+  let mut coordinator = ConsumerGroupCoordinatorImpl::new(
+    ConsumerGroupConfig {
+      topic: "topic-a".to_string().into(),
+      group_id: "group-a".to_string().into(),
+      member_id: members[0].clone().into(),
+      ..Default::default()
+    },
+    Arc::new(InMemoryConsumerGroupLeaseStore::new()),
+    Arc::clone(&membership),
+    4,
+    None,
+  )
+  .unwrap();
+  let now = offset_datetime_from_unix_millis(1_000);
+  membership
+    .acquire_or_renew_planner(
+      "topic-a",
+      "group-a",
+      &members[0],
+      coordinator.planner_session_id(),
+      now,
+      TimeDuration::seconds(30),
+    )
+    .await
+    .unwrap();
+  let plan = ConsumerGroupAssignmentPlan {
+    version: 7,
+    planner_member_id: members[0].clone(),
+    members: [members.clone(), vec!["member-ghost".to_string()]].concat(),
+    member_topology: None,
+    colocate_logical_partitions: true,
+    assignments: partitions
+      .iter()
+      .map(|partition| ConsumerGroupAssignment {
+        virtual_partition_id: *partition,
+        member_id: previous[partition].clone(),
+      })
+      .collect(),
+    published_ts_ms: 1_000,
+  };
+  assert_eq!(
+    assignment_plan_validation_error(&plan, &partitions),
+    Some(AssignmentPlanValidationError::ImbalancedLoad {
+      min_load: 0,
+      max_load: 4,
+    })
+  );
+  assert!(
+    membership
+      .publish_assignment_plan(
+        "topic-a",
+        "group-a",
+        &members[0],
+        coordinator.planner_session_id(),
+        now,
+        plan,
+      )
+      .await
+      .unwrap()
+  );
+
+  // The live owners are already balanced, but an exchange could improve locality. Rejection must
+  // repair the plan's membership without mistaking its ghost member for an accepted transition.
+  let report = coordinator
+    .rebalance(members, partitions.clone(), now)
+    .await
+    .unwrap();
+  assert_eq!(report.rejected_assignment_plan_version, Some(7));
+  let repaired = report.accepted_assignment_plan.unwrap();
+  assert_eq!(repaired.version, 8);
+  assert_eq!(plan_assignment_map(&repaired), previous);
+  assert_eq!(
+    assignment_plan_validation_error(&repaired, &partitions),
+    None
+  );
+}
+
+#[tokio::test]
+async fn coordinator_repairs_only_membership_changes_using_live_percentage() {
+  for (percent, optional_moves) in [(0, 0), (10, 0), (50, 4)] {
+    let membership = membership_store();
+    let loader = FakeLoader::new(Arc::new(
+      DefaultFeatureFlags::default()
+        .with_integer_flag("blob_stream_consumer_colocation_repair_percent", 0),
+    ));
+    let old_members = ["member-a", "member-b", "member-c"]
+      .map(ToString::to_string)
+      .to_vec();
+    let members = old_members[.. 2].to_vec();
+    let partitions = (0 .. 8).collect::<Vec<_>>();
+    let previous = partitions
+      .iter()
+      .map(|partition| {
+        let owner = match partition {
+          0 ..= 2 => &old_members[0],
+          4 ..= 6 => &old_members[1],
+          _ => &old_members[2],
+        };
+        (*partition, owner.clone())
+      })
+      .collect::<HashMap<_, _>>();
+    let mut coordinator = ConsumerGroupCoordinatorImpl::new(
+      ConsumerGroupConfig {
+        topic: "topic-a".to_string().into(),
+        group_id: "group-a".to_string().into(),
+        member_id: members[0].clone().into(),
+        ..Default::default()
+      },
+      Arc::new(InMemoryConsumerGroupLeaseStore::new()),
+      Arc::clone(&membership),
+      2,
+      Some(loader.snapshot_watch()),
+    )
+    .unwrap();
+    let now = offset_datetime_from_unix_millis(1_000);
+    membership
+      .acquire_or_renew_planner(
+        "topic-a",
+        "group-a",
+        &members[0],
+        coordinator.planner_session_id(),
+        now,
+        TimeDuration::seconds(30),
+      )
+      .await
+      .unwrap();
+    let plan = ConsumerGroupAssignmentPlan {
+      version: 7,
+      planner_member_id: members[0].clone(),
+      members: old_members.clone(),
+      member_topology: None,
+      colocate_logical_partitions: true,
+      assignments: partitions
+        .iter()
+        .map(|partition| ConsumerGroupAssignment {
+          virtual_partition_id: *partition,
+          member_id: previous[partition].clone(),
+        })
+        .collect(),
+      published_ts_ms: 1_000,
+    };
+    assert!(
+      membership
+        .publish_assignment_plan(
+          "topic-a",
+          "group-a",
+          &members[0],
+          coordinator.planner_session_id(),
+          now,
+          plan.clone(),
+        )
+        .await
+        .unwrap()
+    );
+
+    // Changing the runtime percentage alone must not change ownership or publish a generation.
+    // This same coordinator then observes the membership change, proving it samples the live value
+    // rather than freezing the percentage when its watch was attached.
+    loader.update(Arc::new(DefaultFeatureFlags::default().with_integer_flag(
+      "blob_stream_consumer_colocation_repair_percent",
+      percent,
+    )));
+    let unchanged = coordinator
+      .rebalance(old_members, partitions.clone(), now)
+      .await
+      .unwrap();
+    assert_eq!(unchanged.accepted_assignment_plan, Some(plan));
+    let baseline =
+      cooperative_colocated_assignment(&members, &partitions, &previous, &members[0], 2);
+    let changed = coordinator
+      .rebalance(members.clone(), partitions.clone(), now)
+      .await
+      .unwrap()
+      .accepted_assignment_plan
+      .unwrap();
+    let actual = plan_assignment_map(&changed);
+    assert_eq!(changed.version, 8);
+    assert_eq!(
+      actual
+        .iter()
+        .filter(|(partition, owner)| baseline.get(partition) != Some(*owner))
+        .count(),
+      optional_moves
+    );
+    assert_eq!(
+      assignment_plan_validation_error(&changed, &partitions),
+      None
+    );
+    if optional_moves == 4 {
+      assert!(
+        actual
+          .iter()
+          .all(|(partition, owner)| owner == &members[usize::from(partition % 2 != 0)])
+      );
+    } else {
+      assert_eq!(actual, baseline);
+    }
+    // Even raising the allowance to 100% cannot repair again after this transition is published.
+    loader.update(Arc::new(DefaultFeatureFlags::default().with_integer_flag(
+      "blob_stream_consumer_colocation_repair_percent",
+      100,
+    )));
+    for timestamp in [1_001, 1_002, 1_003] {
+      let stable = coordinator
+        .rebalance(
+          members.clone(),
+          partitions.clone(),
+          offset_datetime_from_unix_millis(timestamp),
+        )
+        .await
+        .unwrap();
+      assert_eq!(stable.accepted_assignment_plan, Some(changed.clone()));
+    }
+  }
+}
+
+#[test]
+fn colocated_assignment_repairs_zero_owner_when_other_members_are_at_ceiling() {
   let members = vec![
     "member-a".to_string(),
     "member-b".to_string(),
@@ -550,7 +966,8 @@ fn sticky_assignment_repairs_zero_owner_when_other_members_are_at_ceiling() {
     (5, "member-c".to_string()),
   ]);
 
-  let assignment = cooperative_sticky_assignment(&members, &partitions, &previous, "member-a");
+  let assignment =
+    cooperative_colocated_assignment(&members, &partitions, &previous, "member-a", 64);
   let loads = members
     .iter()
     .map(|member| assignment.values().filter(|owner| *owner == member).count())
@@ -601,7 +1018,7 @@ fn pod_aware_assignment_balances_pods_with_minimal_movement() {
     );
   }
 
-  let assignment = cooperative_sticky_assignment_with_pods(&members, &partitions, &previous);
+  let assignment = cooperative_colocated_assignment_with_pods(&members, &partitions, &previous, 64);
   let pod_loads = (0 .. 7)
     .map(|pod_index| {
       assignment
@@ -650,7 +1067,8 @@ fn pod_aware_assignment_prefers_cluster_with_fewer_pods_for_residual_load() {
   ];
   let partitions = vec![0, 1, 2, 3];
 
-  let assignment = cooperative_sticky_assignment_with_pods(&members, &partitions, &HashMap::new());
+  let assignment =
+    cooperative_colocated_assignment_with_pods(&members, &partitions, &HashMap::new(), 64);
   let pod_loads = ["pod-a", "pod-b", "pod-c"]
     .iter()
     .map(|pod_id| {
@@ -691,13 +1109,15 @@ fn pod_aware_assignment_repairs_sticky_residual_load_for_smaller_cluster() {
     (3, "pod-c:worker-0".to_string()),
   ]);
 
-  let assignment = cooperative_sticky_assignment_with_pods(&members, &partitions, &previous);
+  let assignment = cooperative_colocated_assignment_with_pods(&members, &partitions, &previous, 64);
   let moved = partitions
     .iter()
     .filter(|partition_id| assignment.get(partition_id) != previous.get(partition_id))
     .count();
 
-  assert_eq!(assignment.get(&1), Some(&"pod-a:worker-0".to_string()));
+  // Reserve the earlier survivor first; only the excess partition fills the new residual slot.
+  assert_eq!(assignment.get(&1), previous.get(&1));
+  assert_eq!(assignment.get(&2), Some(&"pod-a:worker-0".to_string()));
   assert_eq!(moved, 1);
 }
 
@@ -733,7 +1153,7 @@ fn pod_aware_assignment_preserves_minimal_movement_with_uneven_sticky_loads() {
     })
     .collect::<HashMap<_, _>>();
 
-  let assignment = cooperative_sticky_assignment_with_pods(&members, &partitions, &previous);
+  let assignment = cooperative_colocated_assignment_with_pods(&members, &partitions, &previous, 64);
   let pod_loads = ["pod-a", "pod-b", "pod-z"]
     .iter()
     .map(|pod_id| {
@@ -773,7 +1193,8 @@ fn pod_aware_assignment_ignores_partial_cluster_topology() {
   ];
   let partitions = vec![0, 1, 2, 3];
 
-  let assignment = cooperative_sticky_assignment_with_pods(&members, &partitions, &HashMap::new());
+  let assignment =
+    cooperative_colocated_assignment_with_pods(&members, &partitions, &HashMap::new(), 64);
   let pod_loads = ["pod-a", "pod-b", "pod-z"]
     .iter()
     .map(|pod_id| {
@@ -813,7 +1234,8 @@ fn pod_aware_assignment_ignores_conflicting_cluster_topology() {
   ];
   let partitions = vec![0, 1, 2, 3];
 
-  let assignment = cooperative_sticky_assignment_with_pods(&members, &partitions, &HashMap::new());
+  let assignment =
+    cooperative_colocated_assignment_with_pods(&members, &partitions, &HashMap::new(), 64);
   let pod_loads = ["pod-a", "pod-b", "pod-z"]
     .iter()
     .map(|pod_id| {
@@ -871,7 +1293,6 @@ fn pod_aware_assignment_plan_snapshot_includes_logical_groups_and_topology() {
   let snapshot = assignment_plan_snapshot(plan, 2);
 
   assert_eq!(snapshot.policy, ConsumerAssignmentPolicy::PodAware);
-  assert!(snapshot.colocate_logical_partitions);
   assert_eq!(
     snapshot
       .assignments
@@ -948,7 +1369,7 @@ fn assignment_plan_validation_reports_imbalanced_load() {
     planner_member_id: "member-a".to_string(),
     members,
     member_topology: None,
-    colocate_logical_partitions: false,
+    colocate_logical_partitions: true,
     assignments: (0 .. 6)
       .map(|virtual_partition_id| ConsumerGroupAssignment {
         virtual_partition_id,
@@ -995,6 +1416,8 @@ async fn oversubscribed_consumers_keep_stable_assignments_without_fencing() {
         },
         Arc::clone(&store),
         Arc::clone(&membership_store),
+        64,
+        None,
       )
       .unwrap()
     })
@@ -1084,6 +1507,8 @@ async fn shared_plan_covers_every_partition_despite_divergent_member_snapshots()
         },
         Arc::clone(&lease_store),
         Arc::clone(&membership_store),
+        64,
+        None,
       )
       .unwrap()
     })
@@ -1160,6 +1585,8 @@ async fn coordinator_does_not_create_local_assignment_without_shared_plan() {
     },
     lease_store,
     membership_store,
+    64,
+    None,
   )
   .unwrap();
 
@@ -1192,6 +1619,8 @@ async fn heartbeat_commit_renews_and_commits_cursor() {
     },
     Arc::clone(&store),
     membership_store,
+    64,
+    None,
   )
   .unwrap();
 
@@ -1233,6 +1662,8 @@ async fn commit_cursors_does_not_renew_partition_leases() {
     },
     store,
     membership_store(),
+    64,
+    None,
   )
   .unwrap();
 
@@ -1300,6 +1731,8 @@ async fn rebalance_acquires_partition_leases_concurrently() {
     },
     store,
     membership_store(),
+    64,
+    None,
   )
   .unwrap();
 
@@ -1345,6 +1778,8 @@ async fn stable_rebalance_preserves_owned_partitions_and_committed_cursor() {
     },
     Arc::clone(&store),
     membership_store,
+    64,
+    None,
   )
   .unwrap();
 
@@ -1395,6 +1830,8 @@ async fn heartbeat_detects_fencing_by_new_generation() {
     },
     Arc::clone(&store),
     membership_store,
+    64,
+    None,
   )
   .unwrap();
 
@@ -1459,6 +1896,8 @@ async fn heartbeat_reconciles_fencing_when_another_partition_errors() {
     },
     store,
     membership_store,
+    64,
+    None,
   )
   .unwrap();
 
@@ -1546,6 +1985,8 @@ async fn rebalance_preserves_successful_claims_when_a_sibling_claim_fails() {
     },
     store,
     membership_store(),
+    64,
+    None,
   )
   .unwrap();
 
@@ -1592,6 +2033,8 @@ async fn release_owned_releases_partitions_for_fast_takeover() {
     },
     Arc::clone(&store),
     membership_store,
+    64,
+    None,
   )
   .unwrap();
 
