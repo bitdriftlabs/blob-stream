@@ -179,10 +179,16 @@ DynamoDB replication-delay guarantee. Strong reads accept every valid row return
 
 ## Delivery, Loss, And Consistency
 
-The consumer prefetches decoded batches within a byte budget and preserves planned output order.
-It may range-read one enclosing span for several selected batches from the same segment, accepting
+The consumer prefetches decoded batches within a byte budget and preserves planned output order. It
+may range-read one enclosing span for several selected batches from the same segment, accepting
 intentional overfetch to reduce object-store requests. Assignment revocation discards buffered
-records for the revoked partition before the replacement assignment becomes active.
+records for the revoked partition and fences both read-result and pending-batch admission before the
+callback is published. The prefetch worker selectively suspends revoked reader state at its next
+serialized boundary; an already in-flight pass may finish, but its revoked output is not retained.
+Final application offsets remain commit-eligible through callback acknowledgement. Unread output
+from the previous ownership is removed before replacement work becomes active, including rapid
+same-member reacquisition. See [consumer coordination](consumer-coordination.md) for suspension
+epochs and the lease-release contract.
 
 A valid metadata row whose blob is `NotFound` violates the [storage](storage.md) retention and
 durability contract. The reader records the loss, advances its in-memory cursor through that

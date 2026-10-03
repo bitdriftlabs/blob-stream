@@ -1,8 +1,10 @@
 use super::delivery::{DeliveredSourceRange, DeliveryState};
 use crate::consumer::ConsumerBatchSource;
 use crate::diagnostics::ConsumerDiagnosticsRuntimeState;
+use anyhow::{Result, anyhow, ensure};
 use bd_server_stats::stats::{ContributionGauge, Scope};
 use blob_stream_types::{CommittedSourceCheckpoint, VirtualPartitionId};
+use log::debug;
 use prometheus::{Histogram, IntCounter};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -155,6 +157,13 @@ pub enum ConsumerDeliveryState {
 }
 
 //
+// ReadEpoch
+//
+
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct ReadEpoch(u64);
+
+//
 // ConsumerSharedState
 //
 
@@ -162,12 +171,109 @@ pub enum ConsumerDeliveryState {
 #[derive(Default)]
 pub struct ConsumerSharedState {
   pub(crate) active_partitions: HashMap<VirtualPartitionId, ActivePartitionState>,
+  pub(super) read_epoch: ReadEpoch,
+  pub(super) read_fenced_partitions: HashMap<VirtualPartitionId, ReadEpoch>,
+  pub(super) delivery_fence_epoch: Option<ReadEpoch>,
   pub delivery_state: DeliveryState,
   pub(super) terminal_error: Option<String>,
   pub diagnostics: ConsumerDiagnosticsRuntimeState,
 }
 
 impl ConsumerSharedState {
+  /// Reset delivery and staged progress only when the serialized reader accepts a seek.
+  pub(in crate::iterator) fn apply_seek(
+    &mut self,
+    partition_id: VirtualPartitionId,
+    offset: u64,
+  ) -> Result<()> {
+    ensure!(
+      !self.read_fenced_partitions.contains_key(&partition_id),
+      "consumer partition {partition_id} is read-fenced"
+    );
+    let state = self
+      .active_partitions
+      .get_mut(&partition_id)
+      .ok_or_else(|| anyhow!("cannot seek unassigned virtual partition {partition_id}"))?;
+    state.pending_commit = None;
+    state.delivered_source_ranges.clear();
+    state.delivery_gap_baseline = Some(offset);
+    state.last_delivered_source = None;
+    state.last_stored_source = None;
+    self
+      .delivery_state
+      .drop_partitions(&HashSet::from([partition_id]));
+    Ok(())
+  }
+
+  pub(in crate::iterator) fn read_allowed(&self, partition_id: VirtualPartitionId) -> bool {
+    self.active_partitions.contains_key(&partition_id)
+      && !self.read_fenced_partitions.contains_key(&partition_id)
+  }
+
+  /// Fence reads immediately without removing the application's final-commit eligibility.
+  pub(in crate::iterator) fn fence_reads(
+    &mut self,
+    partitions: &HashSet<VirtualPartitionId>,
+  ) -> ReadEpoch {
+    debug_assert!(self.read_epoch.0 < u64::MAX);
+    self.read_epoch.0 = self.read_epoch.0.saturating_add(1);
+    for partition_id in partitions {
+      self
+        .read_fenced_partitions
+        .insert(*partition_id, self.read_epoch);
+    }
+    self.delivery_state.drop_partitions(partitions);
+    debug!(
+      "consumer read fence published: epoch={:?}, partitions={partitions:?}",
+      self.read_epoch
+    );
+    self.read_epoch
+  }
+
+  pub(in crate::iterator) fn assignment_read_allowed(
+    &self,
+    partition_id: VirtualPartitionId,
+    read_epoch: ReadEpoch,
+    release_delivery_fence: bool,
+  ) -> bool {
+    self
+      .read_fenced_partitions
+      .get(&partition_id)
+      .is_none_or(|epoch| {
+        *epoch <= read_epoch
+          && (self.delivery_fence_epoch.is_none()
+            || self.completes_read_revocation(read_epoch, release_delivery_fence))
+      })
+  }
+
+  fn completes_read_revocation(&self, read_epoch: ReadEpoch, release_delivery_fence: bool) -> bool {
+    release_delivery_fence
+      && self
+        .delivery_fence_epoch
+        .is_some_and(|epoch| epoch <= read_epoch)
+  }
+
+  /// Only a successful serialized assignment may retire its read fences or delivery pause.
+  /// A later revocation remains fenced even when an older acknowledgement finishes first.
+  pub(in crate::iterator) fn complete_read_assignment(
+    &mut self,
+    read_epoch: ReadEpoch,
+    release_delivery_fence: bool,
+  ) -> bool {
+    let completed = self.completes_read_revocation(read_epoch, release_delivery_fence);
+    if self.delivery_fence_epoch.is_none() || completed {
+      self
+        .read_fenced_partitions
+        .retain(|_, epoch| *epoch > read_epoch);
+    }
+    if completed {
+      self.delivery_state.revocation_in_progress = false;
+      self.delivery_fence_epoch = None;
+      return true;
+    }
+    false
+  }
+
   /// Align commit-eligible and diagnostic state with the active assignment after a reader change
   /// has succeeded. Both collections must exclude revoked partitions so diagnostics cannot
   /// recreate a stale local partition from its old committed cursor.
@@ -175,6 +281,15 @@ impl ConsumerSharedState {
     &mut self,
     active_assignment: &HashSet<VirtualPartitionId>,
   ) {
+    let removed = self
+      .active_partitions
+      .keys()
+      .copied()
+      .filter(|partition_id| !active_assignment.contains(partition_id))
+      .collect::<HashSet<_>>();
+    if !removed.is_empty() {
+      self.delivery_state.drop_partitions(&removed);
+    }
     self
       .active_partitions
       .retain(|partition_id, _| active_assignment.contains(partition_id));
@@ -192,6 +307,7 @@ impl ConsumerSharedState {
     &mut self,
     fenced_partitions: &[VirtualPartitionId],
   ) {
+    self.fence_reads(&fenced_partitions.iter().copied().collect());
     for partition_id in fenced_partitions {
       self.active_partitions.remove(partition_id);
       self.diagnostics.last_committed_cursors.remove(partition_id);

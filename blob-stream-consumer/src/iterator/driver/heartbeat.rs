@@ -183,7 +183,7 @@ impl ConsumerDriver {
       self.record_heartbeat_failure(started_at);
       if now >= self.heartbeat_retry_deadline() {
         self
-          .fence_active_partitions_after_heartbeat_failure(now)
+          .fence_active_partitions_after_heartbeat_failure()
           .await?;
       } else {
         debug!(
@@ -233,11 +233,11 @@ impl ConsumerDriver {
     let report = match coordinator_result {
       Ok(report) => report,
       Err(error) => {
-        self.reconcile_fenced_partitions(now).await?;
+        self.reconcile_fenced_partitions().await?;
         if matches!(trigger, HeartbeatTrigger::Scheduled) && now >= self.heartbeat_retry_deadline()
         {
           self
-            .fence_active_partitions_after_heartbeat_failure(now)
+            .fence_active_partitions_after_heartbeat_failure()
             .await?;
         }
         debug!(
@@ -262,7 +262,7 @@ impl ConsumerDriver {
     }
     self.record_successful_heartbeat(now_ts_ms, trigger, &report, &pending_commits, started_at);
 
-    self.remove_fenced_partitions(&report.fenced_partitions, now)?;
+    self.remove_fenced_partitions(&report.fenced_partitions)?;
 
     if matches!(trigger, HeartbeatTrigger::Scheduled) {
       self.next_heartbeat_at = now.saturating_add(consumer_heartbeat_interval(&self.group_config));

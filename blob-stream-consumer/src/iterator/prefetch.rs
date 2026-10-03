@@ -10,12 +10,16 @@
 //! awaits. The local pending queue holds reader output that cannot yet enter the delivery queue
 //! because doing so would exceed the soft byte budget.
 
+#[cfg(test)]
+#[path = "./prefetch_test.rs"]
+mod tests;
+
 use super::delivery::{
   prefetched_batch_bytes,
   update_total_prefetch_bytes,
   update_worker_prefetch_metrics,
 };
-use super::shared::ConsumerIteratorMetrics;
+use super::shared::{ConsumerIteratorMetrics, ReadEpoch};
 use super::{ConsumerLifecycleHooks, ConsumerSeekTarget, ConsumerSharedState};
 use crate::consumer::{
   ConsumerBatch,
@@ -106,6 +110,11 @@ pub(super) enum ConsumerReaderCommand {
     now: OffsetDateTime,
     handoff_phase: Option<&'static str>,
     release_delivery_fence: bool,
+    read_epoch: ReadEpoch,
+  },
+  SuspendReadPartitions {
+    partitions: Vec<VirtualPartitionId>,
+    read_epoch: ReadEpoch,
   },
   Seek {
     virtual_partition_id: VirtualPartitionId,
@@ -257,7 +266,12 @@ impl PrefetchWorker {
         &mut pending_bytes,
         &mut self.recovery_traces,
         &mut self.pending_seek_traces,
-      ) {
+        self.lifecycle_hooks.as_deref(),
+        &self.member_id,
+        &self.metrics,
+      )
+      .await
+      {
         self.finish_recovery_traces("worker_stopped");
         return;
       }
@@ -285,22 +299,40 @@ impl PrefetchWorker {
             .prefetch_capacity_exhausted(&self.member_id, &self.buffered_partition_ids())
             .await;
         }
-        let _ = tokio::time::timeout(
-          std::time::Duration::from_millis(250),
-          self.prefetch_space_notify.notified(),
-        )
-        .await;
+        tokio::select! {
+          () = self.reader_command_notify.notified() => {},
+          _ = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            self.prefetch_space_notify.notified(),
+          ) => {},
+        }
         continue;
       };
 
       let read_started_at = Instant::now();
-      let read_outcome = match self.read_available_with_retry(capacity).await {
+      let mut read_outcome = match self.read_available_with_retry(capacity).await {
         ReadAvailableOutcome::Batches(batches) => batches,
         ReadAvailableOutcome::CommandPending => continue,
       };
       record_reader_diagnostics(&self.reader, &self.shared_state);
       self.record_initial_fast_path_progress().await;
       self.record_recovery_progress().await;
+
+      {
+        let shared_state = self.shared_state.lock();
+        let accepted = read_outcome.batches.len();
+        read_outcome.batches.retain(|batch| {
+          !shared_state
+            .read_fenced_partitions
+            .contains_key(&batch.virtual_partition_id)
+        });
+        if accepted != read_outcome.batches.len() {
+          debug!(
+            "consumer prefetch discarded fenced read output: batches={}",
+            accepted - read_outcome.batches.len()
+          );
+        }
+      }
 
       self
         .metrics
@@ -683,10 +715,7 @@ impl PrefetchWorker {
         let batch_bytes = prefetched_batch_bytes(batch);
         // Assignment can change while the reader is blocked. Drop obsolete pending work before it
         // consumes shared buffer capacity or becomes visible to the caller.
-        if !shared_state
-          .active_partitions
-          .contains_key(&batch.virtual_partition_id)
-        {
+        if !shared_state.read_allowed(batch.virtual_partition_id) {
           pending.pop_front();
           *pending_record_count = pending_record_count.saturating_sub(batch_record_count);
           *pending_bytes = pending_bytes.saturating_sub(batch_bytes);
@@ -748,11 +777,13 @@ impl PrefetchWorker {
     if pending_remains {
       // Wake quickly when callers drain the delivery queue, but periodically retry so a lost
       // notification cannot stall prefetch permanently.
-      let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        self.prefetch_space_notify.notified(),
-      )
-      .await;
+      tokio::select! {
+        () = self.reader_command_notify.notified() => {},
+        _ = tokio::time::timeout(
+          std::time::Duration::from_millis(250),
+          self.prefetch_space_notify.notified(),
+        ) => {},
+      }
     }
     pending_remains
   }
@@ -844,7 +875,7 @@ pub(super) fn record_reader_diagnostics(
 }
 
 /// Apply every queued reader mutation before starting another asynchronous reader scan.
-fn process_reader_commands(
+async fn process_reader_commands(
   reader: &mut ConsumerReaderImpl,
   reader_command_rx: &mut mpsc::UnboundedReceiver<ConsumerReaderCommand>,
   shared_state: &Arc<Mutex<ConsumerSharedState>>,
@@ -855,6 +886,9 @@ fn process_reader_commands(
   pending_bytes: &mut u64,
   recovery_traces: &mut HashMap<VirtualPartitionId, RecoveryTrace>,
   pending_seek_traces: &mut HashMap<VirtualPartitionId, SeekTrace>,
+  lifecycle_hooks: Option<&dyn ConsumerLifecycleHooks>,
+  member_id: &str,
+  metrics: &ConsumerIteratorMetrics,
 ) -> bool {
   loop {
     let command = match reader_command_rx.try_recv() {
@@ -863,6 +897,7 @@ fn process_reader_commands(
       Err(mpsc::error::TryRecvError::Disconnected) => return false,
     };
     let mut handoff_assignment = None;
+    let mut applied_suspension = None;
     let seek_response = match command {
       ConsumerReaderCommand::HydrateCursors {
         recovered_cursors,
@@ -883,7 +918,17 @@ fn process_reader_commands(
         now,
         handoff_phase,
         release_delivery_fence,
+        read_epoch,
       } => {
+        let assignment = {
+          let state = shared_state.lock();
+          assignment
+            .into_iter()
+            .filter(|partition_id| {
+              state.assignment_read_allowed(*partition_id, read_epoch, release_delivery_fence)
+            })
+            .collect::<Vec<_>>()
+        };
         if let Err(error) = reader.set_assigned_virtual_partitions(&assignment, now) {
           shared_state.lock().terminal_error = Some(format!("{error:#}"));
           return false;
@@ -891,15 +936,58 @@ fn process_reader_commands(
         // A revoked partition cannot enter recovery under this assignment. Close its active or
         // pending seek trace now so a later reacquisition cannot inherit the old seek as parent.
         finish_unassigned_recovery_traces(recovery_traces, pending_seek_traces, &assignment);
-        if release_delivery_fence {
+        retain_pending_batches(
+          pending,
+          pending_record_count,
+          pending_bytes,
+          |partition_id| assignment.contains(&partition_id),
+        );
+        {
           let mut shared_state = shared_state.lock();
-          if shared_state.delivery_state.revocation_in_progress {
-            shared_state.delivery_state.revocation_in_progress = false;
+          if shared_state.complete_read_assignment(read_epoch, release_delivery_fence) {
             debug!("consumer delivery fence released after reader assignment update");
             delivery_notify.notify_waiters();
           }
         }
         handoff_assignment = handoff_phase.map(|phase| (assignment, phase));
+        None
+      },
+      ConsumerReaderCommand::SuspendReadPartitions {
+        partitions,
+        read_epoch,
+      } => {
+        let revoked = {
+          let state = shared_state.lock();
+          partitions
+            .into_iter()
+            .filter(|partition_id| {
+              state.read_fenced_partitions.get(partition_id) == Some(&read_epoch)
+            })
+            .collect::<HashSet<_>>()
+        };
+        reader.suspend_read_partitions(&revoked);
+        retain_pending_batches(
+          pending,
+          pending_record_count,
+          pending_bytes,
+          |partition_id| !revoked.contains(&partition_id),
+        );
+        for partition_id in &revoked {
+          if let Some(recovery) = recovery_traces.remove(partition_id) {
+            PrefetchWorker::finish_recovery_trace(recovery, "cancelled");
+          }
+          if let Some(seek_trace) = pending_seek_traces.remove(partition_id) {
+            seek_trace.finish("cancelled");
+          }
+        }
+        debug!(
+          "consumer prefetch read suspension applied: epoch={read_epoch:?}, partitions={revoked:?}"
+        );
+        let mut partitions = revoked.into_iter().collect::<Vec<_>>();
+        partitions.sort_unstable();
+        if !partitions.is_empty() {
+          applied_suspension = Some(partitions);
+        }
         None
       },
       ConsumerReaderCommand::Seek {
@@ -909,6 +997,15 @@ fn process_reader_commands(
         seek_trace,
         response,
       } => {
+        {
+          let mut state = shared_state.lock();
+          if let Err(error) = state.apply_seek(virtual_partition_id, target.offset) {
+            seek_trace.finish("rejected");
+            let _ = response.send(Err(error));
+            continue;
+          }
+          update_worker_prefetch_metrics(metrics, &state.delivery_state);
+        }
         // A newer seek replaces the reader cursor for this partition. Close any prior seek trace
         // rather than letting it absorb recovery work initiated by the newer request.
         if let Some(recovery) = recovery_traces.remove(&virtual_partition_id) {
@@ -921,18 +1018,34 @@ fn process_reader_commands(
         reader.seek(virtual_partition_id, &target, now);
         // A seek invalidates all unread reader output for that partition, including batches that
         // have not crossed the shared byte-budget boundary yet.
-        pending.retain(|batch| {
-          if batch.virtual_partition_id != virtual_partition_id {
-            return true;
-          }
-          *pending_record_count = pending_record_count.saturating_sub(batch.records.len());
-          *pending_bytes = pending_bytes.saturating_sub(prefetched_batch_bytes(batch));
-          false
-        });
+        retain_pending_batches(
+          pending,
+          pending_record_count,
+          pending_bytes,
+          |partition_id| partition_id != virtual_partition_id,
+        );
         Some(response)
       },
     };
     record_reader_diagnostics(reader, shared_state);
+    {
+      let mut state = shared_state.lock();
+      state.diagnostics.prefetch_pending_batch_count = pending.len();
+      state.diagnostics.prefetch_pending_record_count = *pending_record_count;
+      state.diagnostics.prefetch_pending_bytes = *pending_bytes;
+      metrics
+        .prefetch_pending_batches
+        .set(i64::try_from(pending.len()).unwrap_or(i64::MAX));
+      metrics
+        .prefetch_pending_bytes
+        .set(i64::try_from(*pending_bytes).unwrap_or(i64::MAX));
+      update_total_prefetch_bytes(metrics, &state.delivery_state, *pending_bytes);
+    }
+    if let Some(partitions) = applied_suspension
+      && let Some(hooks) = lifecycle_hooks
+    {
+      hooks.read_suspension_applied(member_id, &partitions).await;
+    }
     if let Some((assignment, handoff_phase)) = handoff_assignment {
       {
         let mut shared_state = shared_state.lock();
@@ -971,6 +1084,22 @@ fn process_reader_commands(
       let _ = response.send(Ok(()));
     }
   }
+}
+
+fn retain_pending_batches(
+  pending: &mut VecDeque<ConsumerBatch>,
+  pending_record_count: &mut usize,
+  pending_bytes: &mut u64,
+  keep: impl Fn(VirtualPartitionId) -> bool,
+) {
+  pending.retain(|batch| {
+    if keep(batch.virtual_partition_id) {
+      return true;
+    }
+    *pending_record_count = pending_record_count.saturating_sub(batch.records.len());
+    *pending_bytes = pending_bytes.saturating_sub(prefetched_batch_bytes(batch));
+    false
+  });
 }
 
 fn finish_unassigned_recovery_traces(
