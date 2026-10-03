@@ -7,32 +7,27 @@ for the durable tables.
 ## Membership And Assignment Plans
 
 Consumers with the same topic and group ID register membership liveness. They share one versioned
-assignment plan per topic-group rather than deriving incompatible local sticky maps. A planner
+assignment plan per topic-group rather than deriving incompatible local maps. A planner
 lease elects the member that refreshes or replaces the plan when membership or partition inventory
 changes.
 
-The planner preserves existing placements where possible, then moves the minimum required
-partitions to balance load. A valid plan names its planner as a member, covers every configured
+The planner uses balanced sticky placement with best-effort logical co-location and an optional
+membership-change consolidation allowance. A valid plan names its planner as a member, covers every configured
 virtual partition exactly once, and assigns each partition to a plan member. Until a consumer sees
 a structurally valid plan, it makes no local desired-ownership decision.
 
-When the `blob_stream_consumer_colocate_logical_partitions` flag is enabled, the planner instead
-groups virtual partitions by `virtual_partition_id % TopicConfig.partition_count` and tries to
-assign each logical group to one member. It retains the same at-most-one virtual-partition load
-difference, preferring the tightest whole-group fit before prior ownership and splitting a group
-when no remaining owner can fit it. This mode favors co-location over prior virtual-partition
-ownership. Without the flag, the existing cooperative sticky policy remains in effect. The active
-planner reads the flag on each rebalance; changing it publishes a new versioned assignment plan even
-if membership is unchanged. The plan records the chosen mode so members with different flag
-snapshots still follow one shared plan.
+Virtual partitions are grouped by `virtual_partition_id % TopicConfig.partition_count`; the logical
+count must be positive. Inventory and eligible owners are canonicalized and deduplicated. Stale
+previous partitions do not affect balanced capacity. Each placement layer has a floor/ceiling
+capacity allocation, so its owner loads differ by at most one.
 
 Consumers can register an optional stable `pod_id`. When every active member supplies one, the
 planner balances aggregate partition load across pods first, then balances each pod's partitions
-among its members. Otherwise it uses the flat policy, which balances all members globally. This
-supports rolling adoption without a migration. In co-location mode, the planner first tries to keep
-whole logical groups on a pod, then on a worker within that pod. Pod balance takes precedence over
-worker co-location; a logical group may span pods or workers when their respective virtual-partition
-balance requires it.
+among its members. Otherwise it keeps logical co-location over flat members, balancing them
+globally. The sticky baseline reserves surviving ownership at each layer before placing orphaned,
+new, or capacity-excess partitions, keeping whole groups where the remaining slots permit it.
+Optional repair tries pods first, then workers within each pod. Balance and baseline retention take
+precedence over co-location; a group may remain split even when a different packing could fit it.
 
 Consumers may also register `cluster_id`. When every pod-aware member has a cluster ID and all
 members on a pod agree on it, the planner uses the number of distinct active pods per cluster as a
@@ -45,6 +40,51 @@ assignment and simply omits this preference.
 The planner lease uses a unique coordinator session. Its publication transaction condition-checks
 the lease, preventing a stale process that reused a member ID from publishing or releasing a
 successor's plan.
+
+## Sticky Baseline And Optional Repair
+
+The planner first completes one balanced sticky assignment, including both pod and worker layers.
+It reserves eligible previous ownership within fixed floor/ceiling capacities before placing
+mandatory moves. Previous accepted topology preserves the known pod of a departed worker; missing
+departed-pod information is never inferred from member IDs. The cluster residual-slot preference
+still applies when fixing pod capacities.
+
+Only a membership difference from the accepted valid plan enables optional repair. Initial plans,
+unchanged membership, topology-only changes, planner/session takeover, and runtime-setting updates
+do not enable it. Once the new membership is published, heartbeat replans and cooperative handoff
+retries retain the result rather than spending another allowance.
+
+The planner snapshots `blob_stream_consumer_colocation_repair_percent` once for a membership
+transition. It defaults to 10 and accepts 0-100. For canonical inventory size N, the plan-wide
+allowance is the percentage rounded down, with a positive minimum of two and a maximum of N.
+Zero disables optional repair. Invalid values use the default with a rate-limited warning.
+Mandatory departure, new-partition, and baseline-capacity moves do not consume this allowance.
+Movement counts unique final worker-owner differences from the complete sticky baseline, not
+exchanges or separate pod/worker moves. All layers and pods share that same baseline and allowance.
+
+At each repair layer, groups are visited once by descending size and then logical ID. A split group
+gets one proposal: consolidate on its most occupied domain (canonical ID breaks ties), exchange
+non-group partitions back to the source workers, and evaluate the complete result atomically.
+Return partitions prefer already-fragmented groups and groups already represented on the source
+domain, then partition ID. These fixed construction hints may miss a better return combination.
+Accept only a strict lexicographic reduction in split-group count and extra owner fragments beyond
+the first split, within the movement allowance. Equal locality never justifies canonical-only churn.
+
+Every exchange preserves the exact worker load histogram, and therefore pod loads. Pod repair runs
+on the complete worker map; subsequent worker repair exchanges only within a pod and cannot worsen
+pod locality. An infeasible, over-budget, or non-improving proposal leaves the accepted assignment
+untouched. There is no recursive search, alternate plan comparison, or return-permutation enumeration.
+Candidate count is bounded by one proposal per split group per layer; full copying and scoring still
+scale with inventory. This is neither globally optimal nor guaranteed to converge to optimal
+co-location across deployments. The planner independently validates coverage and balance before
+publication and verifies its lease again when publishing. A slow or fenced planner cannot publish
+after its authority expires. Debug summaries report attempted and consolidated groups, final
+optional movement, and the shared allowance.
+
+Stored `colocate_logical_partitions` is not configuration; plans set it to true. Consumers follow a
+structurally valid plan from an active planner without reinterpreting its assignments. Only an
+authoritative planner can replace that plan with a higher version. Cooperative revocation and lease
+fencing remain unchanged.
 
 ## Lease Ownership And Commits
 
@@ -68,7 +108,7 @@ through retention before entering the bounded Fast path.
 Orderly release stores a `graceful_release_ts` marker while expiring the lease. The next claimant
 can distinguish a graceful handoff from an expiry takeover. On shutdown, a consumer best-effort
 releases owned leases, deregisters membership, and conditionally releases its planner lease so a
-remaining member can elect promptly without discarding the sticky plan.
+remaining member can elect promptly without discarding the accepted plan.
 
 ## State Endpoint
 
@@ -80,8 +120,8 @@ local state.
 
 The response joins retained leases with the last valid assignment plan, so it includes planned but
 unleased partitions and other members' ownership, generation, heartbeat, and committed cursor. Plan
-and local/lease partition rows include the logical partition ID. The plan reports its
-`colocate_logical_partitions` mode and groups virtual partition IDs and distinct planned member IDs
+and local/lease partition rows include the logical partition ID. The plan reports its topology
+and groups virtual partition IDs and distinct planned member IDs
 under `logical_partitions`; `colocated` is false when a group spans multiple planned members. These
 groupings describe desired ownership, not a guarantee that leases have converged.
 

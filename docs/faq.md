@@ -41,22 +41,16 @@ Blob-stream was designed for zero cross-AZ traffic. Every AZ is assigned a "writ
 that domain, every topic has P logical partitions. A topic configured with W writer domains therefore
 has P * W virtual partitions; across multiple topics, sum that product for each topic.
 
-From the consumer perspective, *all* virtual partitions are balanced across all AZs. This is subtly
-different from Kafka. In Kafka, when using a producer controlled partition hash, the same hash is
-going to wind up in the same global partition regardless of which AZ it is written from. With
-blob-stream, the same hash across 3 AZs is going to wind up in 3 different virtual partitions which
-may or may not get assigned to the same consumer.
+From the consumer perspective, *all* virtual partitions are balanced across all AZs. Unlike Kafka,
+the same producer hash across three AZs produces three distinct virtual partitions. Consumer
+placement tries to keep their logical group on the same pod and worker, but virtual-partition
+balance can require splitting it. This is best-effort co-location, not an ordering guarantee. See
+[consumer coordination](design/consumer-coordination.md) for the placement contract.
 
 Use cases that require strict ordering across AZs for a single partition hash cannot currently be
-satisfied by blob-stream. In the future we may consider two possible improvements to satisfy this:
-
-1. Add a consumer assignment mode which will force all virtual partitions for a given partition to
-   be assigned to the same consumer. This would send all same-hashed data to the same consumer, but
-   there would not be strict ordering guarantees. This is still likely good enough for many
-   workflows.
-2. It is technically possible to create a meta-iterator that merges all virtual partitions for a
-   partition and defines a strict global order based on (Sonyflake ID, [per partition sequence
-   range]). This is more complicated but we can consider this in the future if there is demand.
+satisfied by blob-stream. A future meta-iterator could merge a logical partition's virtual
+partitions and define an order based on (Sonyflake ID, per-partition sequence range), but this is
+not part of the current reader contract.
 
 # Why haven't you implemented compaction?
 

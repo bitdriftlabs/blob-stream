@@ -76,9 +76,9 @@ response or rejected payload retries the affected blob group directly from stora
 
 | Scope | Flags | Adoption | Operational effect |
 | --- | --- | --- | --- |
+| Consumer placement repair | `blob_stream_consumer_colocation_repair_percent` | Live, once per accepted-plan membership transition | Defaults to 10%; accepts 0-100. The optional allowance is rounded down from canonical inventory size, with a positive minimum of two partitions and a maximum of inventory size; zero disables optional repair. Invalid values use 10%. Pod and worker passes share the allowance, measured as final worker-owner changes from the complete balanced sticky baseline. Mandatory moves are outside it. Updating the flag, routine heartbeats, and planner takeover do not trigger repair. |
 | Consumer reader | `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads`, `blob_stream_consumer_broker_metadata_direct_fallback` | Live, per scan pass | Configures prefetch capacity and range-read concurrency. Broker metadata fallback defaults on; turning it off returns broker metadata errors without a direct retry. Direct-only scans are unaffected. Metadata consistency is static `runtime.read` configuration. Non-`NOT_FOUND` broker blob failures retry the full affected group directly. |
 | Broker and consumer metadata Query | `blob_stream_metadata_query_initial_delay_ms`, `blob_stream_metadata_query_max_delay_ms`, `blob_stream_metadata_query_page_timeout_ms` | Live, per Query page | Both processes use the same flags and defaults: 50-200 ms full-jitter backoff and a three-second deadline per page. Valid ranges are 2-2000 ms initial delay, initial-2000 ms maximum delay, and maximum-4000 ms page timeout. Invalid snapshots retain the previous valid policy. Only metadata Query disables SDK retries and operation timeouts; other DynamoDB operations keep theirs. |
-| Consumer assignment | `blob_stream_consumer_colocate_logical_partitions` | Live on active planner rebalance | Defaults off. When enabled, tries to assign all virtual partitions of a logical partition to the same consumer while retaining pod-first and within-pod virtual-partition balance. A change publishes a new assignment-plan version; disabling returns to the sticky policy. |
 | Broker metadata-cache admission | `blob_stream_broker_metadata_cache_max_waiters_per_key`, `blob_stream_broker_metadata_cache_max_waiters`, `blob_stream_broker_metadata_cache_max_refills`, `blob_stream_broker_metadata_cache_max_request_partitions`, `blob_stream_broker_metadata_cache_max_response_items`, `blob_stream_broker_metadata_cache_max_response_bytes`, `blob_stream_broker_metadata_cache_max_entry_items`, `blob_stream_broker_metadata_cache_request_timeout_ms` | Live on watched updates | Positive limits govern new requests and refills; limits are parsed at construction and only when flags change. Invalid snapshots retain the previous valid limits; removing a flag restores its unflagged default. Per-key waiters cannot exceed global waiters, refills cannot exceed 1024, and response bytes cannot exceed the 16 MiB transport cap. The request timeout accepts 1-60000 ms and must leave at least half its budget beyond the configured coalescing window. Downshifting refill concurrency rejects new work until active refills fall below the limit. |
 | Consumer broker metadata RPC | `blob_stream_consumer_broker_metadata_rpc_timeout_ms` | Live, per request | Overrides the configured seven-second default with 1-120000 ms; invalid values use the startup-configured timeout. |
 | Broker metadata-cache capacity | `blob_stream_broker_metadata_recovery_cache_max_bytes` | Restart the broker | Sets the Recovery share of the total metadata-cache budget at construction. Half of each configured Tail and Recovery budget goes to its eventual cache; the other halves fund the shared strong sealed-prefix cache. |
@@ -133,12 +133,22 @@ checkpoint is not in the current topic-configured metadata window, including ent
 checkpoint. This is a quick signal for stalled, high-write partitions rather than a delivery
 guarantee; correlate it with the owner, heartbeat, and committed checkpoint before acting.
 
-The consumer `/state` assignment plan reports `colocate_logical_partitions` and a
-`logical_partitions` summary with planned member IDs, virtual partition IDs, and `colocated` per
+The consumer `/state` assignment plan reports its topology and a `logical_partitions` summary with
+planned member IDs, virtual partition IDs, and `colocated` per
 logical group. Compare this with the per-virtual lease rows before concluding that ownership has
 converged: plan membership is desired placement, while lease ownership is fenced active placement.
-Mixed flag settings among members are resolved by the elected planner's published plan; a flag
-update takes effect on that planner's next rebalance, not when each consumer reads its own flag.
+
+Logical co-location is unconditional. The elected planner owns the versioned assignment; members
+follow accepted plans during rolling binary upgrades rather than independently selecting placement.
+The serialized compatibility marker is not an operational toggle. See
+[consumer coordination](design/consumer-coordination.md) for the sticky, repair, and authority contract.
+Placement debug logs report attempted and consolidated groups, optional movement, and the shared
+movement allowance. Repairs are deterministic single-pass attempts, not globally optimal packing;
+an unused allowance does not imply another improving proposal exists. Published-plan
+`movement.summary_json` separates orphan
+placements and survivor moves, and counts known cross-pod, intra-pod, and unknown-topology moves.
+Cross-pod counts include mandatory orphan handoffs; they are not themselves avoidable-movement
+counts. Budget rejection leaves a complete balanced sticky plan and never bypasses cooperative drain.
 
 ## Reading Broker State
 

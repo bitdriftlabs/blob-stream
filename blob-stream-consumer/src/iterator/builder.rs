@@ -267,7 +267,6 @@ impl ConsumerIteratorBuilder<'_> {
     let idle_poll_delay = consumer_idle_poll_delay(&read_config);
     let max_idle_poll_delay = Some(consumer_max_idle_poll_delay(&read_config));
     let prefetch_max_bytes = consumer_prefetch_max_bytes(&read_config);
-    let coordinator_feature_flags = feature_flags.clone();
 
     let active_assignment = HashSet::new();
     let assignment_callback = Arc::new(Mutex::new(None));
@@ -284,7 +283,7 @@ impl ConsumerIteratorBuilder<'_> {
       &metrics_scope.scope("consumer"),
       retention,
       maximum_metadata_publication_lag,
-      feature_flags,
+      feature_flags.clone(),
     )?
     .metadata_window_size(metadata_window_size)
     .maximum_clock_skew(maximum_clock_skew)
@@ -293,8 +292,9 @@ impl ConsumerIteratorBuilder<'_> {
       group_config.clone(),
       Arc::clone(&lease_store),
       Arc::clone(&membership_store),
+      logical_partition_count,
     )?
-    .with_logical_partition_count(logical_partition_count, coordinator_feature_flags)?;
+    .with_feature_flags(feature_flags);
     let now = driver_time_provider.now();
     let now_ts_ms = now.unix_timestamp_ms();
     let membership_lease_duration = consumer_lease_duration(&group_config);

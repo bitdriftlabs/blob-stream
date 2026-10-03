@@ -355,7 +355,6 @@ pub struct ConsumerAssignmentPlanSnapshot {
   pub version: u64,
   pub planner_member_id: String,
   pub policy: ConsumerAssignmentPolicy,
-  pub colocate_logical_partitions: bool,
   pub members: Vec<String>,
   pub member_topology: Vec<ConsumerMemberTopologySnapshot>,
   pub pod_loads: Vec<ConsumerPodLoadSnapshot>,
@@ -788,7 +787,6 @@ pub fn assignment_plan_snapshot(
   ConsumerAssignmentPlanSnapshot {
     version: plan.version,
     planner_member_id: plan.planner_member_id,
-    colocate_logical_partitions: plan.colocate_logical_partitions,
     policy: if plan.member_topology.is_some() {
       ConsumerAssignmentPolicy::PodAware
     } else {

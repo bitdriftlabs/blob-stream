@@ -5,21 +5,28 @@ mod tests;
 #[path = "./coordination/assignment.rs"]
 mod assignment;
 
-use crate::config::{ConsumerGroupConfig, consumer_lease_duration, validate_group_config};
-use anyhow::{Error, Result, ensure};
-pub use assignment::cooperative_sticky_assignment;
+#[path = "./coordination/placement_repair.rs"]
+mod placement_repair;
+
+use crate::config::{
+  ConsumerGroupConfig,
+  consumer_colocation_repair_percent,
+  consumer_lease_duration,
+  validate_group_config,
+};
+use anyhow::{Error, Result, bail, ensure};
 use assignment::{
+  assignment_movement_summary,
   assignment_plan,
   assignment_plan_pod_ids,
   assignment_plan_policy,
   canonical_member_topology,
-  cooperative_colocated_assignment,
-  cooperative_colocated_assignment_with_pods,
-  cooperative_sticky_assignment_with_pods,
+  cooperative_sticky_assignment,
+  cooperative_sticky_assignment_with_topology,
 };
 use async_trait::async_trait;
 use bd_log_util::warn_every;
-use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch};
+use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use bd_time::OffsetDateTimeExt;
 use blob_stream_metadata_store::{
   ConsumerGroupAssignmentOutcome,
@@ -62,8 +69,6 @@ use time::ext::NumericalDuration;
 use uuid::Uuid;
 
 const MAX_CONCURRENT_PARTITION_LEASE_OPERATIONS: usize = 16;
-const COLOCATE_LOGICAL_PARTITIONS_FEATURE_FLAG: &str =
-  "blob_stream_consumer_colocate_logical_partitions";
 
 #[derive(Clone, Copy)]
 enum LeaseMaintenanceOperation {
@@ -82,13 +87,13 @@ enum LeaseMaintenanceOutcome {
 //
 // This module implements consumer-group coordination with a clear split between:
 //
-// 1) Desired ownership computation (shared, durable, cooperative sticky)
+// 1) Desired ownership computation (shared, durable, best-effort logical co-location)
 // 2) Actual ownership claim/renewal (backed by ConsumerGroupLeaseStore fencing semantics)
 //
 // High-level flow
 //
 // A) Rebalance phase (`rebalance`)
-//    - The elected planner builds a desired partition->member map using cooperative sticky
+//    - The elected planner builds a desired partition->member map using logical co-location
 //      assignment, then persists it as the shared plan.
 //    - If desired map changed, bump generation. Generation is the fence token carried in assignment
 //      and heartbeat operations.
@@ -112,12 +117,11 @@ enum LeaseMaintenanceOutcome {
 //   rebalance claims the same partition.
 // - Local `owned` state is derived from store outcomes and actively pruned on fencing events.
 //
-// Sticky/cooperative behavior
+// Co-location/cooperative behavior
 //
-// - Previous placements are retained when member set still allows it (stickiness).
-// - Only unassigned partitions are newly allocated first.
-// - A bounded rebalance step moves the minimum number of partitions from overloaded to underloaded
-//   members to reach a near-even distribution.
+// - Balance is mandatory; surviving ownership is reserved before mandatory moves are placed.
+// - Co-location guides mandatory placement instead of evicting healthy owners to repack groups.
+// - Membership changes may spend a bounded optional allowance on atomic group consolidations.
 //
 // This design uses the membership store for a durable desired plan and the lease store for
 // correctness-critical ownership state (leases, generation checks, and ownership fences).
@@ -276,12 +280,12 @@ pub trait ConsumerGroupCoordinator: Send + Sync {
 pub struct ConsumerGroupCoordinatorImpl {
   config: ConsumerGroupConfig,
   logical_partition_count: u32,
-  feature_flags: Option<FeatureFlagsWatch>,
   lease_store: Arc<dyn ConsumerGroupLeaseStore>,
   membership_store: Arc<dyn ConsumerGroupMembershipStore>,
   planner_session_id: String,
   generation: u64,
   owned: HashMap<VirtualPartitionId, ConsumerGroupLease>,
+  feature_flags: Option<FeatureFlagsWatch>,
 }
 
 impl ConsumerGroupCoordinatorImpl {
@@ -290,34 +294,34 @@ impl ConsumerGroupCoordinatorImpl {
     config: ConsumerGroupConfig,
     lease_store: Arc<dyn ConsumerGroupLeaseStore>,
     membership_store: Arc<dyn ConsumerGroupMembershipStore>,
+    logical_partition_count: u32,
   ) -> Result<Self> {
     // Validate static configuration once at construction so runtime paths stay focused on
     // coordination logic.
     validate_group_config(&config)?;
+    ensure!(
+      logical_partition_count > 0,
+      "logical partition count must be positive"
+    );
     Ok(Self {
       config,
-      logical_partition_count: 0,
-      feature_flags: None,
+      logical_partition_count,
       lease_store,
       membership_store,
       planner_session_id: Uuid::new_v4().to_string(),
       generation: 0,
       owned: HashMap::new(),
+      feature_flags: None,
     })
   }
 
-  pub fn with_logical_partition_count(
-    mut self,
-    logical_partition_count: u32,
-    feature_flags: Option<FeatureFlagsWatch>,
-  ) -> Result<Self> {
-    ensure!(
-      logical_partition_count > 0,
-      "logical partition count must be positive"
-    );
-    self.logical_partition_count = logical_partition_count;
+  #[must_use]
+  /// Attach the live configuration watch without triggering a replan. Only a future membership
+  /// transition samples it; neither configuration changes nor planner/session takeover spend an
+  /// optional movement allowance against otherwise unchanged membership.
+  pub fn with_feature_flags(mut self, feature_flags: Option<FeatureFlagsWatch>) -> Self {
     self.feature_flags = feature_flags;
-    Ok(self)
+    self
   }
 
   async fn shared_assignment(
@@ -359,6 +363,13 @@ impl ConsumerGroupCoordinatorImpl {
       .as_ref()
       .and_then(|plan| current_plan_validation_error.as_ref().map(|_| plan.version));
     let current_members = canonical_members(members, &self.config.member_id);
+    // The accepted plan is the durable transition boundary. Once the new membership is published,
+    // subsequent polls and handoff retries see the same members and cannot spend another allowance.
+    // Inventory/topology repairs and planner takeover may still require a plan, but do not qualify
+    // for optional consolidation unless membership itself also changed.
+    let membership_changed = current_plan
+      .as_ref()
+      .is_some_and(|plan| plan.members != current_members);
     let member_topology = if let Some(local_pod_id) = self.config.pod_id.as_deref() {
       let active_members = self
         .membership_store
@@ -377,13 +388,6 @@ impl ConsumerGroupCoordinatorImpl {
     let topology_changed = current_plan.as_ref().is_some_and(|plan| {
       plan.members != current_members || plan.member_topology != member_topology
     });
-    let colocate_logical_partitions = self
-      .feature_flags
-      .as_ref()
-      .is_some_and(|flags| flags.get_bool(COLOCATE_LOGICAL_PARTITIONS_FEATURE_FLAG, false));
-    let policy_changed = current_plan
-      .as_ref()
-      .is_some_and(|plan| plan.colocate_logical_partitions != colocate_logical_partitions);
     if let Some(plan) = current_plan.as_ref()
       && current_plan_is_valid
     {
@@ -410,7 +414,9 @@ impl ConsumerGroupCoordinatorImpl {
           rejected_assignment_plan_version,
         });
       }
-      if planner_is_active && !topology_changed && !policy_changed {
+      // Placement policy is not a reason to rewrite a valid unchanged plan. Only this session's
+      // planner authority may retain it; a reused member ID must still acquire the fenced lease.
+      if planner_is_active && !topology_changed {
         let outcome = self
           .membership_store
           .acquire_or_renew_planner(
@@ -448,34 +454,45 @@ impl ConsumerGroupCoordinatorImpl {
       )
       .await?;
     if planner_outcome == ConsumerGroupPlannerLeaseOutcome::Acquired {
+      let repair_percent = if membership_changed {
+        let snapshot = self
+          .feature_flags
+          .as_ref()
+          .and_then(|watch| watch.borrow().clone());
+        consumer_colocation_repair_percent(snapshot.as_deref())
+      } else {
+        0
+      };
       let previous_assignment = current_plan
         .as_ref()
         .map(plan_assignment_map)
         .unwrap_or_default();
-      let assignment = match (member_topology.as_deref(), colocate_logical_partitions) {
-        (Some(member_topology), true) => cooperative_colocated_assignment_with_pods(
-          member_topology,
-          partitions,
-          &previous_assignment,
-          self.logical_partition_count,
-        ),
-        (None, true) => cooperative_colocated_assignment(
-          members,
-          partitions,
-          &previous_assignment,
-          &self.config.member_id,
-          self.logical_partition_count,
-        ),
-        (Some(member_topology), false) => {
-          cooperative_sticky_assignment_with_pods(member_topology, partitions, &previous_assignment)
+      let assignment = member_topology.as_deref().map_or_else(
+        || {
+          cooperative_sticky_assignment(
+            members,
+            partitions,
+            &previous_assignment,
+            &self.config.member_id,
+            self.logical_partition_count,
+            repair_percent,
+          )
         },
-        (None, false) => cooperative_sticky_assignment(
-          members,
-          partitions,
-          &previous_assignment,
-          &self.config.member_id,
-        ),
-      };
+        |member_topology| {
+          cooperative_sticky_assignment_with_topology(
+            member_topology,
+            current_plan
+              .as_ref()
+              .filter(|_| current_plan_is_valid)
+              .and_then(|plan| plan.member_topology.as_deref())
+              .unwrap_or_default(),
+            partitions,
+            &previous_assignment,
+            self.logical_partition_count,
+            repair_percent,
+          )
+        },
+      );
       let plan = assignment_plan(
         current_plan
           .as_ref()
@@ -484,10 +501,15 @@ impl ConsumerGroupCoordinatorImpl {
         partitions,
         &assignment,
         member_topology,
-        colocate_logical_partitions,
         &self.config.member_id,
         now.unix_timestamp_ms(),
       );
+      // Check the actual serialized result, independently of placement construction. In particular,
+      // optional consolidation must not weaken complete coverage or either topology balance gate.
+      if let Some(reason) = assignment_plan_validation_error(&plan, partitions) {
+        log_assignment_plan_rejection(&self.config, &plan, partitions, &reason);
+        bail!("computed consumer assignment plan is invalid: {reason:?}");
+      }
       let moved_partitions = plan
         .assignments
         .iter()
@@ -496,9 +518,11 @@ impl ConsumerGroupCoordinatorImpl {
         })
         .count();
       let pod_ids = assignment_plan_pod_ids(&plan);
+      let movement_summary = assignment_movement_summary(&plan, current_plan.as_ref());
       debug!(
         "consumer assignment plan publishing: topic={}, group_id={}, member_id={}, version={}, \
-         policy={}, pods={:?}, members={}, assignments={}, moved_partitions={}",
+         policy={}, pods={:?}, members={}, assignments={}, moved_partitions={}, \
+         movement.summary_json={}",
         self.config.topic,
         self.config.group_id,
         self.config.member_id,
@@ -507,7 +531,8 @@ impl ConsumerGroupCoordinatorImpl {
         pod_ids,
         plan.members.len(),
         plan.assignments.len(),
-        moved_partitions
+        moved_partitions,
+        movement_summary
       );
       if self
         .membership_store
@@ -523,7 +548,8 @@ impl ConsumerGroupCoordinatorImpl {
       {
         info!(
           "consumer assignment plan published: topic={}, group_id={}, member_id={}, version={}, \
-           policy={}, pods={:?}, members={}, partitions={}, moved_partitions={}",
+           policy={}, pods={:?}, members={}, partitions={}, moved_partitions={}, \
+           movement.summary_json={}",
           self.config.topic,
           self.config.group_id,
           self.config.member_id,
@@ -532,7 +558,8 @@ impl ConsumerGroupCoordinatorImpl {
           assignment_plan_pod_ids(&plan),
           plan.members.len(),
           plan.assignments.len(),
-          moved_partitions
+          moved_partitions,
+          movement_summary
         );
         return Ok(SharedAssignment {
           plan: Some(plan),
@@ -1045,10 +1072,6 @@ impl ConsumerGroupCoordinator for ConsumerGroupCoordinatorImpl {
     &self.planner_session_id
   }
 }
-
-//
-// cooperative_sticky_assignment
-//
 
 fn assignment_plan_validation_error(
   plan: &ConsumerGroupAssignmentPlan,

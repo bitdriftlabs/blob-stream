@@ -106,7 +106,6 @@ pub use coordination::{
   HeartbeatReport,
   RebalanceReport,
   RecoveredCursor,
-  cooperative_sticky_assignment,
 };
 pub use diagnostics::{
   ConsumerAssignmentPlanSnapshot,
