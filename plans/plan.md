@@ -147,48 +147,39 @@ during a rolling binary upgrade. Do not reinterpret an old accepted plan in plac
 select different algorithms independently. Remove transitional serialization only when its reader
 compatibility is proven separately.
 
-Preserve the current contract that whole logical groups take priority over previous ownership.
-Do not buy stickiness by degrading co-location. Score feasible candidates lexicographically by:
-
-1. Number of logical groups split at the current placement layer.
-2. Number of surviving partitions moved at that layer.
-3. Extra owner fragments beyond the first split for already-split groups.
-4. Canonical owner/partition ordering for deterministic ties.
-
-Apply this at the pod layer first, then at the worker layer with pod placement fixed. Track
-cross-pod moves separately from intra-pod member moves. Mandatory orphan placements are reported
-but do not count as avoidable survivor moves. Unknown departed-pod topology must not be invented.
+Build a complete balanced sticky baseline first. Optional repair accepts only a strict reduction in
+split logical-group count, then extra owner fragments beyond the first split. Canonical order breaks
+construction ties but never justifies movement at equal locality. Track cross-pod moves separately
+from intra-pod member moves. Mandatory baseline moves are outside the optional allowance; unknown
+departed-pod topology must not be invented.
 
 ### Algorithm
 
-- Keep the current greedy result as a valid comparison candidate and fallback. The selected
-   candidate cannot be worse in split-group count or survivor moves at equal split-group count.
-- Construct a second candidate by reserving existing whole groups and retained fragments on
-   eligible owners before placing orphaned/new partitions. Repair only capacity violations; retain
-   as much previous ownership as possible, and use canonical ordering to break ties.
-- Pack remaining whole groups into free capacity when possible. Split only when the remaining
-   balanced capacity requires it, including the case where preserving a later survivor group is
-   better than packing an early orphan group whole.
-- Improve both candidates with capacity-preserving partition exchanges and whole-group swaps.
-   Accept only strict improvements to the documented score. Search small interacting groups for
-   multi-exchange repairs; bound search by a deterministic count of examined states, not wall time.
-   Keep the best feasible candidate on search exhaustion. This is a bounded heuristic, not a claim
-   of globally optimal bin packing.
-- Specify the state-count limit from the large fixture's planner lease budget before enabling the
-   new policy. A limit must never yield an incomplete assignment. Expose budget exhaustion in the
-   existing bounded planner summary, rather than creating an unbounded tracing stream.
+- Reserve surviving partitions within fixed capacities before placing orphaned, new, or excess
+   partitions. Keep remaining whole groups together when free capacity permits.
+- Complete pod and worker placement before optional repair. Membership changes alone enable one
+   repair pass; stable membership, planner takeover, and configuration changes do not.
+- Snapshot `blob_stream_consumer_colocation_repair_percent` once, default 10%, valid 0-100. Round
+   down against canonical inventory, with positive minimum two and maximum inventory size. Zero
+   disables optional repair; invalid values use the default.
+- Try one canonical whole-group consolidation per split group, with deterministic destination and
+   return partitions. Evaluate the entire exchange atomically; never explore alternative plans or
+   recursive permutations. Require strict locality improvement and exact capacity preservation.
+- Run pod repair followed by within-pod worker repair. Share one allowance for final worker-owner
+   differences from the full sticky baseline across all layers and pods, not one allowance per pass.
+   Log attempted/accepted groups and final optional movement. This heuristic is not globally optimal
+   and repeated deployments do not guarantee convergence to optimal co-location.
 
 Use [coordination_test.rs](../blob-stream-consumer/src/coordination_test.rs#L263) for regressions.
 The paired-group fixture must move only departed partitions `0` and `4`, retain every survivor,
-produce loads `3/3/2`, and keep three whole groups. Existing whole-group-priority and
+produce loads `3/3/2`, and keep three whole groups. Sticky-survivor and
 smaller-cluster-residual tests must remain valid.
 
 Test unchanged feasible membership/idempotence, shuffled and duplicate inputs, empty inventory,
 join/leave, uneven groups, previously fragmented groups, worker departure inside a surviving pod,
-multiple workers, partial pod/cluster metadata, and rolling accepted-plan compatibility. Use exhaustive small
-assignment enumeration as an oracle: require the counterexample's optimum and record gaps for
-other cases without pretending the bounded heuristic is universally optimal. Replanning the
-result with unchanged inputs must be stable, not move to a different equivalent packing.
+multiple workers, partial pod/cluster metadata, and accepted-plan authority. Use exhaustive small
+assignment enumeration only for fixture-specific checks, not as a global policy requirement.
+The coordinator must retain unchanged membership plans rather than spending repair repeatedly.
 
 ### Event-Shaped Regression And Expanded Coverage
 
@@ -209,8 +200,8 @@ Add a deterministic complete synthetic inventory, not a reconstruction that trea
    whole; five splits are necessary. This makes the no-survivor-move baseline a real optimum for
    this fixture, not a claim that the production event needed only six moves.
 
-Replay the current and improved algorithms against the fixture and retain both movement counts
-as evidence. The [preserved Python probe](rebalance-2026-10-02/event-shaped-probe.json) reports
+Retain historical comparison counts as evidence. The
+[preserved Python probe](rebalance-2026-10-02/event-shaped-probe.json) reports
 64 greedy moves, including 58 survivor moves, versus six feasible moves with zero survivor moves,
 at the same five split groups. This validates the fixture against the Python reproduction, not an
 actual Rust test or production replay. Do not hard-code the production count of 57 survivor moves
@@ -220,9 +211,9 @@ cluster membership, and successive departure/join cycles. Build a second full 19
 64-triple fixture to cover a conventional complete virtual-partition layout as well.
 
 Add seeded property-style cases for inventory/owner uniqueness, floor/ceiling balance, deterministic
-ordering, idempotence, no worse co-location than the comparison candidate, and no extra movement at
-equal co-location quality. Use small exhaustive oracles and large bounded-work cases in addition to
-the event-shaped regression. Avoid a few hand-picked comparator tests as the sole coverage.
+ordering, sticky-baseline stability, exact load preservation during repair, shared movement caps,
+and strict locality improvement. Cover atomic rejection and live membership/configuration gates
+in addition to the event-shaped regression.
 
 Complete a live-group event-shaped departure scenario with causal gates, exact changed-owner
 counts, per-record delivery counts, durable cursor/checkpoint checks, and convergence. This must
@@ -232,6 +223,79 @@ For production replay, acquire the full accepted old/new plans and membership fr
 plan store or a reproducible diagnostic capture. Run both policies offline. Attribute necessary
 and avoidable moves only after checking the deployed mode and topology inputs; the 136 observed
 partitions are not a valid full-inventory replay fixture.
+
+### Implementation Evidence
+
+The Rust paired-group regression moves only partitions 0 and 4. The complete synthetic event fixture
+changes six orphan owners and zero survivors, with five split groups and loads of six/seven. The
+earlier capacity-first reproduction changed 64 owners. These are synthetic counts, not a replay of
+the incomplete production inventory.
+
+Placement now uses one sticky baseline and movement-budgeted deterministic consolidation, without
+the earlier comparison candidate or recursive search. The four-partition plateau test proves a
+complete atomic repair can succeed where individual exchanges do not improve locality. Smaller
+allowances reject it without partial movement. Seeded flat and topology cases check final movement
+against the shared full-worker baseline, exact owner-load preservation, strict locality improvement,
+and reordered/duplicate inputs. Authority tests preserve accepted ownership on planner takeover;
+live configuration tests prove only a membership transition samples and spends an allowance.
+
+The live 21-member synthetic fixture uses ordinary membership coordination and a fenced starting
+plan. Lifecycle gates control departure and completed stable replanning. It requires exactly six
+changed owners, zero survivor moves, 272 individually counted before/after records, advancing durable
+source checkpoints on all 136 partitions, and accepted-plan/lease-generation convergence.
+Production replay remains conditional on acquiring complete old/new plans, membership, inventory,
+and deployed revision. Revoked-prefetch and recovery changes are separate workstreams.
+
+### Workstream 1 Validation
+
+The initial implementation's live departure regression passed 25 uncached serial runs (3.4 s
+average service-backed runtime). The full suites passed 223 consumer tests, 75 metadata-store tests,
+and all 45 end-to-end tests. The buffered-record revocation fixture now targets the final partition,
+which canonical scale-out transfers; its fencing assertions are unchanged. Nextest reported a
+background-output leak in an existing metadata retry test, without a test failure.
+
+The sticky-baseline/consolidation implementation passed all 229 consumer tests, 75 metadata-store
+tests, and 45 end-to-end tests through uncached normal Bazel Nextest wrappers. The live event-shaped
+departure still moves only the six orphan partitions, with delivery, durable checkpoints, and lease
+generation assertions intact. Nextest reported a background-output leak for
+`active_broker_restart_continuity`, which passed. All 11 consumer/metadata-store/integration Clippy
+checks passed; all nine touched Rust files passed `just rustfmt -- --check`. Workspace diagnostics
+and whitespace checks were clean. These results validate this replacement; the earlier repetition
+and timing results above are not a new repetition or latency claim for the replacement.
+
+All 11 generated Clippy checks passed. All ten edited deployment files parsed as YAML with the
+obsolete override absent. Editor diagnostics and whitespace checks were clean. No configuration
+was deployed. Current runtime/control references are gone; the investigation archive remains intact.
+
+Commands executed from the monorepo root:
+
+```sh
+just rustfmt -- --check \
+   blob-stream/blob-stream-consumer/src/coordination.rs \
+   blob-stream/blob-stream-consumer/src/coordination/assignment.rs \
+   blob-stream/blob-stream-consumer/src/coordination/assignment_test.rs \
+   blob-stream/blob-stream-consumer/src/coordination/placement_repair.rs \
+   blob-stream/blob-stream-consumer/src/coordination_test.rs \
+   blob-stream/blob-stream-consumer/src/diagnostics.rs \
+   blob-stream/blob-stream-consumer/src/iterator/builder.rs \
+   blob-stream/blob-stream-consumer/src/iterator/iterator_test.rs \
+   blob-stream/blob-stream-consumer/src/lib.rs \
+   blob-stream/blob-stream-integration-tests/src/test_framework/cluster.rs \
+   blob-stream/blob-stream-integration-tests/tests/end_to_end_test.rs \
+   blob-stream/blob-stream-metadata-store/src/lib.rs
+./bazelw test --config=clippy \
+   //blob-stream/blob-stream-consumer/... \
+   //blob-stream/blob-stream-integration-tests/... \
+   //blob-stream/blob-stream-metadata-store/...
+./bazelw test --nocache_test_results \
+   //blob-stream/blob-stream-consumer:test \
+   //blob-stream/blob-stream-metadata-store:test
+./bazelw test --nocache_test_results --test_output=streamed \
+   //blob-stream/blob-stream-integration-tests:end-to-end-test
+./bazelw test --nocache_test_results --runs_per_test=25 --local_test_jobs=1 \
+   --test_arg=-E --test_arg='test(colocated_live_event_departure_moves_only_six_orphans)' \
+   //blob-stream/blob-stream-integration-tests:end-to-end-test
+```
 
 ## Workstream 2: Revoked Prefetch
 
@@ -436,7 +500,7 @@ batch, high-cardinality partition metric labels, or unbounded sets of seen Snowf
 | Payload work | admitted/requested/returned bytes, accepted batches/records, missing blobs | distinguish useful payload from overlap and range overfetch |
 | Stage timing | planning, metadata await, local enumeration, blob await, decode/accept, capacity/idle/retry wait | wall-time buckets must not double-count concurrent futures as critical-path time |
 | Revocation | fence publication/application, pending/queued/in-flight discarded bytes, callback wait, commit and release timing | commit eligibility survives suspension; one bounded in-flight pass is permitted |
-| Planner | mode/revision, membership/inventory hash and counts, co-location score, orphan/survivor/cross-pod/member moves, search exhaustion | full replay inputs live in an explicit diagnostic artifact, not trace attributes |
+| Planner | revision, membership/inventory hash and counts, co-location score, orphan/survivor/cross-pod/member moves, repair attempts and optional movement allowance | full replay inputs live in an explicit diagnostic artifact, not trace attributes |
 
 Use existing segment-without-partition counters to reveal work not represented by batch cursor
 skips. Exact unique observation sets belong in bounded test fixtures or diagnostic captures, not
