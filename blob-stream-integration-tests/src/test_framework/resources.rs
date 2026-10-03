@@ -23,6 +23,7 @@ use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_metadata_store::{
   ConsumerGroupLeaseStore,
   ConsumerGroupMembershipStore,
+  DynamoCapacityMetrics,
   DynamoConsumerGroupLeaseStore,
   DynamoConsumerGroupMembershipStore,
   DynamoMetadataStore,
@@ -133,13 +134,20 @@ impl IntegrationResources {
   }
 
   pub fn metadata_store(&self) -> Arc<dyn MetadataStore> {
+    self.metadata_store_with_capacity_metrics(None)
+  }
+
+  pub fn metadata_store_with_capacity_metrics(
+    &self,
+    capacity_metrics: Option<DynamoCapacityMetrics>,
+  ) -> Arc<dyn MetadataStore> {
     let inner: Arc<dyn MetadataStore> = Arc::new(DynamoMetadataStore::new(
       self.dynamo.clone(),
       self.metadata_table.clone(),
       self.producer_lease_table.clone(),
       HashMap::new(),
       time::Duration::hours(1),
-      None,
+      capacity_metrics,
     ));
     Arc::new(FaultInjectedMetadataStore::new(
       inner,
