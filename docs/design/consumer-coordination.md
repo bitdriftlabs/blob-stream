@@ -107,6 +107,32 @@ invokes the revocation callback, and waits for that callback before activating r
 replacement owner hydrates its reader with the committed cursor and source checkpoint, then recovers
 through retention before entering the bounded Fast path.
 
+Read suspension is separate from commit eligibility. Before publishing a revocation, the iterator
+fences admission of revoked output while retaining final staged offsets and valid lease heartbeats
+through application acknowledgement. At the next serialized prefetch boundary, a revoked-only
+command removes that partition's reader state, metadata cache, traversal, traces, and pending
+batches. Retained partitions and hydrated incoming partitions are not replaced by this operation. An
+already in-flight mixed-partition read may finish, but its revoked batches are discarded at both
+admission boundaries. Idle, capacity-blocked, and retrying workers are notified to apply suspension
+without waiting for their ordinary poll deadline. Both capacity waits listen for persistent
+reader-command notification permits, including commands queued before a waiter registers; the
+periodic capacity retry remains only a fallback for delivery-space notifications. Seeks targeting a
+read-fenced partition are rejected at both the direct-reader and worker boundaries, so they cannot
+recreate suspended reader state while final commits remain eligible. Shared queued records, staged
+offsets, and source provenance reset only when the serialized reader accepts the seek. A rejected
+seek, including one fenced after it was queued, leaves final progress unchanged.
+
+Local read epochs keep delayed commands and assignment completion from clearing a newer fence or
+suspending a later reacquisition; they do not replace durable lease-generation fencing. Reader
+assignment succeeds before its applicable fences are retired. An assignment unrelated to a held
+revocation cannot retire that revocation's read fences or reactivate its reader. A heartbeat that
+reports another lost lease selectively suspends only that partition and removes it from the saved
+replacement assignment, preserving retained reader state and incoming durable hydration. Removal
+also clears unread delivery and worker-pending output so a rapid same-member reacquisition cannot
+replay speculative batches ahead of recovery. A failed final release leaves delivery and reads
+fenced. Application acknowledgement still precedes lease release, and a reacquired partition starts
+from durable claimed progress, never the predecessor's speculative cursor.
+
 Orderly release stores a `graceful_release_ts` marker while expiring the lease. The next claimant
 can distinguish a graceful handoff from an expiry takeover. On shutdown, a consumer best-effort
 releases owned leases, deregisters membership, and conditionally releases its planner lease so a

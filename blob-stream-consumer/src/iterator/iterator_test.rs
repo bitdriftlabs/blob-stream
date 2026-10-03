@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::delivery::{BufferedBatch, DeliveryState};
+use super::driver::HeartbeatTrigger;
 use super::prefetch::{IdlePollBackoff, SeekTrace};
 use super::shared::{ActivePartitionState, ConsumerIteratorMetrics, DeliveredSource};
 use super::{
@@ -24,7 +25,13 @@ use crate::config::{
   TopicConfig,
   consumer_max_clock_skew,
 };
-use crate::consumer::{BrokerBlobRangeQuery, BrokerMetadataQuery, ConsumerBatchSource};
+use crate::consumer::{
+  BrokerBlobRangeQuery,
+  BrokerMetadataQuery,
+  ConsumerBatchSource,
+  ConsumerReader,
+  ReadCapacity,
+};
 use crate::coordination::RecoveredCursor;
 use crate::diagnostics::{
   ConsumerAssignmentPlanSnapshot,
@@ -182,15 +189,15 @@ impl BrokerBlobRangeQuery for RejectingBrokerBlobRangeQuery {
   }
 }
 
-fn rejecting_broker_metadata_query() -> Arc<dyn BrokerMetadataQuery> {
+pub(super) fn rejecting_broker_metadata_query() -> Arc<dyn BrokerMetadataQuery> {
   Arc::new(RejectingBrokerMetadataQuery)
 }
 
-fn rejecting_broker_blob_range_query() -> Arc<dyn BrokerBlobRangeQuery> {
+pub(super) fn rejecting_broker_blob_range_query() -> Arc<dyn BrokerBlobRangeQuery> {
   Arc::new(RejectingBrokerBlobRangeQuery)
 }
 
-struct MutableCoordinationSource {
+pub(super) struct MutableCoordinationSource {
   snapshot: Arc<Mutex<CoordinationSnapshot>>,
 }
 
@@ -201,6 +208,30 @@ struct CommitGateHooks {
 
 struct RebalanceRecordingHooks {
   rebalance_applied_calls: AtomicUsize,
+}
+
+struct ReadSuspensionHooks {
+  capacity: Mutex<Option<oneshot::Sender<()>>>,
+  suspended: Mutex<Option<oneshot::Sender<Vec<VirtualPartitionId>>>>,
+}
+
+#[async_trait::async_trait]
+impl ConsumerLifecycleHooks for ReadSuspensionHooks {
+  async fn prefetch_capacity_exhausted(
+    &self,
+    _member_id: &str,
+    _partitions: &[VirtualPartitionId],
+  ) {
+    if let Some(sender) = self.capacity.lock().take() {
+      let _ = sender.send(());
+    }
+  }
+
+  async fn read_suspension_applied(&self, _member_id: &str, partitions: &[VirtualPartitionId]) {
+    if let Some(sender) = self.suspended.lock().take() {
+      let _ = sender.send(partitions.to_vec());
+    }
+  }
 }
 
 #[test]
@@ -340,6 +371,7 @@ struct FailingLeaseStore {
 struct PartiallyFailingLeaseStore {
   inner: InMemoryConsumerGroupLeaseStore,
   failures_enabled: AtomicBool,
+  release_fails: AtomicBool,
 }
 
 impl FailingLeaseStore {
@@ -355,6 +387,7 @@ impl PartiallyFailingLeaseStore {
     Self {
       inner: InMemoryConsumerGroupLeaseStore::new(),
       failures_enabled: AtomicBool::new(false),
+      release_fails: AtomicBool::new(false),
     }
   }
 }
@@ -542,6 +575,9 @@ impl ConsumerGroupLeaseStore for PartiallyFailingLeaseStore {
     generation: u64,
     now: OffsetDateTime,
   ) -> anyhow::Result<ConsumerGroupReleaseOutcome> {
+    if self.release_fails.load(Ordering::SeqCst) {
+      anyhow::bail!("injected ambiguous partition release");
+    }
     self
       .inner
       .release_partition(key, owner_id, generation, now)
@@ -790,7 +826,7 @@ impl ConsumerGroupMembershipStore for BlockingMembershipStore {
 }
 
 impl MutableCoordinationSource {
-  fn new(snapshot: CoordinationSnapshot) -> Self {
+  pub(super) fn new(snapshot: CoordinationSnapshot) -> Self {
     Self {
       snapshot: Arc::new(Mutex::new(snapshot)),
     }
@@ -1237,7 +1273,7 @@ async fn write_segment_with_publication_time(
     .unwrap();
 }
 
-fn runtime_config() -> ConsumerRuntimeConfig {
+pub(super) fn runtime_config() -> ConsumerRuntimeConfig {
   runtime_config_with_prefetch_max_bytes(None)
 }
 
@@ -1260,7 +1296,7 @@ fn topic_layout_uses_logical_partition_count_not_virtual_partition_count() {
   assert!(TopicPartitionLayout::new(0).is_err());
 }
 
-fn runtime_config_with_prefetch_max_bytes(
+pub(super) fn runtime_config_with_prefetch_max_bytes(
   prefetch_max_bytes: Option<u64>,
 ) -> ConsumerRuntimeConfig {
   let mut read = ConsumerReadConfig::new();
@@ -2519,6 +2555,715 @@ async fn next_does_not_lose_notification_between_state_check_and_wait() {
   assert!(error.to_string().contains("injected test terminal error"));
   drop(next);
   Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn mixed_inflight_read_preserves_retained_output_and_incoming_hydration() {
+  let now = datetime!(2026-10-03 19:30:30 UTC);
+  let window_start = datetime!(2026-10-03 19:30:00 UTC).unix_timestamp();
+  let snowflake_base = SnowflakeId::minimum_for_timestamp(now).as_u64();
+  let time_provider = Arc::new(ManualTimeProvider::new(now));
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![1, 3, 60],
+  }));
+  let leases = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  for (partition_id, offset) in [(9, 900)] {
+    let key = ConsumerGroupLeaseKey {
+      topic: "telemetry".to_string(),
+      group_id: "group-a".to_string(),
+      virtual_partition_id: partition_id,
+    };
+    leases
+      .assign_partition(
+        key.clone(),
+        "seed-owner".to_string(),
+        1,
+        now,
+        TimeDuration::seconds(30),
+      )
+      .await
+      .unwrap();
+    leases
+      .commit_cursor(
+        &key,
+        "seed-owner",
+        1,
+        now,
+        CommittedCursor {
+          virtual_partition_id: partition_id,
+          seq_end: offset,
+          source_checkpoint: Some(CommittedSourceCheckpoint {
+            window_start_unix_seconds: window_start,
+            snowflake_id: snowflake_base + u64::from(partition_id),
+          }),
+        },
+      )
+      .await
+      .unwrap();
+    leases
+      .release_partition(&key, "seed-owner", 1, now)
+      .await
+      .unwrap();
+  }
+  let blob_store = Arc::new(BlockingBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let (suspended_tx, suspended_rx) = oneshot::channel();
+  let hooks = Arc::new(ReadSuspensionHooks {
+    capacity: Mutex::new(None),
+    suspended: Mutex::new(Some(suspended_tx)),
+  });
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime_config(),
+    blob_store.clone(),
+    metadata_store.clone(),
+    leases.clone(),
+    Arc::new(InMemoryConsumerGroupMembershipStore::new()),
+    source.clone(),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+    TopicPartitionLayout::new(64).unwrap(),
+  )
+  .time_provider(time_provider.clone())
+  .lifecycle_hooks(hooks)
+  .build()
+  .await
+  .unwrap();
+  let mut driver = iterator.driver.take().unwrap();
+  let initial = timeout(
+    Duration::from_secs(5),
+    driver
+      .reader
+      .as_mut()
+      .unwrap()
+      .read_available(now, ReadCapacity::new(1_000_000)),
+  )
+  .await
+  .expect("initial empty read did not complete")
+  .unwrap();
+  assert_eq!(initial.len(), 0);
+  iterator.started = true;
+  for (partition_id, first_offset) in [(1, 100), (3, 300), (60, 600), (9, 900)] {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      window_start,
+      snowflake_base + u64::from(partition_id),
+      partition_id,
+      SeqRange {
+        start: first_offset,
+        end: first_offset + 1,
+      },
+      vec![new_record(vec![1], window_start * 1_000); 2],
+    )
+    .await;
+  }
+  blob_store.block_reads.store(true, Ordering::SeqCst);
+  let read_started = blob_store.read_started.notified();
+  tokio::pin!(read_started);
+  read_started.as_mut().enable();
+  driver.spawn_prefetch_task();
+  timeout(Duration::from_secs(5), &mut read_started)
+    .await
+    .unwrap();
+  source.update(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![1, 3, 9],
+  });
+  driver.next_rebalance_at = now;
+  driver.maybe_rebalance(now).await.unwrap();
+  let NextResult::Revoked(revoked) = timeout(Duration::from_secs(5), iterator.next())
+    .await
+    .expect("mixed-read revocation was not emitted")
+    .unwrap()
+  else {
+    panic!("expected mixed-read revocation");
+  };
+  assert_eq!(revoked.partitions(), vec![60]);
+  assert!(
+    iterator
+      .shared_state
+      .lock()
+      .delivery_state
+      .revocation_in_progress
+  );
+  blob_store.block_reads.store(false, Ordering::SeqCst);
+  blob_store.read_release.notify_waiters();
+  assert_eq!(
+    timeout(Duration::from_secs(5), suspended_rx)
+      .await
+      .unwrap()
+      .unwrap(),
+    vec![60]
+  );
+  let lost = leases
+    .list_group_leases("telemetry", "group-a")
+    .await
+    .unwrap()
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == 3)
+    .unwrap();
+  leases
+    .release_partition(&lost.key, "member-a", lost.generation, now)
+    .await
+    .unwrap();
+  leases
+    .assign_partition(
+      lost.key,
+      "member-b".to_string(),
+      lost.generation + 1,
+      now,
+      TimeDuration::seconds(30),
+    )
+    .await
+    .unwrap();
+  let report = driver
+    .heartbeat(now, HeartbeatTrigger::Scheduled)
+    .await
+    .unwrap();
+  assert_eq!(report.fenced_partitions, vec![3]);
+  assert_eq!(driver.pending_assignment.as_ref().unwrap(), &vec![1, 9]);
+  assert!(!driver.active_assignment.contains(&9));
+  assert!(
+    iterator
+      .shared_state
+      .lock()
+      .delivery_state
+      .batches
+      .iter()
+      .all(|batch| batch.virtual_partition_id != 9)
+  );
+  assert!(
+    iterator
+      .shared_state
+      .lock()
+      .read_fenced_partitions
+      .contains_key(&60)
+  );
+  revoked.complete().await;
+  assert!(
+    driver
+      .finish_pending_revocation_if_completed()
+      .await
+      .unwrap()
+  );
+  source.update(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![1, 9, 60],
+  });
+  driver.next_rebalance_at = now;
+  driver.maybe_rebalance(now).await.unwrap();
+  let mut delivered = Vec::new();
+  for _ in 0 .. 5 {
+    let result = timeout(Duration::from_secs(5), iterator.next())
+      .await
+      .unwrap()
+      .unwrap();
+    let NextResult::Record(record) = result else {
+      panic!("expected mixed-read record");
+    };
+    delivered.push((record.virtual_partition_id, record.offset));
+    iterator
+      .store_offset(record.virtual_partition_id, record.offset)
+      .unwrap();
+  }
+  delivered.sort_unstable();
+  assert_eq!(
+    delivered,
+    vec![(1, 100), (1, 101), (9, 901), (60, 600), (60, 601)]
+  );
+  driver
+    .heartbeat(now, HeartbeatTrigger::Commit)
+    .await
+    .unwrap();
+  for (partition_id, offset) in [(1, 101), (9, 901), (60, 601)] {
+    let lease = leases
+      .list_group_leases("telemetry", "group-a")
+      .await
+      .unwrap()
+      .into_iter()
+      .find(|lease| lease.key.virtual_partition_id == partition_id)
+      .unwrap();
+    assert_eq!(lease.owner_id, "member-a");
+    assert_eq!(
+      lease.committed_cursor.unwrap(),
+      CommittedCursor {
+        virtual_partition_id: partition_id,
+        seq_end: offset,
+        source_checkpoint: Some(CommittedSourceCheckpoint {
+          window_start_unix_seconds: window_start,
+          snowflake_id: snowflake_base + u64::from(partition_id),
+        }),
+      }
+    );
+  }
+  assert_eq!(iterator.shared_state.lock().delivery_state.batches.len(), 0);
+  driver.stop_prefetch_task().await;
+}
+
+#[tokio::test]
+async fn failed_revocation_release_keeps_reads_and_delivery_fenced() {
+  let now = datetime!(2026-10-03 19:30:30 UTC);
+  let leases = Arc::new(PartiallyFailingLeaseStore::new());
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![1, 60],
+  }));
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime_config(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    leases.clone(),
+    Arc::new(InMemoryConsumerGroupMembershipStore::new()),
+    source.clone(),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+    TopicPartitionLayout::new(64).unwrap(),
+  )
+  .time_provider(Arc::new(ManualTimeProvider::new(now)))
+  .build()
+  .await
+  .unwrap();
+  let mut driver = iterator.driver.take().unwrap();
+  iterator.started = true;
+  source.update(CoordinationSnapshot {
+    members: vec!["member-a".to_string(), "member-b".to_string()],
+    virtual_partitions: vec![1, 60],
+  });
+  driver.next_rebalance_at = now;
+  driver.maybe_rebalance(now).await.unwrap();
+  let NextResult::Revoked(revoked) = iterator.next().await.unwrap() else {
+    panic!("expected revocation");
+  };
+  driver.remove_fenced_partitions(&[1]).unwrap();
+  assert!(
+    iterator
+      .shared_state
+      .lock()
+      .read_fenced_partitions
+      .contains_key(&60)
+  );
+  assert_eq!(
+    driver.pending_assignment.as_ref().unwrap(),
+    &Vec::<VirtualPartitionId>::new()
+  );
+  leases.release_fails.store(true, Ordering::SeqCst);
+  revoked.complete().await;
+  assert!(
+    driver
+      .finish_pending_revocation_if_completed()
+      .await
+      .is_err()
+  );
+  let state = iterator.shared_state.lock();
+  assert!(state.delivery_state.revocation_in_progress);
+  assert!(state.read_fenced_partitions.contains_key(&60));
+  assert!(state.active_partitions.contains_key(&60));
+  assert!(
+    driver
+      .reader
+      .as_ref()
+      .unwrap()
+      .partition_read_states()
+      .iter()
+      .all(|partition| partition.virtual_partition_id != 60)
+  );
+}
+
+#[tokio::test]
+async fn revocation_wakes_idle_capacity_blocked_and_retrying_workers_without_clock_advance() {
+  for scenario in ["idle", "capacity", "retry"] {
+    let now = datetime!(2026-10-03 19:30:30 UTC);
+    let window = datetime!(2026-10-03 19:30:00 UTC).unix_timestamp();
+    let clock = Arc::new(ManualTimeProvider::new(now));
+    let failing_store = Arc::new(FailingReadBlobStore::new());
+    let blob_store: Arc<dyn BlobStore> = if scenario == "retry" {
+      failing_store.clone()
+    } else {
+      Arc::new(InMemoryBlobStore::new())
+    };
+    let metadata: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+    if scenario != "idle" {
+      write_segment(
+        blob_store.as_ref(),
+        metadata.as_ref(),
+        "telemetry",
+        window,
+        SnowflakeId::minimum_for_timestamp(now).as_u64() + 1,
+        60,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![1; 100], window * 1_000)],
+      )
+      .await;
+    }
+    let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![1, 60],
+    }));
+    let iterator = ConsumerIteratorBuilder::new(
+      &runtime_config_with_prefetch_max_bytes(Some(100)),
+      blob_store,
+      metadata,
+      Arc::new(InMemoryConsumerGroupLeaseStore::new()),
+      Arc::new(InMemoryConsumerGroupMembershipStore::new()),
+      source.clone(),
+      rejecting_broker_metadata_query(),
+      rejecting_broker_blob_range_query(),
+      metrics_scope(),
+      TimeDuration::days(1),
+      DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+      None,
+      TopicPartitionLayout::new(64).unwrap(),
+    )
+    .time_provider(clock.clone())
+    .build()
+    .await
+    .unwrap();
+    let mut driver = iterator.driver.unwrap();
+    let (capacity_tx, capacity_rx) = oneshot::channel();
+    let (suspended_tx, suspended_rx) = oneshot::channel();
+    driver.lifecycle_hooks = Some(Arc::new(ReadSuspensionHooks {
+      capacity: Mutex::new(Some(capacity_tx)),
+      suspended: Mutex::new(Some(suspended_tx)),
+    }));
+    if scenario == "capacity" {
+      let batches = driver
+        .reader
+        .as_mut()
+        .unwrap()
+        .read_available(now, ReadCapacity::new(100))
+        .await
+        .unwrap();
+      assert_eq!(batches.len(), 1);
+      let mut state = driver.shared_state.lock();
+      state.delivery_state.batches.extend(batches);
+      state.delivery_state.buffered_bytes = 100;
+    }
+    driver.spawn_prefetch_task();
+    if scenario == "capacity" {
+      timeout(Duration::from_secs(5), capacity_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    } else {
+      timeout(Duration::from_secs(5), clock.wait_until_sleeping(1))
+        .await
+        .unwrap();
+    }
+    let reads_before_suspension = failing_store.failed_reads.load(Ordering::SeqCst);
+    if scenario == "retry" {
+      assert!(reads_before_suspension > 0);
+    }
+    source.update(CoordinationSnapshot {
+      members: vec!["member-a".to_string(), "member-b".to_string()],
+      virtual_partitions: vec![1, 60],
+    });
+    driver.next_rebalance_at = now;
+    driver.maybe_rebalance(now).await.unwrap();
+    assert_eq!(
+      timeout(Duration::from_secs(5), suspended_rx)
+        .await
+        .unwrap()
+        .unwrap(),
+      vec![60]
+    );
+    timeout(Duration::from_secs(5), clock.wait_until_sleeping(1))
+      .await
+      .unwrap();
+    assert_eq!(
+      failing_store.failed_reads.load(Ordering::SeqCst),
+      reads_before_suspension
+    );
+    {
+      let state = driver.shared_state.lock();
+      assert!(state.active_partitions.contains_key(&60));
+      assert!(state.delivery_state.batches.is_empty());
+      assert_eq!(state.delivery_state.retained_bytes(), 0);
+      assert_eq!(state.diagnostics.prefetch_pending_bytes, 0);
+    }
+    driver.stop_prefetch_task().await;
+  }
+}
+
+#[tokio::test]
+async fn revocation_late_read_then_same_member_reacquisition_preserves_production_order() {
+  let now = datetime!(2026-10-03 19:30:30 UTC);
+  let window_start = datetime!(2026-10-03 19:30:00 UTC).unix_timestamp();
+  let time_provider = Arc::new(ManualTimeProvider::new(now));
+  let blob_store = Arc::new(BlockingBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let lease_store = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![1, 60],
+  }));
+  let ranges = [
+    SeqRange {
+      start: 60_036_750_153,
+      end: 60_036_750_153,
+    },
+    SeqRange {
+      start: 60_036_750_154,
+      end: 60_036_758_653,
+    },
+    SeqRange {
+      start: 60_036_758_654,
+      end: 60_036_773_770,
+    },
+    SeqRange {
+      start: 60_036_773_771,
+      end: 60_036_787_021,
+    },
+    SeqRange {
+      start: 60_036_787_022,
+      end: 60_036_800_344,
+    },
+  ];
+  let snowflake_base =
+    SnowflakeId::minimum_for_timestamp(datetime!(2026-10-03 19:30:00 UTC)).as_u64();
+  for (index, range) in ranges[.. 3].iter().enumerate() {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      window_start,
+      snowflake_base + u64::try_from(index).unwrap() + 1,
+      60,
+      range.clone(),
+      (range.start ..= range.end)
+        .map(|_| new_record(vec![1], window_start * 1_000))
+        .collect(),
+    )
+    .await;
+  }
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime_config(),
+    blob_store.clone(),
+    metadata_store.clone(),
+    lease_store.clone(),
+    Arc::new(InMemoryConsumerGroupMembershipStore::new()),
+    source.clone(),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+    TopicPartitionLayout::new(64).unwrap(),
+  )
+  .time_provider(time_provider.clone())
+  .build()
+  .await
+  .unwrap();
+
+  // Drive coordinator boundaries explicitly, but keep the real asynchronous prefetch worker.
+  // This makes removal and reacquisition occur before a caller can discard stale buffered work.
+  let mut driver = iterator.driver.take().unwrap();
+  let initial_generation = driver.coordinator.generation();
+  let initial_batches = driver
+    .reader
+    .as_mut()
+    .unwrap()
+    .read_available(now, ReadCapacity::new(1_000_000))
+    .await
+    .unwrap();
+  assert_eq!(initial_batches.len(), 3);
+  {
+    let mut state = iterator.shared_state.lock();
+    state.delivery_state.buffered_bytes = initial_batches
+      .iter()
+      .flat_map(|batch| &batch.records)
+      .map(|record| u64::try_from(record.payload.len()).unwrap())
+      .sum();
+    state.delivery_state.batches.extend(initial_batches);
+  }
+  iterator.started = true;
+  let NextResult::Record(last_processed) = iterator.next().await.unwrap() else {
+    panic!("expected the previously processed record");
+  };
+  assert_eq!(last_processed.offset, ranges[0].end);
+  iterator.store_offset(60, last_processed.offset).unwrap();
+
+  let late_snowflake_base = SnowflakeId::minimum_for_timestamp(now).as_u64();
+  for (index, range) in ranges[3 ..].iter().enumerate() {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      window_start,
+      late_snowflake_base + u64::try_from(index).unwrap() + 4,
+      60,
+      range.clone(),
+      (range.start ..= range.end)
+        .map(|_| new_record(vec![1], window_start * 1_000))
+        .collect(),
+    )
+    .await;
+  }
+  blob_store.block_reads.store(true, Ordering::SeqCst);
+  let read_started = blob_store.read_started.notified();
+  tokio::pin!(read_started);
+  read_started.as_mut().enable();
+  driver.spawn_prefetch_task();
+  timeout(Duration::from_secs(5), &mut read_started)
+    .await
+    .unwrap();
+
+  source.update(CoordinationSnapshot {
+    members: vec!["member-a".to_string(), "member-b".to_string()],
+    virtual_partitions: vec![1, 60],
+  });
+  driver.next_rebalance_at = now;
+  driver.maybe_rebalance(now).await.unwrap();
+  let NextResult::Revoked(revoked) = iterator.next().await.unwrap() else {
+    panic!("expected the cooperative revocation");
+  };
+  assert_eq!(revoked.partitions(), vec![60]);
+  assert!(
+    iterator
+      .shared_state
+      .lock()
+      .delivery_state
+      .batches
+      .is_empty()
+  );
+
+  let (seek_tx, seek_rx) = oneshot::channel();
+  driver.seek(
+    60,
+    ConsumerSeekTarget {
+      offset: ranges[0].end - 1,
+      window_start_unix_seconds: window_start,
+      snowflake_id: None,
+    },
+    seek_tx,
+  );
+  assert!(
+    seek_rx
+      .await
+      .unwrap()
+      .unwrap_err()
+      .to_string()
+      .contains("read-fenced")
+  );
+  {
+    let state = iterator.shared_state.lock();
+    let partition = &state.active_partitions[&60];
+    assert_eq!(
+      partition.pending_commit.as_ref().unwrap().offset,
+      ranges[0].end
+    );
+    assert_eq!(partition.delivery_gap_baseline, Some(ranges[0].end));
+    assert_eq!(partition.delivered_source_ranges.len(), 1);
+    assert_eq!(
+      partition.last_stored_source.as_ref().unwrap().offset,
+      ranges[0].end
+    );
+  }
+
+  // The old read finishes while the application callback is still draining, as in production.
+  blob_store.block_reads.store(false, Ordering::SeqCst);
+  blob_store.read_release.notify_waiters();
+  timeout(Duration::from_secs(5), time_provider.wait_until_sleeping(1))
+    .await
+    .unwrap();
+  {
+    let state = iterator.shared_state.lock();
+    assert!(state.delivery_state.batches.is_empty());
+    assert_eq!(state.diagnostics.prefetch_pending_record_count, 0);
+    assert_eq!(state.diagnostics.prefetch_pending_bytes, 0);
+  }
+  driver
+    .heartbeat(now, HeartbeatTrigger::Commit)
+    .await
+    .unwrap();
+  revoked.complete().await;
+  assert!(
+    driver
+      .finish_pending_revocation_if_completed()
+      .await
+      .unwrap()
+  );
+  assert!(
+    !iterator
+      .shared_state
+      .lock()
+      .active_partitions
+      .contains_key(&60)
+  );
+
+  source.update(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![1, 60],
+  });
+  driver.next_rebalance_at = now;
+  driver.maybe_rebalance(now).await.unwrap();
+  timeout(Duration::from_secs(5), async {
+    loop {
+      let recovered = iterator
+        .shared_state
+        .lock()
+        .delivery_state
+        .batches
+        .iter()
+        .any(|batch| batch.virtual_partition_id == 60 && batch.seq_range.start == ranges[1].start);
+      if recovered {
+        break;
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .expect("reacquisition did not recover the dropped lower ranges");
+
+  for expected_offset in ranges[1].start ..= ranges[4].end {
+    let NextResult::Record(record) = iterator.next().await.unwrap() else {
+      panic!("unexpected second revocation");
+    };
+    assert_eq!(record.virtual_partition_id, 60);
+    assert_eq!(
+      record.offset, expected_offset,
+      "stale prefetch overtook recovery"
+    );
+  }
+  assert!(
+    iterator
+      .shared_state
+      .lock()
+      .delivery_state
+      .batches
+      .is_empty(),
+    "duplicate recovery batches"
+  );
+  iterator.store_offset(60, ranges[4].end).unwrap();
+  driver
+    .heartbeat(now, HeartbeatTrigger::Commit)
+    .await
+    .unwrap();
+  let lease = lease_store
+    .list_group_leases("telemetry", "group-a")
+    .await
+    .unwrap()
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == 60)
+    .unwrap();
+  assert!(lease.generation > initial_generation);
+  let committed = lease.committed_cursor.unwrap();
+  assert_eq!(committed.seq_end, ranges[4].end);
+  assert_eq!(
+    committed.source_checkpoint.unwrap().snowflake_id,
+    late_snowflake_base + 5
+  );
+  driver.stop_prefetch_task().await;
 }
 
 #[tokio::test]
