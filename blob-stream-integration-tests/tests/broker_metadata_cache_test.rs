@@ -1,10 +1,12 @@
 use anyhow::{Result, anyhow};
-use bd_time::TimeProvider;
+use bd_server_stats::test::util::stats::Helper;
+use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_consumer::EventualMetadataReadsConfig;
 use blob_stream_consumer::iterator::{ConsumerIterator, NextResult};
 use blob_stream_integration_tests::test_framework::{
   self as framework,
   ClusterHarness,
+  CountingWindowMetadataStore,
   GatedMetadataStore,
   IntegrationResources,
   LifecycleEvent,
@@ -24,9 +26,15 @@ use blob_stream_integration_tests::test_framework::{
   write_recovery_segment,
   write_recovery_segment_for_partitions,
 };
-use blob_stream_metadata_store::MetadataStore;
-use blob_stream_types::ToProtoDuration;
-use std::collections::HashSet;
+use blob_stream_metadata_store::{ConsumerGroupLeaseKey, DynamoCapacityMetrics, MetadataStore};
+use blob_stream_types::{
+  CommittedCursor,
+  CommittedSourceCheckpoint,
+  SnowflakeId,
+  ToProtoDuration,
+  Window,
+};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -37,6 +45,203 @@ fn eventual_metadata_reads(visibility_delay: TimeDuration) -> EventualMetadataRe
     visibility_delay: visibility_delay.into_proto(),
     ..Default::default()
   }
+}
+
+#[tokio::test]
+async fn broker_open_recovery_handoff_bounds_dynamo_work_for_seven_partitions() -> Result<()> {
+  const COMMITTED: u64 = 1_000;
+  const UNREAD: u64 = 100;
+  const PARTITIONS: u32 = 7;
+  let resources = IntegrationResources::create().await?;
+  let stats = Helper::new();
+  let scope = stats.collector().scope("recovery_dynamo");
+  let window_start = Window::for_timestamp(
+    OffsetDateTime::now_utc(),
+    TimeDuration::seconds(WINDOW_SIZE_SECONDS),
+  )
+  .start
+  .unix_timestamp();
+  let now = OffsetDateTime::from_unix_timestamp(window_start + 240)?;
+  let clock = Arc::new(framework::ManualTimeProvider::new(now));
+  let source_floor =
+    SnowflakeId::minimum_for_timestamp(OffsetDateTime::from_unix_timestamp(window_start + 100)?);
+  let metadata_store = Arc::new(CountingWindowMetadataStore::new(
+    resources.metadata_store_with_capacity_metrics(Some(DynamoCapacityMetrics::new(&scope))),
+    window_start,
+  ));
+  let blob_store = resources.blob_store();
+  for sequence in 1 ..= COMMITTED + UNREAD {
+    let payloads = (0 .. PARTITIONS)
+      .map(|partition| format!("{partition}:{sequence}"))
+      .collect::<Vec<_>>();
+    let batches = payloads
+      .iter()
+      .enumerate()
+      .map(|(partition, payload)| Ok((u32::try_from(partition)?, sequence, payload.as_str())))
+      .collect::<Result<Vec<_>>>()?;
+    write_recovery_segment_for_partitions(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      window_start,
+      source_floor.as_u64() + sequence,
+      &batches,
+    )
+    .await?;
+  }
+
+  let leases = resources.consumer_lease_store();
+  let assigned_at = OffsetDateTime::now_utc();
+  for partition in 0 .. PARTITIONS {
+    let key = ConsumerGroupLeaseKey {
+      topic: TOPIC.to_string(),
+      group_id: "integration-group".to_string(),
+      virtual_partition_id: partition,
+    };
+    leases
+      .assign_partition(
+        key.clone(),
+        "departing-member".to_string(),
+        1,
+        assigned_at,
+        TimeDuration::seconds(2),
+      )
+      .await?;
+    leases
+      .commit_cursor(
+        &key,
+        "departing-member",
+        1,
+        assigned_at,
+        CommittedCursor {
+          virtual_partition_id: partition,
+          seq_end: COMMITTED,
+          source_checkpoint: Some(CommittedSourceCheckpoint {
+            window_start_unix_seconds: window_start,
+            snowflake_id: source_floor.as_u64() + COMMITTED,
+          }),
+        },
+      )
+      .await?;
+    leases
+      .release_partition(&key, "departing-member", 1, assigned_at)
+      .await?;
+  }
+
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .partition_count(PARTITIONS)
+    .metadata_store(metadata_store.clone())
+    .consumer_time_provider(clock.clone())
+    .consumer_coordination_time_provider(Arc::new(SystemTimeProvider))
+    .broker_time_provider(clock.clone())
+    .metadata_cache_time_provider(clock)
+    .metadata_cache_timing(TimeDuration::ZERO, TimeDuration::seconds(5))
+    .start()
+    .await?;
+  let fallback_store = Arc::new(CountingWindowMetadataStore::new(
+    resources.metadata_store(),
+    window_start,
+  ));
+  let mut runtime = consumer_runtime_config("replacement-member");
+  runtime
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow!("handoff reader config missing"))?
+    .prefetch_max_bytes = Some(1);
+  let mut consumer = cluster
+    .create_broker_metadata_cache_consumer_with_metadata_store(&runtime, fallback_store.clone())
+    .await?;
+  consumer.start()?;
+  let read_units = || {
+    stats
+      .find_counter("recovery_dynamo:read_request_units_total", &HashMap::new())
+      .map_or(0.0, |counter| counter.value())
+  };
+  let mut deliveries = HashMap::new();
+  let mut initial_read_units = None;
+  timeout(Duration::from_secs(30), async {
+    while deliveries.len() < usize::try_from(u64::from(PARTITIONS) * UNREAD)? {
+      match consumer.next().await? {
+        NextResult::Revoked(revoked) => revoked.complete().await,
+        NextResult::Record(record) => {
+          let payload = String::from_utf8(record.record.payload.to_vec())?;
+          assert_eq!(
+            payload,
+            format!("{}:{}", record.virtual_partition_id, record.offset)
+          );
+          assert!(record.offset > COMMITTED && record.offset <= COMMITTED + UNREAD);
+          *deliveries.entry(payload).or_insert(0_usize) += 1;
+          consumer.store_offset(record.virtual_partition_id, record.offset)?;
+          let initial = *initial_read_units.get_or_insert_with(&read_units);
+          assert!(
+            initial > 0.0,
+            "the initial strong broker scan must consume DynamoDB read units"
+          );
+          assert!(
+            metadata_store.scan_count() <= 2,
+            "capacity refills must not requery the committed prefix"
+          );
+          assert!(
+            read_units() <= initial + 2.0,
+            "only empty suffix work may add capacity after the initial observation"
+          );
+        },
+      }
+    }
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| anyhow!("dense open-window handoff timed out"))??;
+  assert!(deliveries.values().all(|count| *count == 1));
+  let initial =
+    initial_read_units.ok_or_else(|| anyhow!("handoff did not observe initial read units"))?;
+  timeout(Duration::from_secs(5), async {
+    while metadata_store.completed_scan_count() < 2 {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .map_err(|_| {
+    anyhow!(
+      "recovery did not finish its inclusive open suffix scan: scans={}, read_units={}, \
+       initial={initial}",
+      metadata_store.scan_count(),
+      read_units(),
+    )
+  })?;
+  assert_eq!(metadata_store.scan_count(), 2);
+  assert!(read_units() <= initial + 2.0);
+  consumer.commit().await?;
+  let retained = leases.list_group_leases(TOPIC, "integration-group").await?;
+  assert_eq!(retained.len(), usize::try_from(PARTITIONS)?);
+  for lease in retained {
+    assert_eq!(lease.owner_id, "replacement-member");
+    assert_eq!(
+      lease.committed_cursor,
+      Some(CommittedCursor {
+        virtual_partition_id: lease.key.virtual_partition_id,
+        seq_end: COMMITTED + UNREAD,
+        source_checkpoint: Some(CommittedSourceCheckpoint {
+          window_start_unix_seconds: window_start,
+          snowflake_id: source_floor.as_u64() + COMMITTED + UNREAD,
+        }),
+      })
+    );
+  }
+  let floors = metadata_store.scan_floors().await;
+  assert_eq!(floors.len(), 2);
+  assert!(floors[0].is_some_and(|floor| floor <= source_floor));
+  assert!(floors.iter().skip(1).all(|floor| {
+    floor.is_some_and(|floor| floor.as_u64() > source_floor.as_u64() + COMMITTED + UNREAD)
+  }));
+  assert_eq!(
+    fallback_store.scan_count(),
+    0,
+    "recovery must use real broker strong coverage, not direct fallback"
+  );
+  Box::new(consumer).shutdown().await?;
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
 }
 
 #[tokio::test]

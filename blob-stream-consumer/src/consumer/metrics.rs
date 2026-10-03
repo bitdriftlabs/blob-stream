@@ -27,8 +27,8 @@ pub(in crate::consumer) struct ConsumerReaderMetrics {
   mature_metadata_cache_reuses: IntCounter,
   sealed_metadata_prefix_installs: IntCounter,
   metadata_queries_avoided_by_capacity: IntCounter,
-  mature_metadata_cache_entries: ContributionGauge,
-  mature_metadata_cache_retained_bytes: ContributionGauge,
+  metadata_cache_entries: ContributionGauge,
+  metadata_cache_retained_bytes: ContributionGauge,
   pub(in crate::consumer) metadata_fast_scan_without_lower_bound: IntCounter,
   pub(in crate::consumer) metadata_segments_deferred_by_visibility_delay: IntCounter,
   metadata_batches_scanned: IntCounter,
@@ -71,10 +71,8 @@ impl ConsumerReaderMetrics {
       mature_metadata_cache_reuses: scope.counter("mature_metadata_cache_reuses"),
       sealed_metadata_prefix_installs: scope.counter("sealed_metadata_prefix_installs"),
       metadata_queries_avoided_by_capacity: scope.counter("metadata_queries_avoided_by_capacity"),
-      mature_metadata_cache_entries: ContributionGauge::new(
-        scope.gauge("mature_metadata_cache_entries"),
-      ),
-      mature_metadata_cache_retained_bytes: ContributionGauge::new(
+      metadata_cache_entries: ContributionGauge::new(scope.gauge("mature_metadata_cache_entries")),
+      metadata_cache_retained_bytes: ContributionGauge::new(
         scope.gauge("mature_metadata_cache_retained_bytes"),
       ),
       metadata_fast_scan_without_lower_bound: scope
@@ -154,15 +152,15 @@ impl ConsumerReaderMetrics {
     self.broker_metadata_offload_fallbacks.inc();
   }
 
-  pub(in crate::consumer) fn record_mature_metadata_cache_entries(&self, count: usize) {
+  pub(in crate::consumer) fn record_metadata_cache_entries(&self, count: usize) {
     self
-      .mature_metadata_cache_entries
+      .metadata_cache_entries
       .set(i64::try_from(count).unwrap_or(i64::MAX));
   }
 
-  pub(in crate::consumer) fn record_mature_metadata_cache_retained_bytes(&self, bytes: u64) {
+  pub(in crate::consumer) fn record_metadata_cache_retained_bytes(&self, bytes: u64) {
     self
-      .mature_metadata_cache_retained_bytes
+      .metadata_cache_retained_bytes
       .set(i64::try_from(bytes).unwrap_or(i64::MAX));
   }
 

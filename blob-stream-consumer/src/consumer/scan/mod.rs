@@ -123,6 +123,33 @@ pub(in crate::consumer) struct SegmentReadPlan {
 impl SegmentReadPlan {
   /// Create the smallest range containing every selected batch in this segment.
   fn new(metadata: SegmentMetadata, candidates: Vec<BatchReadCandidate>) -> Result<Self> {
+    let byte_range = Self::candidate_range(&metadata, &candidates)?;
+    Ok(Self {
+      metadata,
+      candidates,
+      byte_range,
+    })
+  }
+
+  fn extend_candidates(&mut self, candidates: Vec<BatchReadCandidate>) -> Result<()> {
+    let range = Self::candidate_range(&self.metadata, &candidates)?;
+    self.byte_range.start = self.byte_range.start.min(range.start);
+    self.byte_range.end = self.byte_range.end.max(range.end);
+    for candidate in &candidates {
+      self
+        .metadata
+        .segment_index
+        .entry(candidate.virtual_partition_id)
+        .or_insert_with(|| candidate.batch_metadata.clone());
+    }
+    self.candidates.extend(candidates);
+    Ok(())
+  }
+
+  fn candidate_range(
+    metadata: &SegmentMetadata,
+    candidates: &[BatchReadCandidate],
+  ) -> Result<ByteRange> {
     ensure!(
       !candidates.is_empty(),
       "segment read plan for {} has no batch candidates",
@@ -131,7 +158,7 @@ impl SegmentReadPlan {
 
     let mut start = u64::MAX;
     let mut end = 0;
-    for candidate in &candidates {
+    for candidate in candidates {
       let range = &candidate.batch_metadata.byte_range;
       ensure!(
         !range.is_empty(),
@@ -143,10 +170,6 @@ impl SegmentReadPlan {
       end = end.max(range.end);
     }
 
-    Ok(Self {
-      metadata,
-      candidates,
-      byte_range: ByteRange { start, end },
-    })
+    Ok(ByteRange { start, end })
   }
 }

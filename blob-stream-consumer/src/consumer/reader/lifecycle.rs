@@ -12,6 +12,7 @@ use super::{
   HashSet,
   MetadataStore,
   Mutex,
+  ReaderMetadataCache,
   RecoveryState,
   Result,
   Scope,
@@ -102,8 +103,7 @@ impl ConsumerReaderImpl {
       time_provider,
       fast_frontiers: HashMap::new(),
       recovery_scan_last_partition: None,
-      recovery_metadata_cache: HashMap::new(),
-      sealed_metadata_prefixes: HashMap::new(),
+      metadata_cache: ReaderMetadataCache::default(),
       config,
       blob_store,
       metadata_store,
@@ -193,13 +193,8 @@ impl ConsumerReaderImpl {
         .fast_frontiers
         .retain(|(partition_id, _), _| assigned.contains(partition_id));
     }
-    self
-      .recovery_metadata_cache
-      .retain(|(partition_id, ..), _| assigned.contains(partition_id));
-    self
-      .sealed_metadata_prefixes
-      .retain(|(partition_id, _), _| assigned.contains(partition_id));
-    self.record_mature_metadata_cache_state();
+    self.metadata_cache.retain_partitions(&assigned);
+    self.record_metadata_cache_state();
     // A revoked partition has no reader-local work left after the iterator drains it. Its durable
     // cursor belongs in the consumer-group lease and is hydrated again if this reader reacquires
     // the partition.
@@ -236,7 +231,7 @@ impl ConsumerReaderImpl {
 
   /// Set the in-memory cursor for a virtual partition and reset its fast scan frontier.
   pub fn set_cursor(&mut self, virtual_partition_id: VirtualPartitionId, seq_end: u64) {
-    self.clear_recovery_metadata_cache(virtual_partition_id);
+    self.invalidate_partition_metadata_cache(virtual_partition_id);
     self
       .virtual_partition_states
       .entry(virtual_partition_id)
@@ -250,14 +245,11 @@ impl ConsumerReaderImpl {
       .retain(|(partition_id, _), _| *partition_id != virtual_partition_id);
   }
 
-  fn clear_recovery_metadata_cache(&mut self, virtual_partition_id: VirtualPartitionId) {
+  fn invalidate_partition_metadata_cache(&mut self, virtual_partition_id: VirtualPartitionId) {
     self
-      .recovery_metadata_cache
-      .retain(|(partition_id, ..), _| *partition_id != virtual_partition_id);
-    self
-      .sealed_metadata_prefixes
-      .retain(|(partition_id, _), _| *partition_id != virtual_partition_id);
-    self.record_mature_metadata_cache_state();
+      .metadata_cache
+      .invalidate_partition(virtual_partition_id);
+    self.record_metadata_cache_state();
   }
 
   /// Reposition a partition cursor and recover from the caller-provided metadata source.
@@ -377,13 +369,13 @@ impl ConsumerReaderImpl {
       .virtual_partition_states
       .get(&virtual_partition_id)
       .and_then(VirtualPartitionState::last_scan_handle);
+    self.invalidate_partition_metadata_cache(virtual_partition_id);
     if let Some(state) = self.virtual_partition_states.get_mut(&virtual_partition_id)
       && !matches!(state, VirtualPartitionState::PendingCursor { .. })
     {
       state.advance_cursor(committed_cursor.seq_end);
       return;
     }
-    self.clear_recovery_metadata_cache(virtual_partition_id);
     if source_window_start <= cutover_window_start {
       self.virtual_partition_states.insert(
         virtual_partition_id,

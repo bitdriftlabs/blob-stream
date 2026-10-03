@@ -249,6 +249,7 @@ pub struct CountingWindowMetadataStore {
   inner: Arc<dyn MetadataStore>,
   counted_window_start: i64,
   scan_count: AtomicUsize,
+  completed_scan_count: AtomicUsize,
   scan_floors: Mutex<Vec<Option<SnowflakeId>>>,
 }
 
@@ -259,6 +260,7 @@ impl CountingWindowMetadataStore {
       inner,
       counted_window_start,
       scan_count: AtomicUsize::new(0),
+      completed_scan_count: AtomicUsize::new(0),
       scan_floors: Mutex::new(Vec::new()),
     }
   }
@@ -266,6 +268,11 @@ impl CountingWindowMetadataStore {
   #[must_use]
   pub fn scan_count(&self) -> usize {
     self.scan_count.load(Ordering::Acquire)
+  }
+
+  #[must_use]
+  pub fn completed_scan_count(&self) -> usize {
+    self.completed_scan_count.load(Ordering::Acquire)
   }
 
   pub async fn scan_floors(&self) -> Vec<Option<SnowflakeId>> {
@@ -294,10 +301,14 @@ impl MetadataStore for CountingWindowMetadataStore {
       self.scan_count.fetch_add(1, Ordering::AcqRel);
       self.scan_floors.lock().await.push(min_snowflake);
     }
-    self
+    let result = self
       .inner
       .scan_window_from_snowflake(window, min_snowflake, consistency)
-      .await
+      .await;
+    if window.window_start_unix_seconds == self.counted_window_start && result.is_ok() {
+      self.completed_scan_count.fetch_add(1, Ordering::Release);
+    }
+    result
   }
 }
 
