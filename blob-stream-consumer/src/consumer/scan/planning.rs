@@ -32,34 +32,16 @@ impl ConsumerReaderImpl {
   /// Return cache identities for every partition in an immutable metadata request.
   ///
   /// Mature Recovery windows and a Fast rollover tail's per-partition rows are immutable. The
-  /// key intentionally excludes consistency: runtime changes do not invalidate a completed
-  /// observation or replay it with stronger reads.
+  /// key records the durable Recovery floor; policy changes invalidate reader-local coverage.
   pub(in crate::consumer) fn mature_metadata_cache_keys(
     &self,
     request: &ScanRequest,
     now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Vec<RecoveryMetadataCacheKey> {
-    let (partition_ids, min_snowflake) =
-      if request.recovery_scan && !request.eligibility.fast && !request.eligibility.fresh {
-        let &[partition_id] = request.eligibility.recovering_partitions.as_slice() else {
-          return Vec::new();
-        };
-        (
-          vec![partition_id],
-          request.min_snowflake.map(SnowflakeId::as_u64),
-        )
-      } else if !request.recovery_scan && request.eligibility.fast && !request.eligibility.fresh {
-        // A shared mature tail is cached as one filtered immutable response per partition. A
-        // refill uses it only when every participating partition has an entry, so the combined
-        // result preserves exactly the request's original partition eligibility.
-        (
-          request.fast_partition_bounds.keys().copied().collect(),
-          None,
-        )
-      } else {
-        return Vec::new();
-      };
+    if request.eligibility.fresh {
+      return Vec::new();
+    }
     let window_end_unix_seconds = request
       .window
       .window_start_unix_seconds
@@ -70,15 +52,22 @@ impl ConsumerReaderImpl {
     // Recovery's first-window bound identifies its durable resume point. A Fast-tail frontier
     // only advances as batches are accepted, so its first mature response is a safe superset for
     // later capacity refills and must keep the same cache key as that frontier narrows.
-    partition_ids
-      .into_iter()
-      .map(|partition_id| {
+    request
+      .recovery_partition_bounds
+      .iter()
+      .map(|(&partition_id, &bound)| {
         (
           partition_id,
           request.window.window_start_unix_seconds,
-          min_snowflake,
+          bound.map(SnowflakeId::as_u64),
         )
       })
+      .chain(
+        request
+          .fast_partition_bounds
+          .keys()
+          .map(|&partition_id| (partition_id, request.window.window_start_unix_seconds, None)),
+      )
       .collect()
   }
 

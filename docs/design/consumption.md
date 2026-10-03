@@ -21,8 +21,8 @@ direct metadata scan that exhausts its throttle budget. The live
 `blob_stream_consumer_broker_metadata_direct_fallback` flag defaults to true; disabling it returns
 broker metadata errors instead of retrying those requests directly. Direct-only scans are
 unaffected. Prefetch backs off with a positive, capped full-jitter delay after every failed read;
-failed scans restore cursor and frontier state. Unknown or unspecified broker overload reasons
-retain the direct fallback when the flag is enabled.
+failed scans restore cursor, frontier, and immutable traversal state. Unknown or unspecified broker
+overload reasons retain the direct fallback when the flag is enabled.
 
 Each metadata Query page, whether read by the broker or directly by the consumer, disables SDK
 retries and operation timeouts for that operation. A live, three-second page deadline bounds
@@ -74,7 +74,7 @@ A partition moves through these modes:
    horizon where metadata may still be unpublished or invisible. Fast is an optimization and
    never replaces retained recovery for a resumed partition.
 
-The reader retains complete mature recovery windows and per-partition sealed Fast prefixes. A prefix
+The reader retains complete mature windows and per-partition sealed Recovery and Fast prefixes. A prefix
 `[window lower bound, sealed_before)` is installed only after a complete strong scan whose original
 observation proves the metadata publication deadline has passed; neither an eventual response nor
 elapsed time alone establishes that proof. The broker caps a requested seal using its
@@ -82,12 +82,36 @@ publication-lag and clock-skew budget measured before the storage scan begins, e
 refill's first caller did not request a seal, and returns that original observation. Direct strong
 scans use the same pre-scan proof time. The reader also caps the seal at its pass-start Fast safety
 floor, validates broker proofs against its own horizon, and falls back to direct strong storage on
-an unusable broker response. Later Fast passes process cached batches before asking for the
-inclusive `[sealed_before, window end)` suffix; capacity admission can defer that query altogether.
-Cached prefixes preserve cursor, gap, visibility, and window ordering rules and do not certify an
-open suffix. Assignment changes, seeks, and windows leaving the Fast horizon discard their prefixes.
-The broker's strong cache has a byte budget and idle expiry; the consumer holds prefixes only for
-eligible Fast windows.
+an unusable broker response. Later passes process cached batches before asking for the inclusive
+`[sealed_before, window end)` suffix; capacity admission can defer that query altogether. Shared
+requests require coverage of every participating partition's lower interval and use the least
+advanced valid seal, including mixed Recovery and Fast requests. An uncovered interval forces the
+original query. An unbounded Recovery request becomes bounded only after its complete lower interval
+has been observed. Contiguous strong observations can extend a prefix without changing its earlier
+rows; elapsed time does not extend coverage.
+
+Recovery retains a next-unexamined position in each partition/window's immutable snapshot, validated
+against the accepted cursor and snapshot identity. Partition-projected traversal avoids visiting
+other partitions' copies. Only cursor-proved consumed rows, ordered accepted batches, and the normal
+missing-blob policy advance that position. Partial, deferred, and held batches remain reachable.
+Failed reads restore staged positions without copying retained arrays; gap retries invalidate the
+affected positions. Prefetched responses are admitted once, including their newly installed prefix.
+An open prefix alone cannot complete Recovery: the suffix and all barriers must complete before
+transition to Fast, whose initial coverage floor preserves the validated Recovery seal.
+
+Reader-local metadata retention has a 16 MiB conservative decoded-byte budget and a 512-entry limit.
+Accounting includes partition indexes and traversal overhead, counts shared backing once, and caches
+each allocation's cost rather than walking its rows on every refill. Oldest-window eviction discards
+coverage and its position together; subsequent reads safely requery from the durable checkpoint floor.
+Ownership loss, seeks, hydration, consistency or availability-horizon changes, completed Recovery
+windows, and retention expiry invalidate the applicable state. Recovery prefixes remain available
+until their windows complete even outside the Fast horizon; Fast prefixes follow eligible Fast
+windows. The broker's separate strong cache has its own byte budget and idle expiry.
+
+`ReaderMetadataCache` owns these retained observations, traversal positions, policy invalidation,
+and footprint accounting. The reader supplies checkpoint floors, accepted cursors, availability
+horizons, and lifecycle retention decisions through its interface. Progress checkpoints restore only
+traversal state after a failed pass; validated observations remain available for retry.
 
 A visibility deferral, a sequence discontinuity whose predecessor may still appear, or exhausted
 prefetch capacity blocks cursor progress at the earliest affected batch/window. If concurrent
