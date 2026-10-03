@@ -15,9 +15,37 @@ use super::{
   mpsc,
   oneshot,
   record_reader_diagnostics,
+  update_total_prefetch_bytes,
+  update_worker_prefetch_metrics,
 };
+use crate::iterator::shared::ReadEpoch;
 
 impl ConsumerDriver {
+  pub(in crate::iterator) fn suspend_reader_partitions(
+    &mut self,
+    partitions: Vec<VirtualPartitionId>,
+    read_epoch: ReadEpoch,
+  ) -> Result<()> {
+    if let Some(reader) = &mut self.reader {
+      let revoked = partitions.into_iter().collect();
+      reader.suspend_read_partitions(&revoked);
+      record_reader_diagnostics(reader, &self.shared_state);
+      return Ok(());
+    }
+    self
+      .reader_command_tx
+      .as_ref()
+      .ok_or_else(|| anyhow!("consumer reader is unavailable"))?
+      .send(ConsumerReaderCommand::SuspendReadPartitions {
+        partitions,
+        read_epoch,
+      })
+      .map_err(|_| anyhow!("consumer reader worker stopped"))?;
+    self.reader_command_notify.notify_one();
+    self.prefetch_space_notify.notify_waiters();
+    Ok(())
+  }
+
   pub(in crate::iterator) fn hydrate_cursors(
     &mut self,
     recovered_cursors: HashMap<VirtualPartitionId, RecoveredCursor>,
@@ -81,15 +109,24 @@ impl ConsumerDriver {
     handoff_phase: Option<&'static str>,
     release_delivery_fence: bool,
   ) -> Result<()> {
+    let read_epoch = self.shared_state.lock().read_epoch;
     if let Some(reader) = &mut self.reader {
+      let assignment = {
+        let state = self.shared_state.lock();
+        assignment
+          .into_iter()
+          .filter(|partition_id| {
+            state.assignment_read_allowed(*partition_id, read_epoch, release_delivery_fence)
+          })
+          .collect::<Vec<_>>()
+      };
       reader.set_assigned_virtual_partitions(&assignment, now)?;
       record_reader_diagnostics(reader, &self.shared_state);
-      if release_delivery_fence {
-        self
-          .shared_state
-          .lock()
-          .delivery_state
-          .revocation_in_progress = false;
+      if self
+        .shared_state
+        .lock()
+        .complete_read_assignment(read_epoch, release_delivery_fence)
+      {
         self.delivery_notify.notify_waiters();
       }
       return Ok(());
@@ -104,6 +141,7 @@ impl ConsumerDriver {
         now,
         handoff_phase,
         release_delivery_fence,
+        read_epoch,
       })
       .map_err(|_| anyhow!("consumer reader worker stopped"))?;
     self.reader_command_notify.notify_one();
@@ -118,9 +156,35 @@ impl ConsumerDriver {
     seek_trace: SeekTrace,
     response: oneshot::Sender<Result<()>>,
   ) {
+    if self
+      .shared_state
+      .lock()
+      .read_fenced_partitions
+      .contains_key(&virtual_partition_id)
+    {
+      seek_trace.finish("read_fenced");
+      let _ = response.send(Err(anyhow!(
+        "consumer partition {virtual_partition_id} is read-fenced"
+      )));
+      return;
+    }
     if let Some(reader) = &mut self.reader {
       // Before the iterator starts, the driver owns the reader directly. There is no prefetch
       // worker to enter recovery, so the seek trace finishes at this synchronous application.
+      {
+        let mut state = self.shared_state.lock();
+        if let Err(error) = state.apply_seek(virtual_partition_id, target.offset) {
+          seek_trace.finish("rejected");
+          let _ = response.send(Err(error));
+          return;
+        }
+        update_worker_prefetch_metrics(&self.metrics, &state.delivery_state);
+        update_total_prefetch_bytes(
+          &self.metrics,
+          &state.delivery_state,
+          state.diagnostics.prefetch_pending_bytes,
+        );
+      }
       reader.seek(virtual_partition_id, &target, now);
       record_reader_diagnostics(reader, &self.shared_state);
       seek_trace.finish("reader_inline");

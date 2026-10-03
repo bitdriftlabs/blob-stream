@@ -32,6 +32,7 @@ use crate::consumer::AvailabilityHorizon;
 use crate::iterator::ConsumerSeekTarget;
 use bd_time::TimeProvider;
 use blob_stream_types::offset_datetime_from_unix_millis;
+use log::debug;
 use time::{Duration, OffsetDateTime};
 
 impl ConsumerReaderImpl {
@@ -227,6 +228,30 @@ impl ConsumerReaderImpl {
       );
     }
     Ok(())
+  }
+
+  /// Discard only revoked read state, preserving hydrated incoming and retained partitions.
+  pub(crate) fn suspend_read_partitions(&mut self, revoked: &HashSet<VirtualPartitionId>) {
+    self
+      .virtual_partition_states
+      .retain(|partition_id, _| !revoked.contains(partition_id));
+    self
+      .fast_frontiers
+      .retain(|(partition_id, _), _| !revoked.contains(partition_id));
+    for partition_id in revoked {
+      self.metadata_cache.invalidate_partition(*partition_id);
+    }
+    self.record_metadata_cache_state();
+    if self
+      .recovery_scan_last_partition
+      .is_some_and(|partition_id| revoked.contains(&partition_id))
+    {
+      self.recovery_scan_last_partition = None;
+    }
+    debug!(
+      "consumer reader suspended revoked partitions: topic={}, partitions={revoked:?}",
+      self.config.topic
+    );
   }
 
   /// Set the in-memory cursor for a virtual partition and reset its fast scan frontier.

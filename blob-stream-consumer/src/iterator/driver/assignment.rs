@@ -147,6 +147,12 @@ impl ConsumerDriver {
     {
       let mut shared_state = self.shared_state.lock();
       shared_state.apply_active_assignment(&self.active_assignment);
+      update_worker_prefetch_metrics(&self.metrics, &shared_state.delivery_state);
+      update_total_prefetch_bytes(
+        &self.metrics,
+        &shared_state.delivery_state,
+        shared_state.diagnostics.prefetch_pending_bytes,
+      );
       self.refresh_diagnostics_locked(&mut shared_state);
     }
     if reader_owned_by_driver && let Some(handoff_phase) = handoff_phase {
@@ -191,17 +197,13 @@ impl ConsumerDriver {
 
   pub(in crate::iterator) async fn fence_active_partitions_after_heartbeat_failure(
     &mut self,
-    now: time::OffsetDateTime,
   ) -> Result<()> {
     // Once renewal reaches its deadline, none of the current leases are safe to keep delivering.
     let fenced = self.active_assignment.iter().copied().collect();
-    self.begin_fenced_partition_revocation(fenced, now).await
+    self.begin_fenced_partition_revocation(fenced).await
   }
 
-  pub(in crate::iterator) async fn reconcile_fenced_partitions(
-    &mut self,
-    now: time::OffsetDateTime,
-  ) -> Result<()> {
+  pub(in crate::iterator) async fn reconcile_fenced_partitions(&mut self) -> Result<()> {
     // A failed heartbeat can still reveal lease loss through the coordinator's retained ownership
     // view before the broader heartbeat deadline requires fencing every active partition.
     let owned = self
@@ -210,13 +212,12 @@ impl ConsumerDriver {
       .into_iter()
       .collect::<HashSet<_>>();
     let fenced = self.active_assignment.difference(&owned).copied().collect();
-    self.begin_fenced_partition_revocation(fenced, now).await
+    self.begin_fenced_partition_revocation(fenced).await
   }
 
   pub(in crate::iterator) fn remove_fenced_partitions(
     &mut self,
     fenced_partitions: &[VirtualPartitionId],
-    now: time::OffsetDateTime,
   ) -> Result<()> {
     if fenced_partitions.is_empty() {
       return Ok(());
@@ -227,17 +228,22 @@ impl ConsumerDriver {
     for partition_id in fenced_partitions {
       self.active_assignment.remove(partition_id);
     }
-    {
+    if let Some(assignment) = &mut self.pending_assignment {
+      assignment.retain(|partition_id| !fenced_partitions.contains(partition_id));
+    }
+    let read_epoch = {
       let mut shared_state = self.shared_state.lock();
       shared_state.remove_fenced_partitions(fenced_partitions);
+      update_worker_prefetch_metrics(&self.metrics, &shared_state.delivery_state);
+      update_total_prefetch_bytes(
+        &self.metrics,
+        &shared_state.delivery_state,
+        shared_state.diagnostics.prefetch_pending_bytes,
+      );
       self.refresh_diagnostics_locked(&mut shared_state);
-    }
-    self.set_reader_assignment(
-      self.active_assignment.iter().copied().collect(),
-      now,
-      None,
-      false,
-    )?;
+      shared_state.read_epoch
+    };
+    self.suspend_reader_partitions(fenced_partitions.to_vec(), read_epoch)?;
     info!(
       "consumer heartbeat fenced partitions: topic={}, group_id={}, member_id={}, \
        fenced={fenced_partitions:?}",
@@ -249,7 +255,6 @@ impl ConsumerDriver {
   async fn begin_fenced_partition_revocation(
     &mut self,
     mut fenced: Vec<VirtualPartitionId>,
-    now: time::OffsetDateTime,
   ) -> Result<()> {
     if self.pending_revocation_completion.is_some() {
       return Ok(());
@@ -263,13 +268,14 @@ impl ConsumerDriver {
     let fenced_set = fenced.iter().copied().collect::<HashSet<_>>();
     self.metrics.revocations.inc();
     let (completion_tx, completion_rx) = oneshot::channel();
-    {
+    let read_epoch = {
       let mut shared_state = self.shared_state.lock();
       let pending_bytes = shared_state.diagnostics.prefetch_pending_bytes;
       // Fenced progress no longer describes a local owner. Preserve active state until the
       // callback completes, but do not publish its old durable cursor as current local state.
       shared_state.discard_committed_cursor_diagnostics(&fenced);
-      shared_state.delivery_state.drop_partitions(&fenced_set);
+      let read_epoch = shared_state.fence_reads(&fenced_set);
+      shared_state.delivery_fence_epoch = Some(read_epoch);
       shared_state.delivery_state.pending_revocation =
         Some(NextResult::Revoked(Box::new(RevokedPartitionsImpl {
           revoked: fenced.clone(),
@@ -280,13 +286,14 @@ impl ConsumerDriver {
       update_worker_prefetch_metrics(&self.metrics, &shared_state.delivery_state);
       update_total_prefetch_bytes(&self.metrics, &shared_state.delivery_state, pending_bytes);
       self.refresh_diagnostics_locked(&mut shared_state);
-    }
+      read_epoch
+    };
     let pending_assignment = self
       .active_assignment
       .difference(&fenced_set)
       .copied()
       .collect::<Vec<_>>();
-    self.set_reader_assignment(pending_assignment.clone(), now, None, false)?;
+    self.suspend_reader_partitions(fenced.clone(), read_epoch)?;
     self.prefetch_space_notify.notify_waiters();
     self.pending_assignment = Some(pending_assignment);
     self.pending_revocation_completion = Some(completion_rx);
@@ -518,13 +525,14 @@ impl ConsumerDriver {
     self.metrics.revocations.inc();
     let revoked_set = revoked.iter().copied().collect::<HashSet<_>>();
     let (completion_tx, completion_rx) = oneshot::channel();
-    {
+    let read_epoch = {
       let mut shared_state = self.shared_state.lock();
       let pending_bytes = shared_state.diagnostics.prefetch_pending_bytes;
+      let read_epoch = shared_state.fence_reads(&revoked_set);
+      shared_state.delivery_fence_epoch = Some(read_epoch);
       let delivery_state = &mut shared_state.delivery_state;
       // Cooperative revocation differs from lease fencing: retain active state and its cursor
       // until the application acknowledges the callback, allowing it to commit final work.
-      delivery_state.drop_partitions(&revoked_set);
       delivery_state.pending_revocation =
         Some(NextResult::Revoked(Box::new(RevokedPartitionsImpl {
           revoked: revoked.clone(),
@@ -534,7 +542,9 @@ impl ConsumerDriver {
       delivery_state.revocation_in_progress = true;
       update_worker_prefetch_metrics(&self.metrics, delivery_state);
       update_total_prefetch_bytes(&self.metrics, delivery_state, pending_bytes);
-    }
+      read_epoch
+    };
+    self.suspend_reader_partitions(revoked.clone(), read_epoch)?;
     self.prefetch_space_notify.notify_waiters();
 
     self.pending_assignment = Some(next_assignment);

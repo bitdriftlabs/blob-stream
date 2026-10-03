@@ -15,8 +15,6 @@ use super::{
   info,
   oneshot,
   trace,
-  update_total_prefetch_bytes,
-  update_worker_prefetch_metrics,
 };
 
 impl ConsumerDriver {
@@ -297,30 +295,6 @@ impl ConsumerDriver {
       otel.status_code = field::Empty,
     ));
     self.metrics.seeks.inc();
-    {
-      let mut shared_state = self.shared_state.lock();
-      shared_state
-        .delivery_state
-        .drop_partitions(&HashSet::from([virtual_partition_id]));
-      if let Some(partition_state) = shared_state
-        .active_partitions
-        .get_mut(&virtual_partition_id)
-      {
-        partition_state.pending_commit = None;
-        partition_state.delivered_source_ranges.clear();
-        partition_state.delivery_gap_baseline = Some(target.offset);
-        partition_state.last_delivered_source = None;
-        partition_state.last_stored_source = None;
-      }
-      update_worker_prefetch_metrics(&self.metrics, &shared_state.delivery_state);
-      update_total_prefetch_bytes(
-        &self.metrics,
-        &shared_state.delivery_state,
-        shared_state.diagnostics.prefetch_pending_bytes,
-      );
-    }
-    self.prefetch_space_notify.notify_waiters();
-    self.refresh_diagnostics();
     let requested_offset = target.offset;
     self.seek_reader(
       virtual_partition_id,
