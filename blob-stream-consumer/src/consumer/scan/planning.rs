@@ -696,20 +696,41 @@ impl ConsumerReaderImpl {
     Ok((scan_requests.into_values().collect(), recovery_scan))
   }
 
-  /// Discard frontiers for windows that Fast scans no longer query.
+  /// Discard frontiers outside eligible Fast windows and each partition's unfinished rollover tail.
+  /// Dropping a live tail frontier would widen the next query below its cached mature floor.
   pub(in crate::consumer) fn prune_fast_frontiers(
     &mut self,
     now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<()> {
-    let eligible_window_starts = self
-      .eligible_fast_scan_windows(now, runtime_settings)?
+    let window_size = self.metadata_window_size;
+    let eligible_windows = self.eligible_fast_scan_windows(now, runtime_settings)?;
+    let coverage_tail_window_start = eligible_windows.first().map(|window| {
+      window
+        .window_start_unix_seconds
+        .saturating_sub(window_size.whole_seconds())
+    });
+    let eligible_window_starts = eligible_windows
       .into_iter()
       .map(|window| window.window_start_unix_seconds)
       .collect::<HashSet<_>>();
+    let retention_floor =
+      self.retention_floor_window_start(Window::for_timestamp(now, window_size).start);
     self
       .fast_frontiers
-      .retain(|(_, window_start), _| eligible_window_starts.contains(window_start));
+      .retain(|(partition_id, window_start), _| {
+        eligible_window_starts.contains(window_start)
+          || (Some(*window_start) == coverage_tail_window_start
+            && matches!(
+              self.virtual_partition_states.get(partition_id),
+              Some(VirtualPartitionState::Fast {
+                coverage_floor: Some(coverage_floor),
+                ..
+              }) if Window::for_timestamp((*coverage_floor).max(retention_floor), window_size)
+                .start
+                .unix_timestamp() == *window_start
+            ))
+      });
     Ok(())
   }
 }

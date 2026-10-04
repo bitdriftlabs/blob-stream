@@ -1955,18 +1955,6 @@ impl ConsumerReaderImpl {
       metadata_batches_skipped_by_cursor
     );
 
-    self.commit_recovery_metadata_progress();
-    self.finalize_scan_pass(
-      ScanPassFinalization {
-        scanned_fresh_window_starts,
-        partitions: partition_finalizations,
-        capacity_deferred_fresh_window_starts,
-        next_fast_frontiers,
-      },
-      now,
-      runtime_settings,
-      &mut scan_states,
-    )?;
     if !capacity_exhausted {
       for partition_id in initial_fast_partitions {
         if !blocked_fast_sources
@@ -1985,6 +1973,18 @@ impl ConsumerReaderImpl {
         }
       }
     }
+    self.commit_recovery_metadata_progress();
+    self.finalize_scan_pass(
+      ScanPassFinalization {
+        scanned_fresh_window_starts,
+        partitions: partition_finalizations,
+        capacity_deferred_fresh_window_starts,
+        next_fast_frontiers,
+      },
+      now,
+      runtime_settings,
+      &mut scan_states,
+    )?;
     self.attach_admission_scan_contexts(&mut output);
 
     self.metrics.record_read_available(

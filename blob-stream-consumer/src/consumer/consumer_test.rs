@@ -2256,6 +2256,43 @@ fn fast_coverage_tail_stays_on_the_fast_path_at_window_rollover() {
     reader.virtual_partition_states.get(&7),
     Some(VirtualPartitionState::Fast { .. })
   ));
+
+  let tail_frontier =
+    SnowflakeId(SnowflakeId::minimum_for_timestamp(timestamp(1_199)).as_u64() + 1);
+  reader.fast_frontiers.extend([
+    ((7, 600), tail_frontier),
+    ((7, 900), tail_frontier),
+    ((8, 900), tail_frontier),
+    (
+      (7, 1_200),
+      SnowflakeId::minimum_for_timestamp(timestamp(1_200)),
+    ),
+  ]);
+  reader
+    .prune_fast_frontiers(timestamp(1_215), reader.runtime_settings())
+    .unwrap();
+  assert_eq!(reader.fast_frontiers.get(&(7, 900)), Some(&tail_frontier));
+  assert!(!reader.fast_frontiers.contains_key(&(7, 600)));
+  assert!(!reader.fast_frontiers.contains_key(&(8, 900)));
+  let (requests, recovery_scan) = reader
+    .scan_requests(timestamp(1_215), &[7], reader.runtime_settings())
+    .unwrap();
+  assert!(!recovery_scan);
+  assert_eq!(
+    requests[0].fast_partition_bounds.get(&7),
+    Some(&tail_frontier)
+  );
+
+  reader
+    .virtual_partition_states
+    .get_mut(&7)
+    .unwrap()
+    .set_fast_coverage_floor(timestamp(1_200));
+  reader
+    .prune_fast_frontiers(timestamp(1_215), reader.runtime_settings())
+    .unwrap();
+  assert!(!reader.fast_frontiers.contains_key(&(7, 900)));
+  assert!(reader.fast_frontiers.contains_key(&(7, 1_200)));
 }
 
 #[test]
@@ -2310,6 +2347,13 @@ fn fast_coverage_tail_clamps_a_stale_floor_to_the_retained_window() {
     reader.virtual_partition_states.get(&7),
     Some(VirtualPartitionState::Fast { .. })
   ));
+
+  let tail_frontier = SnowflakeId::minimum_for_timestamp(timestamp(950));
+  reader.fast_frontiers.insert((7, 900), tail_frontier);
+  reader
+    .prune_fast_frontiers(timestamp(1_320), reader.runtime_settings())
+    .unwrap();
+  assert_eq!(reader.fast_frontiers.get(&(7, 900)), Some(&tail_frontier));
 }
 
 #[tokio::test]
@@ -2382,16 +2426,26 @@ async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
   let scope = metrics
     .collector()
     .scope("blob_stream_consumer_uncached_capacity_test");
-  let tail_floor = SnowflakeId::minimum_for_timestamp(timestamp(1_199));
+  let current_window_start = 1_700_000_100;
+  let tail_window_start = current_window_start - 300;
+  let scan_time = timestamp(current_window_start + 15);
+  let coverage_floor = timestamp(current_window_start - 10);
+  let tail_frontier = SnowflakeId::minimum_for_timestamp(timestamp(current_window_start - 2));
+  let tail_floor = SnowflakeId::minimum_for_timestamp(timestamp(current_window_start - 1));
+  assert!(tail_frontier > SnowflakeId::minimum_for_timestamp(coverage_floor));
   for (partition_id, snowflake_id, sequence) in [
     (7, tail_floor.as_u64(), 1),
     (8, tail_floor.as_u64().saturating_add(1 << 25), 1),
+    (7, tail_floor.as_u64().saturating_add(2 << 25), 2),
+    (8, tail_floor.as_u64().saturating_add(3 << 25), 2),
+    (7, tail_floor.as_u64().saturating_add(4 << 25), 3),
+    (8, tail_floor.as_u64().saturating_add(5 << 25), 3),
   ] {
     write_segment(
       blob_store.as_ref(),
       metadata_store_dyn.as_ref(),
       "telemetry",
-      900,
+      tail_window_start,
       snowflake_id,
       partition_id,
       SeqRange {
@@ -2400,7 +2454,7 @@ async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
       },
       vec![new_record(
         vec![u8::try_from(partition_id).unwrap()],
-        900_000,
+        tail_window_start * 1_000,
       )],
       Compression::none(),
     )
@@ -2432,17 +2486,23 @@ async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
       partition_id,
       VirtualPartitionState::Fast {
         cursor: Some(0),
-        coverage_floor: Some(timestamp(1_199)),
+        coverage_floor: Some(coverage_floor),
         gap: None,
         last_scan: None,
       },
     );
+    reader
+      .fast_frontiers
+      .insert((partition_id, tail_window_start), tail_frontier);
   }
 
-  for expected_partition_id in [7, 8] {
+  let expected_deliveries = [(7, 1), (8, 1), (7, 2), (8, 2), (7, 3), (8, 3)];
+  let mut delivered = Vec::new();
+  for (expected_partition_id, expected_sequence) in expected_deliveries {
+    let previous_frontiers = reader.fast_frontiers.clone();
     let outcome = reader
       .read_available_with_capacity_and_settings(
-        timestamp(1_215),
+        scan_time,
         ReadCapacity::new(1),
         reader.runtime_settings(),
       )
@@ -2453,13 +2513,24 @@ async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
       outcome.batches[0].virtual_partition_id,
       expected_partition_id
     );
-    if expected_partition_id == 7 {
+    assert_eq!(
+      outcome.batches[0].seq_range,
+      SeqRange {
+        start: expected_sequence,
+        end: expected_sequence,
+      }
+    );
+    delivered.push((
+      outcome.batches[0].virtual_partition_id,
+      outcome.batches[0].seq_range.start,
+    ));
+    if expected_partition_id == 7 && expected_sequence == 1 {
       assert_eq!(
         metadata_store
           .scans
           .lock()
           .iter()
-          .filter(|(window_start, _)| *window_start == 1_200)
+          .filter(|(window_start, _)| *window_start == current_window_start)
           .count(),
         1,
         "the uncached Tail batch overlaps the later window query"
@@ -2475,12 +2546,308 @@ async fn merged_fast_coverage_tail_is_scanned_once_across_capacity_cycles() {
         .scans
         .lock()
         .iter()
-        .filter(|(window_start, _)| *window_start == 900)
+        .filter(|(window_start, _)| *window_start == tail_window_start)
         .count(),
       1,
       "every capacity refill must reuse the complete merged rollover-tail cache"
     );
+    for scan in reader.partition_scan_states() {
+      let tail_bound = scan
+        .fast_scan_bounds
+        .iter()
+        .find(|bound| bound.window_start_unix_seconds == tail_window_start)
+        .unwrap();
+      assert_eq!(
+        tail_bound.observed_frontier,
+        previous_frontiers
+          .get(&(scan.virtual_partition_id, tail_window_start))
+          .copied()
+      );
+      assert!(tail_bound.partition_lower_bound >= tail_frontier);
+      assert!(
+        reader.metadata_cache.has_mature(
+          &metadata_window_key(scan.virtual_partition_id, tail_window_start)
+            .with_min_snowflake(Some(tail_frontier))
+        )
+      );
+      assert!(
+        !reader.metadata_cache.has_mature(
+          &metadata_window_key(scan.virtual_partition_id, tail_window_start)
+            .with_min_snowflake(None)
+        ),
+        "the fixture must establish bounded coverage, not complete coverage from Snowflake zero"
+      );
+    }
   }
+  assert_eq!(delivered, expected_deliveries);
+
+  let completion = reader
+    .read_available(current_window_start + 15)
+    .await
+    .unwrap();
+  assert_eq!(completion.len(), 0);
+  for partition_id in [7, 8] {
+    assert!(matches!(reader.virtual_partition_states.get(&partition_id),
+      Some(VirtualPartitionState::Fast { cursor: Some(3), coverage_floor: Some(floor), .. })
+        if *floor == timestamp(current_window_start)));
+    assert!(
+      !reader
+        .fast_frontiers
+        .contains_key(&(partition_id, tail_window_start))
+    );
+    assert!(!reader.metadata_cache.has_mature(
+      &metadata_window_key(partition_id, tail_window_start).with_min_snowflake(Some(tail_frontier))
+    ));
+    assert!(
+      reader
+        .metadata_cache
+        .prefix(&metadata_window_key(partition_id, tail_window_start))
+        .is_none()
+    );
+    assert!(
+      !reader
+        .partition_scan_states()
+        .into_iter()
+        .find(|scan| { scan.virtual_partition_id == partition_id })
+        .unwrap()
+        .fast_frontiers
+        .iter()
+        .any(|frontier| frontier.window_start_unix_seconds == tail_window_start)
+    );
+  }
+  for _ in 0 .. 3 {
+    assert_eq!(
+      reader
+        .read_available(current_window_start + 15)
+        .await
+        .unwrap()
+        .len(),
+      0,
+    );
+    assert!(reader.partition_scan_states().iter().all(|scan| {
+      scan
+        .fast_scan_bounds
+        .iter()
+        .all(|bound| bound.window_start_unix_seconds != tail_window_start)
+    }));
+  }
+  assert_eq!(
+    metadata_store
+      .scans
+      .lock()
+      .iter()
+      .filter(|(window_start, _)| { *window_start == tail_window_start })
+      .copied()
+      .collect::<Vec<_>>(),
+    vec![(tail_window_start, Some(tail_frontier))],
+    "completion and later empty polls must not requery the retired window"
+  );
+}
+
+#[tokio::test]
+async fn fast_coverage_tail_retires_completed_partition_without_discarding_unfinished_peer() {
+  let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(RecordingMetadataStore::new());
+  let metadata_store_dyn: Arc<dyn MetadataStore> = metadata_store.clone();
+  let current_window_start = 1_700_000_100;
+  let tail_window_start = current_window_start - 300;
+  let scan_time = timestamp(current_window_start + 15);
+  let completed_frontier = SnowflakeId::minimum_for_timestamp(timestamp(current_window_start - 4));
+  let unfinished_frontier = SnowflakeId::minimum_for_timestamp(timestamp(current_window_start - 2));
+  let tail_floor = SnowflakeId::minimum_for_timestamp(timestamp(current_window_start - 1));
+  for (partition_id, snowflake_id, sequence) in [
+    (7, completed_frontier.as_u64(), 1),
+    (8, tail_floor.as_u64(), 1),
+    (8, tail_floor.as_u64().saturating_add(1 << 25), 2),
+  ] {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store_dyn.as_ref(),
+      "telemetry",
+      tail_window_start,
+      snowflake_id,
+      partition_id,
+      SeqRange {
+        start: sequence,
+        end: sequence,
+      },
+      vec![new_record(
+        vec![u8::try_from(partition_id).unwrap()],
+        tail_window_start * 1_000,
+      )],
+      Compression::none(),
+    )
+    .await;
+  }
+  let segments = metadata_store
+    .scan_window_from_snowflake(
+      &TopicWindowKey {
+        topic: "telemetry".to_string(),
+        window_start_unix_seconds: tail_window_start,
+      },
+      Some(completed_frontier),
+      MetadataReadConsistency::Strong,
+    )
+    .await
+    .unwrap();
+  metadata_store.scans.lock().clear();
+
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7, 8],
+    HashMap::new(),
+    blob_store,
+    metadata_store_dyn,
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    TimeDuration::seconds(15),
+    None,
+  )
+  .unwrap()
+  .metadata_window_size(TimeDuration::seconds(300))
+  .maximum_clock_skew(TimeDuration::ZERO);
+  for (partition_id, cursor, coverage_floor, frontier) in [
+    (7, 1, timestamp(current_window_start), completed_frontier),
+    (
+      8,
+      0,
+      timestamp(current_window_start - 10),
+      unfinished_frontier,
+    ),
+  ] {
+    reader.virtual_partition_states.insert(
+      partition_id,
+      VirtualPartitionState::Fast {
+        cursor: Some(cursor),
+        coverage_floor: Some(coverage_floor),
+        gap: None,
+        last_scan: None,
+      },
+    );
+    reader
+      .fast_frontiers
+      .insert((partition_id, tail_window_start), frontier);
+    reader.metadata_cache.install_mature(
+      metadata_window_key(partition_id, tail_window_start).with_min_snowflake(Some(frontier)),
+      &segments,
+    );
+  }
+  let (requests, recovery_scan) = reader
+    .scan_requests(scan_time, &[7, 8], reader.runtime_settings())
+    .unwrap();
+  assert!(!recovery_scan);
+  let tail_request = requests
+    .iter()
+    .find(|request| request.window.window_start_unix_seconds == tail_window_start)
+    .unwrap();
+  assert_eq!(
+    tail_request
+      .fast_partition_bounds
+      .iter()
+      .map(|(&partition_id, &bound)| { (partition_id, bound) })
+      .collect::<Vec<_>>(),
+    vec![(8, unfinished_frontier)]
+  );
+  assert_eq!(tail_request.min_snowflake, Some(unfinished_frontier));
+
+  let mut delivered = Vec::new();
+  for sequence in [1, 2] {
+    let outcome = reader
+      .read_available_with_capacity_and_settings(
+        scan_time,
+        ReadCapacity::new(1),
+        reader.runtime_settings(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(outcome.batches.len(), 1);
+    assert_eq!(outcome.batches[0].virtual_partition_id, 8);
+    assert_eq!(
+      outcome.batches[0].seq_range,
+      SeqRange {
+        start: sequence,
+        end: sequence
+      }
+    );
+    delivered.push((
+      outcome.batches[0].virtual_partition_id,
+      outcome.batches[0].seq_range.start,
+    ));
+    let scan_states = reader.partition_scan_states();
+    let completed_scan = scan_states
+      .iter()
+      .find(|scan| scan.virtual_partition_id == 7)
+      .unwrap();
+    let unfinished_scan = scan_states
+      .iter()
+      .find(|scan| scan.virtual_partition_id == 8)
+      .unwrap();
+    assert!(
+      completed_scan
+        .fast_scan_bounds
+        .iter()
+        .all(|bound| { bound.window_start_unix_seconds != tail_window_start })
+    );
+    assert!(
+      unfinished_scan
+        .fast_scan_bounds
+        .iter()
+        .any(|bound| { bound.window_start_unix_seconds == tail_window_start })
+    );
+    assert_eq!(
+      reader.virtual_partition_states.get(&7).unwrap().cursor(),
+      Some(1)
+    );
+    assert!(!reader.fast_frontiers.contains_key(&(7, tail_window_start)));
+    assert!(reader.fast_frontiers.contains_key(&(8, tail_window_start)));
+    assert!(!reader.metadata_cache.has_mature(
+      &metadata_window_key(7, tail_window_start).with_min_snowflake(Some(completed_frontier))
+    ));
+    assert!(reader.metadata_cache.has_mature(
+      &metadata_window_key(8, tail_window_start).with_min_snowflake(Some(unfinished_frontier))
+    ));
+  }
+  assert_eq!(delivered, vec![(8, 1), (8, 2)]);
+  assert_eq!(
+    reader
+      .read_available(current_window_start + 15)
+      .await
+      .unwrap()
+      .len(),
+    0,
+  );
+  for (partition_id, frontier) in [(7, completed_frontier), (8, unfinished_frontier)] {
+    assert_eq!(
+      reader
+        .virtual_partition_states
+        .get(&partition_id)
+        .unwrap()
+        .fast_coverage_floor(),
+      Some(timestamp(current_window_start))
+    );
+    assert!(
+      !reader
+        .fast_frontiers
+        .contains_key(&(partition_id, tail_window_start))
+    );
+    assert!(!reader.metadata_cache.has_mature(
+      &metadata_window_key(partition_id, tail_window_start).with_min_snowflake(Some(frontier))
+    ));
+  }
+  assert!(
+    !metadata_store
+      .scans
+      .lock()
+      .iter()
+      .any(|(window_start, _)| *window_start == tail_window_start),
+    "the unfinished partition must reuse its retained tail without involving its completed peer"
+  );
 }
 
 #[tokio::test]

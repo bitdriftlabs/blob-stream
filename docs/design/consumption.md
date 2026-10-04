@@ -117,16 +117,18 @@ remain available until their windows complete even outside the Fast horizon; Fas
 eligible Fast windows. The broker's separate strong cache has its own byte budget and idle expiry.
 
 `ReaderMetadataCache` owns these retained observations, traversal positions, policy invalidation,
-and footprint accounting. Observations are grouped by partition/window, with a complete mature
-lower bound and an optional strong seal describing one shared snapshot. Coverage lookup accepts a
-request only when the retained proof covers its actual floor; Fast requests record their bounded
-floor rather than an unbounded cache identity. Overlapping immutable rows are deduplicated, and
-contiguous prefix and mature coverage can widen the complete range without inventing coverage across
-a gap. The two qualifications retain independent lifetimes within their container. Appending rows
-preserves traversal positions; inserting earlier rows requires recomputing them. Traversal positions
-remain separately checkpointed. The reader supplies checkpoint floors, accepted cursors, availability
-horizons, and lifecycle retention decisions through the cache interface. Progress checkpoints restore
-only traversal state after a failed pass; validated observations remain available for retry.
+and footprint accounting. Observations are grouped by partition/window, with a complete mature lower
+bound and an optional strong seal describing one shared snapshot. Coverage lookup accepts a request
+only when the retained proof covers its actual floor; Fast requests record their bounded floor
+rather than an unbounded cache identity. Overlapping immutable rows are deduplicated, and contiguous
+prefix and mature coverage can widen the complete range without inventing coverage across a gap.
+Fast retains a rollover tail's inclusive frontier until its coverage completes, so later capacity
+refills do not widen their query below the cached mature floor. The two qualifications retain
+independent lifetimes within their container. Appending rows preserves traversal positions;
+inserting earlier rows requires recomputing them. Traversal positions remain separately
+checkpointed. The reader supplies checkpoint floors, accepted cursors, availability horizons, and
+lifecycle retention decisions through the cache interface. Progress checkpoints restore only
+traversal state after a failed pass; validated observations remain available for retry.
 
 Cached partition projections of the same immutable segment are coalesced into one enclosing byte
 range when several owned batches fit in a pass. Broker and direct fallback reads use that same plan;
