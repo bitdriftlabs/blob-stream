@@ -20,8 +20,8 @@ resolver = "2"
 anyhow               = "1.0.104"
 async-trait          = "0.1.92"
 aws-config           = "1.12.0"
-aws-sdk-dynamodb     = "1.129.0"
-aws-sdk-s3           = "1.151.0"
+aws-sdk-dynamodb     = "1.130.0"
+aws-sdk-s3           = "1.152.0"
 aws-types            = "1.6.0"
 axum                 = { version = "0.8.9", features = ["http2", "macros"] }
 bd-backoff           = { git = "https://github.com/bitdriftlabs/shared-core.git" }
@@ -70,8 +70,8 @@ thiserror         = "2.0.21"
 tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }
 tikv-jemallocator = "0.7.0"
 time              = { version = "0.3.55", features = ["formatting", "serde-well-known", "macros", "parsing"] }
-tokio             = { version = "1.53.1", features = ["full"] }
+tokio             = { version = "1.53.2", features = ["full"] }
 tokio-stream      = "0.1.19"
 tracing           = "0.1.44"
-uuid              = { version = "1.26.1", features = ["v4"] }
+uuid              = { version = "1.27.0", features = ["v4"] }
 zstd              = "0.14.0"
