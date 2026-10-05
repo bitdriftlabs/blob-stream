@@ -4,6 +4,7 @@ use super::{
   DEFAULT_MAX_METADATA_PUBLICATION_LAG,
   apply_consumer_startup_overrides,
   consumer_candidate_window_count,
+  consumer_colocation_repair_percent,
   consumer_idle_poll_delay,
   consumer_max_clock_skew,
   consumer_max_idle_poll_delay,
@@ -323,6 +324,27 @@ fn runtime_feature_flags_override_configured_reader_settings() {
       metadata_visibility_delay: Duration::ZERO,
     }
   );
+}
+
+#[test]
+fn colocation_repair_percentage_defaults_disables_and_validates_live_updates() {
+  assert_eq!(consumer_colocation_repair_percent(None), 10);
+  let loader = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
+  let watch = loader.snapshot_watch();
+  for (value, expected) in [
+    (0, 0),
+    (1, 1),
+    (10, 10),
+    (100, 100),
+    (101, 10),
+    (u64::MAX, 10),
+  ] {
+    loader.update(Arc::new(DefaultFeatureFlags::default().with_integer_flag(
+      "blob_stream_consumer_colocation_repair_percent",
+      value,
+    )));
+    assert_eq!(consumer_colocation_repair_percent(Some(&watch)), expected);
+  }
 }
 
 #[test]

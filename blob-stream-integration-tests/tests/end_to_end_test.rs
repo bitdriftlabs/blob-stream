@@ -1,7 +1,5 @@
 use anyhow::{Result, anyhow};
-use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::{Collector, Scope};
-use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use bd_time::{OffsetDateTimeExt, SystemTimeProvider, TimeProvider};
 use blob_stream_blob_store::BlobKey;
 use blob_stream_broker::write::{BrokerLeaseStatus, WriteRequest};
@@ -28,7 +26,9 @@ use blob_stream_consumer::{
 };
 use blob_stream_integration_tests::test_framework::{self as framework, TestConsumerReader};
 use blob_stream_metadata_store::{
+  ConsumerGroupAssignment,
   ConsumerGroupAssignmentOutcome,
+  ConsumerGroupAssignmentPlan,
   ConsumerGroupCommitOutcome,
   ConsumerGroupHeartbeatOutcome,
   ConsumerGroupLeaseKey,
@@ -123,6 +123,7 @@ use framework::{
   stop_aware_revocation_consumer,
   wait_for_group_offsets_committed,
   write_recovery_segment,
+  write_recovery_segment_for_partitions,
 };
 use std::collections::{HashMap, HashSet};
 use std::future::{Future, poll_fn};
@@ -5794,7 +5795,7 @@ async fn prefetch_rebalance_revocation_fences_buffered_record() -> Result<()> {
       .await?,
   );
 
-  let target_partition = 0;
+  let target_partition = PARTITION_COUNT - 1;
   let target_key = (0 .. 1_024)
     .find_map(|key_index| {
       let key = format!("prefetch-fence-key-{key_index}").into_bytes();
@@ -7514,294 +7515,413 @@ async fn dynamic_membership_scale_out_rebalances() -> Result<()> {
   Ok(())
 }
 
-// High-level: verifies a live pod-aware mode change preserves group delivery and durable progress.
 #[tokio::test]
-async fn colocated_assignment_mode_switch_preserves_group_delivery() -> Result<()> {
-  const FLAG: &str = "blob_stream_consumer_colocate_logical_partitions";
-  let flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
-  let mut cluster = ClusterHarness::in_memory(1)
-    .topic_num_writers(2)
+async fn colocated_live_event_departure_moves_only_six_orphans() -> Result<()> {
+  async fn converged_plan(
+    cluster: &ClusterHarness,
+    events: &mut mpsc::UnboundedReceiver<ConsumerTaskEvent>,
+    deliveries: &mut ConsumerDeliveryTraces,
+    member_count: usize,
+  ) -> Result<ConsumerGroupAssignmentPlan> {
+    timeout(Duration::from_secs(10), async {
+      loop {
+        while let Ok(event) = events.try_recv() {
+          handle_consumer_event_with_trace(event, deliveries, &mut 0);
+        }
+        if let Some(plan) = cluster
+          .consumer_membership_store()
+          .get_assignment_plan(TOPIC, "integration-group")
+          .await?
+          && plan.members.len() == member_count
+        {
+          let leases = cluster
+            .consumer_lease_store()
+            .list_group_leases(TOPIC, "integration-group")
+            .await?;
+          if leases.len() == 136
+            && plan.assignments.iter().all(|assignment| {
+              leases.iter().any(|lease| {
+                lease.key.virtual_partition_id == assignment.virtual_partition_id
+                  && lease.owner_id == assignment.member_id
+                  && lease.generation == plan.version
+              })
+            })
+          {
+            return Ok(plan);
+          }
+        }
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .map_err(|_| {
+      anyhow!("live event plan/lease convergence timed out for {member_count} members")
+    })?
+  }
+
+  let resources = IntegrationResources::create().await?;
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .partition_count(64)
+    .topic_num_writers(3)
     .start()
     .await?;
-  let producer = cluster
-    .create_producer(
-      producer_config(),
-      vec![producer_topic_named_with_writers(TOPIC, 2)],
+  let partitions = (0 .. 45)
+    .flat_map(|logical| [logical, logical + 64, logical + 128])
+    .chain([63])
+    .collect::<Vec<_>>();
+  let members = (0 .. 21)
+    .map(|pod| ConsumerGroupMember {
+      member_id: format!("event-worker-{pod:02}"),
+      pod_id: Some(format!("event-pod-{pod:02}")),
+      cluster_id: None,
+    })
+    .collect::<Vec<_>>();
+  let mut assignments = partitions
+    .iter()
+    .map(|partition| {
+      let logical = partition % 64;
+      let pod = if logical < 42 {
+        logical / 2
+      } else if logical == 63 {
+        9
+      } else {
+        (logical - 42) * 3 + partition / 64
+      };
+      ConsumerGroupAssignment {
+        virtual_partition_id: *partition,
+        member_id: format!("event-worker-{pod:02}"),
+      }
+    })
+    .collect::<Vec<_>>();
+  assignments.sort_by_key(|assignment| assignment.virtual_partition_id);
+  let now = SystemTimeProvider.now();
+  let membership = cluster.consumer_membership_store();
+  for member in &members {
+    membership
+      .register_member(
+        TOPIC,
+        "integration-group",
+        &member.member_id,
+        member.pod_id.clone(),
+        None,
+        now,
+        TimeDuration::seconds(60),
+      )
+      .await?;
+  }
+  let initial_plan = ConsumerGroupAssignmentPlan {
+    version: 1,
+    planner_member_id: members[0].member_id.clone(),
+    members: members
+      .iter()
+      .map(|member| member.member_id.clone())
+      .collect(),
+    member_topology: Some(members.clone()),
+    colocate_logical_partitions: true,
+    assignments,
+    published_ts_ms: now.unix_timestamp_ms(),
+  };
+  membership
+    .acquire_or_renew_planner(
+      TOPIC,
+      "integration-group",
+      &members[0].member_id,
+      "fixture-session",
+      now,
+      TimeDuration::seconds(60),
     )
     .await?;
-  let hooks = cluster.lifecycle_hooks();
-  let mut runtime_a = consumer_runtime_config("colocate-a");
-  runtime_a.group.as_mut().unwrap().pod_id = Some("pod-a".into());
-  let mut runtime_b = consumer_runtime_config("colocate-b");
-  runtime_b.group.as_mut().unwrap().pod_id = Some("pod-b".into());
-  let consumer_a = Box::new(
-    cluster
-      .create_consumer_with_feature_flags(&runtime_a, flags.snapshot_watch())
-      .await?,
+  assert!(
+    membership
+      .publish_assignment_plan(
+        TOPIC,
+        "integration-group",
+        &members[0].member_id,
+        "fixture-session",
+        now,
+        initial_plan.clone()
+      )
+      .await?
   );
-  let membership_store = cluster.consumer_membership_store();
-  let planner_plan = membership_store
-    .get_assignment_plan(TOPIC, "integration-group")
-    .await?
-    .ok_or_else(|| anyhow!("first consumer did not publish its initial plan"))?;
-  assert_eq!(planner_plan.planner_member_id, "colocate-a");
-  assert_eq!(planner_plan.members, ["colocate-a"]);
-  let mut planner_started_gate = hooks
+  let window_start = Window::for_timestamp(now, TimeDuration::seconds(WINDOW_SIZE_SECONDS))
+    .start
+    .unix_timestamp();
+  let first_snowflake = SnowflakeId::minimum_for_timestamp(now).as_u64() + 1;
+  let first_payloads = partitions
+    .iter()
+    .map(|partition| format!("before-{partition}"))
+    .collect::<Vec<_>>();
+  let first_records = partitions
+    .iter()
+    .zip(&first_payloads)
+    .map(|(partition, payload)| (*partition, 1, payload.as_str()))
+    .collect::<Vec<_>>();
+  write_recovery_segment_for_partitions(
+    resources.blob_store().as_ref(),
+    resources.metadata_store().as_ref(),
+    window_start,
+    first_snowflake,
+    &first_records,
+  )
+  .await?;
+  let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+  let mut stop_txs = Vec::new();
+  let mut tasks = Vec::new();
+  let mut diagnostics = Vec::new();
+  for member in &members {
+    let mut runtime = consumer_runtime_config(&member.member_id);
+    runtime.group.as_mut().unwrap().pod_id = member.pod_id.clone().map(Into::into);
+    let consumer = Box::new(
+      cluster
+        .create_consumer_with_inventory(&runtime, partitions.clone())
+        .await?,
+    );
+    diagnostics.push(consumer.diagnostics().unwrap().clone());
+    let (stop_tx, stop_rx) = watch::channel(false);
+    stop_txs.push(stop_tx);
+    tasks.push(tokio::spawn(run_consumer_task(
+      consumer,
+      stop_rx,
+      event_tx.clone(),
+    )));
+  }
+  drop(event_tx);
+  let mut deliveries = ConsumerDeliveryTraces::new();
+  assert_eq!(
+    converged_plan(&cluster, &mut event_rx, &mut deliveries, 21).await?,
+    initial_plan
+  );
+  timeout(Duration::from_secs(10), async {
+    while deliveries.len() < partitions.len() {
+      let event = event_rx
+        .recv()
+        .await
+        .ok_or_else(|| anyhow!("group stopped before departure"))?;
+      handle_consumer_event_with_trace(event, &mut deliveries, &mut 0);
+    }
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| anyhow!("live group did not deliver every initial fixture record"))??;
+  wait_for_group_offsets_committed(
+    &cluster,
+    &maximum_delivery_offsets(&deliveries),
+    "before-departure records were not committed",
+  )
+  .await?;
+  let before_leases = cluster
+    .consumer_lease_store()
+    .list_group_leases(TOPIC, "integration-group")
+    .await?;
+  assert!(before_leases.iter().all(|lease| {
+    lease
+      .committed_cursor
+      .as_ref()
+      .is_some_and(|cursor| cursor.seq_end == 1 && cursor.source_checkpoint.is_some())
+  }));
+
+  let mut gate = cluster
+    .lifecycle_hooks()
     .arm_consumer(
       LifecycleEvent::ConsumerBeforeRebalance,
-      "colocate-a",
+      &members[0].member_id,
       None,
       None,
     )
     .await?;
-  let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-  let (stop_tx_a, stop_rx_a) = watch::channel(false);
-  let task_a = tokio::spawn(run_consumer_task(consumer_a, stop_rx_a, event_tx.clone()));
+  timeout(Duration::from_secs(10), gate.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("planner did not reach departure gate"))??;
+  stop_txs.pop().unwrap().send(true)?;
+  tasks
+    .pop()
+    .unwrap()
+    .await
+    .map_err(|error| anyhow!("departing consumer task: {error}"))??;
+  assert_eq!(
+    membership
+      .list_active_members(TOPIC, "integration-group", SystemTimeProvider.now())
+      .await?
+      .len(),
+    20
+  );
+  assert_eq!(
+    membership
+      .get_assignment_plan(TOPIC, "integration-group")
+      .await?,
+    Some(initial_plan.clone())
+  );
+  assert!(
+    membership
+      .release_planner(
+        TOPIC,
+        "integration-group",
+        &members[0].member_id,
+        "fixture-session"
+      )
+      .await?
+  );
+  gate.release()?;
+  let next_plan = converged_plan(&cluster, &mut event_rx, &mut deliveries, 20).await?;
+  assert!(next_plan.version > initial_plan.version);
+  assert!(next_plan.colocate_logical_partitions);
+  assert_eq!(next_plan.assignments.len(), partitions.len());
+  let previous = initial_plan
+    .assignments
+    .iter()
+    .map(|assignment| (assignment.virtual_partition_id, &assignment.member_id))
+    .collect::<HashMap<_, _>>();
+  let changed = next_plan
+    .assignments
+    .iter()
+    .filter(|assignment| previous[&assignment.virtual_partition_id] != &assignment.member_id)
+    .collect::<Vec<_>>();
+  assert_eq!(changed.len(), 6);
+  assert!(
+    changed
+      .iter()
+      .all(|assignment| previous[&assignment.virtual_partition_id] == &members[20].member_id)
+  );
+  let mut loads = next_plan
+    .members
+    .iter()
+    .map(|member| {
+      next_plan
+        .assignments
+        .iter()
+        .filter(|assignment| &assignment.member_id == member)
+        .count()
+    })
+    .collect::<Vec<_>>();
+  loads.sort_unstable();
+  assert_eq!(loads, [vec![6; 4], vec![7; 16]].concat());
+  let mut groups = HashMap::<u32, HashSet<&String>>::new();
+  for assignment in &next_plan.assignments {
+    groups
+      .entry(assignment.virtual_partition_id % 64)
+      .or_default()
+      .insert(&assignment.member_id);
+  }
+  assert_eq!(groups.values().filter(|owners| owners.len() > 1).count(), 5);
+
+  let next_payloads = partitions
+    .iter()
+    .map(|partition| format!("after-{partition}"))
+    .collect::<Vec<_>>();
+  let next_records = partitions
+    .iter()
+    .zip(&next_payloads)
+    .map(|(partition, payload)| (*partition, 2, payload.as_str()))
+    .collect::<Vec<_>>();
+  let next_snowflake = SnowflakeId::minimum_for_timestamp(SystemTimeProvider.now())
+    .as_u64()
+    .max(first_snowflake + 1);
+  write_recovery_segment_for_partitions(
+    resources.blob_store().as_ref(),
+    resources.metadata_store().as_ref(),
+    window_start,
+    next_snowflake,
+    &next_records,
+  )
+  .await?;
+  timeout(Duration::from_secs(10), async {
+    while deliveries.len() < partitions.len() * 2 {
+      let event = event_rx
+        .recv()
+        .await
+        .ok_or_else(|| anyhow!("group stopped after departure"))?;
+      handle_consumer_event_with_trace(event, &mut deliveries, &mut 0);
+    }
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| anyhow!("live group did not deliver every post-departure record"))??;
+  wait_for_group_offsets_committed(
+    &cluster,
+    &maximum_delivery_offsets(&deliveries),
+    "post-departure records were not committed",
+  )
+  .await?;
+  let mut stability_gate = cluster
+    .lifecycle_hooks()
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      &next_plan.planner_member_id,
+      None,
+      None,
+    )
+    .await?;
+  timeout(Duration::from_secs(10), stability_gate.wait_until_reached())
+    .await
+    .map_err(|_| anyhow!("planner did not reach stability gate"))??;
+  stability_gate.release()?;
+  let mut next_cycle_gate = cluster
+    .lifecycle_hooks()
+    .arm_consumer(
+      LifecycleEvent::ConsumerBeforeRebalance,
+      &next_plan.planner_member_id,
+      None,
+      None,
+    )
+    .await?;
   timeout(
     Duration::from_secs(10),
-    planner_started_gate.wait_until_reached(),
+    next_cycle_gate.wait_until_reached(),
   )
   .await
-  .map_err(|_| anyhow!("planner did not start before the second consumer joined"))??;
-  planner_started_gate.release()?;
-
-  let consumer_b = Box::new(cluster.create_consumer(&runtime_b).await?);
-  let follower_diagnostics = consumer_b.diagnostics().unwrap().clone();
-  let (stop_tx_b, stop_rx_b) = watch::channel(false);
-  let task_b = tokio::spawn(run_consumer_task(consumer_b, stop_rx_b, event_tx));
-  let mut deliveries = ConsumerDeliveryTraces::new();
-  let mut revocations = 0;
-  let lease_store = cluster.consumer_lease_store();
-
-  let initial_plan = timeout(Duration::from_secs(10), async {
-    loop {
-      while let Ok(event) = event_rx.try_recv() {
-        handle_consumer_event_with_trace(event, &mut deliveries, &mut revocations);
-      }
-      if let Some(plan) = membership_store
-        .get_assignment_plan(TOPIC, "integration-group")
-        .await?
-        && plan.members.len() == 2
-        && plan.member_topology.is_some()
-      {
-        let leases = lease_store
-          .list_group_leases(TOPIC, "integration-group")
-          .await?;
-        if leases.len() == (PARTITION_COUNT * 2) as usize
-          && plan.assignments.iter().all(|assignment| {
-            leases.iter().any(|lease| {
-              lease.key.virtual_partition_id == assignment.virtual_partition_id
-                && lease.owner_id == assignment.member_id
-            })
-          })
-        {
-          return Ok::<_, anyhow::Error>(plan);
-        }
-      }
-      tokio::task::yield_now().await;
-    }
-  })
-  .await
-  .map_err(|_| anyhow!("legacy two-member assignment did not converge"))??;
-  assert_eq!(initial_plan.planner_member_id, "colocate-a");
-  assert!(!initial_plan.colocate_logical_partitions);
-  let previous_owners = initial_plan
-    .assignments
-    .iter()
-    .map(|assignment| (assignment.virtual_partition_id, &assignment.member_id))
-    .collect::<HashMap<_, _>>();
-  assert!(
-    (0 .. PARTITION_COUNT).any(|logical_id| previous_owners.get(&logical_id)
-      != previous_owners.get(&(logical_id + PARTITION_COUNT)))
+  .map_err(|_| anyhow!("stable rebalance did not finish"))??;
+  assert_eq!(
+    converged_plan(&cluster, &mut event_rx, &mut deliveries, 20).await?,
+    next_plan
   );
-
-  let keys = (0 .. PARTITION_COUNT)
-    .map(|logical_id| {
-      (0 .. 4_096)
-        .map(|index| format!("colocate-key-{logical_id}-{index}").into_bytes())
-        .find(|key| logical_partition_for_key(key, PARTITION_COUNT) == logical_id)
-        .ok_or_else(|| anyhow!("no key found for logical partition {logical_id}"))
-    })
-    .collect::<Result<Vec<_>>>()?;
-  for (logical_id, key) in keys.iter().enumerate() {
-    produce_message(&producer, key.clone(), &format!("before-{logical_id}")).await?;
+  next_cycle_gate.release()?;
+  for stop_tx in stop_txs {
+    stop_tx.send(true)?;
   }
-  timeout(Duration::from_secs(10), async {
-    while (0 .. PARTITION_COUNT)
-      .any(|logical_id| !deliveries.contains_key(&format!("before-{logical_id}")))
-    {
-      let event = event_rx
-        .recv()
-        .await
-        .ok_or_else(|| anyhow!("group consumers stopped before the first phase"))?;
-      handle_consumer_event_with_trace(event, &mut deliveries, &mut revocations);
-    }
-    Ok::<_, anyhow::Error>(())
-  })
-  .await
-  .map_err(|_| anyhow!("group did not deliver before switching modes"))??;
-  wait_for_group_offsets_committed(
-    &cluster,
-    &maximum_delivery_offsets(&deliveries),
-    "pre-switch deliveries were not committed",
-  )
-  .await?;
-  let revocations_before_switch = revocations;
-
-  let mut enable_gate = hooks
-    .arm_consumer(
-      LifecycleEvent::ConsumerBeforeRebalance,
-      "colocate-a",
-      None,
-      None,
-    )
+  for task in tasks {
+    task
+      .await
+      .map_err(|error| anyhow!("surviving consumer task: {error}"))??;
+  }
+  while let Ok(event) = event_rx.try_recv() {
+    handle_consumer_event_with_trace(event, &mut deliveries, &mut 0);
+  }
+  assert_eq!(
+    delivery_counts(&deliveries),
+    first_payloads
+      .into_iter()
+      .chain(next_payloads)
+      .map(|payload| (payload, 1))
+      .collect()
+  );
+  assert!(diagnostics[.. 20].iter().all(|diagnostic| {
+    diagnostic
+      .state_snapshot()
+      .assignment_plan
+      .as_ref()
+      .is_some_and(|plan| plan.version == next_plan.version)
+  }));
+  let final_leases = cluster
+    .consumer_lease_store()
+    .list_group_leases(TOPIC, "integration-group")
     .await?;
-  timeout(Duration::from_secs(10), enable_gate.wait_until_reached())
-    .await
-    .map_err(|_| anyhow!("planner did not reach the enable-mode rebalance"))??;
-  flags.update(Arc::new(
-    DefaultFeatureFlags::default().with_bool_flag(FLAG, true),
-  ));
-  enable_gate.release()?;
-
-  let enabled_plan = timeout(Duration::from_secs(10), async {
-    loop {
-      while let Ok(event) = event_rx.try_recv() {
-        handle_consumer_event_with_trace(event, &mut deliveries, &mut revocations);
-      }
-      if let Some(plan) = membership_store
-        .get_assignment_plan(TOPIC, "integration-group")
-        .await?
-        && plan.version > initial_plan.version
-        && plan.colocate_logical_partitions
-      {
-        let leases = lease_store
-          .list_group_leases(TOPIC, "integration-group")
-          .await?;
-        if leases.len() == (PARTITION_COUNT * 2) as usize
-          && plan.assignments.iter().all(|assignment| {
-            leases.iter().any(|lease| {
-              lease.key.virtual_partition_id == assignment.virtual_partition_id
-                && lease.owner_id == assignment.member_id
-                && lease.generation == plan.version
-            })
-          })
-          && follower_diagnostics
-            .state_snapshot()
-            .assignment_plan
-            .as_ref()
-            .is_some_and(|snapshot| {
-              snapshot.version == plan.version && snapshot.colocate_logical_partitions
-            })
-        {
-          return Ok::<_, anyhow::Error>(plan);
-        }
-      }
-      tokio::task::yield_now().await;
-    }
-  })
-  .await
-  .map_err(|_| anyhow!("co-located plan and leases did not converge across members"))??;
-  assert!(revocations > revocations_before_switch);
-  let owners = enabled_plan
-    .assignments
-    .iter()
-    .map(|assignment| (assignment.virtual_partition_id, &assignment.member_id))
-    .collect::<HashMap<_, _>>();
-  for logical_id in 0 .. PARTITION_COUNT {
-    assert_eq!(
-      owners.get(&logical_id),
-      owners.get(&(logical_id + PARTITION_COUNT))
+  for lease in &final_leases {
+    let cursor = lease.committed_cursor.as_ref().unwrap();
+    assert_eq!(cursor.seq_end, 2);
+    assert!(cursor.source_checkpoint.is_some());
+    assert_ne!(
+      cursor.source_checkpoint,
+      before_leases
+        .iter()
+        .find(|before| before.key.virtual_partition_id == lease.key.virtual_partition_id)
+        .unwrap()
+        .committed_cursor
+        .as_ref()
+        .unwrap()
+        .source_checkpoint
     );
+    assert_eq!(lease.generation, next_plan.version);
   }
-
-  for (logical_id, key) in keys.iter().enumerate() {
-    produce_message(&producer, key.clone(), &format!("after-{logical_id}")).await?;
-  }
-  timeout(Duration::from_secs(10), async {
-    while deliveries.len() < (PARTITION_COUNT * 2) as usize {
-      let event = event_rx
-        .recv()
-        .await
-        .ok_or_else(|| anyhow!("group consumers stopped after switching modes"))?;
-      handle_consumer_event_with_trace(event, &mut deliveries, &mut revocations);
-    }
-    Ok::<_, anyhow::Error>(())
-  })
-  .await
-  .map_err(|_| anyhow!("group did not deliver after switching modes"))??;
-  assert!(
-    delivery_counts(&deliveries)
-      .values()
-      .all(|count| *count >= 1)
-  );
-  wait_for_group_offsets_committed(
-    &cluster,
-    &maximum_delivery_offsets(&deliveries),
-    "post-switch deliveries were not committed",
-  )
-  .await?;
-
-  let mut disable_gate = hooks
-    .arm_consumer(
-      LifecycleEvent::ConsumerBeforeRebalance,
-      "colocate-a",
-      None,
-      None,
-    )
-    .await?;
-  timeout(Duration::from_secs(10), disable_gate.wait_until_reached())
-    .await
-    .map_err(|_| anyhow!("planner did not reach the disable-mode rebalance"))??;
-  flags.update(Arc::new(DefaultFeatureFlags::default()));
-  disable_gate.release()?;
-  timeout(Duration::from_secs(10), async {
-    loop {
-      while let Ok(event) = event_rx.try_recv() {
-        handle_consumer_event_with_trace(event, &mut deliveries, &mut revocations);
-      }
-      if let Some(plan) = membership_store
-        .get_assignment_plan(TOPIC, "integration-group")
-        .await?
-        && plan.version > enabled_plan.version
-        && !plan.colocate_logical_partitions
-        && follower_diagnostics
-          .state_snapshot()
-          .assignment_plan
-          .as_ref()
-          .is_some_and(|snapshot| {
-            snapshot.version == plan.version && !snapshot.colocate_logical_partitions
-          })
-      {
-        let leases = lease_store
-          .list_group_leases(TOPIC, "integration-group")
-          .await?;
-        if leases.len() == (PARTITION_COUNT * 2) as usize
-          && plan.assignments.iter().all(|assignment| {
-            leases.iter().any(|lease| {
-              lease.key.virtual_partition_id == assignment.virtual_partition_id
-                && lease.owner_id == assignment.member_id
-                && lease.generation == plan.version
-            })
-          })
-        {
-          return Ok::<_, anyhow::Error>(());
-        }
-      }
-      tokio::task::yield_now().await;
-    }
-  })
-  .await
-  .map_err(|_| anyhow!("mixed-flag follower did not accept rollback"))??;
-
-  let _ = stop_tx_a.send(true);
-  let _ = stop_tx_b.send(true);
-  task_a
-    .await
-    .map_err(|error| anyhow!("planner consumer stopped: {error}"))??;
-  task_b
-    .await
-    .map_err(|error| anyhow!("follower consumer stopped: {error}"))??;
   cluster.shutdown().await;
   Ok(())
 }
@@ -7912,7 +8032,7 @@ async fn consumer_group_balances_partitions_across_configured_pods() -> Result<(
     .get_assignment_plan(TOPIC, "integration-group")
     .await?
     .ok_or_else(|| anyhow!("pod-aware consumer group did not persist an assignment plan"))?;
-  assert!(!plan.colocate_logical_partitions);
+  assert!(plan.colocate_logical_partitions);
   assert_eq!(
     plan.member_topology,
     Some(

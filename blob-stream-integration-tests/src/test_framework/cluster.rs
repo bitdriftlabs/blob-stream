@@ -73,7 +73,7 @@ use blob_stream_producer::{
   ProducerTopicConfig,
 };
 use blob_stream_proto::protos::blobstream::v1::config::{BrokerConfig, RuntimeConfig, TopicConfig};
-use blob_stream_types::{ToProtoDuration, virtual_partition_count};
+use blob_stream_types::{ToProtoDuration, VirtualPartitionId, virtual_partition_count};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -733,7 +733,7 @@ impl ClusterHarness {
       .await
   }
 
-  /// Build a consumer with watched assignment flags for live group tests.
+  /// Build a consumer with watched reader flags for live group tests.
   pub async fn create_consumer_with_feature_flags(
     &self,
     runtime: &ConsumerRuntimeConfig,
@@ -744,6 +744,7 @@ impl ClusterHarness {
         runtime,
         Arc::new(self.producer_discovery()),
         Some(feature_flags),
+        None,
       )
       .await
   }
@@ -755,7 +756,23 @@ impl ClusterHarness {
     discovery: Arc<dyn BrokerDiscovery>,
   ) -> Result<ConsumerIteratorImpl> {
     self
-      .create_consumer_with_discovery_and_feature_flags(runtime, discovery, None)
+      .create_consumer_with_discovery_and_feature_flags(runtime, discovery, None, None)
+      .await
+  }
+
+  /// Supply a complete synthetic inventory while retaining normal membership coordination.
+  pub async fn create_consumer_with_inventory(
+    &self,
+    runtime: &ConsumerRuntimeConfig,
+    partitions: Vec<VirtualPartitionId>,
+  ) -> Result<ConsumerIteratorImpl> {
+    self
+      .create_consumer_with_discovery_and_feature_flags(
+        runtime,
+        Arc::new(self.producer_discovery()),
+        None,
+        Some(partitions),
+      )
       .await
   }
 
@@ -764,6 +781,7 @@ impl ClusterHarness {
     runtime: &ConsumerRuntimeConfig,
     discovery: Arc<dyn BrokerDiscovery>,
     feature_flags: Option<FeatureFlagsWatch>,
+    partitions: Option<Vec<VirtualPartitionId>>,
   ) -> Result<ConsumerIteratorImpl> {
     let group = runtime
       .group
@@ -775,7 +793,7 @@ impl ClusterHarness {
         group.topic.to_string(),
         group.group_id.to_string(),
         group.member_id.to_string(),
-        (0 .. partition_total).collect(),
+        partitions.unwrap_or_else(|| (0 .. partition_total).collect()),
         Arc::clone(&self.consumer_membership_store),
       )
       .time_provider(Arc::clone(&self.consumer_coordination_time_provider)),

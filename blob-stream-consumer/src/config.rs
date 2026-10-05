@@ -42,6 +42,32 @@ const MAX_IDLE_POLL_DELAY_FEATURE_FLAG: &str = "blob_stream_consumer_max_idle_po
 const LEASE_DURATION_FEATURE_FLAG: &str = "blob_stream_consumer_lease_duration_ms";
 const HEARTBEAT_INTERVAL_FEATURE_FLAG: &str = "blob_stream_consumer_heartbeat_interval_ms";
 const REBALANCE_INTERVAL_FEATURE_FLAG: &str = "blob_stream_consumer_rebalance_interval_ms";
+const COLOCATION_REPAIR_PERCENT_FEATURE_FLAG: &str =
+  "blob_stream_consumer_colocation_repair_percent";
+const DEFAULT_COLOCATION_REPAIR_PERCENT: u8 = 10;
+
+/// Sample the optional movement percentage for one membership transition. This is not a policy
+/// toggle: zero keeps sticky placement and mandatory co-location decisions, disabling only repair.
+/// Invalid percentages fall back to the bounded default instead of accidentally allowing unlimited
+/// movement. The coordinator takes one immutable snapshot, so a live update cannot change a plan
+/// partway through its pod and worker passes.
+pub fn consumer_colocation_repair_percent(feature_flags: Option<&dyn FeatureFlags>) -> u8 {
+  let default = u64::from(DEFAULT_COLOCATION_REPAIR_PERCENT);
+  let percent = feature_flags.map_or(default, |flags| {
+    flags.get_integer(COLOCATION_REPAIR_PERCENT_FEATURE_FLAG, default)
+  });
+  match u8::try_from(percent) {
+    Ok(percent) if percent <= 100 => percent,
+    Ok(_) | Err(_) => {
+      warn_every!(
+        15.seconds(),
+        "consumer feature flag {COLOCATION_REPAIR_PERCENT_FEATURE_FLAG}={percent} exceeds 100; \
+         using default={DEFAULT_COLOCATION_REPAIR_PERCENT}"
+      );
+      DEFAULT_COLOCATION_REPAIR_PERCENT
+    },
+  }
+}
 
 //
 // ConsumerReadConfig
