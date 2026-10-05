@@ -1153,8 +1153,9 @@ async fn write_multi_partition_segment(
   snowflake_id: u64,
   compression: Compression,
   batches: Vec<(VirtualPartitionId, SeqRange, Vec<Record>)>,
-) -> u64 {
+) -> (u64, Vec<Bytes>) {
   let mut payload = Vec::new();
+  let mut batch_payloads = Vec::new();
   let mut segment_index = HashMap::new();
 
   for (virtual_partition_id, seq_range, records) in batches {
@@ -1176,6 +1177,7 @@ async fn write_multi_partition_segment(
     let start = u64::try_from(payload.len()).unwrap();
     payload.extend_from_slice(&encoded);
     let end = u64::try_from(payload.len()).unwrap();
+    batch_payloads.push(Bytes::from(encoded));
 
     assert!(
       segment_index
@@ -1223,7 +1225,7 @@ async fn write_multi_partition_segment(
     .await
     .unwrap();
 
-  payload_len
+  (payload_len, batch_payloads)
 }
 
 async fn write_shared_blob_segments(
@@ -7202,7 +7204,7 @@ fn recovery_planning_rotates_between_partitions() {
 async fn coalesces_owned_ranges_from_one_segment() {
   let blob_store = Arc::new(RecordingRangeBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
-  let payload_len = write_multi_partition_segment(
+  let (payload_len, _) = write_multi_partition_segment(
     blob_store.as_ref(),
     metadata_store.as_ref(),
     "telemetry",
@@ -7266,6 +7268,170 @@ async fn coalesces_owned_ranges_from_one_segment() {
       .collect::<Vec<_>>(),
     vec![&[7], &[17]]
   );
+  assert_eq!(
+    blob_store.ranges(),
+    vec![ByteRange {
+      start: 0,
+      end: payload_len,
+    }]
+  );
+}
+
+#[tokio::test]
+async fn broker_blob_cache_reads_only_owned_ranges_from_one_segment() {
+  let metrics = Helper::new();
+  let metrics_scope = metrics
+    .collector()
+    .scope("blob_stream_consumer_sparse_broker_blob_test");
+  let blob_store = Arc::new(RecordingRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let (payload_len, payloads) = write_multi_partition_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    Compression::none(),
+    vec![
+      (
+        7,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![7], 1_001)],
+      ),
+      (
+        8,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![8], 1_002)],
+      ),
+      (
+        9,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![9], 1_003)],
+      ),
+    ],
+  )
+  .await;
+  let first_len = u64::try_from(payloads[0].len()).unwrap();
+  let last_start = payload_len - u64::try_from(payloads[2].len()).unwrap();
+  let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_success(vec![
+    payloads[0].clone(),
+    payloads[2].clone(),
+  ])));
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7, 9],
+    HashMap::new(),
+    blob_store.clone(),
+    metadata_store,
+    rejecting_broker_metadata_query(),
+    query.clone(),
+    &metrics_scope,
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )
+  .unwrap();
+
+  let batches = reader.read_available(950).await.unwrap();
+
+  assert_eq!(
+    batches
+      .iter()
+      .map(|batch| batch.virtual_partition_id)
+      .collect::<Vec<_>>(),
+    vec![7, 9]
+  );
+  assert_eq!(blob_store.ranges(), Vec::<ByteRange>::new());
+  assert_eq!(query.requests().len(), 1);
+  assert_eq!(
+    query.requests()[0].ranges,
+    vec![
+      BlobRangeRequest {
+        start: 0,
+        end: first_len,
+        ..Default::default()
+      },
+      BlobRangeRequest {
+        start: last_start,
+        end: payload_len,
+        ..Default::default()
+      },
+    ]
+  );
+  metrics.assert_counter_eq(
+    first_len + payload_len - last_start,
+    "blob_stream_consumer_sparse_broker_blob_test:reader:broker_blob_range_bytes",
+    &labels!(),
+  );
+}
+
+#[tokio::test]
+async fn malformed_sparse_broker_blob_response_retries_one_enclosing_direct_range() {
+  let blob_store = Arc::new(RecordingRangeBlobStore::new());
+  let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+  let (payload_len, payloads) = write_multi_partition_segment(
+    blob_store.as_ref(),
+    metadata_store.as_ref(),
+    "telemetry",
+    900,
+    1,
+    Compression::none(),
+    vec![
+      (
+        7,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![7], 1_001)],
+      ),
+      (
+        8,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![8], 1_002)],
+      ),
+      (
+        9,
+        SeqRange { start: 1, end: 1 },
+        vec![new_record(vec![9], 1_003)],
+      ),
+    ],
+  )
+  .await;
+  let query = Arc::new(FixedBrokerBlobRangeQuery::new(broker_blob_success(vec![
+    payloads[0].clone(),
+  ])));
+  let mut reader = ConsumerReaderImpl::new(
+    Arc::new(SystemTimeProvider),
+    ConsumerReadConfig {
+      topic: "telemetry".to_string().into(),
+      ..Default::default()
+    },
+    vec![7, 9],
+    HashMap::new(),
+    blob_store.clone(),
+    metadata_store,
+    rejecting_broker_metadata_query(),
+    query.clone(),
+    &metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+  )
+  .unwrap();
+
+  let batches = reader.read_available(950).await.unwrap();
+
+  assert_eq!(
+    batches
+      .iter()
+      .map(|batch| batch.virtual_partition_id)
+      .collect::<Vec<_>>(),
+    vec![7, 9]
+  );
+  assert_eq!(query.requests().len(), 1);
+  assert_eq!(query.requests()[0].ranges.len(), 2);
   assert_eq!(
     blob_store.ranges(),
     vec![ByteRange {
@@ -8074,7 +8240,7 @@ fn recovery_planning_batches_active_cutover_partitions() {
 async fn capacity_limited_segment_read_excludes_deferred_batches() {
   let blob_store = Arc::new(RecordingRangeBlobStore::new());
   let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
-  let payload_len = write_multi_partition_segment(
+  let (payload_len, _) = write_multi_partition_segment(
     blob_store.as_ref(),
     metadata_store.as_ref(),
     "telemetry",

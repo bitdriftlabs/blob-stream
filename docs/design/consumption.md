@@ -130,9 +130,12 @@ checkpointed. The reader supplies checkpoint floors, accepted cursors, availabil
 lifecycle retention decisions through the cache interface. Progress checkpoints restore only
 traversal state after a failed pass; validated observations remain available for retry.
 
-Cached partition projections of the same immutable segment are coalesced into one enclosing byte
-range when several owned batches fit in a pass. Broker and direct fallback reads use that same plan;
-partition-local cache ownership does not multiply blob-range requests for a shared segment.
+Cached partition projections of the same immutable segment share a read plan when several owned
+batches fit in a pass. The broker receives exact ranges for each selected batch in one request per
+blob key and slices them from its full-blob cache without returning unowned gaps. Direct fallback
+reads use one enclosing byte range per segment, accepting gap overfetch to avoid additional
+object-store requests. Partition-local cache ownership does not multiply blob-range requests for a
+shared segment.
 
 A visibility deferral, a sequence discontinuity whose predecessor may still appear, or exhausted
 prefetch capacity blocks cursor progress at the earliest affected batch/window. If concurrent

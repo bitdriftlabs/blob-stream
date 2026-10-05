@@ -611,24 +611,25 @@ impl ConsumerReaderImpl {
       blob_key: blob_key.clone().into(),
       ranges: plans
         .iter()
-        .map(|plan| BlobRangeRequest {
-          start: plan.byte_range.start,
-          end: plan.byte_range.end,
+        .flat_map(|plan| &plan.candidates)
+        .map(|candidate| BlobRangeRequest {
+          start: candidate.batch_metadata.byte_range.start,
+          end: candidate.batch_metadata.byte_range.end,
           ..Default::default()
         })
         .collect(),
       ..Default::default()
     };
+    let expected_ranges = request
+      .ranges
+      .iter()
+      .map(|range| (range.start, range.end))
+      .collect::<Vec<_>>();
     let started_at = Instant::now();
     self.metrics.record_broker_blob_range_request();
     let response = query.read_blob_ranges(request).await;
     match response.and_then(|response| {
-      decode_blob_range_response_for_ranges(
-        plans
-          .iter()
-          .map(|plan| (plan.byte_range.start, plan.byte_range.end)),
-        response,
-      )
+      decode_blob_range_response_for_ranges(expected_ranges.into_iter(), response)
     }) {
       Ok(BrokerBlobRangeRead::Success(payloads)) => {
         let delivered_bytes = payloads.iter().fold(0_u64, |total, payload| {
@@ -636,17 +637,28 @@ impl ConsumerReaderImpl {
         });
         let decoded = plans
           .iter()
+          .flat_map(|plan| {
+            plan
+              .candidates
+              .iter()
+              .map(move |candidate| (plan, candidate))
+          })
           .zip(&payloads)
-          .map(|(plan, payload)| {
-            self.decode_segment_payload(&plan.metadata, &plan.candidates, &plan.byte_range, payload)
+          .map(|((plan, candidate), payload)| {
+            self.decode_batch(
+              &plan.metadata,
+              &candidate.batch_metadata,
+              candidate.virtual_partition_id,
+              payload.clone(),
+            )
           })
           .collect::<Result<Vec<_>>>();
         match decoded {
-          Ok(groups) => {
+          Ok(batches) => {
             let decoded = plans
               .into_iter()
-              .zip(groups)
-              .flat_map(|(plan, batches)| plan.candidates.into_iter().zip(batches))
+              .flat_map(|plan| plan.candidates)
+              .zip(batches)
               .map(|(candidate, batch)| {
                 self.record_decoded_batch(&batch);
                 BatchReadResult::Decoded { candidate, batch }
