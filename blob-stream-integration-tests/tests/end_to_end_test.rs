@@ -5194,7 +5194,7 @@ async fn run_broker_backed_fast_stall_rollover_boundary(expect_recovery: bool) -
     .ok_or_else(|| anyhow!("Fast diagnostics must retain coverage at the capacity boundary"))?;
 
   let pre_rollover_gap_time = OffsetDateTime::from_unix_timestamp(
-    previous_window_start.saturating_add(WINDOW_SIZE_SECONDS - 1),
+    previous_window_start.saturating_add(WINDOW_SIZE_SECONDS - 2),
   )?;
   broker_time.advance(pre_rollover_gap_time - broker_time.now());
   let gap_id = "fast-recovery-pre-rollover-gap";
@@ -5312,6 +5312,14 @@ async fn run_broker_backed_fast_stall_rollover_boundary(expect_recovery: bool) -
       )?,),
     "retained floor must avoid scanning the full previous window: floor={retained_floor:?}"
   );
+  let mut final_capacity_gate = hooks
+    .arm_consumer(
+      LifecycleEvent::ConsumerPrefetchCapacityExhausted,
+      "fast-recovery-owner",
+      Some(0),
+      None,
+    )
+    .await?;
   recovery_capacity_gate.release()?;
 
   let mut received_ids = HashMap::from([
@@ -5327,12 +5335,24 @@ async fn run_broker_backed_fast_stall_rollover_boundary(expect_recovery: bool) -
         ));
       };
       let id = String::from_utf8(record.record.payload.to_vec())?;
+      if id == gap_id {
+        assert_eq!(
+          record.source_checkpoint.window_start_unix_seconds, previous_window_start,
+          "the pre-rollover gap must be persisted in the retired window"
+        );
+      }
       *received_ids.entry(id).or_insert(0) += 1;
     }
     Ok::<_, anyhow::Error>(())
   })
   .await
   .map_err(|_| anyhow!("owner did not drain all recovered prior-window segments"))??;
+  timeout(
+    Duration::from_secs(5),
+    final_capacity_gate.wait_until_reached(),
+  )
+  .await
+  .map_err(|_| anyhow!("final rollover batch did not reach the prefetch capacity boundary"))??;
   assert_eq!(
     received_ids,
     HashMap::from([
@@ -5347,6 +5367,7 @@ async fn run_broker_backed_fast_stall_rollover_boundary(expect_recovery: bool) -
     previous_window_scan_count + 1,
     "the mature rollover tail must remain cached across later capacity refills"
   );
+  final_capacity_gate.release()?;
 
   Box::new(owner).shutdown().await?;
   cluster.shutdown().await;

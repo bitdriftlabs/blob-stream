@@ -33,7 +33,12 @@ use super::{
 };
 use crate::consumer::diagnostics::{ConsumerReaderMetadataSource, MAX_METADATA_SOURCE_DETAILS};
 use crate::consumer::metadata_query::decode_metadata_response;
-use crate::consumer::reader::SealedMetadataPrefix;
+use crate::consumer::reader::{
+  MAX_RETAINED_METADATA_BYTES,
+  MAX_RETAINED_METADATA_ENTRIES,
+  MetadataSnapshot,
+  MetadataWindowKey,
+};
 use crate::consumer::{
   BrokerBlobRangeQuery,
   BrokerBlobRangeRead,
@@ -98,35 +103,40 @@ struct BatchAcceptance {
 }
 
 //
-// CachedFastPrefix
+// CachedMetadataCoverage
 //
 
-struct CachedFastPrefix {
-  segments: Vec<Arc<[SegmentMetadata]>>,
-  sealed_before: SnowflakeId,
+struct CachedMetadataCoverage {
+  segments: Vec<(VirtualPartitionId, Arc<MetadataSnapshot>, usize)>,
+  sealed_before: Option<SnowflakeId>,
   len: usize,
+  complete_window: bool,
 }
 
-impl CachedFastPrefix {
-  fn iter(&self) -> impl Iterator<Item = &SegmentMetadata> {
+impl CachedMetadataCoverage {
+  fn iter(&self) -> impl Iterator<Item = (&SegmentMetadata, Option<VirtualPartitionId>)> {
     let mut next = BinaryHeap::new();
-    for (partition_index, segments) in self.segments.iter().enumerate() {
-      if let Some(segment) = segments.first()
-        && segment.snowflake_id < self.sealed_before
+    for (partition_index, (_, segments, start)) in self.segments.iter().enumerate() {
+      if let Some(segment) = segments.get(*start)
+        && self
+          .sealed_before
+          .is_none_or(|seal| segment.snowflake_id < seal)
       {
-        next.push(Reverse((segment.snowflake_id, partition_index, 0)));
+        next.push(Reverse((segment.snowflake_id, partition_index, *start)));
       }
     }
     std::iter::from_fn(move || {
       let Reverse((_, partition_index, segment_index)) = next.pop()?;
-      let segments = &self.segments[partition_index];
+      let (partition_id, segments, _) = &self.segments[partition_index];
       let next_index = segment_index + 1;
       if let Some(segment) = segments.get(next_index)
-        && segment.snowflake_id < self.sealed_before
+        && self
+          .sealed_before
+          .is_none_or(|seal| segment.snowflake_id < seal)
       {
         next.push(Reverse((segment.snowflake_id, partition_index, next_index)));
       }
-      Some(&segments[segment_index])
+      Some((segments.get(segment_index)?, Some(*partition_id)))
     })
   }
 }
@@ -157,27 +167,69 @@ fn defer_scan_requests_by_capacity(
 }
 
 impl ConsumerReaderImpl {
-  /// Reuse a sealed Fast prefix only if every participating partition's proof still covers its
+  /// Reuse immutable coverage only if every participating partition's proof still covers its
   /// lower bound under the current availability horizon. The least advanced seal sets the shared
   /// suffix boundary, so no partition's unsealed rows can be skipped.
-  fn cached_fast_prefix(
+  fn cached_metadata_coverage(
     &self,
     request: &ScanRequest,
+    now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
-  ) -> Option<CachedFastPrefix> {
-    if !request.eligibility.fast
-      || request.eligibility.fresh
-      || !request.recovery_partition_bounds.is_empty()
-      || request.fast_partition_bounds.is_empty()
-    {
+  ) -> Option<CachedMetadataCoverage> {
+    if request.eligibility.fresh {
       return None;
     }
+    let bounds = required_prefix_bounds(request).collect::<Vec<_>>();
+    let cache_keys = self.mature_metadata_cache_keys(request, now, runtime_settings);
+    if !cache_keys.is_empty()
+      && bounds.iter().all(|(partition, _)| {
+        cache_keys
+          .iter()
+          .any(|key| key.window.virtual_partition_id == *partition)
+      })
+    {
+      let cached = cache_keys
+        .iter()
+        .map(|key| {
+          let segments = self.metadata_cache.mature(key)?;
+          let lower_bound = bounds
+            .iter()
+            .find(|(partition, _)| *partition == key.window.virtual_partition_id)?
+            .1;
+          let start = self
+            .recovery_metadata_start(
+              key.window.virtual_partition_id,
+              key.window.window_start_unix_seconds,
+              segments,
+            )
+            .max(segments.partition_point(|segment| segment.snowflake_id < lower_bound));
+          Some((key.window.virtual_partition_id, Arc::clone(segments), start))
+        })
+        .collect::<Option<Vec<_>>>();
+      if let Some(cached) = cached {
+        let len = cached
+          .iter()
+          .map(|(_, segments, start)| segments.len().saturating_sub(*start))
+          .sum();
+        return Some(CachedMetadataCoverage {
+          segments: cached,
+          sealed_before: None,
+          len,
+          complete_window: true,
+        });
+      }
+    }
     let mut cached = Vec::new();
+    let mut uncovered = Vec::new();
     let mut sealed_before = None::<SnowflakeId>;
-    for (&partition_id, &lower_bound) in &request.fast_partition_bounds {
-      let prefix = self
-        .sealed_metadata_prefixes
-        .get(&(partition_id, request.window.window_start_unix_seconds))?;
+    for (partition_id, lower_bound) in bounds {
+      let Some(prefix) = self.metadata_cache.prefix(&MetadataWindowKey {
+        virtual_partition_id: partition_id,
+        window_start_unix_seconds: request.window.window_start_unix_seconds,
+      }) else {
+        uncovered.push(lower_bound);
+        continue;
+      };
       if prefix.lower_bound > lower_bound
         || prefix.sealed_before <= lower_bound
         || prefix.sealed_before
@@ -187,28 +239,51 @@ impl ConsumerReaderImpl {
               .saturating_sub(self.availability_horizon(runtime_settings).duration()),
           )
       {
-        return None;
+        uncovered.push(lower_bound);
+        continue;
       }
       sealed_before = Some(sealed_before.map_or(prefix.sealed_before, |bound| {
         bound.min(prefix.sealed_before)
       }));
-      cached.push(Arc::clone(&prefix.segments));
+      let start = self
+        .recovery_metadata_start(
+          partition_id,
+          request.window.window_start_unix_seconds,
+          &prefix.segments,
+        )
+        .max(
+          prefix
+            .segments
+            .partition_point(|segment| segment.snowflake_id < lower_bound),
+        );
+      cached.push((partition_id, Arc::clone(&prefix.segments), start));
     }
     let sealed_before = sealed_before?;
+    if uncovered.iter().any(|bound| *bound < sealed_before) {
+      return None;
+    }
     let len = cached
       .iter()
-      .map(|segments| segments.partition_point(|segment| segment.snowflake_id < sealed_before))
+      .map(|(_, segments, start)| {
+        segments
+          .partition_point(|segment| segment.snowflake_id < sealed_before)
+          .saturating_sub(*start)
+      })
       .sum();
-    Some(CachedFastPrefix {
+    Some(CachedMetadataCoverage {
       segments: cached,
-      sealed_before,
+      sealed_before: Some(sealed_before),
       len,
+      complete_window: sealed_before
+        >= Self::snowflake_floor(offset_datetime_from_unix_seconds(
+          request.window.window_start_unix_seconds + self.metadata_window_size.whole_seconds(),
+        )),
     })
   }
 
   /// Load metadata for every planned window, preserving plan order across cache hits and queries.
   ///
-  /// Complete mature Recovery results and proven sealed Fast prefixes can be reused. Open
+  /// Complete mature results and proven sealed Recovery or Fast prefixes can be reused. Open
   /// suffixes and visibility-deferred results must be queried again on a later pass.
   async fn materialize_window_results(
     &mut self,
@@ -231,7 +306,7 @@ impl ConsumerReaderImpl {
       if !cache_keys.is_empty()
         && let Some(cached_segments) = cache_keys
           .iter()
-          .map(|cache_key| self.recovery_metadata_cache.get(cache_key).cloned())
+          .map(|cache_key| self.metadata_cache.mature(cache_key).cloned())
           .collect::<Option<Vec<_>>>()
       {
         // Cached entries no longer retain the other partitions from their original request.
@@ -244,7 +319,7 @@ impl ConsumerReaderImpl {
         merged_segments.sort_by_key(|metadata| metadata.snowflake_id);
         for cache_key in &cache_keys {
           self.metrics.record_mature_metadata_cache_reuse();
-          if let Some(scan_state) = scan_states.get_mut(&cache_key.0) {
+          if let Some(scan_state) = scan_states.get_mut(&cache_key.window.virtual_partition_id) {
             scan_state.mature_metadata_cache_reuses =
               scan_state.mature_metadata_cache_reuses.saturating_add(1);
           }
@@ -253,7 +328,10 @@ impl ConsumerReaderImpl {
           "consumer reused cached mature metadata: topic={}, partitions={:?}, window_start={}, \
            segments={}",
           self.config.topic,
-          cache_keys.iter().map(|key| key.0).collect::<Vec<_>>(),
+          cache_keys
+            .iter()
+            .map(|key| key.window.virtual_partition_id)
+            .collect::<Vec<_>>(),
           offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
           merged_segments.len()
         );
@@ -397,56 +475,33 @@ impl ConsumerReaderImpl {
         == MetadataReadConsistency::Eventual
         && cache_keys.iter().any(|cache_key| {
           segments.iter().any(|segment| {
-            segment.segment_index.contains_key(&cache_key.0)
+            segment
+              .segment_index
+              .contains_key(&cache_key.window.virtual_partition_id)
               && segment.metadata_published_at > result_visibility_cutoff
           })
         });
       let mut segments = segments;
       segments.sort_by_key(|metadata| metadata.snowflake_id);
-      if request.eligibility.fast
-        && !request.eligibility.fresh
-        && request.recovery_partition_bounds.is_empty()
+      if !request.eligibility.fresh
         && let Some((sealed_before, observed_at)) = sealed_prefix
       {
         // Store only the proven immutable range for each partition. A prior prefix that starts
         // earlier remains useful even if this response was queried from a later suffix bound.
-        for (&partition_id, &lower_bound) in &request.fast_partition_bounds {
-          if lower_bound >= sealed_before {
-            continue;
-          }
-          let key = (partition_id, request.window.window_start_unix_seconds);
-          if self
-            .sealed_metadata_prefixes
-            .get(&key)
-            .is_some_and(|cached| {
-              cached.lower_bound <= lower_bound && cached.sealed_before >= lower_bound
-            })
-          {
-            continue;
-          }
-          let prefix_segments = segments
-            .iter()
-            .filter(|segment| {
-              segment.snowflake_id >= lower_bound && segment.snowflake_id < sealed_before
-            })
-            .cloned()
-            .filter_map(|mut segment| {
-              let batch = segment.segment_index.remove(&partition_id)?;
-              segment.segment_index.clear();
-              segment.segment_index.insert(partition_id, batch);
-              Some(segment)
-            })
-            .collect::<Vec<_>>();
-          self.sealed_metadata_prefixes.insert(
+        for (partition_id, lower_bound) in required_prefix_bounds(&request) {
+          let key = MetadataWindowKey {
+            virtual_partition_id: partition_id,
+            window_start_unix_seconds: request.window.window_start_unix_seconds,
+          };
+          if self.metadata_cache.install_prefix(
             key,
-            SealedMetadataPrefix {
-              lower_bound,
-              sealed_before,
-              observed_at,
-              segments: prefix_segments.into(),
-            },
-          );
-          self.metrics.record_sealed_metadata_prefix_install();
+            lower_bound,
+            sealed_before,
+            observed_at,
+            &segments,
+          ) {
+            self.metrics.record_sealed_metadata_prefix_install();
+          }
         }
       }
       if !cache_keys.is_empty() && !has_visibility_deferred_segment {
@@ -455,30 +510,13 @@ impl ConsumerReaderImpl {
         // back into a response in Snowflake order. Clearing the original index avoids retaining
         // unrelated partition batches in an entry that may be reused on its own.
         for cache_key in cache_keys {
-          let partition_id = cache_key.0;
-          let cached_segments = segments
-            .iter()
-            .cloned()
-            .filter_map(|mut segment| {
-              let partition_batches = segment.segment_index.remove(&partition_id)?;
-              segment.segment_index.clear();
-              segment
-                .segment_index
-                .insert(partition_id, partition_batches);
-              Some(segment)
-            })
-            .collect::<Vec<_>>();
-          let cached_segments: Arc<[SegmentMetadata]> = cached_segments.into();
+          self.metadata_cache.install_mature(cache_key, &segments);
           trace!(
-            "consumer cached mature metadata: topic={}, partition={}, window_start={}, segments={}",
+            "consumer cached mature metadata: topic={}, partition={}, window_start={}",
             self.config.topic,
-            partition_id,
-            offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds),
-            cached_segments.len()
+            cache_key.window.virtual_partition_id,
+            offset_datetime_from_unix_seconds(request.window.window_start_unix_seconds)
           );
-          self
-            .recovery_metadata_cache
-            .insert(cache_key, cached_segments);
         }
       }
       cached_window_results.push((
@@ -488,7 +526,10 @@ impl ConsumerReaderImpl {
         result_visibility_cutoff,
       ));
     }
-    self.record_mature_metadata_cache_state();
+    self
+      .metadata_cache
+      .enforce_budget(MAX_RETAINED_METADATA_BYTES, MAX_RETAINED_METADATA_ENTRIES);
+    self.record_metadata_cache_state();
     cached_window_results.sort_by_key(|(request_index, ..)| *request_index);
     Ok(
       cached_window_results
@@ -904,6 +945,7 @@ impl ConsumerReaderImpl {
     // safety floor; any part of the preceding window that ages safe on the next pass is handled by
     // the planner's one-window Fast tail rather than by a transient Recovery transition.
     let fast_coverage_floor = self.fast_scan_safe_timestamp(now, runtime_settings);
+    let availability_horizon = self.availability_horizon(runtime_settings).duration();
     for (partition_id, state) in &mut self.virtual_partition_states {
       let mut next_state = None;
       match state {
@@ -961,8 +1003,22 @@ impl ConsumerReaderImpl {
           if recovery_state.next_window_start_unix_seconds
             > recovery_state.cutover_window_start_unix_seconds
           {
-            let coverage_floor =
-              offset_datetime_from_unix_seconds(recovery_state.cutover_window_start_unix_seconds);
+            let coverage_floor = self
+              .metadata_cache
+              .prefix(&MetadataWindowKey {
+                virtual_partition_id: *partition_id,
+                window_start_unix_seconds: recovery_state.cutover_window_start_unix_seconds,
+              })
+              .filter(|prefix| {
+                prefix.sealed_before
+                  <= SnowflakeId::minimum_for_timestamp(
+                    prefix.observed_at.saturating_sub(availability_horizon),
+                  )
+              })
+              .and_then(|prefix| prefix.sealed_before.timestamp())
+              .unwrap_or_else(|| {
+                offset_datetime_from_unix_seconds(recovery_state.cutover_window_start_unix_seconds)
+              });
             recoveries_completed.push((
               *partition_id,
               recovery_state.cutover_window_start_unix_seconds,
@@ -1005,17 +1061,25 @@ impl ConsumerReaderImpl {
     }
 
     // Mature responses survive while Recovery can revisit them or Fast still needs its rollover
-    // tail. Sealed prefixes instead follow the eligible Fast windows; open suffixes are never kept.
+    // tail. Sealed prefixes cover remaining Recovery windows or eligible Fast windows, never an
+    // unproven open suffix.
     let retention_floor = self
       .retention_floor_window_start(Window::for_timestamp(now, self.metadata_window_size).start);
-    self
-      .recovery_metadata_cache
-      .retain(|(partition_id, window_start, _), _| {
-        matches!(
-          self.virtual_partition_states.get(partition_id),
-          Some(VirtualPartitionState::Recovering { recovery_state, .. })
-            if recovery_state.next_window_start_unix_seconds <= *window_start
-        ) || matches!(
+    let fast_windows = self
+      .eligible_fast_scan_windows(now, runtime_settings)?
+      .into_iter()
+      .map(|window| window.window_start_unix_seconds)
+      .collect::<HashSet<_>>();
+    self.metadata_cache.retain_windows(
+      |key| {
+        let partition_id = &key.window.virtual_partition_id;
+        let window_start = &key.window.window_start_unix_seconds;
+        *window_start >= retention_floor.unix_timestamp()
+          && (matches!(
+            self.virtual_partition_states.get(partition_id),
+            Some(VirtualPartitionState::Recovering { recovery_state, .. })
+              if recovery_state.next_window_start_unix_seconds <= *window_start
+          ) || matches!(
           self.virtual_partition_states.get(partition_id),
           Some(VirtualPartitionState::Fast {
             coverage_floor: Some(coverage_floor),
@@ -1027,23 +1091,35 @@ impl ConsumerReaderImpl {
             .start
             .unix_timestamp()
             == *window_start
-        )
-      });
-    let fast_windows = self
-      .eligible_fast_scan_windows(now, runtime_settings)?
-      .into_iter()
-      .map(|window| window.window_start_unix_seconds)
-      .collect::<HashSet<_>>();
-    self
-      .sealed_metadata_prefixes
-      .retain(|(partition_id, window_start), _| {
-        fast_windows.contains(window_start)
-          && matches!(
-            self.virtual_partition_states.get(partition_id),
-            Some(VirtualPartitionState::Fast { .. })
-          )
-      });
-    self.record_mature_metadata_cache_state();
+          ))
+      },
+      |key| {
+        let partition_id = &key.virtual_partition_id;
+        let window_start = &key.window_start_unix_seconds;
+        let recovering = match self.virtual_partition_states.get(partition_id) {
+          Some(VirtualPartitionState::Recovering { recovery_state, .. }) => {
+            *window_start >= retention_floor.unix_timestamp()
+              && recovery_state.next_window_start_unix_seconds <= *window_start
+              && *window_start <= recovery_state.cutover_window_start_unix_seconds
+          },
+          _ => false,
+        };
+        recovering
+          || (fast_windows.contains(window_start)
+            && matches!(
+              self.virtual_partition_states.get(partition_id),
+              Some(VirtualPartitionState::Fast { .. })
+            ))
+      },
+      |key| match self.virtual_partition_states.get(&key.virtual_partition_id) {
+        Some(VirtualPartitionState::Recovering { recovery_state, .. }) => {
+          recovery_state.next_window_start_unix_seconds <= key.window_start_unix_seconds
+            && key.window_start_unix_seconds >= retention_floor.unix_timestamp()
+        },
+        _ => false,
+      },
+    );
+    self.record_metadata_cache_state();
 
     self.fast_frontiers = next_fast_frontiers;
     self.prune_fast_frontiers(now, runtime_settings)?;
@@ -1120,12 +1196,16 @@ impl ConsumerReaderImpl {
     // range-read failure must not make already decoded output disappear behind an advanced cursor.
     let virtual_partition_states = self.virtual_partition_states.clone();
     let fast_frontiers = self.fast_frontiers.clone();
+    let recovery_metadata_progress = self.metadata_cache.checkpoint_progress();
     let result = self
       .read_available_impl_inner(now, capacity, runtime_settings)
       .await;
     if result.is_err() {
       self.virtual_partition_states = virtual_partition_states;
       self.fast_frontiers = fast_frontiers;
+      self
+        .metadata_cache
+        .restore_progress(recovery_metadata_progress);
     }
     result
   }
@@ -1140,6 +1220,7 @@ impl ConsumerReaderImpl {
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<ConsumerReadOutcome> {
     let read_started_at = Instant::now();
+    self.validate_metadata_cache_policy(runtime_settings);
     let assigned_partition_ids = self.assigned_virtual_partition_ids();
     trace!(
       "consumer read_available start: topic={}, assigned_partitions={}",
@@ -1252,7 +1333,7 @@ impl ConsumerReaderImpl {
       .collect::<HashSet<_>>();
     let fast_horizon_floor =
       Self::snowflake_floor(self.fast_scan_safe_timestamp(now, runtime_settings));
-    let mut segment_read_plans = Vec::new();
+    let mut segment_read_plans = Vec::<SegmentReadPlan>::new();
     let mut capacity_exhausted = false;
     let mut capacity_filled_from_cache = false;
     let capacity_had_room_at_start = capacity.has_room();
@@ -1264,7 +1345,7 @@ impl ConsumerReaderImpl {
       let has_cached_window = !cached_keys.is_empty()
         && cached_keys
           .iter()
-          .all(|key| self.recovery_metadata_cache.contains_key(key));
+          .all(|key| self.metadata_cache.has_mature(key));
       // Once a prior window fills capacity, do not start another query. An already fetched empty
       // window or a complete cache hit can still be inspected without adding metadata-store work.
       if capacity_had_room_at_start
@@ -1290,18 +1371,28 @@ impl ConsumerReaderImpl {
       // A prefetched response already includes its newly installed sealed prefix. Admit that
       // response once rather than replaying the prefix before consuming the same rows again.
       let cached_prefix = if prefetched_window_results.is_empty() {
-        self.cached_fast_prefix(planned_request, runtime_settings)
+        self.cached_metadata_coverage(planned_request, now, runtime_settings)
       } else {
         None
       };
       if cached_prefix.is_some() {
-        for _ in &planned_request.fast_partition_bounds {
+        for (partition, _) in required_prefix_bounds(planned_request) {
           self.metrics.record_mature_metadata_cache_reuse();
+          if has_cached_window && let Some(scan) = scan_states.get_mut(&partition) {
+            scan.mature_metadata_cache_reuses += 1;
+          }
         }
       }
-      // A sealed Fast prefix is processed first, then only its open suffix is queried. Recheck
+      // A sealed prefix is processed first, then only its open suffix is queried. Recheck
       // capacity between phases: the prefix alone may fill it, leaving the suffix for next pass.
-      let phase_count = if cached_prefix.is_some() { 2 } else { 1 };
+      let phase_count = if cached_prefix
+        .as_ref()
+        .is_some_and(|prefix| !prefix.complete_window)
+      {
+        2
+      } else {
+        1
+      };
       for phase in 0 .. phase_count {
         if phase > 0 && capacity_had_room_at_start && !capacity.has_room() {
           capacity_exhausted = true;
@@ -1321,20 +1412,27 @@ impl ConsumerReaderImpl {
           (planned_request.clone(), None, visibility_cutoff)
         } else {
           let mut request = planned_request.clone();
-          if let Some(prefix) = cached_prefix.as_ref() {
+          if let Some(prefix) = cached_prefix.as_ref()
+            && let Some(sealed_before) = prefix.sealed_before
+          {
             // The cached phase already covered everything below the seal; restrict both the
             // shared query floor and each partition's bound to the still-open suffix.
-            request.min_snowflake =
-              Some(request.min_snowflake.map_or(prefix.sealed_before, |bound| {
-                bound.max(prefix.sealed_before)
-              }));
+            request.min_snowflake = Some(
+              request
+                .min_snowflake
+                .map_or(sealed_before, |bound| bound.max(sealed_before)),
+            );
             for bound in request.fast_partition_bounds.values_mut() {
-              *bound = (*bound).max(prefix.sealed_before);
+              *bound = (*bound).max(sealed_before);
+            }
+            for bound in request.recovery_partition_bounds.values_mut() {
+              *bound = Some(bound.map_or(sealed_before, |bound| bound.max(sealed_before)));
             }
           }
           // Batch only consecutive uncached, Recovery-only windows. A cache hit or a different
           // scan mode is a boundary where capacity must be reconsidered before the next query.
           if prefetched_window_results.is_empty()
+            && cached_prefix.is_none()
             && !request.eligibility.recovering_partitions.is_empty()
             && !request.eligibility.fast
             && !request.eligibility.fresh
@@ -1348,11 +1446,7 @@ impl ConsumerReaderImpl {
                 break;
               }
               let keys = self.mature_metadata_cache_keys(candidate, now, runtime_settings);
-              if !keys.is_empty()
-                && keys
-                  .iter()
-                  .all(|key| self.recovery_metadata_cache.contains_key(key))
-              {
+              if !keys.is_empty() && keys.iter().all(|key| self.metadata_cache.has_mature(key)) {
                 break;
               }
               end += 1;
@@ -1383,7 +1477,9 @@ impl ConsumerReaderImpl {
               && next.eligibility.fast
               && !next.eligibility.fresh
               && next.recovery_partition_bounds.is_empty()
-              && self.cached_fast_prefix(next, runtime_settings).is_none()
+              && self
+                .cached_metadata_coverage(next, now, runtime_settings)
+                .is_none()
             {
               prefetched_window_results = self
                 .materialize_window_results(
@@ -1432,17 +1528,24 @@ impl ConsumerReaderImpl {
 
         // With a cached prefix, replay only its proven range and query only the open suffix.
         // Without one, query from the planned bound; all phases use the same admission checks.
-        for segment in cached_prefix
+        for (segment, projected_partition) in cached_prefix
           .as_ref()
           .filter(|_| segments.is_none())
           .into_iter()
-          .flat_map(CachedFastPrefix::iter)
-          .chain(segments.iter().flat_map(|segments| segments.iter()))
+          .flat_map(CachedMetadataCoverage::iter)
+          .chain(
+            segments
+              .iter()
+              .flat_map(|segments| segments.iter().map(|segment| (segment, None))),
+          )
         {
           // A merged window result can contain batches for other partitions or scan modes;
           // only the partitions eligible for this window may reserve capacity or advance state.
           let mut segment_read_candidates = Vec::new();
           for &partition_id in &assigned_partition_ids {
+            if projected_partition.is_some_and(|projected| projected != partition_id) {
+              continue;
+            }
             let partition_state = self.virtual_partition_states.get(&partition_id);
             let partition_is_eligible = match partition_state {
               Some(VirtualPartitionState::Fresh {
@@ -1477,6 +1580,15 @@ impl ConsumerReaderImpl {
               | None => false,
             };
             if !partition_is_eligible {
+              continue;
+            }
+            if request
+              .recovery_partition_bounds
+              .get(&partition_id)
+              .copied()
+              .flatten()
+              .is_some_and(|bound| segment.snowflake_id < bound)
+            {
               continue;
             }
             if matches!(
@@ -1673,6 +1785,11 @@ impl ConsumerReaderImpl {
               scan_state.metadata_batches_skipped_by_cursor = scan_state
                 .metadata_batches_skipped_by_cursor
                 .saturating_add(1);
+              self.stage_recovery_metadata_skip(
+                partition_id,
+                window.window_start_unix_seconds,
+                segment.snowflake_id,
+              );
               continue;
             }
 
@@ -1721,10 +1838,20 @@ impl ConsumerReaderImpl {
             }
           }
           if !segment_read_candidates.is_empty() {
-            segment_read_plans.push(SegmentReadPlan::new(
-              segment.clone(),
-              segment_read_candidates,
-            )?);
+            // The heap yields projections of one immutable segment consecutively. Preserve the
+            // same enclosing range used for a raw response, before either broker or direct reads.
+            if let Some(plan) = segment_read_plans.last_mut()
+              && plan.metadata.snowflake_id == segment.snowflake_id
+              && plan.metadata.window == segment.window
+              && plan.metadata.blob_key == segment.blob_key
+            {
+              plan.extend_candidates(segment_read_candidates)?;
+            } else {
+              segment_read_plans.push(SegmentReadPlan::new(
+                segment.clone(),
+                segment_read_candidates,
+              )?);
+            }
           }
           if capacity_exhausted {
             // A capacity stop leaves the current request only partially observed and prevents every
@@ -1762,6 +1889,9 @@ impl ConsumerReaderImpl {
       runtime_settings,
     );
     for (partition_id, retry_window) in held_recovery_windows {
+      self
+        .metadata_cache
+        .invalidate_progress_from(partition_id, retry_window);
       if let Some(VirtualPartitionState::Recovering { recovery_state, .. }) =
         self.virtual_partition_states.get_mut(&partition_id)
       {
@@ -1825,17 +1955,6 @@ impl ConsumerReaderImpl {
       metadata_batches_skipped_by_cursor
     );
 
-    self.finalize_scan_pass(
-      ScanPassFinalization {
-        scanned_fresh_window_starts,
-        partitions: partition_finalizations,
-        capacity_deferred_fresh_window_starts,
-        next_fast_frontiers,
-      },
-      now,
-      runtime_settings,
-      &mut scan_states,
-    )?;
     if !capacity_exhausted {
       for partition_id in initial_fast_partitions {
         if !blocked_fast_sources
@@ -1854,6 +1973,18 @@ impl ConsumerReaderImpl {
         }
       }
     }
+    self.commit_recovery_metadata_progress();
+    self.finalize_scan_pass(
+      ScanPassFinalization {
+        scanned_fresh_window_starts,
+        partitions: partition_finalizations,
+        capacity_deferred_fresh_window_starts,
+        next_fast_frontiers,
+      },
+      now,
+      runtime_settings,
+      &mut scan_states,
+    )?;
     self.attach_admission_scan_contexts(&mut output);
 
     self.metrics.record_read_available(
@@ -1901,6 +2032,22 @@ impl ConsumerReaderImpl {
       batch.admission_scan.clone_from(context);
     }
   }
+}
+
+fn required_prefix_bounds(
+  request: &ScanRequest,
+) -> impl Iterator<Item = (VirtualPartitionId, SnowflakeId)> + '_ {
+  let floor = SnowflakeId(0);
+  request
+    .fast_partition_bounds
+    .iter()
+    .map(|(&partition, &bound)| (partition, bound))
+    .chain(
+      request
+        .recovery_partition_bounds
+        .iter()
+        .map(move |(&partition, &bound)| (partition, bound.unwrap_or(floor))),
+    )
 }
 
 async fn scan_direct_metadata(

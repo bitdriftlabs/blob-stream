@@ -20,7 +20,7 @@ use super::{
   trace,
 };
 use crate::config::consumer_candidate_window_count_with_availability_horizon;
-use crate::consumer::reader::RecoveryMetadataCacheKey;
+use crate::consumer::reader::{MatureMetadataCacheKey, MetadataWindowKey};
 use crate::consumer::state::RecoveryState;
 
 // A cross-window sequence hold is exceptional and partition-scoped. Recheck soon enough to
@@ -32,34 +32,16 @@ impl ConsumerReaderImpl {
   /// Return cache identities for every partition in an immutable metadata request.
   ///
   /// Mature Recovery windows and a Fast rollover tail's per-partition rows are immutable. The
-  /// key intentionally excludes consistency: runtime changes do not invalidate a completed
-  /// observation or replay it with stronger reads.
+  /// key records the durable Recovery floor; policy changes invalidate reader-local coverage.
   pub(in crate::consumer) fn mature_metadata_cache_keys(
     &self,
     request: &ScanRequest,
     now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
-  ) -> Vec<RecoveryMetadataCacheKey> {
-    let (partition_ids, min_snowflake) =
-      if request.recovery_scan && !request.eligibility.fast && !request.eligibility.fresh {
-        let &[partition_id] = request.eligibility.recovering_partitions.as_slice() else {
-          return Vec::new();
-        };
-        (
-          vec![partition_id],
-          request.min_snowflake.map(SnowflakeId::as_u64),
-        )
-      } else if !request.recovery_scan && request.eligibility.fast && !request.eligibility.fresh {
-        // A shared mature tail is cached as one filtered immutable response per partition. A
-        // refill uses it only when every participating partition has an entry, so the combined
-        // result preserves exactly the request's original partition eligibility.
-        (
-          request.fast_partition_bounds.keys().copied().collect(),
-          None,
-        )
-      } else {
-        return Vec::new();
-      };
+  ) -> Vec<MatureMetadataCacheKey> {
+    if request.eligibility.fresh {
+      return Vec::new();
+    }
     let window_end_unix_seconds = request
       .window
       .window_start_unix_seconds
@@ -67,18 +49,30 @@ impl ConsumerReaderImpl {
     if window_end_unix_seconds > self.fast_scan_safe_timestamp_unix_seconds(now, runtime_settings) {
       return Vec::new();
     }
-    // Recovery's first-window bound identifies its durable resume point. A Fast-tail frontier
-    // only advances as batches are accepted, so its first mature response is a safe superset for
-    // later capacity refills and must keep the same cache key as that frontier narrows.
-    partition_ids
-      .into_iter()
-      .map(|partition_id| {
-        (
-          partition_id,
-          request.window.window_start_unix_seconds,
-          min_snowflake,
-        )
+    // Record actual coverage floors for both modes. The cache serves later, narrower requests
+    // from the same snapshot, without treating a bounded Fast response as an unbounded scan.
+    request
+      .recovery_partition_bounds
+      .iter()
+      .map(|(&partition_id, &bound)| {
+        MetadataWindowKey {
+          virtual_partition_id: partition_id,
+          window_start_unix_seconds: request.window.window_start_unix_seconds,
+        }
+        .with_min_snowflake(bound)
       })
+      .chain(
+        request
+          .fast_partition_bounds
+          .iter()
+          .map(|(&partition_id, &bound)| {
+            MetadataWindowKey {
+              virtual_partition_id: partition_id,
+              window_start_unix_seconds: request.window.window_start_unix_seconds,
+            }
+            .with_min_snowflake(Some(bound))
+          }),
+      )
       .collect()
   }
 
@@ -702,20 +696,41 @@ impl ConsumerReaderImpl {
     Ok((scan_requests.into_values().collect(), recovery_scan))
   }
 
-  /// Discard frontiers for windows that Fast scans no longer query.
+  /// Discard frontiers outside eligible Fast windows and each partition's unfinished rollover tail.
+  /// Dropping a live tail frontier would widen the next query below its cached mature floor.
   pub(in crate::consumer) fn prune_fast_frontiers(
     &mut self,
     now: time::OffsetDateTime,
     runtime_settings: ConsumerReadRuntimeSettings,
   ) -> Result<()> {
-    let eligible_window_starts = self
-      .eligible_fast_scan_windows(now, runtime_settings)?
+    let window_size = self.metadata_window_size;
+    let eligible_windows = self.eligible_fast_scan_windows(now, runtime_settings)?;
+    let coverage_tail_window_start = eligible_windows.first().map(|window| {
+      window
+        .window_start_unix_seconds
+        .saturating_sub(window_size.whole_seconds())
+    });
+    let eligible_window_starts = eligible_windows
       .into_iter()
       .map(|window| window.window_start_unix_seconds)
       .collect::<HashSet<_>>();
+    let retention_floor =
+      self.retention_floor_window_start(Window::for_timestamp(now, window_size).start);
     self
       .fast_frontiers
-      .retain(|(_, window_start), _| eligible_window_starts.contains(window_start));
+      .retain(|(partition_id, window_start), _| {
+        eligible_window_starts.contains(window_start)
+          || (Some(*window_start) == coverage_tail_window_start
+            && matches!(
+              self.virtual_partition_states.get(partition_id),
+              Some(VirtualPartitionState::Fast {
+                coverage_floor: Some(coverage_floor),
+                ..
+              }) if Window::for_timestamp((*coverage_floor).max(retention_floor), window_size)
+                .start
+                .unix_timestamp() == *window_start
+            ))
+      });
     Ok(())
   }
 }
