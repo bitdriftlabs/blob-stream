@@ -89,13 +89,15 @@ timestamp 1,001; without that older coverage floor, its bound would be $T_{safe}
 query uses the lower effective bound, timestamp 1,001; partition 7 filters rows below its own
 1,005 frontier locally, while partition 8 can still receive rows at or after 1,001.
 
-**One range read for several selected batches.** Assume a selected segment from topic `telemetry`
-contains three independently compressed batches: batches for owned partitions 7 and 9 occupy
-`[0, 100)` and `[150, 240)`, while an unowned partition 8 batch occupies `[100, 150)`. Window
-size, publication deadline, and visibility delay no longer affect this stage: metadata selection
-has already chosen the two owned batches. The reader issues one blob range request for `[0, 240)`,
-then decodes only `[0, 100)` and `[150, 240)`. The middle 50 bytes are intentional overfetch that
-trades data transfer for one fewer object-store request.
+**Broker and direct reads for several selected batches.** Assume a selected segment from topic
+`telemetry` contains three independently compressed batches: batches for owned partitions 7 and 9
+occupy `[0, 100)` and `[150, 240)`, while an unowned partition 8 batch occupies `[100, 150)`. Window
+size, publication deadline, and visibility delay no longer affect this stage: metadata selection has
+already chosen the two owned batches. The reader requests `[0, 100)` and `[150, 240)` in one broker
+RPC; the broker fetches or reuses the full blob and returns only those two slices. If the broker
+cannot deliver them, the direct fallback reads `[0, 240)` in one object-store request and decodes
+only the owned batches. That fallback intentionally overfetches the middle 50 bytes to avoid a
+second object-store request.
 
 ## Cache Use Across Reads
 
