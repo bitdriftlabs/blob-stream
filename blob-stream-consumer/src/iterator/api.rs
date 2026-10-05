@@ -120,6 +120,9 @@ pub type AssignmentCallback = Arc<dyn Fn(&[VirtualPartitionId]) + Send + Sync>;
 /// Test-oriented lifecycle observation points for consumer coordination transitions.
 #[async_trait]
 pub trait ConsumerLifecycleHooks: Send + Sync {
+  /// Runs after revoked reader state and pending output have been removed at a safe boundary.
+  async fn read_suspension_applied(&self, _member_id: &str, _partitions: &[VirtualPartitionId]) {}
+
   /// Runs after a revocation becomes visible to the iterator caller.
   async fn revocation_emitted(
     &self,
