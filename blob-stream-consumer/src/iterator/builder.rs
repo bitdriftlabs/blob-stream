@@ -406,7 +406,7 @@ impl ConsumerIteratorBuilder<'_> {
       driver: Some(driver),
       driver_task: None,
       #[cfg(test)]
-      next_after_delivery_state_check_hook: None,
+      next_after_delivery_state_check_hook: Mutex::default(),
     })
   }
 }

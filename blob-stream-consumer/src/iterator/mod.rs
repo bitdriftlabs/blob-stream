@@ -18,6 +18,7 @@ pub use api::{
   ConsumerRecord,
   ConsumerSeekTarget,
   CoordinationSnapshot,
+  NextBatchResult,
   NextResult,
   NoopConsumerLifecycleHooks,
   RevokedPartitions,

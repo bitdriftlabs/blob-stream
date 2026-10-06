@@ -10,12 +10,13 @@
 //! been fenced, while leaving durable cursor recovery to the next owner.
 
 use super::shared::{ActivePartitionState, ConsumerIteratorMetrics, DeliveredSource};
-use super::{ConsumerRecord, NextResult};
+use super::{ConsumerRecord, NextBatchResult, NextResult};
 use crate::consumer::{ConsumerBatch, ConsumerBatchSource};
 use crate::diagnostics::ConsumerReaderScanSnapshot;
 use blob_stream_types::{CommittedSourceCheckpoint, Record, VirtualPartitionId};
 use log::debug;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 //
@@ -31,6 +32,7 @@ pub struct BufferedBatch {
   pub(super) source: ConsumerBatchSource,
   pub(super) admission_scan: Option<Arc<ConsumerReaderScanSnapshot>>,
   pub(super) remaining_payload_bytes: u64,
+  pub(super) delivery_started: bool,
   pub records: std::vec::IntoIter<Record>,
 }
 
@@ -62,6 +64,11 @@ pub(super) struct DeliveryGap {
 pub(super) struct DeliveryResult {
   pub(super) next_result: NextResult,
   pub(super) gap: Option<DeliveryGap>,
+}
+
+pub(super) struct DeliveryBatchResult {
+  pub(super) next_result: NextBatchResult,
+  pub(super) gaps: Vec<DeliveryGap>,
 }
 
 //
@@ -108,6 +115,118 @@ impl DeliveryState {
     active_partitions: &mut HashMap<VirtualPartitionId, ActivePartitionState>,
     metrics: &ConsumerIteratorMetrics,
   ) -> Option<DeliveryResult> {
+    let result = self.try_take_next_inner(active_partitions, metrics)?;
+    if matches!(result.next_result, NextResult::Record(_)) {
+      metrics.records_delivered.inc();
+    }
+    Some(result)
+  }
+
+  pub(super) fn try_take_batch(
+    &mut self,
+    active_partitions: &mut HashMap<VirtualPartitionId, ActivePartitionState>,
+    metrics: &ConsumerIteratorMetrics,
+    max_records: NonZeroUsize,
+    max_bytes: NonZeroUsize,
+  ) -> Option<DeliveryBatchResult> {
+    let first = self.try_take_next_inner(active_partitions, metrics)?;
+    let record = match first.next_result {
+      NextResult::Record(record) => record,
+      NextResult::Revoked(revoked) => {
+        return Some(DeliveryBatchResult {
+          next_result: NextBatchResult::Revoked(revoked),
+          gaps: Vec::new(),
+        });
+      },
+    };
+    let bytes = record.record.payload.len();
+    let current_records = self
+      .current_batch
+      .as_ref()
+      .into_iter()
+      .flat_map(|batch| batch.records.as_slice());
+    let queued_records = self
+      .batches
+      .iter()
+      .filter(|batch| active_partitions.contains_key(&batch.virtual_partition_id))
+      .flat_map(|batch| &batch.records);
+    let mut capacity = 1;
+    let mut planned_bytes = bytes;
+    for next in current_records.chain(queued_records) {
+      if capacity >= max_records.get()
+        || planned_bytes >= max_bytes.get()
+        || next.payload.len() > max_bytes.get() - planned_bytes
+      {
+        break;
+      }
+      capacity += 1;
+      planned_bytes += next.payload.len();
+    }
+    let mut records = Vec::with_capacity(capacity);
+    records.push(record);
+    let mut gaps = first.gap.into_iter().collect::<Vec<_>>();
+    while records.len() < capacity {
+      if !self.prepare_current_batch(active_partitions) {
+        break;
+      }
+      let current = self.current_batch.as_mut()?;
+      let Some(state) = active_partitions.get_mut(&current.virtual_partition_id) else {
+        break;
+      };
+      let count = current.records.len().min(capacity - records.len());
+      let start = current.next_offset;
+      let end = start.saturating_add(u64::try_from(count - 1).unwrap_or(u64::MAX));
+      gaps.extend(record_delivery_offset(
+        state,
+        current.virtual_partition_id,
+        start,
+        current.end_offset,
+        &current.source_checkpoint,
+        &current.source,
+        current.admission_scan.as_ref(),
+        metrics,
+      ));
+      if !current.delivery_started {
+        metrics.batches_delivered.inc();
+        current.delivery_started = true;
+      }
+      let mut chunk_bytes = 0_u64;
+      for record in current.records.by_ref().take(count) {
+        chunk_bytes = chunk_bytes.saturating_add(record.payload.len() as u64);
+        records.push(ConsumerRecord {
+          virtual_partition_id: current.virtual_partition_id,
+          offset: current.next_offset,
+          source_checkpoint: current.source_checkpoint.clone(),
+          record,
+        });
+        current.next_offset = current.next_offset.saturating_add(1);
+      }
+      current.remaining_payload_bytes = current.remaining_payload_bytes.saturating_sub(chunk_bytes);
+      state.delivery_gap_baseline = Some(end);
+      record_delivered_range(
+        state,
+        start,
+        end,
+        &current.source_checkpoint,
+        &current.source,
+      );
+      debug!(
+        "consumer delivery surfaced records: partition={}, start={start}, end={end}, count={count}",
+        current.virtual_partition_id
+      );
+    }
+    metrics.records_delivered.inc_by(records.len() as u64);
+    Some(DeliveryBatchResult {
+      next_result: NextBatchResult::Records(records),
+      gaps,
+    })
+  }
+
+  fn try_take_next_inner(
+    &mut self,
+    active_partitions: &mut HashMap<VirtualPartitionId, ActivePartitionState>,
+    metrics: &ConsumerIteratorMetrics,
+  ) -> Option<DeliveryResult> {
     // A revocation takes precedence over records so callers cannot observe a replacement
     // assignment before acknowledging the ownership loss.
     if let Some(revocation) = self.pending_revocation.take() {
@@ -122,70 +241,76 @@ impl DeliveryState {
       return None;
     }
 
+    if !self.prepare_current_batch(active_partitions) {
+      return None;
+    }
+    if let Some(current_batch) = self.current_batch.as_mut()
+      && let Some(record) = current_batch.records.next()
+    {
+      if !current_batch.delivery_started {
+        metrics.batches_delivered.inc();
+        current_batch.delivery_started = true;
+      }
+      current_batch.remaining_payload_bytes = current_batch
+        .remaining_payload_bytes
+        .saturating_sub(u64::try_from(record.payload.len()).unwrap_or(u64::MAX));
+      let offset = current_batch.next_offset;
+      current_batch.next_offset = current_batch.next_offset.saturating_add(1);
+      let state = active_partitions.get_mut(&current_batch.virtual_partition_id)?;
+      let gap = record_delivery_offset(
+        state,
+        current_batch.virtual_partition_id,
+        offset,
+        current_batch.end_offset,
+        &current_batch.source_checkpoint,
+        &current_batch.source,
+        current_batch.admission_scan.as_ref(),
+        metrics,
+      );
+      record_delivered_range(
+        state,
+        offset,
+        offset,
+        &current_batch.source_checkpoint,
+        &current_batch.source,
+      );
+      debug!(
+        "consumer delivery surfaced record: partition={}, offset={offset}",
+        current_batch.virtual_partition_id,
+      );
+      return Some(DeliveryResult {
+        next_result: NextResult::Record(ConsumerRecord {
+          virtual_partition_id: current_batch.virtual_partition_id,
+          offset,
+          source_checkpoint: current_batch.source_checkpoint.clone(),
+          record,
+        }),
+        gap,
+      });
+    }
+    None
+  }
+
+  fn prepare_current_batch(
+    &mut self,
+    active_partitions: &HashMap<VirtualPartitionId, ActivePartitionState>,
+  ) -> bool {
     loop {
-      // Fencing can race with caller polling. Drop an in-flight batch before producing another
-      // record when its partition is no longer locally active.
-      if self
-        .current_batch
-        .as_ref()
-        .is_some_and(|batch| !active_partitions.contains_key(&batch.virtual_partition_id))
-      {
-        self.current_batch = None;
-        continue;
+      if self.current_batch.as_ref().is_some_and(|batch| {
+        active_partitions.contains_key(&batch.virtual_partition_id) && batch.records.len() > 0
+      }) {
+        return true;
       }
-
-      if let Some(current_batch) = self.current_batch.as_mut() {
-        if let Some(record) = current_batch.records.next() {
-          current_batch.remaining_payload_bytes = current_batch
-            .remaining_payload_bytes
-            .saturating_sub(u64::try_from(record.payload.len()).unwrap_or(u64::MAX));
-          let offset = current_batch.next_offset;
-          current_batch.next_offset = current_batch.next_offset.saturating_add(1);
-          let gap = record_delivery_offset(
-            active_partitions,
-            current_batch.virtual_partition_id,
-            offset,
-            current_batch.end_offset,
-            &current_batch.source_checkpoint,
-            &current_batch.source,
-            current_batch.admission_scan.as_ref(),
-            metrics,
-          );
-          record_delivered_source(
-            active_partitions,
-            current_batch.virtual_partition_id,
-            offset,
-            &current_batch.source_checkpoint,
-            &current_batch.source,
-          );
-          metrics.records_delivered.inc();
-          debug!(
-            "consumer delivery surfaced record: partition={}, offset={offset}",
-            current_batch.virtual_partition_id,
-          );
-          return Some(DeliveryResult {
-            next_result: NextResult::Record(ConsumerRecord {
-              virtual_partition_id: current_batch.virtual_partition_id,
-              offset,
-              source_checkpoint: current_batch.source_checkpoint.clone(),
-              record,
-            }),
-            gap,
-          });
-        }
-        self.current_batch = None;
-      }
-
-      let batch = self.batches.pop_front()?;
-      self.buffered_bytes = self
-        .buffered_bytes
-        .saturating_sub(prefetched_batch_bytes(&batch));
+      self.current_batch = None;
+      let Some(batch) = self.batches.pop_front() else {
+        return false;
+      };
+      let remaining_payload_bytes = prefetched_batch_bytes(&batch);
+      self.buffered_bytes = self.buffered_bytes.saturating_sub(remaining_payload_bytes);
       if !active_partitions.contains_key(&batch.virtual_partition_id) {
         continue;
       }
 
-      metrics.batches_delivered.inc();
-      let remaining_payload_bytes = prefetched_batch_bytes(&batch);
       self.current_batch = Some(BufferedBatch {
         virtual_partition_id: batch.virtual_partition_id,
         end_offset: batch.seq_range.end,
@@ -194,6 +319,7 @@ impl DeliveryState {
         source: batch.source,
         admission_scan: batch.admission_scan,
         remaining_payload_bytes,
+        delivery_started: false,
         records: batch.records.into_iter(),
       });
     }
@@ -219,7 +345,7 @@ impl DeliveryState {
 
 /// Record the application-visible sequence boundary for one partition.
 fn record_delivery_offset(
-  active_partitions: &mut HashMap<VirtualPartitionId, ActivePartitionState>,
+  partition_state: &mut ActivePartitionState,
   virtual_partition_id: VirtualPartitionId,
   offset: u64,
   current_batch_end_offset: u64,
@@ -228,7 +354,6 @@ fn record_delivery_offset(
   admission_scan: Option<&Arc<ConsumerReaderScanSnapshot>>,
   metrics: &ConsumerIteratorMetrics,
 ) -> Option<DeliveryGap> {
-  let partition_state = active_partitions.get_mut(&virtual_partition_id)?;
   let gap = if let Some(expected_offset) = partition_state
     .delivery_gap_baseline
     .and_then(|baseline| baseline.checked_add(1))
@@ -257,28 +382,25 @@ fn record_delivery_offset(
 }
 
 /// Record source provenance in compact consecutive ranges for `store_offset` validation.
-pub(super) fn record_delivered_source(
-  active_partitions: &mut HashMap<VirtualPartitionId, ActivePartitionState>,
-  virtual_partition_id: VirtualPartitionId,
-  offset: u64,
+fn record_delivered_range(
+  partition_state: &mut ActivePartitionState,
+  start_offset: u64,
+  end_offset: u64,
   source_checkpoint: &CommittedSourceCheckpoint,
   source: &ConsumerBatchSource,
 ) {
-  let Some(partition_state) = active_partitions.get_mut(&virtual_partition_id) else {
-    return;
-  };
   if let Some(last) = partition_state.delivered_source_ranges.last_mut()
-    && last.end_offset.saturating_add(1) == offset
+    && last.end_offset.saturating_add(1) == start_offset
     && last.source_checkpoint == *source_checkpoint
     && last.source == *source
   {
-    last.end_offset = offset;
+    last.end_offset = end_offset;
   } else {
     partition_state
       .delivered_source_ranges
       .push(DeliveredSourceRange {
-        start_offset: offset,
-        end_offset: offset,
+        start_offset,
+        end_offset,
         source_checkpoint: source_checkpoint.clone(),
         source: source.clone(),
       });
@@ -287,10 +409,10 @@ pub(super) fn record_delivered_source(
     && last.source_checkpoint == *source_checkpoint
     && last.source == *source
   {
-    last.offset = offset;
+    last.offset = end_offset;
   } else {
     partition_state.last_delivered_source = Some(DeliveredSource {
-      offset,
+      offset: end_offset,
       source_checkpoint: source_checkpoint.clone(),
       source: source.clone(),
     });

@@ -6,6 +6,7 @@ use super::{
   ConsumerIterator,
   ConsumerSeekTarget,
   ConsumerSharedState,
+  NextBatchResult,
   NextResult,
 };
 use crate::coordination::HeartbeatReport;
@@ -16,6 +17,7 @@ use bd_log_util::WarnTracker;
 use blob_stream_types::VirtualPartitionId;
 use log::{trace, warn};
 use parking_lot::Mutex;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
 use time::ext::NumericalDuration;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -40,7 +42,7 @@ pub struct ConsumerIteratorImpl {
   pub(super) driver: Option<ConsumerDriver>,
   pub(super) driver_task: Option<JoinHandle<()>>,
   #[cfg(test)]
-  pub(super) next_after_delivery_state_check_hook: Option<NextAfterDeliveryStateCheckHook>,
+  pub(super) next_after_delivery_state_check_hook: Mutex<Option<NextAfterDeliveryStateCheckHook>>,
 }
 
 #[cfg(test)]
@@ -50,6 +52,68 @@ pub(super) struct NextAfterDeliveryStateCheckHook {
 }
 
 impl ConsumerIteratorImpl {
+  async fn next_delivery<Output, Gaps, Take>(&self, take_delivery: Take) -> Result<Output>
+  where
+    Output: Send,
+    Gaps: IntoIterator<Item = DeliveryGap> + Send,
+    Take: Fn(&mut ConsumerSharedState, &ConsumerIteratorMetrics) -> Option<(Output, Gaps)> + Send,
+  {
+    ensure!(
+      self.started,
+      "consumer iterator must be started before next"
+    );
+
+    loop {
+      let notified = self.delivery_notify.notified();
+      tokio::pin!(notified);
+      notified.as_mut().enable();
+      let (delivery_result, terminal_error) = {
+        let mut shared_state = self.shared_state.lock();
+        let pending_bytes = shared_state.diagnostics.prefetch_pending_bytes;
+        let delivery_result = take_delivery(&mut shared_state, &self.metrics);
+        update_worker_prefetch_metrics(&self.metrics, &shared_state.delivery_state);
+        update_total_prefetch_bytes(&self.metrics, &shared_state.delivery_state, pending_bytes);
+        (delivery_result, shared_state.terminal_error.clone())
+      };
+      #[cfg(test)]
+      {
+        let hook = if delivery_result.is_none() {
+          self.next_after_delivery_state_check_hook.lock().take()
+        } else {
+          None
+        };
+        if let Some(hook) = hook {
+          let _ = hook.state_checked.send(());
+          let _ = hook.release.await;
+        }
+      }
+      if let Some((next_result, gaps)) = delivery_result {
+        for gap in gaps {
+          if should_log_delivery_gap() {
+            let partition_state_json = self
+              .diagnostics
+              .state_snapshot()
+              .local
+              .partitions
+              .into_iter()
+              .find(|partition| partition.virtual_partition_id == gap.virtual_partition_id)
+              .and_then(|partition| serde_json::to_string(&partition).ok())
+              .unwrap_or_else(|| "null".to_string());
+            log_delivery_gap(&gap, &partition_state_json);
+          }
+        }
+        self.prefetch_space_notify.notify_waiters();
+        return Ok(next_result);
+      }
+
+      if let Some(error) = terminal_error {
+        return Err(anyhow!("consumer driver stopped: {error}"));
+      }
+
+      notified.await;
+    }
+  }
+
   /// Stops local consumer work without committing offsets or releasing group state.
   ///
   /// This intentionally models a process crash for integration tests. Production callers must
@@ -82,11 +146,11 @@ impl ConsumerIteratorImpl {
 
   #[cfg(test)]
   pub(super) fn set_next_after_delivery_state_check_hook(
-    &mut self,
+    &self,
     state_checked: oneshot::Sender<()>,
     release: oneshot::Receiver<()>,
   ) {
-    self.next_after_delivery_state_check_hook = Some(NextAfterDeliveryStateCheckHook {
+    *self.next_after_delivery_state_check_hook.lock() = Some(NextAfterDeliveryStateCheckHook {
       state_checked,
       release,
     });
@@ -118,59 +182,34 @@ impl ConsumerIterator for ConsumerIteratorImpl {
   }
 
   async fn next(&mut self) -> Result<NextResult> {
-    ensure!(
-      self.started,
-      "consumer iterator must be started before next"
-    );
+    self
+      .next_delivery(|shared_state, metrics| {
+        shared_state
+          .delivery_state
+          .try_take_next(&mut shared_state.active_partitions, metrics)
+          .map(|result| (result.next_result, result.gap))
+      })
+      .await
+  }
 
-    loop {
-      let notified = self.delivery_notify.notified();
-      tokio::pin!(notified);
-      notified.as_mut().enable();
-      let (delivery_result, terminal_error) = {
-        let mut shared_state = self.shared_state.lock();
-        let pending_bytes = shared_state.diagnostics.prefetch_pending_bytes;
-        let ConsumerSharedState {
-          active_partitions,
-          delivery_state,
-          terminal_error,
-          ..
-        } = &mut *shared_state;
-        let delivery_result = delivery_state.try_take_next(active_partitions, &self.metrics);
-        update_worker_prefetch_metrics(&self.metrics, delivery_state);
-        update_total_prefetch_bytes(&self.metrics, delivery_state, pending_bytes);
-        (delivery_result, terminal_error.clone())
-      };
-      #[cfg(test)]
-      if let Some(hook) = self.next_after_delivery_state_check_hook.take() {
-        let _ = hook.state_checked.send(());
-        let _ = hook.release.await;
-      }
-      if let Some(delivery_result) = delivery_result {
-        if let Some(gap) = delivery_result.gap
-          && should_log_delivery_gap()
-        {
-          let partition_state_json = self
-            .diagnostics
-            .state_snapshot()
-            .local
-            .partitions
-            .into_iter()
-            .find(|partition| partition.virtual_partition_id == gap.virtual_partition_id)
-            .and_then(|partition| serde_json::to_string(&partition).ok())
-            .unwrap_or_else(|| "null".to_string());
-          log_delivery_gap(&gap, &partition_state_json);
-        }
-        self.prefetch_space_notify.notify_waiters();
-        return Ok(delivery_result.next_result);
-      }
-
-      if let Some(error) = terminal_error {
-        return Err(anyhow!("consumer driver stopped: {error}"));
-      }
-
-      notified.await;
-    }
+  async fn next_batch(
+    &mut self,
+    max_records: NonZeroUsize,
+    max_bytes: NonZeroUsize,
+  ) -> Result<NextBatchResult> {
+    self
+      .next_delivery(|shared_state, metrics| {
+        shared_state
+          .delivery_state
+          .try_take_batch(
+            &mut shared_state.active_partitions,
+            metrics,
+            max_records,
+            max_bytes,
+          )
+          .map(|result| (result.next_result, result.gaps))
+      })
+      .await
   }
 
   fn store_offset(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()> {

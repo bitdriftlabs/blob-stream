@@ -107,6 +107,12 @@ invokes the revocation callback, and waits for that callback before activating r
 replacement owner hydrates its reader with the committed cursor and source checkpoint, then recovers
 through retention before entering the bounded Fast path.
 
+A batch already returned by `next_batch()` remains bounded in-flight application work if ownership
+is subsequently fenced. The fence removes unread queued records, not those already returned. Before
+acknowledging revocation, the application finishes or abandons that work and stages only processed
+offsets with their delivered source checkpoints. Pending revocation callbacks are returned before
+any additional batch, and no new revoked output is admitted.
+
 Read suspension is separate from commit eligibility. Before publishing a revocation, the iterator
 fences admission of revoked output while retaining final staged offsets and valid lease heartbeats
 through application acknowledgement. At the next serialized prefetch boundary, a revoked-only

@@ -184,6 +184,19 @@ DynamoDB replication-delay guarantee. Strong reads accept every valid row return
 
 ## Delivery, Loss, And Consistency
 
+`next()` delivers one record. `next_batch()` waits for the first record or a pending revocation,
+then drains immediately available records under one delivery-state lock without waiting to fill
+the batch. Its nonzero record-count and payload-byte limits bound each returned batch, except that
+an oversized first record is returned alone to guarantee progress. A drain can span sources and
+partitions while preserving delivery order and each record's source checkpoint. Undelivered records
+remain buffered; occupancy gauges and the prefetch-capacity notification update once per drain.
+
+Pending revocations take precedence over records. Cancellation while waiting does not consume
+records, and the iterator does not await after removing a ready batch. Returned records are bounded
+in-flight application work, not unread buffered work: a subsequent fence discards the unread suffix
+but preserves final commit eligibility for records already delivered. Applications must retain
+per-record offsets and source checkpoints and stage only processed progress.
+
 The consumer prefetches decoded batches within a byte budget and preserves planned output order. It
 may range-read one enclosing span for several selected batches from the same segment, accepting
 intentional overfetch to reduce object-store requests. Assignment revocation discards buffered

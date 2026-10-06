@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+use super::api::RevokedPartitionsImpl;
 use super::delivery::{BufferedBatch, DeliveryState};
 use super::driver::HeartbeatTrigger;
 use super::prefetch::{IdlePollBackoff, SeekTrace};
@@ -13,6 +14,7 @@ use super::{
   ConsumerLifecycleHooks,
   ConsumerSeekTarget,
   CoordinationSnapshot,
+  NextBatchResult,
   NextResult,
   TopicPartitionLayout,
 };
@@ -28,6 +30,7 @@ use crate::config::{
 use crate::consumer::{
   BrokerBlobRangeQuery,
   BrokerMetadataQuery,
+  ConsumerBatch,
   ConsumerBatchSource,
   ConsumerReader,
   ReadCapacity,
@@ -46,6 +49,7 @@ use crate::diagnostics::{
 };
 use bd_runtime_config::loader::Loader;
 use bd_server_stats::stats::Collector;
+use bd_server_stats::test::util::stats::Helper as StatsHelper;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use bd_time::SystemTimeProvider;
 use blob_stream_blob_store::{
@@ -109,9 +113,11 @@ use blob_stream_types::{
 };
 use bytes::Bytes;
 use parking_lot::Mutex;
+use prometheus::labels;
 use protobuf::Message;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
@@ -861,6 +867,7 @@ fn current_batch_for_fenced_partition_is_not_delivered() {
       },
       admission_scan: None,
       remaining_payload_bytes: 1,
+      delivery_started: true,
       records: vec![new_record(vec![1], 0)].into_iter(),
     }),
     ..Default::default()
@@ -894,6 +901,7 @@ fn current_batch_remaining_bytes_decrease_as_records_are_delivered() {
       },
       admission_scan: None,
       remaining_payload_bytes: 3,
+      delivery_started: true,
       records: vec![new_record(vec![1, 2, 3], 0)].into_iter(),
     }),
     ..Default::default()
@@ -913,6 +921,684 @@ fn current_batch_remaining_bytes_decrease_as_records_are_delivered() {
 }
 
 #[test]
+fn bulk_delivery_preserves_limits_offsets_and_source_ranges() {
+  let checkpoint = CommittedSourceCheckpoint {
+    window_start_unix_seconds: 0,
+    snowflake_id: 1,
+  };
+  let mut delivery_state = DeliveryState {
+    current_batch: Some(BufferedBatch {
+      virtual_partition_id: 7,
+      end_offset: 4,
+      next_offset: 1,
+      source_checkpoint: checkpoint.clone(),
+      source: ConsumerBatchSource {
+        blob_key: BlobKey::new("telemetry/0/1.bin"),
+        metadata_published_at: OffsetDateTime::UNIX_EPOCH,
+      },
+      admission_scan: None,
+      remaining_payload_bytes: 13,
+      delivery_started: true,
+      records: vec![
+        new_record(vec![1, 2, 3], 0),
+        new_record(vec![4, 5, 6], 0),
+        new_record(vec![7, 8, 9, 10, 11], 0),
+        new_record(vec![12, 13], 0),
+      ]
+      .into_iter(),
+    }),
+    ..Default::default()
+  };
+  let mut active_partitions = HashMap::from([(7, ActivePartitionState::default())]);
+  let stats = StatsHelper::default();
+  let metrics = ConsumerIteratorMetrics::new(&stats.collector().scope("bulk_delivery"));
+  let max_records = NonZeroUsize::new(2).unwrap();
+  let mut delivered = Vec::new();
+  for (expected_count, max_bytes) in [(2, 64), (1, 4), (1, 4)] {
+    let result = delivery_state
+      .try_take_batch(
+        &mut active_partitions,
+        &metrics,
+        max_records,
+        NonZeroUsize::new(max_bytes).unwrap(),
+      )
+      .unwrap();
+    let NextBatchResult::Records(records) = result.next_result else {
+      panic!("expected records");
+    };
+    assert_eq!(records.len(), expected_count);
+    assert!(result.gaps.is_empty());
+    assert!(
+      records
+        .iter()
+        .all(|record| record.source_checkpoint == checkpoint)
+    );
+    delivered.extend(records.into_iter().map(|record| record.offset));
+  }
+  assert_eq!(delivered, vec![1, 2, 3, 4]);
+  assert_eq!(delivery_state.retained_bytes(), 0);
+  stats.assert_counter_eq(4, "bulk_delivery:iterator:records_delivered", &labels! {});
+  let state = active_partitions.get(&7).unwrap();
+  assert_eq!(state.delivered_source_ranges.len(), 1);
+  assert_eq!(state.delivered_source_ranges[0].start_offset, 1);
+  assert_eq!(state.delivered_source_ranges[0].end_offset, 4);
+}
+
+fn bulk_delivery_batch(
+  partition: u32,
+  start: u64,
+  source_id: u64,
+  payload_sizes: &[usize],
+) -> ConsumerBatch {
+  ConsumerBatch {
+    virtual_partition_id: partition,
+    seq_range: SeqRange {
+      start,
+      end: start + u64::try_from(payload_sizes.len()).unwrap() - 1,
+    },
+    source_checkpoint: CommittedSourceCheckpoint {
+      window_start_unix_seconds: 0,
+      snowflake_id: source_id,
+    },
+    source: ConsumerBatchSource {
+      blob_key: BlobKey::new(format!("telemetry/0/{source_id}.bin")),
+      metadata_published_at: OffsetDateTime::UNIX_EPOCH,
+    },
+    admission_scan: None,
+    records: payload_sizes
+      .iter()
+      .map(|size| new_record(vec![1; *size], 0))
+      .collect(),
+  }
+}
+
+async fn bulk_delivery_iterator(
+  batches: Vec<ConsumerBatch>,
+) -> (ConsumerIteratorImpl, StatsHelper) {
+  let stats = StatsHelper::default();
+  let mut iterator = ConsumerIteratorImpl::from_config(
+    &runtime_config(),
+    Arc::new(InMemoryBlobStore::new()),
+    Arc::new(InMemoryMetadataStore::new()),
+    Arc::new(InMemoryConsumerGroupLeaseStore::new()),
+    Arc::new(InMemoryConsumerGroupMembershipStore::new()),
+    Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+      members: vec!["member-a".to_string()],
+      virtual_partitions: vec![7, 8],
+    })),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    stats.collector().scope("bulk_delivery"),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+    topic_layout(),
+  )
+  .await
+  .unwrap();
+  iterator.started = true;
+  {
+    let mut shared = iterator.shared_state.lock();
+    shared.active_partitions = HashMap::from([
+      (7, ActivePartitionState::default()),
+      (8, ActivePartitionState::default()),
+    ]);
+    shared.delivery_state.buffered_bytes = batches
+      .iter()
+      .flat_map(|batch| &batch.records)
+      .map(|record| record.payload.len() as u64)
+      .sum();
+    shared.delivery_state.batches.extend(batches);
+  }
+  (iterator, stats)
+}
+
+#[tokio::test]
+async fn single_delivery_preserves_payload_and_buffered_suffix_for_batch_read() {
+  let batch = bulk_delivery_batch(7, 1, 1, &[80, 2, 2]);
+  let payload_pointer = batch.records[0].payload.as_ptr();
+  let (mut iterator, stats) = bulk_delivery_iterator(vec![batch]).await;
+  let space_notify = iterator.prefetch_space_notify.clone();
+  let space_available = space_notify.notified();
+  tokio::pin!(space_available);
+  space_available.as_mut().enable();
+
+  let NextResult::Record(record) = iterator.next().await.unwrap() else {
+    panic!("expected a single record");
+  };
+  assert_eq!(record.offset, 1);
+  assert_eq!(record.record.payload.as_ptr(), payload_pointer);
+  assert_eq!(record.record.payload.len(), 80);
+  assert_eq!(
+    iterator.shared_state.lock().delivery_state.retained_bytes(),
+    4
+  );
+  stats.assert_counter_eq(
+    1,
+    "bulk_delivery:consumer:iterator:records_delivered",
+    &labels! {},
+  );
+  stats.assert_gauge_eq(
+    4,
+    "bulk_delivery:consumer:iterator:prefetch_total_bytes",
+    &labels! {},
+  );
+  assert!(
+    space_available
+      .as_mut()
+      .poll(&mut Context::from_waker(Waker::noop()))
+      .is_ready()
+  );
+  iterator.store_offset(7, record.offset).unwrap();
+  assert!(iterator.store_offset(7, 2).is_err());
+
+  let NextBatchResult::Records(records) = iterator
+    .next_batch(
+      NonZeroUsize::new(8).unwrap(),
+      NonZeroUsize::new(64).unwrap(),
+    )
+    .await
+    .unwrap()
+  else {
+    panic!("expected the remaining batch records");
+  };
+  assert_eq!(
+    records
+      .iter()
+      .map(|record| record.offset)
+      .collect::<Vec<_>>(),
+    vec![2, 3]
+  );
+  stats.assert_counter_eq(
+    3,
+    "bulk_delivery:consumer:iterator:records_delivered",
+    &labels! {},
+  );
+  stats.assert_gauge_eq(
+    0,
+    "bulk_delivery:consumer:iterator:prefetch_total_bytes",
+    &labels! {},
+  );
+}
+
+#[tokio::test]
+async fn bulk_delivery_crosses_sources_and_partitions_without_filling() {
+  let (mut iterator, stats) = bulk_delivery_iterator(vec![
+    bulk_delivery_batch(7, 1, 1, &[2, 2]),
+    bulk_delivery_batch(7, 4, 2, &[2]),
+    bulk_delivery_batch(8, 10, 3, &[2]),
+  ])
+  .await;
+  let result = iterator
+    .next_batch(
+      NonZeroUsize::new(8).unwrap(),
+      NonZeroUsize::new(64).unwrap(),
+    )
+    .await
+    .unwrap();
+  let NextBatchResult::Records(records) = result else {
+    panic!("expected records");
+  };
+  assert_eq!(
+    records
+      .iter()
+      .map(|record| (
+        record.virtual_partition_id,
+        record.offset,
+        record.source_checkpoint.snowflake_id
+      ))
+      .collect::<Vec<_>>(),
+    vec![(7, 1, 1), (7, 2, 1), (7, 4, 2), (8, 10, 3)]
+  );
+  stats.assert_counter_eq(
+    4,
+    "bulk_delivery:consumer:iterator:records_delivered",
+    &labels! {},
+  );
+  stats.assert_counter_eq(
+    3,
+    "bulk_delivery:consumer:iterator:batches_delivered",
+    &labels! {},
+  );
+  stats.assert_counter_eq(
+    1,
+    "bulk_delivery:consumer:iterator:delivery_gap_events",
+    &labels! {},
+  );
+  assert_eq!(
+    iterator.shared_state.lock().delivery_state.retained_bytes(),
+    0
+  );
+  iterator.store_offset(7, 2).unwrap();
+  assert_eq!(
+    iterator.shared_state.lock().active_partitions[&7]
+      .pending_commit
+      .as_ref()
+      .unwrap()
+      .source_checkpoint
+      .snowflake_id,
+    1
+  );
+  iterator.store_offset(7, 4).unwrap();
+  assert_eq!(
+    iterator.shared_state.lock().active_partitions[&7]
+      .pending_commit
+      .as_ref()
+      .unwrap()
+      .source_checkpoint
+      .snowflake_id,
+    2
+  );
+}
+
+#[tokio::test]
+async fn bulk_delivery_byte_boundary_keeps_the_undelivered_suffix() {
+  let (mut iterator, stats) = bulk_delivery_iterator(vec![
+    bulk_delivery_batch(7, 1, 1, &[3]),
+    bulk_delivery_batch(7, 2, 2, &[4, 1]),
+  ])
+  .await;
+  let max_records = NonZeroUsize::new(8).unwrap();
+  let max_bytes = NonZeroUsize::new(6).unwrap();
+  let NextBatchResult::Records(first) = iterator.next_batch(max_records, max_bytes).await.unwrap()
+  else {
+    panic!("expected records");
+  };
+  assert_eq!(first.len(), 1);
+  assert_eq!(first.capacity(), 1);
+  stats.assert_counter_eq(
+    1,
+    "bulk_delivery:consumer:iterator:batches_delivered",
+    &labels! {},
+  );
+  assert_eq!(
+    iterator.shared_state.lock().delivery_state.retained_bytes(),
+    5
+  );
+  assert!(iterator.store_offset(7, 2).is_err());
+  let NextBatchResult::Records(rest) = iterator.next_batch(max_records, max_bytes).await.unwrap()
+  else {
+    panic!("expected records");
+  };
+  assert_eq!(
+    rest.iter().map(|record| record.offset).collect::<Vec<_>>(),
+    vec![2, 3]
+  );
+  assert_eq!(rest.capacity(), 2);
+  stats.assert_counter_eq(
+    2,
+    "bulk_delivery:consumer:iterator:batches_delivered",
+    &labels! {},
+  );
+}
+
+#[tokio::test]
+async fn bulk_delivery_byte_boundary_does_not_count_a_fenced_source() {
+  let (mut iterator, stats) = bulk_delivery_iterator(vec![
+    bulk_delivery_batch(7, 1, 1, &[3]),
+    bulk_delivery_batch(7, 2, 2, &[4, 1]),
+  ])
+  .await;
+  let max_records = NonZeroUsize::new(8).unwrap();
+  let max_bytes = NonZeroUsize::new(6).unwrap();
+  let NextBatchResult::Records(records) =
+    iterator.next_batch(max_records, max_bytes).await.unwrap()
+  else {
+    panic!("expected first source record");
+  };
+  assert_eq!(records.len(), 1);
+  iterator
+    .shared_state
+    .lock()
+    .fence_reads(&HashSet::from([7]));
+  assert_eq!(
+    iterator.shared_state.lock().delivery_state.retained_bytes(),
+    0
+  );
+  stats.assert_counter_eq(
+    1,
+    "bulk_delivery:consumer:iterator:batches_delivered",
+    &labels! {},
+  );
+  stats.assert_counter_eq(
+    1,
+    "bulk_delivery:consumer:iterator:records_delivered",
+    &labels! {},
+  );
+}
+
+#[tokio::test]
+async fn bulk_delivery_cancellation_and_notification_preserve_records() {
+  let (mut iterator, _) = bulk_delivery_iterator(Vec::new()).await;
+  let max_records = NonZeroUsize::new(8).unwrap();
+  let max_bytes = NonZeroUsize::new(64).unwrap();
+  let (checked_tx, checked_rx) = oneshot::channel();
+  let (release_tx, release_rx) = oneshot::channel();
+  iterator.set_next_after_delivery_state_check_hook(checked_tx, release_rx);
+  let shared_state = iterator.shared_state.clone();
+  let notify = iterator.delivery_notify.clone();
+  let mut next = Box::pin(iterator.next_batch(max_records, max_bytes));
+  let mut context = Context::from_waker(Waker::noop());
+  assert!(next.as_mut().poll(&mut context).is_pending());
+  checked_rx.await.unwrap();
+  {
+    let mut shared = shared_state.lock();
+    shared
+      .delivery_state
+      .batches
+      .push_back(bulk_delivery_batch(7, 1, 1, &[2, 2]));
+    shared.delivery_state.buffered_bytes = 4;
+  }
+  notify.notify_waiters();
+  release_tx.send(()).unwrap();
+  let Poll::Ready(Ok(NextBatchResult::Records(records))) = next.as_mut().poll(&mut context) else {
+    panic!("batch notification was lost");
+  };
+  assert_eq!(records.len(), 2);
+  drop(next);
+  let mut cancelled = Box::pin(iterator.next_batch(max_records, max_bytes));
+  assert!(cancelled.as_mut().poll(&mut context).is_pending());
+  drop(cancelled);
+  {
+    let mut shared = shared_state.lock();
+    shared
+      .delivery_state
+      .batches
+      .push_back(bulk_delivery_batch(7, 3, 1, &[2]));
+    shared.delivery_state.buffered_bytes = 2;
+  }
+  let NextBatchResult::Records(records) =
+    iterator.next_batch(max_records, max_bytes).await.unwrap()
+  else {
+    panic!("expected records after cancellation");
+  };
+  assert_eq!(records[0].offset, 3);
+}
+
+async fn wait_for_bulk_driver_state(
+  iterator: &ConsumerIteratorImpl,
+  boundary: &str,
+  ready: impl Fn(&ConsumerStateSnapshot) -> bool,
+) {
+  timeout(Duration::from_secs(5), async {
+    loop {
+      if ready(&iterator.diagnostics.state_snapshot()) {
+        return;
+      }
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .unwrap_or_else(|error| {
+    panic!(
+      "{boundary}: {error}; snapshot={:?}",
+      iterator.diagnostics.state_snapshot()
+    )
+  });
+}
+
+#[tokio::test]
+async fn bulk_delivery_live_driver_seeks_commits_revokes_and_reacquires() {
+  let now = datetime!(2026-10-03 19:30:30 UTC);
+  let window = datetime!(2026-10-03 19:30:00 UTC).unix_timestamp();
+  let clock = Arc::new(ManualTimeProvider::new(now));
+  let blob_store = Arc::new(InMemoryBlobStore::new());
+  let metadata_store = Arc::new(InMemoryMetadataStore::new());
+  let leases = Arc::new(InMemoryConsumerGroupLeaseStore::new());
+  let snowflake = SnowflakeId::minimum_for_timestamp(now).as_u64();
+  for (source_id, start) in [(snowflake + 1, 1), (snowflake + 2, 3)] {
+    write_segment(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      "telemetry",
+      window,
+      source_id,
+      7,
+      SeqRange {
+        start,
+        end: start + 1,
+      },
+      vec![new_record(vec![1], window * 1000); 2],
+    )
+    .await;
+  }
+  let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![7],
+  }));
+  let (suspended_tx, suspended_rx) = oneshot::channel();
+  let hooks = Arc::new(ReadSuspensionHooks {
+    capacity: Mutex::new(None),
+    suspended: Mutex::new(Some(suspended_tx)),
+  });
+  let mut iterator = ConsumerIteratorBuilder::new(
+    &runtime_config(),
+    blob_store,
+    metadata_store,
+    leases.clone(),
+    Arc::new(InMemoryConsumerGroupMembershipStore::new()),
+    source.clone(),
+    rejecting_broker_metadata_query(),
+    rejecting_broker_blob_range_query(),
+    metrics_scope(),
+    TimeDuration::days(1),
+    DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+    None,
+    topic_layout(),
+  )
+  .time_provider(clock.clone())
+  .lifecycle_hooks(hooks)
+  .build()
+  .await
+  .unwrap();
+  iterator.start().unwrap();
+  wait_for_bulk_driver_state(&iterator, "initial sources were not prefetched", |state| {
+    state.prefetch_buffered_batch_count == 2
+  })
+  .await;
+  let max_records = NonZeroUsize::new(usize::MAX).unwrap();
+  let max_bytes = NonZeroUsize::new(3).unwrap();
+  let NextBatchResult::Records(first) = iterator.next_batch(max_records, max_bytes).await.unwrap()
+  else {
+    panic!("expected initial source batch");
+  };
+  assert_eq!(first.capacity(), 3);
+  assert_eq!(
+    first
+      .iter()
+      .map(|record| (record.offset, record.source_checkpoint.snowflake_id))
+      .collect::<Vec<_>>(),
+    vec![(1, snowflake + 1), (2, snowflake + 1), (3, snowflake + 2)]
+  );
+  assert!(iterator.store_offset(7, 4).is_err());
+  iterator
+    .seek(
+      7,
+      ConsumerSeekTarget {
+        offset: 0,
+        window_start_unix_seconds: window,
+        snowflake_id: Some(snowflake + 1),
+      },
+    )
+    .await
+    .unwrap();
+  wait_for_bulk_driver_state(&iterator, "seek did not prefetch both sources", |state| {
+    state.prefetch_buffered_batch_count == 2
+  })
+  .await;
+  let NextBatchResult::Records(inflight) =
+    iterator.next_batch(max_records, max_bytes).await.unwrap()
+  else {
+    panic!("expected replayed batch");
+  };
+  assert_eq!(inflight, first);
+  source.update(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![8],
+  });
+  timeout(Duration::from_secs(5), clock.wait_until_sleeping(2))
+    .await
+    .unwrap();
+  clock.advance(TimeDuration::milliseconds(10));
+  assert_eq!(
+    timeout(Duration::from_secs(5), suspended_rx)
+      .await
+      .unwrap()
+      .unwrap(),
+    vec![7]
+  );
+  wait_for_bulk_driver_state(&iterator, "revocation was not published", |state| {
+    state.local.pending_revocation
+  })
+  .await;
+  assert!(
+    iterator
+      .shared_state
+      .lock()
+      .read_fenced_partitions
+      .contains_key(&7)
+  );
+  assert_eq!(
+    iterator.shared_state.lock().delivery_state.retained_bytes(),
+    0
+  );
+  let NextBatchResult::Revoked(revoked) =
+    iterator.next_batch(max_records, max_bytes).await.unwrap()
+  else {
+    panic!("expected ownership-loss notification");
+  };
+  assert_eq!(revoked.partitions(), vec![7]);
+  iterator.store_offset(7, 3).unwrap();
+  assert!(iterator.store_offset(7, 4).is_err());
+  iterator.commit().await.unwrap();
+  let lease = leases
+    .list_group_leases("telemetry", "group-a")
+    .await
+    .unwrap()
+    .into_iter()
+    .find(|lease| lease.key.virtual_partition_id == 7)
+    .unwrap();
+  let cursor = lease.committed_cursor.unwrap();
+  assert_eq!(cursor.seq_end, 3);
+  assert_eq!(
+    cursor.source_checkpoint,
+    Some(inflight[2].source_checkpoint.clone())
+  );
+  let mut fenced = Box::pin(iterator.next_batch(max_records, max_bytes));
+  assert!(
+    fenced
+      .as_mut()
+      .poll(&mut Context::from_waker(Waker::noop()))
+      .is_pending()
+  );
+  drop(fenced);
+  revoked.complete().await;
+  wait_for_bulk_driver_state(
+    &iterator,
+    "replacement assignment was not activated",
+    |state| active_partition_ids(state) == vec![8],
+  )
+  .await;
+
+  source.update(CoordinationSnapshot {
+    members: vec!["member-a".to_string()],
+    virtual_partitions: vec![7],
+  });
+  timeout(Duration::from_secs(5), clock.wait_until_sleeping(2))
+    .await
+    .unwrap();
+  clock.advance(TimeDuration::milliseconds(10));
+  let NextBatchResult::Revoked(revoked) = timeout(
+    Duration::from_secs(5),
+    iterator.next_batch(max_records, max_bytes),
+  )
+  .await
+  .unwrap()
+  .unwrap() else {
+    panic!("expected replacement partition revocation");
+  };
+  assert_eq!(revoked.partitions(), vec![8]);
+  revoked.complete().await;
+  timeout(Duration::from_secs(5), clock.wait_until_sleeping(2))
+    .await
+    .unwrap();
+  clock.advance(TimeDuration::milliseconds(10));
+  wait_for_bulk_driver_state(
+    &iterator,
+    "original partition was not reacquired",
+    |state| active_partition_ids(state) == vec![7],
+  )
+  .await;
+  let NextBatchResult::Records(resumed) = timeout(
+    Duration::from_secs(5),
+    iterator.next_batch(max_records, max_bytes),
+  )
+  .await
+  .unwrap()
+  .unwrap() else {
+    panic!("expected records after reacquisition");
+  };
+  assert_eq!(
+    resumed
+      .iter()
+      .map(|record| record.offset)
+      .collect::<Vec<_>>(),
+    vec![4]
+  );
+  assert_eq!(resumed[0].source_checkpoint, inflight[2].source_checkpoint);
+  iterator.store_offset(7, 4).unwrap();
+  iterator.commit().await.unwrap();
+  Box::new(iterator).shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn bulk_delivery_revocation_fences_queued_records_and_preserves_inflight_progress() {
+  let (mut iterator, _) =
+    bulk_delivery_iterator(vec![bulk_delivery_batch(7, 1, 1, &[2, 2, 2])]).await;
+  let max_bytes = NonZeroUsize::new(64).unwrap();
+  let NextBatchResult::Records(inflight) = iterator
+    .next_batch(NonZeroUsize::new(2).unwrap(), max_bytes)
+    .await
+    .unwrap()
+  else {
+    panic!("expected inflight records");
+  };
+  let (completion_tx, completion_rx) = oneshot::channel();
+  {
+    let mut shared = iterator.shared_state.lock();
+    shared.fence_reads(&HashSet::from([7]));
+    shared.delivery_state.revocation_in_progress = true;
+    shared.delivery_state.pending_revocation =
+      Some(NextResult::Revoked(Box::new(RevokedPartitionsImpl {
+        revoked: vec![7],
+        completion_tx: Some(completion_tx),
+        completion_notify: Arc::new(tokio::sync::Notify::new()),
+      })));
+  }
+  iterator
+    .store_offset(7, inflight.last().unwrap().offset)
+    .unwrap();
+  assert!(iterator.store_offset(7, 3).is_err());
+  let NextBatchResult::Revoked(revoked) = iterator
+    .next_batch(NonZeroUsize::MIN, max_bytes)
+    .await
+    .unwrap()
+  else {
+    panic!("expected revocation before more records");
+  };
+  assert_eq!(revoked.partitions(), vec![7]);
+  revoked.complete().await;
+  completion_rx.await.unwrap();
+  let mut next = Box::pin(iterator.next_batch(NonZeroUsize::MIN, max_bytes));
+  assert!(
+    next
+      .as_mut()
+      .poll(&mut Context::from_waker(Waker::noop()))
+      .is_pending()
+  );
+}
+
+#[test]
 fn delivered_record_after_a_gap_records_the_missing_sequences() {
   let mut delivery_state = DeliveryState {
     current_batch: Some(BufferedBatch {
@@ -929,6 +1615,7 @@ fn delivered_record_after_a_gap_records_the_missing_sequences() {
       },
       admission_scan: None,
       remaining_payload_bytes: 1,
+      delivery_started: true,
       records: vec![new_record(vec![1], 0)].into_iter(),
     }),
     ..Default::default()
