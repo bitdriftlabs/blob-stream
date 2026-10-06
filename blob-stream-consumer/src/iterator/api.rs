@@ -3,6 +3,7 @@ use crate::diagnostics::ConsumerDiagnostics;
 use anyhow::Result;
 use async_trait::async_trait;
 use blob_stream_types::{CommittedSourceCheckpoint, Record, VirtualPartitionId};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::sync::{Notify, oneshot};
 
@@ -107,6 +108,12 @@ pub enum NextResult {
   /// Next available record for an owned partition.
   Record(ConsumerRecord),
   /// Notification that partitions were revoked and must be drained.
+  Revoked(Box<dyn RevokedPartitions>),
+}
+
+/// A bounded group of delivered records, or an ownership-loss notification.
+pub enum NextBatchResult {
+  Records(Vec<ConsumerRecord>),
   Revoked(Box<dyn RevokedPartitions>),
 }
 
@@ -223,8 +230,16 @@ impl ConsumerLifecycleHooks for NoopConsumerLifecycleHooks {}
 pub trait ConsumerIterator: Send + Sync {
   /// Start iterator processing and initialize internal timers/state.
   fn start(&mut self) -> Result<()>;
-  /// Poll for either a new batch or revocation event.
+  /// Poll for either a record or revocation event.
   async fn next(&mut self) -> Result<NextResult>;
+  /// Wait for the first record, then drain immediately available records within both limits.
+  /// An oversized first record is returned alone. Revocations take priority over queued records.
+  async fn next_batch(&mut self, _: NonZeroUsize, _: NonZeroUsize) -> Result<NextBatchResult> {
+    Ok(match self.next().await? {
+      NextResult::Record(record) => NextBatchResult::Records(vec![record]),
+      NextResult::Revoked(revoked) => NextBatchResult::Revoked(revoked),
+    })
+  }
   /// Stage an offset for commit on the next `commit`/heartbeat.
   fn store_offset(&mut self, virtual_partition_id: VirtualPartitionId, offset: u64) -> Result<()>;
   /// Flush staged offsets without renewing unrelated partition leases.
