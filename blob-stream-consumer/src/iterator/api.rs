@@ -234,7 +234,11 @@ pub trait ConsumerIterator: Send + Sync {
   async fn next(&mut self) -> Result<NextResult>;
   /// Wait for the first record, then drain immediately available records within both limits.
   /// An oversized first record is returned alone. Revocations take priority over queued records.
-  async fn next_batch(&mut self, _: NonZeroUsize, _: NonZeroUsize) -> Result<NextBatchResult> {
+  async fn next_batch(
+    &mut self,
+    _max_records: NonZeroUsize,
+    _max_bytes: NonZeroUsize,
+  ) -> Result<NextBatchResult> {
     Ok(match self.next().await? {
       NextResult::Record(record) => NextBatchResult::Records(vec![record]),
       NextResult::Revoked(revoked) => NextBatchResult::Revoked(revoked),
