@@ -200,8 +200,8 @@ pub(super) fn decode_metadata_response(
     .consistency
     .enum_value()
     .map_err(|_| anyhow!("broker metadata request has an unsupported consistency"))?;
-  // Ordinary eventual coverage cannot satisfy a strong request. Retained strong coverage must
-  // carry its original observation time: a fresh suffix read cannot retroactively seal a prefix.
+  // Ordinary eventual coverage cannot satisfy a strong request. A composite strong proof must
+  // cover the retained prefix as well as any freshly scanned suffix.
   ensure!(
     consistency == MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL
       || !success.retained_coverage,

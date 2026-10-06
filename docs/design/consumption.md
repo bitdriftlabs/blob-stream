@@ -92,7 +92,18 @@ requests require coverage of every participating partition's lower interval and 
 advanced valid seal, including mixed Recovery and Fast requests. An uncovered interval forces the
 original query. An unbounded Recovery request becomes bounded only after its complete lower interval
 has been observed. Contiguous strong observations can extend a prefix without changing its earlier
-rows; elapsed time does not extend coverage.
+rows; elapsed time does not extend coverage. A strong scan started at time `T` proves completeness
+below the Snowflake bound for `T` minus its publication-lag, clock-skew, and requested-horizon
+budget. Once `[L, S1)` is sealed by a scan started at `T1`, its rows cannot be published later.
+A strong scan started at `T2 >= T1` from at or before `S1` can therefore join `[S1, S2)` to the
+retained prefix when `S2` is safe at `T2`, including when the new interval is empty. The broker
+records `T2` as the composite proof time and retains `[L, S2)`; each response caps the seal at
+its caller's requested bound and safety horizon. A promoted prefix is reusable only for horizons
+no stricter than the one that certified its composite scan. A stricter caller gets a fresh strong
+scan from its original request floor, not a seal inferred from the newer proof time. Open suffixes
+still require strong storage reads; once a window is fully sealed, a retained strong hit needs no
+storage query. The reader separately validates adjacent strong observations before extending its
+local prefix.
 
 Recovery retains a next-unexamined position in each partition/window's immutable snapshot, validated
 against the accepted cursor, snapshot identity, and the position's initial query floor. Relaxing that
