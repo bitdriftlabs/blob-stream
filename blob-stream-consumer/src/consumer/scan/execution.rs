@@ -953,9 +953,9 @@ impl ConsumerReaderImpl {
     } = finalization;
     let mut initial_scans_completed = Vec::new();
     let mut recoveries_completed = Vec::new();
-    // A Fresh scan covers its assigned current window. Once complete, Fast starts at this pass's
-    // safety floor; any part of the preceding window that ages safe on the next pass is handled by
-    // the planner's one-window Fast tail rather than by a transient Recovery transition.
+    // A Fresh scan covers only its assigned window. Fast starts at the lesser of this pass's
+    // safety floor and that window's end; the planner's one-window Fast tail handles any part of
+    // the preceding window that ages safe on the next pass.
     let fast_coverage_floor = self.fast_scan_safe_timestamp(now, runtime_settings);
     let availability_horizon = self.availability_horizon(runtime_settings).duration();
     for (partition_id, state) in &mut self.virtual_partition_states {
@@ -971,10 +971,19 @@ impl ConsumerReaderImpl {
             .is_some_and(|partition| partition.fresh_deferred_by_visibility)
           && !capacity_deferred_fresh_window_starts.contains(initial_window_start_unix_seconds) =>
         {
-          initial_scans_completed.push((*partition_id, *initial_window_start_unix_seconds));
+          let initial_window_end = offset_datetime_from_unix_seconds(
+            initial_window_start_unix_seconds
+              .saturating_add(self.metadata_window_size.whole_seconds()),
+          );
+          let coverage_floor = fast_coverage_floor.min(initial_window_end);
+          initial_scans_completed.push((
+            *partition_id,
+            *initial_window_start_unix_seconds,
+            coverage_floor,
+          ));
           next_state = Some(VirtualPartitionState::Fast {
             cursor: *cursor,
-            coverage_floor: Some(fast_coverage_floor),
+            coverage_floor: Some(coverage_floor),
             gap: None,
             last_scan: None,
           });
@@ -1015,6 +1024,11 @@ impl ConsumerReaderImpl {
           if recovery_state.next_window_start_unix_seconds
             > recovery_state.cutover_window_start_unix_seconds
           {
+            let cutover_window_end = offset_datetime_from_unix_seconds(
+              recovery_state
+                .cutover_window_start_unix_seconds
+                .saturating_add(self.metadata_window_size.whole_seconds()),
+            );
             let coverage_floor = self
               .metadata_cache
               .prefix(&MetadataWindowKey {
@@ -1028,12 +1042,18 @@ impl ConsumerReaderImpl {
                   )
               })
               .and_then(|prefix| prefix.sealed_before.timestamp())
-              .unwrap_or_else(|| {
-                offset_datetime_from_unix_seconds(recovery_state.cutover_window_start_unix_seconds)
-              });
+              .map_or_else(
+                || {
+                  offset_datetime_from_unix_seconds(
+                    recovery_state.cutover_window_start_unix_seconds,
+                  )
+                },
+                |floor| floor.min(cutover_window_end),
+              );
             recoveries_completed.push((
               *partition_id,
               recovery_state.cutover_window_start_unix_seconds,
+              coverage_floor,
             ));
             next_state = Some(VirtualPartitionState::Fast {
               cursor: *cursor,
@@ -1053,22 +1073,25 @@ impl ConsumerReaderImpl {
         *state = next_state;
       }
     }
-    for (partition_id, initial_window_start_unix_seconds) in initial_scans_completed {
+    for (partition_id, initial_window_start_unix_seconds, coverage_floor) in initial_scans_completed
+    {
       info!(
         "consumer partition initial scan completed; fast path active: topic={}, partition={}, \
-         initial_window={}",
+         initial_window={}, fast_coverage_floor={}",
         self.config.topic,
         partition_id,
-        offset_datetime_from_unix_seconds(initial_window_start_unix_seconds)
+        offset_datetime_from_unix_seconds(initial_window_start_unix_seconds),
+        coverage_floor
       );
     }
-    for (partition_id, cutover_window_start_unix_seconds) in recoveries_completed {
+    for (partition_id, cutover_window_start_unix_seconds, coverage_floor) in recoveries_completed {
       info!(
         "consumer partition recovery completed; fast path active: topic={}, partition={}, \
-         cutover_window={}",
+         cutover_window={}, fast_coverage_floor={}",
         self.config.topic,
         partition_id,
-        offset_datetime_from_unix_seconds(cutover_window_start_unix_seconds)
+        offset_datetime_from_unix_seconds(cutover_window_start_unix_seconds),
+        coverage_floor
       );
     }
 

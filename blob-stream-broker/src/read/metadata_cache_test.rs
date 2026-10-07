@@ -1069,6 +1069,109 @@ async fn retains_strong_reads_of_sealed_windows() {
 }
 
 #[tokio::test]
+async fn strong_seals_stop_at_window_end_on_refill_and_reuse() {
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let window_end = SnowflakeId::minimum_for_timestamp(timestamp(300));
+  for full_recovery in [false, true] {
+    let store = Arc::new(CountingMetadataStore {
+      scans: AtomicUsize::new(0),
+      observed_bounds: Mutex::new(Vec::new()),
+      segments: Vec::new(),
+    });
+    let cache = Arc::new(
+      MetadataCache::new(
+        store.clone(),
+        cache_config(Duration::seconds(1), StdDuration::ZERO),
+        None,
+      )
+      .time_provider(Arc::new(ManualTimeProvider::new(timestamp(500)))),
+    );
+    let mut request = if full_recovery {
+      full_recovery_request()
+    } else {
+      tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG)
+    };
+    request.window_start_unix_seconds = window_start;
+    request.consistency = MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG.into();
+    request.requested_seal_before =
+      Some(SnowflakeId::minimum_for_timestamp(timestamp(303)).as_u64());
+    for retained in [false, true] {
+      let Some(read_metadata_window_response::Result::Success(success)) =
+        cache.read(request.clone()).await.result
+      else {
+        panic!("strong metadata read must succeed");
+      };
+      assert_eq!(success.sealed_before, Some(window_end.as_u64()));
+      assert_eq!(success.retained_strong_coverage, retained);
+      assert!(!success.retained_coverage);
+    }
+    assert_eq!(store.scans.load(Ordering::Relaxed), 1);
+    let specification = cache.validate_request(&request).unwrap();
+    assert_eq!(specification.requested_seal_before, Some(window_end));
+    assert_eq!(
+      cache
+        .strong_sealed_entries
+        .get(&specification.key)
+        .await
+        .unwrap()
+        .sealed_before,
+      Some(window_end)
+    );
+  }
+}
+
+#[tokio::test]
+async fn retained_oversized_seal_is_bounded_by_the_current_window_request() {
+  let window_start = 1_735_689_600;
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
+  let store = Arc::new(CountingMetadataStore {
+    scans: AtomicUsize::new(0),
+    observed_bounds: Mutex::new(Vec::new()),
+    segments: Vec::new(),
+  });
+  let cache = Arc::new(
+    MetadataCache::new(
+      store.clone(),
+      cache_config(Duration::seconds(1), StdDuration::ZERO),
+      None,
+    )
+    .time_provider(Arc::new(ManualTimeProvider::new(timestamp(500)))),
+  );
+  let mut request = tail_request(0, MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG);
+  request.window_start_unix_seconds = window_start;
+  request.requested_seal_before = Some(SnowflakeId::minimum_for_timestamp(timestamp(303)).as_u64());
+  let specification = cache.validate_request(&request).unwrap();
+  cache
+    .strong_sealed_entries
+    .insert(
+      specification.key,
+      Arc::new(CacheEntry {
+        refill_floor: Some(SnowflakeId(0)),
+        observed_at: timestamp(500),
+        sealed_before: Some(SnowflakeId::minimum_for_timestamp(timestamp(400))),
+        sealed_at: Some(timestamp(500)),
+        retained_bytes: 0,
+        generation: 1,
+        prefix_segments: None,
+        segments: Arc::from([]),
+      }),
+    )
+    .await;
+  let Some(read_metadata_window_response::Result::Success(success)) =
+    cache.read(request).await.result
+  else {
+    panic!("retained metadata read must succeed");
+  };
+  assert_eq!(
+    success.sealed_before,
+    Some(SnowflakeId::minimum_for_timestamp(timestamp(300)).as_u64())
+  );
+  assert!(success.retained_strong_coverage);
+  assert_eq!(store.scans.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn slow_strong_scan_seals_only_the_pre_scan_safe_prefix() {
   let window_start = 1_735_689_600;
   let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset).unwrap();
