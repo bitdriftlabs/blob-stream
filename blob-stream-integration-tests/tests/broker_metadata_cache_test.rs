@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow};
+use bd_runtime_config::loader::Loader;
 use bd_server_stats::test::util::stats::Helper;
+use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_consumer::EventualMetadataReadsConfig;
 use blob_stream_consumer::iterator::{ConsumerIterator, NextResult};
@@ -45,6 +47,171 @@ fn eventual_metadata_reads(visibility_delay: TimeDuration) -> EventualMetadataRe
     visibility_delay: visibility_delay.into_proto(),
     ..Default::default()
   }
+}
+
+#[tokio::test]
+async fn broker_recovery_crossing_rollover_preserves_shared_partition_prefixes() -> Result<()> {
+  const MEMBER: &str = "rollover-replacement";
+  let resources = IntegrationResources::create().await?;
+  let window_start = Window::for_timestamp(
+    OffsetDateTime::now_utc(),
+    TimeDuration::seconds(WINDOW_SIZE_SECONDS),
+  )
+  .start
+  .unix_timestamp();
+  let next_window_start = window_start + WINDOW_SIZE_SECONDS;
+  let assigned_at = OffsetDateTime::from_unix_timestamp(window_start + 290)?;
+  let scan_at =
+    OffsetDateTime::from_unix_timestamp(next_window_start + 18)? + TimeDuration::milliseconds(320);
+  let read_clock = Arc::new(framework::ManualTimeProvider::new(assigned_at));
+  let coordination_clock = Arc::new(framework::ManualTimeProvider::new(assigned_at));
+  let blob_store = resources.blob_store();
+  let metadata_store = resources.metadata_store();
+  for (sequence, source_at) in [
+    (10, window_start + 280),
+    (11, window_start + 299),
+    (12, next_window_start + 1),
+    (13, next_window_start + 4),
+  ] {
+    let source_at = OffsetDateTime::from_unix_timestamp(source_at)?;
+    let payload_zero = format!("0:{sequence}");
+    let payload_one = format!("1:{sequence}");
+    write_recovery_segment_for_partitions(
+      blob_store.as_ref(),
+      metadata_store.as_ref(),
+      Window::for_timestamp(source_at, TimeDuration::seconds(WINDOW_SIZE_SECONDS))
+        .start
+        .unix_timestamp(),
+      SnowflakeId::minimum_for_timestamp(source_at).as_u64(),
+      &[(0, sequence, &payload_zero), (1, sequence, &payload_one)],
+    )
+    .await?;
+  }
+  let leases = resources.consumer_lease_store();
+  for (partition, committed, source_at) in
+    [(0, 10, window_start + 280), (1, 11, window_start + 299)]
+  {
+    let key = ConsumerGroupLeaseKey {
+      topic: TOPIC.to_string(),
+      group_id: "integration-group".to_string(),
+      virtual_partition_id: partition,
+    };
+    leases
+      .assign_partition(
+        key.clone(),
+        "departing-member".to_string(),
+        1,
+        assigned_at,
+        TimeDuration::seconds(2),
+      )
+      .await?;
+    leases
+      .commit_cursor(
+        &key,
+        "departing-member",
+        1,
+        assigned_at,
+        CommittedCursor {
+          virtual_partition_id: partition,
+          seq_end: committed,
+          source_checkpoint: Some(CommittedSourceCheckpoint {
+            window_start_unix_seconds: window_start,
+            snowflake_id: SnowflakeId::minimum_for_timestamp(OffsetDateTime::from_unix_timestamp(
+              source_at,
+            )?)
+            .as_u64(),
+          }),
+        },
+      )
+      .await?;
+    leases
+      .release_partition(&key, "departing-member", 1, assigned_at)
+      .await?;
+  }
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .partition_count(2)
+    .consumer_time_provider(read_clock.clone())
+    .consumer_coordination_time_provider(coordination_clock)
+    .broker_time_provider(read_clock.clone())
+    .metadata_cache_time_provider(read_clock.clone())
+    .metadata_cache_timing(TimeDuration::ZERO, TimeDuration::seconds(5))
+    .start()
+    .await?;
+  let mut runtime = consumer_runtime_config(MEMBER);
+  runtime
+    .read
+    .as_mut()
+    .ok_or_else(|| anyhow!("rollover reader config missing"))?
+    .prefetch_max_bytes = Some(1);
+  let feature_flags = FakeLoader::new(Arc::new(DefaultFeatureFlags::default().with_bool_flag(
+    "blob_stream_consumer_broker_metadata_direct_fallback",
+    false,
+  )))
+  .snapshot_watch();
+  let mut consumer = cluster
+    .create_consumer_with_feature_flags(&runtime, feature_flags)
+    .await?;
+  let assigned = leases.list_group_leases(TOPIC, "integration-group").await?;
+  assert_eq!(assigned.len(), 2);
+  assert!(assigned.iter().all(|lease| lease.owner_id == MEMBER));
+  read_clock.set_time(scan_at);
+  consumer.start()?;
+  let mut delivered = HashMap::from([(0, Vec::new()), (1, Vec::new())]);
+  let mut last_delivered = HashMap::from([(0, 10), (1, 11)]);
+  timeout(Duration::from_secs(10), async {
+    while delivered.values().map(Vec::len).sum::<usize>() < 5 {
+      match consumer.next().await? {
+        NextResult::Revoked(revoked) => revoked.complete().await,
+        NextResult::Record(record) => {
+          let previous = last_delivered
+            .get_mut(&record.virtual_partition_id)
+            .unwrap();
+          assert_eq!(record.offset, *previous + 1);
+          *previous = record.offset;
+          assert_eq!(
+            String::from_utf8(record.record.payload.to_vec())?,
+            format!("{}:{}", record.virtual_partition_id, record.offset)
+          );
+          delivered
+            .get_mut(&record.virtual_partition_id)
+            .unwrap()
+            .push(record.offset);
+          consumer.store_offset(record.virtual_partition_id, record.offset)?;
+        },
+      }
+    }
+    Ok::<_, anyhow::Error>(())
+  })
+  .await
+  .map_err(|_| anyhow!("rollover recovery did not deliver every contiguous offset"))??;
+  assert_eq!(
+    delivered,
+    HashMap::from([(0, vec![11, 12, 13]), (1, vec![12, 13])])
+  );
+  consumer.commit().await?;
+  let committed = leases.list_group_leases(TOPIC, "integration-group").await?;
+  assert_eq!(committed.len(), 2);
+  for lease in committed {
+    assert_eq!(lease.owner_id, MEMBER);
+    assert_eq!(
+      lease.committed_cursor,
+      Some(CommittedCursor {
+        virtual_partition_id: lease.key.virtual_partition_id,
+        seq_end: 13,
+        source_checkpoint: Some(CommittedSourceCheckpoint {
+          window_start_unix_seconds: next_window_start,
+          snowflake_id: SnowflakeId::minimum_for_timestamp(OffsetDateTime::from_unix_timestamp(
+            next_window_start + 4
+          )?,)
+          .as_u64(),
+        }),
+      })
+    );
+  }
+  Box::new(consumer).shutdown().await?;
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
 }
 
 #[tokio::test]

@@ -1469,6 +1469,17 @@ impl MetadataCache {
       consistency,
       coverage,
     };
+    let requested_seal_before = if let Some(requested) = request.requested_seal_before {
+      let window_end = OffsetDateTime::from_unix_timestamp(
+        request
+          .window_start_unix_seconds
+          .saturating_add(topic.metadata_window_size.whole_seconds()),
+      )
+      .map_err(|_| anyhow!("metadata window end is out of range"))?;
+      Some(SnowflakeId(requested).min(SnowflakeId::minimum_for_timestamp(window_end)))
+    } else {
+      None
+    };
     Ok(ReadSpecification {
       key,
       window: TopicWindowKey {
@@ -1480,7 +1491,7 @@ impl MetadataCache {
       coverage,
       partitions: partition_ids,
       min_by_partition,
-      requested_seal_before: request.requested_seal_before.map(SnowflakeId),
+      requested_seal_before,
       requested_seal_horizon: request.requested_seal_horizon_ms.map_or(
         Ok(Duration::ZERO),
         |milliseconds| {
@@ -1899,7 +1910,12 @@ fn response_from_entry(
         refill_floor: entry.refill_floor.map(SnowflakeId::as_u64),
         generation: entry.generation,
         retained_coverage,
-        sealed_before: entry.sealed_before.map(SnowflakeId::as_u64),
+        sealed_before: entry.sealed_before.map(|bound| {
+          specification
+            .requested_seal_before
+            .map_or(bound, |requested| bound.min(requested))
+            .as_u64()
+        }),
         sealed_at_unix_ms: entry
           .sealed_before
           .and(entry.sealed_at)

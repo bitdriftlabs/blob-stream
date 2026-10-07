@@ -64,7 +64,9 @@ window.
 A partition moves through these modes:
 
 1. **Fresh:** No committed cursor or source checkpoint exists. The reader scans the current aligned
-   window and becomes Fast after completing it without a visibility or capacity barrier.
+   window captured at assignment and becomes Fast after completing it without a visibility or
+   capacity barrier. Its initial Fast coverage floor is the lesser of the scan's safety floor and
+   that captured window's end, even if the scan is delayed across later windows.
 2. **Recovering:** A resumed partition starts at the checkpoint window, clamped to retention, and
    scans chronologically to a captured current-window cutover. A usable checkpoint applies an
    inclusive overlap bound only to its first window; later windows are full scans. Recovery scans
@@ -77,12 +79,14 @@ A partition moves through these modes:
 The reader retains complete mature windows and per-partition sealed Recovery and Fast prefixes. A
 prefix `[window lower bound, sealed_before)` is installed only after a complete strong scan whose
 original observation proves the metadata publication deadline has passed; neither an eventual
-response nor elapsed time alone establishes that proof. The broker caps a requested seal using its
-publication-lag and clock-skew budget measured before the storage scan begins, even when the
-refill's first caller did not request a seal, and returns that original observation. Direct strong
-scans use the same pre-scan proof time. The reader also caps the seal at its pass-start Fast safety
-floor, validates broker proofs against its own horizon, and falls back to direct strong storage on
-an unusable broker response. Later passes process cached batches before asking for the inclusive
+response nor elapsed time alone establishes that proof. A seal cannot extend beyond the queried
+window's end. The broker caps a requested seal using that window boundary and its publication-lag
+and clock-skew budget measured before the storage scan begins, even when the refill's first caller
+did not request a seal, and returns that original observation. Retained responses also bound their
+seal by the current caller's window-bounded request. Direct strong scans use the same window bound
+and pre-scan proof time. The reader also caps the seal at its pass-start Fast safety floor,
+validates broker proofs against its own horizon, and falls back to direct strong storage on an
+unusable broker response. Later passes process cached batches before asking for the inclusive
 `[sealed_before, window end)` suffix; capacity admission can defer that query altogether. Shared
 requests require coverage of every participating partition's lower interval and use the least
 advanced valid seal, including mixed Recovery and Fast requests. An uncovered interval forces the
@@ -98,7 +102,10 @@ and the normal missing-blob policy advance that position. Partial, deferred, and
 reachable. Failed reads restore staged positions without copying retained rows; gap retries invalidate
 the affected positions. Prefetched responses are admitted once, including their newly installed prefix.
 An open prefix alone cannot complete Recovery: the suffix and all barriers must complete before
-transition to Fast, whose initial coverage floor preserves the validated Recovery seal.
+transition to Fast, whose initial coverage floor preserves the validated Recovery seal, bounded by
+the captured cutover window's end. A delayed Recovery scan or an older broker's oversized seal
+cannot prove coverage of later windows. Without a usable seal, Fast starts at the cutover window's
+start and conservatively revisits it.
 
 Reader-local metadata retention has a 16 MiB conservative decoded-byte budget and a 512-entry limit.
 Each partition/window retains one canonical, ordered segment snapshot. Its mature completeness
