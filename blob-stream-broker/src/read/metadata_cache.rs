@@ -1118,6 +1118,10 @@ impl MetadataCache {
       .retained_bytes
       .saturating_add(estimate_retained_bytes(&suffix));
     let suffix: Vector<_> = suffix.into_iter().map(Arc::new).collect();
+    let generation = self
+      .generation
+      .fetch_add(1, Ordering::Relaxed)
+      .saturating_add(1);
     let mut sealed_before = Some(seal_before);
     let mut sealed_at = prefix.sealed_at;
     let mut sealed_horizon = prefix.sealed_horizon;
@@ -1178,7 +1182,7 @@ impl MetadataCache {
                   sealed_at,
                   sealed_horizon,
                   retained_bytes: promoted_bytes,
-                  generation: prefix.generation,
+                  generation,
                   segments: promoted_segments,
                 }))
               } else {
@@ -1201,10 +1205,7 @@ impl MetadataCache {
       sealed_at,
       sealed_horizon,
       retained_bytes,
-      generation: self
-        .generation
-        .fetch_add(1, Ordering::Relaxed)
-        .saturating_add(1),
+      generation,
       segments,
     }))
   }

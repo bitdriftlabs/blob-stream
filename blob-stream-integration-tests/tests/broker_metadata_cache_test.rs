@@ -378,6 +378,7 @@ async fn broker_strong_suffix_promotion_reduces_dynamo_read_capacity() -> Result
   };
   assert!(hit.retained_strong_coverage);
   assert_eq!(hit.sealed_before, fully_sealed.sealed_before);
+  assert_eq!(hit.generation, fully_sealed.generation);
   assert_eq!(
     hit
       .segments

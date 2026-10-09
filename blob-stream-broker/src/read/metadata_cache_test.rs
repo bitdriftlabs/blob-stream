@@ -1502,6 +1502,8 @@ async fn strong_suffix_promotions_share_retained_rows() {
       .await
       .unwrap();
     assert!(promoted.sealed_before > previous.sealed_before);
+    assert!(promoted.generation > previous.generation);
+    assert_eq!(promoted.generation, scanned.generation);
     assert_eq!(promoted.segments.len(), expected_len);
     for (old, retained) in previous.segments.iter().zip(&promoted.segments) {
       assert!(Arc::ptr_eq(old, retained));
