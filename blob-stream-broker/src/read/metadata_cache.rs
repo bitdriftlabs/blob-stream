@@ -36,12 +36,15 @@ use blob_stream_types::{
   TopicWindowKey,
   topic_metadata_window_size,
 };
+use im::Vector;
 use log::debug;
 use moka::future::Cache;
+use moka::ops::compute::{CompResult, Op};
 use parking_lot::Mutex;
 use protobuf::Message;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
+use std::future::ready;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -853,23 +856,19 @@ impl MetadataCache {
     self: &Arc<Self>,
     specification: ReadSpecification,
   ) -> Result<LoadedCacheEntry> {
+    let horizon = specification.seal_horizon(self.config.seal_clock_skew);
     loop {
       if specification.consistency == StoreConsistency::Strong
         && specification.requested_seal_before.is_some()
         && let Some(entry) = self.strong_sealed_entries.get(&specification.key).await
         && entry.covers(&specification)
+        && entry
+          .sealed_horizon
+          .is_none_or(|certified| horizon <= certified)
         && let (Some(stored_bound), Some(sealed_at)) = (entry.sealed_before, entry.sealed_at)
       {
-        let safe_at_observation = SnowflakeId::minimum_for_timestamp(
-          sealed_at.saturating_sub(
-            specification.requested_seal_horizon.max(
-              specification
-                .topic
-                .max_metadata_publication_lag
-                .saturating_add(self.config.seal_clock_skew),
-            ),
-          ),
-        );
+        let safe_at_observation =
+          SnowflakeId::minimum_for_timestamp(sealed_at.saturating_sub(horizon));
         let bound = stored_bound
           .min(specification.requested_seal_before.expect("seal requested"))
           .min(safe_at_observation);
@@ -882,9 +881,29 @@ impl MetadataCache {
             .window_end_snowflake()
             .is_some_and(|window_end| bound < window_end)
           {
-            let entry = self
+            let scanned = self
               .coalesced_strong_suffix(&specification, entry, bound)
               .await?;
+            let proof_at = scanned.sealed_at.unwrap_or(sealed_at);
+            let seal_bound = scanned
+              .sealed_before
+              .unwrap_or(bound)
+              .min(specification.requested_seal_before.expect("seal requested"))
+              .min(SnowflakeId::minimum_for_timestamp(
+                proof_at.saturating_sub(horizon),
+              ));
+            let entry = Arc::new(CacheEntry {
+              refill_floor: scanned.refill_floor,
+              observed_at: scanned.observed_at,
+              sealed_before: Some(seal_bound),
+              sealed_at: Some(proof_at),
+              sealed_horizon: (proof_at > sealed_at)
+                .then_some(horizon)
+                .or(scanned.sealed_horizon),
+              retained_bytes: scanned.retained_bytes,
+              generation: scanned.generation,
+              segments: scanned.segments.clone(),
+            });
             return Ok(LoadedCacheEntry {
               entry,
               retained_coverage: false,
@@ -954,16 +973,8 @@ impl MetadataCache {
           let sealed_at = entry
             .sealed_at
             .ok_or_else(|| anyhow!("strong refill missing pre-scan seal proof time"))?;
-          let safe_at_observation = SnowflakeId::minimum_for_timestamp(
-            sealed_at.saturating_sub(
-              specification.requested_seal_horizon.max(
-                specification
-                  .topic
-                  .max_metadata_publication_lag
-                  .saturating_add(self.config.seal_clock_skew),
-              ),
-            ),
-          );
+          let safe_at_observation =
+            SnowflakeId::minimum_for_timestamp(sealed_at.saturating_sub(horizon));
           let bound = entry
             .sealed_before
             .unwrap_or(requested)
@@ -977,10 +988,10 @@ impl MetadataCache {
             observed_at: entry.observed_at,
             sealed_before: seal.then_some(bound),
             sealed_at: seal.then_some(sealed_at),
+            sealed_horizon: entry.sealed_horizon,
             retained_bytes: entry.retained_bytes,
             generation: entry.generation,
-            prefix_segments: entry.prefix_segments.clone(),
-            segments: Arc::clone(&entry.segments),
+            segments: entry.segments.clone(),
           });
         }
         return Ok(LoadedCacheEntry {
@@ -1076,6 +1087,7 @@ impl MetadataCache {
     prefix: Arc<CacheEntry>,
     seal_before: SnowflakeId,
   ) -> Result<Arc<CacheEntry>> {
+    let scan_started_at = self.time_provider.now();
     let min_snowflake = Some(
       specification
         .min_snowflake()
@@ -1093,9 +1105,8 @@ impl MetadataCache {
       .await?;
     suffix.retain(|segment| segment.snowflake_id >= seal_before);
     suffix.sort_by_key(|segment| segment.snowflake_id);
-    let prefix_len = prefix
-      .segments
-      .partition_point(|segment| segment.snowflake_id < seal_before);
+    let observed_at = self.time_provider.now();
+    let prefix_len = prefix.prefix_len(seal_before);
     ensure!(
       prefix_len.saturating_add(suffix.len()) <= self.limits().max_entry_items,
       MetadataCacheOverload {
@@ -1106,18 +1117,96 @@ impl MetadataCache {
     let retained_bytes = prefix
       .retained_bytes
       .saturating_add(estimate_retained_bytes(&suffix));
+    let suffix: Vector<_> = suffix.into_iter().map(Arc::new).collect();
+    let generation = self
+      .generation
+      .fetch_add(1, Ordering::Relaxed)
+      .saturating_add(1);
+    let mut sealed_before = Some(seal_before);
+    let mut sealed_at = prefix.sealed_at;
+    let mut sealed_horizon = prefix.sealed_horizon;
+    let stored_bound = prefix
+      .sealed_before
+      .ok_or_else(|| anyhow!("strong suffix refill missing retained seal"))?;
+    let original_seal_at = prefix
+      .sealed_at
+      .ok_or_else(|| anyhow!("strong suffix refill missing retained proof time"))?;
+    if min_snowflake.is_some_and(|floor| floor <= stored_bound)
+      && scan_started_at >= original_seal_at
+      && observed_at >= scan_started_at
+      && let (Some(requested), Some(window_end)) = (
+        specification.requested_seal_before,
+        specification.window_end_snowflake(),
+      )
+    {
+      let horizon = specification.seal_horizon(self.config.seal_clock_skew);
+      let safe_at_scan =
+        SnowflakeId::minimum_for_timestamp(scan_started_at.saturating_sub(horizon));
+      let promoted_bound = requested.min(window_end).min(safe_at_scan);
+      if promoted_bound > stored_bound {
+        sealed_before = Some(promoted_bound);
+        sealed_at = Some(scan_started_at);
+        sealed_horizon = Some(horizon);
+        let newly_sealed: Vector<_> = suffix
+          .iter()
+          .filter(|segment| {
+            segment.snowflake_id >= stored_bound && segment.snowflake_id < promoted_bound
+          })
+          .cloned()
+          .collect();
+        let prefix_bytes = if prefix.segments.is_empty() {
+          0
+        } else {
+          prefix.retained_bytes
+        };
+        let newly_sealed_bytes = if newly_sealed.is_empty() {
+          0
+        } else {
+          estimate_retained_bytes(newly_sealed.iter().map(Arc::as_ref))
+        };
+        let promoted_bytes = prefix_bytes.saturating_add(newly_sealed_bytes).max(1);
+        // Moka serializes this decision per key; the computation must not await or re-enter the
+        // cache.
+        let installed = self
+          .strong_sealed_entries
+          .entry(specification.key.clone())
+          .and_compute_with(|current| {
+            ready(
+              if current.is_some_and(|current| Arc::ptr_eq(current.value(), &prefix)) {
+                let mut promoted_segments = prefix.segments.clone();
+                promoted_segments.append(newly_sealed);
+                Op::Put(Arc::new(CacheEntry {
+                  refill_floor: prefix.refill_floor,
+                  observed_at,
+                  sealed_before,
+                  sealed_at,
+                  sealed_horizon,
+                  retained_bytes: promoted_bytes,
+                  generation,
+                  segments: promoted_segments,
+                }))
+              } else {
+                Op::Nop
+              },
+            )
+          })
+          .await;
+        if matches!(installed, CompResult::ReplacedWith(_)) {
+          self.metrics.strong_sealed_installs.inc();
+        }
+      }
+    }
+    let mut segments = prefix.segments.take(prefix_len);
+    segments.append(suffix);
     Ok(Arc::new(CacheEntry {
       refill_floor: prefix.refill_floor,
-      observed_at: self.time_provider.now(),
-      sealed_before: Some(seal_before),
-      sealed_at: prefix.sealed_at,
+      observed_at,
+      sealed_before,
+      sealed_at,
+      sealed_horizon,
       retained_bytes,
-      generation: self
-        .generation
-        .fetch_add(1, Ordering::Relaxed)
-        .saturating_add(1),
-      prefix_segments: Some((Arc::clone(&prefix.segments), prefix_len)),
-      segments: suffix.into(),
+      generation,
+      segments,
     }))
   }
 
@@ -1279,31 +1368,25 @@ impl MetadataCache {
     let sealed_before = if specification.consistency == StoreConsistency::Strong {
       specification.requested_seal_before.map(|requested| {
         requested.min(SnowflakeId::minimum_for_timestamp(
-          scan_started_at.saturating_sub(
-            specification.requested_seal_horizon.max(
-              specification
-                .topic
-                .max_metadata_publication_lag
-                .saturating_add(self.config.seal_clock_skew),
-            ),
-          ),
+          scan_started_at.saturating_sub(specification.seal_horizon(self.config.seal_clock_skew)),
         ))
       })
     } else {
       None
     };
+    let retained_bytes = estimate_retained_bytes(&segments);
     let entry = Arc::new(CacheEntry {
       refill_floor: min_snowflake,
       observed_at,
       sealed_before,
       sealed_at: (specification.consistency == StoreConsistency::Strong).then_some(scan_started_at),
-      retained_bytes: estimate_retained_bytes(&segments),
+      sealed_horizon: None,
+      retained_bytes,
       generation: self
         .generation
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1),
-      prefix_segments: None,
-      segments: segments.into(),
+      segments: segments.into_iter().map(Arc::new).collect(),
     });
     // A strong read establishes no reusable eventual observation. Both eventual coverage modes
     // retain the full scan so later callers can be filtered to their own partitions and bounds.
@@ -1337,30 +1420,44 @@ impl MetadataCache {
         .is_none_or(|floor| floor < bound)
       && specification.window_end_snowflake().is_some()
     {
-      self.metrics.strong_sealed_installs.inc();
-      let mut sealed_segments = entry
-        .segments
-        .iter()
-        .filter(|segment| segment.snowflake_id < bound)
-        .cloned()
-        .collect::<Vec<_>>();
-      sealed_segments.shrink_to_fit();
-      self
+      let sealed_segments = entry.segments.take(entry.prefix_len(bound));
+      let sealed_entry = Arc::new(CacheEntry {
+        refill_floor: entry.refill_floor,
+        observed_at,
+        sealed_before,
+        sealed_at: entry.sealed_at,
+        sealed_horizon: None,
+        retained_bytes: estimate_retained_bytes(sealed_segments.iter().map(Arc::as_ref)),
+        generation: entry.generation,
+        segments: sealed_segments,
+      });
+      // Compare and replace together so a late scan cannot overwrite a newer compatible proof.
+      let installed = self
         .strong_sealed_entries
-        .insert(
-          specification.key,
-          Arc::new(CacheEntry {
-            refill_floor: entry.refill_floor,
-            observed_at,
-            sealed_before,
-            sealed_at: entry.sealed_at,
-            retained_bytes: estimate_retained_bytes(&sealed_segments),
-            generation: entry.generation,
-            prefix_segments: None,
-            segments: sealed_segments.into(),
-          }),
-        )
+        .entry(specification.key.clone())
+        .and_compute_with(|current| {
+          ready(
+            if current.is_some_and(|current| {
+              let current = current.value();
+              current.covers(&specification)
+                && current.sealed_before >= sealed_before
+                && current.sealed_horizon.is_none_or(|certified| {
+                  specification.seal_horizon(self.config.seal_clock_skew) <= certified
+                })
+            }) {
+              Op::Nop
+            } else {
+              Op::Put(sealed_entry)
+            },
+          )
+        })
         .await;
+      if matches!(
+        installed,
+        CompResult::Inserted(_) | CompResult::ReplacedWith(_)
+      ) {
+        self.metrics.strong_sealed_installs.inc();
+      }
     }
     Ok(entry)
   }
@@ -1568,6 +1665,15 @@ impl ReadSpecification {
       .and_then(|bounds| bounds.values().copied().min())
   }
 
+  fn seal_horizon(&self, clock_skew: Duration) -> Duration {
+    self.requested_seal_horizon.max(
+      self
+        .topic
+        .max_metadata_publication_lag
+        .saturating_add(clock_skew),
+    )
+  }
+
   fn window_end_snowflake(&self) -> Option<SnowflakeId> {
     OffsetDateTime::from_unix_timestamp(
       self
@@ -1587,10 +1693,10 @@ struct CacheEntry {
   observed_at: OffsetDateTime,
   sealed_before: Option<SnowflakeId>,
   sealed_at: Option<OffsetDateTime>,
+  sealed_horizon: Option<Duration>,
   retained_bytes: u32,
   generation: u64,
-  prefix_segments: Option<(Arc<[SegmentMetadata]>, usize)>,
-  segments: Arc<[SegmentMetadata]>,
+  segments: Vector<Arc<SegmentMetadata>>,
 }
 
 fn oldest_entry_age_seconds(
@@ -1619,6 +1725,13 @@ struct LoadedCacheEntry {
 }
 
 impl CacheEntry {
+  fn prefix_len(&self, bound: SnowflakeId) -> usize {
+    self
+      .segments
+      .binary_search_by_key(&bound, |segment| segment.snowflake_id)
+      .unwrap_or_else(|index| index)
+  }
+
   fn covers(&self, specification: &ReadSpecification) -> bool {
     match (self.refill_floor, specification.min_snowflake()) {
       (Some(refill_floor), Some(request_floor)) => refill_floor <= request_floor,
@@ -1847,12 +1960,7 @@ fn response_from_entry(
   // partitions or Tail rows outside the coverage it requested.
   let mut segments = Vec::new();
   let mut response_bytes = 0_u64;
-  for segment in entry
-    .prefix_segments
-    .iter()
-    .flat_map(|(segments, prefix_len)| segments[.. *prefix_len].iter())
-    .chain(entry.segments.iter())
-  {
+  for segment in &entry.segments {
     if let Some(min_snowflake) = specification.min_snowflake()
       && segment.snowflake_id < min_snowflake
     {
@@ -1963,8 +2071,10 @@ fn response_error(
   }
 }
 
-fn estimate_retained_bytes(segments: &[SegmentMetadata]) -> u32 {
-  let bytes = segments.iter().fold(0_u64, |total, segment| {
+fn estimate_retained_bytes<'segment>(
+  segments: impl IntoIterator<Item = &'segment SegmentMetadata>,
+) -> u32 {
+  let bytes = segments.into_iter().fold(0_u64, |total, segment| {
     let index_bytes = u64::try_from(segment.segment_index.len()).unwrap_or(u64::MAX) * 40;
     total
       .saturating_add(u64::try_from(segment.blob_key.as_str().len()).unwrap_or(u64::MAX))

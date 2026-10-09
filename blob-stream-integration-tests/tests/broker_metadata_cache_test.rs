@@ -4,6 +4,7 @@ use bd_server_stats::test::util::stats::Helper;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use bd_time::{SystemTimeProvider, TimeProvider};
 use blob_stream_consumer::EventualMetadataReadsConfig;
+use blob_stream_consumer::consumer::{BrokerMetadataQuery, GrpcBrokerMetadataQuery};
 use blob_stream_consumer::iterator::{ConsumerIterator, NextResult};
 use blob_stream_integration_tests::test_framework::{
   self as framework,
@@ -29,6 +30,13 @@ use blob_stream_integration_tests::test_framework::{
   write_recovery_segment_for_partitions,
 };
 use blob_stream_metadata_store::{ConsumerGroupLeaseKey, DynamoCapacityMetrics, MetadataStore};
+use blob_stream_proto::protos::blobstream::v1::broker::{
+  FullRecoveryMetadataCoverage,
+  MetadataReadConsistency,
+  ReadMetadataWindowRequest,
+  read_metadata_window_request,
+  read_metadata_window_response,
+};
 use blob_stream_types::{
   CommittedCursor,
   CommittedSourceCheckpoint,
@@ -209,6 +217,191 @@ async fn broker_recovery_crossing_rollover_preserves_shared_partition_prefixes()
     );
   }
   Box::new(consumer).shutdown().await?;
+  cluster.shutdown().await;
+  resources.cleanup().await;
+  Ok(())
+}
+
+#[tokio::test]
+async fn broker_strong_suffix_promotion_reduces_dynamo_read_capacity() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let stats = Helper::new();
+  let scope = stats.collector().scope("strong_suffix_dynamo");
+  let window_start = Window::for_timestamp(
+    OffsetDateTime::now_utc(),
+    TimeDuration::seconds(WINDOW_SIZE_SECONDS),
+  )
+  .start
+  .unix_timestamp();
+  let timestamp = |offset| OffsetDateTime::from_unix_timestamp(window_start + offset);
+  let clock = Arc::new(framework::ManualTimeProvider::new(timestamp(100)?));
+  let metadata_store = Arc::new(CountingWindowMetadataStore::new(
+    resources.metadata_store_with_capacity_metrics(Some(DynamoCapacityMetrics::new(&scope))),
+    window_start,
+  ));
+  let blob_store = resources.blob_store();
+  let mut expected_ids = Vec::new();
+  for (offset, count) in [(30, 32_u64), (120, 96), (220, 2)] {
+    let first_id = SnowflakeId::minimum_for_timestamp(timestamp(offset)?).as_u64();
+    for index in 0 .. count {
+      let snowflake_id = first_id + index;
+      write_recovery_segment_for_partitions(
+        blob_store.as_ref(),
+        metadata_store.as_ref(),
+        window_start,
+        snowflake_id,
+        &[(
+          0,
+          u64::try_from(expected_ids.len())? + 1,
+          "capacity-baseline",
+        )],
+      )
+      .await?;
+      expected_ids.push(snowflake_id);
+    }
+  }
+
+  let mut cluster = ClusterHarness::builder(&resources, 1)
+    .metadata_store(metadata_store.clone())
+    .metadata_cache_time_provider(clock.clone())
+    .metadata_cache_timing(TimeDuration::ZERO, TimeDuration::seconds(5))
+    .start()
+    .await?;
+  let broker = GrpcBrokerMetadataQuery::new(Arc::new(cluster.producer_discovery())).await?;
+  let request = ReadMetadataWindowRequest {
+    topic: TOPIC.into(),
+    window_start_unix_seconds: window_start,
+    consistency: MetadataReadConsistency::METADATA_READ_CONSISTENCY_STRONG.into(),
+    coverage: Some(read_metadata_window_request::Coverage::FullRecovery(
+      FullRecoveryMetadataCoverage {
+        virtual_partition_ids: vec![0],
+        ..Default::default()
+      },
+    )),
+    requested_seal_before: Some(
+      SnowflakeId::minimum_for_timestamp(timestamp(WINDOW_SIZE_SECONDS + 3)?).as_u64(),
+    ),
+    max_response_bytes: 1024 * 1024,
+    ..Default::default()
+  };
+  let read_units = || {
+    stats
+      .find_counter(
+        "strong_suffix_dynamo:read_request_units_total",
+        &HashMap::new(),
+      )
+      .map_or(0.0, |counter| counter.value())
+  };
+  let mut units = vec![read_units()];
+  let mut seals = Vec::new();
+  let mut retained = Vec::new();
+  let late_id = SnowflakeId::minimum_for_timestamp(timestamp(99)?).as_u64();
+  for read_number in 0 .. 3 {
+    let response = broker.read_metadata_window(request.clone()).await?;
+    let Some(read_metadata_window_response::Result::Success(success)) = response.result else {
+      return Err(anyhow!("strong broker metadata read {read_number} failed"));
+    };
+    assert_eq!(
+      success
+        .segments
+        .iter()
+        .map(|segment| segment.snowflake_id)
+        .collect::<Vec<_>>(),
+      expected_ids
+    );
+    seals.push(
+      success
+        .sealed_before
+        .ok_or_else(|| anyhow!("strong broker metadata read has no seal"))?,
+    );
+    assert!(success.sealed_at_unix_ms.is_some());
+    retained.push(success.retained_strong_coverage);
+    units.push(read_units());
+    if read_number == 0 {
+      assert!(late_id >= seals[0]);
+      write_recovery_segment_for_partitions(
+        blob_store.as_ref(),
+        metadata_store.as_ref(),
+        window_start,
+        late_id,
+        &[(
+          0,
+          u64::try_from(expected_ids.len())? + 1,
+          "late-publication",
+        )],
+      )
+      .await?;
+      expected_ids.push(late_id);
+      expected_ids.sort_unstable();
+      clock.advance(TimeDuration::seconds(80));
+    }
+  }
+
+  let first_seal = SnowflakeId(seals[0]);
+  assert!(first_seal > SnowflakeId::minimum_for_timestamp(timestamp(30)?));
+  assert!(first_seal < SnowflakeId::minimum_for_timestamp(timestamp(120)?));
+  assert!(seals[1] > seals[0]);
+  assert!(late_id < seals[1]);
+  assert_eq!(seals[2], seals[1]);
+  assert_eq!(retained, vec![false, true, true]);
+  assert_eq!(
+    metadata_store.scan_floors().await,
+    vec![None, Some(first_seal), Some(SnowflakeId(seals[1]))]
+  );
+  assert_eq!(metadata_store.completed_scan_count(), 3);
+  assert!(units[1] > units[0]);
+  assert!(units[2] > units[1]);
+  assert!(units[3] - units[2] < units[2] - units[1]);
+  assert!(units[1] - units[0] > units[2] - units[1]);
+  clock.advance(TimeDuration::seconds(WINDOW_SIZE_SECONDS));
+  let response = broker.read_metadata_window(request.clone()).await?;
+  let Some(read_metadata_window_response::Result::Success(fully_sealed)) = response.result else {
+    return Err(anyhow!("full-window seal read failed"));
+  };
+  assert_eq!(
+    fully_sealed.sealed_before,
+    Some(SnowflakeId::minimum_for_timestamp(timestamp(WINDOW_SIZE_SECONDS)?).as_u64())
+  );
+  assert_eq!(
+    fully_sealed
+      .segments
+      .iter()
+      .map(|segment| segment.snowflake_id)
+      .collect::<Vec<_>>(),
+    expected_ids
+  );
+  let before_hit = read_units();
+  assert!(before_hit > units[3]);
+  let response = broker.read_metadata_window(request).await?;
+  let Some(read_metadata_window_response::Result::Success(hit)) = response.result else {
+    return Err(anyhow!("fully sealed cache hit failed"));
+  };
+  assert!(hit.retained_strong_coverage);
+  assert_eq!(hit.sealed_before, fully_sealed.sealed_before);
+  assert_eq!(hit.generation, fully_sealed.generation);
+  assert_eq!(
+    hit
+      .segments
+      .iter()
+      .map(|segment| segment.snowflake_id)
+      .collect::<Vec<_>>(),
+    expected_ids
+  );
+  assert_eq!(metadata_store.completed_scan_count(), 4);
+  assert_eq!(
+    metadata_store.scan_floors().await[3],
+    Some(SnowflakeId(seals[2]))
+  );
+  assert_eq!(read_units(), before_hit);
+  println!(
+    "strong broker metadata read units: initial={}, repeated_suffix={}, \
+     repeated_suffix_after_advance={}, fully_sealed_hit={}",
+    units[1] - units[0],
+    units[2] - units[1],
+    units[3] - units[2],
+    read_units() - before_hit
+  );
+
   cluster.shutdown().await;
   resources.cleanup().await;
   Ok(())

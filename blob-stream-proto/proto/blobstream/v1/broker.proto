@@ -169,7 +169,9 @@ message MetadataReadSuccess {
   repeated BrokerSegmentMetadata segments = 5;
   // Exclusive upper bound of coverage observed strongly after it was safe to seal.
   optional uint64 sealed_before = 6;
-  // Original strong observation time for the sealed prefix (not the fresh suffix).
+  // Time at which the entire sealed prefix is proven complete for the requested horizon.
+  // A contiguous strong suffix scan may advance this proof time after an earlier prefix was sealed;
+  // elapsed time alone never advances it.
   optional int64 sealed_at_unix_ms = 7;
   // True only when sealed coverage was reused from a prior strong observation.
   bool retained_strong_coverage = 8;

@@ -38,6 +38,7 @@ futures.workspace                 = true
 hostname.workspace                = true
 http.workspace                    = true
 humantime-serde.workspace         = true
+im.workspace                      = true
 log.workspace                     = true
 moka.workspace                    = true
 parking_lot.workspace             = true
