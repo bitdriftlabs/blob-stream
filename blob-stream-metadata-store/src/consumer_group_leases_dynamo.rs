@@ -2,6 +2,7 @@
 #[path = "./consumer_group_leases_dynamo_test.rs"]
 mod tests;
 
+use crate::aws::{DynamoRequestExt as _, trace_dynamo_operation};
 use crate::dynamo::duration_seconds_ceil;
 use crate::{
   ConsumerGroupAssignmentOutcome,
@@ -20,6 +21,9 @@ use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnConsumedCapacity, ReturnValue};
+use bd_runtime_config::feature_flags::FeatureFlagsWatch;
+use blob_stream_runtime_config::AwsTraceSampler;
+use blob_stream_runtime_config::aws_tracing::mark_expected_outcome;
 use blob_stream_types::{CommittedCursor, unix_millis_from_offset_datetime};
 use log::{debug, trace};
 use serde::{Deserialize, Serialize};
@@ -47,6 +51,7 @@ pub struct DynamoConsumerGroupLeaseStore {
   table_name: String,
   ttl_buffer: Duration,
   capacity_metrics: Option<DynamoCapacityMetrics>,
+  trace_sampler: AwsTraceSampler,
 }
 
 impl DynamoConsumerGroupLeaseStore {
@@ -56,12 +61,14 @@ impl DynamoConsumerGroupLeaseStore {
     table_name: impl Into<String>,
     ttl_buffer: Duration,
     capacity_metrics: Option<DynamoCapacityMetrics>,
+    feature_flags: Option<FeatureFlagsWatch>,
   ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
       ttl_buffer,
       capacity_metrics,
+      trace_sampler: AwsTraceSampler::new(feature_flags),
     }
   }
 
@@ -93,6 +100,7 @@ impl DynamoConsumerGroupLeaseStore {
       .consistent_read(false)
       .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
+      .trace_request("GetItem")
       .await?;
     self.record_read_capacity(response.consumed_capacity.as_ref());
 
@@ -125,60 +133,63 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     topic: &str,
     group_id: &str,
   ) -> Result<Vec<ConsumerGroupLease>> {
-    trace!(
-      "consumer lease(dynamo) list group: table={}, topic={}, group_id={}",
-      self.table_name, topic, group_id
-    );
-    let partition_key = format!("{topic}#{group_id}");
-    let mut leases = Vec::new();
-    let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+    trace_dynamo_operation!(self, "list_group_leases", async {
+      trace!(
+        "consumer lease(dynamo) list group: table={}, topic={}, group_id={}",
+        self.table_name, topic, group_id
+      );
+      let partition_key = format!("{topic}#{group_id}");
+      let mut leases = Vec::new();
+      let mut start_key: Option<HashMap<String, AttributeValue>> = None;
 
-    loop {
-      let mut values = HashMap::new();
-      values.insert(":pk".to_string(), AttributeValue::S(partition_key.clone()));
-      let mut query = self
-        .client
-        .query()
-        .table_name(&self.table_name)
-        .key_condition_expression(format!("{ATTR_PK} = :pk"))
-        .consistent_read(true)
-        .set_expression_attribute_values(Some(values));
-      if let Some(key) = start_key.take() {
-        query = query.set_exclusive_start_key(Some(key));
+      loop {
+        let mut values = HashMap::new();
+        values.insert(":pk".to_string(), AttributeValue::S(partition_key.clone()));
+        let mut query = self
+          .client
+          .query()
+          .table_name(&self.table_name)
+          .key_condition_expression(format!("{ATTR_PK} = :pk"))
+          .consistent_read(true)
+          .set_expression_attribute_values(Some(values));
+        if let Some(key) = start_key.take() {
+          query = query.set_exclusive_start_key(Some(key));
+        }
+
+        let response = query
+          .return_consumed_capacity(ReturnConsumedCapacity::Total)
+          .send()
+          .trace_request("Query")
+          .await?;
+        self.record_read_capacity(response.consumed_capacity.as_ref());
+        for item in response.items() {
+          let partition_id = item
+            .get(ATTR_SK)
+            .ok_or_else(|| anyhow!("consumer lease query returned row without string sort key"))?
+            .as_s()
+            .map_err(|_| anyhow!("consumer lease query returned row without string sort key"))?
+            .parse()
+            .map_err(|error| {
+              anyhow!("consumer lease query returned invalid partition id: {error}")
+            })?;
+          let key = ConsumerGroupLeaseKey {
+            topic: topic.to_string(),
+            group_id: group_id.to_string(),
+            virtual_partition_id: partition_id,
+          };
+          leases.push(Self::lease_from_item(item.clone(), key)?);
+        }
+
+        if let Some(key) = response.last_evaluated_key {
+          start_key = Some(key);
+        } else {
+          break;
+        }
       }
 
-      let response = query
-        .return_consumed_capacity(ReturnConsumedCapacity::Total)
-        .send()
-        .await?;
-      self.record_read_capacity(response.consumed_capacity.as_ref());
-      for item in response.items() {
-        let partition_id = item
-          .get(ATTR_SK)
-          .ok_or_else(|| anyhow!("consumer lease query returned row without string sort key"))?
-          .as_s()
-          .map_err(|_| anyhow!("consumer lease query returned row without string sort key"))?
-          .parse()
-          .map_err(|error| {
-            anyhow!("consumer lease query returned invalid partition id: {error}")
-          })?;
-        let key = ConsumerGroupLeaseKey {
-          topic: topic.to_string(),
-          group_id: group_id.to_string(),
-          virtual_partition_id: partition_id,
-        };
-        leases.push(Self::lease_from_item(item.clone(), key)?);
-      }
-
-      if let Some(key) = response.last_evaluated_key {
-        start_key = Some(key);
-      } else {
-        break;
-      }
-    }
-
-    leases.sort_by_key(|lease| lease.key.virtual_partition_id);
-    Ok(leases)
+      leases.sort_by_key(|lease| lease.key.virtual_partition_id);
+      Ok(leases)
+    })
   }
 
   async fn list_active_leases(
@@ -186,59 +197,62 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     topics: &[String],
     now: OffsetDateTime,
   ) -> Result<Vec<ConsumerGroupLease>> {
-    if topics.is_empty() {
-      return Ok(Vec::new());
-    }
-    let now_ts_ms = unix_millis_from_offset_datetime(now)
-      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let mut leases = Vec::new();
-    let mut start_key: Option<HashMap<String, AttributeValue>> = None;
-
-    loop {
-      let mut values = HashMap::new();
-      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-      let mut scan = self
-        .client
-        .scan()
-        .table_name(&self.table_name)
-        .consistent_read(false)
-        .filter_expression(format!("{ATTR_LEASE_EXPIRES} > :now"))
-        .set_expression_attribute_values(Some(values));
-      if let Some(key) = start_key.take() {
-        scan = scan.set_exclusive_start_key(Some(key));
+    trace_dynamo_operation!(self, "list_active_leases", async {
+      if topics.is_empty() {
+        return Ok(Vec::new());
       }
+      let now_ts_ms = unix_millis_from_offset_datetime(now)
+        .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+      let mut leases = Vec::new();
+      let mut start_key: Option<HashMap<String, AttributeValue>> = None;
 
-      let response = scan
-        .return_consumed_capacity(ReturnConsumedCapacity::Total)
-        .send()
-        .await?;
-      self.record_read_capacity(response.consumed_capacity.as_ref());
-      for item in response.items() {
-        if let Some(key) = consumer_group_lease_key_from_scan_item(item, topics)? {
-          leases.push(Self::lease_from_item(item.clone(), key)?);
+      loop {
+        let mut values = HashMap::new();
+        values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+        let mut scan = self
+          .client
+          .scan()
+          .table_name(&self.table_name)
+          .consistent_read(false)
+          .filter_expression(format!("{ATTR_LEASE_EXPIRES} > :now"))
+          .set_expression_attribute_values(Some(values));
+        if let Some(key) = start_key.take() {
+          scan = scan.set_exclusive_start_key(Some(key));
+        }
+
+        let response = scan
+          .return_consumed_capacity(ReturnConsumedCapacity::Total)
+          .send()
+          .trace_request("Scan")
+          .await?;
+        self.record_read_capacity(response.consumed_capacity.as_ref());
+        for item in response.items() {
+          if let Some(key) = consumer_group_lease_key_from_scan_item(item, topics)? {
+            leases.push(Self::lease_from_item(item.clone(), key)?);
+          }
+        }
+
+        if let Some(key) = response.last_evaluated_key {
+          start_key = Some(key);
+        } else {
+          break;
         }
       }
 
-      if let Some(key) = response.last_evaluated_key {
-        start_key = Some(key);
-      } else {
-        break;
-      }
-    }
-
-    leases.sort_by(|left, right| {
-      (
-        &left.key.topic,
-        &left.key.group_id,
-        left.key.virtual_partition_id,
-      )
-        .cmp(&(
-          &right.key.topic,
-          &right.key.group_id,
-          right.key.virtual_partition_id,
-        ))
-    });
-    Ok(leases)
+      leases.sort_by(|left, right| {
+        (
+          &left.key.topic,
+          &left.key.group_id,
+          left.key.virtual_partition_id,
+        )
+          .cmp(&(
+            &right.key.topic,
+            &right.key.group_id,
+            right.key.virtual_partition_id,
+          ))
+      });
+      Ok(leases)
+    })
   }
 
   async fn assign_partition(
@@ -249,112 +263,116 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     now: OffsetDateTime,
     lease_duration: Duration,
   ) -> Result<ConsumerGroupAssignmentOutcome> {
-    trace!(
-      "consumer lease(dynamo) assign: table={}, topic={}, group_id={}, partition={}, owner_id={}, \
-       generation={}",
-      self.table_name, key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
-    );
-    let now_ts_ms = unix_millis_from_offset_datetime(now)
-      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let lease_duration_ms = i64::try_from(lease_duration.whole_milliseconds())
-      .map_err(|_| anyhow!("lease duration exceeds Dynamo millisecond range"))?;
-    let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
+    trace_dynamo_operation!(self, "assign_partition", async {
+      trace!(
+        "consumer lease(dynamo) assign: table={}, topic={}, group_id={}, partition={}, \
+         owner_id={}, generation={}",
+        self.table_name, key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
+      );
+      let now_ts_ms = unix_millis_from_offset_datetime(now)
+        .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+      let lease_duration_ms = i64::try_from(lease_duration.whole_milliseconds())
+        .map_err(|_| anyhow!("lease duration exceeds Dynamo millisecond range"))?;
+      let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
+      let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
 
-    let mut values = HashMap::new();
-    values.insert(":owner".to_string(), AttributeValue::S(owner_id.clone()));
-    values.insert(
-      ":expires".to_string(),
-      AttributeValue::N(expires_at.to_string()),
-    );
-    values.insert(
-      ":ttl".to_string(),
-      AttributeValue::N(ttl_epoch_seconds.to_string()),
-    );
-    values.insert(
-      ":generation".to_string(),
-      AttributeValue::N(generation.to_string()),
-    );
-    values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-    let update = format!(
-      "SET {ATTR_OWNER} = :owner, {ATTR_LEASE_EXPIRES} = :expires, {ATTR_GENERATION} = \
-       :generation, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl REMOVE \
-       {ATTR_GRACEFUL_RELEASE_TS}"
-    );
-    let condition = format!(
-      "attribute_not_exists({ATTR_PK}) OR {ATTR_LEASE_EXPIRES} <= :now OR {ATTR_OWNER} = :owner"
-    );
+      let mut values = HashMap::new();
+      values.insert(":owner".to_string(), AttributeValue::S(owner_id.clone()));
+      values.insert(
+        ":expires".to_string(),
+        AttributeValue::N(expires_at.to_string()),
+      );
+      values.insert(
+        ":ttl".to_string(),
+        AttributeValue::N(ttl_epoch_seconds.to_string()),
+      );
+      values.insert(
+        ":generation".to_string(),
+        AttributeValue::N(generation.to_string()),
+      );
+      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+      let update = format!(
+        "SET {ATTR_OWNER} = :owner, {ATTR_LEASE_EXPIRES} = :expires, {ATTR_GENERATION} = \
+         :generation, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl REMOVE \
+         {ATTR_GRACEFUL_RELEASE_TS}"
+      );
+      let condition = format!(
+        "attribute_not_exists({ATTR_PK}) OR {ATTR_LEASE_EXPIRES} <= :now OR {ATTR_OWNER} = :owner"
+      );
 
-    let response = self
-      .client
-      .update_item()
-      .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(key.partition_key()))
-      .key(ATTR_SK, AttributeValue::S(key.sort_key()))
-      .update_expression(update)
-      .condition_expression(condition)
-      .set_expression_attribute_values(Some(values))
-      .return_values(ReturnValue::AllOld)
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await;
+      let response = self
+        .client
+        .update_item()
+        .table_name(&self.table_name)
+        .key(ATTR_PK, AttributeValue::S(key.partition_key()))
+        .key(ATTR_SK, AttributeValue::S(key.sort_key()))
+        .update_expression(update)
+        .condition_expression(condition)
+        .set_expression_attribute_values(Some(values))
+        .return_values(ReturnValue::AllOld)
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .trace_request("UpdateItem")
+        .await;
 
-    match response {
-      Ok(output) => {
-        self.record_write_capacity(output.consumed_capacity.as_ref());
-        let previous_entry = output.attributes.map(serde_dynamo::from_item).transpose()?;
-        let previous_lease = previous_entry
-          .as_ref()
-          .map(|entry: &DynamoLeaseItem| Box::new(entry.clone().into_lease(key.clone())));
-        let lease = ConsumerGroupLease {
-          key,
-          owner_id,
-          generation,
-          lease_expiration_ts_ms: expires_at,
-          last_heartbeat_ts_ms: now_ts_ms,
-          committed_cursor: previous_lease
+      match response {
+        Ok(output) => {
+          self.record_write_capacity(output.consumed_capacity.as_ref());
+          let previous_entry = output.attributes.map(serde_dynamo::from_item).transpose()?;
+          let previous_lease = previous_entry
             .as_ref()
-            .and_then(|previous| previous.committed_cursor.clone()),
-          committed_ts_ms: previous_lease
-            .as_ref()
-            .and_then(|previous| previous.committed_ts_ms),
-        };
-        if let Some(previous) = previous_entry.as_ref()
-          && previous.owner_id != lease.owner_id
-          && previous.graceful_release_ts.is_none()
+            .map(|entry: &DynamoLeaseItem| Box::new(entry.clone().into_lease(key.clone())));
+          let lease = ConsumerGroupLease {
+            key,
+            owner_id,
+            generation,
+            lease_expiration_ts_ms: expires_at,
+            last_heartbeat_ts_ms: now_ts_ms,
+            committed_cursor: previous_lease
+              .as_ref()
+              .and_then(|previous| previous.committed_cursor.clone()),
+            committed_ts_ms: previous_lease
+              .as_ref()
+              .and_then(|previous| previous.committed_ts_ms),
+          };
+          if let Some(previous) = previous_entry.as_ref()
+            && previous.owner_id != lease.owner_id
+            && previous.graceful_release_ts.is_none()
+          {
+            debug_assert!(previous.lease_expiration_ts_ms <= now_ts_ms);
+          }
+          let transition = consumer_group_lease_transition(
+            previous_entry
+              .as_ref()
+              .map(|previous| ConsumerGroupLeasePredecessor {
+                owner_id: &previous.owner_id,
+                generation: previous.generation,
+                last_heartbeat_ts_ms: previous.last_heartbeat_ts_ms,
+                graceful_release_ts_ms: previous.graceful_release_ts,
+              }),
+            &lease.owner_id,
+          );
+          debug!("consumer lease(dynamo) assign result: assigned, transition={transition:?}");
+          Ok(ConsumerGroupAssignmentOutcome::Assigned {
+            lease,
+            previous_lease,
+            transition,
+          })
+        },
+        Err(SdkError::ServiceError(service_error))
+          if service_error.err().is_conditional_check_failed_exception() =>
         {
-          debug_assert!(previous.lease_expiration_ts_ms <= now_ts_ms);
-        }
-        let transition = consumer_group_lease_transition(
-          previous_entry
-            .as_ref()
-            .map(|previous| ConsumerGroupLeasePredecessor {
-              owner_id: &previous.owner_id,
-              generation: previous.generation,
-              last_heartbeat_ts_ms: previous.last_heartbeat_ts_ms,
-              graceful_release_ts_ms: previous.graceful_release_ts,
-            }),
-          &lease.owner_id,
-        );
-        debug!("consumer lease(dynamo) assign result: assigned, transition={transition:?}");
-        Ok(ConsumerGroupAssignmentOutcome::Assigned {
-          lease,
-          previous_lease,
-          transition,
-        })
-      },
-      Err(SdkError::ServiceError(service_error))
-        if service_error.err().is_conditional_check_failed_exception() =>
-      {
-        debug!("consumer lease(dynamo) assign result: held_by_other");
-        let lease = self
-          .get_lease(&key)
-          .await?
-          .ok_or_else(|| anyhow!("lease missing after conditional failure"))?;
-        Ok(ConsumerGroupAssignmentOutcome::HeldByOther(lease))
-      },
-      Err(error) => Err(error.into()),
-    }
+          debug!("consumer lease(dynamo) assign result: held_by_other");
+          let lease = self
+            .get_lease(&key)
+            .await?
+            .ok_or_else(|| anyhow!("lease missing after conditional failure"))?;
+          mark_expected_outcome();
+          Ok(ConsumerGroupAssignmentOutcome::HeldByOther(lease))
+        },
+        Err(error) => Err(error.into()),
+      }
+    })
   }
 
   async fn heartbeat_partition(
@@ -366,97 +384,103 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     lease_duration: Duration,
     committed_cursor: Option<CommittedCursor>,
   ) -> Result<ConsumerGroupHeartbeatOutcome> {
-    trace!(
-      "consumer lease(dynamo) heartbeat: table={}, topic={}, group_id={}, partition={}, \
-       owner_id={}, generation={}",
-      self.table_name, key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
-    );
-    if let Some(cursor) = committed_cursor.as_ref() {
-      validate_cursor(key, cursor)?;
-    }
+    trace_dynamo_operation!(self, "heartbeat_partition", async {
+      trace!(
+        "consumer lease(dynamo) heartbeat: table={}, topic={}, group_id={}, partition={}, \
+         owner_id={}, generation={}",
+        self.table_name, key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
+      );
+      if let Some(cursor) = committed_cursor.as_ref() {
+        validate_cursor(key, cursor)?;
+      }
 
-    let now_ts_ms = unix_millis_from_offset_datetime(now)
-      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let lease_duration_ms = i64::try_from(lease_duration.whole_milliseconds())
-      .map_err(|_| anyhow!("lease duration exceeds Dynamo millisecond range"))?;
-    let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
+      let now_ts_ms = unix_millis_from_offset_datetime(now)
+        .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+      let lease_duration_ms = i64::try_from(lease_duration.whole_milliseconds())
+        .map_err(|_| anyhow!("lease duration exceeds Dynamo millisecond range"))?;
+      let expires_at = expires_at(now_ts_ms, lease_duration_ms)?;
+      let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
 
-    let mut values = HashMap::new();
-    values.insert(
-      ":owner".to_string(),
-      AttributeValue::S(owner_id.to_string()),
-    );
-    values.insert(
-      ":generation".to_string(),
-      AttributeValue::N(generation.to_string()),
-    );
-    values.insert(
-      ":expires".to_string(),
-      AttributeValue::N(expires_at.to_string()),
-    );
-    values.insert(
-      ":ttl".to_string(),
-      AttributeValue::N(ttl_epoch_seconds.to_string()),
-    );
-    values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+      let mut values = HashMap::new();
+      values.insert(
+        ":owner".to_string(),
+        AttributeValue::S(owner_id.to_string()),
+      );
+      values.insert(
+        ":generation".to_string(),
+        AttributeValue::N(generation.to_string()),
+      );
+      values.insert(
+        ":expires".to_string(),
+        AttributeValue::N(expires_at.to_string()),
+      );
+      values.insert(
+        ":ttl".to_string(),
+        AttributeValue::N(ttl_epoch_seconds.to_string()),
+      );
+      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
 
-    let update = if let Some(cursor) = committed_cursor {
-      values.insert(":cursor".to_string(), Self::cursor_value(&cursor)?);
-      format!(
-        "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl, \
-         {ATTR_COMMITTED_CURSOR} = :cursor, {ATTR_COMMITTED_TS} = :now"
-      )
-    } else {
-      format!(
-        "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl"
-      )
-    };
-    let condition = format!(
-      "{ATTR_OWNER} = :owner AND {ATTR_GENERATION} = :generation AND {ATTR_LEASE_EXPIRES} > :now"
-    );
+      let update = if let Some(cursor) = committed_cursor {
+        values.insert(":cursor".to_string(), Self::cursor_value(&cursor)?);
+        format!(
+          "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl, \
+           {ATTR_COMMITTED_CURSOR} = :cursor, {ATTR_COMMITTED_TS} = :now"
+        )
+      } else {
+        format!(
+          "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl"
+        )
+      };
+      let condition = format!(
+        "{ATTR_OWNER} = :owner AND {ATTR_GENERATION} = :generation AND {ATTR_LEASE_EXPIRES} > :now"
+      );
 
-    let response = self
-      .client
-      .update_item()
-      .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(key.partition_key()))
-      .key(ATTR_SK, AttributeValue::S(key.sort_key()))
-      .update_expression(update)
-      .condition_expression(condition)
-      .set_expression_attribute_values(Some(values))
-      .return_values(ReturnValue::AllNew)
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await;
+      let response = self
+        .client
+        .update_item()
+        .table_name(&self.table_name)
+        .key(ATTR_PK, AttributeValue::S(key.partition_key()))
+        .key(ATTR_SK, AttributeValue::S(key.sort_key()))
+        .update_expression(update)
+        .condition_expression(condition)
+        .set_expression_attribute_values(Some(values))
+        .return_values(ReturnValue::AllNew)
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .trace_request("UpdateItem")
+        .await;
 
-    match response {
-      Ok(output) => {
-        self.record_write_capacity(output.consumed_capacity.as_ref());
-        let attributes = output
-          .attributes
-          .ok_or_else(|| anyhow!("lease attributes missing"))?;
-        let lease = Self::lease_from_item(attributes, key.clone())?;
-        debug!("consumer lease(dynamo) heartbeat result: renewed");
-        Ok(ConsumerGroupHeartbeatOutcome::Renewed(lease))
-      },
-      Err(SdkError::ServiceError(service_error))
-        if service_error.err().is_conditional_check_failed_exception() =>
-      {
-        let Some(lease) = self.get_lease(key).await? else {
-          debug!("consumer lease(dynamo) heartbeat result: expired");
-          return Ok(ConsumerGroupHeartbeatOutcome::Expired);
-        };
-        if lease.lease_expiration_ts_ms <= now_ts_ms {
-          debug!("consumer lease(dynamo) heartbeat result: expired");
-          Ok(ConsumerGroupHeartbeatOutcome::Expired)
-        } else {
-          debug!("consumer lease(dynamo) heartbeat result: held_by_other");
-          Ok(ConsumerGroupHeartbeatOutcome::HeldByOther(lease))
-        }
-      },
-      Err(error) => Err(error.into()),
-    }
+      match response {
+        Ok(output) => {
+          self.record_write_capacity(output.consumed_capacity.as_ref());
+          let attributes = output
+            .attributes
+            .ok_or_else(|| anyhow!("lease attributes missing"))?;
+          let lease = Self::lease_from_item(attributes, key.clone())?;
+          debug!("consumer lease(dynamo) heartbeat result: renewed");
+          Ok(ConsumerGroupHeartbeatOutcome::Renewed(lease))
+        },
+        Err(SdkError::ServiceError(service_error))
+          if service_error.err().is_conditional_check_failed_exception() =>
+        {
+          let Some(lease) = self.get_lease(key).await? else {
+            debug!("consumer lease(dynamo) heartbeat result: expired");
+            mark_expected_outcome();
+            return Ok(ConsumerGroupHeartbeatOutcome::Expired);
+          };
+          if lease.lease_expiration_ts_ms <= now_ts_ms {
+            mark_expected_outcome();
+            debug!("consumer lease(dynamo) heartbeat result: expired");
+            Ok(ConsumerGroupHeartbeatOutcome::Expired)
+          } else {
+            debug!("consumer lease(dynamo) heartbeat result: held_by_other");
+            mark_expected_outcome();
+            Ok(ConsumerGroupHeartbeatOutcome::HeldByOther(lease))
+          }
+        },
+        Err(error) => Err(error.into()),
+      }
+    })
   }
 
   async fn commit_cursor(
@@ -467,82 +491,88 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     now: OffsetDateTime,
     committed_cursor: CommittedCursor,
   ) -> Result<ConsumerGroupCommitOutcome> {
-    trace!(
-      "consumer lease(dynamo) commit: table={}, topic={}, group_id={}, partition={}, owner_id={}, \
-       generation={}, seq_end={}",
-      self.table_name,
-      key.topic,
-      key.group_id,
-      key.virtual_partition_id,
-      owner_id,
-      generation,
-      committed_cursor.seq_end
-    );
-    validate_cursor(key, &committed_cursor)?;
+    trace_dynamo_operation!(self, "commit_cursor", async {
+      trace!(
+        "consumer lease(dynamo) commit: table={}, topic={}, group_id={}, partition={}, \
+         owner_id={}, generation={}, seq_end={}",
+        self.table_name,
+        key.topic,
+        key.group_id,
+        key.virtual_partition_id,
+        owner_id,
+        generation,
+        committed_cursor.seq_end
+      );
+      validate_cursor(key, &committed_cursor)?;
 
-    let now_ts_ms = unix_millis_from_offset_datetime(now)
-      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let mut values = HashMap::new();
-    values.insert(
-      ":owner".to_string(),
-      AttributeValue::S(owner_id.to_string()),
-    );
-    values.insert(
-      ":generation".to_string(),
-      AttributeValue::N(generation.to_string()),
-    );
-    values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-    values.insert(
-      ":cursor".to_string(),
-      Self::cursor_value(&committed_cursor)?,
-    );
+      let now_ts_ms = unix_millis_from_offset_datetime(now)
+        .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+      let mut values = HashMap::new();
+      values.insert(
+        ":owner".to_string(),
+        AttributeValue::S(owner_id.to_string()),
+      );
+      values.insert(
+        ":generation".to_string(),
+        AttributeValue::N(generation.to_string()),
+      );
+      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+      values.insert(
+        ":cursor".to_string(),
+        Self::cursor_value(&committed_cursor)?,
+      );
 
-    let update = format!("SET {ATTR_COMMITTED_CURSOR} = :cursor, {ATTR_COMMITTED_TS} = :now");
-    let condition = format!(
-      "{ATTR_OWNER} = :owner AND {ATTR_GENERATION} = :generation AND {ATTR_LEASE_EXPIRES} > :now"
-    );
+      let update = format!("SET {ATTR_COMMITTED_CURSOR} = :cursor, {ATTR_COMMITTED_TS} = :now");
+      let condition = format!(
+        "{ATTR_OWNER} = :owner AND {ATTR_GENERATION} = :generation AND {ATTR_LEASE_EXPIRES} > :now"
+      );
 
-    let response = self
-      .client
-      .update_item()
-      .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(key.partition_key()))
-      .key(ATTR_SK, AttributeValue::S(key.sort_key()))
-      .update_expression(update)
-      .condition_expression(condition)
-      .set_expression_attribute_values(Some(values))
-      .return_values(ReturnValue::AllNew)
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await;
+      let response = self
+        .client
+        .update_item()
+        .table_name(&self.table_name)
+        .key(ATTR_PK, AttributeValue::S(key.partition_key()))
+        .key(ATTR_SK, AttributeValue::S(key.sort_key()))
+        .update_expression(update)
+        .condition_expression(condition)
+        .set_expression_attribute_values(Some(values))
+        .return_values(ReturnValue::AllNew)
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .trace_request("UpdateItem")
+        .await;
 
-    match response {
-      Ok(output) => {
-        self.record_write_capacity(output.consumed_capacity.as_ref());
-        let attributes = output
-          .attributes
-          .ok_or_else(|| anyhow!("lease attributes missing"))?;
-        let lease = Self::lease_from_item(attributes, key.clone())?;
-        debug!("consumer lease(dynamo) commit result: committed");
-        Ok(ConsumerGroupCommitOutcome::Committed(lease))
-      },
-      Err(SdkError::ServiceError(service_error))
-        if service_error.err().is_conditional_check_failed_exception() =>
-      {
-        let Some(lease) = self.get_lease(key).await? else {
-          debug!("consumer lease(dynamo) commit result: expired");
-          return Ok(ConsumerGroupCommitOutcome::Expired);
-        };
-        if lease.lease_expiration_ts_ms <= now_ts_ms {
-          debug!("consumer lease(dynamo) commit result: expired");
-          Ok(ConsumerGroupCommitOutcome::Expired)
-        } else {
-          debug!("consumer lease(dynamo) commit result: held_by_other");
-          Ok(ConsumerGroupCommitOutcome::HeldByOther(lease))
-        }
-      },
-      Err(error) => Err(error.into()),
-    }
+      match response {
+        Ok(output) => {
+          self.record_write_capacity(output.consumed_capacity.as_ref());
+          let attributes = output
+            .attributes
+            .ok_or_else(|| anyhow!("lease attributes missing"))?;
+          let lease = Self::lease_from_item(attributes, key.clone())?;
+          debug!("consumer lease(dynamo) commit result: committed");
+          Ok(ConsumerGroupCommitOutcome::Committed(lease))
+        },
+        Err(SdkError::ServiceError(service_error))
+          if service_error.err().is_conditional_check_failed_exception() =>
+        {
+          let Some(lease) = self.get_lease(key).await? else {
+            debug!("consumer lease(dynamo) commit result: expired");
+            mark_expected_outcome();
+            return Ok(ConsumerGroupCommitOutcome::Expired);
+          };
+          if lease.lease_expiration_ts_ms <= now_ts_ms {
+            mark_expected_outcome();
+            debug!("consumer lease(dynamo) commit result: expired");
+            Ok(ConsumerGroupCommitOutcome::Expired)
+          } else {
+            debug!("consumer lease(dynamo) commit result: held_by_other");
+            mark_expected_outcome();
+            Ok(ConsumerGroupCommitOutcome::HeldByOther(lease))
+          }
+        },
+        Err(error) => Err(error.into()),
+      }
+    })
   }
 
   async fn release_partition(
@@ -552,74 +582,80 @@ impl ConsumerGroupLeaseStore for DynamoConsumerGroupLeaseStore {
     generation: u64,
     now: OffsetDateTime,
   ) -> Result<ConsumerGroupReleaseOutcome> {
-    trace!(
-      "consumer lease(dynamo) release: table={}, topic={}, group_id={}, partition={}, \
-       owner_id={}, generation={}",
-      self.table_name, key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
-    );
+    trace_dynamo_operation!(self, "release_partition", async {
+      trace!(
+        "consumer lease(dynamo) release: table={}, topic={}, group_id={}, partition={}, \
+         owner_id={}, generation={}",
+        self.table_name, key.topic, key.group_id, key.virtual_partition_id, owner_id, generation
+      );
 
-    let now_ts_ms = unix_millis_from_offset_datetime(now)
-      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let mut values = HashMap::new();
-    values.insert(
-      ":owner".to_string(),
-      AttributeValue::S(owner_id.to_string()),
-    );
-    values.insert(
-      ":generation".to_string(),
-      AttributeValue::N(generation.to_string()),
-    );
-    values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-    values.insert(
-      ":ttl".to_string(),
-      AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer)?.to_string()),
-    );
-    let update = format!(
-      "SET {ATTR_LEASE_EXPIRES} = :now, {ATTR_LAST_HEARTBEAT} = :now, {ATTR_GRACEFUL_RELEASE_TS} \
-       = :now, {ATTR_TTL} = :ttl"
-    );
-    let condition = format!(
-      "{ATTR_OWNER} = :owner AND {ATTR_GENERATION} = :generation AND {ATTR_LEASE_EXPIRES} > :now"
-    );
+      let now_ts_ms = unix_millis_from_offset_datetime(now)
+        .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+      let mut values = HashMap::new();
+      values.insert(
+        ":owner".to_string(),
+        AttributeValue::S(owner_id.to_string()),
+      );
+      values.insert(
+        ":generation".to_string(),
+        AttributeValue::N(generation.to_string()),
+      );
+      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+      values.insert(
+        ":ttl".to_string(),
+        AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer)?.to_string()),
+      );
+      let update = format!(
+        "SET {ATTR_LEASE_EXPIRES} = :now, {ATTR_LAST_HEARTBEAT} = :now, \
+         {ATTR_GRACEFUL_RELEASE_TS} = :now, {ATTR_TTL} = :ttl"
+      );
+      let condition = format!(
+        "{ATTR_OWNER} = :owner AND {ATTR_GENERATION} = :generation AND {ATTR_LEASE_EXPIRES} > :now"
+      );
 
-    let response = self
-      .client
-      .update_item()
-      .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(key.partition_key()))
-      .key(ATTR_SK, AttributeValue::S(key.sort_key()))
-      .update_expression(update)
-      .condition_expression(condition)
-      .set_expression_attribute_values(Some(values))
-      .return_values(ReturnValue::AllNew)
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await;
+      let response = self
+        .client
+        .update_item()
+        .table_name(&self.table_name)
+        .key(ATTR_PK, AttributeValue::S(key.partition_key()))
+        .key(ATTR_SK, AttributeValue::S(key.sort_key()))
+        .update_expression(update)
+        .condition_expression(condition)
+        .set_expression_attribute_values(Some(values))
+        .return_values(ReturnValue::AllNew)
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .trace_request("UpdateItem")
+        .await;
 
-    match response {
-      Ok(output) => {
-        self.record_write_capacity(output.consumed_capacity.as_ref());
-        debug!("consumer lease(dynamo) release result: released");
-        Ok(ConsumerGroupReleaseOutcome::Released)
-      },
-      Err(SdkError::ServiceError(service_error))
-        if service_error.err().is_conditional_check_failed_exception() =>
-      {
-        let Some(lease) = self.get_lease(key).await? else {
-          debug!("consumer lease(dynamo) release result: expired");
-          return Ok(ConsumerGroupReleaseOutcome::Expired);
-        };
+      match response {
+        Ok(output) => {
+          self.record_write_capacity(output.consumed_capacity.as_ref());
+          debug!("consumer lease(dynamo) release result: released");
+          Ok(ConsumerGroupReleaseOutcome::Released)
+        },
+        Err(SdkError::ServiceError(service_error))
+          if service_error.err().is_conditional_check_failed_exception() =>
+        {
+          let Some(lease) = self.get_lease(key).await? else {
+            debug!("consumer lease(dynamo) release result: expired");
+            mark_expected_outcome();
+            return Ok(ConsumerGroupReleaseOutcome::Expired);
+          };
 
-        if lease.lease_expiration_ts_ms <= now_ts_ms {
-          debug!("consumer lease(dynamo) release result: expired");
-          Ok(ConsumerGroupReleaseOutcome::Expired)
-        } else {
-          debug!("consumer lease(dynamo) release result: held_by_other");
-          Ok(ConsumerGroupReleaseOutcome::HeldByOther(lease))
-        }
-      },
-      Err(error) => Err(error.into()),
-    }
+          if lease.lease_expiration_ts_ms <= now_ts_ms {
+            mark_expected_outcome();
+            debug!("consumer lease(dynamo) release result: expired");
+            Ok(ConsumerGroupReleaseOutcome::Expired)
+          } else {
+            debug!("consumer lease(dynamo) release result: held_by_other");
+            mark_expected_outcome();
+            Ok(ConsumerGroupReleaseOutcome::HeldByOther(lease))
+          }
+        },
+        Err(error) => Err(error.into()),
+      }
+    })
   }
 }
 

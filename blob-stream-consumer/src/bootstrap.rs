@@ -34,6 +34,7 @@ use blob_stream_metadata_store::{
   ConsumerGroupMember,
   ConsumerGroupMembershipStore,
   DynamoCapacityMetrics,
+  DynamoConsumerGroupLeaseStore,
   DynamoConsumerGroupMembershipStore,
   DynamoMetadataStore,
   InMemoryConsumerGroupLeaseStore,
@@ -43,7 +44,6 @@ use blob_stream_metadata_store::{
   aws_retry_config,
   aws_timeout_config,
   build_dynamo_client,
-  build_dynamo_consumer_group_lease_store,
 };
 use blob_stream_proto::protos::blobstream::v1::config::{
   BlobStoreConfig,
@@ -279,7 +279,7 @@ impl ConsumerIteratorImpl {
 
     let virtual_partitions = virtual_partitions_for_topic(&config.topic)?;
 
-    let blob_store = build_blob_store(&config.blob_store).await?;
+    let blob_store = build_blob_store(&config.blob_store, feature_flags.clone()).await?;
     let dynamo_capacity_metrics = DynamoCapacityMetrics::new(&metrics_scope.scope("dynamo"));
     let (metadata_store, lease_store, membership_store) = build_metadata_and_coordination_stores(
       &config.metadata_store,
@@ -357,7 +357,10 @@ fn virtual_partitions_for_topic(topic: &TopicConfig) -> Result<Vec<VirtualPartit
   Ok((0 .. total).collect())
 }
 
-async fn build_blob_store(config: &BlobStoreConfig) -> Result<Arc<dyn BlobStore>> {
+async fn build_blob_store(
+  config: &BlobStoreConfig,
+  feature_flags: Option<FeatureFlagsWatch>,
+) -> Result<Arc<dyn BlobStore>> {
   if config.has_in_memory() {
     let store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
     return Ok(store);
@@ -387,7 +390,7 @@ async fn build_blob_store(config: &BlobStoreConfig) -> Result<Arc<dyn BlobStore>
       aws_sdk_s3::Client::from_conf(conf)
     };
 
-    let store: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(client, bucket));
+    let store: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(client, bucket, feature_flags));
     return Ok(store);
   }
 
@@ -422,34 +425,34 @@ async fn build_metadata_and_coordination_stores(
 
     let client = build_dynamo_client(dynamo.region.as_str(), dynamo.endpoint.as_str()).await;
 
-    let metadata_store: Arc<dyn MetadataStore> = Arc::new(
-      DynamoMetadataStore::new(
-        client.clone(),
-        metadata_table,
-        producer_partition_lease_table,
-        HashMap::new(),
-        DEFAULT_MEMBERSHIP_TTL_BUFFER,
-        Some(capacity_metrics.clone()),
-      )
-      .with_feature_flags(feature_flags),
-    );
+    let metadata_store: Arc<dyn MetadataStore> = Arc::new(DynamoMetadataStore::new(
+      client.clone(),
+      metadata_table,
+      producer_partition_lease_table,
+      HashMap::new(),
+      DEFAULT_MEMBERSHIP_TTL_BUFFER,
+      Some(capacity_metrics.clone()),
+      feature_flags.clone(),
+    ));
     let membership_ttl_buffer = dynamo.lease_ttl_buffer.as_ref().map_or(
       DEFAULT_MEMBERSHIP_TTL_BUFFER,
       ProtoDurationExt::to_time_duration,
     );
     let consumer_lease_ttl_buffer = consumer_group_lease_ttl_buffer(retention)?;
-    let lease_store = build_dynamo_consumer_group_lease_store(
+    let lease_store = Arc::new(DynamoConsumerGroupLeaseStore::new(
       client.clone(),
       consumer_lease_table,
       consumer_lease_ttl_buffer,
       Some(capacity_metrics.clone()),
-    );
+      feature_flags.clone(),
+    ));
     let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
       Arc::new(DynamoConsumerGroupMembershipStore::new(
         client,
         consumer_membership_table,
         membership_ttl_buffer,
         Some(capacity_metrics),
+        feature_flags,
       ));
     return Ok((metadata_store, lease_store, membership_store));
   }

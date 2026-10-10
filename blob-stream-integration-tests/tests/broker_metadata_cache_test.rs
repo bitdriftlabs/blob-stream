@@ -1,8 +1,10 @@
 use anyhow::{Result, anyhow};
+use bd_log::test::TestTraceContext;
 use bd_runtime_config::loader::Loader;
 use bd_server_stats::test::util::stats::Helper;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use bd_time::{SystemTimeProvider, TimeProvider};
+use blob_stream_broker::read::metadata_cache::{MetadataCache, MetadataCacheConfig};
 use blob_stream_consumer::EventualMetadataReadsConfig;
 use blob_stream_consumer::consumer::{BrokerMetadataQuery, GrpcBrokerMetadataQuery};
 use blob_stream_consumer::iterator::{ConsumerIterator, NextResult};
@@ -37,6 +39,8 @@ use blob_stream_proto::protos::blobstream::v1::broker::{
   read_metadata_window_request,
   read_metadata_window_response,
 };
+use blob_stream_proto::protos::blobstream::v1::config::{BrokerConfig, RuntimeConfig, TopicConfig};
+use blob_stream_runtime_config::AWS_DYNAMODB_TRACE_SAMPLE_RATE;
 use blob_stream_types::{
   CommittedCursor,
   CommittedSourceCheckpoint,
@@ -55,6 +59,77 @@ fn eventual_metadata_reads(visibility_delay: TimeDuration) -> EventualMetadataRe
     visibility_delay: visibility_delay.into_proto(),
     ..Default::default()
   }
+}
+
+#[tokio::test]
+async fn aws_tracing_metadata_cache_hit_does_not_call_dynamo() -> Result<()> {
+  let resources = IntegrationResources::create().await?;
+  let loader = FakeLoader::new(Arc::new(
+    DefaultFeatureFlags::default().with_bool_flag(AWS_DYNAMODB_TRACE_SAMPLE_RATE, true),
+  ));
+  let store = resources.metadata_store_with_runtime_config(None, Some(loader.snapshot_watch()));
+  let clock = Arc::new(framework::ManualTimeProvider::new(
+    OffsetDateTime::from_unix_timestamp(20)?,
+  ));
+  let runtime = RuntimeConfig {
+    broker: Some(BrokerConfig {
+      metadata_cache_coalescing_window: TimeDuration::ZERO.into_proto(),
+      ..Default::default()
+    })
+    .into(),
+    topics: vec![TopicConfig {
+      name: TOPIC.into(),
+      partition_count: 1,
+      num_writers: 1,
+      metadata_cache_max_age: TimeDuration::seconds(1).into_proto(),
+      ..Default::default()
+    }],
+    ..Default::default()
+  };
+  let cache = Arc::new(
+    MetadataCache::new(
+      store,
+      MetadataCacheConfig::from_runtime_config(&runtime, None)?,
+      None,
+    )
+    .time_provider(clock),
+  );
+  let context = TestTraceContext::new("cache-aws-test");
+  let dispatch = context.dispatch();
+  let _guard = tracing::dispatcher::set_default(&dispatch);
+  let request = ReadMetadataWindowRequest {
+    topic: TOPIC.into(),
+    window_start_unix_seconds: 0,
+    consistency: MetadataReadConsistency::METADATA_READ_CONSISTENCY_EVENTUAL.into(),
+    coverage: Some(read_metadata_window_request::Coverage::FullRecovery(
+      FullRecoveryMetadataCoverage {
+        virtual_partition_ids: vec![0],
+        ..Default::default()
+      },
+    )),
+    max_response_bytes: 1024 * 1024,
+    ..Default::default()
+  };
+  let response = cache.read(request.clone()).await;
+  assert!(matches!(
+    response.result,
+    Some(read_metadata_window_response::Result::Success(_))
+  ));
+  let spans = context.exported_spans();
+  assert_eq!(
+    spans
+      .iter()
+      .filter(|span| span.name == "aws.dynamodb.request")
+      .count(),
+    1
+  );
+  let response = cache.read(request).await;
+  let Some(read_metadata_window_response::Result::Success(success)) = response.result else {
+    return Err(anyhow!("cached metadata read failed"));
+  };
+  assert!(success.retained_coverage);
+  assert_eq!(context.exported_spans().len(), spans.len());
+  Ok(())
 }
 
 #[tokio::test]

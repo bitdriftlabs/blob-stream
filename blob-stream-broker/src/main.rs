@@ -2,17 +2,17 @@ use anyhow::{Context, Result};
 use bd_panic::PanicType;
 use bd_runtime_config::loader::Stats;
 use bd_shutdown::{ComponentShutdownTrigger, real_graceful_shutdown};
-use blob_stream_broker::config::load_runtime_config;
+use blob_stream_broker::config::{broker_log_config, load_runtime_config};
 use blob_stream_broker::grpc::make_broker_router;
 use blob_stream_broker::metrics::BrokerMetrics;
 use blob_stream_broker::read::blob_cache::{BlobCache, BlobCacheConfig};
 use blob_stream_broker::read::metadata_cache::{MetadataCache, MetadataCacheConfig};
-use blob_stream_broker::storage::build_runtime_blob_store;
+use blob_stream_broker::storage::build_runtime_blob_store_with_feature_flags;
 use blob_stream_broker::write::memory_pressure::MemoryPressureController;
 use blob_stream_broker::write::{RuntimeWriteEngineBuilder, build_runtime_metadata_store};
 use blob_stream_metadata_store::DynamoCapacityMetrics;
 use clap::Parser;
-use log::info;
+use log::{error, info};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,7 +32,11 @@ fn main() -> Result<()> {
   bd_log::SwapLogger::initialize();
 
   let runtime = bd_rt::new_runtime()?;
-  runtime.block_on(async_main())
+  let result = runtime.block_on(async_main());
+  if let Err(error) = bd_log::SwapLogger::shutdown() {
+    error!("broker trace exporter shutdown failed: {error}");
+  }
+  result
 }
 
 async fn async_main() -> Result<()> {
@@ -42,6 +46,7 @@ async fn async_main() -> Result<()> {
     .broker
     .as_ref()
     .context("runtime config missing broker config")?;
+  bd_log::SwapLogger::initialize_with_config(&broker_log_config(broker_config)?)?;
   let bind_addr = broker_config.bind_addr.to_string();
   let bind_addr = bind_addr.trim().to_string();
   let addr: SocketAddr = bind_addr
@@ -75,7 +80,8 @@ async fn async_main() -> Result<()> {
     feature_flags_watch.clone(),
   )
   .await?;
-  let broker_blob_store = build_runtime_blob_store(&config).await?;
+  let broker_blob_store =
+    build_runtime_blob_store_with_feature_flags(&config, feature_flags_watch.clone()).await?;
   let metadata_cache_config =
     MetadataCacheConfig::from_runtime_config(&config, feature_flags_watch.as_ref())?;
   let metadata_cache = MetadataCache::new_with_metrics(

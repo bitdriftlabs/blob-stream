@@ -16,6 +16,7 @@ use super::{
   oneshot,
   trace,
 };
+use tracing::Instrument as _;
 
 impl ConsumerDriver {
   pub(in crate::iterator) async fn commit(&mut self) -> Result<HeartbeatReport> {
@@ -67,7 +68,7 @@ impl ConsumerDriver {
         error.message = field::Empty,
         otel.status_code = field::Empty,
       );
-      let commit_result = self.commit().await;
+      let commit_result = self.commit().instrument(shutdown_span.clone()).await;
       if let Some(lifecycle_hooks) = &self.lifecycle_hooks {
         lifecycle_hooks
           .shutdown_commit_finished(&self.group_config.member_id, self.coordinator.generation())
@@ -99,6 +100,7 @@ impl ConsumerDriver {
       let release_result = self
         .coordinator
         .release_owned(self.time_provider.now())
+        .instrument(shutdown_span.clone())
         .await;
       match &release_result {
         Ok(released_partitions) => {
@@ -161,6 +163,7 @@ impl ConsumerDriver {
           &self.group_config.group_id,
           &self.group_config.member_id,
         )
+        .instrument(shutdown_span.clone())
         .await;
       let planner_release_result = self
         .membership_store
@@ -170,6 +173,7 @@ impl ConsumerDriver {
           &self.group_config.member_id,
           self.coordinator.planner_session_id(),
         )
+        .instrument(shutdown_span.clone())
         .await;
       if let Err(error) = &planner_release_result {
         debug!(

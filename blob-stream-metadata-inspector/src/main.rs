@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
     window_radius: cli.window_radius,
   };
   let client = build_dynamo_client(&cli.aws_region, &cli.dynamodb_endpoint).await;
-  let store = DynamoMetadataStore::new_read_only(client, cli.segment_dynamo_table);
+  let store = DynamoMetadataStore::new_read_only(client, cli.segment_dynamo_table, None);
   let report = inspect_metadata(&store, &request).await?;
   match cli.format {
     OutputFormat::Table => print_table(&report, cli.context_rows),

@@ -1,4 +1,9 @@
-use crate::aws::{retry_dynamo_transaction_conflicts, transaction_cancellation_has_code};
+use crate::aws::{
+  DynamoRequestExt as _,
+  retry_dynamo_transaction_conflicts,
+  trace_dynamo_operation,
+  transaction_cancellation_has_code,
+};
 use crate::dynamo_attributes::{
   ATTR_EPOCH,
   ATTR_EXPIRES,
@@ -23,6 +28,7 @@ use async_trait::async_trait;
 use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_dynamodb::operation::RequestId;
 use aws_sdk_dynamodb::operation::query::builders::QueryFluentBuilder;
 use aws_sdk_dynamodb::operation::query::{QueryError, QueryOutput};
 use aws_sdk_dynamodb::primitives::Blob;
@@ -37,17 +43,21 @@ use aws_sdk_dynamodb::{Client, Config};
 use bd_backoff::{ExponentialBackoffBuilder, Finite, InfiniteBackoff as _, SystemClock};
 use bd_log_util::warn_every;
 use bd_runtime_config::feature_flags::{FeatureFlags, FeatureFlagsWatch, WatchedFeatureFlags};
+use blob_stream_runtime_config::AwsTraceSampler;
+use blob_stream_runtime_config::aws_tracing::bounded_diagnostic;
 use blob_stream_types::{SnowflakeId, TopicWindowKey, offset_datetime_from_unix_seconds};
 use bytes::Bytes;
 use log::{debug, trace};
 use parking_lot::Mutex;
 use protobuf::Chars;
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use time::Duration;
 use time::ext::NumericalDuration;
 use tokio::time::{Instant, sleep, timeout_at};
+use tracing::{Instrument as _, Span};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -177,66 +187,110 @@ async fn query_page_with_retries(
   window: &TopicWindowKey,
   policy: QueryRetryPolicy,
 ) -> Result<QueryOutput> {
-  let deadline = Instant::now() + policy.page_timeout;
-  // A 100% jitter factor produces delays in [0, 2 * interval].
-  let mut backoff = ExponentialBackoffBuilder::<SystemClock, Finite>::new_infinite()
-    .with_initial_interval(Duration::milliseconds(
-      i64::try_from(policy.initial_delay.as_millis() / 2).unwrap_or(i64::MAX),
-    ))
-    .with_max_interval(Duration::milliseconds(
-      i64::try_from(policy.max_delay.as_millis() / 2).unwrap_or(i64::MAX),
-    ))
-    .with_randomization_factor(1.0)
-    .with_multiplier(2.0)
-    .build();
-  let mut last_throttle = None;
+  let page = bd_log::otel_info_span_if_parent!(
+    "aws.dynamodb.query_page",
+    aws.application_attempts = tracing::field::Empty,
+    aws.last_response_request_id = tracing::field::Empty,
+    aws.last_response_is_prior = tracing::field::Empty,
+    aws.outcome = tracing::field::Empty,
+  );
+  let completion = page.clone();
   let mut attempt = 0;
-  loop {
-    attempt += 1;
-    let response = timeout_at(
-      deadline,
-      query
-        .clone()
-        .customize()
-        .config_override(
-          Config::builder()
-            .retry_config(RetryConfig::disabled())
-            .timeout_config(TimeoutConfig::disabled()),
-        )
-        .send(),
-    )
-    .await;
-    let error = match response {
-      Ok(Ok(output)) => return Ok(output),
-      Ok(Err(error)) => error,
-      Err(_) => {
+  let mut last_request_id = None;
+  let mut timed_out = false;
+  let result = async {
+    let deadline = Instant::now() + policy.page_timeout;
+    // A 100% jitter factor produces delays in [0, 2 * interval].
+    let mut backoff = ExponentialBackoffBuilder::<SystemClock, Finite>::new_infinite()
+      .with_initial_interval(Duration::milliseconds(
+        i64::try_from(policy.initial_delay.as_millis() / 2).unwrap_or(i64::MAX),
+      ))
+      .with_max_interval(Duration::milliseconds(
+        i64::try_from(policy.max_delay.as_millis() / 2).unwrap_or(i64::MAX),
+      ))
+      .with_randomization_factor(1.0)
+      .with_multiplier(2.0)
+      .build();
+    let mut last_throttle = None;
+    loop {
+      attempt += 1;
+      let response = timeout_at(
+        deadline,
+        query
+          .clone()
+          .customize()
+          .config_override(
+            Config::builder()
+              .retry_config(RetryConfig::disabled())
+              .timeout_config(TimeoutConfig::disabled()),
+          )
+          .send()
+          .trace_request("Query"),
+      )
+      .await;
+      let request_id = match &response {
+        Ok(Ok(output)) => output.request_id(),
+        Ok(Err(error)) => error
+          .raw_response()
+          .and_then(|raw| raw.headers().get("x-amzn-requestid")),
+        Err(_) => None,
+      };
+      if let Some(id) = request_id {
+        last_request_id = Some(bounded_diagnostic(id).to_string());
+      }
+      let error = match response {
+        Ok(Ok(output)) => return Ok(output),
+        Ok(Err(error)) => error,
+        Err(_) => {
+          timed_out = true;
+          return Err(last_throttle.map_or_else(
+            || anyhow!("metadata Query page timed out"),
+            |(attempts, source)| exhausted_throttle(source, attempts, window),
+          ));
+        },
+      };
+      let throttled = query_error_is_throttled(&error);
+      if !query_error_is_retryable(&error) {
+        return if throttled {
+          Err(exhausted_throttle(error, attempt, window))
+        } else {
+          Err(error.into())
+        };
+      }
+      debug!(
+        "metadata(dynamo) Query retry: topic={}, window_start={}, attempt={}, \
+         throttled={throttled}",
+        window.topic, window.window_start_unix_seconds, attempt
+      );
+      last_throttle = throttled.then_some((attempt, error));
+      let delay = backoff.next_backoff().unsigned_abs();
+      if timeout_at(deadline, sleep(delay)).await.is_err() {
+        timed_out = true;
         return Err(last_throttle.map_or_else(
           || anyhow!("metadata Query page timed out"),
           |(attempts, source)| exhausted_throttle(source, attempts, window),
         ));
-      },
-    };
-    let throttled = query_error_is_throttled(&error);
-    if !query_error_is_retryable(&error) {
-      return if throttled {
-        Err(exhausted_throttle(error, attempt, window))
-      } else {
-        Err(error.into())
-      };
-    }
-    debug!(
-      "metadata(dynamo) Query retry: topic={}, window_start={}, attempt={}, throttled={throttled}",
-      window.topic, window.window_start_unix_seconds, attempt
-    );
-    last_throttle = throttled.then_some((attempt, error));
-    let delay = backoff.next_backoff().unsigned_abs();
-    if timeout_at(deadline, sleep(delay)).await.is_err() {
-      return Err(last_throttle.map_or_else(
-        || anyhow!("metadata Query page timed out"),
-        |(attempts, source)| exhausted_throttle(source, attempts, window),
-      ));
+      }
     }
   }
+  .instrument(page)
+  .await;
+  completion.record("aws.application_attempts", attempt);
+  completion.record("aws.last_response_is_prior", timed_out);
+  completion.record(
+    "aws.outcome",
+    if timed_out {
+      "deadline"
+    } else if result.is_err() {
+      "failure"
+    } else {
+      "success"
+    },
+  );
+  if let Some(id) = last_request_id {
+    completion.record("aws.last_response_request_id", id.as_str());
+  }
+  result
 }
 
 //
@@ -252,13 +306,26 @@ pub struct DynamoMetadataStore {
   ttl_buffer: Duration,
   capacity_metrics: Option<DynamoCapacityMetrics>,
   watched_query_policy: Arc<Mutex<WatchedFeatureFlags<QueryRetryPolicy>>>,
+  trace_sampler: AwsTraceSampler,
 }
 
 impl DynamoMetadataStore {
   /// Build a metadata store used only for read-only inspection.
   #[must_use]
-  pub fn new_read_only(client: Client, table_name: impl Into<String>) -> Self {
-    Self::new(client, table_name, "", HashMap::new(), Duration::ZERO, None)
+  pub fn new_read_only(
+    client: Client,
+    table_name: impl Into<String>,
+    feature_flags: Option<FeatureFlagsWatch>,
+  ) -> Self {
+    Self::new(
+      client,
+      table_name,
+      "",
+      HashMap::new(),
+      Duration::ZERO,
+      None,
+      feature_flags,
+    )
   }
 
   #[must_use]
@@ -269,6 +336,7 @@ impl DynamoMetadataStore {
     topic_retention: HashMap<Chars, Duration>,
     ttl_buffer: Duration,
     capacity_metrics: Option<DynamoCapacityMetrics>,
+    feature_flags: Option<FeatureFlagsWatch>,
   ) -> Self {
     Self {
       client,
@@ -277,20 +345,12 @@ impl DynamoMetadataStore {
       topic_retention,
       ttl_buffer,
       capacity_metrics,
+      trace_sampler: AwsTraceSampler::new(feature_flags.clone()),
       watched_query_policy: Arc::new(Mutex::new(WatchedFeatureFlags::new(
-        None,
+        feature_flags,
         Arc::new(QueryRetryPolicy::default()),
       ))),
     }
-  }
-
-  #[must_use]
-  pub fn with_feature_flags(mut self, feature_flags: Option<FeatureFlagsWatch>) -> Self {
-    self.watched_query_policy = Arc::new(Mutex::new(WatchedFeatureFlags::new(
-      feature_flags,
-      Arc::new(QueryRetryPolicy::default()),
-    )));
-    self
   }
 
   fn query_retry_policy(&self) -> QueryRetryPolicy {
@@ -353,173 +413,184 @@ impl MetadataStore for DynamoMetadataStore {
     fences: Option<&[ProducerPartitionFence]>,
     now_ts_ms: i64,
   ) -> MetadataWriteResult {
-    trace!(
-      "metadata(dynamo) write_segment start: table={}, topic={}, window_start={}, snowflake_id={}",
-      self.table_name,
-      metadata.window.topic,
-      offset_datetime_from_unix_seconds(metadata.window.window_start_unix_seconds),
-      metadata.snowflake_id.as_u64()
-    );
-    if let Some(fences) = fences {
-      if fences.is_empty() {
-        return Err(
-          anyhow!("fenced metadata publication requires at least one producer partition fence")
-            .into(),
+    trace_dynamo_operation!(
+      self,
+      "write_segment",
+      async {
+        Span::current().record("aws.details_json", json!({"topic": bounded_diagnostic(metadata.window.topic.as_str()), "window_start": metadata.window.window_start_unix_seconds, "snowflake_id": metadata.snowflake_id.as_u64(), "fence_count": fences.map_or(0, <[ProducerPartitionFence]>::len), "producer_lease_table": bounded_diagnostic(&self.producer_partition_lease_table_name)}).to_string());
+        trace!(
+          "metadata(dynamo) write_segment start: table={}, topic={}, window_start={}, \
+           snowflake_id={}",
+          self.table_name,
+          metadata.window.topic,
+          offset_datetime_from_unix_seconds(metadata.window.window_start_unix_seconds),
+          metadata.snowflake_id.as_u64()
         );
-      }
-      if fences.len() > MAX_FENCED_METADATA_PARTITIONS {
-        return Err(
-          anyhow!(
-            "fenced metadata publication supports at most {MAX_FENCED_METADATA_PARTITIONS} \
-             partitions"
-          )
-          .into(),
-        );
-      }
-      let mut lease_keys = HashSet::with_capacity(fences.len());
-      for fence in fences {
-        if !lease_keys.insert(&fence.key) {
-          return Err(
-            anyhow!("fenced metadata publication has duplicate producer lease key").into(),
+        if let Some(fences) = fences {
+          if fences.is_empty() {
+            return Err(
+              anyhow!("fenced metadata publication requires at least one producer partition fence")
+                .into(),
+            );
+          }
+          if fences.len() > MAX_FENCED_METADATA_PARTITIONS {
+            return Err(
+              anyhow!(
+                "fenced metadata publication supports at most {MAX_FENCED_METADATA_PARTITIONS} \
+                 partitions"
+              )
+              .into(),
+            );
+          }
+          let mut lease_keys = HashSet::with_capacity(fences.len());
+          for fence in fences {
+            if !lease_keys.insert(&fence.key) {
+              return Err(
+                anyhow!("fenced metadata publication has duplicate producer lease key").into(),
+              );
+            }
+          }
+          if fences.len() != metadata.segment_index.len()
+            || !fences.iter().all(|fence| {
+              fence.key.topic.as_str() == metadata.window.topic
+                && metadata
+                  .segment_index
+                  .contains_key(&fence.key.virtual_partition_id)
+            })
+          {
+            return Err(
+              anyhow!(
+                "fenced metadata publication requires producer lease fences matching segment \
+                 partitions"
+              )
+              .into(),
+            );
+          }
+        }
+
+        let ttl_epoch_seconds = self.metadata_ttl_epoch_seconds(&metadata);
+        let encoded = codec::encode(&metadata).map_err(MetadataWriteError::from)?;
+        let mut item = HashMap::from([
+          (
+            ATTR_PK.to_string(),
+            AttributeValue::S(encoded.partition_key),
+          ),
+          (ATTR_SK.to_string(), AttributeValue::S(encoded.sort_key)),
+          (
+            ATTR_SEGMENT_METADATA_V1.to_string(),
+            AttributeValue::B(Blob::new(encoded.payload)),
+          ),
+        ]);
+        if let Some(ttl_epoch_seconds) = ttl_epoch_seconds {
+          item.insert(
+            ATTR_TTL.to_string(),
+            AttributeValue::N(ttl_epoch_seconds.to_string()),
           );
         }
-      }
-      if fences.len() != metadata.segment_index.len()
-        || !fences.iter().all(|fence| {
-          fence.key.topic.as_str() == metadata.window.topic
-            && metadata
-              .segment_index
-              .contains_key(&fence.key.virtual_partition_id)
-        })
-      {
-        return Err(
-          anyhow!(
-            "fenced metadata publication requires producer lease fences matching segment \
-             partitions"
-          )
-          .into(),
-        );
-      }
-    }
 
-    let ttl_epoch_seconds = self.metadata_ttl_epoch_seconds(&metadata);
-    let encoded = codec::encode(&metadata).map_err(MetadataWriteError::from)?;
-    let mut item = HashMap::from([
-      (
-        ATTR_PK.to_string(),
-        AttributeValue::S(encoded.partition_key),
-      ),
-      (ATTR_SK.to_string(), AttributeValue::S(encoded.sort_key)),
-      (
-        ATTR_SEGMENT_METADATA_V1.to_string(),
-        AttributeValue::B(Blob::new(encoded.payload)),
-      ),
-    ]);
-    if let Some(ttl_epoch_seconds) = ttl_epoch_seconds {
-      item.insert(
-        ATTR_TTL.to_string(),
-        AttributeValue::N(ttl_epoch_seconds.to_string()),
-      );
-    }
+        let Some(fences) = fences else {
+          let response = self
+            .client
+            .put_item()
+            .table_name(&self.table_name)
+            .set_item(Some(item))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .trace_request("PutItem")
+            .await
+            .map_err(|error| MetadataWriteError::Other(error.into()))?;
+          self.record_write_capacity(response.consumed_capacity.as_ref());
 
-    let Some(fences) = fences else {
-      let response = self
-        .client
-        .put_item()
-        .table_name(&self.table_name)
-        .set_item(Some(item))
-        .return_consumed_capacity(ReturnConsumedCapacity::Total)
-        .send()
-        .await
-        .map_err(|error| MetadataWriteError::Other(error.into()))?;
-      self.record_write_capacity(response.consumed_capacity.as_ref());
+          debug!(
+            "metadata(dynamo) write_segment complete: table={}",
+            self.table_name
+          );
+          return Ok(());
+        };
 
-      debug!(
-        "metadata(dynamo) write_segment complete: table={}",
-        self.table_name
-      );
-      return Ok(());
-    };
-
-    let metadata_put = Put::builder()
-      .table_name(&self.table_name)
-      .set_item(Some(item))
-      .build()
-      .map_err(|error| MetadataWriteError::Other(error.into()))?;
-    let mut transaction_items = Vec::with_capacity(fences.len() + 1);
-    transaction_items.push(TransactWriteItem::builder().put(metadata_put).build());
-    for producer_fence in fences {
-      let mut values = HashMap::new();
-      values.insert(
-        ":holder".to_string(),
-        AttributeValue::S(producer_fence.fence.holder_id.clone()),
-      );
-      values.insert(
-        ":epoch".to_string(),
-        AttributeValue::N(producer_fence.fence.lease_epoch.to_string()),
-      );
-      values.insert(
-        ":session".to_string(),
-        AttributeValue::S(producer_fence.fence.lease_session_id.clone()),
-      );
-      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-      let lease_check = ConditionCheck::builder()
-        .table_name(&self.producer_partition_lease_table_name)
-        .key(ATTR_PK, AttributeValue::S(producer_fence.key.format()))
-        .condition_expression(format!(
-          "{ATTR_HOLDER} = :holder AND {ATTR_EPOCH} = :epoch AND {ATTR_SESSION} = :session AND \
-           {ATTR_EXPIRES} > :now"
-        ))
-        .set_expression_attribute_values(Some(values))
-        .build()
-        .map_err(|error| MetadataWriteError::Other(error.into()))?;
-      transaction_items.push(
-        TransactWriteItem::builder()
-          .condition_check(lease_check)
-          .build(),
-      );
-    }
-
-    let client_request_token = Uuid::new_v4().to_string();
-    let result = retry_dynamo_transaction_conflicts(
-      "fenced_metadata_write",
-      || {
-        self
-          .client
-          .transact_write_items()
-          .client_request_token(client_request_token.clone())
-          .set_transact_items(Some(transaction_items.clone()))
-          .return_consumed_capacity(ReturnConsumedCapacity::Total)
-          .send()
-      },
-      |error| {
-        matches!(
-          error,
-          SdkError::ServiceError(service_error)
-            if transaction_cancellation_has_code(service_error.err(), "TransactionConflict")
-        )
-      },
-    )
-    .await;
-    match result {
-      Ok(output) => {
-        for capacity in output.consumed_capacity.as_deref().unwrap_or_default() {
-          self.record_write_capacity(Some(capacity));
+        let metadata_put = Put::builder()
+          .table_name(&self.table_name)
+          .set_item(Some(item))
+          .build()
+          .map_err(|error| MetadataWriteError::Other(error.into()))?;
+        let mut transaction_items = Vec::with_capacity(fences.len() + 1);
+        transaction_items.push(TransactWriteItem::builder().put(metadata_put).build());
+        for producer_fence in fences {
+          let mut values = HashMap::new();
+          values.insert(
+            ":holder".to_string(),
+            AttributeValue::S(producer_fence.fence.holder_id.clone()),
+          );
+          values.insert(
+            ":epoch".to_string(),
+            AttributeValue::N(producer_fence.fence.lease_epoch.to_string()),
+          );
+          values.insert(
+            ":session".to_string(),
+            AttributeValue::S(producer_fence.fence.lease_session_id.clone()),
+          );
+          values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+          let lease_check = ConditionCheck::builder()
+            .table_name(&self.producer_partition_lease_table_name)
+            .key(ATTR_PK, AttributeValue::S(producer_fence.key.format()))
+            .condition_expression(format!(
+              "{ATTR_HOLDER} = :holder AND {ATTR_EPOCH} = :epoch AND {ATTR_SESSION} = :session \
+               AND {ATTR_EXPIRES} > :now"
+            ))
+            .set_expression_attribute_values(Some(values))
+            .build()
+            .map_err(|error| MetadataWriteError::Other(error.into()))?;
+          transaction_items.push(
+            TransactWriteItem::builder()
+              .condition_check(lease_check)
+              .build(),
+          );
         }
-        debug!(
-          "metadata(dynamo) fenced write complete: table={}, partitions={}",
-          self.table_name,
-          fences.len()
-        );
-        Ok(())
+
+        let client_request_token = Uuid::new_v4().to_string();
+        let result = retry_dynamo_transaction_conflicts(
+          "fenced_metadata_write",
+          || {
+            self
+              .client
+              .transact_write_items()
+              .client_request_token(client_request_token.clone())
+              .set_transact_items(Some(transaction_items.clone()))
+              .return_consumed_capacity(ReturnConsumedCapacity::Total)
+              .send()
+              .trace_request("TransactWriteItems")
+          },
+          |error| {
+            matches!(
+              error,
+              SdkError::ServiceError(service_error)
+                if transaction_cancellation_has_code(service_error.err(), "TransactionConflict")
+            )
+          },
+        )
+        .await;
+        match result {
+          Ok(output) => {
+            for capacity in output.consumed_capacity.as_deref().unwrap_or_default() {
+              self.record_write_capacity(Some(capacity));
+            }
+            debug!(
+              "metadata(dynamo) fenced write complete: table={}, partitions={}",
+              self.table_name,
+              fences.len()
+            );
+            Ok(())
+          },
+          Err(SdkError::ServiceError(service_error))
+            if transaction_cancellation_has_code(service_error.err(), "ConditionalCheckFailed") =>
+          {
+            Err(MetadataWriteError::ProducerLeaseFenceLost)
+          },
+          Err(error) => Err(MetadataWriteError::Other(error.into())),
+        }
       },
-      Err(SdkError::ServiceError(service_error))
-        if transaction_cancellation_has_code(service_error.err(), "ConditionalCheckFailed") =>
-      {
-        Err(MetadataWriteError::ProducerLeaseFenceLost)
-      },
-      Err(error) => Err(MetadataWriteError::Other(error.into())),
-    }
+      |error| matches!(error, MetadataWriteError::ProducerLeaseFenceLost)
+    )
   }
 
   async fn scan_window_from_snowflake(
@@ -528,75 +599,78 @@ impl MetadataStore for DynamoMetadataStore {
     min_snowflake: Option<SnowflakeId>,
     consistency: MetadataReadConsistency,
   ) -> Result<Vec<SegmentMetadata>> {
-    trace!(
-      "metadata(dynamo) scan_window start: table={}, topic={}, window_start={}, \
-       min_snowflake={:?}, consistency={consistency:?}",
-      self.table_name,
-      window.topic,
-      offset_datetime_from_unix_seconds(window.window_start_unix_seconds),
-      min_snowflake.map(SnowflakeId::as_u64)
-    );
+    trace_dynamo_operation!(self, "scan_window_from_snowflake", async {
+      Span::current().record("aws.details_json", json!({"topic": bounded_diagnostic(&window.topic), "window_start": window.window_start_unix_seconds, "min_snowflake": min_snowflake.map(SnowflakeId::as_u64), "consistency": if matches!(consistency, MetadataReadConsistency::Strong) { "strong" } else { "eventual" }}).to_string());
+      trace!(
+        "metadata(dynamo) scan_window start: table={}, topic={}, window_start={}, \
+         min_snowflake={:?}, consistency={consistency:?}",
+        self.table_name,
+        window.topic,
+        offset_datetime_from_unix_seconds(window.window_start_unix_seconds),
+        min_snowflake.map(SnowflakeId::as_u64)
+      );
 
-    let mut segments = Vec::new();
-    let mut start_key = None;
-    loop {
-      let mut values = HashMap::new();
-      values.insert(":pk".to_string(), AttributeValue::S(window.format()));
-      if let Some(min_snowflake) = min_snowflake {
-        values.insert(
-          ":min_snowflake".to_string(),
-          AttributeValue::S(min_snowflake.format_lex()),
-        );
-      }
-
-      let key_condition = if min_snowflake.is_some() {
-        format!("{ATTR_PK} = :pk AND sk >= :min_snowflake")
-      } else {
-        format!("{ATTR_PK} = :pk")
-      };
-      let mut query = self
-        .client
-        .query()
-        .table_name(&self.table_name)
-        .key_condition_expression(key_condition)
-        .projection_expression(format!("{ATTR_PK}, {ATTR_SK}, {ATTR_SEGMENT_METADATA_V1}"))
-        .set_expression_attribute_values(Some(values))
-        .consistent_read(matches!(consistency, MetadataReadConsistency::Strong));
-      if let Some(key) = start_key.clone() {
-        query = query.set_exclusive_start_key(Some(key));
-      }
-
-      let response = query_page_with_retries(
-        query.return_consumed_capacity(ReturnConsumedCapacity::Total),
-        window,
-        self.query_retry_policy(),
-      )
-      .await?;
-      self.record_read_capacity(response.consumed_capacity.as_ref());
-      for item in response.items.unwrap_or_default() {
-        match Self::decode_item(item) {
-          Ok(metadata) => segments.push(metadata),
-          Err(error) => {
-            warn_every!(
-              15.seconds(),
-              "metadata(dynamo) skipped noncompliant segment: {error}"
-            );
-          },
+      let mut segments = Vec::new();
+      let mut start_key = None;
+      loop {
+        let mut values = HashMap::new();
+        values.insert(":pk".to_string(), AttributeValue::S(window.format()));
+        if let Some(min_snowflake) = min_snowflake {
+          values.insert(
+            ":min_snowflake".to_string(),
+            AttributeValue::S(min_snowflake.format_lex()),
+          );
         }
+
+        let key_condition = if min_snowflake.is_some() {
+          format!("{ATTR_PK} = :pk AND sk >= :min_snowflake")
+        } else {
+          format!("{ATTR_PK} = :pk")
+        };
+        let mut query = self
+          .client
+          .query()
+          .table_name(&self.table_name)
+          .key_condition_expression(key_condition)
+          .projection_expression(format!("{ATTR_PK}, {ATTR_SK}, {ATTR_SEGMENT_METADATA_V1}"))
+          .set_expression_attribute_values(Some(values))
+          .consistent_read(matches!(consistency, MetadataReadConsistency::Strong));
+        if let Some(key) = start_key.clone() {
+          query = query.set_exclusive_start_key(Some(key));
+        }
+
+        let response = query_page_with_retries(
+          query.return_consumed_capacity(ReturnConsumedCapacity::Total),
+          window,
+          self.query_retry_policy(),
+        )
+        .await?;
+        self.record_read_capacity(response.consumed_capacity.as_ref());
+        for item in response.items.unwrap_or_default() {
+          match Self::decode_item(item) {
+            Ok(metadata) => segments.push(metadata),
+            Err(error) => {
+              warn_every!(
+                15.seconds(),
+                "metadata(dynamo) skipped noncompliant segment: {error}"
+              );
+            },
+          }
+        }
+
+        let Some(key) = response.last_evaluated_key else {
+          break;
+        };
+        start_key = Some(key);
       }
 
-      let Some(key) = response.last_evaluated_key else {
-        break;
-      };
-      start_key = Some(key);
-    }
-
-    debug!(
-      "metadata(dynamo) scan_window complete: table={}, segments={}",
-      self.table_name,
-      segments.len()
-    );
-    Ok(segments)
+      debug!(
+        "metadata(dynamo) scan_window complete: table={}, segments={}",
+        self.table_name,
+        segments.len()
+      );
+      Ok(segments)
+    })
   }
 }
 
