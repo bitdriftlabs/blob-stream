@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
 use aws_types::region::Region;
+use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_metadata_store::{aws_retry_config, aws_timeout_config};
 use blob_stream_proto::protos::blobstream::v1::config::{BlobStoreConfig, RuntimeConfig};
@@ -24,14 +25,24 @@ pub struct BrokerBlobStore {
 
 /// Build the blob store configured for the broker runtime.
 pub async fn build_runtime_blob_store(config: &RuntimeConfig) -> Result<BrokerBlobStore> {
+  build_runtime_blob_store_with_feature_flags(config, None).await
+}
+
+pub async fn build_runtime_blob_store_with_feature_flags(
+  config: &RuntimeConfig,
+  feature_flags: Option<FeatureFlagsWatch>,
+) -> Result<BrokerBlobStore> {
   let blob_store = config
     .blob_store
     .as_ref()
     .ok_or_else(|| anyhow!("runtime config missing blob_store config"))?;
-  build_blob_store(blob_store).await
+  build_blob_store(blob_store, feature_flags).await
 }
 
-async fn build_blob_store(config: &BlobStoreConfig) -> Result<BrokerBlobStore> {
+async fn build_blob_store(
+  config: &BlobStoreConfig,
+  feature_flags: Option<FeatureFlagsWatch>,
+) -> Result<BrokerBlobStore> {
   if config.has_in_memory() {
     debug!("using in-memory blob store backend");
     return Ok(BrokerBlobStore {
@@ -62,7 +73,7 @@ async fn build_blob_store(config: &BlobStoreConfig) -> Result<BrokerBlobStore> {
         .build();
       aws_sdk_s3::Client::from_conf(config)
     };
-    return Ok(broker_blob_store_from_s3_config(s3, client));
+    return Ok(broker_blob_store_from_s3_config(s3, client, feature_flags));
   }
 
   Err(anyhow!("blob_store backend not configured"))
@@ -71,9 +82,14 @@ async fn build_blob_store(config: &BlobStoreConfig) -> Result<BrokerBlobStore> {
 fn broker_blob_store_from_s3_config(
   config: &blob_stream_proto::protos::blobstream::v1::config::S3BlobStoreConfig,
   client: aws_sdk_s3::Client,
+  feature_flags: Option<FeatureFlagsWatch>,
 ) -> BrokerBlobStore {
   BrokerBlobStore {
-    blob_store: Arc::new(S3BlobStore::new(client, config.bucket.to_string())),
+    blob_store: Arc::new(S3BlobStore::new(
+      client,
+      config.bucket.to_string(),
+      feature_flags,
+    )),
     prefix: (!config.prefix.is_empty()).then(|| config.prefix.to_string()),
   }
 }

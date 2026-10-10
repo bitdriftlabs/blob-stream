@@ -15,7 +15,7 @@ async fn builds_an_in_memory_store_for_writer_reads() {
     InMemoryBlobStoreConfig::new(),
   ));
 
-  let store = build_blob_store(&config).await.unwrap();
+  let store = build_blob_store(&config, None).await.unwrap();
   let key = BlobKey::from("topic/blob");
   store
     .blob_store
@@ -49,7 +49,7 @@ fn builds_an_s3_store_with_the_configured_prefix() {
       .build(),
   );
 
-  let store = broker_blob_store_from_s3_config(&config, client);
+  let store = broker_blob_store_from_s3_config(&config, client, None);
 
   assert_eq!(store.prefix.as_deref(), Some("segments/"));
 }

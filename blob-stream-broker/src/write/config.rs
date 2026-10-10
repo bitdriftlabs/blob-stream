@@ -12,13 +12,13 @@ use blob_stream_broker_discovery::{BrokerDiscovery, BrokerMembership, BrokerNode
 use blob_stream_metadata_store::{
   ConsumerGroupLeaseStore,
   DynamoCapacityMetrics,
+  DynamoConsumerGroupLeaseStore,
   DynamoProducerPartitionLeaseStore,
   InMemoryMetadataStore,
   InMemoryProducerPartitionLeaseStore,
   MetadataStore,
   ProducerPartitionLeaseStore,
   build_dynamo_client,
-  build_dynamo_consumer_group_lease_store,
 };
 use blob_stream_proto::protos::blobstream::v1::config::{
   BrokerConfig,
@@ -469,11 +469,18 @@ impl<'a> RuntimeWriteEngineBuilder<'a> {
       .as_ref()
       .context("runtime config missing metadata_store config")?;
 
-    let lease_store =
-      build_producer_partition_lease_store(metadata_store_config, dynamo_capacity_metrics.clone())
-        .await?;
-    let consumer_lease_store =
-      build_consumer_group_lease_store(metadata_store_config, dynamo_capacity_metrics).await?;
+    let lease_store = build_producer_partition_lease_store(
+      metadata_store_config,
+      dynamo_capacity_metrics.clone(),
+      feature_flags.clone(),
+    )
+    .await?;
+    let consumer_lease_store = build_consumer_group_lease_store(
+      metadata_store_config,
+      dynamo_capacity_metrics,
+      feature_flags.clone(),
+    )
+    .await?;
     let topics_count = topics.len();
     let holder_id_for_log = holder_id.clone();
     let writer_id = write_config.writer_id;
@@ -532,6 +539,7 @@ pub async fn build_runtime_metadata_store(
 async fn build_producer_partition_lease_store(
   config: &MetadataStoreConfig,
   capacity_metrics: DynamoCapacityMetrics,
+  feature_flags: Option<FeatureFlagsWatch>,
 ) -> Result<Arc<dyn ProducerPartitionLeaseStore>> {
   if config.has_in_memory() {
     debug!("using in-memory producer partition lease store backend");
@@ -556,6 +564,7 @@ async fn build_producer_partition_lease_store(
         table_name,
         ttl_buffer,
         Some(capacity_metrics),
+        feature_flags,
       ));
     return Ok(store);
   }
@@ -566,6 +575,7 @@ async fn build_producer_partition_lease_store(
 async fn build_consumer_group_lease_store(
   config: &MetadataStoreConfig,
   capacity_metrics: DynamoCapacityMetrics,
+  feature_flags: Option<FeatureFlagsWatch>,
 ) -> Result<Option<Arc<dyn ConsumerGroupLeaseStore>>> {
   if config.has_in_memory() {
     return Ok(None);
@@ -580,12 +590,13 @@ async fn build_consumer_group_lease_store(
       .lease_ttl_buffer
       .as_ref()
       .map_or(DEFAULT_LEASE_TTL_BUFFER, ProtoDurationExt::to_time_duration);
-    let store = build_dynamo_consumer_group_lease_store(
+    let store = Arc::new(DynamoConsumerGroupLeaseStore::new(
       client,
       table_name,
       ttl_buffer,
       Some(capacity_metrics),
-    );
+      feature_flags,
+    ));
     return Ok(Some(store));
   }
 
@@ -715,17 +726,16 @@ async fn build_metadata_store(
       ProtoDurationExt::to_time_duration,
     );
 
-    let store: Arc<dyn MetadataStore> = Arc::new(
-      blob_stream_metadata_store::DynamoMetadataStore::new(
+    let store: Arc<dyn MetadataStore> =
+      Arc::new(blob_stream_metadata_store::DynamoMetadataStore::new(
         client,
         table_name,
         producer_partition_lease_table_name,
         retention_by_topic,
         ttl_buffer,
         Some(capacity_metrics),
-      )
-      .with_feature_flags(feature_flags),
-    );
+        feature_flags,
+      ));
     return Ok(store);
   }
 

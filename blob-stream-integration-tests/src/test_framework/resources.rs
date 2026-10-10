@@ -19,6 +19,7 @@ use aws_sdk_dynamodb::types::{
   TimeToLiveSpecification,
 };
 use aws_sdk_s3::Client as S3Client;
+use bd_runtime_config::feature_flags::FeatureFlagsWatch;
 use blob_stream_blob_store::{BlobStore, InMemoryBlobStore, S3BlobStore};
 use blob_stream_metadata_store::{
   ConsumerGroupLeaseStore,
@@ -128,7 +129,7 @@ impl IntegrationResources {
 
   pub fn s3_blob_store(&self) -> Arc<dyn BlobStore> {
     Arc::new(FaultInjectedBlobStore::new(
-      Arc::new(S3BlobStore::new(self.s3.clone(), self.bucket.clone())),
+      Arc::new(S3BlobStore::new(self.s3.clone(), self.bucket.clone(), None)),
       self.store_fault_controller.clone(),
     ))
   }
@@ -141,6 +142,14 @@ impl IntegrationResources {
     &self,
     capacity_metrics: Option<DynamoCapacityMetrics>,
   ) -> Arc<dyn MetadataStore> {
+    self.metadata_store_with_runtime_config(capacity_metrics, None)
+  }
+
+  pub fn metadata_store_with_runtime_config(
+    &self,
+    capacity_metrics: Option<DynamoCapacityMetrics>,
+    feature_flags: Option<FeatureFlagsWatch>,
+  ) -> Arc<dyn MetadataStore> {
     let inner: Arc<dyn MetadataStore> = Arc::new(DynamoMetadataStore::new(
       self.dynamo.clone(),
       self.metadata_table.clone(),
@@ -148,6 +157,7 @@ impl IntegrationResources {
       HashMap::new(),
       time::Duration::hours(1),
       capacity_metrics,
+      feature_flags,
     ));
     Arc::new(FaultInjectedMetadataStore::new(
       inner,
@@ -162,6 +172,7 @@ impl IntegrationResources {
         self.producer_lease_table.clone(),
         time::Duration::hours(1),
         None,
+        None,
       ));
     Arc::new(FaultInjectedProducerPartitionLeaseStore::new(
       inner,
@@ -174,6 +185,7 @@ impl IntegrationResources {
       self.dynamo.clone(),
       self.consumer_lease_table.clone(),
       time::Duration::hours(1),
+      None,
       None,
     ));
     Arc::new(FaultInjectedConsumerGroupLeaseStore::new(
@@ -188,6 +200,7 @@ impl IntegrationResources {
         self.dynamo.clone(),
         self.consumer_membership_table.clone(),
         time::Duration::hours(1),
+        None,
         None,
       ));
     Arc::new(FaultInjectedConsumerGroupMembershipStore::new(

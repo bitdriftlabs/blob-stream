@@ -73,5 +73,5 @@ time              = { version = "0.3.55", features = ["formatting", "serde-well-
 tokio             = { version = "1.53.2", features = ["full"] }
 tokio-stream      = "0.1.19"
 tracing           = "0.1.44"
-uuid              = { version = "1.27.0", features = ["v4"] }
-zstd              = "0.14.0"
+uuid              = { version = "1.28.0", features = ["v4"] }
+zstd              = "0.14.2"

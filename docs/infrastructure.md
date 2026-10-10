@@ -99,6 +99,27 @@ constructed. Producer batching, retry, timeout, concurrency, and compression fla
 a producer is constructed. See [Operations](operations.md) for the complete inventory and rollout
 behavior.
 
+### Trace Collector
+
+Set the optional `broker.otlp_collector_hostname` to enable the broker's OTLP gRPC exporter:
+
+```yaml
+broker:
+  otlp_collector_hostname: "otel-collector.observability.svc"
+```
+
+Use a hostname, not a URL or port. The endpoint is `http://<hostname>:4317`, with a three-second
+export timeout. This setting is read at startup and requires a broker restart to change. When
+absent, the broker does not initialize a trace exporter. The service and tracer names are
+`blob-stream-broker`; resource attributes include the hostname as `k8s.pod.name` and a nonempty
+`K8S_CLUSTER_NAME` as `k8s.cluster.name`. The broker shuts down the logger after its asynchronous
+main completes, while the runtime is still available to flush the exporter.
+
+Consumer libraries use the embedding application's existing `bd-log` exporter and logger
+lifecycle; they do not install or shut down a global logger. Supply the same live feature-flag
+watch to consumer bootstrap to control direct-store sampling. See [AWS tracing](operations.md#aws-tracing)
+for sampling controls, outcome policy, and diagnostic fields.
+
 ## S3
 
 Production brokers write segment objects and consumers range-read them. Brokers also need read

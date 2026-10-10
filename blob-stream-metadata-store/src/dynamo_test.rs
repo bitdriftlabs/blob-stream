@@ -28,10 +28,12 @@ use aws_sdk_dynamodb::types::{
   KeyType,
   ScalarAttributeType,
 };
+use bd_log::test::TestTraceContext;
 use bd_runtime_config::loader::Loader;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_blob_store::BlobKey;
 use blob_stream_proto::protos::blobstream::v1::metadata::SegmentMetadataV1;
+use blob_stream_runtime_config::AWS_DYNAMODB_TRACE_SAMPLE_RATE;
 use blob_stream_types::{
   BatchMetadata,
   Compression,
@@ -52,6 +54,136 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 const TTL_ATTRIBUTE_NAME: &str = "ttl_epoch_seconds";
+
+#[tokio::test]
+async fn aws_tracing_dynamo_preserves_page_ids_and_final_results() {
+  for sampled in [false, true] {
+    for failed in [false, true] {
+      let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+      let address = listener.local_addr().unwrap();
+      let server = tokio::spawn(async move {
+        let responses = if failed {
+          vec![(
+            "400 Bad Request",
+            r#"{"__type":"ResourceNotFoundException","message":"missing"}"#,
+          )]
+        } else {
+          vec![
+            (
+              "500 Internal Server Error",
+              r#"{"__type":"InternalServerError","message":"retry"}"#,
+            ),
+            (
+              "200 OK",
+              r#"{"Items":[],"Count":0,"ScannedCount":0,"LastEvaluatedKey":{"pk":{"S":"topic#0"},"sk":{"S":"1"}}}"#,
+            ),
+            ("200 OK", r#"{"Items":[],"Count":0,"ScannedCount":0}"#),
+          ]
+        };
+        for (index, (status, body)) in responses.into_iter().enumerate() {
+          let (mut socket, _) = listener.accept().await.unwrap();
+          let mut request = Vec::new();
+          while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+            let mut buffer = [0; 8192];
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert_ne!(read, 0);
+            request.extend_from_slice(&buffer[.. read]);
+          }
+          let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/x-amz-json-1.0\r\nx-amzn-requestid: \
+             request-{index}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+          );
+          socket.write_all(response.as_bytes()).await.unwrap();
+        }
+      });
+      let client = Client::from_conf(
+        aws_sdk_dynamodb::Config::builder()
+          .region(Region::new("us-east-1"))
+          .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+          .endpoint_url(format!("http://{address}"))
+          .behavior_version_latest()
+          .build(),
+      );
+      let loader = FakeLoader::new(Arc::new(
+        DefaultFeatureFlags::default().with_bool_flag(AWS_DYNAMODB_TRACE_SAMPLE_RATE, sampled),
+      ));
+      let store =
+        DynamoMetadataStore::new_read_only(client, "metadata", Some(loader.snapshot_watch()));
+      let context = TestTraceContext::new("dynamo-test");
+      let dispatch = context.dispatch();
+      let _guard = tracing::dispatcher::set_default(&dispatch);
+      let result = store
+        .scan_window_from_snowflake(
+          &TopicWindowKey {
+            topic: "topic".to_string(),
+            window_start_unix_seconds: 0,
+          },
+          None,
+          MetadataReadConsistency::Strong,
+        )
+        .await;
+      server.await.unwrap();
+      assert_eq!(result.is_err(), failed);
+      let spans = context.exported_spans();
+      let requests = spans
+        .iter()
+        .filter(|span| span.name == "aws.dynamodb.request")
+        .collect::<Vec<_>>();
+      assert_eq!(
+        requests.len(),
+        if failed {
+          1
+        } else if sampled {
+          3
+        } else {
+          0
+        }
+      );
+      for span in &spans {
+        assert_eq!(span.dropped_attributes_count, 0);
+      }
+      for index in 0 .. requests.len() {
+        assert!(requests.iter().any(|span| {
+          span.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "aws.request_id"
+              && attribute.value.as_str() == format!("request-{index}")
+          })
+        }));
+      }
+      if !failed && !sampled {
+        assert_eq!(spans.len(), 0);
+      }
+    }
+  }
+}
+
+#[tokio::test]
+async fn aws_tracing_dynamo_sampling_changes_without_rebuilding_store() {
+  let client = dynamo_client().await.unwrap();
+  let table_name = format!("trace_{}", Uuid::new_v4().simple());
+  create_segments_table(&client, &table_name).await.unwrap();
+  let loader = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
+  let store = DynamoMetadataStore::new_read_only(client, table_name, Some(loader.snapshot_watch()));
+  let context = TestTraceContext::new("live-dynamo-test");
+  let dispatch = context.dispatch();
+  let _guard = tracing::dispatcher::set_default(&dispatch);
+  let window = TopicWindowKey {
+    topic: "topic".to_string(),
+    window_start_unix_seconds: 0,
+  };
+  for sampled in [false, true, false] {
+    loader.update(Arc::new(
+      DefaultFeatureFlags::default().with_bool_flag(AWS_DYNAMODB_TRACE_SAMPLE_RATE, sampled),
+    ));
+    let previous = context.exported_spans().len();
+    store
+      .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Strong)
+      .await
+      .unwrap();
+    assert_eq!(context.exported_spans().len() > previous, sampled);
+  }
+}
 
 #[tokio::test]
 async fn metadata_query_disables_sdk_retries_per_application_attempt() -> Result<()> {
@@ -277,8 +409,11 @@ async fn query_retry_flags_keep_last_valid_policy() -> Result<()> {
   let loader = FakeLoader::new(Arc::new(
     DefaultFeatureFlags::default().with_integer_flag(QUERY_PAGE_TIMEOUT_FLAG, 1_000),
   ));
-  let store = DynamoMetadataStore::new_read_only(dynamo_client().await?, "metadata")
-    .with_feature_flags(Some(loader.snapshot_watch()));
+  let store = DynamoMetadataStore::new_read_only(
+    dynamo_client().await?,
+    "metadata",
+    Some(loader.snapshot_watch()),
+  );
   let first = store.query_retry_policy();
   assert_eq!(first.page_timeout, Duration::from_secs(1));
 
@@ -462,6 +597,7 @@ async fn writes_and_scans_window() -> Result<()> {
     HashMap::new(),
     TimeDuration::hours(1),
     None,
+    None,
   );
   let first = build_segment("topic-a", 100, 1);
   let second = build_segment("topic-a", 100, 2);
@@ -501,6 +637,7 @@ async fn scans_window_from_inclusive_snowflake() -> Result<()> {
     HashMap::new(),
     TimeDuration::hours(1),
     None,
+    None,
   );
   let first = build_segment("topic-a", 100, 1);
   let second = build_segment("topic-a", 100, 2);
@@ -539,6 +676,7 @@ async fn writes_segment_ttl_attribute() -> Result<()> {
     "unused_producer_leases_table",
     topic_retention,
     TimeDuration::hours(1),
+    None,
     None,
   );
   let segment = build_segment("topic-a", 100, 1);
@@ -604,6 +742,7 @@ async fn skips_noncompliant_segment_rows() -> Result<()> {
     "unused_producer_leases_table",
     HashMap::new(),
     TimeDuration::hours(1),
+    None,
     None,
   );
   let valid = build_segment("topic-a", 100, 2);

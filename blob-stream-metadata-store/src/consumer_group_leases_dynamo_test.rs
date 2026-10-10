@@ -121,6 +121,7 @@ async fn list_group_leases_returns_retained_rows_in_partition_order() -> Result<
     table_name.clone(),
     TimeDuration::hours(1),
     None,
+    None,
   );
   let key_two = lease_key_for("topic-a", "group-a", 2);
   let key_ten = lease_key_for("topic-a", "group-a", 10);
@@ -203,6 +204,7 @@ async fn list_active_leases_filters_expired_and_unconfigured_rows() -> Result<()
     table_name.clone(),
     TimeDuration::hours(1),
     None,
+    None,
   );
   let active_a = lease_key_for("topic-a", "group-a", 2);
   let active_b = lease_key_for("topic-a", "group-b", 1);
@@ -284,6 +286,7 @@ async fn fences_assignment() -> Result<()> {
     table_name.clone(),
     TimeDuration::hours(1),
     None,
+    None,
   );
   let key = lease_key();
 
@@ -358,6 +361,7 @@ async fn heartbeats_and_commits() -> Result<()> {
     table_name.clone(),
     TimeDuration::hours(1),
     None,
+    None,
   );
   let key = lease_key();
 
@@ -426,6 +430,7 @@ async fn retained_assignment_preserves_committed_cursor() -> Result<()> {
     table_name.clone(),
     TimeDuration::hours(1),
     None,
+    None,
   );
   let key = lease_key();
   let committed_cursor = cursor_with_source(key.virtual_partition_id, 10);
@@ -485,6 +490,7 @@ async fn heartbeat_fences_other_members() -> Result<()> {
     table_name.clone(),
     TimeDuration::hours(1),
     None,
+    None,
   );
   let key = lease_key();
 
@@ -529,6 +535,7 @@ async fn release_partition_allows_immediate_takeover() -> Result<()> {
     client.clone(),
     table_name.clone(),
     TimeDuration::hours(1),
+    None,
     None,
   );
 
@@ -590,6 +597,7 @@ async fn release_partition_rejects_stale_owner_or_generation() -> Result<()> {
     table_name.clone(),
     TimeDuration::hours(1),
     None,
+    None,
   );
   let key = ConsumerGroupLeaseKey {
     topic: "topic-a".to_string(),
@@ -629,6 +637,7 @@ async fn writes_ttl_attribute_for_consumer_leases() -> Result<()> {
     client.clone(),
     table_name.clone(),
     TimeDuration::seconds(120),
+    None,
     None,
   );
   let key = lease_key();

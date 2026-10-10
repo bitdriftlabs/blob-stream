@@ -76,6 +76,7 @@ response or rejected payload retries the affected blob group directly from stora
 
 | Scope | Flags | Adoption | Operational effect |
 | --- | --- | --- | --- |
+| Broker and consumer AWS stores | `blob_stream_aws_s3_trace_sample_rate`, `blob_stream_aws_dynamodb_trace_sample_rate` | Live, once per logical operation | Default zero. Integer rates are out of 10,000; 100 samples 1%, and 10,000 or higher samples every completed operation. Final unexpected failures are retained regardless of rate. See [AWS tracing](#aws-tracing). |
 | Consumer placement repair | `blob_stream_consumer_colocation_repair_percent` | Live, once per accepted-plan membership transition | Defaults to 10%; accepts 0-100. The optional allowance is rounded down from canonical inventory size, with a positive minimum of two partitions and a maximum of inventory size; zero disables optional repair. Invalid values use 10%. Pod and worker passes share the allowance, measured as final worker-owner changes from the complete balanced sticky baseline. Mandatory moves are outside it. Updating the flag, routine heartbeats, and planner takeover do not trigger repair. |
 | Consumer reader | `blob_stream_consumer_prefetch_max_bytes`, `blob_stream_consumer_max_in_flight_batch_reads`, `blob_stream_consumer_broker_metadata_direct_fallback` | Live, per scan pass | Configures prefetch capacity and range-read concurrency. Broker metadata fallback defaults on; turning it off returns broker metadata errors without a direct retry. Direct-only scans are unaffected. Metadata consistency is static `runtime.read` configuration. Non-`NOT_FOUND` broker blob failures retry the full affected group directly. |
 | Broker and consumer metadata Query | `blob_stream_metadata_query_initial_delay_ms`, `blob_stream_metadata_query_max_delay_ms`, `blob_stream_metadata_query_page_timeout_ms` | Live, per Query page | Both processes use the same flags and defaults: 50-200 ms full-jitter backoff and a three-second deadline per page. Valid ranges are 2-2000 ms initial delay, initial-2000 ms maximum delay, and maximum-4000 ms page timeout. Invalid snapshots retain the previous valid policy. Only metadata Query disables SDK retries and operation timeouts; other DynamoDB operations keep theirs. |
@@ -111,6 +112,53 @@ rate-limited warning with the relevant current limit or pressure state. These re
 the consumer's direct blob-storage fallback for non-`NOT_FOUND` failures; public storage failure
 messages remain sanitized. The blob-cache idle TTL and shared 80% cgroup pressure threshold remain
 restart-only/static, respectively.
+
+## AWS Tracing
+
+The shared S3 and DynamoDB stores create a local `blob_stream.aws` trace for each logical
+operation, linked to any ambient OTEL span. This includes broker uploads, blob-cache refills,
+metadata-cache refills, consumer direct fallback, metadata publication, and lease, sequence,
+membership, and planner operations. A true retained-cache hit makes no AWS call and creates no
+AWS trace. Provisioning, credential resolution, and in-memory stores are outside this boundary.
+
+The final unexpected store failure retains the trace through `otel_span_on_error`, even when
+sampling is off or a higher-level caller recovers. Response decoding and S3 body reads remain
+inside the operation. Recovered retries do not force retention. Expected S3 `NotFound`,
+whole-object admission rejection, publication fence loss, ownership conflicts, and expired
+leases are labeled `aws.outcome=expected` and retained only by sampling. Canceled operations are
+not exported, including operations selected for sampling. Request-level errors do not independently
+force retention; the completed logical operation decides once.
+
+`blob_stream_aws_s3_trace_sample_rate` and `blob_stream_aws_dynamodb_trace_sample_rate` are
+independent integer feature flags. Missing flags, wrong types, an absent watch, or an absent snapshot
+mean zero. Values from 1 to 9,999 select that many operations out of 10,000 probabilistically;
+10,000 or higher selects all. Existing clients observe watch updates without being rebuilt; an
+in-flight operation keeps its entry decision. Start with a low nonzero rate when latency rises,
+then restore zero after collecting representative support IDs. The collector must be configured
+as described in [Infrastructure setup](infrastructure.md#trace-collector).
+
+Retained traces include service, region, operation, bucket/table, outcome, and retention reason.
+S3 request spans contain `aws.request_id`, `aws.s3.extended_request_id`, object key, requested
+range, and bounded response metadata where supplied. DynamoDB request spans each carry their own
+`aws.request_id` and `aws.request_index`; bounded `aws.details_json` includes returned counts,
+consumed capacity, throttling reasons/resources, or transaction cancellation codes where available.
+Failure responses include the actual HTTP status and service code. No payloads, DynamoDB item
+contents, credentials, or arbitrary headers are recorded.
+
+Metadata Query spans group requests by page, with application-attempt counts and the last received
+request ID. `aws.last_response_is_prior=true` on a page deadline means that ID belongs to an
+earlier received response, not the attempt that timed out. SDK-internal retry attempts are not
+intercepted; only SDK-surfaced responses and application attempts are visible. Success outputs
+do not expose an HTTP status. Construction, dispatch, and timeout failures may have no response
+and therefore no AWS request ID. Missing IDs are never fabricated; oversized diagnostic strings
+are omitted instead of publishing a misleading partial ID.
+
+Retention is best effort, not an audit guarantee. Recording remains bounded even when success
+sampling is off: captures are limited to 1,024 spans and 4 MiB each, with a 60-second age limit
+checked on activity and a shared 64 MiB budget. The exporter allows 16 attributes per span;
+structured details are grouped in bounded JSON attributes. Capture limits, export queue pressure,
+collector unavailability, and shutdown deadlines can drop retained data. Sampling does not change
+store retry, timeout, cache, routing, or delivery behavior.
 
 ## HTTP Endpoints
 
