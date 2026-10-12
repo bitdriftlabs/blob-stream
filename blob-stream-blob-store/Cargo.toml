@@ -9,16 +9,22 @@ version = "0.1.0"
 doctest = true
 
 [dependencies]
-anyhow.workspace      = true
-async-trait.workspace = true
-aws-config.workspace  = true
-aws-sdk-s3.workspace  = true
-bytes.workspace       = true
-log.workspace         = true
-parking_lot.workspace = true
-serde.workspace       = true
-thiserror.workspace   = true
-tokio.workspace       = true
+anyhow.workspace            = true
+async-trait.workspace       = true
+aws-config.workspace        = true
+aws-sdk-s3.workspace        = true
+bd-log.workspace            = true
+bd-runtime-config.workspace = true
+blob-stream-runtime-config  = { path = "../blob-stream-runtime-config" }
+bytes.workspace             = true
+log.workspace               = true
+parking_lot.workspace       = true
+serde.workspace             = true
+serde_json.workspace        = true
+thiserror.workspace         = true
+tokio.workspace             = true
+tracing.workspace           = true
 
 [dev-dependencies]
-mockall.workspace = true
+bd-test-helpers-core.workspace = true
+mockall.workspace              = true

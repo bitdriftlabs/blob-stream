@@ -18,6 +18,7 @@ use super::{
   update_worker_prefetch_metrics,
 };
 use crate::iterator::NextResult;
+use tracing::Instrument as _;
 impl ConsumerDriver {
   pub(in crate::iterator) fn record_accepted_assignment_plan(
     &self,
@@ -346,6 +347,7 @@ impl ConsumerDriver {
         let release_result = self
           .coordinator
           .release_partitions(&revoked, self.time_provider.now())
+          .instrument(handoff_span.clone())
           .await;
         match &release_result {
           Ok(released_partitions) => {

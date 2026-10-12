@@ -151,6 +151,7 @@ async fn register_heartbeat_list_and_deregister() -> Result<()> {
     table_name.clone(),
     TimeDuration::hours(1),
     None,
+    None,
   );
 
   store
@@ -266,6 +267,7 @@ async fn register_rejects_invalid_ttl() -> Result<()> {
     table_name.clone(),
     TimeDuration::hours(1),
     None,
+    None,
   );
   let err = store
     .register_member(
@@ -299,6 +301,7 @@ async fn writes_ttl_attribute_for_membership_rows() -> Result<()> {
     client.clone(),
     table_name.clone(),
     TimeDuration::seconds(120),
+    None,
     None,
   );
 
@@ -371,6 +374,7 @@ async fn planner_release_allows_immediate_takeover_and_fences_stale_owner() -> R
     table_name.clone(),
     TimeDuration::hours(1),
     None,
+    None,
   );
   assert_eq!(
     store
@@ -430,6 +434,7 @@ async fn planner_records_do_not_appear_in_legacy_member_partition() -> Result<()
     client.clone(),
     table_name.clone(),
     TimeDuration::hours(1),
+    None,
     None,
   );
   store
@@ -511,6 +516,7 @@ async fn assignment_plan_topology_round_trips_and_is_removed_for_flat_plan() -> 
     client.clone(),
     table_name.clone(),
     TimeDuration::hours(1),
+    None,
     None,
   );
   assert_eq!(
@@ -645,6 +651,7 @@ async fn planner_session_fences_stale_process_and_mismatched_plan_publisher() ->
     client.clone(),
     table_name.clone(),
     TimeDuration::hours(1),
+    None,
     None,
   );
   assert_eq!(

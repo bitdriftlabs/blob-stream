@@ -2,7 +2,12 @@
 #[path = "./producer_partition_leases_dynamo_test.rs"]
 mod tests;
 
-use crate::aws::{is_dynamo_transaction_conflict, retry_dynamo_transaction_conflicts};
+use crate::aws::{
+  DynamoRequestExt as _,
+  is_dynamo_transaction_conflict,
+  retry_dynamo_transaction_conflicts,
+  trace_dynamo_operation,
+};
 use crate::dynamo::duration_seconds_ceil;
 use crate::dynamo_attributes::{
   ATTR_EPOCH,
@@ -32,6 +37,9 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemOutput;
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnConsumedCapacity, ReturnValue};
+use bd_runtime_config::feature_flags::FeatureFlagsWatch;
+use blob_stream_runtime_config::AwsTraceSampler;
+use blob_stream_runtime_config::aws_tracing::{bounded_diagnostic, mark_expected_outcome};
 use blob_stream_types::{
   SeqRange,
   offset_datetime_from_unix_millis,
@@ -39,9 +47,11 @@ use blob_stream_types::{
 };
 use log::{debug, trace};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use time::{Duration, OffsetDateTime};
+use tracing::Span;
 
 const ATTR_MAX_SEQ: &str = "max_allocated_seq";
 const ATTR_LEASE_SEQUENCE_START: &str = "lease_sequence_start";
@@ -58,6 +68,7 @@ pub struct DynamoProducerPartitionLeaseStore {
   table_name: String,
   ttl_buffer: Duration,
   capacity_metrics: Option<DynamoCapacityMetrics>,
+  trace_sampler: AwsTraceSampler,
 }
 
 impl DynamoProducerPartitionLeaseStore {
@@ -67,12 +78,14 @@ impl DynamoProducerPartitionLeaseStore {
     table_name: impl Into<String>,
     ttl_buffer: Duration,
     capacity_metrics: Option<DynamoCapacityMetrics>,
+    feature_flags: Option<FeatureFlagsWatch>,
   ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
       ttl_buffer,
       capacity_metrics,
+      trace_sampler: AwsTraceSampler::new(feature_flags),
     }
   }
 
@@ -106,6 +119,7 @@ impl DynamoProducerPartitionLeaseStore {
       .consistent_read(false)
       .return_consumed_capacity(ReturnConsumedCapacity::Total)
       .send()
+      .trace_request("GetItem")
       .await?;
     self.record_read_capacity(response.consumed_capacity.as_ref());
 
@@ -213,6 +227,7 @@ impl DynamoProducerPartitionLeaseStore {
           .return_values(ReturnValue::AllNew)
           .return_consumed_capacity(ReturnConsumedCapacity::Total)
           .send()
+          .trace_request("UpdateItem")
       },
       is_dynamo_transaction_conflict,
     )
@@ -235,7 +250,7 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     &self,
     key: &ProducerPartitionLeaseKey,
   ) -> Result<Option<ProducerPartitionLease>> {
-    self.read_lease(key).await
+    trace_dynamo_operation!(self, "get_lease", self.read_lease(key))
   }
 
   async fn acquire_lease(
@@ -285,121 +300,126 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     reservation_size: Option<u64>,
     sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseAcquireAndReserveOutcome> {
-    trace!(
-      "producer lease(dynamo) acquire/reserve: table={}, topic={}, partition={}, holder_id={}, \
-       reservation_size={reservation_size:?}",
-      self.table_name, key.topic, key.virtual_partition_id, holder_id
-    );
-    if reservation_size == Some(0) {
-      return Err(anyhow!("reservation_size must be greater than zero"));
-    }
-    let expires_at = expires_at(now, lease_duration)?;
-    let expires_at_ms = unix_millis_from_offset_datetime(expires_at)
-      .map_err(|_| anyhow!("lease expiration exceeds Dynamo millisecond range"))?;
-    let now_ts_ms = unix_millis_from_offset_datetime(now)
-      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at_ms, self.ttl_buffer)?;
-    let pk = key.format();
-
-    let mut values = HashMap::new();
-    values.insert(":holder".to_string(), AttributeValue::S(holder_id.clone()));
-    values.insert(
-      ":session".to_string(),
-      AttributeValue::S(lease_session_id.clone()),
-    );
-    values.insert(
-      ":expires".to_string(),
-      AttributeValue::N(expires_at_ms.to_string()),
-    );
-    values.insert(
-      ":ttl".to_string(),
-      AttributeValue::N(ttl_epoch_seconds.to_string()),
-    );
-    values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-    if let Some(reservation_size) = reservation_size {
-      values.insert(
-        ":delta".to_string(),
-        AttributeValue::N(reservation_size.to_string()),
+    trace_dynamo_operation!(self, "acquire_lease_and_reserve_sequences", async {
+      Span::current().record("aws.details_json", json!({"topic": bounded_diagnostic(&key.topic), "partition": key.virtual_partition_id, "reservation_size": reservation_size}).to_string());
+      trace!(
+        "producer lease(dynamo) acquire/reserve: table={}, topic={}, partition={}, holder_id={}, \
+         reservation_size={reservation_size:?}",
+        self.table_name, key.topic, key.virtual_partition_id, holder_id
       );
-      values.insert(":initial".to_string(), AttributeValue::N("-1".to_string()));
+      if reservation_size == Some(0) {
+        return Err(anyhow!("reservation_size must be greater than zero"));
+      }
+      let expires_at = expires_at(now, lease_duration)?;
+      let expires_at_ms = unix_millis_from_offset_datetime(expires_at)
+        .map_err(|_| anyhow!("lease expiration exceeds Dynamo millisecond range"))?;
+      let now_ts_ms = unix_millis_from_offset_datetime(now)
+        .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+      let ttl_epoch_seconds = ttl_epoch_seconds(expires_at_ms, self.ttl_buffer)?;
+      let pk = key.format();
+
+      let mut values = HashMap::new();
+      values.insert(":holder".to_string(), AttributeValue::S(holder_id.clone()));
       values.insert(
-        ":max_reservable".to_string(),
-        AttributeValue::N((u64::MAX - reservation_size).to_string()),
+        ":session".to_string(),
+        AttributeValue::S(lease_session_id.clone()),
       );
-    }
+      values.insert(
+        ":expires".to_string(),
+        AttributeValue::N(expires_at_ms.to_string()),
+      );
+      values.insert(
+        ":ttl".to_string(),
+        AttributeValue::N(ttl_epoch_seconds.to_string()),
+      );
+      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+      if let Some(reservation_size) = reservation_size {
+        values.insert(
+          ":delta".to_string(),
+          AttributeValue::N(reservation_size.to_string()),
+        );
+        values.insert(":initial".to_string(), AttributeValue::N("-1".to_string()));
+        values.insert(
+          ":max_reservable".to_string(),
+          AttributeValue::N((u64::MAX - reservation_size).to_string()),
+        );
+      }
 
-    let renewal_update = match reservation_size {
-      Some(_) => format!(
-        "SET {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl, {ATTR_MAX_SEQ} = \
-         if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta"
-      ),
-      None => format!("SET {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl"),
-    };
-    let renewal_update = sequence_progress_update(
-      renewal_update,
-      &mut values,
-      sequence_progress,
-      reservation_size.is_some(),
-      now_ts_ms,
-    );
-    let renewal_condition =
-      format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EXPIRES} > :now");
-    let renewal_condition = match reservation_size {
-      Some(_) => format!(
-        "({renewal_condition}) AND (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= \
-         :max_reservable)"
-      ),
-      None => renewal_condition,
-    };
-    let response = retry_dynamo_transaction_conflicts(
-      "producer_lease_acquire_or_renew",
-      || {
-        self
-          .client
-          .update_item()
-          .table_name(&self.table_name)
-          .key(ATTR_PK, AttributeValue::S(pk.clone()))
-          .update_expression(renewal_update.clone())
-          .condition_expression(renewal_condition.clone())
-          .set_expression_attribute_values(Some(values.clone()))
-          .return_values(ReturnValue::AllNew)
-          .return_consumed_capacity(ReturnConsumedCapacity::Total)
-          .send()
-      },
-      is_dynamo_transaction_conflict,
-    )
-    .await;
+      let renewal_update = match reservation_size {
+        Some(_) => format!(
+          "SET {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl, {ATTR_MAX_SEQ} = \
+           if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta"
+        ),
+        None => format!("SET {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl"),
+      };
+      let renewal_update = sequence_progress_update(
+        renewal_update,
+        &mut values,
+        sequence_progress,
+        reservation_size.is_some(),
+        now_ts_ms,
+      );
+      let renewal_condition =
+        format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EXPIRES} > :now");
+      let renewal_condition = match reservation_size {
+        Some(_) => format!(
+          "({renewal_condition}) AND (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= \
+           :max_reservable)"
+        ),
+        None => renewal_condition,
+      };
+      let response = retry_dynamo_transaction_conflicts(
+        "producer_lease_acquire_or_renew",
+        || {
+          self
+            .client
+            .update_item()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(pk.clone()))
+            .update_expression(renewal_update.clone())
+            .condition_expression(renewal_condition.clone())
+            .set_expression_attribute_values(Some(values.clone()))
+            .return_values(ReturnValue::AllNew)
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .trace_request("UpdateItem")
+        },
+        is_dynamo_transaction_conflict,
+      )
+      .await;
 
-    match response {
-      Ok(output) => self.complete_acquire(output, key, reservation_size, "acquired"),
-      Err(SdkError::ServiceError(service_error))
-        if service_error.err().is_conditional_check_failed_exception() =>
-      {
-        if let Some(output) = self
-          .claim_after_failed_renewal(pk, values, reservation_size, sequence_progress, now_ts_ms)
-          .await?
+      match response {
+        Ok(output) => self.complete_acquire(output, key, reservation_size, "acquired"),
+        Err(SdkError::ServiceError(service_error))
+          if service_error.err().is_conditional_check_failed_exception() =>
         {
-          self.complete_acquire(output, key, reservation_size, "acquired takeover")
-        } else {
-          debug!("producer lease(dynamo) acquire/reserve result: held_by_other");
-          let lease = self
-            .read_lease(&key)
+          if let Some(output) = self
+            .claim_after_failed_renewal(pk, values, reservation_size, sequence_progress, now_ts_ms)
             .await?
-            .ok_or_else(|| anyhow!("lease missing after conditional failure"))?;
-          if reservation_would_overflow(
-            &lease,
-            &holder_id,
-            &lease_session_id,
-            now,
-            reservation_size,
-          ) {
-            return Err(anyhow!("sequence range overflow"));
+          {
+            self.complete_acquire(output, key, reservation_size, "acquired takeover")
+          } else {
+            debug!("producer lease(dynamo) acquire/reserve result: held_by_other");
+            let lease = self
+              .read_lease(&key)
+              .await?
+              .ok_or_else(|| anyhow!("lease missing after conditional failure"))?;
+            if reservation_would_overflow(
+              &lease,
+              &holder_id,
+              &lease_session_id,
+              now,
+              reservation_size,
+            ) {
+              return Err(anyhow!("sequence range overflow"));
+            }
+            mark_expected_outcome();
+            Ok(LeaseAcquireAndReserveOutcome::HeldByOther(lease))
           }
-          Ok(LeaseAcquireAndReserveOutcome::HeldByOther(lease))
-        }
-      },
-      Err(error) => Err(error.into()),
-    }
+        },
+        Err(error) => Err(error.into()),
+      }
+    })
   }
 
   async fn heartbeat_lease(
@@ -411,92 +431,103 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     lease_duration: Duration,
     sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseHeartbeatOutcome> {
-    trace!(
-      "producer lease(dynamo) heartbeat: table={}, topic={}, partition={}, holder_id={}",
-      self.table_name, key.topic, key.virtual_partition_id, holder_id
-    );
-    let expires_at = expires_at(now, lease_duration)?;
-    let expires_at_ms = unix_millis_from_offset_datetime(expires_at)
-      .map_err(|_| anyhow!("lease expiration exceeds Dynamo millisecond range"))?;
-    let now_ts_ms = unix_millis_from_offset_datetime(now)
-      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at_ms, self.ttl_buffer)?;
+    trace_dynamo_operation!(self, "heartbeat_lease", async {
+      Span::current().record(
+        "aws.details_json",
+        json!({"topic": bounded_diagnostic(&key.topic), "partition": key.virtual_partition_id})
+          .to_string(),
+      );
+      trace!(
+        "producer lease(dynamo) heartbeat: table={}, topic={}, partition={}, holder_id={}",
+        self.table_name, key.topic, key.virtual_partition_id, holder_id
+      );
+      let expires_at = expires_at(now, lease_duration)?;
+      let expires_at_ms = unix_millis_from_offset_datetime(expires_at)
+        .map_err(|_| anyhow!("lease expiration exceeds Dynamo millisecond range"))?;
+      let now_ts_ms = unix_millis_from_offset_datetime(now)
+        .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+      let ttl_epoch_seconds = ttl_epoch_seconds(expires_at_ms, self.ttl_buffer)?;
 
-    let mut values = HashMap::new();
-    values.insert(
-      ":holder".to_string(),
-      AttributeValue::S(holder_id.to_string()),
-    );
-    values.insert(
-      ":session".to_string(),
-      AttributeValue::S(lease_session_id.to_string()),
-    );
-    values.insert(
-      ":expires".to_string(),
-      AttributeValue::N(expires_at_ms.to_string()),
-    );
-    values.insert(
-      ":ttl".to_string(),
-      AttributeValue::N(ttl_epoch_seconds.to_string()),
-    );
-    values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+      let mut values = HashMap::new();
+      values.insert(
+        ":holder".to_string(),
+        AttributeValue::S(holder_id.to_string()),
+      );
+      values.insert(
+        ":session".to_string(),
+        AttributeValue::S(lease_session_id.to_string()),
+      );
+      values.insert(
+        ":expires".to_string(),
+        AttributeValue::N(expires_at_ms.to_string()),
+      );
+      values.insert(
+        ":ttl".to_string(),
+        AttributeValue::N(ttl_epoch_seconds.to_string()),
+      );
+      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
 
-    let update = sequence_progress_update(
-      format!("SET {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl"),
-      &mut values,
-      sequence_progress,
-      false,
-      now_ts_ms,
-    );
-    let condition =
-      format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EXPIRES} > :now");
+      let update = sequence_progress_update(
+        format!("SET {ATTR_EXPIRES} = :expires, {ATTR_TTL} = :ttl"),
+        &mut values,
+        sequence_progress,
+        false,
+        now_ts_ms,
+      );
+      let condition =
+        format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EXPIRES} > :now");
 
-    let response = retry_dynamo_transaction_conflicts(
-      "producer_lease_heartbeat",
-      || {
-        self
-          .client
-          .update_item()
-          .table_name(&self.table_name)
-          .key(ATTR_PK, AttributeValue::S(key.format()))
-          .update_expression(update.clone())
-          .condition_expression(condition.clone())
-          .set_expression_attribute_values(Some(values.clone()))
-          .return_values(ReturnValue::AllNew)
-          .return_consumed_capacity(ReturnConsumedCapacity::Total)
-          .send()
-      },
-      is_dynamo_transaction_conflict,
-    )
-    .await;
+      let response = retry_dynamo_transaction_conflicts(
+        "producer_lease_heartbeat",
+        || {
+          self
+            .client
+            .update_item()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(key.format()))
+            .update_expression(update.clone())
+            .condition_expression(condition.clone())
+            .set_expression_attribute_values(Some(values.clone()))
+            .return_values(ReturnValue::AllNew)
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .trace_request("UpdateItem")
+        },
+        is_dynamo_transaction_conflict,
+      )
+      .await;
 
-    match response {
-      Ok(output) => {
-        self.record_write_capacity(output.consumed_capacity.as_ref());
-        let attributes = output
-          .attributes
-          .ok_or_else(|| anyhow!("lease attributes missing"))?;
-        let lease = Self::lease_from_item(attributes, key.clone())?;
-        debug!("producer lease(dynamo) heartbeat result: renewed");
-        Ok(LeaseHeartbeatOutcome::Renewed(lease))
-      },
-      Err(SdkError::ServiceError(service_error))
-        if service_error.err().is_conditional_check_failed_exception() =>
-      {
-        let Some(lease) = self.read_lease(key).await? else {
-          debug!("producer lease(dynamo) heartbeat result: expired");
-          return Ok(LeaseHeartbeatOutcome::Expired);
-        };
-        if lease.lease_expiration_at <= now {
-          debug!("producer lease(dynamo) heartbeat result: expired");
-          Ok(LeaseHeartbeatOutcome::Expired)
-        } else {
-          debug!("producer lease(dynamo) heartbeat result: held_by_other");
-          Ok(LeaseHeartbeatOutcome::HeldByOther(lease))
-        }
-      },
-      Err(error) => Err(error.into()),
-    }
+      match response {
+        Ok(output) => {
+          self.record_write_capacity(output.consumed_capacity.as_ref());
+          let attributes = output
+            .attributes
+            .ok_or_else(|| anyhow!("lease attributes missing"))?;
+          let lease = Self::lease_from_item(attributes, key.clone())?;
+          debug!("producer lease(dynamo) heartbeat result: renewed");
+          Ok(LeaseHeartbeatOutcome::Renewed(lease))
+        },
+        Err(SdkError::ServiceError(service_error))
+          if service_error.err().is_conditional_check_failed_exception() =>
+        {
+          let Some(lease) = self.read_lease(key).await? else {
+            debug!("producer lease(dynamo) heartbeat result: expired");
+            mark_expected_outcome();
+            return Ok(LeaseHeartbeatOutcome::Expired);
+          };
+          if lease.lease_expiration_at <= now {
+            mark_expected_outcome();
+            debug!("producer lease(dynamo) heartbeat result: expired");
+            Ok(LeaseHeartbeatOutcome::Expired)
+          } else {
+            debug!("producer lease(dynamo) heartbeat result: held_by_other");
+            mark_expected_outcome();
+            Ok(LeaseHeartbeatOutcome::HeldByOther(lease))
+          }
+        },
+        Err(error) => Err(error.into()),
+      }
+    })
   }
 
   async fn reserve_sequences(
@@ -508,118 +539,125 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     reservation_size: u64,
     sequence_progress: ProducerSequenceProgress,
   ) -> Result<SequenceReservationOutcome> {
-    trace!(
-      "producer lease(dynamo) reserve: table={}, topic={}, partition={}, holder_id={}, size={}",
-      self.table_name, key.topic, key.virtual_partition_id, holder_id, reservation_size
-    );
-    if reservation_size == 0 {
-      return Err(anyhow!("reservation_size must be greater than zero"));
-    }
-    let now_ts_ms = unix_millis_from_offset_datetime(now)
-      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+    trace_dynamo_operation!(self, "reserve_sequences", async {
+      Span::current().record("aws.details_json", json!({"topic": bounded_diagnostic(&key.topic), "partition": key.virtual_partition_id, "reservation_size": reservation_size}).to_string());
+      trace!(
+        "producer lease(dynamo) reserve: table={}, topic={}, partition={}, holder_id={}, size={}",
+        self.table_name, key.topic, key.virtual_partition_id, holder_id, reservation_size
+      );
+      if reservation_size == 0 {
+        return Err(anyhow!("reservation_size must be greater than zero"));
+      }
+      let now_ts_ms = unix_millis_from_offset_datetime(now)
+        .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
 
-    let mut values = HashMap::new();
-    values.insert(
-      ":holder".to_string(),
-      AttributeValue::S(holder_id.to_string()),
-    );
-    values.insert(
-      ":session".to_string(),
-      AttributeValue::S(lease_session_id.to_string()),
-    );
-    values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-    values.insert(
-      ":delta".to_string(),
-      AttributeValue::N(reservation_size.to_string()),
-    );
-    values.insert(":initial".to_string(), AttributeValue::N("-1".to_string()));
-    values.insert(
-      ":max_reservable".to_string(),
-      AttributeValue::N((u64::MAX - reservation_size).to_string()),
-    );
+      let mut values = HashMap::new();
+      values.insert(
+        ":holder".to_string(),
+        AttributeValue::S(holder_id.to_string()),
+      );
+      values.insert(
+        ":session".to_string(),
+        AttributeValue::S(lease_session_id.to_string()),
+      );
+      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+      values.insert(
+        ":delta".to_string(),
+        AttributeValue::N(reservation_size.to_string()),
+      );
+      values.insert(":initial".to_string(), AttributeValue::N("-1".to_string()));
+      values.insert(
+        ":max_reservable".to_string(),
+        AttributeValue::N((u64::MAX - reservation_size).to_string()),
+      );
 
-    let update = sequence_progress_update(
-      format!("SET {ATTR_MAX_SEQ} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta"),
-      &mut values,
-      sequence_progress,
-      true,
-      now_ts_ms,
-    );
-    let condition = format!(
-      "{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EXPIRES} > :now AND \
-       (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= :max_reservable)"
-    );
+      let update = sequence_progress_update(
+        format!("SET {ATTR_MAX_SEQ} = if_not_exists({ATTR_MAX_SEQ}, :initial) + :delta"),
+        &mut values,
+        sequence_progress,
+        true,
+        now_ts_ms,
+      );
+      let condition = format!(
+        "{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session AND {ATTR_EXPIRES} > :now AND \
+         (attribute_not_exists({ATTR_MAX_SEQ}) OR {ATTR_MAX_SEQ} <= :max_reservable)"
+      );
 
-    let response = retry_dynamo_transaction_conflicts(
-      "producer_lease_reserve_sequences",
-      || {
-        self
-          .client
-          .update_item()
-          .table_name(&self.table_name)
-          .key(ATTR_PK, AttributeValue::S(key.format()))
-          .update_expression(update.clone())
-          .condition_expression(condition.clone())
-          .set_expression_attribute_values(Some(values.clone()))
-          .return_values(ReturnValue::UpdatedOld)
-          .return_consumed_capacity(ReturnConsumedCapacity::Total)
-          .send()
-      },
-      is_dynamo_transaction_conflict,
-    )
-    .await;
+      let response = retry_dynamo_transaction_conflicts(
+        "producer_lease_reserve_sequences",
+        || {
+          self
+            .client
+            .update_item()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(key.format()))
+            .update_expression(update.clone())
+            .condition_expression(condition.clone())
+            .set_expression_attribute_values(Some(values.clone()))
+            .return_values(ReturnValue::UpdatedOld)
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .trace_request("UpdateItem")
+        },
+        is_dynamo_transaction_conflict,
+      )
+      .await;
 
-    match response {
-      Ok(output) => {
-        self.record_write_capacity(output.consumed_capacity.as_ref());
-        let old_max = output
-          .attributes
-          .as_ref()
-          .and_then(|attrs| attrs.get(ATTR_MAX_SEQ))
-          .map(parse_u64)
-          .transpose()?;
+      match response {
+        Ok(output) => {
+          self.record_write_capacity(output.consumed_capacity.as_ref());
+          let old_max = output
+            .attributes
+            .as_ref()
+            .and_then(|attrs| attrs.get(ATTR_MAX_SEQ))
+            .map(parse_u64)
+            .transpose()?;
 
-        let reservation = reservation_from_old(old_max, reservation_size)?;
-        let lease = self
-          .read_lease(key)
-          .await?
-          .ok_or_else(|| anyhow!("lease missing after reservation"))?;
+          let reservation = reservation_from_old(old_max, reservation_size)?;
+          let lease = self
+            .read_lease(key)
+            .await?
+            .ok_or_else(|| anyhow!("lease missing after reservation"))?;
 
-        debug!(
-          "producer lease(dynamo) reserve result: start={}, end={}",
-          reservation.start, reservation.end
-        );
-        Ok(SequenceReservationOutcome::Reserved(SequenceReservation {
-          range: reservation,
-          lease,
-        }))
-      },
-      Err(SdkError::ServiceError(service_error))
-        if service_error.err().is_conditional_check_failed_exception() =>
-      {
-        let Some(lease) = self.read_lease(key).await? else {
-          debug!("producer lease(dynamo) reserve result: expired");
-          return Ok(SequenceReservationOutcome::Expired);
-        };
-        if reservation_would_overflow(
-          &lease,
-          holder_id,
-          lease_session_id,
-          now,
-          Some(reservation_size),
-        ) {
-          return Err(anyhow!("sequence range overflow"));
-        }
-        if lease.lease_expiration_at <= now {
-          debug!("producer lease(dynamo) reserve result: expired");
-          Ok(SequenceReservationOutcome::Expired)
-        } else {
-          debug!("producer lease(dynamo) reserve result: held_by_other");
-          Ok(SequenceReservationOutcome::HeldByOther(lease))
-        }
-      },
-      Err(error) => Err(error.into()),
-    }
+          debug!(
+            "producer lease(dynamo) reserve result: start={}, end={}",
+            reservation.start, reservation.end
+          );
+          Ok(SequenceReservationOutcome::Reserved(SequenceReservation {
+            range: reservation,
+            lease,
+          }))
+        },
+        Err(SdkError::ServiceError(service_error))
+          if service_error.err().is_conditional_check_failed_exception() =>
+        {
+          let Some(lease) = self.read_lease(key).await? else {
+            debug!("producer lease(dynamo) reserve result: expired");
+            mark_expected_outcome();
+            return Ok(SequenceReservationOutcome::Expired);
+          };
+          if reservation_would_overflow(
+            &lease,
+            holder_id,
+            lease_session_id,
+            now,
+            Some(reservation_size),
+          ) {
+            return Err(anyhow!("sequence range overflow"));
+          }
+          if lease.lease_expiration_at <= now {
+            mark_expected_outcome();
+            debug!("producer lease(dynamo) reserve result: expired");
+            Ok(SequenceReservationOutcome::Expired)
+          } else {
+            debug!("producer lease(dynamo) reserve result: held_by_other");
+            mark_expected_outcome();
+            Ok(SequenceReservationOutcome::HeldByOther(lease))
+          }
+        },
+        Err(error) => Err(error.into()),
+      }
+    })
   }
 
   async fn release_lease(
@@ -630,80 +668,91 @@ impl ProducerPartitionLeaseStore for DynamoProducerPartitionLeaseStore {
     now: OffsetDateTime,
     sequence_progress: ProducerSequenceProgress,
   ) -> Result<LeaseReleaseOutcome> {
-    trace!(
-      "producer lease(dynamo) release: table={}, topic={}, partition={}, holder_id={}",
-      self.table_name, key.topic, key.virtual_partition_id, holder_id
-    );
-    let now_ts_ms = unix_millis_from_offset_datetime(now)
-      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let mut values = HashMap::new();
-    values.insert(
-      ":holder".to_string(),
-      AttributeValue::S(holder_id.to_string()),
-    );
-    values.insert(
-      ":session".to_string(),
-      AttributeValue::S(lease_session_id.to_string()),
-    );
-    values.insert(
-      ":expired".to_string(),
-      AttributeValue::N(now_ts_ms.to_string()),
-    );
-    values.insert(
-      ":ttl".to_string(),
-      AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer)?.to_string()),
-    );
+    trace_dynamo_operation!(self, "release_lease", async {
+      Span::current().record(
+        "aws.details_json",
+        json!({"topic": bounded_diagnostic(&key.topic), "partition": key.virtual_partition_id})
+          .to_string(),
+      );
+      trace!(
+        "producer lease(dynamo) release: table={}, topic={}, partition={}, holder_id={}",
+        self.table_name, key.topic, key.virtual_partition_id, holder_id
+      );
+      let now_ts_ms = unix_millis_from_offset_datetime(now)
+        .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+      let mut values = HashMap::new();
+      values.insert(
+        ":holder".to_string(),
+        AttributeValue::S(holder_id.to_string()),
+      );
+      values.insert(
+        ":session".to_string(),
+        AttributeValue::S(lease_session_id.to_string()),
+      );
+      values.insert(
+        ":expired".to_string(),
+        AttributeValue::N(now_ts_ms.to_string()),
+      );
+      values.insert(
+        ":ttl".to_string(),
+        AttributeValue::N(ttl_epoch_seconds(now_ts_ms, self.ttl_buffer)?.to_string()),
+      );
 
-    let update = sequence_progress_update(
-      format!("SET {ATTR_EXPIRES} = :expired, {ATTR_TTL} = :ttl"),
-      &mut values,
-      sequence_progress,
-      false,
-      now_ts_ms,
-    );
-    let condition = format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session");
-    let response = retry_dynamo_transaction_conflicts(
-      "producer_lease_release",
-      || {
-        self
-          .client
-          .update_item()
-          .table_name(&self.table_name)
-          .key(ATTR_PK, AttributeValue::S(key.format()))
-          .update_expression(update.clone())
-          .condition_expression(condition.clone())
-          .set_expression_attribute_values(Some(values.clone()))
-          .return_values(ReturnValue::AllNew)
-          .return_consumed_capacity(ReturnConsumedCapacity::Total)
-          .send()
-      },
-      is_dynamo_transaction_conflict,
-    )
-    .await;
+      let update = sequence_progress_update(
+        format!("SET {ATTR_EXPIRES} = :expired, {ATTR_TTL} = :ttl"),
+        &mut values,
+        sequence_progress,
+        false,
+        now_ts_ms,
+      );
+      let condition = format!("{ATTR_HOLDER} = :holder AND {ATTR_SESSION} = :session");
+      let response = retry_dynamo_transaction_conflicts(
+        "producer_lease_release",
+        || {
+          self
+            .client
+            .update_item()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(key.format()))
+            .update_expression(update.clone())
+            .condition_expression(condition.clone())
+            .set_expression_attribute_values(Some(values.clone()))
+            .return_values(ReturnValue::AllNew)
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .trace_request("UpdateItem")
+        },
+        is_dynamo_transaction_conflict,
+      )
+      .await;
 
-    match response {
-      Ok(output) => {
-        self.record_write_capacity(output.consumed_capacity.as_ref());
-        debug!("producer lease(dynamo) release result: released");
-        Ok(LeaseReleaseOutcome::Released)
-      },
-      Err(SdkError::ServiceError(service_error))
-        if service_error.err().is_conditional_check_failed_exception() =>
-      {
-        let Some(lease) = self.get_lease(key).await? else {
-          debug!("producer lease(dynamo) release result: expired");
-          return Ok(LeaseReleaseOutcome::Expired);
-        };
-        if lease.lease_expiration_at <= now {
-          debug!("producer lease(dynamo) release result: expired");
-          Ok(LeaseReleaseOutcome::Expired)
-        } else {
-          debug!("producer lease(dynamo) release result: held_by_other");
-          Ok(LeaseReleaseOutcome::HeldByOther(lease))
-        }
-      },
-      Err(error) => Err(error.into()),
-    }
+      match response {
+        Ok(output) => {
+          self.record_write_capacity(output.consumed_capacity.as_ref());
+          debug!("producer lease(dynamo) release result: released");
+          Ok(LeaseReleaseOutcome::Released)
+        },
+        Err(SdkError::ServiceError(service_error))
+          if service_error.err().is_conditional_check_failed_exception() =>
+        {
+          let Some(lease) = self.get_lease(key).await? else {
+            debug!("producer lease(dynamo) release result: expired");
+            mark_expected_outcome();
+            return Ok(LeaseReleaseOutcome::Expired);
+          };
+          if lease.lease_expiration_at <= now {
+            mark_expected_outcome();
+            debug!("producer lease(dynamo) release result: expired");
+            Ok(LeaseReleaseOutcome::Expired)
+          } else {
+            debug!("producer lease(dynamo) release result: held_by_other");
+            mark_expected_outcome();
+            Ok(LeaseReleaseOutcome::HeldByOther(lease))
+          }
+        },
+        Err(error) => Err(error.into()),
+      }
+    })
   }
 }
 

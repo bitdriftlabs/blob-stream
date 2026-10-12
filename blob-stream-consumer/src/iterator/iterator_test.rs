@@ -378,6 +378,7 @@ struct PartiallyFailingLeaseStore {
   inner: InMemoryConsumerGroupLeaseStore,
   failures_enabled: AtomicBool,
   release_fails: AtomicBool,
+  release_trace_ids: Mutex<Vec<Option<String>>>,
 }
 
 impl FailingLeaseStore {
@@ -394,6 +395,7 @@ impl PartiallyFailingLeaseStore {
       inner: InMemoryConsumerGroupLeaseStore::new(),
       failures_enabled: AtomicBool::new(false),
       release_fails: AtomicBool::new(false),
+      release_trace_ids: Mutex::new(Vec::new()),
     }
   }
 }
@@ -584,6 +586,10 @@ impl ConsumerGroupLeaseStore for PartiallyFailingLeaseStore {
     if self.release_fails.load(Ordering::SeqCst) {
       anyhow::bail!("injected ambiguous partition release");
     }
+    self
+      .release_trace_ids
+      .lock()
+      .push(bd_log::current_trace_request_id());
     self
       .inner
       .release_partition(key, owner_id, generation, now)
@@ -4671,48 +4677,61 @@ async fn prefetch_retry_uses_updated_broker_metadata_fallback() {
 
 #[test]
 fn shutdown_span_reports_success_after_all_work_completes() {
-  let (spans, ()) = bd_log::test::with_two_phase_test_otel("blob-stream-consumer-test", async {
-    let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
-    let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
-    let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
-      Arc::new(InMemoryConsumerGroupLeaseStore::new());
-    let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
-      Arc::new(InMemoryConsumerGroupMembershipStore::new());
-    let source: Arc<dyn ConsumerCoordinationSource> =
-      Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
-        members: vec!["member-a".to_string()],
-        virtual_partitions: vec![3],
-      }));
-    let mut iterator = ConsumerIteratorImpl::from_config(
-      &runtime_config(),
-      blob_store,
-      metadata_store,
-      lease_store,
-      membership_store,
-      source,
-      rejecting_broker_metadata_query(),
-      rejecting_broker_blob_range_query(),
-      metrics_scope(),
-      TimeDuration::days(1),
-      DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-      None,
-      topic_layout(),
-    )
-    .await
-    .unwrap();
+  let (spans, release_trace_ids) =
+    bd_log::test::with_two_phase_test_otel("blob-stream-consumer-test", async {
+      let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+      let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+      let lease_store = Arc::new(PartiallyFailingLeaseStore::new());
+      let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+        Arc::new(InMemoryConsumerGroupMembershipStore::new());
+      let source: Arc<dyn ConsumerCoordinationSource> =
+        Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+          members: vec!["member-a".to_string()],
+          virtual_partitions: vec![3],
+        }));
+      let mut iterator = ConsumerIteratorImpl::from_config(
+        &runtime_config(),
+        blob_store,
+        metadata_store,
+        lease_store.clone(),
+        membership_store,
+        source,
+        rejecting_broker_metadata_query(),
+        rejecting_broker_blob_range_query(),
+        metrics_scope(),
+        TimeDuration::days(1),
+        DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+        None,
+        topic_layout(),
+      )
+      .await
+      .unwrap();
 
-    let mut driver = iterator
-      .driver
-      .take()
-      .expect("iterator should own a driver");
-    driver.start().unwrap();
-    driver.shutdown().await.unwrap();
-  });
+      let mut driver = iterator
+        .driver
+        .take()
+        .expect("iterator should own a driver");
+      driver.start().unwrap();
+      driver.shutdown().await.unwrap();
+      lease_store.release_trace_ids.lock().clone()
+    });
 
   let shutdown_span = spans
     .iter()
     .find(|span| span.name == "blob_stream.consumer.shutdown")
     .expect("shutdown span should be exported");
+  assert_ne!(release_trace_ids.len(), 0);
+  assert_eq!(
+    release_trace_ids,
+    vec![
+      Some(format!(
+        "{}-{}",
+        shutdown_span.span_context.trace_id(),
+        shutdown_span.span_context.span_id()
+      ));
+      release_trace_ids.len()
+    ]
+  );
   let attribute = |key: &str| {
     shutdown_span
       .attributes
@@ -4806,81 +4825,95 @@ fn shutdown_span_reports_best_effort_cleanup_failure() {
 
 #[test]
 fn revocation_handoff_span_reports_success_after_reassignment() {
-  let (spans, ()) = bd_log::test::with_two_phase_test_otel("blob-stream-consumer-test", async {
-    let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
-    let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
-    let lease_store: Arc<dyn ConsumerGroupLeaseStore> =
-      Arc::new(InMemoryConsumerGroupLeaseStore::new());
-    let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
-      Arc::new(InMemoryConsumerGroupMembershipStore::new());
-    let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
-      members: vec!["member-a".to_string()],
-      virtual_partitions: vec![0, 1],
-    }));
-    let hooks = Arc::new(RebalanceRecordingHooks {
-      rebalance_applied_calls: AtomicUsize::new(0),
-    });
-    let mut iterator = ConsumerIteratorBuilder::new(
-      &runtime_config(),
-      blob_store,
-      metadata_store,
-      lease_store,
-      membership_store,
-      source.clone(),
-      rejecting_broker_metadata_query(),
-      rejecting_broker_blob_range_query(),
-      metrics_scope(),
-      TimeDuration::days(1),
-      DEFAULT_MAX_METADATA_PUBLICATION_LAG,
-      None,
-      topic_layout(),
-    )
-    .lifecycle_hooks(hooks.clone())
-    .build()
-    .await
-    .unwrap();
-
-    let mut driver = iterator
-      .driver
-      .take()
-      .expect("iterator should own a driver");
-    driver.start().unwrap();
-    source.update(CoordinationSnapshot {
-      members: vec!["member-a".to_string(), "member-b".to_string()],
-      virtual_partitions: vec![0, 1],
-    });
-    driver
-      .maybe_rebalance(offset_datetime_from_unix_millis(
-        now_unix_millis().saturating_add(1_000),
-      ))
+  let (spans, release_trace_ids) =
+    bd_log::test::with_two_phase_test_otel("blob-stream-consumer-test", async {
+      let blob_store: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+      let metadata_store: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+      let lease_store = Arc::new(PartiallyFailingLeaseStore::new());
+      let membership_store: Arc<dyn ConsumerGroupMembershipStore> =
+        Arc::new(InMemoryConsumerGroupMembershipStore::new());
+      let source = Arc::new(MutableCoordinationSource::new(CoordinationSnapshot {
+        members: vec!["member-a".to_string()],
+        virtual_partitions: vec![0, 1],
+      }));
+      let hooks = Arc::new(RebalanceRecordingHooks {
+        rebalance_applied_calls: AtomicUsize::new(0),
+      });
+      let mut iterator = ConsumerIteratorBuilder::new(
+        &runtime_config(),
+        blob_store,
+        metadata_store,
+        lease_store.clone(),
+        membership_store,
+        source.clone(),
+        rejecting_broker_metadata_query(),
+        rejecting_broker_blob_range_query(),
+        metrics_scope(),
+        TimeDuration::days(1),
+        DEFAULT_MAX_METADATA_PUBLICATION_LAG,
+        None,
+        topic_layout(),
+      )
+      .lifecycle_hooks(hooks.clone())
+      .build()
       .await
       .unwrap();
 
-    let revocation = driver
-      .shared_state
-      .lock()
-      .delivery_state
-      .pending_revocation
-      .take()
-      .expect("rebalance should request partition revocation");
-    let NextResult::Revoked(revocation) = revocation else {
-      panic!("expected revocation callback");
-    };
-    revocation.complete().await;
-    assert!(
+      let mut driver = iterator
+        .driver
+        .take()
+        .expect("iterator should own a driver");
+      driver.start().unwrap();
+      source.update(CoordinationSnapshot {
+        members: vec!["member-a".to_string(), "member-b".to_string()],
+        virtual_partitions: vec![0, 1],
+      });
       driver
-        .finish_pending_revocation_if_completed()
+        .maybe_rebalance(offset_datetime_from_unix_millis(
+          now_unix_millis().saturating_add(1_000),
+        ))
         .await
-        .unwrap()
-    );
-    assert_eq!(hooks.rebalance_applied_calls.load(Ordering::Relaxed), 1);
-    driver.shutdown().await.unwrap();
-  });
+        .unwrap();
+
+      let revocation = driver
+        .shared_state
+        .lock()
+        .delivery_state
+        .pending_revocation
+        .take()
+        .expect("rebalance should request partition revocation");
+      let NextResult::Revoked(revocation) = revocation else {
+        panic!("expected revocation callback");
+      };
+      revocation.complete().await;
+      assert!(
+        driver
+          .finish_pending_revocation_if_completed()
+          .await
+          .unwrap()
+      );
+      assert_eq!(hooks.rebalance_applied_calls.load(Ordering::Relaxed), 1);
+      let release_trace_ids = lease_store.release_trace_ids.lock().clone();
+      driver.shutdown().await.unwrap();
+      release_trace_ids
+    });
 
   let handoff_span = spans
     .iter()
     .find(|span| span.name == "blob_stream.consumer.revocation_handoff")
     .expect("revocation handoff span should be exported");
+  assert_ne!(release_trace_ids.len(), 0);
+  assert_eq!(
+    release_trace_ids,
+    vec![
+      Some(format!(
+        "{}-{}",
+        handoff_span.span_context.trace_id(),
+        handoff_span.span_context.span_id()
+      ));
+      release_trace_ids.len()
+    ]
+  );
   let attribute = |key: &str| {
     handoff_span
       .attributes

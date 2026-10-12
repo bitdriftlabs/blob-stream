@@ -2,7 +2,12 @@
 #[path = "./consumer_group_membership_dynamo_test.rs"]
 mod tests;
 
-use crate::aws::{is_dynamo_transaction_conflict, retry_dynamo_transaction_conflicts};
+use crate::aws::{
+  DynamoRequestExt as _,
+  is_dynamo_transaction_conflict,
+  retry_dynamo_transaction_conflicts,
+  trace_dynamo_operation,
+};
 use crate::dynamo::duration_seconds_ceil;
 use crate::{
   ConsumerGroupAssignment,
@@ -24,6 +29,9 @@ use aws_sdk_dynamodb::types::{
   TransactWriteItem,
   Update,
 };
+use bd_runtime_config::feature_flags::FeatureFlagsWatch;
+use blob_stream_runtime_config::AwsTraceSampler;
+use blob_stream_runtime_config::aws_tracing::mark_expected_outcome;
 use blob_stream_types::unix_millis_from_offset_datetime;
 use log::trace;
 use std::collections::{HashMap, HashSet};
@@ -75,6 +83,7 @@ pub struct DynamoConsumerGroupMembershipStore {
   table_name: String,
   ttl_buffer: Duration,
   capacity_metrics: Option<DynamoCapacityMetrics>,
+  trace_sampler: AwsTraceSampler,
 }
 
 impl DynamoConsumerGroupMembershipStore {
@@ -84,12 +93,14 @@ impl DynamoConsumerGroupMembershipStore {
     table_name: impl Into<String>,
     ttl_buffer: Duration,
     capacity_metrics: Option<DynamoCapacityMetrics>,
+    feature_flags: Option<FeatureFlagsWatch>,
   ) -> Self {
     Self {
       client,
       table_name: table_name.into(),
       ttl_buffer,
       capacity_metrics,
+      trace_sampler: AwsTraceSampler::new(feature_flags),
     }
   }
 
@@ -372,60 +383,63 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     now: OffsetDateTime,
     ttl: Duration,
   ) -> Result<()> {
-    trace!(
-      "consumer membership(dynamo) register: table={}, topic={}, group_id={}, member_id={}",
-      self.table_name, topic, group_id, member_id
-    );
-    let now_ts_ms = unix_millis_from_offset_datetime(now)
-      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let ttl_ms = i64::try_from(ttl.whole_milliseconds())
-      .map_err(|_| anyhow!("membership ttl exceeds Dynamo millisecond range"))?;
-    let expires_at = expires_at(now_ts_ms, ttl_ms)?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
-
-    let mut values = HashMap::new();
-    values.insert(
-      ":expires".to_string(),
-      AttributeValue::N(expires_at.to_string()),
-    );
-    values.insert(
-      ":ttl".to_string(),
-      AttributeValue::N(ttl_epoch_seconds.to_string()),
-    );
-    values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-    values.insert(
-      ":member_type".to_string(),
-      AttributeValue::S(RECORD_TYPE_MEMBER.to_string()),
-    );
-    if let Some(pod_id) = &pod_id {
-      values.insert(":pod_id".to_string(), AttributeValue::S(pod_id.clone()));
-    }
-    if let Some(cluster_id) = &cluster_id {
-      values.insert(
-        ":cluster_id".to_string(),
-        AttributeValue::S(cluster_id.clone()),
+    trace_dynamo_operation!(self, "register_member", async {
+      trace!(
+        "consumer membership(dynamo) register: table={}, topic={}, group_id={}, member_id={}",
+        self.table_name, topic, group_id, member_id
       );
-    }
-    let topology_update_expression =
-      membership_topology_update_expression(pod_id.is_some(), cluster_id.is_some());
+      let now_ts_ms = unix_millis_from_offset_datetime(now)
+        .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+      let ttl_ms = i64::try_from(ttl.whole_milliseconds())
+        .map_err(|_| anyhow!("membership ttl exceeds Dynamo millisecond range"))?;
+      let expires_at = expires_at(now_ts_ms, ttl_ms)?;
+      let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
 
-    let response = self
-      .client
-      .update_item()
-      .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(Self::pk(topic, group_id)))
-      .key(ATTR_SK, AttributeValue::S(Self::sk(member_id)))
-      .update_expression(format!(
-        "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_TTL} = :ttl, {ATTR_LAST_HEARTBEAT} = :now, \
-         {ATTR_RECORD_TYPE} = :member_type{topology_update_expression}"
-      ))
-      .set_expression_attribute_values(Some(values))
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await?;
-    self.record_write_capacity(response.consumed_capacity.as_ref());
+      let mut values = HashMap::new();
+      values.insert(
+        ":expires".to_string(),
+        AttributeValue::N(expires_at.to_string()),
+      );
+      values.insert(
+        ":ttl".to_string(),
+        AttributeValue::N(ttl_epoch_seconds.to_string()),
+      );
+      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+      values.insert(
+        ":member_type".to_string(),
+        AttributeValue::S(RECORD_TYPE_MEMBER.to_string()),
+      );
+      if let Some(pod_id) = &pod_id {
+        values.insert(":pod_id".to_string(), AttributeValue::S(pod_id.clone()));
+      }
+      if let Some(cluster_id) = &cluster_id {
+        values.insert(
+          ":cluster_id".to_string(),
+          AttributeValue::S(cluster_id.clone()),
+        );
+      }
+      let topology_update_expression =
+        membership_topology_update_expression(pod_id.is_some(), cluster_id.is_some());
 
-    Ok(())
+      let response = self
+        .client
+        .update_item()
+        .table_name(&self.table_name)
+        .key(ATTR_PK, AttributeValue::S(Self::pk(topic, group_id)))
+        .key(ATTR_SK, AttributeValue::S(Self::sk(member_id)))
+        .update_expression(format!(
+          "SET {ATTR_LEASE_EXPIRES} = :expires, {ATTR_TTL} = :ttl, {ATTR_LAST_HEARTBEAT} = :now, \
+           {ATTR_RECORD_TYPE} = :member_type{topology_update_expression}"
+        ))
+        .set_expression_attribute_values(Some(values))
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .trace_request("UpdateItem")
+        .await?;
+      self.record_write_capacity(response.consumed_capacity.as_ref());
+
+      Ok(())
+    })
   }
 
   async fn heartbeat_member(
@@ -448,23 +462,26 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
   }
 
   async fn deregister_member(&self, topic: &str, group_id: &str, member_id: &str) -> Result<()> {
-    trace!(
-      "consumer membership(dynamo) deregister: table={}, topic={}, group_id={}, member_id={}",
-      self.table_name, topic, group_id, member_id
-    );
+    trace_dynamo_operation!(self, "deregister_member", async {
+      trace!(
+        "consumer membership(dynamo) deregister: table={}, topic={}, group_id={}, member_id={}",
+        self.table_name, topic, group_id, member_id
+      );
 
-    let response = self
-      .client
-      .delete_item()
-      .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(Self::pk(topic, group_id)))
-      .key(ATTR_SK, AttributeValue::S(Self::sk(member_id)))
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await?;
-    self.record_write_capacity(response.consumed_capacity.as_ref());
+      let response = self
+        .client
+        .delete_item()
+        .table_name(&self.table_name)
+        .key(ATTR_PK, AttributeValue::S(Self::pk(topic, group_id)))
+        .key(ATTR_SK, AttributeValue::S(Self::sk(member_id)))
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .trace_request("DeleteItem")
+        .await?;
+      self.record_write_capacity(response.consumed_capacity.as_ref());
 
-    Ok(())
+      Ok(())
+    })
   }
 
   async fn list_active_members(
@@ -473,76 +490,79 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     group_id: &str,
     now: OffsetDateTime,
   ) -> Result<Vec<ConsumerGroupMember>> {
-    trace!(
-      "consumer membership(dynamo) list_active_members: table={}, topic={}, group_id={}",
-      self.table_name, topic, group_id
-    );
-
-    let now_ts_ms = unix_millis_from_offset_datetime(now)
-      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let mut members = HashSet::new();
-    let mut start_key: Option<HashMap<String, AttributeValue>> = None;
-
-    loop {
-      let mut values = HashMap::new();
-      values.insert(
-        ":pk".to_string(),
-        AttributeValue::S(Self::pk(topic, group_id)),
-      );
-      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-      values.insert(
-        ":member_type".to_string(),
-        AttributeValue::S(RECORD_TYPE_MEMBER.to_string()),
+    trace_dynamo_operation!(self, "list_active_members", async {
+      trace!(
+        "consumer membership(dynamo) list_active_members: table={}, topic={}, group_id={}",
+        self.table_name, topic, group_id
       );
 
-      let mut query = self
-        .client
-        .query()
-        .table_name(&self.table_name)
-        .key_condition_expression(format!("{ATTR_PK} = :pk"))
-        .consistent_read(true)
-        .filter_expression(format!(
-          "{ATTR_LEASE_EXPIRES} > :now AND (attribute_not_exists({ATTR_RECORD_TYPE}) OR \
-           {ATTR_RECORD_TYPE} = :member_type)"
-        ))
-        .projection_expression(format!("{ATTR_SK}, {ATTR_POD_ID}, {ATTR_CLUSTER_ID}"))
-        .set_expression_attribute_values(Some(values));
+      let now_ts_ms = unix_millis_from_offset_datetime(now)
+        .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+      let mut members = HashSet::new();
+      let mut start_key: Option<HashMap<String, AttributeValue>> = None;
 
-      if let Some(key) = start_key.take() {
-        query = query.set_exclusive_start_key(Some(key));
-      }
+      loop {
+        let mut values = HashMap::new();
+        values.insert(
+          ":pk".to_string(),
+          AttributeValue::S(Self::pk(topic, group_id)),
+        );
+        values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+        values.insert(
+          ":member_type".to_string(),
+          AttributeValue::S(RECORD_TYPE_MEMBER.to_string()),
+        );
 
-      let response = query
-        .return_consumed_capacity(ReturnConsumedCapacity::Total)
-        .send()
-        .await?;
-      self.record_read_capacity(response.consumed_capacity.as_ref());
-      for item in response.items() {
-        if let Some(AttributeValue::S(member_id)) = item.get(ATTR_SK) {
-          members.insert(ConsumerGroupMember {
-            member_id: member_id.clone(),
-            pod_id: item
-              .get(ATTR_POD_ID)
-              .and_then(|value| value.as_s().ok())
-              .cloned(),
-            cluster_id: item
-              .get(ATTR_CLUSTER_ID)
-              .and_then(|value| value.as_s().ok())
-              .cloned(),
-          });
+        let mut query = self
+          .client
+          .query()
+          .table_name(&self.table_name)
+          .key_condition_expression(format!("{ATTR_PK} = :pk"))
+          .consistent_read(true)
+          .filter_expression(format!(
+            "{ATTR_LEASE_EXPIRES} > :now AND (attribute_not_exists({ATTR_RECORD_TYPE}) OR \
+             {ATTR_RECORD_TYPE} = :member_type)"
+          ))
+          .projection_expression(format!("{ATTR_SK}, {ATTR_POD_ID}, {ATTR_CLUSTER_ID}"))
+          .set_expression_attribute_values(Some(values));
+
+        if let Some(key) = start_key.take() {
+          query = query.set_exclusive_start_key(Some(key));
+        }
+
+        let response = query
+          .return_consumed_capacity(ReturnConsumedCapacity::Total)
+          .send()
+          .trace_request("Query")
+          .await?;
+        self.record_read_capacity(response.consumed_capacity.as_ref());
+        for item in response.items() {
+          if let Some(AttributeValue::S(member_id)) = item.get(ATTR_SK) {
+            members.insert(ConsumerGroupMember {
+              member_id: member_id.clone(),
+              pod_id: item
+                .get(ATTR_POD_ID)
+                .and_then(|value| value.as_s().ok())
+                .cloned(),
+              cluster_id: item
+                .get(ATTR_CLUSTER_ID)
+                .and_then(|value| value.as_s().ok())
+                .cloned(),
+            });
+          }
+        }
+
+        if let Some(key) = response.last_evaluated_key {
+          start_key = Some(key);
+        } else {
+          break;
         }
       }
 
-      if let Some(key) = response.last_evaluated_key {
-        start_key = Some(key);
-      } else {
-        break;
-      }
-    }
-
-    let mut members = members.into_iter().collect::<Vec<_>>();
-    members.sort_by(|left, right| left.member_id.cmp(&right.member_id));
-    Ok(members)
+      let mut members = members.into_iter().collect::<Vec<_>>();
+      members.sort_by(|left, right| left.member_id.cmp(&right.member_id));
+      Ok(members)
+    })
   }
 
   async fn get_assignment_plan(
@@ -550,33 +570,36 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     topic: &str,
     group_id: &str,
   ) -> Result<Option<ConsumerGroupAssignmentPlan>> {
-    let response = self
-      .client
-      .get_item()
-      .table_name(&self.table_name)
-      .key(
-        ATTR_PK,
-        AttributeValue::S(Self::control_pk(topic, group_id)),
-      )
-      .key(ATTR_SK, AttributeValue::S(Self::plan_key()))
-      .consistent_read(true)
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await?;
-    self.record_read_capacity(response.consumed_capacity.as_ref());
-    let Some(item) = response.item else {
-      return Ok(None);
-    };
+    trace_dynamo_operation!(self, "get_assignment_plan", async {
+      let response = self
+        .client
+        .get_item()
+        .table_name(&self.table_name)
+        .key(
+          ATTR_PK,
+          AttributeValue::S(Self::control_pk(topic, group_id)),
+        )
+        .key(ATTR_SK, AttributeValue::S(Self::plan_key()))
+        .consistent_read(true)
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .trace_request("GetItem")
+        .await?;
+      self.record_read_capacity(response.consumed_capacity.as_ref());
+      let Some(item) = response.item else {
+        return Ok(None);
+      };
 
-    if item
-      .get(ATTR_RECORD_TYPE)
-      .and_then(|value| value.as_s().ok().map(String::as_str))
-      != Some(RECORD_TYPE_ASSIGNMENT_PLAN)
-    {
-      return Err(anyhow!("unexpected assignment plan record type"));
-    }
+      if item
+        .get(ATTR_RECORD_TYPE)
+        .and_then(|value| value.as_s().ok().map(String::as_str))
+        != Some(RECORD_TYPE_ASSIGNMENT_PLAN)
+      {
+        return Err(anyhow!("unexpected assignment plan record type"));
+      }
 
-    Self::plan_from_item(&item).map(Some)
+      Self::plan_from_item(&item).map(Some)
+    })
   }
 
   async fn get_planner_lease(
@@ -584,31 +607,34 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     topic: &str,
     group_id: &str,
   ) -> Result<Option<ConsumerGroupPlannerLease>> {
-    let response = self
-      .client
-      .get_item()
-      .table_name(&self.table_name)
-      .key(
-        ATTR_PK,
-        AttributeValue::S(Self::control_pk(topic, group_id)),
-      )
-      .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
-      .consistent_read(true)
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await?;
-    self.record_read_capacity(response.consumed_capacity.as_ref());
-    let Some(item) = response.item else {
-      return Ok(None);
-    };
-    if item
-      .get(ATTR_RECORD_TYPE)
-      .and_then(|value| value.as_s().ok().map(String::as_str))
-      != Some(RECORD_TYPE_PLANNER_LEASE)
-    {
-      return Err(anyhow!("unexpected assignment planner record type"));
-    }
-    Self::planner_lease_from_item(&item).map(Some)
+    trace_dynamo_operation!(self, "get_planner_lease", async {
+      let response = self
+        .client
+        .get_item()
+        .table_name(&self.table_name)
+        .key(
+          ATTR_PK,
+          AttributeValue::S(Self::control_pk(topic, group_id)),
+        )
+        .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
+        .consistent_read(true)
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .trace_request("GetItem")
+        .await?;
+      self.record_read_capacity(response.consumed_capacity.as_ref());
+      let Some(item) = response.item else {
+        return Ok(None);
+      };
+      if item
+        .get(ATTR_RECORD_TYPE)
+        .and_then(|value| value.as_s().ok().map(String::as_str))
+        != Some(RECORD_TYPE_PLANNER_LEASE)
+      {
+        return Err(anyhow!("unexpected assignment planner record type"));
+      }
+      Self::planner_lease_from_item(&item).map(Some)
+    })
   }
 
   async fn acquire_or_renew_planner(
@@ -620,74 +646,78 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     now: OffsetDateTime,
     ttl: Duration,
   ) -> Result<ConsumerGroupPlannerLeaseOutcome> {
-    let now_ts_ms = unix_millis_from_offset_datetime(now)
-      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let ttl_ms = i64::try_from(ttl.whole_milliseconds())
-      .map_err(|_| anyhow!("planner ttl exceeds Dynamo millisecond range"))?;
-    let expires_at = expires_at(now_ts_ms, ttl_ms)?;
-    let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
-    let mut values = HashMap::new();
-    values.insert(
-      ":owner".to_string(),
-      AttributeValue::S(member_id.to_string()),
-    );
-    values.insert(
-      ":session".to_string(),
-      AttributeValue::S(planner_session_id.to_string()),
-    );
-    values.insert(
-      ":expires".to_string(),
-      AttributeValue::N(expires_at.to_string()),
-    );
-    values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-    values.insert(
-      ":ttl".to_string(),
-      AttributeValue::N(ttl_epoch_seconds.to_string()),
-    );
-    values.insert(
-      ":planner_type".to_string(),
-      AttributeValue::S(RECORD_TYPE_PLANNER_LEASE.to_string()),
-    );
+    trace_dynamo_operation!(self, "acquire_or_renew_planner", async {
+      let now_ts_ms = unix_millis_from_offset_datetime(now)
+        .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+      let ttl_ms = i64::try_from(ttl.whole_milliseconds())
+        .map_err(|_| anyhow!("planner ttl exceeds Dynamo millisecond range"))?;
+      let expires_at = expires_at(now_ts_ms, ttl_ms)?;
+      let ttl_epoch_seconds = ttl_epoch_seconds(expires_at, self.ttl_buffer)?;
+      let mut values = HashMap::new();
+      values.insert(
+        ":owner".to_string(),
+        AttributeValue::S(member_id.to_string()),
+      );
+      values.insert(
+        ":session".to_string(),
+        AttributeValue::S(planner_session_id.to_string()),
+      );
+      values.insert(
+        ":expires".to_string(),
+        AttributeValue::N(expires_at.to_string()),
+      );
+      values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+      values.insert(
+        ":ttl".to_string(),
+        AttributeValue::N(ttl_epoch_seconds.to_string()),
+      );
+      values.insert(
+        ":planner_type".to_string(),
+        AttributeValue::S(RECORD_TYPE_PLANNER_LEASE.to_string()),
+      );
 
-    let control_pk = Self::control_pk(topic, group_id);
-    let response = retry_dynamo_transaction_conflicts(
-      "acquire_or_renew",
-      || {
-        self
-          .client
-          .update_item()
-          .table_name(&self.table_name)
-          .key(ATTR_PK, AttributeValue::S(control_pk.clone()))
-          .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
-          .update_expression(format!(
-            "SET {ATTR_RECORD_TYPE} = :planner_type, {ATTR_OWNER} = :owner, \
-             {ATTR_PLANNER_SESSION} = :session, {ATTR_LEASE_EXPIRES} = :expires, \
-             {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl"
-          ))
-          .condition_expression(format!(
-            "attribute_not_exists({ATTR_PK}) OR {ATTR_LEASE_EXPIRES} <= :now OR ({ATTR_OWNER} = \
-             :owner AND {ATTR_PLANNER_SESSION} = :session)"
-          ))
-          .set_expression_attribute_values(Some(values.clone()))
-          .return_consumed_capacity(ReturnConsumedCapacity::Total)
-          .send()
-      },
-      is_dynamo_transaction_conflict,
-    )
-    .await;
+      let control_pk = Self::control_pk(topic, group_id);
+      let response = retry_dynamo_transaction_conflicts(
+        "acquire_or_renew",
+        || {
+          self
+            .client
+            .update_item()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(control_pk.clone()))
+            .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
+            .update_expression(format!(
+              "SET {ATTR_RECORD_TYPE} = :planner_type, {ATTR_OWNER} = :owner, \
+               {ATTR_PLANNER_SESSION} = :session, {ATTR_LEASE_EXPIRES} = :expires, \
+               {ATTR_LAST_HEARTBEAT} = :now, {ATTR_TTL} = :ttl"
+            ))
+            .condition_expression(format!(
+              "attribute_not_exists({ATTR_PK}) OR {ATTR_LEASE_EXPIRES} <= :now OR ({ATTR_OWNER} = \
+               :owner AND {ATTR_PLANNER_SESSION} = :session)"
+            ))
+            .set_expression_attribute_values(Some(values.clone()))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .trace_request("UpdateItem")
+        },
+        is_dynamo_transaction_conflict,
+      )
+      .await;
 
-    match response {
-      Ok(output) => {
-        self.record_write_capacity(output.consumed_capacity.as_ref());
-        Ok(ConsumerGroupPlannerLeaseOutcome::Acquired)
-      },
-      Err(SdkError::ServiceError(service_error))
-        if service_error.err().is_conditional_check_failed_exception() =>
-      {
-        Ok(ConsumerGroupPlannerLeaseOutcome::HeldByOther)
-      },
-      Err(error) => Err(error.into()),
-    }
+      match response {
+        Ok(output) => {
+          self.record_write_capacity(output.consumed_capacity.as_ref());
+          Ok(ConsumerGroupPlannerLeaseOutcome::Acquired)
+        },
+        Err(SdkError::ServiceError(service_error))
+          if service_error.err().is_conditional_check_failed_exception() =>
+        {
+          mark_expected_outcome();
+          Ok(ConsumerGroupPlannerLeaseOutcome::HeldByOther)
+        },
+        Err(error) => Err(error.into()),
+      }
+    })
   }
 
   async fn release_planner(
@@ -697,48 +727,52 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     member_id: &str,
     planner_session_id: &str,
   ) -> Result<bool> {
-    let mut values = HashMap::new();
-    values.insert(
-      ":owner".to_string(),
-      AttributeValue::S(member_id.to_string()),
-    );
-    values.insert(
-      ":session".to_string(),
-      AttributeValue::S(planner_session_id.to_string()),
-    );
-    let control_pk = Self::control_pk(topic, group_id);
-    let response = retry_dynamo_transaction_conflicts(
-      "release",
-      || {
-        self
-          .client
-          .delete_item()
-          .table_name(&self.table_name)
-          .key(ATTR_PK, AttributeValue::S(control_pk.clone()))
-          .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
-          .condition_expression(format!(
-            "{ATTR_OWNER} = :owner AND {ATTR_PLANNER_SESSION} = :session"
-          ))
-          .set_expression_attribute_values(Some(values.clone()))
-          .return_consumed_capacity(ReturnConsumedCapacity::Total)
-          .send()
-      },
-      is_dynamo_transaction_conflict,
-    )
-    .await;
+    trace_dynamo_operation!(self, "release_planner", async {
+      let mut values = HashMap::new();
+      values.insert(
+        ":owner".to_string(),
+        AttributeValue::S(member_id.to_string()),
+      );
+      values.insert(
+        ":session".to_string(),
+        AttributeValue::S(planner_session_id.to_string()),
+      );
+      let control_pk = Self::control_pk(topic, group_id);
+      let response = retry_dynamo_transaction_conflicts(
+        "release",
+        || {
+          self
+            .client
+            .delete_item()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(control_pk.clone()))
+            .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
+            .condition_expression(format!(
+              "{ATTR_OWNER} = :owner AND {ATTR_PLANNER_SESSION} = :session"
+            ))
+            .set_expression_attribute_values(Some(values.clone()))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .trace_request("DeleteItem")
+        },
+        is_dynamo_transaction_conflict,
+      )
+      .await;
 
-    match response {
-      Ok(output) => {
-        self.record_write_capacity(output.consumed_capacity.as_ref());
-        Ok(true)
-      },
-      Err(SdkError::ServiceError(service_error))
-        if service_error.err().is_conditional_check_failed_exception() =>
-      {
-        Ok(false)
-      },
-      Err(error) => Err(error.into()),
-    }
+      match response {
+        Ok(output) => {
+          self.record_write_capacity(output.consumed_capacity.as_ref());
+          Ok(true)
+        },
+        Err(SdkError::ServiceError(service_error))
+          if service_error.err().is_conditional_check_failed_exception() =>
+        {
+          mark_expected_outcome();
+          Ok(false)
+        },
+        Err(error) => Err(error.into()),
+      }
+    })
   }
 
   async fn publish_assignment_plan(
@@ -750,84 +784,90 @@ impl ConsumerGroupMembershipStore for DynamoConsumerGroupMembershipStore {
     now: OffsetDateTime,
     plan: ConsumerGroupAssignmentPlan,
   ) -> Result<bool> {
-    if plan.planner_member_id != member_id {
-      return Ok(false);
-    }
+    trace_dynamo_operation!(self, "publish_assignment_plan", async {
+      if plan.planner_member_id != member_id {
+        mark_expected_outcome();
+        return Ok(false);
+      }
 
-    let now_ts_ms = unix_millis_from_offset_datetime(now)
-      .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
-    let mut planner_values = HashMap::new();
-    planner_values.insert(
-      ":owner".to_string(),
-      AttributeValue::S(member_id.to_string()),
-    );
-    planner_values.insert(
-      ":session".to_string(),
-      AttributeValue::S(planner_session_id.to_string()),
-    );
-    planner_values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
-    let plan_values = Self::plan_values(&plan)?;
-    let group_key = Self::control_pk(topic, group_id);
+      let now_ts_ms = unix_millis_from_offset_datetime(now)
+        .map_err(|_| anyhow!("current time exceeds Dynamo millisecond range"))?;
+      let mut planner_values = HashMap::new();
+      planner_values.insert(
+        ":owner".to_string(),
+        AttributeValue::S(member_id.to_string()),
+      );
+      planner_values.insert(
+        ":session".to_string(),
+        AttributeValue::S(planner_session_id.to_string()),
+      );
+      planner_values.insert(":now".to_string(), AttributeValue::N(now_ts_ms.to_string()));
+      let plan_values = Self::plan_values(&plan)?;
+      let group_key = Self::control_pk(topic, group_id);
 
-    let planner_check = ConditionCheck::builder()
-      .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(group_key.clone()))
-      .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
-      .condition_expression(format!(
-        "{ATTR_OWNER} = :owner AND {ATTR_PLANNER_SESSION} = :session AND {ATTR_LEASE_EXPIRES} > \
-         :now"
-      ))
-      .set_expression_attribute_values(Some(planner_values))
-      .build()?;
-    let topology_update = if plan.member_topology.is_some() {
-      format!(", {ATTR_PLAN_MEMBER_TOPOLOGY} = :member_topology")
-    } else {
-      String::new()
-    };
-    let topology_removal = if plan.member_topology.is_some() {
-      String::new()
-    } else {
-      format!(" REMOVE {ATTR_PLAN_MEMBER_TOPOLOGY}")
-    };
-    let plan_update = Update::builder()
-      .table_name(&self.table_name)
-      .key(ATTR_PK, AttributeValue::S(group_key))
-      .key(ATTR_SK, AttributeValue::S(Self::plan_key()))
-      .update_expression(format!(
-        "SET {ATTR_RECORD_TYPE} = :plan_type, {ATTR_PLAN_VERSION} = :version, {ATTR_PLAN_PLANNER} \
-         = :planner, {ATTR_PLAN_MEMBERS} = :members, {ATTR_PLAN_ASSIGNMENTS} = :assignments, \
-         {ATTR_PLAN_PUBLISHED} = :published, {ATTR_PLAN_COLOCATE_LOGICAL_PARTITIONS} = \
-         :colocate_logical_partitions{topology_update}{topology_removal}"
-      ))
-      .set_expression_attribute_values(Some(plan_values))
-      .build()?;
-    let client_request_token = Uuid::new_v4().to_string();
-    let response = self
-      .client
-      .transact_write_items()
-      .client_request_token(client_request_token)
-      .transact_items(
-        TransactWriteItem::builder()
-          .condition_check(planner_check)
-          .build(),
-      )
-      .transact_items(TransactWriteItem::builder().update(plan_update).build())
-      .return_consumed_capacity(ReturnConsumedCapacity::Total)
-      .send()
-      .await;
+      let planner_check = ConditionCheck::builder()
+        .table_name(&self.table_name)
+        .key(ATTR_PK, AttributeValue::S(group_key.clone()))
+        .key(ATTR_SK, AttributeValue::S(Self::planner_key()))
+        .condition_expression(format!(
+          "{ATTR_OWNER} = :owner AND {ATTR_PLANNER_SESSION} = :session AND {ATTR_LEASE_EXPIRES} > \
+           :now"
+        ))
+        .set_expression_attribute_values(Some(planner_values))
+        .build()?;
+      let topology_update = if plan.member_topology.is_some() {
+        format!(", {ATTR_PLAN_MEMBER_TOPOLOGY} = :member_topology")
+      } else {
+        String::new()
+      };
+      let topology_removal = if plan.member_topology.is_some() {
+        String::new()
+      } else {
+        format!(" REMOVE {ATTR_PLAN_MEMBER_TOPOLOGY}")
+      };
+      let plan_update = Update::builder()
+        .table_name(&self.table_name)
+        .key(ATTR_PK, AttributeValue::S(group_key))
+        .key(ATTR_SK, AttributeValue::S(Self::plan_key()))
+        .update_expression(format!(
+          "SET {ATTR_RECORD_TYPE} = :plan_type, {ATTR_PLAN_VERSION} = :version, \
+           {ATTR_PLAN_PLANNER} = :planner, {ATTR_PLAN_MEMBERS} = :members, \
+           {ATTR_PLAN_ASSIGNMENTS} = :assignments, {ATTR_PLAN_PUBLISHED} = :published, \
+           {ATTR_PLAN_COLOCATE_LOGICAL_PARTITIONS} = \
+           :colocate_logical_partitions{topology_update}{topology_removal}"
+        ))
+        .set_expression_attribute_values(Some(plan_values))
+        .build()?;
+      let client_request_token = Uuid::new_v4().to_string();
+      let response = self
+        .client
+        .transact_write_items()
+        .client_request_token(client_request_token)
+        .transact_items(
+          TransactWriteItem::builder()
+            .condition_check(planner_check)
+            .build(),
+        )
+        .transact_items(TransactWriteItem::builder().update(plan_update).build())
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .trace_request("TransactWriteItems")
+        .await;
 
-    match response {
-      Ok(output) => {
-        self.record_write_capacities(output.consumed_capacity.as_deref().unwrap_or_default());
-        Ok(true)
-      },
-      Err(SdkError::ServiceError(service_error))
-        if service_error.err().is_transaction_canceled_exception() =>
-      {
-        Ok(false)
-      },
-      Err(error) => Err(error.into()),
-    }
+      match response {
+        Ok(output) => {
+          self.record_write_capacities(output.consumed_capacity.as_deref().unwrap_or_default());
+          Ok(true)
+        },
+        Err(SdkError::ServiceError(service_error))
+          if service_error.err().is_transaction_canceled_exception() =>
+        {
+          mark_expected_outcome();
+          Ok(false)
+        },
+        Err(error) => Err(error.into()),
+      }
+    })
   }
 }
 
