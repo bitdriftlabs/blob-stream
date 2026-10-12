@@ -73,16 +73,18 @@ Assignment plans and planner leases share the membership table under reserved co
 
 ## AWS Observability Boundary
 
-Concrete AWS stores own conditional traces around complete logical operations, including
-application retries, response decoding, and S3 body consumption. Each surfaced SDK request has
-its own request-ID span. Nested helpers in the same service share the outer retention decision;
-an unexpected final failure is retained independently of ambient caller success, while expected
+Concrete AWS stores own conditional traces around complete logical operations, including application
+retries, response decoding, and S3 body consumption. Each surfaced SDK request has its own
+request-ID span. Nested helpers in the same service share the outer retention decision; an
+unexpected final failure is retained independently of ambient caller success, while expected
 outcomes and recovered retries require sampling or a direct OTEL parent at operation entry, checked
 with the same predicate as the `otel_*_if_parent` macros. An attached OTEL context alone does not
-qualify, nor does an ordinary non-OTEL current span.
-Parented operations retain an independent trace linked to that parent, including existing consumer
-handoff and shutdown flows. Cancellation suppresses export even with a parent. Cache hits and
-in-memory operations do not create AWS captures. This boundary does not change storage semantics.
+qualify, nor does an ordinary non-OTEL current span. Parented operations share their caller's trace
+ID and record a real parent span ID, including existing consumer handoff and shutdown flows. Capture
+ownership and retention remain independent of the caller; a retained failure can reference a
+suppressed parent. Without a direct OTEL parent, the operation starts a standalone trace. Trace
+links are not emitted. Cancellation suppresses export even with a parent. Cache hits and in-memory
+operations do not create AWS captures. This boundary does not change storage semantics.
 
 See [Infrastructure setup](../infrastructure.md#trace-collector) for exporter configuration and
 [Operations](../operations.md#aws-tracing) for live sampling, diagnostic fields, and capture limits.
