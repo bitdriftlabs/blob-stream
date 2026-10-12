@@ -159,11 +159,9 @@ async fn aws_operation_valid_parent_retains_completed_success_and_expected_outco
         .find(|span| span.name == "blob_stream.aws")
         .unwrap();
       let parent = spans.iter().find(|span| span.name == "handoff").unwrap();
-      assert_eq!(root.links.len(), 1);
-      assert_eq!(
-        root.links[0].span_context.span_id(),
-        parent.span_context.span_id()
-      );
+      assert_eq!(root.links.len(), 0);
+      assert_eq!(root.parent_span_id, parent.span_context.span_id());
+      assert_eq!(root.span_context.trace_id(), parent.span_context.trace_id());
       for (key, expected) in [
         ("aws.retention_reason", "parent"),
         (

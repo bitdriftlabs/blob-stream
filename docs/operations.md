@@ -115,25 +115,28 @@ restart-only/static, respectively.
 
 ## AWS Tracing
 
-The shared S3 and DynamoDB stores create a local `blob_stream.aws` trace for each logical
-operation, linked to any ambient OTEL span. This includes broker uploads, blob-cache refills,
-metadata-cache refills, consumer direct fallback, metadata publication, and lease, sequence,
-membership, and planner operations. A true retained-cache hit makes no AWS call and creates no
-AWS trace. Provisioning, credential resolution, and in-memory stores are outside this boundary.
+The shared S3 and DynamoDB stores create a `blob_stream.aws` span for each logical operation. It is
+a child of the current direct OTEL span, sharing its trace ID, or a standalone trace root when no
+direct OTEL parent exists. Trace links are not emitted. This includes broker uploads, blob-cache
+refills, metadata-cache refills, consumer direct fallback, metadata publication, and lease,
+sequence, membership, and planner operations. A true retained-cache hit makes no AWS call and
+creates no AWS trace. Provisioning, credential resolution, and in-memory stores are outside this
+boundary.
 
 The final unexpected store failure retains the trace through `otel_span_on_error`, even when
-sampling is off or a higher-level caller recovers. Response decoding and S3 body reads remain
-inside the operation. Recovered retries do not force retention. Expected S3 `NotFound`,
-whole-object admission rejection, publication fence loss, ownership conflicts, and expired
-leases are labeled `aws.outcome=expected`. Successful and expected outcomes are retained by
-sampling or a direct OTEL parent at operation entry, using the same currently entered span check
-as the `otel_*_if_parent` macros. Existing consumer revocation-handoff
-and shutdown spans propagate through their store calls, so those AWS operations are retained even
-at a zero sampling rate, with `aws.retention_reason=parent`. The AWS root remains an independent
-trace linked to the ambient span. An attached OTEL context alone or an ordinary non-OTEL current
-span does not qualify, even beneath a direct OTEL span. Canceled operations
-are not exported, including parented or sampled operations. Request-level errors do not independently
-force retention; the completed logical operation decides once.
+sampling is off or a higher-level caller recovers. Response decoding and S3 body reads remain inside
+the operation. Recovered retries do not force retention. Expected S3 `NotFound`, whole-object
+admission rejection, publication fence loss, ownership conflicts, and expired leases are labeled
+`aws.outcome=expected`. Successful and expected outcomes are retained by sampling or a direct OTEL
+parent at operation entry, using the same currently entered span check as the `otel_*_if_parent`
+macros. Existing consumer revocation-handoff and shutdown spans propagate through their store calls,
+so those AWS operations are retained even at a zero sampling rate, with
+`aws.retention_reason=parent` and a real `ParentSpanId`. AWS capture ownership and retention remain
+independent of the caller, even within the same trace. An independently retained failure can name a
+parent whose own capture was suppressed. An attached OTEL context alone or an ordinary non-OTEL
+current span does not qualify, even beneath a direct OTEL span. Canceled operations are not
+exported, including parented or sampled operations. Request-level errors do not independently force
+retention; the completed logical operation decides once.
 
 `blob_stream_aws_s3_trace_sample_rate` and `blob_stream_aws_dynamodb_trace_sample_rate` are
 independent integer feature flags. Missing flags, wrong types, an absent watch, or an absent snapshot
