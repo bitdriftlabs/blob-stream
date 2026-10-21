@@ -1,7 +1,7 @@
 use super::{S3BlobStore, read_content_length_body};
 use crate::{BlobKey, BlobStore, BlobStoreError, ByteRange};
 use aws_sdk_s3::config::{Credentials, Region};
-use bd_log::test::TestTraceContext;
+use bd_log::test::TraceCapture;
 use bd_runtime_config::loader::Loader;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_runtime_config::AWS_S3_TRACE_SAMPLE_RATE;
@@ -66,31 +66,33 @@ async fn aws_tracing_s3_preserves_support_ids_and_final_outcomes() {
         DefaultFeatureFlags::default().with_bool_flag(AWS_S3_TRACE_SAMPLE_RATE, sampled),
       ));
       let store = S3BlobStore::new(client, "bucket", Some(flags.snapshot_watch()));
-      let context = TestTraceContext::new("s3-test");
-      let dispatch = context.dispatch();
-      let _guard = tracing::dispatcher::set_default(&dispatch);
+      let capture = TraceCapture::new();
       let key = BlobKey::from("key");
-      let result = match scenario {
-        "put" => store
-          .put(&key, Bytes::from_static(b"data"))
-          .await
-          .map(|()| Bytes::new())
-          .map_err(|source| BlobStoreError::Read {
-            key: "key".to_string(),
-            source,
-          }),
-        "admission" | "rejected" => {
-          store
-            .get_with_cache_admission(&key, &move |_| scenario != "rejected")
-            .await
-        },
-        _ => store.get_range(&key, ByteRange { start: 0, end: 4 }).await,
-      };
+      let result = capture
+        .scope(async {
+          match scenario {
+            "put" => store
+              .put(&key, Bytes::from_static(b"data"))
+              .await
+              .map(|()| Bytes::new())
+              .map_err(|source| BlobStoreError::Read {
+                key: "key".to_string(),
+                source,
+              }),
+            "admission" | "rejected" => {
+              store
+                .get_with_cache_admission(&key, &move |_| scenario != "rejected")
+                .await
+            },
+            _ => store.get_range(&key, ByteRange { start: 0, end: 4 }).await,
+          }
+        })
+        .await;
       server.await.unwrap();
       let unexpected = matches!(scenario, "failure" | "short");
       let expected = matches!(scenario, "missing" | "rejected");
       assert_eq!(result.is_err(), unexpected || expected, "{scenario}");
-      let spans = context.exported_spans();
+      let spans = capture.finish();
       assert_eq!(
         spans.len(),
         if sampled || unexpected { 2 } else { 0 },

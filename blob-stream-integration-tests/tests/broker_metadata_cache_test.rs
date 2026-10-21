@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use bd_log::test::TestTraceContext;
+use bd_log::test::{TraceCapture, TraceCaptureHandle};
 use bd_runtime_config::loader::Loader;
 use bd_server_stats::test::util::stats::Helper;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
@@ -31,7 +31,15 @@ use blob_stream_integration_tests::test_framework::{
   write_recovery_segment,
   write_recovery_segment_for_partitions,
 };
-use blob_stream_metadata_store::{ConsumerGroupLeaseKey, DynamoCapacityMetrics, MetadataStore};
+use blob_stream_metadata_store::{
+  ConsumerGroupLeaseKey,
+  DynamoCapacityMetrics,
+  MetadataReadConsistency as StoreReadConsistency,
+  MetadataStore,
+  MetadataWriteResult,
+  ProducerPartitionFence,
+  SegmentMetadata,
+};
 use blob_stream_proto::protos::blobstream::v1::broker::{
   FullRecoveryMetadataCoverage,
   MetadataReadConsistency,
@@ -46,6 +54,7 @@ use blob_stream_types::{
   CommittedSourceCheckpoint,
   SnowflakeId,
   ToProtoDuration,
+  TopicWindowKey,
   Window,
 };
 use std::collections::{HashMap, HashSet};
@@ -61,13 +70,53 @@ fn eventual_metadata_reads(visibility_delay: TimeDuration) -> EventualMetadataRe
   }
 }
 
+struct CapturedMetadataStore {
+  inner: Arc<dyn MetadataStore>,
+  capture: TraceCaptureHandle,
+}
+
+#[async_trait::async_trait]
+impl MetadataStore for CapturedMetadataStore {
+  async fn write_segment(
+    &self,
+    metadata: SegmentMetadata,
+    fences: Option<&[ProducerPartitionFence]>,
+    now_ts_ms: i64,
+  ) -> MetadataWriteResult {
+    self
+      .capture
+      .scope(self.inner.write_segment(metadata, fences, now_ts_ms))
+      .await
+  }
+
+  async fn scan_window_from_snowflake(
+    &self,
+    window: &TopicWindowKey,
+    min_snowflake: Option<SnowflakeId>,
+    consistency: StoreReadConsistency,
+  ) -> Result<Vec<SegmentMetadata>> {
+    self
+      .capture
+      .scope(
+        self
+          .inner
+          .scan_window_from_snowflake(window, min_snowflake, consistency),
+      )
+      .await
+  }
+}
+
 #[tokio::test]
 async fn aws_tracing_metadata_cache_hit_does_not_call_dynamo() -> Result<()> {
   let resources = IntegrationResources::create().await?;
   let loader = FakeLoader::new(Arc::new(
     DefaultFeatureFlags::default().with_bool_flag(AWS_DYNAMODB_TRACE_SAMPLE_RATE, true),
   ));
-  let store = resources.metadata_store_with_runtime_config(None, Some(loader.snapshot_watch()));
+  let capture = TraceCapture::new();
+  let store = Arc::new(CapturedMetadataStore {
+    inner: resources.metadata_store_with_runtime_config(None, Some(loader.snapshot_watch())),
+    capture: capture.handle(),
+  });
   let clock = Arc::new(framework::ManualTimeProvider::new(
     OffsetDateTime::from_unix_timestamp(20)?,
   ));
@@ -94,9 +143,6 @@ async fn aws_tracing_metadata_cache_hit_does_not_call_dynamo() -> Result<()> {
     )
     .time_provider(clock),
   );
-  let context = TestTraceContext::new("cache-aws-test");
-  let dispatch = context.dispatch();
-  let _guard = tracing::dispatcher::set_default(&dispatch);
   let request = ReadMetadataWindowRequest {
     topic: TOPIC.into(),
     window_start_unix_seconds: 0,
@@ -110,12 +156,12 @@ async fn aws_tracing_metadata_cache_hit_does_not_call_dynamo() -> Result<()> {
     max_response_bytes: 1024 * 1024,
     ..Default::default()
   };
-  let response = cache.read(request.clone()).await;
+  let response = capture.scope(cache.read(request.clone())).await;
   assert!(matches!(
     response.result,
     Some(read_metadata_window_response::Result::Success(_))
   ));
-  let spans = context.exported_spans();
+  let spans = capture.spans();
   assert_eq!(
     spans
       .iter()
@@ -123,12 +169,12 @@ async fn aws_tracing_metadata_cache_hit_does_not_call_dynamo() -> Result<()> {
       .count(),
     1
   );
-  let response = cache.read(request).await;
+  let response = capture.scope(cache.read(request)).await;
   let Some(read_metadata_window_response::Result::Success(success)) = response.result else {
     return Err(anyhow!("cached metadata read failed"));
   };
   assert!(success.retained_coverage);
-  assert_eq!(context.exported_spans().len(), spans.len());
+  assert_eq!(capture.finish().len(), spans.len());
   Ok(())
 }
 
