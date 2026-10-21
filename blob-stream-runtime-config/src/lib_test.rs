@@ -1,6 +1,6 @@
 use super::aws_tracing::{instrument_operation, mark_expected_outcome};
 use super::{AWS_DYNAMODB_TRACE_SAMPLE_RATE, AWS_S3_TRACE_SAMPLE_RATE, AwsTraceSampler};
-use bd_log::test::TestTraceContext;
+use bd_log::test::TraceCapture;
 use bd_runtime_config::feature_flags::FeatureFlags;
 use std::future::{Future, pending, poll_fn};
 use std::sync::Arc;
@@ -65,37 +65,36 @@ async fn aws_operation_retains_only_final_failure_or_sample_and_preserves_result
       let (_sender, receiver) =
         watch::channel(Some(flags(sampled.then_some(AWS_S3_TRACE_SAMPLE_RATE))));
       let sampler = AwsTraceSampler::new(Some(receiver));
-      let context = TestTraceContext::new("aws-operation-test");
-      let dispatch = context.dispatch();
-      let _guard = tracing::dispatcher::set_default(&dispatch);
-      let result = instrument_operation(
-        &sampler,
-        AWS_S3_TRACE_SAMPLE_RATE,
-        "S3",
-        "outer",
-        "region",
-        "bucket",
-        async {
-          instrument_operation(
-            &sampler,
-            AWS_S3_TRACE_SAMPLE_RATE,
-            "S3",
-            "inner",
-            "region",
-            "bucket",
-            async {
-              mark_expected_outcome();
-              outcome
-            },
-            |_| false,
-          )
-          .await
-        },
-        |error| *error == "expected",
-      )
-      .await;
+      let capture = TraceCapture::new();
+      let result = capture
+        .scope(instrument_operation(
+          &sampler,
+          AWS_S3_TRACE_SAMPLE_RATE,
+          "S3",
+          "outer",
+          "region",
+          "bucket",
+          async {
+            instrument_operation(
+              &sampler,
+              AWS_S3_TRACE_SAMPLE_RATE,
+              "S3",
+              "inner",
+              "region",
+              "bucket",
+              async {
+                mark_expected_outcome();
+                outcome
+              },
+              |_| false,
+            )
+            .await
+          },
+          |error| *error == "expected",
+        ))
+        .await;
       assert_eq!(result, outcome);
-      let spans = context.exported_spans();
+      let spans = capture.finish();
       assert_eq!(
         spans.len(),
         usize::from(sampled || outcome == Err("failure"))
@@ -131,28 +130,29 @@ async fn aws_operation_valid_parent_retains_completed_success_and_expected_outco
   ] {
     for outcome in [Ok(7), Err("expected")] {
       let sampler = AwsTraceSampler::default();
-      let context = TestTraceContext::new("aws-parent-test");
-      let dispatch = context.dispatch();
-      let _guard = tracing::dispatcher::set_default(&dispatch);
-      let parent = bd_log::otel_info_span!("handoff");
-      let result = instrument_operation(
-        &sampler,
-        flag,
-        service,
-        "operation",
-        "region",
-        "resource",
-        async {
-          drop(bd_log::otel_info_span_if_parent!("request"));
-          outcome
-        },
-        |error| *error == "expected",
-      )
-      .instrument(parent.clone())
-      .await;
+      let capture = TraceCapture::new();
+      let parent = capture.in_scope(|| bd_log::otel_info_span!("handoff"));
+      let result = capture
+        .scope(
+          instrument_operation(
+            &sampler,
+            flag,
+            service,
+            "operation",
+            "region",
+            "resource",
+            async {
+              drop(bd_log::otel_info_span_if_parent!("request"));
+              outcome
+            },
+            |error| *error == "expected",
+          )
+          .instrument(parent.clone()),
+        )
+        .await;
       assert_eq!(result, outcome);
       drop(parent);
-      let spans = context.exported_spans();
+      let spans = capture.finish();
       assert_eq!(spans.len(), 3);
       let root = spans
         .iter()
@@ -195,10 +195,8 @@ async fn aws_operation_valid_parent_retains_completed_success_and_expected_outco
 async fn aws_operation_sampled_cancellation_does_not_export() {
   let (_sender, receiver) = watch::channel(Some(flags(Some(AWS_S3_TRACE_SAMPLE_RATE))));
   let sampler = AwsTraceSampler::new(Some(receiver));
-  let context = TestTraceContext::new("aws-cancellation-test");
-  let dispatch = context.dispatch();
-  let _guard = tracing::dispatcher::set_default(&dispatch);
-  let mut operation = Box::pin(instrument_operation(
+  let capture = TraceCapture::new();
+  let mut operation = Box::pin(capture.scope(instrument_operation(
     &sampler,
     AWS_S3_TRACE_SAMPLE_RATE,
     "S3",
@@ -207,11 +205,11 @@ async fn aws_operation_sampled_cancellation_does_not_export() {
     "bucket",
     pending::<Result<(), &str>>(),
     |_| false,
-  ));
+  )));
   assert_eq!(
     poll_fn(|task| Poll::Ready(operation.as_mut().poll(task))).await,
     Poll::Pending
   );
   drop(operation);
-  assert_eq!(context.exported_spans().len(), 0);
+  assert_eq!(capture.finish().len(), 0);
 }

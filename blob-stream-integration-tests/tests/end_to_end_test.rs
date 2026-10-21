@@ -1005,20 +1005,43 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
   let runtime_1 = consumer_runtime_config("consumer-1");
   let runtime_2 = consumer_runtime_config("consumer-2");
 
+  let consumer_0 = Box::new(cluster.create_consumer(&runtime_0).await?);
+  let consumer_1 = Box::new(cluster.create_consumer(&runtime_1).await?);
+  let mut initial_assignment_gate = cluster
+    .lifecycle_hooks()
+    .arm_consumer(
+      LifecycleEvent::ConsumerRebalanceApplied,
+      "consumer-1",
+      None,
+      None,
+    )
+    .await?;
   let (event_tx, mut event_rx) = mpsc::unbounded_channel();
   let (stop_tx_0, stop_rx_0) = watch::channel(false);
   let (stop_tx_1, stop_rx_1) = watch::channel(false);
   let (stop_tx_2, stop_rx_2) = watch::channel(false);
-  let consumer_0_task = tokio::spawn(run_consumer_task(
-    Box::new(cluster.create_consumer(&runtime_0).await?),
-    stop_rx_0,
-    event_tx.clone(),
-  ));
-  let consumer_1_task = tokio::spawn(run_consumer_task(
-    Box::new(cluster.create_consumer(&runtime_1).await?),
-    stop_rx_1,
-    event_tx.clone(),
-  ));
+  let consumer_0_task = tokio::spawn(run_consumer_task(consumer_0, stop_rx_0, event_tx.clone()));
+  let consumer_1_task = tokio::spawn(run_consumer_task(consumer_1, stop_rx_1, event_tx.clone()));
+
+  let mut delivery_traces = ConsumerDeliveryTraces::new();
+  let mut revocation_count = 0usize;
+  timeout(Duration::from_secs(10), async {
+    let assignment_wait = initial_assignment_gate.wait_until_reached();
+    tokio::pin!(assignment_wait);
+    loop {
+      tokio::select! {
+        result = &mut assignment_wait => return result,
+        event = event_rx.recv() => {
+          let event = event
+            .ok_or_else(|| anyhow!("initial consumer tasks stopped before assignment"))?;
+          handle_consumer_event_with_trace(event, &mut delivery_traces, &mut revocation_count);
+        }
+      }
+    }
+  })
+  .await
+  .map_err(|_| anyhow!("consumer-1 did not apply its initial partition assignment"))??;
+  initial_assignment_gate.release()?;
 
   // Step 3: Produce and drain phase 1 traffic through the consumer group.
   let mut expected_ids = HashSet::new();
@@ -1034,8 +1057,6 @@ async fn autoscaling_rebalance_and_failover_preserves_progress() -> Result<()> {
     expected_ids.insert(id);
   }
 
-  let mut delivery_traces = ConsumerDeliveryTraces::new();
-  let mut revocation_count = 0usize;
   timeout(Duration::from_secs(20), async {
     while delivery_traces.len() < expected_ids.len() {
       let event = event_rx

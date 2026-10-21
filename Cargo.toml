@@ -17,12 +17,19 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-anyhow               = "1.0.104"
-async-trait          = "0.1.92"
-aws-config           = "1.12.0"
-aws-sdk-dynamodb     = "1.130.0"
-aws-sdk-s3           = "1.152.0"
-aws-types            = "1.6.0"
+anyhow      = "1.0.104"
+async-trait = "0.1.92"
+aws-config  = "1.13.0"
+
+aws-sdk-dynamodb = { version = "1.132.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.153.0", default-features = false, features = [
+  "default-https-client",
+  "http-1x",
+  "rt-tokio",
+  "sigv4a",
+] }
+
+aws-types            = "1.7.0"
 axum                 = { version = "0.8.9", features = ["http2", "macros"] }
 bd-backoff           = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 bd-grpc              = { git = "https://github.com/bitdriftlabs/shared-core.git" }
@@ -51,7 +58,7 @@ kube                 = { version = "4.2.0", features = ["runtime", "rustls-tls"]
 log                  = "0.4.34"
 mockall              = "0.15.0"
 moka                 = { version = "0.12.16", features = ["future", "sync"] }
-parking_lot          = "0.12.5"
+parking_lot          = "0.13.0"
 prometheus           = "0.14.0"
 
 protobuf = { git = "https://github.com/bitdriftlabs/rust-protobuf.git", branch = "patch-stack", features = [
@@ -70,8 +77,8 @@ thiserror         = "2.0.21"
 tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }
 tikv-jemallocator = "0.7.0"
 time              = { version = "0.3.55", features = ["formatting", "serde-well-known", "macros", "parsing"] }
-tokio             = { version = "1.53.2", features = ["full"] }
+tokio             = { version = "1.54.0", features = ["full"] }
 tokio-stream      = "0.1.19"
 tracing           = "0.1.44"
 uuid              = { version = "1.28.0", features = ["v4"] }
-zstd              = "0.14.2"
+zstd              = "0.14.3"

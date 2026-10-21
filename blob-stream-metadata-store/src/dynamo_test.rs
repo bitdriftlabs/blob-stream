@@ -28,7 +28,7 @@ use aws_sdk_dynamodb::types::{
   KeyType,
   ScalarAttributeType,
 };
-use bd_log::test::TestTraceContext;
+use bd_log::test::TraceCapture;
 use bd_runtime_config::loader::Loader;
 use bd_test_helpers_core::feature_flags::{DefaultFeatureFlags, FakeLoader};
 use blob_stream_blob_store::BlobKey;
@@ -112,29 +112,30 @@ async fn aws_tracing_dynamo_preserves_page_ids_and_final_results() {
         ));
         let store =
           DynamoMetadataStore::new_read_only(client, "metadata", Some(loader.snapshot_watch()));
-        let context = TestTraceContext::new("dynamo-test");
-        let dispatch = context.dispatch();
-        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let capture = TraceCapture::new();
         let parent = if traced_parent {
-          bd_log::otel_info_span!("handoff")
+          capture.in_scope(|| bd_log::otel_info_span!("handoff"))
         } else {
           tracing::Span::none()
         };
-        let result = store
-          .scan_window_from_snowflake(
-            &TopicWindowKey {
-              topic: "topic".to_string(),
-              window_start_unix_seconds: 0,
-            },
-            None,
-            MetadataReadConsistency::Strong,
+        let result = capture
+          .scope(
+            store
+              .scan_window_from_snowflake(
+                &TopicWindowKey {
+                  topic: "topic".to_string(),
+                  window_start_unix_seconds: 0,
+                },
+                None,
+                MetadataReadConsistency::Strong,
+              )
+              .instrument(parent.clone()),
           )
-          .instrument(parent.clone())
           .await;
         server.await.unwrap();
         assert_eq!(result.is_err(), failed);
         drop(parent);
-        let spans = context.exported_spans();
+        let spans = capture.finish();
         let requests = spans
           .iter()
           .filter(|span| span.name == "aws.dynamodb.request")
@@ -195,9 +196,7 @@ async fn aws_tracing_dynamo_sampling_changes_without_rebuilding_store() {
   create_segments_table(&client, &table_name).await.unwrap();
   let loader = FakeLoader::new(Arc::new(DefaultFeatureFlags::default()));
   let store = DynamoMetadataStore::new_read_only(client, table_name, Some(loader.snapshot_watch()));
-  let context = TestTraceContext::new("live-dynamo-test");
-  let dispatch = context.dispatch();
-  let _guard = tracing::dispatcher::set_default(&dispatch);
+  let capture = TraceCapture::new();
   let window = TopicWindowKey {
     topic: "topic".to_string(),
     window_start_unix_seconds: 0,
@@ -206,13 +205,15 @@ async fn aws_tracing_dynamo_sampling_changes_without_rebuilding_store() {
     loader.update(Arc::new(
       DefaultFeatureFlags::default().with_bool_flag(AWS_DYNAMODB_TRACE_SAMPLE_RATE, sampled),
     ));
-    let previous = context.exported_spans().len();
-    store
-      .scan_window_from_snowflake(&window, None, MetadataReadConsistency::Strong)
+    let previous = capture.spans().len();
+    capture
+      .scope(store.scan_window_from_snowflake(&window, None, MetadataReadConsistency::Strong))
       .await
       .unwrap();
-    assert_eq!(context.exported_spans().len() > previous, sampled);
+    assert_eq!(capture.spans().len() > previous, sampled);
   }
+  let spans = capture.finish();
+  assert_eq!(spans.len(), 3);
 }
 
 #[tokio::test]
