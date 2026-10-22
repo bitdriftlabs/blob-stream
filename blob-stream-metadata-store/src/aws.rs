@@ -21,6 +21,7 @@ use aws_sdk_dynamodb::operation::transact_write_items::{
 };
 use aws_sdk_dynamodb::operation::update_item::UpdateItemOutput;
 use aws_sdk_dynamodb::types::ConsumedCapacity;
+use bd_backoff::future::retry_notify;
 use bd_backoff::{ExponentialBackoffBuilder, Finite, FiniteBackoff as _, SystemClock};
 use blob_stream_runtime_config::aws_tracing::{bounded_diagnostic, next_request_index};
 use log::trace;
@@ -29,7 +30,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use time::Duration as TimeDuration;
-use tokio::time::sleep;
 use tracing::Instrument as _;
 
 macro_rules! trace_dynamo_operation {
@@ -281,7 +281,7 @@ pub fn transaction_cancellation_has_code(
 /// Retry short-lived `DynamoDB` transaction conflicts outside the SDK retry classifier.
 pub async fn retry_dynamo_transaction_conflicts<T, E, F, Fut, IsConflict>(
   operation_name: &str,
-  mut operation: F,
+  operation: F,
   is_transaction_conflict: IsConflict,
 ) -> Result<T, E>
 where
@@ -303,22 +303,18 @@ where
     .build();
   let mut retry = 0;
 
-  loop {
-    match operation().await {
-      Ok(value) => return Ok(value),
-      Err(error) if is_transaction_conflict(&error) => match backoff.next_backoff() {
-        Some(delay) => {
-          retry += 1;
-          trace!(
-            "DynamoDB transaction conflict retrying: operation={operation_name}, retry={retry}, \
-             delay_ms={}",
-            delay.whole_milliseconds()
-          );
-          sleep(delay.unsigned_abs()).await;
-        },
-        None => return Err(error),
-      },
-      Err(error) => return Err(error),
-    }
-  }
+  retry_notify(
+    || backoff.next_backoff(),
+    operation,
+    is_transaction_conflict,
+    |_, delay| {
+      retry += 1;
+      trace!(
+        "DynamoDB transaction conflict retrying: operation={operation_name}, retry={retry}, \
+         delay_ms={}",
+        delay.as_millis()
+      );
+    },
+  )
+  .await
 }

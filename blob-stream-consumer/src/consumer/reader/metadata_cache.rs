@@ -24,7 +24,7 @@ mod tests;
 
 use blob_stream_metadata_store::{MetadataReadConsistency, SegmentMetadata};
 use blob_stream_types::{BatchMetadata, SnowflakeId, VirtualPartitionId};
-use im::Vector;
+use imbl::Vector;
 use log::debug;
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;

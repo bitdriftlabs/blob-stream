@@ -36,7 +36,7 @@ use blob_stream_types::{
   TopicWindowKey,
   topic_metadata_window_size,
 };
-use im::Vector;
+use imbl::Vector;
 use log::debug;
 use moka::future::Cache;
 use moka::ops::compute::{CompResult, Op};
