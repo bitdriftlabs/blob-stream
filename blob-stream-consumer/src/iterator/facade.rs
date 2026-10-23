@@ -8,6 +8,7 @@ use super::{
   ConsumerSharedState,
   NextBatchResult,
   NextResult,
+  RevokedPartitions,
 };
 use crate::coordination::HeartbeatReport;
 use crate::diagnostics::ConsumerDiagnostics;
@@ -188,6 +189,23 @@ impl ConsumerIterator for ConsumerIteratorImpl {
           .delivery_state
           .try_take_next(&mut shared_state.active_partitions, metrics)
           .map(|result| (result.next_result, result.gap))
+      })
+      .await
+  }
+
+  async fn next_revocation(&mut self) -> Result<Box<dyn RevokedPartitions>> {
+    self
+      .next_delivery(|shared_state, _| {
+        shared_state
+          .delivery_state
+          .pending_revocation
+          .take()
+          .map(|event| {
+            let NextResult::Revoked(revoked) = event else {
+              unreachable!("pending revocation must contain a revocation");
+            };
+            (revoked, std::iter::empty::<DeliveryGap>())
+          })
       })
       .await
   }

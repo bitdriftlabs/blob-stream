@@ -59,6 +59,12 @@ Every delivered record retains its source checkpoint. `store_offset()` persists 
 paired with the cursor, allowing a replacement owner to start retained recovery at the correct
 window.
 
+Applications use `ConsumerIterator::next()` or `next_batch()` to receive records and revocations.
+While applying record backpressure, `next_revocation()` waits only for a revocation without draining
+buffered records or advancing delivered offsets. Cancelling that wait leaves queued records and
+pending revocations available to subsequent polling. The returned revocation handle uses the same
+drain-and-complete protocol as a revocation returned by the record-polling methods.
+
 ## Reader Modes
 
 A partition moves through these modes:

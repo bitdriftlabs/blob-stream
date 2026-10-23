@@ -1559,6 +1559,75 @@ async fn bulk_delivery_live_driver_seeks_commits_revokes_and_reacquires() {
 }
 
 #[tokio::test]
+async fn revocation_poll_preserves_queued_records_and_cancellation_safety() {
+  let (mut iterator, stats) =
+    bulk_delivery_iterator(vec![bulk_delivery_batch(7, 1, 1, &[2, 2])]).await;
+  {
+    let mut waiting = Box::pin(iterator.next_revocation());
+    assert!(
+      waiting
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending()
+    );
+  }
+  assert!(iterator.store_offset(7, 1).is_err());
+  assert_eq!(
+    iterator.shared_state.lock().delivery_state.retained_bytes(),
+    4
+  );
+
+  let (completion_tx, completion_rx) = oneshot::channel();
+  iterator
+    .shared_state
+    .lock()
+    .delivery_state
+    .pending_revocation = Some(NextResult::Revoked(Box::new(RevokedPartitionsImpl {
+    revoked: vec![8],
+    completion_tx: Some(completion_tx),
+    completion_notify: Arc::new(tokio::sync::Notify::new()),
+  })));
+  let revoked = iterator.next_revocation().await.unwrap();
+  assert_eq!(revoked.partitions(), vec![8]);
+  revoked.complete().await;
+  completion_rx.await.unwrap();
+  assert!(iterator.store_offset(7, 1).is_err());
+  assert_eq!(
+    iterator.shared_state.lock().delivery_state.retained_bytes(),
+    4
+  );
+  stats.assert_counter_eq(
+    0,
+    "bulk_delivery:consumer:iterator:records_delivered",
+    &labels! {},
+  );
+
+  let NextBatchResult::Records(records) = iterator
+    .next_batch(
+      NonZeroUsize::new(2).unwrap(),
+      NonZeroUsize::new(64).unwrap(),
+    )
+    .await
+    .unwrap()
+  else {
+    panic!("expected the queued records after control-only polling");
+  };
+  assert_eq!(
+    records
+      .iter()
+      .map(|record| record.offset)
+      .collect::<Vec<_>>(),
+    vec![1, 2]
+  );
+  iterator.store_offset(7, 2).unwrap();
+  stats.assert_counter_eq(
+    2,
+    "bulk_delivery:consumer:iterator:records_delivered",
+    &labels! {},
+  );
+}
+
+#[tokio::test]
 async fn bulk_delivery_revocation_fences_queued_records_and_preserves_inflight_progress() {
   let (mut iterator, _) =
     bulk_delivery_iterator(vec![bulk_delivery_batch(7, 1, 1, &[2, 2, 2])]).await;

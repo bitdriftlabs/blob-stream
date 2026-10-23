@@ -141,13 +141,17 @@ impl ConsumerIterator for StopAwareRevocationTestConsumer {
   }
 
   async fn next(&mut self) -> Result<NextResult> {
+    self.next_revocation().await.map(NextResult::Revoked)
+  }
+
+  async fn next_revocation(&mut self) -> Result<Box<dyn RevokedPartitions>> {
     if self.sent_revocation {
       std::future::pending().await
     } else {
       self.sent_revocation = true;
-      Ok(NextResult::Revoked(Box::new(StopAwareRevokedPartitions {
+      Ok(Box::new(StopAwareRevokedPartitions {
         revocation_completed: Arc::clone(&self.revocation_completed),
-      })))
+      }))
     }
   }
 

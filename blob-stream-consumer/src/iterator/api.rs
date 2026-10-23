@@ -232,6 +232,8 @@ pub trait ConsumerIterator: Send + Sync {
   fn start(&mut self) -> Result<()>;
   /// Poll for either a record or revocation event.
   async fn next(&mut self) -> Result<NextResult>;
+  /// Wait for revocation without delivering buffered records.
+  async fn next_revocation(&mut self) -> Result<Box<dyn RevokedPartitions>>;
   /// Wait for the first record, then drain immediately available records within both limits.
   /// An oversized first record is returned alone. Revocations take priority over queued records.
   async fn next_batch(
