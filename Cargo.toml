@@ -26,7 +26,6 @@ aws-sdk-s3 = { version = "1.154.0", default-features = false, features = [
   "default-https-client",
   "http-1x",
   "rt-tokio",
-  "sigv4a",
 ] }
 
 aws-types            = "1.7.0"
